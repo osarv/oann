@@ -1,5 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Werror -Wextra -Wpedantic -g
+LBINS = -lm
 
 bin/%.o: %.c bin
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -7,7 +8,7 @@ bin/%.o: %.c bin
 all: clean build run
 
 build: $(addprefix bin/, $(addsuffix .o, $(basename $(wildcard *.c))))
-	$(CC) $(CFLAGS) $^ -o bin/out
+	$(CC) $(CFLAGS) $^ -o bin/out $(LBINS) 
 
 run:
 	bin/out
