@@ -11,7 +11,7 @@ struct layer {
     int nBuckets;
     int rehashRate;
     Matrix hashVectors;
-    Matrix preHashes;
+    katrix preHashes;
     Matrix passHashes;
     Matrix weights;
     Matrix biases;
@@ -29,6 +29,11 @@ void LayerDestroy(Layer l) {
 void LayerMount(Layer l, Matrix inF) {
     l->outF = MatrixCreate(l->nOut, inF->nCols);
     l->outB = MatrixCreate(inF->nRows, inF->nCols);
+    l->passHashes = MatrixCreate();
+}
+
+static void hashWeights(Layer l) {
+    MatrixMul(l->weights, l->hashVectors, l->hashes, false, true);
 }
 
 void HashDenseInit(Layer l, Matrix inF) {
@@ -40,11 +45,15 @@ void HashDenseInit(Layer l, Matrix inF) {
     MatrixInitNormDist(l->weights, 0, sqrt(2.0 / (float)inF.nRows));
     MatrixInitConst(l->biases, 0);
     MatrixInitNormDist(l->hashVectors, 0, 1);
-    MatrixInitConst(l->preHashes, 0); //TODO hash
+    hashWeights(l);
+}
+
+static void hashInput(Layer l, Matrix inF) {
+    MatrixMul(l->hashVectors, inF, false, true, );
 }
 
 Matrix HashDenseForward(Layer l, Matrix inF) {
-    cblas_sgemm(CblasRowMajor, CblasNoTranspose, CblasNoTranspose, );
+    MatrixMul();
 }
 
 Matrix HashDenseBackward() {

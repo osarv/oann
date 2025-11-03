@@ -1,5 +1,7 @@
-#include <stdlib.h> #include <stdio.h>
+#include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
+#include <cblas.h>
 #include "matrix.h"
 #include "util.h"
 
@@ -48,5 +50,6 @@ void MatrixInitNormDist(Matrix m, float mean, float stddev) {
 }
 
 void MatrixMul(Matrix a, Matrix b, Matrix res, bool aTrans, bool bTrans) {
-
+    cblas_sgemm(CblasRowMajor, aTrans ? CblasTrans : CblasNoTrans, bTrans ? CblasTrans : CblasNoTrans,
+            a->nRows, b->nCols, b->nCols, 1.0, a->elems, 1, b->elems, 1, 1.0, res->elems, 1);
 }

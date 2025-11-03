@@ -17,5 +17,6 @@ Matrix MatrixCreate(int nRows, int nCols);
 void MatrixInitConst(Matrix m, float c);
 void MatrixInitUniform(Matrix m, float min, float max);
 void MatrixInitNormDist(Matrix m, float mean, float stddev);
+void MatrixMul(Matrix a, Matrix b, Matrix res, bool aTrans, bool bTrans);
 
 #endif //MATRIX_H
