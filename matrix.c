@@ -1,26 +1,13 @@
-#include <stdlib.h>
-#include <stdio.h>
+#include <stdlib.h> #include <stdio.h>
 #include <math.h>
 #include "matrix.h"
 #include "util.h"
 
-struct matrix {
-    int nRows;
-    int nCols;
-    int rowStride;
-    int colStride;
-    float* elems;
-};
-
-Matrix MatrixCreate(int nRows, int nCols, enum matrixOrder order) {
-    Matrix m = malloc(sizeof(struct matrix));
-    CheckPtr(m);
-    m->elems = malloc(sizeof(float) * nRows * nCols);
-    CheckPtr(m->elems);
+Matrix MatrixCreate(int nRows, int nCols) {
+    Matrix m = MallocOrCrash(sizeof(struct matrix));
+    m->elems = MallocOrCrash(sizeof(float) * nRows * nCols);
     m->nRows = nRows;
     m->nCols = nCols;
-    m->rowStride = order == ROW_MAJOR ? 1 : nCols;
-    m->colStride = order == COL_MAJOR ? 1 : nRows;
     return m;
 }
 
@@ -58,4 +45,8 @@ void MatrixInitNormDist(Matrix m, float mean, float stddev) {
     }
     getStdDevPair(&m->elems[elemLen -1], &m->elems[elemLen -1]);
     m->elems[elemLen -1] = (m->elems[elemLen -1] + mean) * stddev;
+}
+
+void MatrixMul(Matrix a, Matrix b, Matrix res, bool aTrans, bool bTrans) {
+
 }
