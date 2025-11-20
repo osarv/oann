@@ -1,15 +1,26 @@
 #ifndef LAYER_H
 #define LAYER_H
-
-#include "matrix.h"
+#include "vecarr.h"
+#include "util.h"
 
 typedef struct layer* Layer;
-
-enum layerType {
-    LAYER_HASHDENSE
+struct layer {
+    struct vecArr outF;
+    struct vecArr inB;
+    void (*mount)(Layer l, struct vecArr inF);
+    void (*init)(Layer l, struct vecArr inF);
+    void (*destroy)(Layer l);
+    void (*forward)(Layer l, struct vecArr inF);
+    void (*backward)(Layer l, struct vecArr inF, struct vecArr outB);
+    struct list optParams; //list of parameters to optimize
+    struct list optParamGrads; //list of gradients of parameters to optimize
+    struct list optimizers; //corresponding optimizers
 };
 
-void LayerDestroy(Layer l);
-Layer HashDenseCreate(int nOut, int nVectors, int nBuckets, int rehashRate);
+void LayerMount(Layer l, struct vecArr inF); //mounting creates all temporary buffers
+void LayerInit(Layer l, struct vecArr inF); //initilalization is internal creation for a clean UI
+void LayerDestroy(Layer l); //memory destruction
+void LayerForward(Layer l, struct vecArr inF); //forward pass
+void LayerBackward(Layer l, struct vecArr inF, struct vecArr outB); //backward passing, presumes relevant forward pass in model state
 
 #endif //LAYER_H
