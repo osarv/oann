@@ -2,8 +2,18 @@
 #define UTIL_H
 #include <stdbool.h>
 
-#define TEST_PASSED {printf("\x1b[32m" "Test Passed\n" "\x1b[0m"); return;}
-#define TEST_FAILED {printf("\x1b[31m" "Test failed\n" "\x1b[0m"); return;}
+#ifdef TEST
+#undef TEST
+#define TEST(func) __attribute__((constructor)) static void Test##func
+#endif //TEST
+
+#ifndef TEST
+#undef TEST
+#define TEST(func) __attribute__((unused)) static void Test##func
+#endif //TEST
+
+#define TEST_PASSED {printf("\x1b[32m" "%s passed\n" "\x1b[0m", __func__); return;}
+#define TEST_FAILED {printf("\x1b[31m" "%s failed\n" "\x1b[0m", __func__); return;}
 
 //error handling
 void ErrorBugFound();

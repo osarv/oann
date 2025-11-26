@@ -18,9 +18,10 @@ void DenseMount(Layer l, struct vecArr inF) {
     struct dense* d = (struct dense*)l;
     l->outF = VecArrCreate(d->nOut, inF.nVecs);
     l->inB = VecArrCreate(d->nOut, inF.nVecs);
-    l->optParams = VecArrListInit();
     VecArrListAdd(&l->optParams, d->w);
     VecArrListAdd(&l->optParams, d->b);
+    VecArrListAdd(&l->optParamGrads, d->wGrads);
+    VecArrListAdd(&l->optParamGrads, d->bGrads);
 }
 
 void DenseInit(Layer l, struct vecArr inF) {

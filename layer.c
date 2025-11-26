@@ -14,6 +14,8 @@ void LayerInit(Layer l, struct vecArr inF) {
 }
 
 void LayerMount(Layer l, struct vecArr inF) {
+    l->optParams = VecArrListInit();
+    l->optParamGrads = VecArrListInit();
     l->mount(l, inF);
 }
 
