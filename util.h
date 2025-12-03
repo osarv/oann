@@ -4,12 +4,12 @@
 
 #ifdef TEST
 #undef TEST
-#define TEST(func) __attribute__((constructor)) static void Test##func
+#define TEST(func) __attribute__((constructor)) static void Test##func()
 #endif //TEST
 
 #ifndef TEST
 #undef TEST
-#define TEST(func) __attribute__((unused)) static void Test##func
+#define TEST(func) __attribute__((unused)) static void Test##func()
 #endif //TEST
 
 #define TEST_PASSED {printf("\x1b[32m" "%s passed\n" "\x1b[0m", __func__); return;}

@@ -5,26 +5,26 @@
 #include "util.h"
 #include "operation.h"
 
-void ReluMount(Layer l, struct vecArr inF) {
-    l->outF = VecArrCreate(inF.vecLen, inF.nVecs);
-    l->inB = VecArrCreate(inF.vecLen, inF.nVecs);
+void ReluMount(Layer l, struct vecArr x) {
+    l->y = VecArrCreate(x.vecLen, x.nVecs);
+    l->dy = VecArrCreate(x.vecLen, x.nVecs);
 }
 
-void ReluInit(Layer l, struct vecArr inF) {
+void ReluInit(Layer l, struct vecArr x) {
     (void)l; //correct implementation
-    (void)inF; //correct implementation
+    (void)x; //correct implementation
 }
 
 void ReluDestroy(Layer l) {
     free(l);
 }
 
-void ReluForward(Layer l, struct vecArr inF) {
-    OperationReluForward(inF, l->inB);
+void ReluForward(Layer l, struct vecArr x) {
+    OperationReluForward(x, l->dy);
 }
 
-void ReluBackward(Layer l, struct vecArr inF, struct vecArr outB) {
-    OperationReluBackward(inF, l->inB, outB);
+void ReluBackward(Layer l, struct vecArr x, struct vecArr dx) {
+    OperationReluBackward(x, l->dy, dx);
 }
 
 Layer ReluCreate() {

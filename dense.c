@@ -9,24 +9,24 @@ struct dense {
     struct layer l;
     int nOut;
     struct vecArr w;
-    struct vecArr wGrads;
+    struct vecArr dw;
     struct vecArr b;
-    struct vecArr bGrads;
+    struct vecArr db;
 };
 
-void DenseMount(Layer l, struct vecArr inF) {
+void DenseMount(Layer l, struct vecArr x) {
     struct dense* d = (struct dense*)l;
-    l->outF = VecArrCreate(d->nOut, inF.nVecs);
-    l->inB = VecArrCreate(d->nOut, inF.nVecs);
+    l->y = VecArrCreate(d->nOut, x.nVecs);
+    l->dy = VecArrCreate(d->nOut, x.nVecs);
     VecArrListAdd(&l->optParams, d->w);
     VecArrListAdd(&l->optParams, d->b);
-    VecArrListAdd(&l->optParamGrads, d->wGrads);
-    VecArrListAdd(&l->optParamGrads, d->bGrads);
+    VecArrListAdd(&l->dOptParams, d->dw);
+    VecArrListAdd(&l->dOptParams, d->db);
 }
 
-void DenseInit(Layer l, struct vecArr inF) {
+void DenseInit(Layer l, struct vecArr x) {
     struct dense* d = (struct dense*)l;
-    d->w = VecArrCreate(inF.vecLen, d->nOut);
+    d->w = VecArrCreate(x.vecLen, d->nOut);
     d->b = VecArrCreate(d->nOut, 1);
 }
 
@@ -37,14 +37,14 @@ void DenseDestroy(Layer l) {
     free(d);
 }
 
-void DenseForward(Layer l, struct vecArr inF) {
+void DenseForward(Layer l, struct vecArr x) {
     struct dense* d = (struct dense*)l;
-    OperationDenseForward(inF, d->w, d->b, l->outF);
+    OperationDenseForward(x, d->w, d->b, l->y);
 }
 
-void DenseBackward(Layer l, struct vecArr inF, struct vecArr outB) {
+void DenseBackward(Layer l, struct vecArr x, struct vecArr dx) {
     struct dense* d = (struct dense*)l;
-    OperationDenseBackward(inF, l->inB, d->w, d->wGrads, outB);
+    OperationDenseBackward(x, l->dy, d->w, d->dw, dx);
 }
 
 Layer DenseCreate(int nOut) {

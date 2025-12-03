@@ -9,20 +9,20 @@ void LayerDestroy(Layer l) {
     l->destroy(l);
 }
 
-void LayerInit(Layer l, struct vecArr inF) {
-    l->init(l, inF);
+void LayerInit(Layer l, struct vecArr x) {
+    l->init(l, x);
 }
 
-void LayerMount(Layer l, struct vecArr inF) {
+void LayerMount(Layer l, struct vecArr x) {
     l->optParams = VecArrListInit();
-    l->optParamGrads = VecArrListInit();
-    l->mount(l, inF);
+    l->dOptParams = VecArrListInit();
+    l->mount(l, x);
 }
 
-void LayerForward(Layer l, struct vecArr inF) {
-    l->forward(l, inF);
+void LayerForward(Layer l, struct vecArr x) {
+    l->forward(l, x);
 }
 
-void LayerBackward(Layer l, struct vecArr inF, struct vecArr inB) {
-    l->backward(l, inF, inB);
+void LayerBackward(Layer l, struct vecArr x, struct vecArr dy) {
+    l->backward(l, x, dy);
 }
