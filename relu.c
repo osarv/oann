@@ -20,7 +20,7 @@ void ReluDestroy(Layer l) {
 }
 
 void ReluForward(Layer l, struct vecArr x) {
-    OperationReluForward(x, l->dy);
+    OperationReluForward(x, l->y);
 }
 
 void ReluBackward(Layer l, struct vecArr x, struct vecArr dx) {

@@ -43,7 +43,7 @@ void OperationDenseBackward(struct vecArr x, struct vecArr dy, struct vecArr w, 
 }
 #endif //OP_MODE_BLAS
 
-TEST(OperationDenseForwardAndBackward) {
+TEST(Dense) {
     struct vecArr x = VecArrCreate(3, 2);
     struct vecArr dy = VecArrCreate(2, 2);
     struct vecArr y = VecArrCreate(2, 2);
@@ -85,7 +85,7 @@ TEST(OperationDenseForwardAndBackward) {
     TEST_PASSED
 }
 
-TEST(OperationReluForwardAndBackward) {
+TEST(Relu) {
     struct vecArr x = VecArrCreate(3, 2);
     struct vecArr dy = VecArrCreate(3, 2);
     struct vecArr y = VecArrCreate(3, 2);
@@ -135,7 +135,7 @@ float OperationSCECalcLoss(struct vecArr y, struct vecArr labels) {
     return loss;
 }
 
-TEST(OperationSCEForwardAndBackward) {
+TEST(SCE) {
     struct vecArr x = VecArrCreate(3, 2);
     struct vecArr y = VecArrCreate(3, 2);
     struct vecArr dx = VecArrCreate(3, 2);
@@ -154,14 +154,20 @@ TEST(OperationSCEForwardAndBackward) {
     float dxDesiredElems[6];
     float sum1 = exp(0) + exp(1) + exp(2);
     float sum2 = exp(3) + exp(4) + exp(5);
+    float lossDesired = 0;
     for (int i = 0; i < 3; i++) yDesiredElems[i] = exp(i) / sum1;
     for (int i = 3; i < 6; i++) yDesiredElems[i] = exp(i) / sum2;
-    for (int i = 0; i < 6; i++) dxDesiredElems[i] = yDesiredElems[i] - labels.elems[i];
+    for (int i = 0; i < 6; i++) {
+        dxDesiredElems[i] = yDesiredElems[i] - labels.elems[i];
+        lossDesired -= labels.elems[i] * log(yDesiredElems[i]);
+    }
     yDesired.elems = yDesiredElems;
     dxDesired.elems = dxDesiredElems;
     OperationSCEForward(x, y);
     OperationSCEBackward(y, labels, dx);
+    float loss = OperationSCECalcLoss(y, labels);
     if (!VecArrIsEqual(y, yDesired)) TEST_FAILED
     if (!VecArrIsEqual(dx, dxDesired)) TEST_FAILED
+    if (loss != lossDesired) TEST_FAILED
     TEST_PASSED
 }
