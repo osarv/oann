@@ -11,5 +11,6 @@ void NetworkAddLayer(Network n, Layer l);
 Layer DenseCreate(int nOut);
 Layer ReluCreate();
 Losser SCECreate();
+Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay);
 
 #endif //OANN_H

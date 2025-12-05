@@ -6,8 +6,8 @@
 #include "operation.h"
 
 void ReluMount(Layer l, struct vecArr x) {
-    l->y = VecArrCreate(x.vecLen, x.nVecs);
-    l->dy = VecArrCreate(x.vecLen, x.nVecs);
+    l->y = VecArrCreateSameDim(x);
+    l->dy = VecArrCreateSameDim(x);
 }
 
 void ReluInit(Layer l, struct vecArr x) {

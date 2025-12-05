@@ -12,6 +12,10 @@ struct vecArr VecArrCreate(int vecLen, int nVecs) {
     return v;
 }
 
+struct vecArr VecArrCreateSameDim(struct vecArr v) {
+    return VecArrCreate(v.vecLen, v.nVecs);
+}
+
 void VecArrDestroy(struct vecArr v) {
     free(v.elems);
 }

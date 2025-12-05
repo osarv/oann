@@ -2,10 +2,14 @@
 #include <stdio.h>
 #include "optimizer.h"
 
-void OptimizerOptimize(Optimizer o, struct vecArr optParams, struct vecArr dOptParams) {
-    o->optimize(o, optParams, dOptParams);
+void OptimizerOptimize(Optimizer o, struct vecArr p, struct vecArr dp) {
+    o->optimize(o, p, dp);
 }
 
-Optimizer OptimizerInitCopy(Optimizer o, struct vecArr optParams) {
-    return o->initCopy(o, optParams);
+void OptimizerDestroy(Optimizer o) {
+    o->destroy(o);
+}
+
+Optimizer OptimizerCreateCopy(Optimizer o, struct vecArr p) {
+    return o->createCopy(o, p);
 }

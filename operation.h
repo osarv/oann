@@ -11,5 +11,7 @@ void OperationDenseBackward(struct vecArr x, struct vecArr dy, struct vecArr w, 
 void OperationSCEForward(struct vecArr x, struct vecArr y);
 void OperationSCEBackward(struct vecArr y, struct vecArr labels, struct vecArr dx);
 float OperationSCECalcLoss(struct vecArr y, struct vecArr labels);
+void OperationAdamWOptimize(struct vecArr p, struct vecArr dp, struct vecArr m, struct vecArr v,
+        float lr, float mDecay, float vDecay, float wDecay);
 
 #endif //OPERATION_H

@@ -45,15 +45,15 @@ void OperationDenseBackward(struct vecArr x, struct vecArr dy, struct vecArr w, 
 
 TEST(Dense) {
     struct vecArr x = VecArrCreate(3, 2);
-    struct vecArr dy = VecArrCreate(2, 2);
     struct vecArr y = VecArrCreate(2, 2);
-    struct vecArr yDesired = VecArrCreate(2, 2);
-    struct vecArr dx = VecArrCreate(3, 2);
-    struct vecArr dxDesired = VecArrCreate(3, 2);
+    struct vecArr dy = VecArrCreateSameDim(y);
+    struct vecArr yDesired = VecArrCreateSameDim(y);
+    struct vecArr dx = VecArrCreateSameDim(x);
+    struct vecArr dxDesired = VecArrCreateSameDim(x);
     struct vecArr w = VecArrCreate(3, 2);
     struct vecArr b = VecArrCreate(2, 1);
-    struct vecArr dw = VecArrCreate(3, 2);
-    struct vecArr dwDesired = VecArrCreate(3, 2);
+    struct vecArr dw = VecArrCreateSameDim(w);
+    struct vecArr dwDesired = VecArrCreateSameDim(w);
     for (int i = 0; i < 6; i++) {x.elems[i] = i; w.elems[i] = i; dw.elems[i] = i; dx.elems[i] = i;}
     for (int i = 0; i < 4; i++) {y.elems[i] = i; dy.elems[i] = i;}
     for (int i = 0; i < 2; i++) b.elems[i] = i;
@@ -87,11 +87,11 @@ TEST(Dense) {
 
 TEST(Relu) {
     struct vecArr x = VecArrCreate(3, 2);
-    struct vecArr dy = VecArrCreate(3, 2);
-    struct vecArr y = VecArrCreate(3, 2);
-    struct vecArr yDesired = VecArrCreate(3, 2);
-    struct vecArr dx = VecArrCreate(3, 2);
-    struct vecArr dxDesired = VecArrCreate(3, 2);
+    struct vecArr dy = VecArrCreateSameDim(x);
+    struct vecArr y = VecArrCreateSameDim(x);
+    struct vecArr yDesired = VecArrCreateSameDim(x);
+    struct vecArr dx = VecArrCreateSameDim(x);
+    struct vecArr dxDesired = VecArrCreateSameDim(x);
     for (int i = 0; i < 6; i++) {
         x.elems[i] = i -2;
         dy.elems[i] = i;
@@ -137,11 +137,11 @@ float OperationSCECalcLoss(struct vecArr y, struct vecArr labels) {
 
 TEST(SCE) {
     struct vecArr x = VecArrCreate(3, 2);
-    struct vecArr y = VecArrCreate(3, 2);
-    struct vecArr dx = VecArrCreate(3, 2);
-    struct vecArr labels = VecArrCreate(3, 2);
-    struct vecArr yDesired = VecArrCreate(3, 2);
-    struct vecArr dxDesired = VecArrCreate(3, 2);
+    struct vecArr y = VecArrCreateSameDim(x);
+    struct vecArr dx = VecArrCreateSameDim(x);
+    struct vecArr labels = VecArrCreateSameDim(x);
+    struct vecArr yDesired = VecArrCreateSameDim(x);
+    struct vecArr dxDesired = VecArrCreateSameDim(x);
     for (int i = 0; i < 6; i++) {
         x.elems[i] = i;
         y.elems[i] = i;
@@ -169,5 +169,44 @@ TEST(SCE) {
     if (!VecArrIsEqual(y, yDesired)) TEST_FAILED
     if (!VecArrIsEqual(dx, dxDesired)) TEST_FAILED
     if (loss != lossDesired) TEST_FAILED
+    TEST_PASSED
+}
+
+#define ADAMW_NUM_STAB_CONST 0.00000001
+void OperationAdamWOptimize(struct vecArr p, struct vecArr dp, struct vecArr m, struct vecArr v,
+        float lr, float mDecay, float vDecay, float wDecay) {
+    for (int i = 0; i < p.vecLen * p.nVecs; i++) {
+        m.elems[i] = mDecay * m.elems[i] + (1 - mDecay) * dp.elems[i];
+        v.elems[i] = vDecay * v.elems[i] + (1 - vDecay) * dp.elems[i] * dp.elems[i];
+        p.elems[i] -= lr * (m.elems[i] / (v.elems[i] + ADAMW_NUM_STAB_CONST) + wDecay * p.elems[i]);
+    }
+}
+
+TEST(AdamW) {
+    struct vecArr p = VecArrCreate(2, 3);
+    struct vecArr dp = VecArrCreateSameDim(p);
+    struct vecArr pDesired = VecArrCreateSameDim(p);
+    struct vecArr m = VecArrCreateSameDim(p);
+    struct vecArr mDesired = VecArrCreateSameDim(p);
+    struct vecArr v = VecArrCreateSameDim(p);
+    struct vecArr vDesired = VecArrCreateSameDim(p);
+    float lr = 0.01;
+    float mDecay = 0.9;
+    float vDecay = 0.99;
+    float wDecay = 0.01;
+    for (int i = 0; i < 2 * 3; i++) {
+        p.elems[i] = i;
+        dp.elems[i] = i;
+        m.elems[i] = i;
+        v.elems[i] = i;
+        mDesired.elems[i] = mDecay * i + (1 - mDecay) * i;
+        vDesired.elems[i] = vDecay * i + (1 - vDecay) * i * i;
+        pDesired.elems[i] = i - lr *
+            (mDesired.elems[i] / (vDesired.elems[i] + ADAMW_NUM_STAB_CONST) + wDecay * i);
+    }
+    OperationAdamWOptimize(p, dp, m, v, lr, mDecay, vDecay, wDecay);
+    if (!VecArrIsEqual(m, mDesired)) TEST_FAILED
+    if (!VecArrIsEqual(v, vDesired)) TEST_FAILED
+    if (!VecArrIsEqual(p, pDesired)) TEST_FAILED
     TEST_PASSED
 }

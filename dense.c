@@ -1,8 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include "layer.h"
-#include "vecarr.h"
-#include "util.h"
 #include "operation.h"
 
 struct dense {
@@ -55,5 +53,5 @@ Layer DenseCreate(int nOut) {
     d->l.destroy = DenseDestroy;
     d->l.forward = DenseForward;
     d->l.backward = DenseBackward;
-    return &(d->l);
+    return &d->l;
 }
