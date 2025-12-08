@@ -10,8 +10,4 @@ struct losser {
     float (*calcLoss)(Losser l, struct vecArr x, struct vecArr labels);
 };
 
-void LosserForward(Losser l, struct vecArr x);
-void LosserBackward(Losser l, struct vecArr x, struct vecArr labels, struct vecArr dx);
-float LosserCalcLoss(Losser l, struct vecArr x, struct vecArr labels);
-
 #endif //LOSSER_H

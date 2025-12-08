@@ -9,8 +9,4 @@ struct optimizer {
     Optimizer (*createCopy)(Optimizer o, struct vecArr p);
 };
 
-void OptimizerOptimize(Optimizer o, struct vecArr p, struct vecArr dp);
-void OptimizerDestroy(Optimizer o); //do not call for recipe optimizer
-Optimizer OptimizerCreateCopy(Optimizer o, struct vecArr p);
-
 #endif //OPTIMIZER_H

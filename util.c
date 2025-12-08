@@ -9,6 +9,12 @@ void* MallocOrCrash(size_t size) {
     return ptr;
 }
 
+void* CallocOrCrash(size_t size) {
+    void* ptr = calloc(size, 1);
+    if (!ptr) exit(EXIT_FAILURE);
+    return ptr;
+}
+
 void* ReallocOrCrash(void* oldPtr, size_t size) {
     void* ptr = realloc(oldPtr, size);
     if (!ptr) exit(EXIT_FAILURE);

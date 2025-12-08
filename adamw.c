@@ -21,8 +21,8 @@ void AdamWOptimize(Optimizer o, struct vecArr p, struct vecArr dp) {
 
 void AdamWDestroy(Optimizer o) {
     struct adamw* a = (struct adamw*)o;
-    VecArrDestroy(a->m);
-    VecArrDestroy(a->v);
+    if (a->m.elems) VecArrDestroy(a->m); //check needed for recipe optimizer
+    if (a->v.elems) VecArrDestroy(a->v); //check needed for recipe optimizer
     free(a);
 }
 
@@ -38,7 +38,7 @@ Optimizer AdamWCreateCopy(Optimizer o, struct vecArr p) {
 }
 
 Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay) {
-    struct adamw* a = MallocOrCrash(sizeof(struct adamw));
+    struct adamw* a = CallocOrCrash(sizeof(struct adamw)); //calloc needed to set m and v elems ptrs to NULL
     a->o.optimize = AdamWOptimize;
     a->o.destroy = AdamWDestroy;
     a->o.createCopy = AdamWCreateCopy;

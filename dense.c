@@ -16,10 +16,12 @@ void DenseMount(Layer l, struct vecArr x) {
     struct dense* d = (struct dense*)l;
     l->y = VecArrCreate(d->nOut, x.nVecs);
     l->dy = VecArrCreate(d->nOut, x.nVecs);
-    VecArrListAdd(&l->optParams, d->w);
-    VecArrListAdd(&l->optParams, d->b);
-    VecArrListAdd(&l->dOptParams, d->dw);
-    VecArrListAdd(&l->dOptParams, d->db);
+    l->p = VecArrListInit();
+    l->dp = VecArrListInit();
+    VecArrListAdd(&l->p, d->w);
+    VecArrListAdd(&l->p, d->b);
+    VecArrListAdd(&l->dp, d->dw);
+    VecArrListAdd(&l->dp, d->db);
 }
 
 void DenseInit(Layer l, struct vecArr x) {
@@ -46,7 +48,7 @@ void DenseBackward(Layer l, struct vecArr x, struct vecArr dx) {
 }
 
 Layer DenseCreate(int nOut) {
-    struct dense* d = MallocOrCrash(sizeof(struct dense));
+    struct dense* d = CallocOrCrash(sizeof(struct dense)); //calloc needed to initialized lists to zero length
     d->nOut = nOut;
     d->l.mount = DenseMount;
     d->l.init = DenseInit;

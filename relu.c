@@ -28,7 +28,7 @@ void ReluBackward(Layer l, struct vecArr x, struct vecArr dx) {
 }
 
 Layer ReluCreate() {
-    Layer l = MallocOrCrash(sizeof(struct layer));
+    Layer l = CallocOrCrash(sizeof(struct layer)); //calloc needed to initialized lists to zero length
     l->mount = ReluMount;
     l->init = ReluInit;
     l->destroy = ReluDestroy;

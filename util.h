@@ -18,6 +18,7 @@
 //error handling
 void ErrorBugFound();
 void* MallocOrCrash(size_t size);
+void* CallocOrCrash(size_t size);
 void* ReallocOrCrash(void* oldPtr, size_t size);
 
 //lists
