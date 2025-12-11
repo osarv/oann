@@ -12,6 +12,13 @@ struct dense {
     struct vecArr db;
 };
 
+void DenseUnmount(Layer l) {
+    VecArrDestroy(l->y);
+    VecArrDestroy(l->dy);
+    ListDestroy(l->p);
+    ListDestroy(l->dp);
+}
+
 void DenseMount(Layer l, struct vecArr x) {
     struct dense* d = (struct dense*)l;
     l->y = VecArrCreate(d->nOut, x.nVecs);
@@ -50,6 +57,7 @@ void DenseBackward(Layer l, struct vecArr x, struct vecArr dx) {
 Layer DenseCreate(int nOut) {
     struct dense* d = CallocOrCrash(sizeof(struct dense)); //calloc needed to initialized lists to zero length
     d->nOut = nOut;
+    d->l.unmount = DenseUnmount;
     d->l.mount = DenseMount;
     d->l.init = DenseInit;
     d->l.destroy = DenseDestroy;

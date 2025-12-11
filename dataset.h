@@ -3,12 +3,14 @@
 #include "vecarr.h"
 
 struct dataset {
-    int nBatches;
+    int trainBatchSize;
+    int testBatchSize;
+    int nTrainBatches;
     int nTestBatches;
-    struct vecArr (*feedFeatures)(DataSet d);
-    struct vecArr (*feedTrainLabels)(DataSet d);
-    struct vecArr (*feedTestFeatures)(DataSet d);
-    struct vecArr (*feedTestLabels)(DataSet d);
+    struct vecArr (*getTrainFeatures)(DataSet d, struct vecArr buf, int batchIdx); //no idx checking
+    struct vecArr (*getTrainLabels)(DataSet d, struct vecArr buf, int batchIdx); //no idx checking
+    struct vecArr (*getTestFeatures)(DataSet d, struct vecArr buf, int batchIdx); //no idx checking
+    struct vecArr (*getTestLabels)(DataSet d, struct vecArr buf, int batchIdx); //no idx checking
 };
 
 #endif //DATASET_H

@@ -5,7 +5,7 @@
 
 struct optimizer {
     void (*optimize)(Optimizer o, struct vecArr p, struct vecArr dp);
-    void (*destroy)(Optimizer o); //do not call for recipe optimizer
+    void (*destroy)(Optimizer o); //call with recipe optimizer is defined
     Optimizer (*createCopy)(Optimizer o, struct vecArr p);
 };
 

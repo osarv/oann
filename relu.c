@@ -5,6 +5,11 @@
 #include "util.h"
 #include "operation.h"
 
+void ReluUnmount(Layer l) {
+    VecArrDestroy(l->y);
+    VecArrDestroy(l->dy);
+}
+
 void ReluMount(Layer l, struct vecArr x) {
     l->y = VecArrCreateSameDim(x);
     l->dy = VecArrCreateSameDim(x);
@@ -29,6 +34,7 @@ void ReluBackward(Layer l, struct vecArr x, struct vecArr dx) {
 
 Layer ReluCreate() {
     Layer l = CallocOrCrash(sizeof(struct layer)); //calloc needed to initialized lists to zero length
+    l->unmount = ReluUnmount;
     l->mount = ReluMount;
     l->init = ReluInit;
     l->destroy = ReluDestroy;

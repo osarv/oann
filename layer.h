@@ -11,9 +11,10 @@
 struct layer {
     struct vecArr y;
     struct vecArr dy;
+    void (*unmount)(Layer l);
     void (*mount)(Layer l, struct vecArr x);
     void (*init)(Layer l, struct vecArr x);
-    void (*destroy)(Layer l);
+    void (*destroy)(Layer l); //presumes former unmounting
     void (*forward)(Layer l, struct vecArr x);
     void (*backward)(Layer l, struct vecArr x, struct vecArr dx);
     struct list p; //list of parameters to optimize
