@@ -9,7 +9,7 @@
 #include "dataset.h"
 
 struct network {
-    int inputVecLen;
+    int nIn;
     int batchSize;
     struct vecArr features;
     struct vecArr dFeatures; //needed for generic layer backward calling
@@ -31,7 +31,7 @@ static void networkUnmount(Network n) {
 }
 
 static void networkMount(Network n) {
-    n->features = VecArrCreate(n->inputVecLen, n->batchSize);
+    n->features = VecArrCreate(n->nIn, n->batchSize);
     n->dFeatures = VecArrCreateSameDim(n->features);
     struct vecArr x = n->features;
     for (int i = 0; i < n->layers.len; i++) {
@@ -54,16 +54,23 @@ void NetworkDestroy(Network n) {
     free(n);
 }
 
-Network NetworkCreate(int inputVecLen, Optimizer o) {
+Network NetworkCreate(int nIn, Losser lsr, Optimizer o) {
     Network n = CallocOrCrash(sizeof(struct network)); //zero batch size
-    n->inputVecLen = inputVecLen;
+    n->nIn = nIn;
     n->layers = ListInit(sizeof(Layer));
+    n->lsr = lsr;
     n->o = o;
     return n;
 }
 
 void NetworkAddLayer(Network n, Layer l) {
+    int nIn = n->nIn;
+    if (n->layers.len > 0) {
+        Layer l = ListGetIdx(&n->layers, n->layers.len -1);
+        nIn = l->nOut;
+    }
     ListAdd(&n->layers, l);
+    l->init(l, nIn);
 }
 
 static void networkSetBatchSize(Network n, int batchSize) {
@@ -83,17 +90,28 @@ static void networkForward(Network n, struct vecArr x) {
     n->lsr->forward(n->lsr, x);
 }
 
+static void optimizeLayer(Layer l) {
+    for (int i = 0; i < l->p.len; i++) {
+        struct vecArr p = *(struct vecArr*)ListGetIdx(&l->p, i);
+        struct vecArr dp = *(struct vecArr*)ListGetIdx(&l->dp, i);
+        Optimizer o = ListGetIdx(&l->optimizers, i);
+        o->optimize(o, p, dp);
+    }
+}
+
 //assumes proper mounting
-static void networkBackward(Network n, struct vecArr labels) {
+static void networkBackwardAndOptimize(Network n, struct vecArr labels) {
     Layer prevL = ListGetIdx(&n->layers, n->layers.len -1);
     n->lsr->backward(n->lsr, prevL->y, labels, prevL->dy);
     Layer l = prevL;
     for (int i = n->layers.len -1; i >= 1; i--) {
         prevL = ListGetIdx(&n->layers, i -1);
         l->backward(l, prevL->y, prevL->dy);
+        optimizeLayer(l);
         prevL = l;
     }
     l->backward(l, n->features, n->dFeatures);
+    optimizeLayer(l);
 }
 
 void NetworkTrain(Network n, DataSet d) {
@@ -102,7 +120,7 @@ void NetworkTrain(Network n, DataSet d) {
         struct vecArr x = d->getTrainFeatures(d, n->features, i);
         struct vecArr labels = d->getTrainLabels(d, n->features, i);
         networkForward(n, x);
-        networkBackward(n, labels);
+        networkBackwardAndOptimize(n, labels);
     }
 }
 

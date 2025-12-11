@@ -10,7 +10,7 @@ Layer DenseCreate(int nOut);
 Layer ReluCreate();
 Losser SCECreate();
 Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay);
-Network NetworkCreate(int inputVecLen, Optimizer o);
+Network NetworkCreate(int nIn, Losser lsr, Optimizer o);
 void NetworkDestroy(Network n);
 void NetworkAddLayer(Network n, Layer l);
 void NetworkTrain(Network n, DataSet d);

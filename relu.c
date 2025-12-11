@@ -15,9 +15,9 @@ void ReluMount(Layer l, struct vecArr x) {
     l->dy = VecArrCreateSameDim(x);
 }
 
-void ReluInit(Layer l, struct vecArr x) {
+void ReluInit(Layer l, int nIn) {
     (void)l; //correct implementation
-    (void)x; //correct implementation
+    (void)nIn; //correct implementation
 }
 
 void ReluDestroy(Layer l) {
