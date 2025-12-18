@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Werror -Wextra -Wpedantic -g -DOP_MODE_BLAS
-LBINS = -lm -lopenblas
+LBINS = -lm -lopenblas -lcurl -lz
 
 bin/%.o: %.c bin
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -22,6 +22,7 @@ run:
 
 clean:
 	rm -rf bin
+	rm -rf dataset/*/*
 
 bin:
 	mkdir bin

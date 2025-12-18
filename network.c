@@ -114,17 +114,21 @@ static void networkBackwardAndOptimize(Network n, struct vecArr labels) {
     optimizeLayer(l);
 }
 
-void NetworkTrain(Network n, DataSet d) {
+float NetworkTrain(Network n, Dataset d) {
     networkSetBatchSize(n, d->trainBatchSize);
+    float loss = 0;
     for (int i = 0; i < d->nTrainBatches; i++) {
         struct vecArr x = d->getTrainFeatures(d, n->features, i);
         struct vecArr labels = d->getTrainLabels(d, n->features, i);
         networkForward(n, x);
+        Layer lastL = ListGetIdx(&n->layers, n->layers.len -1);
+        loss += n->lsr->calcLoss(n->lsr, lastL->y, labels) / d->nTrainBatches;
         networkBackwardAndOptimize(n, labels);
     }
+    return loss;
 }
 
-float NetworkTest(Network n, DataSet d) {
+float NetworkTest(Network n, Dataset d) {
     networkSetBatchSize(n, d->testBatchSize);
     float loss = 0;
     for (int i = 0; i < d->nTestBatches; i++) {
@@ -132,7 +136,12 @@ float NetworkTest(Network n, DataSet d) {
         struct vecArr labels = d->getTestLabels(d, n->labels, i);
         networkForward(n, x);
         Layer lastL = ListGetIdx(&n->layers, n->layers.len -1);
-        loss += n->lsr->calcLoss(n->lsr, lastL->y, labels);
+        loss += n->lsr->calcLoss(n->lsr, lastL->y, labels) / d->nTestBatches;
     }
     return loss;
+}
+
+float NetworkRunTrainSample(Network n, Dataset d, int idx, float* featuresBuf, float* labelsBuf) {
+    if (idx < 0 || idx >= d->nTrainBatches * d->trainBatchSize) ErrorAndCrash("invalid sample index chosen");
+    networkSetBatchSize(n, 1);
 }
