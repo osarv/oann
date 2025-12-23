@@ -14,7 +14,8 @@ Network NetworkCreate(int nIn, Losser lsr, Optimizer o);
 Dataset MnistCreate(int trainBatchSize, int testBatchSize);
 void NetworkDestroy(Network n);
 void NetworkAddLayer(Network n, Layer l);
-float NetworkTrain(Network n, Dataset d);
-float NetworkTest(Network n, Dataset d);
+float NetworkTrain(Network n, int batchSize, Dataset d);
+float NetworkTest(Network n, int batchSize, Dataset d);
+float NetworkInferTrainSample(Network n, Dataset d, int idx, float** features, float** predictions);
 
 #endif //OANN_H

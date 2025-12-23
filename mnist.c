@@ -42,9 +42,9 @@ Dataset MnistCreate(int trainBatchSize, int testBatchSize) {
     if (MNIST_N_TEST_SAMPLES % testBatchSize != 0) ErrorAndCrash("mnist testBatchSize must divide 10k");
     mnistDownloadIfNeeded();
     Dataset m = MallocOrCrash(sizeof(struct dataset));
-    m->trainBatchSize = trainBatchSize;
-    m->trainBatchSize = trainBatchSize;
-    m->nTrainBatches = MNIST_N_TRAIN_SAMPLES / trainBatchSize;
-    m->nTestBatches = MNIST_N_TEST_SAMPLES / testBatchSize;
+    m->nTrainSamples = MNIST_N_TRAIN_SAMPLES;
+    m->nTestSamples = MNIST_N_TEST_SAMPLES;
+    m->featureSize = MNIST_FEATURE_SIZE;
+    m->labelSize = MNIST_LABEL_SIZE;
     return m;
 }

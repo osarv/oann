@@ -3,5 +3,5 @@
 #include "../oann.h"
 
 int main() {
-
+    Network n = NetworkCreate();
 }
