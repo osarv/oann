@@ -23,7 +23,6 @@ run:
 
 clean:
 	rm -rf bin
-	rm -rf dataset/*/*
 
 bin:
 	mkdir bin
