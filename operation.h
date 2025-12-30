@@ -2,16 +2,16 @@
 #define OPERATION_H
 #include "vecarr.h"
 
-void OperationReluForward(struct vecArr x, struct vecArr y);
-void OperationReluBackward(struct vecArr x, struct vecArr dy, struct vecArr dx);
+void OperationReluForward(VecArr x, VecArr y);
+void OperationReluBackward(VecArr x, VecArr dy, VecArr dx);
 
 //operations header for collected operations wrapping computation methods
-void OperationDenseForward(struct vecArr x, struct vecArr w, struct vecArr b, struct vecArr y);
-void OperationDenseBackward(struct vecArr x, struct vecArr dy, struct vecArr w, struct vecArr wGrads, struct vecArr dx);
-void OperationSCEForward(struct vecArr x, struct vecArr y);
-void OperationSCEBackward(struct vecArr y, struct vecArr labels, struct vecArr dx);
-float OperationSCECalcLoss(struct vecArr y, struct vecArr labels);
-void OperationAdamWOptimize(struct vecArr p, struct vecArr dp, struct vecArr m, struct vecArr v,
+void OperationDenseForward(VecArr x, VecArr w, VecArr b, VecArr y);
+void OperationDenseBackward(VecArr x, VecArr dy, VecArr w, VecArr wGrads, VecArr dx);
+void OperationSCEForward(VecArr x, VecArr y);
+void OperationSCEBackward(VecArr y, VecArr labels, VecArr dx);
+float OperationSCECalcLoss(VecArr y, VecArr labels);
+void OperationAdamWOptimize(VecArr p, VecArr dp, VecArr m, VecArr v,
         float lr, float mDecay, float vDecay, float wDecay);
 
 #endif //OPERATION_H

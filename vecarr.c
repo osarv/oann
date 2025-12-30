@@ -4,25 +4,36 @@
 #include "vecarr.h"
 #include "util.h"
 
-struct vecArr VecArrCreate(int vecLen, int nVecs) {
-    struct vecArr v;
-    v.elems = MallocOrCrash(sizeof(float) * vecLen * nVecs);
-    v.vecLen = vecLen;
-    v.nVecs = nVecs;
-    return v;
+int VecArrVecLen(VecArr v) {
+    return ((int*)v)[-2];
 }
 
-struct vecArr VecArrCreateSameDim(struct vecArr v) {
-    return VecArrCreate(v.vecLen, v.nVecs);
+int VecArrNVecs(VecArr v) {
+    return ((int*)v)[-1];
 }
 
-void VecArrDestroy(struct vecArr v) {
-    free(v.elems);
+int VecArrNElems(VecArr v) {
+    return VecArrVecLen(v) * VecArrNVecs(v);
 }
 
-void VecArrInitConst(struct vecArr v, float c) {
-    for (int i = 0; i < v.vecLen * v.nVecs; i++) {
-        v.elems[i] = c;
+VecArr VecArrCreate(int vecLen, int nVecs) {
+    VecArr v = MallocOrCrash(2 * sizeof(int) + sizeof(float) * vecLen * nVecs);
+    ((int*)v)[0] = vecLen;
+    ((int*)v)[1] = nVecs;
+    return (float*)(((int*)v) + 2);
+}
+
+VecArr VecArrCreateSameDim(VecArr v) {
+    return VecArrCreate(VecArrVecLen(v), VecArrNVecs(v));
+}
+
+void VecArrDestroy(VecArr v) {
+    free(((int*)v) - 2);
+}
+
+void VecArrInitConst(VecArr v, float c) {
+    for (int i = 0; i < VecArrNElems(v); i++) {
+        v[i] = c;
     }
 }
 
@@ -30,9 +41,9 @@ static float getRandomFloat(float min, float max) {
     return ((float)(rand()%1000000000)) / 1000000000.0f * (max - min) - min;
 }
 
-void VecArrInitUniform(struct vecArr v, float min, float max) {
-    for (int i = 0; i < v.vecLen * v.nVecs; i++) {
-        v.elems[i] = getRandomFloat(min, max);
+void VecArrInitUniform(VecArr v, float min, float max) {
+    for (int i = 0; i < VecArrNElems(v); i++) {
+        v[i] = getRandomFloat(min, max);
     }
 }
 
@@ -45,39 +56,28 @@ static void getStdDevPair(float* a, float* b) {
     *b = y * sqrt(-2 * lnS / s);
 }
 
-void VecArrInitNormDist(struct vecArr v, float mean, float stddev) {
-    int elemLen = v.vecLen * v.nVecs;
-    for (int i = 0; i < (elemLen - elemLen%2) / 2; i++) {
-        getStdDevPair(&v.elems[i], &v.elems[i +1]);
-        v.elems[i] = (v.elems[i] + mean) * stddev;
-        v.elems[i +1] = (v.elems[i +1] + mean) * stddev;
+void VecArrInitNormDist(VecArr v, float mean, float stddev) {
+    for (int i = 0; i < (VecArrNElems(v) - VecArrNElems(v)%2) / 2; i++) {
+        getStdDevPair(&v[i], &v[i +1]);
+        v[i] = (v[i] + mean) * stddev;
+        v[i +1] = (v[i +1] + mean) * stddev;
     }
-    getStdDevPair(&v.elems[elemLen -1], &v.elems[elemLen -1]);
-    v.elems[elemLen -1] = (v.elems[elemLen -1] + mean) * stddev;
+    getStdDevPair(&v[VecArrNElems(v) -1], &v[VecArrNElems(v) -1]);
+    v[VecArrNElems(v) -1] = (v[VecArrNElems(v) -1] + mean) * stddev;
 }
 
-struct list VecArrListInit() {
-    return ListInit(sizeof(struct vecArr));
-}
-
-void VecArrListAdd(struct list* l, struct vecArr va) {
-    ListAdd(l, &va);
-}
-
-bool VecArrIsEqual(struct vecArr va1, struct vecArr va2) {
-    if (va1.vecLen != va2.vecLen) return false;
-    if (va1.nVecs != va2.nVecs) return false;
-    for (int i = 0; i < va1.vecLen * va1.nVecs; i++) {
-        if (va1.elems[i] != va2.elems[i]) return false;
+bool VecArrFloatArrIsEqual(VecArr v, float* fArr) {
+    for (int i = 0; i < VecArrNElems(v); i++) {
+        if (v[i] != fArr[i]) return false;
     }
     return true;
 }
 
-void VecArrPrint(struct vecArr va) {
-    printf("vector array: vecLen=%d, nVecs =%d\n", va.vecLen, va.nVecs);
-    for (int i = 0; i < va.nVecs; i++) {
-        for (int j = 0; j < va.vecLen; j++) {
-            printf("%f, ", va.elems[i * va.vecLen + j]);
+void VecArrPrint(VecArr v) {
+    printf("vector array: vecLen=%d, nVecs =%d\n", VecArrVecLen(v), VecArrNVecs(v));
+    for (int i = 0; i < VecArrNVecs(v); i++) {
+        for (int j = 0; j < VecArrVecLen(v); j++) {
+            printf("%f, ", v[i * VecArrVecLen(v) + j]);
         }
         puts("");
     }

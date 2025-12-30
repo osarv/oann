@@ -30,22 +30,15 @@ bool CheckIfFileExists(char* path);
 bool DownloadFile(char* url, char* path);
 bool DecompressGzFile(char* src, char* dst);
 
-//lists
-struct list {
-    int elemSize;
+struct ptrList {
     int len;
     int cap;
-    void* ptr;
+    void** ptr;
 };
 
-struct list ListInit(int elemSize);
-struct list ListSlice(struct list* l, int start, int end); //list slices must not be added to
-void ListClear(struct list* l);
-void ListDestroy(struct list l);
-void ListAdd(struct list* l, void* elem);
-void ListAddList(struct list* head, struct list tail);
-void ListRetract(struct list* l, int newLen);
-void* ListGetIdx(struct list* l, int idx);
-void* ListGetCmp(struct list* l, void* cmpVal, bool(*cmpFunc)(void* cmpVal, void* listElem));
+struct ptrList PtrListInit();
+void PtrListDestroy(struct ptrList l);
+void PtrListAdd(struct ptrList* l, void* ptr);
+void* PtrListGetIdx(struct ptrList l, int idx);
 
 #endif //UTIL_H

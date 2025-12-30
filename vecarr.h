@@ -2,21 +2,17 @@
 #define VECARR_H
 #include "util.h"
 
-struct vecArr {
-    int vecLen;
-    int nVecs;
-    float* elems;
-};
-
-struct vecArr VecArrCreate(int vecLen, int nVec);
-struct vecArr VecArrCreateSameDim(struct vecArr v);
-void VecArrDestroy(struct vecArr v);
-void VecArrInitConst(struct vecArr v, float c);
-void VecArrInitUniform(struct vecArr v, float min, float max);
-void VecArrInitNormDist(struct vecArr v, float mean, float stddev);
-struct list VecArrListInit();
-void VecArrListAdd(struct list* l, struct vecArr va);
-bool VecArrIsEqual(struct vecArr va1, struct vecArr va2);
-void VecArrPrint(struct vecArr va);
+typedef float* VecArr;
+int VecArrVecLen(VecArr v);
+int VecArrNVecs(VecArr v);
+int VecArrNElems(VecArr v);
+VecArr VecArrCreate(int vecLen, int nVec);
+VecArr VecArrCreateSameDim(VecArr v);
+void VecArrDestroy(VecArr v);
+void VecArrInitConst(VecArr v, float c);
+void VecArrInitUniform(VecArr v, float min, float max);
+void VecArrInitNormDist(VecArr v, float mean, float stddev);
+bool VecArrFloatArrIsEqual(VecArr v, float* fArr);
+void VecArrPrint(VecArr v);
 
 #endif //VECARR_H

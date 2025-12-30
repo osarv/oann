@@ -1,43 +1,91 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include "losser.h"
 #include "operation.h"
 //softmax cross entropy loss
 
-void SCEUnmount(Losser l) {
+static void sceUnmount(Losser l) {
     VecArrDestroy(l->y);
 }
 
-void SCEMount(Losser l, struct vecArr x) {
+static void sceMount(Losser l, VecArr x) {
     l->y = VecArrCreateSameDim(x);
 }
 
-void SCEDestroy(Losser l) {
+static void sceDestroy(Losser l) {
     free(l);
 }
 
-void SCEForward(Losser l, struct vecArr x) {
-    OperationSCEForward(x, l->y);
+static void sceForward(Losser l, VecArr x) {
+    for (int i = 0; i < VecArrNVecs(x); i++) {
+        float maxVal = 0;
+        for (int j = 0; j < VecArrVecLen(x); j++) {
+            if (x[i * VecArrVecLen(x) + j] > maxVal) maxVal = x[i * VecArrVecLen(x) + j];
+        }
+        float sum = 0;
+        for (int j = 0; j < VecArrVecLen(x); j++) {
+            l->y[i * VecArrVecLen(x) + j] = exp(x[i * VecArrVecLen(x) + j] - maxVal);
+            sum += l->y[i * VecArrVecLen(x) + j];
+        }
+        for (int j = 0; j < VecArrVecLen(x); j++) l->y[i * VecArrVecLen(x) + j] /= sum;
+    }
 }
 
-void SCEBackward(Losser l, struct vecArr x, struct vecArr labels, struct vecArr dx) {
+static void sceBackward(Losser l, VecArr x, VecArr labels, VecArr dx) {
     (void)x; //correct implementation
-    OperationSCEBackward(l->y, labels, dx);
+    for (int i = 0; i < VecArrNElems(l->y); i++) dx[i] = l->y[i] - labels[i];
 }
 
-float SCECalcLoss(Losser l, struct vecArr x, struct vecArr labels) {
+static float sceCalcLoss(Losser l, VecArr x, VecArr labels) {
     (void)x; //correct implementation
-    return OperationSCECalcLoss(l->y, labels);
+    float loss = 0;
+    for (int i = 0; i < VecArrNElems(l->y); i++) loss -= labels[i] * log(l->y[i]);
+    return loss;
 }
 
+TEST(SCE) {
+    Losser l = SceCreate();
+    VecArr x = VecArrCreate(3, 2);
+    VecArr dx = VecArrCreateSameDim(x);
+    VecArr labels = VecArrCreateSameDim(x);
+    l->mount(l, x);
+    for (int i = 0; i < 6; i++) {
+        x[i] = i;
+        labels[i] = 0;
+    }
+    labels[1] = 1;
+    labels[5] = 1;
 
-Losser SCECreate() {
+    float yDesired[6];
+    float dxDesired[6];
+    float sum1 = exp(0) + exp(1) + exp(2);
+    float sum2 = exp(3) + exp(4) + exp(5);
+    float lossDesired = 0;
+    for (int i = 0; i < 3; i++) yDesired[i] = exp(i) / sum1;
+    for (int i = 3; i < 6; i++) yDesired[i] = exp(i) / sum2;
+    for (int i = 0; i < 6; i++) {
+        dxDesired[i] = yDesired[i] - labels[i];
+        lossDesired -= labels[i] * log(yDesired[i]);
+    }
+    l->forward(l, x);
+    l->backward(l, x, labels, dx);
+    float loss = l->calcLoss(l, x, labels);
+    if (!VecArrFloatArrIsEqual(l->y, yDesired)) TEST_FAILED
+    if (!VecArrFloatArrIsEqual(dx, dxDesired)) TEST_FAILED
+    if (loss != lossDesired) TEST_FAILED
+    l->unmount(l);
+    l->destroy(l);
+    TEST_PASSED
+}
+
+Losser SceCreate() {
     struct losser* s = MallocOrCrash(sizeof(struct losser));
-    s->unmount = SCEUnmount;
-    s->mount = SCEMount;
-    s->destroy = SCEDestroy;
-    s->forward = SCEForward;
-    s->backward = SCEBackward;
-    s->calcLoss = SCECalcLoss;
+    s->unmount = sceUnmount;
+    s->mount = sceMount;
+    s->destroy = sceDestroy;
+    s->forward = sceForward;
+    s->backward = sceBackward;
+    s->calcLoss = sceCalcLoss;
     return s;
 }

@@ -10,17 +10,17 @@
 
 struct layer {
     int nOut;
-    struct vecArr y;
-    struct vecArr dy;
+    VecArr y;
+    VecArr dy;
     void (*unmount)(Layer l);
-    void (*mount)(Layer l, struct vecArr x);
+    void (*mount)(Layer l, VecArr x);
     void (*init)(Layer l, int nIn);
     void (*destroy)(Layer l); //presumes former unmounting
-    void (*forward)(Layer l, struct vecArr x);
-    void (*backward)(Layer l, struct vecArr x, struct vecArr dx); //does NOT call the optimizers
-    struct list p; //list of parameters to optimize
-    struct list dp; //list of gradients of parameters to optimize
-    struct list optimizers; //corresponding optimizers
+    void (*forward)(Layer l, VecArr x);
+    void (*backward)(Layer l, VecArr x, VecArr dx); //does NOT call the optimizers
+    struct ptrList p; //list of parameters to optimize
+    struct ptrList dp; //list of gradients of parameters to optimize
+    struct ptrList optimizers; //corresponding optimizers
 };
 
 #endif //LAYER_H

@@ -5,12 +5,10 @@
 struct dataset {
     int nTrainSamples;
     int nTestSamples;
-    int featureSize;
-    int labelSize;
-    void (*getTrainFeatures)(Dataset d, struct vecArr buf, int sampleIdxStart); //no idx checking
-    void (*getTrainLabels)(Dataset d, struct vecArr buf, int sampleIdxStart); //no idx checking
-    void (*getTestFeatures)(Dataset d, struct vecArr buf, int sampleIdxStart); //no idx checking
-    void (*getTestLabels)(Dataset d, struct vecArr buf, int sampleIdxStart); //no idx checking
+    void (*getTrainFeatures)(VecArr buf, int sampleIdxStart);
+    void (*getTrainLabels)(VecArr buf, int sampleIdxStart);
+    void (*getTestFeatures)(VecArr buf, int sampleIdxStart);
+    void (*getTestLabels)(VecArr buf, int sampleIdxStart);
 };
 
 #endif //DATASET_H

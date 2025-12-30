@@ -4,9 +4,9 @@
 #include "oann.h"
 
 struct optimizer {
-    void (*optimize)(Optimizer o, struct vecArr p, struct vecArr dp);
+    void (*optimize)(Optimizer o, VecArr p, VecArr dp);
     void (*destroy)(Optimizer o); //call with recipe optimizer is defined
-    Optimizer (*createCopy)(Optimizer o, struct vecArr p);
+    Optimizer (*yieldOptimizer)(Optimizer o, VecArr p);
 };
 
 #endif //OPTIMIZER_H

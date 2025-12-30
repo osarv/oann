@@ -1,6 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Werror -Wextra -Wpedantic -g -DOP_MODE_BLAS
 LBINS = -lm -lopenblas -lcurl -lz
+SRCS = $(filter-out test.c mnistdemo.c, $(wildcard *.c))
 
 bin/%.o: %.c bin
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -8,13 +9,13 @@ bin/%.o: %.c bin
 bin/test%.o: %.c bin
 	$(CC) $(CFLAGS) -DTEST -c $< -o $@
 
-all: clean build run
-test: clean testbuild run
+testtarget: clean bin buildtest run
+mnisttarget: clean bin buildmnistdemo run
 
-build: $(addprefix bin/, $(addsuffix .o, $(basename $(wildcard *.c))))
+buildtest: bin/test.o $(addprefix bin/test, $(addsuffix .o, $(basename $(SRCS))))
 	$(CC) $(CFLAGS) $^ -o bin/out $(LBINS) 
 
-testbuild: $(addprefix bin/test, $(addsuffix .o, $(basename $(wildcard *.c))))
+buildmnistdemo: bin/mnistdemo.o $(addprefix bin/, $(addsuffix .o, $(basename $(SRCS))))
 	$(CC) $(CFLAGS) $^ -o bin/out $(LBINS) 
 
 run:
