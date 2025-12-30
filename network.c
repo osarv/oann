@@ -16,7 +16,7 @@ struct network {
     VecArr labels;
     struct ptrList layers;
     Losser lsr;
-    Optimizer o;
+    Optimizer oRecipe;
 };
 
 static void networkUnmount(Network n) {
@@ -50,7 +50,7 @@ void NetworkDestroy(Network n) {
         l->destroy(l);
     }
     n->lsr->destroy(n->lsr);
-    n->o->destroy(n->o);
+    n->oRecipe->destroy(n->oRecipe);
     free(n);
 }
 
@@ -61,7 +61,7 @@ Network NetworkCreate(int nIn, Losser lsr, Optimizer o) {
     n->dFeatures = VecArrCreateSameDim(n->features);
     n->layers = PtrListInit();
     n->lsr = lsr;
-    n->o = o;
+    n->oRecipe = o;
     return n;
 }
 
@@ -71,8 +71,13 @@ void NetworkAddLayer(Network n, Layer l) {
         Layer l = PtrListGetIdx(n->layers, n->layers.len -1);
         nIn = l->nOut;
     }
-    PtrListAdd(&n->layers, l);
     l->init(l, nIn);
+    for (int i = 0; i < l->p.len; i++) {
+        VecArr p = PtrListGetIdx(l->p, i);
+        Optimizer o = n->oRecipe->yieldOptimizer(n->oRecipe, p);
+        PtrListAdd(&l->optimizers, o);
+    }
+    PtrListAdd(&n->layers, l);
 }
 
 //must be called internally after network creation at least once

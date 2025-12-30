@@ -51,27 +51,44 @@ static void denseDestroy(Layer l) {
 static void denseForward(Layer l, VecArr x) {
     struct dense* d = (struct dense*)l;
 
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
-            VecArrNVecs(d->w), VecArrNVecs(x), VecArrVecLen(d->w), 1.0f, d->w, VecArrVecLen(d->w),
-            x, VecArrVecLen(x), 0.0f, l->y, VecArrVecLen(l->y));
+    int nIn = VecArrVecLen(x);
+    int nOut = l->nOut;
+    int batchSize = VecArrNVecs(x);
 
-    for (int i = 0; i < VecArrNVecs(l->y); i++) {
-        cblas_saxpy(VecArrVecLen(d->b), 1.0f, d->b, 1, l->y + i * VecArrVecLen(l->y), 1);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+            batchSize, nOut, nIn, 1.0f, x, nIn,
+            d->w, nIn, 0.0f, l->y, nOut);
+
+    for (int i = 0; i < batchSize; i++) {
+        cblas_saxpy(nOut, 1.0f, d->b, 1, l->y + i * nOut, 1);
     }
 }
 
 static void denseBackward(Layer l, VecArr x, VecArr dx) {
     struct dense* d = (struct dense*)l;
 
-    //calculate weight gradients
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
-            VecArrNVecs(d->w), VecArrVecLen(d->w), VecArrNVecs(x), 1.0f, l->dy, VecArrVecLen(l->dy),
-            x, VecArrVecLen(x), 0.0f, d->dw, VecArrVecLen(d->dw));
+    int nIn = VecArrVecLen(x);
+    int nOut = l->nOut;
+    int batchSize = VecArrNVecs(x);
 
     //calculate gradients downstream
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+            batchSize, nIn, nOut, 1.0f, l->dy, nOut,
+            d->w, nIn, 0.0f, dx, nIn);
+
+    //calculate weight gradients
     cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
-            VecArrNVecs(x), VecArrVecLen(d->w), VecArrNVecs(d->w), 1.0f, l->dy, VecArrVecLen(l->dy),
-            d->w, VecArrVecLen(d->w), 0.0f, dx, VecArrVecLen(dx));
+            nOut, nIn, batchSize, 1.0f, l->dy, nOut,
+            x, nIn, 0.0f, d->dw, nIn);
+
+    //calculate bias gradients
+    for (int i = 0; i < batchSize; i++) {
+        d->db[i] = 0;
+    }
+
+    for (int i = 0; i < batchSize; i++) {
+        cblas_saxpy(nOut, 1.0f, l->dy + i * nOut, 1, d->db, 1);
+    }
 }
 #endif //OP_MODE_BLAS
 
@@ -102,13 +119,15 @@ TEST(Dense) {
     for (int i = 0; i < 2; i++) d->b[i] = i;
     
     float yDesired[] = {5, 15, 14, 51};
-    float dxDesired[] = {6, 8, 10, 9, 13, 17};
-    float dwDesired[] = {3, 4, 5, 9, 14, 19};
+    float dwDesired[] = {6, 8, 10, 9, 13, 17};
+    float dbDesired[] = {2, 4};
+    float dxDesired[] = {3, 4, 5, 9, 14, 19};
 
     l->forward(l, x);
     if (!VecArrFloatArrIsEqual(l->y, yDesired)) TEST_FAILED
     l->backward(l, x, dx);
     if (!VecArrFloatArrIsEqual(d->dw, dwDesired)) TEST_FAILED
+    if (!VecArrFloatArrIsEqual(d->db, dbDesired)) TEST_FAILED
     if (!VecArrFloatArrIsEqual(dx, dxDesired)) TEST_FAILED
     if (l->p.len != 2) TEST_FAILED;
     if (l->dp.len != 2) TEST_FAILED;

@@ -6,7 +6,7 @@
 struct optimizer {
     void (*optimize)(Optimizer o, VecArr p, VecArr dp);
     void (*destroy)(Optimizer o); //call with recipe optimizer is defined
-    Optimizer (*yieldOptimizer)(Optimizer o, VecArr p);
+    Optimizer (*yieldOptimizer)(Optimizer oRecipe, VecArr p);
 };
 
 #endif //OPTIMIZER_H
