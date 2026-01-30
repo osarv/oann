@@ -12,6 +12,9 @@ void VecArrDestroy(VecArr v);
 void VecArrInitConst(VecArr v, float c);
 void VecArrInitUniform(VecArr v, float min, float max);
 void VecArrInitNormDist(VecArr v, float mean, float stddev);
+float VecArrMean(VecArr v);
+float VecArrStdDev(VecArr v);
+bool VecArrIsNan(VecArr v);
 bool VecArrFloatArrIsEqual(VecArr v, float* fArr);
 void VecArrPrint(VecArr v);
 

@@ -13,10 +13,11 @@ Layer DenseCreate(int nOut);
 Layer ReluCreate();
 Losser SceCreate();
 Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay);
-Network NetworkCreate(int nIn, Losser lsr, Optimizer o);
+Network NetworkCreate(int nIn, Optimizer o);
 Dataset MnistCreate();
 void NetworkDestroy(Network n);
 void NetworkAddLayer(Network n, Layer l);
+void NetworkSetLosser(Network n, Losser lsr); //completes the network creation
 float NetworkTrain(Network n, int batchSize, Dataset d);
 float NetworkTest(Network n, int batchSize, Dataset d);
 float NetworkInferTrainSample(Network n, Dataset d, int idx, float** features, float** predictions);

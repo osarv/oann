@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 #include <cblas.h>
 #include "layer.h"
 #include "operation.h"
@@ -23,7 +24,7 @@ static void denseMount(Layer l, VecArr x) {
     l->dy = VecArrCreate(l->nOut, VecArrNVecs(x));
 }
 
-static void denseInit(Layer l, int nIn) {
+static void denseInit(Layer l, int nIn, float varScalingNextLayer) {
     struct dense* d = (struct dense*)l;
     d->w = VecArrCreate(nIn, l->nOut);
     d->dw = VecArrCreateSameDim(d->w);
@@ -35,6 +36,8 @@ static void denseInit(Layer l, int nIn) {
     PtrListAdd(&l->p, d->b);
     PtrListAdd(&l->dp, d->dw);
     PtrListAdd(&l->dp, d->db);
+    VecArrInitNormDist(d->w, 0, sqrt(1 / (nIn * varScalingNextLayer)));
+    VecArrInitConst(d->b, 0);
 }
 
 static void denseDestroy(Layer l) {
@@ -82,18 +85,14 @@ static void denseBackward(Layer l, VecArr x, VecArr dx) {
             x, nIn, 0.0f, d->dw, nIn);
 
     //calculate bias gradients
-    for (int i = 0; i < batchSize; i++) {
-        d->db[i] = 0;
-    }
-
-    for (int i = 0; i < batchSize; i++) {
-        cblas_saxpy(nOut, 1.0f, l->dy + i * nOut, 1, d->db, 1);
-    }
+    VecArrInitConst(d->db, 0);
+    for (int i = 0; i < batchSize; i++) cblas_saxpy(nOut, 1.0f, l->dy + i * nOut, 1, d->db, 1);
 }
 #endif //OP_MODE_BLAS
 
 Layer DenseCreate(int nOut) {
     struct dense* d = CallocOrCrash(sizeof(struct dense)); //calloc needed to initialized lists to zero length
+    d->l.varScaling = 1;
     d->l.nOut = nOut;
     d->l.unmount = denseUnmount;
     d->l.mount = denseMount;
@@ -109,7 +108,7 @@ TEST(Dense) {
     struct dense* d = (struct dense*)l;
     VecArr x = VecArrCreate(3, 2);
     VecArr dx = VecArrCreateSameDim(x);
-    l->init(l, 3);
+    l->init(l, 3, 1);
     l->mount(l, x);
     for (int i = 0; i < 6; i++) {
         d->w[i] = i;

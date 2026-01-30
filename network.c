@@ -54,33 +54,46 @@ void NetworkDestroy(Network n) {
     free(n);
 }
 
-Network NetworkCreate(int nIn, Losser lsr, Optimizer o) {
+Network NetworkCreate(int nIn, Optimizer o) {
     Network n = CallocOrCrash(sizeof(struct network)); //set batchSize to zero
     n->nIn = nIn;
     n->features = VecArrCreate(n->nIn, n->batchSize);
     n->dFeatures = VecArrCreateSameDim(n->features);
     n->layers = PtrListInit();
-    n->lsr = lsr;
     n->oRecipe = o;
     return n;
 }
 
 void NetworkAddLayer(Network n, Layer l) {
+    PtrListAdd(&n->layers, l);
+}
+
+void NetworkSetLosser(Network n, Losser lsr) { //completes the network creation
+    n->lsr = lsr;
+
     int nIn = n->nIn;
-    if (n->layers.len > 0) {
-        Layer l = PtrListGetIdx(n->layers, n->layers.len -1);
+    Layer l = PtrListGetIdx(n->layers, 0);
+    for (int i = 0; i < n->layers.len -1; i++) {
+        Layer nextL = PtrListGetIdx(n->layers, i +1);
+        l->init(l, nIn, nextL->varScaling);
+        for (int j = 0; j < l->p.len; j++) {
+            VecArr p = PtrListGetIdx(l->p, j);
+            Optimizer o = n->oRecipe->yieldOptimizer(n->oRecipe, p);
+            PtrListAdd(&l->optimizers, o);
+        }
         nIn = l->nOut;
+        l = nextL;
     }
-    l->init(l, nIn);
+
+    l->init(l, nIn, 1);
     for (int i = 0; i < l->p.len; i++) {
         VecArr p = PtrListGetIdx(l->p, i);
         Optimizer o = n->oRecipe->yieldOptimizer(n->oRecipe, p);
         PtrListAdd(&l->optimizers, o);
     }
-    PtrListAdd(&n->layers, l);
 }
 
-//must be called internally after network creation at least once
+//must be called internally before network usage at least once
 static void networkSetBatchSize(Network n, int batchSize) {
     if (n->batchSize == batchSize) return;
     if (n->batchSize != 0) networkUnmount(n);
@@ -117,7 +130,7 @@ static void networkBackwardAndOptimize(Network n) {
         prevL = PtrListGetIdx(n->layers, i -1);
         l->backward(l, prevL->y, prevL->dy);
         optimizeLayer(l);
-        prevL = l;
+        l = prevL;
     }
     l->backward(l, n->features, n->dFeatures);
     optimizeLayer(l);
@@ -137,9 +150,12 @@ float NetworkTrain(Network n, int batchSize, Dataset d) {
     networkSetBatchSize(n, batchSize);
     float loss = 0;
     int i = 0;
-    for (; i + batchSize < d->nTrainSamples; i += batchSize) loss += networkTrainBatch(n, d, i);
-    networkSetBatchSize(n, d->nTrainSamples - i * batchSize);
-    loss += networkTrainBatch(n, d, i * batchSize);
+    networkTrainBatch(n, d, 0);
+    //for (; i + batchSize <= d->nTrainSamples; i += batchSize) loss += networkTrainBatch(n, d, i);
+    if (i < d->nTestSamples) {
+        networkSetBatchSize(n, d->nTrainSamples - i);
+        loss += networkTrainBatch(n, d, i);
+    }
     return loss;
 }
 
@@ -157,9 +173,11 @@ float NetworkTest(Network n, int batchSize, Dataset d) {
     networkSetBatchSize(n, batchSize);
     float loss = 0;
     int i = 0;
-    for (; i + batchSize < d->nTestSamples; i += batchSize) loss += networkTestBatch(n, d, i);
-    networkSetBatchSize(n, d->nTestSamples - i * batchSize);
-    loss += networkTestBatch(n, d, i * batchSize);
+    for (; i + batchSize <= d->nTestSamples; i += batchSize) loss += networkTestBatch(n, d, i);
+    if (i < d->nTestSamples) {
+        networkSetBatchSize(n, d->nTestSamples - i);
+        loss += networkTestBatch(n, d, i);
+    }
     return loss;
 }
 

@@ -38,13 +38,17 @@ void mnistDownloadIfNeeded() {
 }
 
 static void mnistGetTrainFeatures(VecArr buf, int sampleIdxStart) {
+    char charBuf[MNIST_N_FEATURES * VecArrNVecs(buf)];
     FILE* fp = fopen(MNIST_PATH "trainf", "r");
     if (!fp) ErrorAndCrash("could not open mnist train features");
     if (fseek(fp, MNIST_HEADER_SIZE_FEATURES + sampleIdxStart * MNIST_N_FEATURES, SEEK_SET)) {
         ErrorAndCrash("could not seek in mnist train features");
     }
-    if (fread(buf, 1, MNIST_N_FEATURES * VecArrNVecs(buf), fp) != (unsigned int)MNIST_N_FEATURES * VecArrNVecs(buf)) {
+    if (fread(charBuf, 1, MNIST_N_FEATURES * VecArrNVecs(buf), fp) != (unsigned int)MNIST_N_FEATURES * VecArrNVecs(buf)) {
         ErrorAndCrash("could not read from mnist train features");
+    }
+    for (int i = 0; i < MNIST_N_FEATURES * VecArrNVecs(buf); i++) {
+        buf[i] = ((float)charBuf[i]) / 255;
     }
     fclose(fp);
 }
@@ -65,13 +69,17 @@ static void mnistGetTrainLabels(VecArr buf, int sampleIdxStart) {
 }
 
 static void mnistGetTestFeatures(VecArr buf, int sampleIdxStart) {
+    char charBuf[MNIST_N_FEATURES * VecArrNVecs(buf)];
     FILE* fp = fopen(MNIST_PATH "testf", "r");
     if (!fp) ErrorAndCrash("could not open mnist test features");
     if (fseek(fp, MNIST_HEADER_SIZE_FEATURES + sampleIdxStart * MNIST_N_FEATURES, SEEK_SET)) {
         ErrorAndCrash("could not seek in mnist test features");
     }
-    if (fread(buf, 1, MNIST_N_FEATURES * VecArrNVecs(buf), fp) != (unsigned int)MNIST_N_FEATURES * VecArrNVecs(buf)) {
+    if (fread(charBuf, 1, MNIST_N_FEATURES * VecArrNVecs(buf), fp) != (unsigned int)MNIST_N_FEATURES * VecArrNVecs(buf)) {
         ErrorAndCrash("could not read from mnist test features");
+    }
+    for (int i = 0; i < MNIST_N_FEATURES * VecArrNVecs(buf); i++) {
+        buf[i] = ((float)charBuf[i]) / 255;
     }
     fclose(fp);
 }
