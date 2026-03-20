@@ -38,7 +38,7 @@ void mnistDownloadIfNeeded() {
 }
 
 static void mnistGetTrainFeatures(VecArr buf, int sampleIdxStart) {
-    char charBuf[MNIST_N_FEATURES * VecArrNVecs(buf)];
+    char* charBuf = malloc(MNIST_N_FEATURES * VecArrNVecs(buf));
     FILE* fp = fopen(MNIST_PATH "trainf", "r");
     if (!fp) ErrorAndCrash("could not open mnist train features");
     if (fseek(fp, MNIST_HEADER_SIZE_FEATURES + sampleIdxStart * MNIST_N_FEATURES, SEEK_SET)) {
@@ -47,10 +47,10 @@ static void mnistGetTrainFeatures(VecArr buf, int sampleIdxStart) {
     if (fread(charBuf, 1, MNIST_N_FEATURES * VecArrNVecs(buf), fp) != (unsigned int)MNIST_N_FEATURES * VecArrNVecs(buf)) {
         ErrorAndCrash("could not read from mnist train features");
     }
-    for (int i = 0; i < MNIST_N_FEATURES * VecArrNVecs(buf); i++) {
-        buf[i] = ((float)charBuf[i]) / 255;
-    }
+    for (int i = 0; i < MNIST_N_FEATURES * VecArrNVecs(buf); i++) buf[i] = ((OANNfloat)charBuf[i]);
+    VecArrNormalize(buf);
     fclose(fp);
+    free(charBuf);
 }
 
 static void mnistGetTrainLabels(VecArr buf, int sampleIdxStart) {
@@ -69,7 +69,7 @@ static void mnistGetTrainLabels(VecArr buf, int sampleIdxStart) {
 }
 
 static void mnistGetTestFeatures(VecArr buf, int sampleIdxStart) {
-    char charBuf[MNIST_N_FEATURES * VecArrNVecs(buf)];
+    char* charBuf = malloc(MNIST_N_FEATURES * VecArrNVecs(buf));
     FILE* fp = fopen(MNIST_PATH "testf", "r");
     if (!fp) ErrorAndCrash("could not open mnist test features");
     if (fseek(fp, MNIST_HEADER_SIZE_FEATURES + sampleIdxStart * MNIST_N_FEATURES, SEEK_SET)) {
@@ -78,10 +78,10 @@ static void mnistGetTestFeatures(VecArr buf, int sampleIdxStart) {
     if (fread(charBuf, 1, MNIST_N_FEATURES * VecArrNVecs(buf), fp) != (unsigned int)MNIST_N_FEATURES * VecArrNVecs(buf)) {
         ErrorAndCrash("could not read from mnist test features");
     }
-    for (int i = 0; i < MNIST_N_FEATURES * VecArrNVecs(buf); i++) {
-        buf[i] = ((float)charBuf[i]) / 255;
-    }
+    for (int i = 0; i < MNIST_N_FEATURES * VecArrNVecs(buf); i++) buf[i] = ((OANNfloat)charBuf[i]);
+    VecArrNormalize(buf);
     fclose(fp);
+    free(charBuf);
 }
 
 static void mnistGetTestLabels(VecArr buf, int sampleIdxStart) {

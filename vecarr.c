@@ -17,10 +17,10 @@ int VecArrNElems(VecArr v) {
 }
 
 VecArr VecArrCreate(int vecLen, int nVecs) {
-    VecArr v = MallocOrCrash(2 * sizeof(int) + sizeof(float) * vecLen * nVecs);
+    VecArr v = MallocOrCrash(2 * sizeof(int) + sizeof(OANNfloat) * vecLen * nVecs);
     ((int*)v)[0] = vecLen;
     ((int*)v)[1] = nVecs;
-    return (float*)(((int*)v) + 2);
+    return (OANNfloat*)(((int*)v) + 2);
 }
 
 VecArr VecArrCreateSameDim(VecArr v) {
@@ -31,36 +31,36 @@ void VecArrDestroy(VecArr v) {
     free(((int*)v) - 2);
 }
 
-void VecArrInitConst(VecArr v, float c) {
+void VecArrInitConst(VecArr v, OANNfloat c) {
     for (int i = 0; i < VecArrNElems(v); i++) {
         v[i] = c;
     }
 }
 
-static float getRandomFloat(float min, float max) {
-    return ((float)(rand()%1000000001)) / 1000000000.0f * (max - min) + min;
+static OANNfloat getRandomOANNfloat(OANNfloat min, OANNfloat max) {
+    return ((OANNfloat)(rand()%1000000001)) / 1000000000 * (max - min) + min;
 }
 
-void VecArrInitUniform(VecArr v, float min, float max) {
+void VecArrInitUniform(VecArr v, OANNfloat min, OANNfloat max) {
     for (int i = 0; i < VecArrNElems(v); i++) {
-        v[i] = getRandomFloat(min, max);
+        v[i] = getRandomOANNfloat(min, max);
     }
 }
 
-static void getStdDevPair(float* a, float* b) {
-    float x, y, s;
+static void getStdDevPair(OANNfloat* a, OANNfloat* b) {
+    OANNfloat x, y, s;
     do {
-        x = getRandomFloat(-1,1);
-        y = getRandomFloat(-1,1);
+        x = getRandomOANNfloat(-1,1);
+        y = getRandomOANNfloat(-1,1);
         s = x * x + y * y;
     }
     while (s == 0 || s >= 1);
-    float lnS = log(s);
+    OANNfloat lnS = log(s);
     *a = x * sqrt(-2 * lnS / s);
     *b = y * sqrt(-2 * lnS / s);
 }
 
-void VecArrInitNormDist(VecArr v, float mean, float stddev) {
+void VecArrInitNormDist(VecArr v, OANNfloat mean, OANNfloat stddev) {
     for (int i = 0; i < VecArrNElems(v) - 1; i += 2) {
         getStdDevPair(&v[i], &v[i +1]);
         v[i] = v[i] * stddev + mean;
@@ -72,17 +72,17 @@ void VecArrInitNormDist(VecArr v, float mean, float stddev) {
     }
 }
 
-float VecArrMean(VecArr v) {
-    float sum = 0;
+OANNfloat VecArrMean(VecArr v) {
+    OANNfloat sum = 0;
     for (int i = 0; i < VecArrNElems(v); i++) {
         sum += v[i];
     }
     return sum / VecArrNElems(v);
 }
 
-float VecArrStdDev(VecArr v) {
-    float mean = VecArrMean(v);
-    float sum = 0;
+OANNfloat VecArrStdDev(VecArr v) {
+    OANNfloat mean = VecArrMean(v);
+    OANNfloat sum = 0;
     for (int i = 0; i < VecArrNElems(v); i++) {
         sum += (v[i] - mean) * (v[i] - mean);
     }
@@ -96,7 +96,15 @@ bool VecArrIsNan(VecArr v) {
     return false;
 }
 
-bool VecArrFloatArrIsEqual(VecArr v, float* fArr) {
+void VecArrNormalize(VecArr v) {
+    OANNfloat mean = VecArrMean(v);
+    OANNfloat stddev = VecArrStdDev(v);
+    for (int i = 0; i < VecArrNElems(v); i++) {
+        v[i] = (v[i] - mean) / stddev;
+    }
+}
+
+bool VecArrOANNfloatArrIsEqual(VecArr v, OANNfloat* fArr) {
     for (int i = 0; i < VecArrNElems(v); i++) {
         if (v[i] != fArr[i]) return false;
     }

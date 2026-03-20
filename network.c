@@ -20,38 +20,18 @@ struct network {
 };
 
 static void networkUnmount(Network n) {
-    VecArrDestroy(n->features);
-    VecArrDestroy(n->dFeatures);
-    for (int i = 0; i < n->layers.len; i++) {
-        Layer l = PtrListGetIdx(n->layers, i);
-        l->unmount(l);
-    }
-    n->lsr->unmount(n->lsr);
-    VecArrDestroy(n->labels);
+    (void)n;
+    //TODO
 }
 
 static void networkMount(Network n) {
-    n->features = VecArrCreate(n->nIn, n->batchSize);
-    n->dFeatures = VecArrCreateSameDim(n->features);
-    VecArr x = n->features;
-    for (int i = 0; i < n->layers.len; i++) {
-        Layer l = PtrListGetIdx(n->layers, i);
-        l->mount(l, x);
-        x = l->y;
-    }
-    n->lsr->mount(n->lsr, x);
-    n->labels = VecArrCreate(VecArrVecLen(n->lsr->y), n->batchSize);
+    (void)n;
+    //TODO
 }
 
 void NetworkDestroy(Network n) {
-    if (n->batchSize != 0) networkUnmount(n);
-    for (int i = 0; i < n->layers.len; i++) {
-        Layer l = PtrListGetIdx(n->layers, i);
-        l->destroy(l);
-    }
-    n->lsr->destroy(n->lsr);
-    n->oRecipe->destroy(n->oRecipe);
-    free(n);
+    (void)n;
+    //TODO
 }
 
 Network NetworkCreate(int nIn, Optimizer o) {
@@ -136,22 +116,21 @@ static void networkBackwardAndOptimize(Network n) {
     optimizeLayer(l);
 }
 
-static float networkTrainBatch(Network n, Dataset d, int sampleIdxStart) {
-    d->getTrainFeatures(n->features, sampleIdxStart);
-    d->getTrainLabels(n->labels, sampleIdxStart);
+static OANNfloat networkTrainBatch(Network n, Dataset d, int sIdx) {
+    d->getTrainFeatures(n->features, sIdx);
+    d->getTrainLabels(n->labels, sIdx);
     networkForward(n);
     Layer lastL = PtrListGetIdx(n->layers, n->layers.len -1);
-    float loss = n->lsr->calcLoss(n->lsr, lastL->y, n->labels) / d->nTrainSamples;
+    OANNfloat loss = n->lsr->calcLoss(n->lsr, lastL->y, n->labels) / d->nTrainSamples;
     networkBackwardAndOptimize(n);
     return loss;
 }
 
-float NetworkTrain(Network n, int batchSize, Dataset d) {
+OANNfloat NetworkTrain(Network n, int batchSize, Dataset d) {
     networkSetBatchSize(n, batchSize);
-    float loss = 0;
+    OANNfloat loss = 0;
     int i = 0;
-    networkTrainBatch(n, d, 0);
-    //for (; i + batchSize <= d->nTrainSamples; i += batchSize) loss += networkTrainBatch(n, d, i);
+    for (; i + batchSize <= d->nTrainSamples; i += batchSize) loss += networkTrainBatch(n, d, i);
     if (i < d->nTestSamples) {
         networkSetBatchSize(n, d->nTrainSamples - i);
         loss += networkTrainBatch(n, d, i);
@@ -159,19 +138,25 @@ float NetworkTrain(Network n, int batchSize, Dataset d) {
     return loss;
 }
 
-static float networkTestBatch(Network n, Dataset d, int sampleIdxStart) {
-        d->getTestFeatures(n->features, sampleIdxStart);
-        d->getTestLabels(n->labels, sampleIdxStart);
+OANNfloat NetworkTrainOneBatch(Network n, int batchSize, int sIdx, Dataset d) {
+    if (sIdx < 0 || sIdx + batchSize >= d->nTrainSamples) ErrorAndCrash("invalid batch range");
+    networkSetBatchSize(n, batchSize);
+    return networkTrainBatch(n, d, sIdx);
+}
+
+static OANNfloat networkTestBatch(Network n, Dataset d, int sIdx) {
+        d->getTestFeatures(n->features, sIdx);
+        d->getTestLabels(n->labels, sIdx);
         networkForward(n);
         Layer lastL = PtrListGetIdx(n->layers, n->layers.len -1);
-        float loss = n->lsr->calcLoss(n->lsr, lastL->y, n->labels) / d->nTestSamples;
+        OANNfloat loss = n->lsr->calcLoss(n->lsr, lastL->y, n->labels) / d->nTestSamples;
         networkBackwardAndOptimize(n);
         return loss;
 }
 
-float NetworkTest(Network n, int batchSize, Dataset d) {
+OANNfloat NetworkTest(Network n, int batchSize, Dataset d) {
     networkSetBatchSize(n, batchSize);
-    float loss = 0;
+    OANNfloat loss = 0;
     int i = 0;
     for (; i + batchSize <= d->nTestSamples; i += batchSize) loss += networkTestBatch(n, d, i);
     if (i < d->nTestSamples) {
@@ -181,8 +166,14 @@ float NetworkTest(Network n, int batchSize, Dataset d) {
     return loss;
 }
 
-float NetworkInferTrainSample(Network n, Dataset d, int idx, float** features, float** predictions) {
-    if (idx < 0 || idx >= d->nTrainSamples) ErrorAndCrash("invalid sample index chosen");
+OANNfloat NetworkTestOneBatch(Network n, int batchSize, int sIdx, Dataset d) {
+    if (sIdx < 0 || sIdx + batchSize >= d->nTestSamples) ErrorAndCrash("invalid batch range");
+    networkSetBatchSize(n, batchSize);
+    return networkTestBatch(n, d, sIdx);
+}
+
+OANNfloat NetworkInferTrainSample(Network n, Dataset d, int idx, OANNfloat** features, OANNfloat** predictions) {
+    if (idx < 0 || idx >= d->nTrainSamples) ErrorAndCrash("invalid sample index");
     networkSetBatchSize(n, 1);
     d->getTrainFeatures(n->features, idx);
     d->getTrainLabels(n->labels, idx);
@@ -197,8 +188,8 @@ float NetworkInferTrainSample(Network n, Dataset d, int idx, float** features, f
     return n->lsr->calcLoss(n->lsr, x, n->labels);
 }
 
-float NetworkInferTestSample(Network n, Dataset d, int idx, float** features, float** predictions) {
-    if (idx < 0 || idx >= d->nTestSamples) ErrorAndCrash("invalid sample index chosen");
+OANNfloat NetworkInferTestSample(Network n, Dataset d, int idx, OANNfloat** features, OANNfloat** predictions) {
+    if (idx < 0 || idx >= d->nTestSamples) ErrorAndCrash("invalid sample index");
     networkSetBatchSize(n, 1);
     d->getTestFeatures(n->features, idx);
     d->getTestLabels(n->labels, idx);

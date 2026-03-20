@@ -4,24 +4,26 @@
 #include "vecarr.h"
 #include "util.h"
 
-//All layer implementations must include the layer struct, preferably as the first member.
-//Additionally, they must implement the mount, init, destroy, forward backward functions.
-//Furthermore they must and add any parameters and gradients to be optimized to the p and dp lists
+enum layerType {
+    LAYER_MUL,
+    LAYER_ADD,
+    LAYER_RELU,
+};
 
+//layers are completely defined by the layer struct
 struct layer {
-    float varScaling; //variance scaling of a stdnorm dist by the layer
-    int nOut;
-    VecArr y;
-    VecArr dy;
-    void (*unmount)(Layer l);
-    void (*mount)(Layer l, VecArr x);
-    void (*init)(Layer l, int nIn, float varScalingNextLayer);
-    void (*destroy)(Layer l); //presumes former unmounting
-    void (*forward)(Layer l, VecArr x);
-    void (*backward)(Layer l, VecArr x, VecArr dx); //does NOT call the optimizers
+    enum layerType type;
+    OANNfloat varScaling;
+    int nOut; //may be set in create or init
+    void (*init)(Layer l, int nIn, OANNfloat varScalingNextLayer);
+    VecArr (*forward)(Layer l, VecArr x); //returns y; y may be x
+    VecArr (*backward)(Layer l, VecArr x, VecArr dx); //returns dx, dx may be dy; OBS: should NOT call the optimizers
     struct ptrList p; //list of parameters to optimize
-    struct ptrList dp; //list of gradients of parameters to optimize
-    struct ptrList optimizers; //corresponding optimizers
+    
+    VecArr y; //OBS: created and filled by network
+    VecArr dy; //OBS: created and filled by network
+    struct ptrList dp; //OBS: created and filled by network; list of gradients of parameters to optimize
+    struct ptrList optimizers; //OBS: created and filled by network; corresponding optimizer
 };
 
 #endif //LAYER_H

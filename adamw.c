@@ -1,21 +1,21 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include "oann.h"
 #include "optimizer.h"
 #include "util.h"
-#include "operation.h"
 //adaptive momentum with l2 weight decay
 
 struct adamw {
     struct optimizer o;
-    float lr;
-    float mDecay;
-    float vDecay;
-    float wDecay;
+    OANNfloat lr;
+    OANNfloat mDecay;
+    OANNfloat vDecay;
+    OANNfloat wDecay;
     VecArr m;
     VecArr v;
 };
 
-#define ADAMW_NUM_STAB_CONST 0.00000001
+#define ADAMW_NUM_STAB_CONST 1e-8
 static void adamWOptimize(Optimizer o, VecArr p, VecArr dp) {
     struct adamw* a = (struct adamw*)o;
 
@@ -33,7 +33,7 @@ static void adamWDestroy(Optimizer o) {
     free(a);
 }
 
-Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay);
+Optimizer AdamWCreate(OANNfloat lr, OANNfloat mDecay, OANNfloat vDecay, OANNfloat wDecay);
 static Optimizer adamWYieldOptimizer(Optimizer o, VecArr p) {
     struct adamw* recipe = (struct adamw*)o;
     struct adamw* new = (struct adamw*)AdamWCreate(recipe->lr, recipe->mDecay, recipe->vDecay, recipe->wDecay);
@@ -44,7 +44,7 @@ static Optimizer adamWYieldOptimizer(Optimizer o, VecArr p) {
     return &new->o;
 }
 
-Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay) {
+Optimizer AdamWCreate(OANNfloat lr, OANNfloat mDecay, OANNfloat vDecay, OANNfloat wDecay) {
     struct adamw* a = CallocOrCrash(sizeof(struct adamw)); //calloc needed to set m and v to NULL
     a->o.optimize = adamWOptimize;
     a->o.destroy = adamWDestroy;
@@ -57,19 +57,19 @@ Optimizer AdamWCreate(float lr, float mDecay, float vDecay, float wDecay) {
 }
 
 TEST(AdamW) {
-    float lr = 0.01;
-    float mDecay = 0.9;
-    float vDecay = 0.99;
-    float wDecay = 0.01;
+    OANNfloat lr = 0.01;
+    OANNfloat mDecay = 0.9;
+    OANNfloat vDecay = 0.99;
+    OANNfloat wDecay = 0.01;
     Optimizer oRecipe = AdamWCreate(lr, mDecay, vDecay, wDecay);
     VecArr p = VecArrCreate(2, 3);
     VecArr dp = VecArrCreateSameDim(p);
     Optimizer o = oRecipe->yieldOptimizer(oRecipe, p);
     struct adamw* a = (struct adamw*)o;
     o->destroy(oRecipe);
-    float mDesired[6];
-    float vDesired[6];
-    float pDesired[6];
+    OANNfloat mDesired[6];
+    OANNfloat vDesired[6];
+    OANNfloat pDesired[6];
     for (int i = 0; i < 2 * 3; i++) {
         p[i] = i;
         dp[i] = i;
@@ -80,9 +80,9 @@ TEST(AdamW) {
         pDesired[i] = i - lr * (mDesired[i] / (vDesired[i] + ADAMW_NUM_STAB_CONST) + wDecay * i);
     }
     o->optimize(o, p, dp);
-    if (!VecArrFloatArrIsEqual(a->m, mDesired)) TEST_FAILED
-    if (!VecArrFloatArrIsEqual(a->v, vDesired)) TEST_FAILED
-    if (!VecArrFloatArrIsEqual(p, pDesired)) TEST_FAILED
+    if (!VecArrOANNfloatArrIsEqual(a->m, mDesired)) TEST_FAILED
+    if (!VecArrOANNfloatArrIsEqual(a->v, vDesired)) TEST_FAILED
+    if (!VecArrOANNfloatArrIsEqual(p, pDesired)) TEST_FAILED
     o->destroy(o);
     TEST_PASSED
 }

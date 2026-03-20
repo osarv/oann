@@ -10,7 +10,7 @@ struct losser {
     void (*destroy)(Losser l);
     void (*forward)(Losser l, VecArr x);
     void (*backward)(Losser l, VecArr x, VecArr labels, VecArr dx);
-    float (*calcLoss)(Losser l, VecArr x, VecArr labels);
+    OANNfloat (*calcLoss)(Losser l, VecArr x, VecArr labels);
 };
 
 #endif //LOSSER_H

@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <math.h>
 #include "losser.h"
-#include "operation.h"
 //softmax cross entropy loss
 
 static void sceUnmount(Losser l) {
@@ -19,11 +18,11 @@ static void sceDestroy(Losser l) {
 
 static void sceForward(Losser l, VecArr x) {
     for (int i = 0; i < VecArrNVecs(x); i++) {
-        float maxVal = 0;
+        OANNfloat maxVal = 0;
         for (int j = 0; j < VecArrVecLen(x); j++) {
             if (x[i * VecArrVecLen(x) + j] > maxVal) maxVal = x[i * VecArrVecLen(x) + j];
         }
-        float sum = 0;
+        OANNfloat sum = 0;
         for (int j = 0; j < VecArrVecLen(x); j++) {
             l->y[i * VecArrVecLen(x) + j] = exp(x[i * VecArrVecLen(x) + j] - maxVal);
             sum += l->y[i * VecArrVecLen(x) + j];
@@ -37,10 +36,11 @@ static void sceBackward(Losser l, VecArr x, VecArr labels, VecArr dx) {
     for (int i = 0; i < VecArrNElems(l->y); i++) dx[i] = l->y[i] - labels[i];
 }
 
-static float sceCalcLoss(Losser l, VecArr x, VecArr labels) {
+#define SCE_EPSILON 1e-10f
+static OANNfloat sceCalcLoss(Losser l, VecArr x, VecArr labels) {
     (void)x; //correct implementation
-    float loss = 0;
-    for (int i = 0; i < VecArrNElems(l->y); i++) loss -= labels[i] * log(l->y[i]);
+    OANNfloat loss = 0;
+    for (int i = 0; i < VecArrNElems(l->y); i++) loss -= labels[i] * log(l->y[i] + SCE_EPSILON);
     return loss;
 }
 
@@ -57,11 +57,11 @@ TEST(SCE) {
     labels[1] = 1;
     labels[5] = 1;
 
-    float yDesired[6];
-    float dxDesired[6];
-    float sum1 = exp(0) + exp(1) + exp(2);
-    float sum2 = exp(3) + exp(4) + exp(5);
-    float lossDesired = 0;
+    OANNfloat yDesired[6];
+    OANNfloat dxDesired[6];
+    OANNfloat sum1 = exp(0) + exp(1) + exp(2);
+    OANNfloat sum2 = exp(3) + exp(4) + exp(5);
+    OANNfloat lossDesired = 0;
     for (int i = 0; i < 3; i++) yDesired[i] = exp(i) / sum1;
     for (int i = 3; i < 6; i++) yDesired[i] = exp(i) / sum2;
     for (int i = 0; i < 6; i++) {
@@ -70,9 +70,9 @@ TEST(SCE) {
     }
     l->forward(l, x);
     l->backward(l, x, labels, dx);
-    float loss = l->calcLoss(l, x, labels);
-    if (!VecArrFloatArrIsEqual(l->y, yDesired)) TEST_FAILED
-    if (!VecArrFloatArrIsEqual(dx, dxDesired)) TEST_FAILED
+    OANNfloat loss = l->calcLoss(l, x, labels);
+    if (!VecArrOANNfloatArrIsEqual(l->y, yDesired)) TEST_FAILED
+    if (!VecArrOANNfloatArrIsEqual(dx, dxDesired)) TEST_FAILED
     if (loss != lossDesired) TEST_FAILED
     l->unmount(l);
     l->destroy(l);
