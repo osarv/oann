@@ -3,7 +3,28 @@
 #include <string.h>
 #include <curl/curl.h>
 #include <zlib.h>
+#include "layer.h"
 #include "util.h"
+
+#ifdef TEST
+void main(){}
+
+struct testArrs TestPrepareLayer(Layer l) {
+    struct testArrs arrs;
+    arrs.x = VecArrCreate(3, 2);
+    arrs.dx = VecArrCreateSameDim(arrs.x);
+    l->init(l, VecArrVecLen(arrs.x), 1);
+    l->y = VecArrCreate(2, 2);
+    l->dy = VecArrCreateSameDim(l->y);
+    l->dp = PtrListInit();
+    for (int i = 0; i < PtrListLen(l->p); i++) {
+        VecArr p = PtrListGetIdx(l->p, i);
+        VecArr dp = VecArrCreateSameDim(p);
+        PtrListAdd(&(arrs.dp), dp);
+    }
+    return arrs;
+}
+#endif //TEST
 
 void* MallocOrCrash(size_t size) {
     void* ptr = malloc(size);

@@ -3,11 +3,9 @@
 #include "oann.h"
 #include "vecarr.h"
 
+//everything is owned and freed by the network
 struct losser {
     VecArr y;
-    void (*unmount)(Losser l);
-    void (*mount)(Losser l, VecArr x);
-    void (*destroy)(Losser l);
     void (*forward)(Losser l, VecArr x);
     void (*backward)(Losser l, VecArr x, VecArr labels, VecArr dx);
     OANNfloat (*calcLoss)(Losser l, VecArr x, VecArr labels);

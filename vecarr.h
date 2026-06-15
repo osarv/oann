@@ -1,7 +1,7 @@
 #ifndef VECARR_H
 #define VECARR_H
+#include <stdbool.h>
 #include "oann.h"
-#include "util.h"
 
 typedef OANNfloat* VecArr;
 int VecArrVecLen(VecArr v);

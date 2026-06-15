@@ -7,6 +7,7 @@
 //vector addition layer
 
 static void addInit(Layer l, int nIn, OANNfloat varScalingNextLayer) {
+    (void)varScalingNextLayer;
     l->nOut = nIn;
     l->p = PtrListInit();
     VecArr b = VecArrCreate(nIn, 1);
@@ -14,7 +15,7 @@ static void addInit(Layer l, int nIn, OANNfloat varScalingNextLayer) {
     PtrListAdd(&(l->p), b);
 }
 
-static vecArr addForward(Layer l, VecArr x) {
+static VecArr addForward(Layer l, VecArr x) {
     VecArr b = PtrListGetIdx(l->p, 0);
     for (int i = 0; i < VecArrNVecs(x); i++) {
         for (int j = 0; j < VecArrVecLen(l->y); j++) {
@@ -25,6 +26,8 @@ static vecArr addForward(Layer l, VecArr x) {
 }
 
 static VecArr addBackward(Layer l, VecArr x, VecArr dx) {
+    (void)x;
+    (void)dx;
     VecArr b = PtrListGetIdx(l->p, 0);
     VecArr db = PtrListGetIdx(l->dp, 0);
     for (int i = 0; i < VecArrVecLen(b); i++) {
@@ -32,16 +35,25 @@ static VecArr addBackward(Layer l, VecArr x, VecArr dx) {
         for (int j = 0; j < VecArrNVecs(l->y); j++) {
             sum += l->dy[i + j * VecArrVecLen(l->y)];
         }
+        db[i] = sum;
     }
     return l->dy;
 }
 
-static void addCreate() {
-    Layer l = malloc(sizeof(struct Layer));
+Layer AddCreate() {
+    Layer l = malloc(sizeof(struct layer));
     l->type = LAYER_ADD;
     l->varScaling = 1;
     l->init = addInit;
     l->forward = addForward;
     l->backward = addBackward;
     return l;
+}
+
+TEST(Add) {
+    Layer l = AddCreate();
+    struct testArrs arrs = TestPrepareLayer(l);
+    for (int i = 0; i < VecArrNElems(x); i++) x[i] = i + 1;
+    for (int i = 0; i < VecArrNElems(b); i++) w[i] = i + 3;
+    for (int i = 0; i < VecArrNElems(l->dy); i++) l->dy[i] = i;
 }

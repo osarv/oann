@@ -12,7 +12,7 @@ bin/test%.o: %.c bin
 testtarget: clean bin buildtest run
 mnisttarget: clean bin buildmnistdemo run
 
-buildtest: bin/test.o $(addprefix bin/test, $(addsuffix .o, $(basename $(SRCS))))
+buildtest: $(addprefix bin/test, $(addsuffix .o, $(basename $(SRCS))))
 	$(CC) $(CFLAGS) $^ -o bin/out $(LBINS) 
 
 buildmnistdemo: bin/mnistdemo.o $(addprefix bin/, $(addsuffix .o, $(basename $(SRCS))))

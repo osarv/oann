@@ -10,14 +10,14 @@ enum layerType {
     LAYER_RELU,
 };
 
-//layers are completely defined by the layer struct
+//everything is owned and freed by the network
 struct layer {
     enum layerType type;
     OANNfloat varScaling;
     int nOut; //may be set in create or init
     void (*init)(Layer l, int nIn, OANNfloat varScalingNextLayer);
     VecArr (*forward)(Layer l, VecArr x); //returns y; y may be x
-    VecArr (*backward)(Layer l, VecArr x, VecArr dx); //returns dx, dx may be dy; OBS: should NOT call the optimizers
+    VecArr (*backward)(Layer l, VecArr x, VecArr dx); //returns dx, dx may be dy; does NOT call the optimizers
     struct ptrList p; //list of parameters to optimize
     
     VecArr y; //OBS: created and filled by network

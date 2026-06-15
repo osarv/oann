@@ -3,10 +3,10 @@
 #include "vecarr.h"
 #include "oann.h"
 
+//everything is owned and freed by the network
 struct optimizer {
     void (*optimize)(Optimizer o, VecArr p, VecArr dp);
-    void (*destroy)(Optimizer o); //call with recipe optimizer is defined
-    Optimizer (*yieldOptimizer)(Optimizer oRecipe, VecArr p);
+    Optimizer (*yieldCopy)(Optimizer oRecipe, VecArr p);
 };
 
 #endif //OPTIMIZER_H

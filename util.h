@@ -1,19 +1,23 @@
 #ifndef UTIL_H
 #define UTIL_H
 #include <stdbool.h>
+#include "vecarr.h"
 
 #define COLOR_RESET "\x1b[0m"
 #define COLOR_RED "\x1b[31m"
 #define COLOR_GREEN "\x1b[32m"
 
-
 #ifdef TEST
 #undef TEST
 #define TEST(func) __attribute__((constructor)) static void Test##func()
+struct layerTestArrs {
+    VecArr x;
+    VecArr dx;
+};
+struct testArrs TestPrepareLayer(struct layer* l);
 #endif //TEST
 
 #ifndef TEST
-#undef TEST
 #define TEST(func) __attribute__((unused)) static void Test##func()
 #endif //TEST
 
