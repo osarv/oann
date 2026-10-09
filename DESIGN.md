@@ -25,7 +25,8 @@ ahead of the C reference over OpenBLAS (0.93 s, interleaved), and a transformer 
 (section 18): attention's products on std/linalg's `Gemm` (attention 1.5x faster at context 64, 2x at 256), and mixed
 precision - a `Graph<BF16>` stores everything in BF16 and computes in F32 with F32 master weights, matching F32's
 accuracy on MNIST and the character model with half the arena; on this compiler it runs 3.4-4.1x slower, its narrowing
-to BF16 being a library call per element (repro/bf16narrow).
+to BF16 being a library call per element (repro/bf16narrow). A `Dataset` trait and `Loader<D>` over it, and a graph
+planned `Ahead` filling the next batch on a task while the current one trains.
 
 ## 1. The operand: Matrix
 
@@ -113,6 +114,7 @@ parameters or a second loss need no new backward code.
 | `g.Save(path)`, `g.Load(path)` | the parameter region to and from a file | `state_dict` |
 | `checkpoint.Save(g, path, names, dtype)`, `checkpoint.Load(g, path, names)` | the parameters as safetensors, by name | `save_file`, `load_state_dict` |
 | `g.Profiling`, `g.Times` | time per kind of operation, forward and backward | `torch.profiler` |
+| `g.Ahead = true` before `Plan`; `g.NextInputData(x)`, `g.NextClassData(y)`, `g.Flip()` | a second region for every input, filled for the next step while this one runs | a `DataLoader` worker |
 | `nn.Graph<BF16>(...)`, `g.Masters()`, `g.SyncParams()` | mixed precision: BF16 storage, F32 computation, F32 masters | `autocast(dtype=torch.bfloat16)`, roughly |
 
 `Product` and `Multiply` are the builders of `MatMul` and `Mul`: olang reserves the operator methods' names (`MatMul`
@@ -318,10 +320,17 @@ generates with and without the key-value cache.
 ## 7. Datasets (`datasets/`)
 
 - `datasets/idx` reads the IDX format; its elements are a view of the file's bytes.
-- `datasets/loader`: `Labeled` holds a set as bytes with a per-feature `Scale` and `Shift` (default `1/255` and `0`).
-  `Loader` makes a seeded order each epoch (Fisher-Yates, std/rand's xoshiro256**) and `Fill(b, x, y)` writes batch
-  `b` as F32 rows and classes into the graph's own buffers, giving its size (the last is short). Nothing is allocated
-  per batch.
+- `datasets/loader`: a `Dataset` is a trait (a constraint) - `Size()` samples of `Dim()` features, and `Get(i,
+  features)` writing sample `i`'s features as F32 and giving its class. `Labeled` is one: a set held as bytes with a
+  per-feature `Scale` and `Shift` (default `1/255` and `0`). `Loader<D Dataset>` makes a seeded order each epoch
+  (Fisher-Yates, std/rand's xoshiro256**) and `Fill(b, x, y)` writes batch `b` as rows and classes into the graph's
+  own buffers - rounded to the graph's type, BF16 for a mixed-precision graph - giving its size (the last is short).
+  Nothing is allocated per batch.
+- **Filling ahead.** A graph planned with `g.Ahead = true` has two regions for every input; `train.Epoch` and
+  `Evaluate` then fill batch `b + 1` into the second (`g.NextInputData`, `g.NextClassData`) on a task, while batch `b`
+  runs forward, backward and through the optimizer in the same `join` block, and `g.Flip()` swaps the two between
+  steps. Nothing in a step touches the region being filled, so there is no lock; the join is the handoff. The results
+  are identical to filling in turn (`train.olang`'s test). Measured in section 18.
 - `datasets/mnist` fetches the four files with curl and gunzip into `data/mnist` (each written to a `.part` file and
   renamed when whole), validates them and loads both sets. Fashion-MNIST and KMNIST are the same call with another
   address.
@@ -335,8 +344,7 @@ generates with and without the key-value cache.
   `Fetch` gets tiny Shakespeare with curl (written to a `.part` file and renamed).
 
 Tokens beyond characters are `tokenizer.olang`'s byte-level BPE (section 16): its ids go into the same `Windows`.
-Next: a `Dataset` trait (a constraint) so one `Loader<D>` takes any source, and filling the next batch on a task while
-the step runs.
+(`Windows` fills a language model's batch in 0.01 ms - nothing worth filling ahead.)
 
 ## 8. Results and performance (measured 2026-10-09)
 
@@ -957,7 +965,7 @@ circuit's flat parameter region with the same loops `AdamW`/`Sgd` use.
 `examples/bandit_settle.olang` runs the contextual bandit, reversal and trace-pinning tasks over many lives with
 confidence intervals. The results and decisions are in docs/settling.md, sections 2.11, 5.8 and 6.
 
-## 18. Phase 5: attention on products, mixed precision
+## 18. Phase 5: attention on products, mixed precision, a Dataset trait
 
 ### Attention through std/linalg's Gemm
 
@@ -1080,6 +1088,26 @@ a full and a short batch. The masters start where an F32 graph's parameters do, 
 graph move masters by steps BF16 cannot hold (1 - 1e-4 rounds back to 1), until they show in the graph. Checkpoints,
 raw and safetensors, load between BF16 and F32 graphs exactly. `kernels.ToBF16` gives `BF16(x)`'s bits for zeros,
 ties, subnormals, the largest finite values, infinities and NaN (and all 4,194,304 normal draws of the reproducer).
+
+### A Dataset trait, and filling the next batch on a task
+
+`loader.Dataset` is a trait - `Size()`, `Dim()`, `Get(i, features)` - and `Loader<D Dataset>` reads any type that
+has those methods, `Labeled` (bytes, scaled and shifted) among them; a test reads a dataset made up as it is read. The
+loader writes F32 features straight into an F32 batch, and through a row of its own, rounded once, into a BF16 one.
+
+A graph planned `Ahead` keeps two regions per input (section 7), and `train.Epoch` and `Evaluate` fill the next batch
+into the second on a task - `spawn next = l.Fill(b + 1, g.NextInputData(x), g.NextClassData(y))` in the `join` block
+that runs the step - then `Flip` between steps. Three epochs with and without it give the same losses, parameters and
+accuracy bit for bit. `examples/mnist_mlp.olang` plans its graph `Ahead`.
+
+**Measured** (`bench/train.olang`: `train.Epoch` on two graphs, one `Ahead`, alternating rounds, medians of five): it
+gains only where a core is free, and this machine never had one while it was measured. Filling a batch is 8% of an
+MNIST epoch (50 ms of 0.60 s; 2-4 ms of a CNN or language model's step, nothing worth hiding), and a `join` with one
+task costs 7 us once its worker is cached (3.4 ms over an epoch's 469 batches) - so on an idle core the epoch would
+lose up to ~45 ms of its 0.60 s. Under the shared machine's load of 6-12 on 4 cores, the task waits for a core and the
+step waits for the task: 0.61 s in turn against 0.74 filling ahead at a load of 6, then 0.78-0.88 against 0.83-1.01 at
+12 (six runs). It is worth turning on for a training run with a core to spare, and costs a second input region (0.39 MB
+for MNIST's batches); the examples other than MNIST's leave it off.
 
 ### olang issues found in phase 5 (repro/)
 

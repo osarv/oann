@@ -131,6 +131,7 @@ type Node struct(Kind Op, Rows I64, Cols I64, Batched Bool) {
     Offset mut I64 = 0
     GradOffset mut I64 = -1
     SavedOffset mut I64 = -1
+    NextOffset mut I64 = -1         # an input's second region, when the graph is Ahead: the next step's batch
 }
 
 # a network of T elements, planned for batches of up to Batch rows; its products split over Threads tasks. A graph
@@ -156,6 +157,8 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     scratchSize mut I64 = 0
     colsOffset mut I64 = 0          # convolutions' patches (conv.Im2col): the largest one's, shared by all
     colsSize mut I64 = 0
+    Ahead mut Bool = false          # set before Plan: every input has a second region, filled for the next step while
+                                    # this one runs (NextInputData, NextClassData, then Flip)
     Profiling mut Bool = false      # with it set, Times collects where Forward and Backward spend their time:
     Times mut Array<I64>& = Array<I64>(2 * KindNames.Len())  # ns, Times[2 k] forward, Times[2 k + 1] backward, kind k
     masters mut Array<F32>& = Array<F32>(0)   # a BF16 graph's parameters in F32, laid out as Params() is
@@ -489,10 +492,18 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
             case Op.Classes, Op.Tokens {
                 nd.Offset = rows
                 rows += nd.Rows
+                if g.Ahead {
+                    nd.NextOffset = rows
+                    rows += nd.Rows
+                }
             }
             nomatch {
                 nd.Offset = at
                 at += size
+                if g.Ahead and nd.Kind is Op.Input {
+                    nd.NextOffset = at
+                    at += size
+                }
                 if needs[i] {
                     nd.GradOffset = at
                     at += size
@@ -650,6 +661,42 @@ fn (g Graph<<T>>&) ClassData(v Var) mut Array<I32>&g {
 # where the caller puts a batch's tokens, one per row
 fn (g Graph<<T>>&) TokenData(v Var) mut Array<I32>&g {
     return g.ClassData(v)
+}
+
+# ---- filling the next batch while this one runs ----
+# A graph planned Ahead has two regions for every input (Input, Classes, Tokens): the one this step reads, and the one
+# the next step will - which a task may fill while this step runs, since nothing in the step touches it. Flip, between
+# steps, makes the next region this one.
+
+# where the next step's batch of input v goes, in a graph planned Ahead
+fn (g Graph<<T>>&) NextInputData(v Var) mut Array<T>&g {
+    nd := g.nodes[v]
+    if nd.NextOffset < 0 { mismatch("NextInputData of a graph not planned Ahead, or of a node no Input") }
+    return g.mem[nd.NextOffset:nd.NextOffset + nd.Rows * nd.Cols]
+}
+
+# where the next step's classes (or tokens) go, in a graph planned Ahead
+fn (g Graph<<T>>&) NextClassData(v Var) mut Array<I32>&g {
+    nd := g.nodes[v]
+    if nd.NextOffset < 0 { mismatch("NextClassData of a graph not planned Ahead, or of a node no Classes or Tokens") }
+    return g.classes[nd.NextOffset:nd.NextOffset + nd.Rows]
+}
+
+fn (g Graph<<T>>&) NextTokenData(v Var) mut Array<I32>&g {
+    return g.NextClassData(v)
+}
+
+# makes every input's next region the one the next Forward reads, and this one the region filled after it
+fn (g mut Graph<<T>>&) Flip() {
+    for i in range g.nodes.Len() {
+        nd := g.nodes[i]
+        if nd.NextOffset >= 0 {
+            at := nd.Offset
+            nd.Offset = nd.NextOffset
+            nd.NextOffset = at
+            g.nodes[i] = nd
+        }
+    }
 }
 
 # attention's scratch: a region of the arena
