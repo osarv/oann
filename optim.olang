@@ -61,10 +61,12 @@ type Regularizer enum {
 
 # ---- the input projection, shared by every optimizer ----
 
-# the workspace the projection needs: the largest dense layer's batch x outputs, and one norm per row
+# the workspace the projection needs: the largest dense layer's batch x outputs, one norm per row, and its product's
+# packing panels (grown in the first step, so a step allocates nothing after it)
 type projectionSpace<T> struct(g mut nn.Graph<T>&) {
     m mut Array<T>& = Array<T>(largestLinear(g))
     norms mut Array<T>& = Array<T>(g.Batch)
+    ws mut linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()
 }
 
 fn largestLinear(g mut nn.Graph<<T>>&) I64 {
@@ -106,7 +108,7 @@ fn project(g mut nn.Graph<<T>>&, alpha F64, normalized Bool, space mut projectio
                         }
                     }
                 }
-                linalg.Gemm(w, m, true, x, false, -alpha / F64(x.Rows), 1, g.Threads)
+                space.ws.Gemm(w, m, true, x, false, -alpha / F64(x.Rows), 1, g.Threads)
             }
             nomatch { }
         }

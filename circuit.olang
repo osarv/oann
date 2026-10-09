@@ -167,6 +167,7 @@ type Circuit<T> struct(Rows I64) {
     residual mut I64 = 0
     lastResidual mut I64 = 0
     mass mut I64 = 0
+    ws mut linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()  # the products' packing panels, grown once
 }
 
 # a circuit that is wrong - a shape, a role, an order of calls: stops with what is wrong
@@ -588,16 +589,14 @@ fn (c mut Circuit<<T>>&) prepare(v I64, s I64) {
         w := c.Weights(Projection(i))
         pre := c.regions[pr.Pre]
         post := c.regions[pr.Post]
-        for b in range c.N {
-            to I64 = c.constant + b * n + post.Col
-            from I64 = s + b * n + pre.Col
-            linalg.Gemv(c.mem[to:to + post.Size], w, false, c.mem[from:from + pre.Size], 1, 1)
-        }
+        to := linalg.View(c.mem, c.constant + post.Col, c.N, post.Size, n)
+        from := linalg.View(c.mem, s + pre.Col, c.N, pre.Size, n)
+        c.ws.Gemm(to, from, false, w, true, 1, 1)
     }
 }
 
 # total = the constant (or zero) + every recurrent block's transport of the activities at x: s_pre W^T into post, and
-# for a reciprocal block s_post W into pre - one matrix-vector product per block, direction and row
+# for a reciprocal block s_post W into pre - one product per block and direction, the batch's rows together
 fn (c mut Circuit<<T>>&) transport(x I64, withConstant Bool) {
     n := c.Neurons
     if withConstant { c.copyRun(c.constant, c.total, c.N * n) } else { c.zeroRun(c.total, c.N * n) }
@@ -607,17 +606,13 @@ fn (c mut Circuit<<T>>&) transport(x I64, withConstant Bool) {
         w := c.Weights(Projection(i))
         pre := c.regions[pr.Pre]
         post := c.regions[pr.Post]
-        both Bool = pr.Kind is Wiring.Reciprocal
-        for b in range c.N {
-            row I64 = b * n
-            tp I64 = c.total + row + post.Col
-            xp I64 = x + row + pre.Col
-            linalg.Gemv(c.mem[tp:tp + post.Size], w, false, c.mem[xp:xp + pre.Size], 1, 1)
-            if both {
-                tq I64 = c.total + row + pre.Col
-                xq I64 = x + row + post.Col
-                linalg.Gemv(c.mem[tq:tq + pre.Size], w, true, c.mem[xq:xq + post.Size], 1, 1)
-            }
+        to := linalg.View(c.mem, c.total + post.Col, c.N, post.Size, n)
+        from := linalg.View(c.mem, x + pre.Col, c.N, pre.Size, n)
+        c.ws.Gemm(to, from, false, w, true, 1, 1)
+        if pr.Kind is Wiring.Reciprocal {
+            back := linalg.View(c.mem, c.total + pre.Col, c.N, pre.Size, n)
+            at := linalg.View(c.mem, x + post.Col, c.N, post.Size, n)
+            c.ws.Gemm(back, at, false, w, false, 1, 1)
         }
     }
 }
