@@ -1027,6 +1027,10 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
   lesson and 4 an answer - the certificate bounds each readout neuron's input to 0.9, which the cross-entropy at
   `T = 0.25` cannot separate ten classes well with; a deployed circuit wants a lower temperature or training aware of
   the bound. An epoch takes 8.7 s on the shared machine (backprop's 784-128-10 epoch: 2.4 s; 2.10 says where it goes).
+- **End to end, spiking MNIST** (the same example with `window` 256: Lif hidden and readout neurons, squared error
+  toward 0.2 spikes a step for the class, `beta = 1`, Adam 5e-3, 10 000 training samples): 89.73% after one pass,
+  90.48% after two; about 1 870 steps a lesson and 780 an answer, 45-66 s a pass. Learning works on spike counts;
+  it is slow and noisy beside the rate circuit, as 4.6 expects (long windows, many steps).
 
 ## 6. Decisions and open questions
 
