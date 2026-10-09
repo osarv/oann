@@ -105,6 +105,32 @@ fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&) I64 {
     return active
 }
 
+# the code of reading x at the mean as it is, its K cells (increasing) into idx and their values into code; gives the
+# cells active - what Read and Write compute first, kept by a caller that reads or writes one reading many times
+fn (s mut Store<<T>>&) Encode(x Array<T>&, idx mut Array<I32>&, code mut Array<T>&) I64 {
+    active := s.code(x)
+    for j in range s.K {
+        idx[j] = s.Idx[j]
+        code[j] = s.Code[j]
+    }
+    return active
+}
+
+# Read at a code Encode gave: code T at its cells, into out
+fn (s mut Store<<T>>&) ReadCode(idx Array<I32>&, code Array<T>&, out mut Array<T>&) {
+    sparse.GatherRowsWeighted(out, s.Table, idx, code, s.K)
+}
+
+# Write at a code Encode gave: the delta rule toward target at its cells, at Rate - the mean does not move (the code is
+# already made)
+fn (s mut Store<<T>>&) WriteCode(idx Array<I32>&, code Array<T>&, target Array<T>&) {
+    like T
+    sparse.GatherRowsWeighted(s.y, s.Table, idx, code, s.K)
+    for t in range s.Outputs { s.err[t] = target[t] - s.y[t] }
+    sparse.ScatterRank1(s.Table, idx, code, s.K, s.err, linalg.Cast(s.Rate, like))
+    s.Writes++
+}
+
 # the table forgets everything (the projection and the mean stay)
 fn (s mut Store<<T>>&) Clear() {
     zero T
@@ -185,6 +211,29 @@ test "a write at rate 1 is read back exactly; another reading is disturbed only 
             for t in range 3 { assert out[t] == before[t] }
         }
     }
+}
+
+test "a code kept: ReadCode and WriteCode are Read and Write at the code Encode gave" {
+    a := Store<F64>(8, 2, 11, 0, 0, 1, 0)
+    b := Store<F64>(8, 2, 11, 0, 0, 1, 0)
+    r := rand.Rand(5)
+    idx := Array<I32>(a.K)
+    code := Array<F64>(a.K)
+    out := Array<F64>(2)
+    want := Array<F64>(2)
+    for trial in range 30 {
+        x := reading(r, 8)
+        target := reading(r, 2)
+        a.Encode(x, idx, code)
+        a.WriteCode(idx, code, target)
+        b.Write(x, target)
+        q := reading(r, 8)
+        a.Encode(q, idx, code)
+        a.ReadCode(idx, code, out)
+        b.Read(q, want)
+        for t in range 2 { assert out[t] == want[t] }
+    }
+    for i in range a.Table.Len() { assert a.Table[i] == b.Table[i] }
 }
 
 test "the running mean follows the writes, and a smaller rate averages noisy targets" {

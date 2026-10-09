@@ -6,9 +6,9 @@ OLANG ?= /home/user/wt/oannc2/build/out
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang datasets/loader.olang \
 	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
-	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang
+	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -72,7 +72,7 @@ safetensors:
 
 # MNIST by a settling circuit the board can run, its lessons settled on the simulated board engine (board.olang) or in
 # F32, the test set answered both ways after every epoch - ARGS: epochs, board or float, samples, hidden, batch, seed,
-# rate, beta, temperature
+# rate, beta, temperature, restrain, and a window to make it spiking
 board:
 	$(OLANG) -b examples/mnist_board.olang
 	./build/examples_mnist_board $(ARGS)
@@ -82,6 +82,12 @@ board:
 sparse:
 	$(OLANG) -b bench/sparse.olang
 	./build/bench_sparse $(ARGS)
+
+# sleep against interference (consolidator.olang): days of a flip-flop with and without nights - ARGS: nights or
+# retention, seeds, days, sequences a day, repeats, hidden, window, passes, the day's step, the night's rate
+sleep:
+	$(OLANG) -b examples/sleep_retention.olang
+	./build/examples_sleep_retention $(ARGS)
 
 # an epoch's time against C over OpenBLAS (bench/epoch.sh)
 epoch:
