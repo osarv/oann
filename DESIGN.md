@@ -638,7 +638,15 @@ multi-index - not used by oann, whose element access is `Get`/`Set` and runs of 
    lower-triangular block skipped. Attention runs on a `Gemm` per sequence and head now (section 18): 29 of ~150 ms a
    step at context 64, 73 of ~180 at 256, growing as `T^2` - and half of each product is the upper triangle the
    softmax then throws away. A batched causal `Gemm` would skip it and make one call where there are six per sequence
-   and head; `ops.attendHead` and `ops.attendHeadBackward` are where it goes in. Also: **std/linalg computes a product
+   and head; `ops.attendHead` and `ops.attendHeadBackward` are where it goes in. **It exists now** (std/linalg's
+   `GemmBatch` over `Batch<T>` - `m.Heads(T, heads)` for q, k, v and their gradients, `m.Stacked(T, heads)` for `P`,
+   `Triangular.Result` computing only `j <= i`, `Triangular.Left` reading its left operand as lower-triangular), on an
+   olang newer than the edf8238 this phase was built with. Adopting it (section 18): `Attention` and
+   `AttentionBackward` make the six calls over every sequence and head at once, with std/linalg's threads, and run the
+   softmax and `dS` passes over `P`'s rows between them - those passes already write the zeros above the diagonal that
+   `Result` leaves uncomputed. What goes: the per-sequence tasks, their workspaces and `Plan`'s warm-up, and the
+   transposes; what changes: the scratch becomes one `dS` the size of `P` (`B heads T x T`), in place of a `T x T`
+   and a `dh x T` per task. Also: **std/linalg computes a product
    of at most 64^3 multiply-adds directly** (no packing) when its right operand is not transposed, and on this
    machine's AVX-512 that path is 3x slower than the packed one at attention's `64 x 32 x 64` (17-21 us against 6.5);
    attention transposes its right operands to reach the packed path. The threshold wants lowering on wide targets.
