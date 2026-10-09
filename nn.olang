@@ -26,6 +26,7 @@ import "std/rand"
 import "std/time"
 import "ops"
 import "kernels"
+import "conv"
 
 # a node's handle: an index into the graph's nodes
 type Var I64
@@ -67,6 +68,8 @@ type Op enum {
     Dropout(x Var, p F64)                           # while training, each element zeroed with probability p
     SoftmaxCrossEntropy(logits Var, classes Var)    # the mean over the rows: a 1 x 1 loss
     Mse(a Var, b Var)                               # the mean of the squared differences: a 1 x 1 loss
+    Conv2d(x Var, w Var, b Var, s conv.Shape)       # a convolution of images held as rows, channels last (conv)
+    MaxPool2d(x Var, p conv.Pool)                   # each window's maximum, per channel
 }
 
 # ---- profiling ----
@@ -75,7 +78,7 @@ type Op enum {
 KindNames := String&[
     "Input", "Classes", "Tokens", "Constant", "Param", "MatMul", "Linear", "AddRow", "Add", "Sub", "Mul", "Scale",
     "Relu", "LeakyRelu", "Gelu", "GeluTanh", "Sigmoid", "Tanh", "Softmax", "Embedding", "Positions", "LayerNorm",
-    "RmsNorm", "Attention", "Dropout", "SoftmaxCrossEntropy", "Mse"
+    "RmsNorm", "Attention", "Dropout", "SoftmaxCrossEntropy", "Mse", "Conv2d", "MaxPool2d"
 ]
 
 fn KindOf(k Op) I64 {
@@ -107,6 +110,8 @@ fn KindOf(k Op) I64 {
         case Op.Dropout(_, _) => 24
         case Op.SoftmaxCrossEntropy(_, _) => 25
         case Op.Mse(_, _) => 26
+        case Op.Conv2d(_, _, _, _) => 27
+        case Op.MaxPool2d(_, _) => 28
     }
 }
 
@@ -143,6 +148,8 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     workSize mut I64 = 0
     scratchOffset mut I64 = 0       # attention's backward: a T x T matrix per task
     scratchSize mut I64 = 0
+    colsOffset mut I64 = 0          # convolutions' patches (conv.Im2col): the largest one's, shared by all
+    colsSize mut I64 = 0
     Profiling mut Bool = false      # with it set, Times collects where Forward and Backward spend their time:
     Times mut Array<I64>& = Array<I64>(2 * KindNames.Len())  # ns, Times[2 k] forward, Times[2 k + 1] backward, kind k
     planned mut Bool = false
@@ -360,6 +367,34 @@ fn (g mut Graph<<T>>&) Mse(a Var, b Var) Var {
     return g.add(Op.Mse(a, b), 1, 1, false)
 }
 
+# a convolution of the images x - rows of H x W pixels of inC channels, the channels of a pixel together - by outC
+# kernels of kernel x kernel, w outC x (inC kernel kernel) (PyTorch's Conv2d weight) and b 1 x outC, moved stride
+# pixels at a time over the images padded with "padding" zeros: rows of OutH x OutW pixels of outC channels (conv)
+fn (g mut Graph<<T>>&) Conv2d(x Var, w Var, b Var, inC I64, outC I64, kernel I64, stride I64, padding I64, H I64,
+        W I64) Var {
+    s := conv.Shape(inC, H, W, outC, kernel, stride, padding)
+    xs := g.nodes[x]
+    ws := g.nodes[w]
+    bs := g.nodes[b]
+    if not s.Valid() or xs.Cols != H * W * inC or ws.Rows != outC or ws.Cols != s.Patch() or bs.Rows != 1 or
+            bs.Cols != outC or ws.Batched or bs.Batched {
+        mismatch("Conv2d of " $g.shape(x) " as " $H "x" $W "x" $inC " images by weights " $g.shape(w) " and bias "
+            $g.shape(b) ": " $outC " kernels of " $kernel "x" $kernel ", stride " $stride ", padding " $padding)
+    }
+    return g.add(Op.Conv2d(x, w, b, s), xs.Rows, s.Positions() * outC, xs.Batched)
+}
+
+# max pooling of the images x - rows of H x W pixels of C channels, channels last - over kernel x kernel windows
+# moved stride pixels at a time: rows of OutH x OutW pixels of C channels
+fn (g mut Graph<<T>>&) MaxPool2d(x Var, C I64, H I64, W I64, kernel I64, stride I64) Var {
+    p := conv.Pool(C, H, W, kernel, stride)
+    xs := g.nodes[x]
+    if not p.Valid() or xs.Cols != H * W * C {
+        mismatch("MaxPool2d of " $g.shape(x) " as " $H "x" $W "x" $C " images over " $kernel "x" $kernel " windows")
+    }
+    return g.add(Op.MaxPool2d(x, p), xs.Rows, p.OutH * p.OutW * C, xs.Batched)
+}
+
 # ---- planning ----
 
 # the inputs of an operation, -1 where it has fewer than three
@@ -373,7 +408,8 @@ fn inputs(k Op) (I64, I64, I64) {
         case Op.Relu(x), Op.Gelu(x), Op.GeluTanh(x), Op.Sigmoid(x), Op.Tanh(x), Op.Softmax(x) { return x, -1, -1 }
         case Op.Embedding(t, w), Op.Positions(t, w, _), Op.RmsNorm(t, w, _) { return t, w, -1 }
         case Op.LayerNorm(x, a, b, _), Op.Attention(x, a, b, _, _, _) { return x, a, b }
-        case Op.Dropout(x, _) { return x, -1, -1 }
+        case Op.Dropout(x, _), Op.MaxPool2d(x, _) { return x, -1, -1 }
+        case Op.Conv2d(x, w, b, _) { return x, w, b }
         case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { return -1, -1, -1 }
     }
 }
@@ -399,7 +435,7 @@ fn (g Graph<<T>>&) savedShape(nd Node&, inUse Bool) (I64, I64) {
             if g.Decoding { return 2 * T * nd.Cols + T, 1 }     # the cache: keys and values, T x Cols each, and scores
             return rows * heads, T
         }
-        case Op.Dropout(_, _) { return rows, nd.Cols }
+        case Op.Dropout(_, _), Op.MaxPool2d(_, _) { return rows, nd.Cols }     # the mask; each maximum's place
         nomatch { return 0, 0 }
     }
 }
@@ -425,6 +461,9 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     rows I64 = 0
     widest I64 = 1                              # the largest dimension of any node: what a product can be
     scratch I64 = 0
+    cols I64 = 0                                # the largest convolution's patches, and its products' workspace
+    like <T>
+    convWork I64 = 0
     for i in range count {
         nd := g.nodes[i]
         size I64 = nd.Rows * nd.Cols
@@ -452,19 +491,27 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
                     case Op.Attention(_, _, _, _, T, _) {
                         if needs[i] and g.Threads * T * T > scratch { scratch = g.Threads * T * T }
                     }
+                    case Op.Conv2d(_, _, _, s) {
+                        if nd.Rows * s.Positions() * s.Patch() > cols { cols = nd.Rows * s.Positions() * s.Patch() }
+                        cw := conv.GemmSpace(s, nd.Rows, g.Threads, like)
+                        if cw > convWork { convWork = cw }
+                    }
                     nomatch { }
                 }
             }
         }
         g.nodes[i] = nd
     }
-    like <T>
     g.workOffset = at
     g.workSize = kernels.GemmSpace(widest, widest, widest, g.Threads, like)
+    if convWork > g.workSize { g.workSize = convWork }
     at += g.workSize
     g.scratchOffset = at
     g.scratchSize = scratch
     at += scratch
+    g.colsOffset = at
+    g.colsSize = cols
+    at += cols
     g.mem = Array<<T>>(at)
     g.classes = Array<I32>(rows)
     g.written = Array<Bool>(count)
@@ -533,6 +580,11 @@ fn (g Graph<<T>>&) work() mut Array<<T>>&g {
 
 fn (g Graph<<T>>&) scratch() mut Array<<T>>&g {
     return g.mem[g.scratchOffset:g.scratchOffset + g.scratchSize]
+}
+
+# a convolution's patches for n images, in the region every convolution shares
+fn (g Graph<<T>>&) patches(s conv.Shape&, n I64) linalg.Matrix<<T>> {
+    return linalg.View(g.mem, g.colsOffset, n * s.Positions(), s.Patch())
 }
 
 # a loss's value: the 1 x 1 node's element
@@ -681,6 +733,10 @@ fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
             y.Data[0] = ops.SoftmaxCrossEntropy(g.Value(z), g.classData(c), g.saved(node))
         }
         case Op.Mse(a, b) { y.Data[0] = ops.Mse(g.Value(a), g.Value(b)) }
+        case Op.Conv2d(x, w, b, s) {
+            conv.Conv2d(y, g.Value(x), g.Value(w), g.Value(b), s, g.patches(s, y.Rows), th, g.work())
+        }
+        case Op.MaxPool2d(x, p) { conv.MaxPool2d(y, g.Value(x), p, g.saved(node), th) }
     }
 }
 
@@ -879,6 +935,19 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
             db := g.gradOf(b)
             cb := g.acc(b)
             ops.MseBackward(dy.Data[0], g.Value(a), g.Value(b), da, ca, db, cb)
+        }
+        case Op.Conv2d(x, w, b, s) {
+            dx := g.gradOf(x)
+            cx := g.acc(x)
+            dw := g.gradOf(w)
+            cw := g.acc(w)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            conv.Conv2dBackward(dy, g.Value(x), g.Value(w), s, dx, cx, dw, cw, db, cb, g.patches(s, dy.Rows), th,
+                g.work())
+        }
+        case Op.MaxPool2d(x, p) {
+            if g.nodes[x].GradOffset >= 0 { conv.MaxPool2dBackward(dy, g.saved(v), p, g.Grad(x), g.acc(x), th) }
         }
     }
 }

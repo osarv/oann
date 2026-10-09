@@ -5,9 +5,10 @@ OLANG ?= /home/user/wt/oannc2/build/out
 
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang \
-	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang
+	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
+	vision.olang
 
-.PHONY: test data bench epoch mnist charlm lmbench lmref bpe bpelm safetensors clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -22,6 +23,12 @@ data bench:
 mnist:
 	$(OLANG) -b examples/mnist_mlp.olang
 	./build/examples_mnist_mlp $(ARGS)
+
+# trains a small convolutional network on MNIST (two 3x3 convolutions with ReLU and 2x2 max pooling, then a dense layer)
+# - ARGS: epochs, seed, threads, the convolutions' channels C1 and C2, and "profile" for where the first epoch goes
+cnn:
+	$(OLANG) -b examples/mnist_cnn.olang
+	./build/examples_mnist_cnn $(ARGS)
 
 # trains the character-level transformer on tiny Shakespeare (fetched into data/shakespeare once) and generates a
 # sample - ARGS: steps, seed, threads, dropout, characters to generate

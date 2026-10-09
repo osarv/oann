@@ -16,7 +16,8 @@ built** (section 11): tokens, embeddings, learned positions, layer and RMS norma
 dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
 with a key-value cache - every backward checked against central differences, the first training steps equal to the same
 model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Phase 4** (section 16):
-a byte-level BPE tokenizer, and the transformer trained on its tokens; safetensors checkpoints. **Next: settling networks** (docs/settling.md).
+a byte-level BPE tokenizer, and the transformer trained on its tokens; safetensors checkpoints; convolution and max
+pooling (im2col and one product for the whole batch), and a small CNN on MNIST. **Next: settling networks** (docs/settling.md).
 
 ## 1. The operand: Matrix
 
@@ -30,9 +31,9 @@ is no N-d tensor - data is interpreted in one place only, by the operation that 
 - **A bias is a `1 x C` matrix**, added to every row by an explicit row operation; there is no implicit broadcasting.
 - **Views are by row stride.** A matrix is shape, stride and a reference to storage; `linalg.View(data, offset, rows,
   cols)` makes one over the graph's arena without allocating, and a short batch is the view of its first rows.
-- **Structure beyond two dimensions lives in the operation.** A convolution reads each row as one `C x H x W` image
-  (im2col into a workspace, one GEMM); attention reads rows as `B x T` tokens and its heads as column blocks
-  (section 11).
+- **Structure beyond two dimensions lives in the operation.** A convolution reads each row as one `H x W x C` image,
+  channels last (im2col into a workspace, one GEMM for the whole batch: section 16); attention reads rows as `B x T`
+  tokens and its heads as column blocks (section 11).
 
 oann is generic over the element type: MNIST trains in `F32`, the gradient checks run in `F64`, and `BF16` storage with
 `F32` accumulation is the mixed-precision path (std/linalg already accumulates `F16`/`BF16` products in `F32`).
@@ -70,8 +71,8 @@ parameters or a second loss need no new backward code.
   `MatMul(a, b, ta, tb)`, `Linear(x, w, b)`, `AddRow(x, b)`, `Add`, `Sub`, `Mul`, `Scale(x, k)`, `Relu`,
   `LeakyRelu(x, slope)`, `Gelu`, `GeluTanh`, `Sigmoid`, `Tanh`, `Softmax`, `Embedding(tokens, table)`,
   `Positions(x, table, T)`, `LayerNorm(x, gain, bias, eps)`, `RmsNorm(x, gain, eps)`, `Attention(q, k, v, heads, T,
-  causal)`, `Dropout(x, p)`, `SoftmaxCrossEntropy(logits, classes)`, `Mse`, and the leaves `Input`, `Classes`,
-  `Tokens`, `Constant`, `Param(init, decay)`.
+  causal)`, `Dropout(x, p)`, `SoftmaxCrossEntropy(logits, classes)`, `Mse`, `Conv2d(x, w, b, shape)`,
+  `MaxPool2d(x, pool)`, and the leaves `Input`, `Classes`, `Tokens`, `Constant`, `Param(init, decay)`.
 - **Views are values.** `g.Value(v)` and `g.Grad(v)` are `Matrix<T>` views of the arena, made per use for nothing.
 - **Traits only as constraints.** A training loop takes `o mut <O optim.Optimizer<F32>>&`, so the optimizer's step is a
   direct, inlinable call.
@@ -97,6 +98,7 @@ parameters or a second loss need no new backward code.
 | `g.LayerNorm(x, gain, bias)`, `g.RmsNorm(x, gain)` | row-wise normalization | `nn.LayerNorm`, `nn.RMSNorm` |
 | `g.Attention(q, k, v, heads, T, causal)` | multi-head attention per sequence of `T` rows, fused | `scaled_dot_product_attention` |
 | `g.Dropout(x, p)`, `g.Training` | dropout from the graph's own `g.Rng`, off when `Training` is false | `nn.Dropout`, `.train()` |
+| `g.Conv2d(x, w, b, inC, outC, k, stride, pad, H, W)`, `g.MaxPool2d(x, C, H, W, k, stride)` | images as rows, channels last | `nn.Conv2d`, `nn.MaxPool2d` on NHWC |
 | a negative class | a padding row the loss ignores, the mean over the rest | `ignore_index` |
 | `nn.Graph<F32>(T, 1, true)`, `g.Pos` | a graph for decoding: forward only, a key-value cache per attention | `past_key_values` |
 | `g.Save(path)`, `g.Load(path)` | the parameter region to and from a file | `state_dict` |
@@ -129,8 +131,9 @@ One `Array<T>` per graph, laid out at `Plan`:
 3. every other node's **value**, its **gradient** when it needs one, and what its backward keeps (softmax cross-entropy
    its probabilities, the normalizations each row's statistics, attention its probabilities - `T x T` per sequence and
    head - and dropout its mask; in a graph for decoding, attention's key-value cache);
-4. the products' **packing workspace** (`kernels.Gemm`, sized once from the graph's largest dimension) and attention's
-   backward **scratch** (one `T x T` matrix per task).
+4. the products' **packing workspace** (`kernels.Gemm`, sized once from the graph's largest dimension and its
+   convolutions' products), attention's backward **scratch** (one `T x T` matrix per task), and the convolutions'
+   **patches** (one region, the largest convolution's im2col matrix, shared by all of them).
 
 Class indices live in an `Array<I32>` beside it; optimizer state (AdamW's `m` and `v`, the projection's workspace) is
 made once, by the optimizer, in the parameters' layout. Liveness-based reuse of the activation region (a gradient is
@@ -159,6 +162,8 @@ which is what an eager mode would call too.
 | `RmsNorm(x, g)` | per row `x rinv g`; `rinv` saved | `rinv (dy g - xn mean(dy g xn))`, column sums |
 | `Attention(q, k, v, heads, T, causal)` | per sequence and head `softmax(Q K^T / sqrt(dh)) V`, probabilities saved | `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO` |
 | `Dropout(x, p)` | `x mask`, mask `1/(1-p)` or 0, kept | `dy mask` |
+| `Conv2d(x, w, b, shape)` | im2col, then `cols w^T + b` - one GEMM for the batch (`conv.olang`) | `db` = column sums, `dw = dY^T cols` (patches rebuilt), `dcols = dY w`, col2im |
+| `MaxPool2d(x, pool)` | each window's maximum per channel; where it was, kept | the gradient added where the maximum was |
 
 Every backward is checked against central differences in `F64` (`nn.olang`'s tests: each op through a small graph,
 step 1e-6, agreement to 1e-6, the relative error floored at 1e-3 so a gradient near zero is compared absolutely - its
@@ -193,10 +198,11 @@ fn (d Dense&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var { return g.Linear(x, 
 Applying a layer twice shares its parameters. Starting values follow PyTorch's `nn.Linear`: weights and biases uniform
 in `+-1/sqrt(in)`, drawn from the `rand.Rand` given to `Plan`, so a run is reproducible from its seed.
 
-For transformers (section 11): `Norm` (layer or RMS normalization's gain and bias), `AttentionBlock` and
-`Transformer`, built by `NewNorm`, `NewAttentionBlock(g, D, heads, T, layers, dropout, rms)` and `NewTransformer(g, V,
-T, D, heads, layers, tied, dropout, rms)`, with GPT-2's starting values (`NewDenseWith` takes an `Init` for the
-weights and one for the bias).
+For images (`vision.olang`, section 16): `Conv`, made by `NewConv(g, inC, outC, kernel, H, W, stride, padding)` with
+PyTorch's Conv2d starting values. For transformers (section 11): `Norm` (layer or RMS normalization's gain and bias),
+`AttentionBlock` and `Transformer`, built by `NewNorm`, `NewAttentionBlock(g, D, heads, T, layers, dropout, rms)` and
+`NewTransformer(g, V, T, D, heads, layers, tied, dropout, rms)`, with GPT-2's starting values (`NewDenseWith` takes an
+`Init` for the weights and one for the bias).
 
 Why a factory function and not a constructor taking the graph: olang's zero values (D13c) are a constructor run on
 zeros, and a constructor reading through a reference parameter has none, so such a struct can never be a `List`
@@ -376,6 +382,10 @@ the runtime's pool, and a `Gemm` taking a workspace in std/linalg (section 13).
   starting values, windows, AdamW, schedule and clipping in numpy (`bench/ref/charlm.py`, F64).
 - `make lmbench`: where a transformer's step goes, by kind of operation (the graph's own profiling).
 - `make mnist` trains end to end (needs the downloaded data); `make epoch` times it against C.
+- Phase 4 (section 16): `tokenizer.olang` (GPT-2's chunks, merge order and ties, round trips, JSON), `checkpoint.olang`
+  (safetensors in every dtype, each error, GPT-2's names), `conv.olang` (the convolution against its definition, col2im
+  as im2col's adjoint, max pooling) and `vision.olang` (convolution and pooling against central differences); `make
+  bpe` and `make safetensors` check the tokenizer and the format against independent Python implementations.
 
 ## 10. Serialization
 
@@ -585,6 +595,10 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
    its instruction set alone (section 8) - the largest lever on a step, ~2x or more. The same target is what
    vectorizes `FastTanh` cheaply (~5 ns an element on SSE2: GELU's 27 ms a step).
 5. **Two-operand indexing**, `m[r, c]` - now in olang (E31 multi-index), not yet used by oann.
+6. **For convolutions** (section 16): a `Gemm` whose A panels are packed straight from the images (an implicit GEMM,
+   or a packing callback) - im2col and the product's packing copy every patch twice, and the patches matrix is the
+   largest convolution's whole im2col; and a path for thin products (a depth of 9 for a one-channel first layer runs
+   at half the rate of the others).
 
 ## 14. Open questions
 
@@ -605,8 +619,8 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
 ## 15. Layout
 
 ```
-makefile                OLANG ?= the compiler; make test, data, mnist, epoch, charlm, lmbench, lmref, bpe, bpelm,
-                        safetensors, clean
+makefile                OLANG ?= the compiler; make test, data, mnist, cnn, epoch, charlm, lmbench, lmref, bpe,
+                        bpelm, safetensors, clean
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
@@ -617,11 +631,14 @@ train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep,
 generate.olang          sampling; generation running the context again, and with a key-value cache
 tokenizer.olang         byte-level BPE: GPT-2's pre-tokenization, training, encoding, decoding, JSON
 checkpoint.olang        safetensors: Names (PyTorch's for the layers), Save and Load in F64, F32, F16 or BF16
+conv.olang              convolution (im2col, one product, col2im) and max pooling on images held as rows
+vision.olang            the convolution layer; the gradient checks of convolution and pooling
 datasets/idx.olang      the IDX format
 datasets/loader.olang   Labeled sets and the Loader
 datasets/mnist.olang    fetching and loading MNIST
 datasets/text.olang     a character corpus, its split, and windows of tokens; fetching tiny Shakespeare
 examples/mnist_mlp.olang
+examples/mnist_cnn.olang  a small convolutional network on MNIST, its memory and where its time goes
 examples/charlm.olang   the character-level transformer on tiny Shakespeare, trained, saved and sampled
 examples/charlm_sample.olang  sampling from its checkpoint, with and without the cache
 examples/bpelm.olang    the same transformer on 512 BPE tokens, per character against the character model
@@ -632,6 +649,7 @@ bench/lm.olang          where a transformer's step goes, by kind of operation
 bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
 bench/attention.olang   attention's kernels against a Gemm per sequence and head
 bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
+bench/conv.olang        a convolution's passes timed: im2col, the three products, col2im
 bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against numpy
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
@@ -641,7 +659,7 @@ data/, build/           downloads and build output, not in git
 Each file is one olang module, imported by its path relative to the importing file without the extension
 (`import "../datasets/mnist"`). Random numbers are std/rand's, times std/time's.
 
-## 16. Phase 4: byte-pair tokens, safetensors
+## 16. Phase 4: byte-pair tokens, safetensors, convolutions
 
 ### Byte-level BPE (`tokenizer.olang`)
 
@@ -781,4 +799,72 @@ and the first past it (infinity), an F16 underflow, near F32's largest, BF16 tie
 of its own - a tensor per dtype, in an order of its own, F16 subnormals and an F64 subnormal, a one-row parameter as a
 vector, metadata of its own, an unpadded header - which oann loads into an F64 graph exactly: 27 of 27 values as numpy
 stored them.
+
+### Convolutions (`conv.olang`, `vision.olang`)
+
+- **Images are rows, channels last.** An image is one row of `H x W x C` - a pixel's channels together, NHWC for the
+  batch (TensorFlow's default layout) - and a convolution's output rows are `OutH x OutW x OutC` the same way. The
+  weights are PyTorch's `Conv2d.weight` flattened, `OutC x (C K K)`, each kernel `[C][K][K]`, so a checkpoint maps
+  onto PyTorch's by a reshape (a PyTorch model's flatten before its first dense layer is channels first, though: such
+  a layer's columns need permuting).
+- **One product for the whole batch.** im2col writes every output position of every image as a row of the patch it
+  sees - `(n OutH OutW) x (C K K)`, zeros where the kernel hangs over the padding - and `Y = cols W^T + b` is one
+  `kernels.Gemm` and a bias row. With channels last, `Y`'s `OutC`-wide rows are the images' output rows one after
+  another: the node's value *is* `Y`, reshaped, nothing transposed. Channels first would need a product per image, or
+  a transpose pass - which is why section 1's `C x H x W` plan changed.
+- **Backward**: `db` = the column sums of `dY`, `dW = dY^T cols`, `dcols = dY W` (only when the input wants a
+  gradient - a network's first convolution skips it), then col2im adds every patch's gradient back to the pixels it
+  came from. The patches are **not kept**: the backward builds them again into the same region before `dW` (a pass
+  over memory, against products of the layer's size) and `dcols` then overwrites them, so a graph has **one patches
+  region, its largest convolution's**, shared by all of them; the packing workspace is sized for the convolutions'
+  products too. For the MNIST network below, 128 x 784 x 9 F32 - 3.6 MB.
+- **im2col's innermost loop** is a pixel's channels, read in order - unless an image has fewer channels than the
+  kernel is wide (a first layer, grey or RGB), when a window inside the image is copied a kernel row at a time,
+  written in order with no test per element: 3.0 ms against 8.9-11.0 for a batch of 128 one-channel images, and the
+  same as before for 16 channels (measured interleaved in one process).
+- **`MaxPool2d(x, C, H, W, k, stride)`** keeps, as its saved matrix, where each maximum was in its window (`ky K +
+  kx`, exact in any float type; the first of equal values, as PyTorch picks); the backward adds each gradient there,
+  so overlapping windows add up. No padding yet. A pixel's channels are the innermost loop here too.
+- Images are split over the graph's threads (`linalg.ParallelRows`), the products by `kernels.Gemm`. Builders:
+  `g.Conv2d(x, w, b, inC, outC, kernel, stride, padding, H, W)`, `g.MaxPool2d(x, C, H, W, kernel, stride)`; the layer
+  `vision.NewConv(g, inC, outC, kernel, H, W, stride, padding)` draws PyTorch's starting values (uniform in
+  `+-1/sqrt(C K K)`, weights and bias).
+
+**Checked**: the convolution through im2col and one product against its definition (four shapes - padding, strides 2
+and 3, 1 to 3 channels, 2x2 to 5x5 kernels - on one task and three), col2im as im2col's adjoint (`<im2col(x), c> =
+<x, col2im(c)>`), max pooling against its definition; and through the graph in F64 against central differences: two
+convolutions reading one pooled value, a convolution applied twice (shared weights), overlapping 3x3 pools at stride
+2, padding with stride 2, a short batch, and the input gradients of 3- and 1-channel images that are parameters. A
+deliberately broken col2im fails both graph checks.
+
+**MNIST** (`make cnn ARGS="10 1 1"`, `examples/mnist_cnn.olang`): a 3x3 convolution 1->16 (padding 1), ReLU, 2x2 max
+pooling, a 3x3 convolution 16->32, ReLU, 2x2 max pooling, a dense layer 1568->10 - 20,490 parameters - with softmax
+cross-entropy, AdamW at 1e-3 and batches of 128, seed 1, one thread, at a load average of 3-6:
+
+| epoch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| test accuracy, % | 96.97 | 97.83 | 98.42 | 98.55 | 98.78 | 98.41 | 98.52 | 98.81 | 98.83 | **98.84** |
+| test loss | 0.0994 | 0.0652 | 0.0474 | 0.0442 | 0.0385 | 0.0457 | 0.0416 | 0.0351 | 0.0349 | 0.0334 |
+
+against the 784-128-10 perceptron's **97.73%** after its 10 epochs (101,770 parameters, section 8). An epoch takes
+**54-61 s** (57.6 s on average over the ten; 54.1 s after max pooling's channel loop moved inside), against the
+perceptron's 2.2 s: the network does 0.76 GFLOP a step to the perceptron's 0.05. Results are identical bit for bit on
+one and two threads (two were slower on the oversubscribed machine). **A step allocates nothing**: resident memory
+116,748 kB after step 10, 116,756 after step 100, 116,760 after every epoch to the tenth (4,690 steps); the arena is
+63 MB, laid out once.
+
+Where the first epoch goes (`ARGS="1 1 1 16 32 profile"`): the convolutions 46.0 s (forward 17.5, backward 28.5),
+max pooling 4.6, ReLU 2.4, the dense layer 1.0. Split by pass (`bench/conv.olang`, ms for a batch of 128):
+
+| | im2col (twice) | forward product | dW | dcols | col2im | bias and its sums |
+|---|---|---|---|---|---|---|
+| conv 1->16 on 28x28 | 6.3 | 5.4 (5.4 GFLOPS) | 4.7 (6.1) | 4.6 (6.3) | 3.0 | 1.7 |
+| conv 16->32 on 14x14 | 8.8 | 21.6 (10.7) | 19.6 (11.8) | 18.5 (12.5) | 4.1 | 0.9 |
+
+(In the network the first convolution needs no `dcols` or col2im - its input is the images.) The second
+convolution's products run at 11-12 GFLOPS, std/linalg's GEMM rate on this target (section 8): the epoch is the
+instruction set again. The first's run at half that, because a depth of 9 (`C K K` for one channel) is too thin for a
+packed product - the case for a direct convolution, or a small-depth path in `Gemm`. And im2col plus the product's
+own packing copies every patch twice: a `Gemm` that packs its A panels straight from the images (an implicit GEMM)
+would skip the patches matrix and both passes over it.
 
