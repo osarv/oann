@@ -378,6 +378,12 @@ number of its key) - with 5% a new task's writes land on an old one's cells and 
 interference. Both are what complementary learning systems ask of the two learners: a slow neocortex, a hippocampus
 that separates patterns.
 
+*In an agent (phase 5, 2.14):* the agent lives its days into a consolidator - each moment that learns writes the
+observation it acted on and the reward of the action it took, the only output observed - and its recall drives the
+readout beside the memories'. Its store is keyed by the observation alone, since a night moves the slow part's state.
+On the tasks of 5.11 the store kept the agent's answers across a change of surroundings and back; the nights added
+nothing, changing the recall only at observations never seen.
+
 ### 1.10 Sizes, budgets and cost
 
 **Planning classes** (oann's; the model fixes none):
@@ -629,9 +635,10 @@ type Store<T> struct(inputs I64, outputs I64, seed U64, ...)                # ph
 fn (e Engine&) LifOf(region I64) Neuron                                     # phase 4: a Lif region as the board runs it
 type Consolidator<T> struct(inputs I64, outputs I64, hidden I64, window I64, batch I64, seed U64,
         Config SleepSettings = SleepSettings())                             # phase 4: 1.9's slow part and store
-fn (k mut Consolidator<<T>>&) Day(u Array<<T>>&, y Array<<T>>&, n I64)      # phase 4: n sequences seen by day
+fn (k mut Consolidator<<T>>&) Day(u Array<<T>>&, y Array<<T>>&, n I64, known Array<Bool>& = null)  # phase 4; known: 5
 fn (k mut Consolidator<<T>>&) Sleep(passes I64 = 0) F64                     # phase 4: a night over every cue kept
 fn (k mut Consolidator<<T>>&) Predict(u Array<<T>>&, first I64, n I64, out mut Array<<T>>&, withStore Bool = true)
+fn (a mut Agent<<T>>&) Sleep(passes I64 = 0) F64                           # phase 5: Settings.Consolidate's night
 ```
 
 ### 2.9 Phases of work
@@ -652,6 +659,9 @@ Settling networks follow the transformer work (section 6).
    `Sleep` on the `Graph` with the checks of 5.4 and sleep measured against interference; spiking neurons on the board
    engine, validated against the floating-point ones; checkpoints that keep the generator's state; open questions 8 and
    10 measured. The PYNQ-Z2 overlay waits for an FPGA toolchain. Results in 2.13 and 5.10.
+5. **Done (2026-10-10, `agent.olang`):** open question 11 - an agent may have a consolidator, its moments that learn
+   writing what they observed into its store by day, its recall a drive on the readout, `Sleep` between stretches of
+   life; measured on the bandit, the reversal and the retention task lived. Results in 2.14 and 5.11.
 
 ### 2.10 As built: phase 1
 
@@ -893,6 +903,45 @@ Measured and not taken (decision 57).
 
 **Repro statuses.** `repro/ctorpush.olang` and `repro/ctorunstored.olang` are fixed by olang edf8238; their workarounds
 (`circuitFor`, datasets/text) need no change.
+
+### 2.14 As built: phase 5 - the consolidator in the agent (open question 11)
+
+`Settings.Consolidate` gives an agent a consolidator (`consolidator.Consolidator<T>`, 1.9 and 2.13) beside its
+memories. Off by default; an agent without one lives exactly as before (the bandit and the reversal compared line for
+line). Results in 5.11; decisions 62-71.
+
+- **Its shape.** Inputs the observation, outputs a value per action of each group, and a window of one: each moment is
+  a sequence of its own, from `h = 0`. History is the agent's context trace's to carry; what the consolidator keeps is
+  what each observation's actions brought. Its slow part has `SleepHidden` (16) neurons, its nights batches of 16, and
+  its generator its own (seeded from the agent's), so an agent draws the same numbers with it or without.
+- **The day.** Every moment that learns - the one after an aroused moment, the arousal gate covering the consolidator
+  as it covers the memories (1.7) - writes its outcome: the observation acted on as the input, the reward as the
+  target of each group's chosen action, and nothing else, since nothing else was observed. `Day(u, y, n, known)`
+  takes such a target: the slow part learns nothing from the unobserved outputs (its target there is its own output)
+  and the store's write leaves their reads as they were (`Store.Write`'s `known`). The observation is kept as a cue.
+- **The store learns by day at `RecallRate` (0.2, the persistent memory's `c_0`):** rewards are `+-1` draws, so a read
+  is about the mean of the last five outcomes, where a rate of 1 would hold the last one. Dawn writes at rate 1 all the
+  same - the dreams it stores are not noisy (`Store.WriteCode`'s `rate`).
+- **The store is keyed by the observation alone** (`SleepSettings.StateInKey` off): 1.9's key `[alpha u, rho h]` holds
+  the slow part's state, which every night moves, and with it which memories share cells. Kept in the key, a night
+  that taught the slow part one surroundings' answers moved another's keys toward them, so the next day's writes for
+  the one landed on the other's cells, and the next night consolidated the interference (5.11).
+- **A quiet readout** (`SleepSettings.QuietReadout`): the slow part's readout starts at 0, so before its first night
+  the consolidator answers 0 where nothing was written - an action never tried - rather than the untrained part's
+  noise.
+- **Its recall drives the readout.** At every settle the readout's drive is the memories' read plus `RecallGain` (1)
+  times the consolidator's recall - slow part and store - of the observation.
+- **Sleep is the caller's to call:** `a.Sleep(passes)` runs a night over every cue kept, between stretches of life;
+  when a stretch ends is the world's to know. `examples/bandit_settle.olang` sleeps every `night=` moments (500).
+- **Checkpoints carry it** - the slow weights, the store's table and mean, the cues and the generator's state; the
+  metadata says whether an agent consolidates, and an agent with a consolidator and one without refuse each other's
+  checkpoints.
+- **Cost.** A store read at every settle (a product of 3 600 x 24 and a top-k for the return task's observations of 24)
+  and a day's run and write at every moment that learns: the return task took 0.27 ms a moment with a consolidator and
+  no nights and 0.67 ms with a night every 500 moments, against 0.03 ms without one (one thread, load 5-7).
+- **What it bought** (5.11): the consolidator's store, by day, much of what an agent keeps across a change of
+  surroundings and back - the first 250 moments back in a surroundings left for a conflicting one cost 0.07 of regret
+  against 0.19 without it - and lower regret everywhere else; its nights, nothing more on these tasks.
 
 ---
 
@@ -1616,6 +1665,61 @@ arousal's level following `EntropyGain` times the policy's entropy over `ln(acti
 
 (each block's interval about +-0.013) - neither remedy is taken (decision 57).
 
+### 5.11 Results of phase 5 (2026-10-10)
+
+`examples/bandit_settle.olang` (F32) with olang db2af5d on the shared four-core machine; regrets are deterministic, times
+were taken at loads of 5-7. Every agent has 64 hidden neurons and 4 contexts of 16 numbers, a block is 250 moments, and
+intervals are 95%. Three agents: without a consolidator; with one and no nights (its store learning by day, its slow
+part never taught, its quiet readout answering 0); with one and a night every 500 moments.
+
+**Expected, written before the full runs** (after a two-life trial of the return task): "bandit - with nights, regret
+within the intervals of the agent without a consolidator; reversal - with nights, recovery after the swap slower (the
+slow part holds the old values until a night consolidates the store's new ones); return - the first block back in A
+near the reversal's first block after its swap without a consolidator (about 0.2), well below it with nights (0.1 or
+less), a consolidator without nights between the two."
+
+**Retention, lived** (the return task: 2 000 moments in surroundings A, 2 000 in B - the same contexts, each one's best
+and worst arms swapped, the surroundings' code of 8 signs telling them apart - and 2 000 back in A; 40 lives):
+
+| moments | 1 750-2 000 (A) | 2 000-2 250 (B begins) | 2 250-2 500 | 3 750-4 000 | 4 000-4 250 (A again) | 4 250-4 500 | 5 750-6 000 |
+|---|---|---|---|---|---|---|---|
+| no consolidator | 0.043 +- 0.016 | 0.211 +- 0.017 | 0.086 +- 0.023 | 0.084 +- 0.022 | 0.193 +- 0.023 | 0.129 +- 0.029 | 0.109 +- 0.033 |
+| a consolidator, no nights | 0.022 +- 0.011 | 0.159 +- 0.019 | 0.049 +- 0.020 | 0.038 +- 0.016 | **0.069 +- 0.014** | 0.028 +- 0.015 | 0.024 +- 0.011 |
+| a consolidator and nights | 0.022 +- 0.011 | 0.178 +- 0.017 | 0.052 +- 0.017 | 0.030 +- 0.013 | **0.079 +- 0.014** | 0.027 +- 0.014 | 0.014 +- 0.008 |
+
+The expectation held for the agent alone and failed for the nights. The store keeps what each surroundings' actions
+brought apart - its codes of the two surroundings' observations share few cells - so an agent coming back to A finds
+A's values recalled where it left them: a third of the regret of an agent without it in the first block back, a fifth
+of it afterwards. The nights add nothing to that. They cannot: with a key the nights do not move and a dawn exact on
+every cue kept (as here, eight observations), a night leaves the recall at every observation already seen as it was
+(5.4.2's dreams written back), and changes it only where the slow part generalizes - at observations never seen. Here
+that is B's at its start, where the slow part answers what it learned in A, which is B's worst: 0.178 against 0.159.
+Late in A again, after nights over both surroundings' cues, the nights' agent's regret is a little lower (0.014 against
+0.024, the intervals overlapping).
+
+The first runs keyed the store by `[alpha u, rho h]` as 1.9 does (20 lives): the nights' agent lost more coming back to A
+- 0.095 +- 0.023 against 0.068 +- 0.022 without nights, and 0.046 against 0.018 in the next block - because a night that
+taught the slow part A moved B's keys (the state is part of them) toward A's, and B's days then wrote into A's cells
+(decision 65). Smaller and larger store rates (0.1: 0.079 with nights, 0.076 without), a store twice as large and half
+as dense (14 400 cells, 36 active: 0.078 and 0.065) and nights only at the phases' ends (0.091) did not change that.
+
+**The bandit and the reversal** (4 000 moments, 20 lives): a consolidator lowers the regret from the first block on
+(bandit, moments 0-250: 0.143 +- 0.015 against 0.186 +- 0.015 without; 3 750-4 000: 0.006 +- 0.004 against 0.047 +- 0.025;
+reversal, the 250 moments after the swap: 0.188 +- 0.029 against 0.239 +- 0.036, and 0.029 +- 0.017 against 0.086 +-
+0.031 at the end), and the nights change no decision at all: every observation repeats exactly, so a night leaves every
+recall as it found it and the lives with and without nights are the same to the third decimal in every block - the
+reversal's slower recovery expected with nights did not happen either.
+
+**Observations drawn around their contexts** (`noise=0.1` a number, the return task, 20 lives): nights did not help
+here either (the first block back in A 0.095 +- 0.023 with nights, 0.094 +- 0.029 without; afterwards 0.055 against
+0.039), though every observation is new and the slow part's generalization is all a store keyed by them cannot give.
+The store's sparse codes of nearby observations already overlap, which is generalization of its own kind.
+
+**Checks** (`make test`): a masked day writes only what was observed (the store, the consolidator and the agent each);
+a night keeps the agent's recall at every cue but for what dawn's store could not hold apart; a checkpoint restores a
+consolidating agent into one of another seed exactly - its next 100 moments, a night among them, the same - and agents
+with and without a consolidator refuse each other's checkpoints.
+
 ## 6. Decisions and open questions
 
 **Decided**
@@ -1811,6 +1915,33 @@ arousal's level following `EntropyGain` times the policy's entropy over `ln(acti
     sampled replay waits for a task that needs it.
 61. **The retention task's tasks look different**: each has a context of 8 random signs beside the shared symbols, as two
     surroundings of a life do - not one bit (5.10 measures one bit too).
+62. **An agent may have a consolidator** (`Settings.Consolidate`, open question 11), off by default: its store lowered
+    every task's regret (5.11), but it costs nine to twenty times a moment of an agent without one, and the nights add
+    nothing measured yet. An agent without one lives exactly as before.
+63. **One moment a sequence** (a window of one, from `h = 0`): the agent's context trace carries its history, and a
+    longer window would need the last moments' observations at every recall. The consolidator keeps what each
+    observation's actions brought.
+64. **The day is gated by arousal, as the memories are**: the moments that learn write their outcomes and keep their
+    observations as cues; a calm moment writes nothing (1.7's "no memory write").
+65. **The agent's store is keyed by the observation alone** (`SleepSettings.StateInKey` off; 1.9's consolidator keeps
+    the state in its key): a night moves the slow part's state, and with it which memories share cells. Measured on the
+    return task (5.11), a state in the key let one surroundings' days write into the other's cells after a night (the
+    first block back 0.095 against 0.068 without nights); keyed by the observation, a night leaves every recall it has
+    seen as it was.
+66. **Only what was observed is written**: the reward is the value of each group's chosen action, the others unknown -
+    the slow part's target there its own output, the store's error there zero (`Day`'s and `Store.Write`'s `known`).
+    Writing them as zero, or as anything else, would teach values nothing observed.
+67. **The store learns by day at `RecallRate` 0.2**, the persistent memory's `c_0`: rewards are draws of +-1, and a
+    store at rate 1 recalls the last one. Dawn writes at 1 (Kaczmarz to the dreams' residuals, which are not noisy).
+68. **A quiet readout** (`SleepSettings.QuietReadout`): the slow part answers 0 until its first night, so an action never
+    tried reads 0 rather than the untrained part's noise - a drive on the readout the actor would have to learn against.
+69. **The recall is a drive on the readout beside the memories', at gain 1** (`RecallGain`), the same scale as the
+    memories' read: values of rewards in `[-1, 1]`.
+70. **Sleep is called by the life's owner** (`Agent.Sleep`), not by the agent: when a stretch of life ends - an episode,
+    a day, a change of surroundings - is the world's to know. The bandit example sleeps every 500 moments.
+71. **A checkpoint keeps the consolidator's store's projection seed, not the projection**: the projection is made again
+    from it (`Store.Reseed`) when the restoring agent's own differs, as the agent's generator state goes into any agent
+    of its shape.
 
 **Open questions**
 
@@ -1849,11 +1980,13 @@ arousal's level following `EntropyGain` times the policy's entropy over `ln(acti
     certified circuits** (from 5.9). Restrained MNIST gains 2.3 points at `T = 0.05`, at about 2.4x the sweeps of a
     lesson at the end of training. Recommended: make `T = 0.1` the default for circuits meant for the board (`Restrain`
     on), keep 0.25 otherwise. Default: 0.25 everywhere.
-11. **The consolidator and the agent.** The consolidator stands alone: its days are sequences given to it. An agent
-    could live its days into one - observations as inputs, the rewards of its actions as targets - and drive its readout
-    with the consolidator's recall beside its memories, sleeping between stretches of life. Recommended: when a task
-    needs the agent to keep what it learned across a change of surroundings (the retention of 5.10, lived); until then
-    the agent's persistent memory is its only consolidation (1.6). Default: separate.
+11. *(Taken: built as an option - decisions 62-71.)* **The consolidator and the agent.** The consolidator stands alone:
+    its days are sequences given to it. An agent could live its days into one - observations as inputs, the rewards of
+    its actions as targets - and drive its readout with the consolidator's recall beside its memories, sleeping between
+    stretches of life. Recommended: when a task needs the agent to keep what it learned across a change of surroundings
+    (the retention of 5.10, lived); until then the agent's persistent memory is its only consolidation (1.6). Default:
+    separate. *Built (2.14) and measured on the retention task lived (5.11): the store keeps the agent's answers across
+    the change; the nights add nothing there.*
 12. **The capacity of dawn's store.** A store that cannot hold every residual apart leaves its residue in the recall
     after a night (decision 56); the cues kept also grow without bound (decision 60). Recommended: measure on the first
     task that consolidates more than a few thousand steps - grow the store with its cues, or replay a sample. Default:
@@ -1862,6 +1995,12 @@ arousal's level following `EntropyGain` times the policy's entropy over `ln(acti
     multiply-adds of the rate engine's dense recurrent transport) but a lane design for them - which lane adds a spike's
     column, how a reciprocal block's rows are read - is not made, nor whether Lif currents need a wider format than
     Q4.14 (decision 54). Recommended: when a spiking circuit is to be synthesized. Default: the simulation only.
+14. **What an agent's nights are for** (from 5.11). Keyed by its observations, an agent's nights change its recall only
+    where it has never been - the slow part's generalization - which cost it where the new surroundings conflicted with
+    the old and bought nothing measurable with noisy observations. A task where generalization pays - new contexts drawn
+    near old ones with the old ones' answers, or a store too small for every observation (open question 12) - is where
+    they should. Recommended: measure on such a task before using nights in an agent. Default: a consolidator, if
+    any, sleeping as the caller chooses.
 
 
 ---

@@ -10,7 +10,10 @@
 #   a calm one settles once, answers greedily and changes nothing that learns.
 # Step(obs, reward) is one moment (1.8). With Settings.Groups above 1 the readout is that many groups of the actions,
 # each its own softmax, and a moment chooses an action in each - a joint action, the product of the groups' policies,
-# its contrast the sum of theirs (circuit's readout groups). Nothing is allocated per moment.
+# its contrast the sum of theirs (circuit's readout groups). With Settings.Consolidate it also has a consolidator
+# (consolidator.olang, docs/settling.md 1.9, 2.14): the moments that learn write their outcomes into its store by day,
+# Sleep() consolidates them between stretches of life, and its recall is a drive on the readout beside the memories'.
+# Nothing is allocated per moment.
 
 import "std/json"
 import "std/linalg"
@@ -18,6 +21,7 @@ import "std/math"
 import "std/os"
 import "std/rand"
 import "circuit"
+import "consolidator"
 import "optim"
 
 # ---- arousal (1.7) ----
@@ -236,6 +240,16 @@ type Settings struct() {
                                         # probable one - exploration without learning (docs/settling.md 6, question 8)
     EntropyGain F64 = 0.0               # arousal's level also follows the policy's uncertainty, this times its entropy
                                         # over ln(actions) (0 to 1) - question 8's second remedy; 0: off
+    Consolidate Bool = false            # a consolidator beside the memories (docs/settling.md 2.14, open question 11):
+                                        # what the moments that learn observed goes into its store by day, Sleep()
+                                        # consolidates it, and its recall drives the readout
+    SleepHidden I64 = 16                # its slow part's neurons
+    RecallGain F64 = 1.0                # its recall's weight on the readout (the memories' read has Gain)
+    RecallRate F64 = 0.2                # its store's rate by day - rewards are noisy, so a read is about the mean of the
+                                        # last 1 / rate outcomes; the persistent memory's c_0
+    SleepPasses I64 = 60                # passes over the dreams a night
+    SleepCells I64 = 0                  # its store's cells, and of them active in a code (0: the consolidator's defaults,
+    SleepActive I64 = 0                 # 150 cells per number of its key and 0.5% of them active)
 }
 
 # a life of observations observations and actions actions (in each of Config.Groups groups), with hidden regions of the
@@ -261,6 +275,13 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
     Inner circuit.Region = circuit.Region(2)            # the first hidden region; the others follow it
     Choice circuit.Region = circuit.Region(2 + hidden.Len())
     Groups I64 = Config.Groups
+    # the consolidator (Settings.Consolidate): its inputs the observation, its outputs a value per action of each group,
+    # one moment a sequence (window 1); its generator its own, so an agent's draws are the same with it or without
+    Sleeper mut consolidator.Consolidator<T>& = (sleeperFor(phi, observations, actions * Config.Groups, Config, seed)
+        if Config.Consolidate else null)
+    recall mut Array<T>& = Array<T>(actions * Config.Groups)     # the consolidator's recall of this moment
+    dayY mut Array<T>& = Array<T>(actions * Config.Groups)       # a moment's outcome as its day sees it
+    dayKnown mut Array<Bool>& = Array<Bool>(actions * Config.Groups)
     Elig mut circuit.Eligibility<T>& = circuit.Eligibility<T>(Net)
     Opt mut optim.FlatAdamW<T>& = optim.FlatAdamW<T>(Net.ParamCount, Config.Rate)
     Mem mut Memory<T>& = Memory<T>(observations, actions * Groups, Config.MemoryDecay, Config.MemoryRate, Config.MemoryGain)
@@ -318,6 +339,23 @@ fn circuitFor(like Array<<T>>&, observations I64, actions I64, hidden Array<I64>
     return c
 }
 
+# an agent's consolidator (docs/settling.md 2.14): its inputs an observation, its outputs a value per action, one
+# moment a sequence, a store reading about the last 1 / RecallRate outcomes by day and keyed by the observation alone
+# (the slow part's state, which every night moves, would move the keys too and with them which memories share cells),
+# and a quiet readout - an action never tried reads 0, not the untrained slow part's noise
+fn sleeperFor(like Array<<T>>&, observations I64, outputs I64, s Settings, seed U64) consolidator.Consolidator<T>& {
+    q := consolidator.SleepSettings()
+    q.StoreRate = s.RecallRate
+    q.Passes = s.SleepPasses
+    q.QuietReadout = true
+    q.StateInKey = false
+    q.Cells = s.SleepCells
+    q.Active = s.SleepActive
+    k mut consolidator.Consolidator<T>&return = consolidator.Consolidator<T>(observations, outputs, s.SleepHidden, 1, 16,
+        seed ^ U64(0x5EEB5EEB), q)
+    return k
+}
+
 # the life tolerance (docs/settling.md 1.10): every logit of the policy within T / 40 of its equilibrium, so each
 # log-probability within 5%, is a residual of T (1 - kappa) / 40 - kappa held at most 0.9
 fn lifeTolerance(c mut circuit.Circuit<<T>>&, temperature F64) F64 {
@@ -329,12 +367,44 @@ fn lifeBudget(c mut circuit.Circuit<<T>>&, least I64, tolerance F64) I64 {
     return n if n > least else least
 }
 
-# the drives of a moment: the observation, the context trace, the memories' read of the observation on the readout
+# the drives of a moment: the observation, the context trace, the memories' read of the observation on the readout -
+# and the consolidator's recall of it, RecallGain times, beside it
 fn (a mut Agent<<T>>&) drive(obs Array<T>&) {
     d := a.Net.DriveData(a.Sensors)
     for i in range a.Observations { d[i] = obs[i] }
     a.Ctx.Drive(a.Net.DriveData(a.Context))
-    a.Mem.Read(obs, a.Net.DriveData(a.Choice))
+    c := a.Net.DriveData(a.Choice)
+    a.Mem.Read(obs, c)
+    if a.Sleeper != null {
+        a.Sleeper.Predict(obs, 0, 1, a.recall)
+        like T
+        gain := linalg.Cast(a.Config.RecallGain, like)
+        for j in range a.recall.Len() { c[j] = c[j] + gain * a.recall[j] }
+    }
+}
+
+# the last moment's outcome into the consolidator's day: the observation it acted on, and the reward as the value of
+# each group's chosen action - the only values observed, so the only ones written (Day's known)
+fn (a mut Agent<<T>>&) remember(reward F64) {
+    like T
+    for j in range a.dayY.Len() {
+        a.dayY[j] = like
+        a.dayKnown[j] = false
+    }
+    for g in range a.Groups {
+        a.dayY[g * a.Actions + a.Chosen[g]] = linalg.Cast(reward, like)
+        a.dayKnown[g * a.Actions + a.Chosen[g]] = true
+    }
+    a.Sleeper.Day(a.lastKey, a.dayY, 1, a.dayKnown)
+}
+
+# a night (docs/settling.md 1.9, 2.14) - between stretches of life: the consolidator dreams every observation its days
+# kept, teaches its slow part the dreams and rewrites its store with what the slow part did not absorb. passes 0 is
+# Settings.SleepPasses. Gives the night's last loss. Changes nothing else the agent keeps; its next moment drives the
+# readout with the recall as the night left it
+fn (a mut Agent<<T>>&) Sleep(passes I64 = 0) F64 {
+    if a.Sleeper == null { stop("Sleep on an agent made without Settings.Consolidate") }
+    return a.Sleeper.Sleep(passes)
 }
 
 fn (a mut Agent<<T>>&) settle(p circuit.Phase) ? circuit.NotSettled {
@@ -457,6 +527,7 @@ fn (a mut Agent<<T>>&) Step(obs Array<T>&, reward F64, terminal Bool = false) I6
     decay F64 = a.Config.Gamma * a.Config.Lambda
     if a.lastAroused {
         for g in range a.Groups { a.Mem.Write(a.lastKey, g * a.Actions + a.Chosen[g], reward, math.Abs(delta)) }
+        if a.Sleeper != null { a.remember(reward) }
         a.Net.Contrast(a.Config.Beta)
         a.Elig.Add(a.Net, decay)
         a.Elig.Credit(a.Net, delta)
@@ -605,11 +676,13 @@ fn word(hi F64, lo F64) U64 { return (U64(hi) << 32) | U64(lo) }
 # contrast reads them), Adam's moments, the eligibility trace, the critic and its trace, the context trace, both
 # memories, the last moment's observation and features, and the scalars - arousal's statistics, pending decays,
 # counters, the pending action, the seed, and the generator's state (version 2; version 1 kept the numbers drawn and
-# replayed them)
+# replayed them). An agent that consolidates adds its consolidator: the slow part's weights, the store's table, mean
+# and projection's seed, the cues kept, and its generator's state and counts ("consolidates" in the metadata)
 fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
     g := gathering()
     g.header.Push("{\"__metadata__\":{\"format\":\"oann.agent\",\"version\":\"2\",\"observations\":\"" $(a.Observations)
-        "\",\"actions\":\"" $(a.Actions) "\",\"width\":\"" $(a.Width) "\",\"parameters\":\"" $(a.Net.ParamCount) "\"}")
+        "\",\"actions\":\"" $(a.Actions) "\",\"width\":\"" $(a.Width) "\",\"parameters\":\"" $(a.Net.ParamCount)
+        "\",\"consolidates\":\"" $(1 if a.Sleeper != null else 0) "\"}")
     g.add("\"circuit.params\"", a.Net.ParamData())
     for k in range 4 {
         p := circuit.Phase.Free if k < 2 else (circuit.Phase.Plus if k == 2 else circuit.Phase.Minus)
@@ -627,7 +700,24 @@ fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
     g.add("\"last.key\"", a.lastKey)
     g.add("\"last.features\"", a.lastPhi)
     g.add("\"scalars\"", a.scalars())
+    if a.Sleeper != null {
+        k := a.Sleeper
+        g.add("\"sleep.slow\"", k.Slow.Params().Data)
+        g.add("\"sleep.table\"", k.Fast.Table, k.Fast.N)
+        g.add("\"sleep.mean\"", k.Fast.Mean)
+        g.add("\"sleep.cues\"", k.CueInputs())
+        g.add("\"sleep.scalars\"", sleepScalars(k))
+    }
     try os.WriteFile(path, g.bytes())
+}
+
+# the consolidator's scalars a checkpoint keeps: its days, nights and store writes, its generator's state as eight
+# 32-bit halves, and the seed of its store's projection (the projection is made again from it, not kept)
+fn sleepScalars(k consolidator.Consolidator<<T>>&) Array<F64>& {
+    st := k.Generator()
+    out mut Array<F64>&return = F64[F64(k.Days), F64(k.Nights), F64(k.Fast.Writes), high(st[0]), low(st[0]), high(st[1]),
+        low(st[1]), high(st[2]), low(st[2]), high(st[3]), low(st[3]), high(k.Fast.Seed), low(k.Fast.Seed)]
+    return out
 }
 
 # reads a checkpoint Save wrote into this agent, which must have the saved one's shape (observations, actions, hidden
@@ -643,6 +733,7 @@ fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
     doc := try json.Parse(text[8:8 + n]) catch { error CheckpointError.FORMAT }
     current := try isVersion(doc, "2") catch { error CheckpointError.FORMAT }
     if not current { error CheckpointError.FORMAT }
+    if consolidates(doc) != (a.Sleeper != null) { error CheckpointError.MISMATCH }
     base I64 = 8 + n
     params := Array<F64>(a.Net.ParamCount)
     try fetch(doc, text, base, "circuit.params", params)
@@ -712,6 +803,58 @@ fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
     for k in range 4 { state[k] = word(v[28 + 2 * k], v[29 + 2 * k]) }
     a.rng.SetState(state)
     a.Draws = I64(v[17])
+    if a.Sleeper != null { try restoreSleeper(a.Sleeper, doc, text, base) }
+}
+
+# a checkpoint's consolidator into k, which must have its shape
+fn restoreSleeper(k mut consolidator.Consolidator<<T>>&, doc json.Json&, text String&, base I64) ? CheckpointError {
+    slow := Array<F64>(k.Slow.ParamCount)
+    try fetch(doc, text, base, "sleep.slow", slow)
+    put(slow, k.Slow.Params().Data)
+    table := Array<F64>(k.Fast.Table.Len())
+    try fetch(doc, text, base, "sleep.table", table)
+    put(table, k.Fast.Table)
+    mean := Array<F64>(k.Fast.Mean.Len())
+    try fetch(doc, text, base, "sleep.mean", mean)
+    put(mean, k.Fast.Mean)
+    per I64 = k.Window * k.Inputs
+    values := try sizeOf(doc, "sleep.cues")
+    if values % per != 0 { error CheckpointError.MISMATCH }
+    cues := Array<F64>(values)
+    try fetch(doc, text, base, "sleep.cues", cues)
+    held := Array<T>(values)
+    put(cues, held)
+    k.Keep(held, values / per)
+    v := Array<F64>(13)
+    try fetch(doc, text, base, "sleep.scalars", v)
+    seed := word(v[11], v[12])
+    if seed != k.Fast.Seed { k.Fast.Reseed(seed) }
+    k.Days = I64(v[0])
+    k.Nights = I64(v[1])
+    k.Fast.Writes = I64(v[2])
+    state Array<U64, 4>
+    for i in range 4 { state[i] = word(v[3 + 2 * i], v[4 + 2 * i]) }
+    k.SetGenerator(state)
+}
+
+# the number of F64 values a checkpoint's tensor name holds
+fn sizeOf(doc json.Json&, name String&) I64 ? CheckpointError {
+    entry := try doc[name] catch { error CheckpointError.FORMAT }
+    place := try entry["data_offsets"] catch { error CheckpointError.FORMAT }
+    offsets := try place.AsArr() catch { error CheckpointError.FORMAT }
+    if offsets.Len() != 2 { error CheckpointError.FORMAT }
+    b := try offsets[0].AsInt() catch { error CheckpointError.FORMAT }
+    e := try offsets[1].AsInt() catch { error CheckpointError.FORMAT }
+    if e < b or (e - b) % 8 != 0 { error CheckpointError.FORMAT }
+    return (e - b) / 8
+}
+
+# whether a checkpoint's agent consolidates: its metadata's "consolidates" (absent, as before consolidators: not)
+fn consolidates(doc json.Json&) Bool {
+    meta := try doc["__metadata__"] catch { return false }
+    flag := try meta["consolidates"] catch { return false }
+    text := try flag.AsStr() catch { return false }
+    return text == "1"
 }
 
 # whether a checkpoint's header names format version v in its metadata
@@ -918,6 +1061,78 @@ test "a checkpoint restores a life exactly: the restored agent's moments are the
     try os.WriteFile(path, U8[3, 0, 0, 0, 0, 0, 0, 0, 120, 120, 120]) catch { fail }
     refused = false
     try c.Restore(path) catch CheckpointError.FORMAT { refused = true } catch { fail }
+    assert refused
+    try os.Remove(path) catch { }
+}
+
+test "a consolidating agent: its days write only the actions taken, a night keeps its recall, a checkpoint restores it" {
+    s := Settings()
+    s.Consolidate = true
+    s.SleepHidden = 4
+    s.Critical = 60
+    s.Threshold = 3.0                               # some moments calm, some aroused
+    a := little(s, 13)
+    obs := Array<F64>(4)
+    scene(0, obs)
+    key := Array<F64>(4)
+    for j in range 4 { key[j] = obs[j] }
+    before := Array<F64>(2)
+    after := Array<F64>(2)
+    a.Sleeper.Predict(key, 0, 1, before)
+    assert before[0] == 0.0 and before[1] == 0.0    # a quiet readout and an empty store: nothing recalled yet
+    try a.Begin(obs) catch { fail }
+    chosen := a.Chosen[0]
+    assert a.lastAroused                            # the critical period's first moment keeps a contrast to learn from
+    scene(1, obs)
+    try a.Step(obs, 1.0, true) catch { fail }
+    a.Sleeper.Predict(key, 0, 1, after)
+    # the reward is the chosen action's value, written at RecallRate; the other action, not observed, reads as it did
+    assert math.Abs(after[chosen] - 0.2) < 1e-12 and after[1 - chosen] == 0.0 and a.Sleeper.Days == 1
+    acts := Array<I64>(150)
+    livedFrom(a, 2, 150, acts)
+    assert a.Sleeper.Days > 1 and a.Sleeper.Days <= a.Aroused          # a day for each moment that learned
+    # a night: it dreams every cue kept, consolidates, and rewrites the store
+    count := a.Sleeper.Cues()
+    cues := a.Sleeper.CueInputs()
+    was := Array<F64>(2 * count)
+    now := Array<F64>(2 * count)
+    a.Sleeper.PredictAll(cues, count, was, true)
+    a.Sleep()
+    a.Sleeper.PredictAll(cues, count, now, true)
+    worst F64 = 0.0
+    for i in range was.Len() { worst = math.Max(worst, math.Abs(now[i] - was[i])) }
+    # the recall at every cue kept is what it was, but for what dawn's store could not hold apart: every cue here is an
+    # observation of its own, more of them than its 600 cells keep apart (a bandit's cues are its few contexts)
+    println("a consolidating agent: " $count " moments that learned kept as cues; a night keeps their recall within " $worst
+        " - dawn's reads within " $(a.Sleeper.DawnError) " after " $(a.Sleeper.DawnPassesTaken) " passes")
+    assert worst <= a.Sleeper.DawnError + 1e-12 and a.Sleeper.Nights == 1
+    # a checkpoint after the night, restored into an agent of another seed (its store's projection made again from the
+    # saved one's): the same moments, nights included
+    livedFrom(a, 152, 50, acts)
+    path := "build/agent_sleep_checkpoint_test.safetensors"
+    try a.Save(path) catch { fail }
+    late := Array<I64>(100)
+    livedFrom(a, 202, 50, late)
+    a.Sleep()
+    livedFrom(a, 252, 50, late[50:])
+    b := little(s, 31)
+    try b.Restore(path) catch { fail }
+    again := Array<I64>(100)
+    livedFrom(b, 202, 50, again)
+    b.Sleep()
+    livedFrom(b, 252, 50, again[50:])
+    for i in range 100 { assert late[i] == again[i] }
+    for i in range a.Sleeper.Slow.ParamCount { assert a.Sleeper.Slow.Params().Data[i] == b.Sleeper.Slow.Params().Data[i] }
+    for i in range a.Sleeper.Fast.Table.Len() { assert a.Sleeper.Fast.Table[i] == b.Sleeper.Fast.Table[i] }
+    assert a.Sleeper.Cues() == b.Sleeper.Cues() and a.Sleeper.Nights == b.Sleeper.Nights
+    # an agent that does not consolidate refuses its checkpoint, and it refuses theirs
+    plain := little(Settings(), 13)
+    refused Bool = false
+    try plain.Restore(path) catch CheckpointError.MISMATCH { refused = true } catch { fail }
+    assert refused
+    try plain.Save(path) catch { fail }
+    refused = false
+    try b.Restore(path) catch CheckpointError.MISMATCH { refused = true } catch { fail }
     assert refused
     try os.Remove(path) catch { }
 }

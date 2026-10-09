@@ -10,7 +10,7 @@ with no cost the code does not show, natural language, minimal syntax. Concretel
 allocates nothing of its own**, every hot loop is a GEMM or one pass over memory, and a model is written the way a
 PyTorch or Flax user would expect.
 
-**State (phase 6):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
+**State (phase 7):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
 the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epochs (phase 2). **Transformers are
 built** (section 11): tokens, embeddings, learned positions, layer and RMS normalization, fused multi-head attention,
 dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
@@ -31,7 +31,9 @@ planned `Ahead` filling the next batch on a task while the current one trains. *
 one std/linalg `GemmBatch` over the heads, causal ones confined to their triangle (attention 1.3x faster at context
 256, its forward now mostly the softmax's exponentials); the convolution's forward packs its patches straight from the
 images (`GemmPatches`: its forward 1.2x faster in the CNN, the same results bit for bit); `GemmAct` measured and not
-adopted.
+adopted. **Phase 7** (section 20, olang db2af5d): mixed precision as fast as F32 (a transformer step 115 ms in BF16
+against 119 in F32, 215 before), attention's softmax by std/linalg's `FastExp` (its forward 1.3-1.9x faster), and an
+agent may live its days into a consolidator (docs/settling.md 2.14).
 
 ## 1. The operand: Matrix
 
@@ -1030,6 +1032,14 @@ Phase 4 adds sleep and spiking on the board (all but the PYNQ-Z2 overlay, which 
 `make sleep` runs `examples/sleep_retention.olang`; `make board ARGS=...` with a window runs spiking MNIST on the
 board. Results and decisions: docs/settling.md sections 2.13, 5.10 and 6 (decisions 48-61).
 
+Phase 5 wires the consolidator into the agent (open question 11), as an option (`Settings.Consolidate`): the moments
+that learn write what they observed - the observation, the reward of the action taken and nothing else - into its
+store by day, `a.Sleep()` runs a night between stretches of life, and its recall drives the readout beside the
+memories'. Measured on the bandit, the reversal and a retention task lived (surroundings A, a conflicting B, A again):
+the store lowers every task's regret - back in A, 0.07 in the first 250 moments against 0.19 without it - while the
+nights add nothing, changing the recall only at observations never seen. Results and decisions: docs/settling.md
+sections 2.14, 5.11 and 6 (decisions 62-71).
+
 ## 18. Phase 5: attention on products, mixed precision, a Dataset trait
 
 ### Attention through std/linalg's Gemm
@@ -1350,9 +1360,9 @@ with the build before - 0.53-0.76 s an epoch before, 0.55-0.93 after, medians 0.
   `$(...)`), `nestedtry` and `tryindex` as before. `capturedfn`, `ctorpush` and `ctorunstored`, fixed since olang
   edf8238, are deleted.
 
-## 20. Phase 7: olang db2af5d - the catch-up, BF16 again, sleep in the agent
+## 20. Phase 7: olang db2af5d - the catch-up, BF16 again, the softmax's exponential, sleep in the agent
 
-Built with olang db2af5d, measured 2026-10-09 between 22:00 and 02:00 CEST on the shared 4-core machine at the load
+Built with olang db2af5d, measured 2026-10-10 between 00:00 and 02:00 CEST on the shared 4-core machine at the load
 averages given with each figure (other agents compiling and testing): every time is an interleaved median or a range
 of them.
 
@@ -1447,3 +1457,42 @@ runs):
 
 So decision 5 of section 19 is reversed: the softmax takes std/linalg's exponential, and section 13's first item is
 done.
+
+### Sleep in the agent
+
+docs/settling.md's open question 11 is built (its 2.14, 5.11, decisions 62-71): `agent.Settings.Consolidate` gives an
+agent a `consolidator.Consolidator` beside its memories. What it took of the consolidator: a day that observes only some
+targets (`Day(u, y, n, known)`, and `Store.Write`'s `known` below it), a store rate for noisy targets by day with dawn
+writing at 1, a slow part that answers 0 until its first night (`QuietReadout`), a store keyed by the input alone
+(`StateInKey`), and its state in the agent's checkpoint (`Store.Reseed` makes a saved store's projection again from its
+seed). An agent without a consolidator lives exactly as before.
+
+What it bought, on `examples/bandit_settle.olang`'s tasks: its store, learning by day, a third of an agent's regret in
+the first 250 moments back in surroundings it had left for conflicting ones (0.069 against 0.193, 40 lives), a fifth
+of it afterwards, and lower regret in the plain bandit and the reversal; its nights, nothing more - with every
+observation seen before, a night leaves the recall as it was, and where an observation is new the slow part's
+generalization cost it (the conflicting surroundings' start, 0.178 against 0.159). Keyed as 1.9 keys the store, by the
+slow part's state too, the nights did harm (0.095 against 0.068), each moving the keys that decide which memories share
+cells. A consolidator costs 0.27 ms a moment, 0.67 with a night every 500 moments, against 0.03 without one.
+
+### Decisions
+
+1. **The graph's products are `g.MatMul` and `g.Mul`** again, olang's E31 no longer reserving the names; **the layers
+   keep their factories** (`NewDense`, ...), a constructor changing only the spelling.
+2. **`kernels.Down` is the plain conversion**: `ToBF16`, rounding by the bits, measured the same and is gone.
+3. **The element-wise lambdas capture what they use** (`z`, `like`) rather than declaring witnesses inside: level.
+4. **The element-wise kernels go through `ops.each1`, `each2` and `each3`**, not std/linalg's `Map`: the same loops
+   with each row's storage in a local, which is what lets a BF16 loop vectorize on this compiler (repro/narrowtbaa);
+   `nn.SyncParams` and `loader.Fill` take their arrays into locals for the same reason. When olang tags BF16 stores,
+   `Map` would do again.
+5. **Attention's softmax takes `FastExp`**, its sum a pass of its own (reversing section 19's decision 5): 1.3-1.9x
+   faster forward, every accuracy check as before.
+6. **An agent may have a consolidator**, off by default: docs/settling.md decisions 62-71.
+
+### olang issues (repro/)
+
+- New: `repro/narrowtbaa.olang` - the element stores of I8, I16, U16, U32, F16 and BF16 carry no type-based alias tag,
+  so a loop reaching its array through a struct at every element - std/linalg's `Map` - stays scalar for them: a BF16
+  add 2.2-3.0 ns an element against 0.3 with the array in a local (F32 0.6 either way).
+- Fixed in db2af5d and deleted: `genericctor`, `operatornames`, `spawncall`, `bf16narrow`, `capturedvalue`.
+- Still open: `condliteral` (being fixed in olang). Kept as records: `fieldname`, `joinparen`, `nestedtry`, `tryindex`.

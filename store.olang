@@ -90,8 +90,10 @@ fn (s mut Store<<T>>&) Read(x Array<T>&, out mut Array<T>&) {
 }
 
 # one write of target for reading x: the running mean moves toward x, then the table's active rows by the delta rule
-# toward target, at Rate. Gives the cells active
-fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&) I64 {
+# toward target, at Rate. With known, only the outputs it marks are written - the others' errors are taken as 0, so
+# their reads stay as they were (a reading whose target is observed in part: an agent's reward for the one action it
+# took). Gives the cells active
+fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&, known Array<Bool>& = null) I64 {
     like T
     m := linalg.Cast(s.MeanRate, like)
     if s.MeanRate > 0.0 {
@@ -100,6 +102,11 @@ fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&) I64 {
     active := s.code(x)
     sparse.GatherRowsWeighted(s.y, s.Table, s.Idx, s.Code, s.K)
     for t in range s.Outputs { s.err[t] = target[t] - s.y[t] }
+    if known != null {
+        for t in range s.Outputs {
+            if not known[t] { s.err[t] = like }
+        }
+    }
     sparse.ScatterRank1(s.Table, s.Idx, s.Code, s.K, s.err, linalg.Cast(s.Rate, like))
     s.Writes++
     return active
@@ -121,14 +128,20 @@ fn (s mut Store<<T>>&) ReadCode(idx Array<I32>&, code Array<T>&, out mut Array<T
     sparse.GatherRowsWeighted(out, s.Table, idx, code, s.K)
 }
 
-# Write at a code Encode gave: the delta rule toward target at its cells, at Rate - the mean does not move (the code is
-# already made)
-fn (s mut Store<<T>>&) WriteCode(idx Array<I32>&, code Array<T>&, target Array<T>&) {
+# Write at a code Encode gave: the delta rule toward target at its cells, at rate (Rate when rate is 0) - the mean does
+# not move (the code is already made)
+fn (s mut Store<<T>>&) WriteCode(idx Array<I32>&, code Array<T>&, target Array<T>&, rate F64 = 0.0) {
     like T
     sparse.GatherRowsWeighted(s.y, s.Table, idx, code, s.K)
     for t in range s.Outputs { s.err[t] = target[t] - s.y[t] }
-    sparse.ScatterRank1(s.Table, idx, code, s.K, s.err, linalg.Cast(s.Rate, like))
+    sparse.ScatterRank1(s.Table, idx, code, s.K, s.err, linalg.Cast(rate if rate != 0.0 else s.Rate, like))
     s.Writes++
+}
+
+# the projection made again from another seed - a checkpoint's store restored into one made from its own
+fn (s mut Store<<T>>&) Reseed(seed U64) {
+    s.Seed = seed
+    fillProjection(s.R, s.N, s.Inputs, seed)
 }
 
 # the table forgets everything (the projection and the mean stay)
@@ -234,6 +247,28 @@ test "a code kept: ReadCode and WriteCode are Read and Write at the code Encode 
         for t in range 2 { assert out[t] == want[t] }
     }
     for i in range a.Table.Len() { assert a.Table[i] == b.Table[i] }
+}
+
+test "a write that knows only some outputs leaves the others' reads as they were, everywhere" {
+    s := Store<F64>(8, 3, 12, 0, 0, 0.5, 0)
+    r := rand.Rand(6)
+    known := Bool[false, true, false]
+    before := Array<F64>(3)
+    after := Array<F64>(3)
+    for trial in range 40 {
+        x := reading(r, 8)
+        target := reading(r, 3)
+        s.Write(x, target)                             # some content to keep
+        q := reading(r, 8)
+        s.Read(q, before)
+        s.Read(x, after)
+        moved := after[1] + 0.5 * (target[1] - after[1])
+        s.Write(x, target, known)
+        s.Read(x, after)
+        assert math.Abs(after[1] - moved) < 1e-14       # the known output moves at Rate, as an unmasked write does
+        s.Read(q, after)
+        assert after[0] == before[0] and after[2] == before[2]
+    }
 }
 
 test "the running mean follows the writes, and a smaller rate averages noisy targets" {
