@@ -15,9 +15,9 @@
 #   potential v, total, constant, bias,     Q4.14   18 bits   [-8, 8 - 2^-14], step 2^-14
 #     drive
 #   target                                  Q1.15   16 bits
-#   product w s                             Q2.30   summed exactly in a 48-bit accumulator: |w s| < 2^30, so no sum
-#                                                   of fewer than 2^16 products (each block's fan-in, checked) and a
-#                                                   constant overflows it
+#   product w s                             Q2.30   summed exactly in a 48-bit accumulator: |w s| <= 2^30, and each
+#                                                   neuron's fan-in (a synapse counted 2^shift times) is checked to be
+#                                                   at most 2^16, so no sum and constant overflows it
 #   probability p, force                    Q.16    17 bits   (a probability of 1 is 2^16)
 #   dt                                      Q.16    17 bits, unsigned (1 is 2^16)
 #   nudge strength beta                     Q.14    signed
@@ -63,7 +63,6 @@ import "std/math"
 import "std/linalg"
 import "std/os"
 import "circuit"
-import "optim"
 
 # the formats' limits and scales
 ActOne I64 = 32768                          # 2^15: an activity or weight of 1 (one past the largest)
@@ -219,7 +218,6 @@ fn Board(c mut circuit.Circuit<<T>>&) Engine& {
         e.BlockDesc[d + 5] = 1 if c.IsFolded(p) else 0
         e.BlockDesc[d + 7] = at
         at += c.SizeOf(pre) * c.SizeOf(post)
-        if c.SizeOf(pre) >= 65536 or c.SizeOf(post) >= 65536 { wrong("a block's fan-in is below 2^16 on the board") }
     }
     e.tables()
     e.Load(c)
@@ -330,6 +328,32 @@ fn (e mut Engine&) Load(c circuit.Circuit<<T>>&) {
     }
     e.DtQ = quantize(c.Dt, 16, 1, 65536)
     e.Attempts = c.Attempts
+    e.checkRange()
+}
+
+# every sum the engine makes fits its 48-bit accumulator: a product is at most 2^30 in magnitude, so each neuron's
+# fan-in - its folded synapses for the constant, its recurrent ones for a total, each weighted by its block's 2^shift -
+# must stay at most 2^16, which keeps a sum within 2^46 and leaves room for the constant's 2^33
+fn (e Engine&) checkRange() {
+    sums := Array<I64>(2 * e.Neurons)             # the folded fan-ins, then the recurrent ones
+    for k in range e.BlockCount {
+        d I64 = k * BlockWords
+        pre I64 = e.BlockDesc[d]
+        preSize I64 = e.BlockDesc[d + 1]
+        post I64 = e.BlockDesc[d + 2]
+        postSize I64 = e.BlockDesc[d + 3]
+        shift I64 = e.BlockDesc[d + 6]
+        at I64 = 0 if e.BlockDesc[d + 5] == 1 else e.Neurons
+        for i in range postSize { sums[at + post + i] = sums[at + post + i] + (preSize << shift) }
+        if e.BlockDesc[d + 4] == 1 {
+            for j in range preSize { sums[at + pre + j] = sums[at + pre + j] + (postSize << shift) }
+        }
+    }
+    for i in range 2 * e.Neurons {
+        if sums[i] > 65536 {
+            wrong("a neuron's fan-in, each synapse weighted by its block's 2^shift, is at most 2^16 on the board")
+        }
+    }
 }
 
 # c's drives, classes and targets for its rows in use, quantized into the engine - what the processing system pushes
@@ -913,6 +937,7 @@ fn (e Engine&) StoreInputs(c mut circuit.Circuit<<T>>&) {
 
 import "std/json"
 import "std/rand"
+import "optim"
 
 test "the activation tables and the exponential's: their largest errors over every input" {
     c := circuit.Circuit<F64>(1)
@@ -1267,4 +1292,61 @@ test "XOR learned with its settles on the board, beside the same learning in flo
             ", gain " $(c.Gain()) ", " $(F64(sweeps) / 400.0) " sweeps a lesson")
         assert right == 4 and c.Loss(circuit.Phase.Free) < 0.05
     }
+}
+
+# a circuit with patterned blocks stored as layout, from seed 9: six inputs into nine hidden (lateral) and four readouts
+fn layered(m mut circuit.Circuit<F64>&, layout circuit.Layout) {
+    xi := m.Input(6)
+    hi := m.Hidden(9)
+    oi := m.Readout(4)
+    m.Project(xi, hi, circuit.Wiring.OneWay, 0.3, false, layout)
+    m.Project(hi, hi, circuit.Wiring.Reciprocal, 0.4, false, layout)
+    m.Project(hi, oi, circuit.Wiring.Reciprocal, 0.4, false, layout)
+    rm := rand.Rand(9)
+    m.Plan(rm)
+    m.Certify(0.85)
+    for j in range m.DriveData(xi).Len() { m.DriveData(xi)[j] = rm.Uniform(-0.9, 0.9) }
+    for j in range 3 { m.LabelData(oi)[j] = I32(j % 4) }
+}
+
+test "readout groups and sparse blocks on the board: each group's force its own, a sparse block the dense one bit for bit" {
+    r := rand.Rand(8)
+    # a readout of two groups of three: a phase nudged toward each group's class is within the bound
+    c := circuit.Circuit<F64>(2)
+    x := c.Input(3)
+    h := c.Hidden(5)
+    o := c.Readout(6, circuit.Cost.CrossEntropy(0.25), circuit.Neuron.Rate(circuit.Rho.Tanh), 2)
+    c.Project(x, h, circuit.Wiring.OneWay)
+    c.Project(h, h)
+    c.Project(h, o)
+    c.Plan(r)
+    c.Certify(0.8)
+    for j in range c.DriveData(x).Len() { c.DriveData(x)[j] = r.Uniform(-0.9, 0.9) }
+    for j in range c.LabelData(o).Len() { c.LabelData(o)[j] = I32(r.Below(3)) }
+    e := boardOf(c)
+    k := c.Gain()
+    try c.Settle(circuit.Phase.Free, 20000, 1e-13) catch { fail }
+    try e.settle(circuit.Phase.Free, 2000, 1, true) catch { fail }
+    c.Warm(circuit.Phase.Plus, circuit.Phase.Free)
+    c.Nudge(circuit.Phase.Plus, 0.5)
+    try c.Settle(circuit.Phase.Plus, 20000, 1e-13) catch { fail }
+    e.Warm(circuit.Phase.Plus, circuit.Phase.Free)
+    e.Nudge(circuit.Phase.Plus, 0.5)
+    try e.settle(circuit.Phase.Plus, 4000, 2, false) catch { fail }
+    pv, ps := gap(e, c, circuit.Phase.Plus)
+    bound F64 = (2.0 / F64(PotOne) + e.Delta(k, 0.0, 0.5, 0.25, 3) + 1e-13) / (1.0 - k)
+    println("two readout groups on the board: the plus phase within " $pv " of the exact (the bound " $bound ")")
+    assert pv <= bound and ps <= bound + e.ActError
+    # a sparse projection is stored densely on the board: the same image and the same settles as the masked dense one
+    a := circuit.Circuit<F64>(3)
+    layered(a, circuit.Layout.Dense)
+    b := circuit.Circuit<F64>(3)
+    layered(b, circuit.Layout.Sparse)
+    assert b.IsSparse(circuit.Projection(1)) and not a.IsSparse(circuit.Projection(1))
+    ea := Board(a)
+    eb := Board(b)
+    for i in range ea.Weights.Len() { assert ea.Weights[i] == eb.Weights[i] }
+    try ea.Teach(a, 3, circuit.Lesson(0.5)) catch { fail }
+    try eb.Teach(b, 3, circuit.Lesson(0.5)) catch { fail }
+    for i in range ea.V.Len() { assert ea.V[i] == eb.V[i] and ea.S[i] == eb.S[i] }
 }

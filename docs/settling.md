@@ -88,7 +88,9 @@ A warm start (the previous equilibrium under a changed drive) begins with a smal
 region (`kappa >= 1`), and then only the residual test and the refusal remain. Since `rho_W < 1` bounds every single
 recurrent weight, a certified circuit has `|W[e]| < 1` on every recurrent synapse - a fact the hardware mapping uses
 (section 4); the folded input blocks are not bounded by the certificate, so the board's range argument (4.2) needs
-its own bound on them, the incoming mass with the inputs counted (phase 3).
+its own treatment of them - *decided in phase 3* (2.12, decision 34): a folded block too large for 16 bits is stored
+scaled by a power of two, and a constant beyond the potentials' range saturates, which a `tanh` or hard-sigmoid neuron's
+activity does not notice.
 
 **A nudged phase** adds the force's own feedback. The force `beta f(s)` on a readout neuron falls as its activity
 rises - by `p (1 - p) / T <= 1 / (4 T)` per unit of `s` for the cross-entropy force, by 1 for the squared error - so a
@@ -125,8 +127,8 @@ and folded into a constant. Large sparse circuits use CSR or a segmented sum ins
 A circuit is a set of **regions** with roles - **input** (no inbound synapses; driven by data, a context trace or a
 memory), **hidden**, and **readout** (nudged in learning, read as an action or a class; it may be split into groups,
 each with its own softmax) - and **projections** between them: one-way or reciprocal, dense or masked by a
-connectivity density, each with an optional frozen flag. A reciprocal projection from a region to itself is a symmetric
-lateral block.
+connectivity density (or given as a list of synapses, a wiring diagram), stored as dense blocks or as compressed sparse
+rows, each with an optional frozen flag. A reciprocal projection from a region to itself is a symmetric lateral block.
 
 **Initialization.** Weights are drawn Glorot-uniform (Glorot & Bengio 2010) from a seeded generator and then
 **certified**: all recurrent weights are multiplied by one factor so that the largest incoming mass equals the target
@@ -464,7 +466,8 @@ backprop, its store a custom op whose read carries no gradient, and `Sleep` is a
 - lays out **state** per phase - `Free`, `Plus`, `Minus`, `Scratch` (imagination, refused attempts) - as `v` and `s`
   `[rows, n]`, **double-buffered** so a sweep reads one copy and writes the other;
 - lays out **workspace**: the drive, the per-settle constant `c`, `total`, `dS = S+ - S-`, nudge targets and softmax
-  probabilities, a `U8` connectivity mask for each projection with `density < 1`;
+  probabilities, a `U8` connectivity mask for each dense projection with `density < 1` (a sparse one keeps its
+  pattern instead - 2.12);
 - classifies blocks: a block whose pre region is an `Input` is **folded** into the constant; the rest are recurrent;
 - computes the certificate's incoming masses (absolute row and column sums of the blocks, combined per neuron) and
   derives `kappa`, `q`, the tolerance and the budget from them.
@@ -521,7 +524,8 @@ generator state and the pending action (safetensors plus a metadata block, DESIG
 ### 2.7 The store and sleep (later phases)
 
 The sparse-code store needs a top-k, a gather-weighted read and a `k`-row write (section 3); its projection is stored
-on a CPU (on an FPGA it can be regenerated from the seed instead, section 4). The consolidator is a `Graph` model (the
+on a CPU (on an FPGA it can be regenerated from the seed instead, section 4). *Built in phase 3* (`store.olang`, 2.12);
+the consolidator and sleep are phase 4. The consolidator is a `Graph` model (the
 recurrent cell unrolled over a window, BPTT) with the store as a `Custom` op; `Sleep` is: dream the cues (forward with
 the store), freeze the dreams, train the slow weights on them with the store excluded, rewrite the store.
 
@@ -582,8 +586,12 @@ error NotSettled { BUDGET  NONFINITE }
 
 fn (c mut Circuit<<T>>&) Input(size I64, model Neuron = Neuron.Rate(Rho.Linear)) Region
 fn (c mut Circuit<<T>>&) Hidden(size I64, model Neuron = Neuron.Rate(Rho.Tanh)) Region
-fn (c mut Circuit<<T>>&) Readout(size I64, fit Cost = Cost.CrossEntropy(0.25), model Neuron = ...) Region
-fn (c mut Circuit<<T>>&) Project(pre Region, post Region, kind Wiring = Reciprocal, density F64 = 1, frozen Bool = false) Projection
+fn (c mut Circuit<<T>>&) Readout(size I64, fit Cost = Cost.CrossEntropy(0.25), model Neuron = ..., groups I64 = 1) Region
+fn (c mut Circuit<<T>>&) Project(pre Region, post Region, kind Wiring = Reciprocal, density F64 = 1, frozen Bool = false,
+        store Layout = Layout.Auto) Projection                              # Layout: Auto, Dense, Sparse (phase 3)
+fn (c mut Circuit<<T>>&) ProjectWired(pre Region, post Region, posts Array<I32>&, pres Array<I32>&, kind Wiring = Reciprocal,
+        frozen Bool = false, store Layout = Layout.Auto) Projection         # a given wiring (phase 3)
+fn (c Circuit<<T>>&) SparseWeights(p Projection) sparse.Csr<T>             # a sparse projection's synapses (phase 3)
 fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&)
 fn (c mut Circuit<<T>>&) Settle(p Phase, budget I64, tolerance F64) Settlement ? NotSettled  # qualified, warm
 fn (c mut Circuit<<T>>&) Run(p Phase, sweeps I64) Settlement               # finite phase, residual reported
@@ -604,6 +612,9 @@ fn (c Circuit<<T>>&) Loss(p Phase) F64
 fn (t mut Eligibility<<T>>&) Add(c mut Circuit<<T>>&, decay F64)          # also Decay(decay), Credit(c, delta)
 fn (a mut Agent<<T>>&) Step(obs Array<<T>>&, reward <T>) I64 ? NotSettled   # phase 2
 fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) Settlement ? NotSettled    # phase 2: private; changes nothing
+fn Board(c mut Circuit<<T>>&) board.Engine&                                # phase 3: the board's engine, simulated
+fn (e mut Engine&) Teach(c mut Circuit<<T>>&, n I64, l Lesson) I64 ? NotSettled   # settles on the board, learns in c
+type Store<T> struct(inputs I64, outputs I64, seed U64, ...)                # phase 3: the sparse-code store
 ```
 
 ### 2.9 Phases of work
@@ -617,8 +628,9 @@ Settling networks follow the transformer work (section 6).
 2. **Done (2026-10-09, `agent.olang`):** the `Agent` - critic, `Trace`, `Memory`, `Arousal`, the moment loop,
    checkpoints - with the checks of 5.3 (all but the sparse-code store, which belongs to phase 3) and the end-to-end
    tasks of 5.5. Results in 2.11 and 5.8.
-3. The fixed-point simulation of the board engine (4.2, 5.6); the sparse-code store, extra readout groups, CSR
-   projections for large circuits.
+3. **Done (2026-10-09, `board.olang`, `store.olang`, `sparse.olang`):** the fixed-point simulation of the board engine
+   (4.2, 5.6), with lessons settled on it; the sparse-code store and the checks of 5.3.2; readout groups (circuit and
+   agent); CSR projections for large circuits. Results in 2.12 and 5.9.
 4. The consolidator and `Sleep` on the `Graph`; the PYNQ-Z2 overlay; further neuron models (spiking, section 4.6).
 
 ### 2.10 As built: phase 1
@@ -709,6 +721,94 @@ test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/
   15 us a moment and 4-5 sweeps a moment in the bandit (warm starts, drives far from the rails): 160 000 moments in
   2.4 s.
 
+### 2.12 As built: phase 3 - the board engine, the store, readout groups, sparse projections
+
+Three modules and two extensions: `board.olang` (the engine of 4.2, in integers), `store.olang` (the sparse-code store
+of 1.6), `sparse.olang` (CSR matrices, top-k and the store's products: section 3, items 8-10); readout groups and
+sparse projections in `circuit.olang`, readout groups in `agent.olang`. `examples/mnist_board.olang` (`make board`)
+teaches and answers MNIST through the engine; `bench/sparse.olang` (`make sparse`) measures sparse blocks against dense
+ones. Results in 5.9; decisions 31-47.
+
+**The board engine (`board.Engine`)** - the reference a hardware engine is checked against.
+
+- *Data only.* The engine runs a planned rate circuit from a descriptor table (8 words per region: role, first column,
+  size, activation table, fit, `1/T`, groups, where its classes start; 8 per block: the two regions' columns and sizes,
+  reciprocal, folded, shift, where its weights start), the weights (`I16`), the biases (`I32` holding Q4.14), three
+  tables and, per settle, the drives, classes and targets. Nothing in a settle is floating point. The header of
+  `board.olang` states every format and every operation, as an HLS or RTL implementation needs them.
+- *The processing system's side.* `Board(c)` makes an engine for a circuit; `Load(c)` quantizes its weights and biases
+  (the push after a learning step), `Inputs(c)` its drives, classes and targets (the push before a settle), `Store(c, p)`
+  reads a phase's state back into the circuit as values. `Settle`, `Run`, `Warm`, `Nudge` and `Teach` mirror the
+  circuit's. The settle loop is the circuit's: qualify on every row's residual, commit or refuse (a refusal leaves the
+  committed state bit for bit), damping by halving `dt` over the budget's parts, a phase nudged with `beta > 0` at
+  `Dt / (1 + beta lambda)`.
+- *Formats* are 4.2's, with what it left open decided: a drive, bias, constant, total and potential are Q4.14 (18 bits);
+  an input region's activity is made from its Q4.14 drive by the activation unit (a linear input's is `sat16(2 d)`); a
+  probability and a force are Q.16, `dt` Q.16 unsigned, `beta` Q.14 and `1/T` Q.10. A block whose largest weight does not
+  fit Q1.15 - a folded block, which the certificate does not bound - is stored scaled by `2^-shift`, its sums shifted
+  back as they are accumulated; a certified recurrent block has shift 0. (Decisions 31-34.)
+- *Arithmetic.* Every sum of products is exact in a 48-bit accumulator (each neuron's fan-in, a synapse counted
+  `2^shift` times, is checked to be at most `2^16`), so the order
+  of summation changes nothing and lanes and adder trees summing in any order match the simulation bit for bit. A
+  constant is rounded to Q4.14 once a settle, a total once a sweep (`(x + 2^15) >> 16`: to the nearest, halves up); the
+  processing system quantizes to the nearest, ties to even. A value beyond its range saturates and is counted
+  (`Saturations`, `Clipped` for constants).
+- *The activation unit* is a table of 1024 segments over `[-8, 8)` - a base and a delta per segment, two 18-bit words,
+  so one BRAM18 pair - interpolated linearly with an 8-bit fraction: `tanh`, and the hard sigmoid through the same
+  table (exact between knots). Its largest error over all `2^18` inputs is 4.7e-5, 1.5 steps of Q1.15, within the
+  derived 5.4e-5 (4.2's `h^2/8 max|tanh''|` plus the two roundings). Linear relaxing neurons and spiking circuits are not
+  for this engine (decision 36).
+- *The cross-entropy force* takes a softmax per group every sweep: `z = (s - max s) / T` rounded to Q5.14 and clamped at
+  -16, a second table for `exp` over `[-16, 0]` (largest error 4.0e-5), their sum, and one division per neuron (decision
+  37). The squared error's force is a subtraction.
+- *Tolerance.* The board settles to `max(floor(tau 2^14), 5)` steps of Q4.14 - 4.2's `max(tau, 3e-4)`. With `dt = 1` the
+  integer iteration reaches an exact fixed point (residual 0) in about half of the fixtures; otherwise it ends in a
+  cycle of a step or two, inside the floor (decision 38).
+- *The bound of 5.6, made precise.* The comparison is with the circuit in exact arithmetic carrying the board's own
+  values (`StoreParams`, `StoreInputs` put them back into a circuit), so it covers the engine's arithmetic alone.
+  `Delta(kappa, folded, beta, T, width)` bounds the error of one evaluation of the map: the constant's and the total's
+  roundings (`2^-15` each), the activation table's error through the recurrent weights (`kappa`) and, for non-linear
+  inputs, through the folded ones; in a nudged phase also the nudge's rounding and `beta` times the force's error (for
+  the cross-entropy the table error through the softmax, at most `1/(2T)` of it, and the exponential's error through
+  `p = e / S` with `S >= 1`). A settle that qualifies at `tau_b` is then within `(tau_b + Delta + tau) / (1 - kappa)` of
+  the exact equilibrium settled to `tau`, by 1.2's argument - for the free phase and the squared error exactly, for the
+  cross-entropy with 1.2's caveat. The weights' own rounding is a separate term, a fan-in times `2^-16` (decision 39).
+- *Learning on the board* (4.4's default): `Teach(c, n, lesson)` settles the three phases on the engine, reads their
+  states back into the circuit and takes the contrast there in the circuit's precision; the circuit holds the master
+  weights, an optimizer steps them, `Restrain(0.9)` keeps them certified, and `Load(c)` pushes the requantized copy
+  (decision 40).
+- *Golden vectors.* `Dump(path)` writes the engine's image and its last settle - descriptors, weights, biases, tables,
+  inputs, every phase's committed state, the residuals - as safetensors with integer dtypes: what a testbench feeds a
+  hardware engine and compares with bit for bit (decision 41).
+- *Cycles.* `SweepCycles()` and `ConstantCycles()` apply 4.2's cycle model to the descriptors: 80 and 1 664 for
+  784-128-10, as in 4.3's table.
+
+**The sparse-code store (`store.Store<T>`)**, 1.6's: `Read(x, out)` and `Write(x, target)`. `R` is `Cells x Inputs`,
+`N(0, 1/Inputs)`, each row drawn from a generator seeded by the store's seed and the row's number, so a row can be
+made again from the seed alone (`ProjectionRow`) - the FPGA's option of 4.1. The running mean follows each write
+(weight `MeanRate`, default 0.01) and a read changes nothing; a write moves the mean, codes the reading at the new mean,
+reads, and writes the delta rule's step at the code's rows. Defaults: `Cells = 20 Inputs`, `K = ceil(0.05 Cells)`, `Rate
+1` (decision 42). The selection is `sparse.TopK` (a quickselect, median of three, then two passes; ties to the earlier
+cell; decision 43), the read `GatherRowsWeighted`, the write `ScatterRank1`.
+
+**Readout groups.** `Readout(size, fit, model, groups)` splits a readout into `groups` softmaxes of `size / groups`
+neurons: a class per group per row (`LabelData` holds `Rows x groups`), each group's cost and force its own, `Loss` their
+sum, `Predict` one class per group. The contrast is then the gradient of the summed cost (checked) and, nudged toward a
+joint action, `T grad log pi(a)` with `pi` the groups' product (checked). An agent with `Settings.Groups` above 1 chooses
+an action in each group; `Step` gives the joint action as one number (`sum_g Chosen[g] actions^g`), the memory holds a
+value per action of each group and writes each chosen one with the shared reward (decision 44).
+
+**Sparse projections.** `Project(..., store)` takes a `Layout` - `Auto`, `Dense` or `Sparse` - and `ProjectWired(pre,
+post, posts, pres)` takes a wiring as synapse pairs. A projection that is not complete (a density below 1, a wiring, or
+`Sparse`) gets its pattern first, drawn by geometric gaps (a draw per synapse, not per position) or sorted from the
+pairs; its weights are then drawn per synapse, Glorot over the expected fan-in and fan-out - the same weights whether the
+block is stored dense (absent synapses as masked zeros) or sparse, and at density 1 the same as a complete block's.
+`Auto` stores a projection sparse at a density of at most 0.25 (decision 45). A sparse block's synapses are a
+`sparse.Csr` view of the parameter region, so optimizers step them in place; its transport is `MulAdd` into post and
+`MulAddT` into pre, its contrast `Sampled` - the batch's products sampled at the synapses only - both on the rows in
+use transposed into feature-major once a sweep (one row is used as it is). The certificate, `Restrain`, `Energy` and
+`DriveGrad` all read sparse blocks. On the board a sparse block is stored densely (decision 46).
+
 ---
 
 ## 3. What the matrix library and olang must provide
@@ -740,10 +840,15 @@ is a batch-1 GEMV, and its softmax and activations need the same vectorized row 
    the per-row residual and the next `v`, `s` into the other buffer, in one pass. The library's part is that row-slice
    loops vectorize and views cost nothing.
 8. **Top-k per row** (k-winners for the store): indices and values, linear-time selection, a caller-supplied workspace.
+   *Built in oann*, `sparse.TopK` (2.12).
 9. **Sparse-code products**: `GatherRowsWeighted(out, table, idx, w)` (`sum_j w_j table[idx_j]`) and
-   `ScatterRank1(table, idx, w, err, rate)` (`table[idx_j] += rate w_j err`).
+   `ScatterRank1(table, idx, w, err, rate)` (`table[idx_j] += rate w_j err`). *Built in oann*, `sparse.olang`.
 10. **CSR sparse matrices** (phase 3): SpMV/SpMM in both transposes, and a sampled dense-dense product (the contrast at
-    existing synapses only) for large sparse circuits.
+    existing synapses only) for large sparse circuits. *Built in oann*: `sparse.Csr` with `MulAdd` (`Y += W X`),
+    `MulAddT` (`Y += W^T X`) and `Sampled` (`g = (A B^T)` at the entries), on batches laid out feature-major (a sample's
+    feature `j` at `j * stride + t`, so each entry's index and value are read once for the whole batch and its run of
+    multiply-adds vectorizes), and `DrawPattern`/`PatternOf` for patterns. Against dense at the densities that matter in
+    5.9. They live in oann rather than std/linalg for now: nothing else needs them yet.
 11. **Bernoulli fills**: `FillMask(r, density)`, seeded from the shared `Rand`.
 12. **Precision**: F64 for every kernel (gradient checks, references); F32 for lives and learning. F16/BF16 cannot
     resolve the settle tolerance (their epsilons, 9.8e-4 and 7.8e-3, are at or above it) and contrasts cancel, so only
@@ -827,6 +932,16 @@ values plus the table error, is about 1e-4, so the board's tolerance is `max(tau
 equilibrium is at most the floor over `1 - kappa`, about 1e-3 at `kappa = 0.9`, comfortably below the life tolerance's
 `eps = T/40 = 6.25e-3`. The board therefore runs only *certified* circuits (the projection of 1.3 on). The arithmetic is
 integer, so it is associative and the simulation of 5.6 can match the engine bit for bit.
+
+*As built (phase 3, 2.12).* `board.olang` simulates this engine bit for bit and fixes what the table above left open:
+drives and the constant are Q4.14 too; a linear input's activity is `sat16(2 d)`; the table is 1024 base-and-delta
+pairs (two BRAM18 words a segment) with an 8-bit interpolation fraction; the cross-entropy's softmax uses a second,
+exponential table over `[-16, 0]` and one division per neuron, probabilities and forces in Q.16; shifts round to the
+nearest with halves up; a folded block too large for Q1.15 carries a power-of-two shift. Measured (5.9): the
+activation table errs by at most 4.7e-5 (1.5 steps), and the engine's equilibria lie within a third of the bound of
+5.6 on the fixtures. The range argument above covers the recurrent part only: with the folded inputs a constant can
+exceed `[-8, 8)` - on MNIST 0.2-2.7% of the hidden neurons' constants do - and saturates, which a `tanh` or
+hard-sigmoid activity does not notice (`tanh(8) = 1 - 2.3e-7`, below a step of Q1.15).
 
 **Why not floating point.** The DSP48E1 has no floating-point unit: an F32 multiply-add built from the vendor cores
 takes about five DSP slices, which would leave roughly 40 lanes of 220 and double the weight memory. F16/BF16 are not
@@ -1026,6 +1141,15 @@ Q4.14: the simulated equilibrium differs from the F64 one by less than the bound
 fixtures above. On the board, the PL result must equal the simulation exactly (integer arithmetic, associative sums) and
 the F64 result within the bound.
 
+*As built (2.12):* the simulation is `board.Engine` (plain `I16`/`I32`/`I64` arrays rather than a `Q1_15` type: the
+engine is data, and its formats are stated once in the module's header). The floor is made precise as
+`tau_b + Delta`, `Delta` the error of one evaluation of the map, against the F64 circuit carrying the board's own
+values; weight rounding is a separate term. Checked: one neuron against bisection; twelve random certified circuits at
+`kappa` 0.5, 0.8 and 0.9, linear and `tanh` inputs, cross-entropy and squared readouts, four rows, at board tolerances
+of 0, 1 and 5 steps; nudged phases of both costs at `beta = +-0.5`; a lesson's gradient; against the unquantized
+circuit; refusal; determinism; and the golden vectors read back. A hardware engine is checked against the simulation by
+`Dump`'s vectors, bit for bit.
+
 ---
 
 ### 5.7 Results of phase 1 (2026-10-09)
@@ -1140,6 +1264,106 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
   learners relearn within the aroused stretch a change provokes, but there is a floor (regret about 0.03-0.05 in the
   bandit, a little higher after a reversal) where a still-imperfect policy no longer surprises the agent.
 
+### 5.9 Results of phase 3 (2026-10-09)
+
+`board.olang`, `store.olang`, `sparse.olang` and `circuit.olang`'s tests (F64), `examples/mnist_board.olang` (F32) and
+`bench/sparse.olang`, on the shared four-core machine with olang edf8238.
+
+**The board (5.6).** Every check holds within its bound, and the measured gaps are a third of it or less.
+
+- *Tables.* `tanh`'s largest error over all `2^18` inputs 4.7e-5 (1.5 steps of Q1.15; bound 5.4e-5); the
+  exponential's 4.0e-5 (bound 4.6e-5).
+- *One neuron* (5.1.1's, `w` in {0.5, -0.8, 0.9, -0.3}, four drives) at the board's floor of 5 steps: 6-28 sweeps, within
+  1.4e-4 to 4.3e-4 of the bisected root (bounds 6.3e-4 to 4.7e-3).
+- *Twelve certified circuits* (`kappa` 0.5, 0.8, 0.9; linear and `tanh` inputs; both costs; four rows): the largest
+  gap 0.34 of its bound. At `kappa = 0.9` and a tolerance of one step, 8 sweeps and potentials within 1.1e-4 of the exact
+  equilibrium (bound 1.6e-3); at the floor, 7 sweeps and 3.0e-4 (bound 4.1e-3). An exact fixed point (residual 0) in 7
+  of the 12; the rest end in a cycle of a step or two.
+- *Nudged phases* at `beta = +-0.5`: the squared error's within 7.5e-5 and 2.0e-4 (bound 1.4e-3; the plus phase at
+  `dt = 2/3`), the cross-entropy's within 1.3e-4 (bound 2.2e-3).
+- *A lesson* (four rows, `beta = 0.5`, `kappa = 0.9`): the gradient within 1.4e-4 of the exact circuit's, 4.0e-4 of its
+  largest element (the bound from the states' errors: 2.7e-2).
+- *Against the circuit before quantization*: within 1.0e-4 (`kappa = 0.5`) and 1.4e-4 (`kappa = 0.9`); the weights'
+  rounding is not visible beside the arithmetic's.
+- *XOR* (8 hidden, inputs +-1, Adam 0.05, `Restrain(0.9)` after every step, 400 lessons): settled in F64, 4/4 answered on
+  the board, loss 0.01077, 8.8 sweeps a lesson; settled on the board, 4/4, loss 0.01074, 8.8 sweeps a lesson.
+- *MNIST* (784-128-10, batch 32, Adam 1e-3, `beta = 0.5`, `Restrain(0.9)` after every step; test accuracy after epochs
+  1 / 2 / 3, answered in F32 and on the board):
+
+  | lessons settled | `T` | F32 answers | board answers | answers agreeing |
+  |---|---|---|---|---|
+  | in F32 | 0.25 | 90.05 / 91.02 / 91.09% | 90.05 / 91.02 / 91.09% | 100.00% |
+  | on the board | 0.25 | 90.04 / 91.02 / 91.09% | 90.04 / 91.01 / 91.10% | 99.99% |
+  | in F32 | 0.1 | 91.95 / 92.73 / 93.20% | 91.95 / 92.74 / 93.20% | 99.99-100% |
+  | on the board | 0.1 | 92.06 / 92.73 / 93.19% | 92.06 / 92.73 / 93.19% | 100.00% |
+  | on the board | 0.05 | 91.71 / 92.94 / 93.42% | 91.71 / 92.94 / 93.42% | 100.00% |
+  | in F32, not restrained | 0.25 | 95.69 / 96.48 / 96.58% | 95.69 / 96.48 / 96.58% | 100.00% |
+
+  Settling on the board changes the learning curve by a few hundredths at most: the board is as good a teacher as F32.
+  The certificate is what costs accuracy (91-93% against 96.6% without it - 5.7's observation), and a lower
+  temperature recovers part of it (T = 0.1: 93.2%, T = 0.05: 93.4%). Even the uncertified circuit (gain 7.7-10) answers identically on
+  the board, though nothing guarantees it. 0.2-2.7% of the hidden neurons' constants exceed Q4.14's range and saturate,
+  harmlessly for `tanh`. 4.3's cycle model gives 80 cycles a sweep and 1 664 for the folded constant (0.8 us and 17 us
+  at 100 MHz): about 21 us an answer at its 3.9-4 sweeps.
+- *Simulation speed*: a first MNIST epoch (15.3 sweeps a lesson) with its lessons settled on the board takes 6.1 s
+  against 4.7 s in F32 - medians of three interleaved runs at a load of 3.5-5.7, each run's numbers identical to the
+  last digit (the simulation is deterministic, and so is the F32 circuit). Later epochs, at more sweeps a lesson, take
+  7.8-10 s either way.
+
+**The sparse-code store (5.3.2)**, `Inputs = 16`, 320 cells, `K = 16`:
+
+- 50 random readings: every code has norm 1 (to 1e-14) and exactly 16 active cells, the 16 largest projections.
+- A write at rate 1 reads back exactly (1e-14); another reading moves by exactly the dot of the two codes times the
+  write's error (1e-14, 20 trials), and not at all when their codes share no cell.
+- The running mean follows the writes as computed by hand (1e-14); at rate 0.1, 400 noisy targets around 0.7 (+-0.2)
+  read 0.737.
+- One exposure each, then everything read back (rms error; a store knowing nothing scores 0.577 on these targets):
+
+  | inputs (cells, active) | 10 stored | 100 stored | 1 000 stored |
+  |---|---|---|---|
+  | 16 (320, 16) | 0.164 | 0.478 | 0.744 |
+  | 64 (1 280, 64) | 0.086 | 0.198 | 0.471 |
+
+  Interference grows with what is stored, as 1.6 expects of a fast, one-shot store - which is why sleep (1.9) moves
+  what it holds into slow weights.
+
+**Readout groups.** Two groups of three, cross-entropy at `T = 0.25`: the centered estimate against central
+differences 6.6e-7 of the largest element at `beta = 1e-3`; a joint action's contrast against central differences of
+`T log pi(a)`, `pi` the groups' product, 5.1e-7. An agent with two groups (two contexts; group 0 should answer the
+context, group 1 its opposite; reward the mean of the groups' +-1): every one of the last 499 moments right in both
+groups, 2 399 calm moments and 101 aroused.
+
+**Sparse projections.** A sparse projection is the masked dense one: the same weights, equilibria within 1e-12, the
+gradient within 1e-10, the drive's gradient within 1e-10, `Restrain` alike - at one row and at three. Against dense
+blocks (interleaved medians of five rounds, F32; the dense ones through std/linalg's `Gemm` with a workspace, at one
+row the contrast as two outer products):
+
+| n x n, rows | operation | density 0.01 | 0.02 | 0.05 | 0.1 | 0.2 | 0.5 |
+|---|---|---|---|---|---|---|---|
+| 1 024, 1 | transport (both ways) | 13.2x | 7.9x | 4.4x | 2.4x | 1.5x | 0.75x |
+| 1 024, 1 | contrast | 5.7x | 4.3x | 2.5x | 1.3x | 0.86x | 0.51x |
+| 1 024, 32 | transport | 15.6x | 11.2x | 6.1x | 3.6x | 2.2x | 1.0x |
+| 1 024, 32 | contrast | 6.5x | 4.8x | 2.4x | 1.3x | 0.66x | 0.31x |
+| 4 096, 1 | transport | 40.6x | 23.5x | 10.0x | 5.2x | 2.6x | 1.1x |
+| 4 096, 1 | contrast | 19.0x | 11.8x | 5.3x | 2.6x | 1.3x | 0.52x |
+| 4 096, 32 | transport | 29.3x | 21.1x | 10.5x | 5.6x | 3.3x | 1.1x |
+| 4 096, 32 | contrast | 10.2x | 5.2x | 2.7x | 1.5x | 0.76x | 0.32x |
+
+(the sparse block's speed-up; e.g. 4 096 x 4 096 at density 0.01 and 32 rows: a transport in 4.2 ms against 123 ms).
+A transport breaks even near half the positions, a contrast near a sixth at 32 rows and a quarter at one (a sampled
+product of a batch is a dot of 32 per synapse, against a dense product at the arithmetic peak). Whole circuits - 256
+inputs into 2 048 hidden neurons with a lateral block at the density, reciprocal with 10 readouts - where a settle is
+many transports to a lesson's one contrast:
+
+| lateral density | 0.01 | 0.05 | 0.1 | 0.25 | 0.5 |
+|---|---|---|---|---|---|
+| a lesson, 32 rows: dense / sparse | 345 / 21 ms (17x) | 400 / 49 ms (8.2x) | 324 / 77 ms (4.2x) | 325 / 208 ms (1.6x) | 357 / 425 ms (0.84x) |
+| a free settle from cold, one row | 20.8 / 1.1 ms (18x) | 23.0 / 2.5 ms (9.4x) | 21.2 / 3.7 ms (5.7x) | 20.2 / 8.9 ms (2.3x) | 21.5 / 21.3 ms (1.0x) |
+
+(medians of five interleaved rounds at a load of 2-4; a second run gave the same picture within about 30%, its lesson at
+0.25 2.0x and at 0.5 1.3x.) So `Auto` stores a projection sparse at a density of at most 0.25, where a lesson is still 1.6-2x and a settle 2.3x
+as fast; between 0.25 and 0.5 the two are close and the dense block keeps the batch's products at the arithmetic peak.
+
 ## 6. Decisions and open questions
 
 **Decided**
@@ -1210,6 +1434,57 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
 29. **The circuit is made by a function**, working around repro/ctorpush.
 30. **Pinning is detected** by the rate of repeating the last action when the best arm changed (5.8).
 
+**Taken in phase 3 (2026-10-09)**
+
+31. **The board engine is data**: a descriptor table of 8 words per region and 8 per block, weights, biases and three
+    tables, with the formats and every operation stated in `board.olang`'s header - the simulation is the engine's
+    specification (2.12), and plain `I16`/`I32`/`I64` arrays stand in for a `Q1_15` type.
+32. **Formats 4.2 left open**: drives, biases and constants Q4.14 like potentials; an input's activity from its Q4.14
+    drive through the activation unit (a linear input's `sat16(2 d)`, so a drive of exactly 1 reads `1 - 2^-15`);
+    probabilities and forces Q.16 (17 bits), `dt` Q.16 unsigned, `beta` Q.14, `1/T` Q.10.
+33. **Rounding**: the engine's shifts round to the nearest, halves up (`(x + 2^(k-1)) >> k`), as a DSP's rounding
+    constant does; the processing system quantizes to the nearest, ties to even (its float unit's default); every
+    saturation is counted.
+34. **A block that does not fit Q1.15 carries a power-of-two shift** - only folded input blocks, which the certificate
+    does not bound; and a constant or total beyond Q4.14's range saturates rather than having its own wider format,
+    because a `tanh` or hard-sigmoid activity cannot tell (1.2's range question for the folded inputs, answered).
+35. **The constant is rounded once a settle** to an 18-bit word and the total once a sweep (two roundings, rather than
+    a 48-bit constant per neuron per row held through the settle).
+36. **One activation unit, a table**: 1024 segments over `[-8, 8)`, each a base and a delta (two BRAM18 words), an
+    8-bit interpolation fraction; the hard sigmoid uses the same table, exact between knots. Linear and `LifRate`
+    relaxing neurons and spiking circuits are refused by the engine (spiking is phase 4).
+37. **The cross-entropy force on the board**: `z = (s - max) / T` rounded to Q5.14 and clamped at -16, an exponential
+    table of 1024 segments over `[-16, 0]`, a sum, and one division per neuron (to the nearest).
+38. **The board's tolerance** is `max(floor(tau 2^14), 5)` steps of Q4.14 - 4.2's `max(tau, 3e-4)`, the floor covering
+    the integer iteration's last cycle of a step or two.
+39. **The board is validated against the circuit carrying the board's own values** (`StoreParams`, `StoreInputs`), so
+    5.6's bound - `(tau_b + Delta + tau) / (1 - kappa)` with `Delta` the error of one evaluation of the map - covers the
+    engine's arithmetic alone; the weights' rounding is a separate term (a fan-in times `2^-16`).
+40. **Learning on the board is 4.4's default**: the engine settles, the states are read back, the contrast and the
+    optimizer's step are taken in the circuit's precision on master weights, `Restrain(0.9)` keeps them certified and
+    `Load` pushes the requantized copy after every step.
+41. **Golden vectors**: `Dump` writes the image and the last settle as safetensors with integer dtypes, for a
+    testbench to compare a hardware engine with, bit for bit.
+42. **The sparse-code store**: `R`'s row `i` from a generator seeded by the seed and `i` (any row regenerates alone);
+    the running mean follows the writes only (`MeanRate` 0.01), so a read changes nothing; a write moves the mean before
+    coding; `Rate` 1 (one exposure stores); `K = ceil(0.05 Cells)`; a selected cell whose projection is not positive
+    is inactive (0 in the code).
+43. **Top-k** is a quickselect (median of three) on a copy, then a pass counting the larger and a pass collecting:
+    ties go to the earlier position, positions come out increasing.
+44. **Readout groups** are equal-sized groups of one readout region (heterogeneous groups are separate readouts); a
+    class per group per row; an agent's joint action is one number, `sum_g Chosen[g] actions^g`, and its memory writes
+    each group's chosen action with the shared reward.
+45. **Sparse projections**: every projection that is not complete gets a pattern first - drawn by geometric gaps or
+    sorted from given pairs - and then a weight per synapse, Glorot over the expected fan-in and fan-out, so the dense
+    and sparse layouts of one seed are one circuit (this changes the draws of masked dense projections from phase 1;
+    complete ones are unchanged). `Auto` is sparse at a density of at most 0.25 (5.9); a batch is transposed into
+    feature-major once a sweep (one row used as it is). The kernels live in oann (`sparse.olang`) until something else
+    needs them in std/linalg.
+46. **On the board a sparse block is stored densely**, absent synapses as zeros: lanes that skip absent synapses (an
+    index memory per lane) wait until a sparse circuit is to run there.
+47. **The board runs whatever rate circuit it is given**, certified or not: the guarantees of 4.2 and 5.6 hold for
+    certified circuits; an uncertified one is measured (5.9: the 96.6% MNIST circuit answers identically).
+
 **Open questions**
 
 1. **Scope and order within settling networks.** Recommended: the circuit and the agent (phases 1-2) first; the
@@ -1236,6 +1511,13 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
    ways out, both changes to the model: sample rather than act greedily in calm moments (exploration without learning,
    at no cost to calm's "no synapse touched"), or let arousal also rise with the policy's entropy. Recommended: try the
    first. Default: as specified (greedy when calm).
+9. **Sparse lanes on the board** (decision 46). A sparse block stored densely costs its full size in BRAM and cycles;
+   lanes skipping absent synapses need an index per weight (about 10 bits) and break the one-weight-per-clock rhythm of
+   a lane. Recommended: dense until a wiring diagram is to run on the board; then measure the densities involved.
+   Default: dense.
+10. **A lower temperature for certified circuits** (from 5.9). Restrained MNIST gains 2.3 points at `T = 0.05`, at
+    about 2.4x the sweeps of a lesson at the end of training. Recommended: make `T = 0.1` the default for circuits
+    meant for the board (`Restrain` on), keep 0.25 otherwise. Default: 0.25 everywhere.
 
 ---
 

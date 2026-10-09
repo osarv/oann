@@ -642,7 +642,7 @@ multi-index - not used by oann, whose element access is `Get`/`Set` and runs of 
 
 ```
 makefile                OLANG ?= the compiler; make test, data, mnist, cnn, epoch, charlm, lmbench, lmref, bpe,
-                        bpelm, safetensors, clean
+                        bpelm, safetensors, board, sparse, clean
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
@@ -655,6 +655,12 @@ tokenizer.olang         byte-level BPE: GPT-2's pre-tokenization, training, enco
 checkpoint.olang        safetensors: Names (PyTorch's for the layers), Save and Load in F64, F32, F16 or BF16
 conv.olang              convolution (im2col, one product, col2im) and max pooling on images held as rows
 vision.olang            the convolution layer; the gradient checks of convolution and pooling
+circuit.olang           settling networks: Circuit (regions, projections dense or sparse, readout groups), settles,
+                        the certificate, Teach, Eligibility; the neuron models, spiking included
+agent.olang             Agent: a circuit living moments, with a critic, memories, a context trace and arousal
+board.olang             the PYNQ-Z2 engine simulated in integers (docs/settling.md 4.2), golden vectors
+store.olang             the sparse-code store
+sparse.olang            CSR matrices and their products, top-k, the sparse-code products
 datasets/idx.olang      the IDX format
 datasets/loader.olang   Labeled sets and the Loader
 datasets/mnist.olang    fetching and loading MNIST
@@ -664,6 +670,8 @@ examples/mnist_cnn.olang  a small convolutional network on MNIST, its memory and
 examples/charlm.olang   the character-level transformer on tiny Shakespeare, trained, saved and sampled
 examples/charlm_sample.olang  sampling from its checkpoint, with and without the cache
 examples/bpelm.olang    the same transformer on 512 BPE tokens, per character against the character model
+examples/xor_settle.olang, xor_spiking.olang, mnist_settle.olang, bandit_settle.olang  settling networks end to end
+examples/mnist_board.olang  MNIST taught and answered through the board engine, against F32
 bench/data.olang        the data pipeline, checked and timed
 bench/train.olang       where an epoch's time goes
 bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
@@ -673,6 +681,7 @@ bench/attention.olang   attention's kernels against a Gemm per sequence and head
 bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
 bench/conv.olang        a convolution's passes timed: im2col, the three products, col2im
 bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against numpy
+bench/sparse.olang      sparse projections against dense ones, kernels and whole circuits
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
@@ -938,3 +947,21 @@ circuit's flat parameter region with the same loops `AdamW`/`Sgd` use.
 
 `examples/bandit_settle.olang` runs the contextual bandit, reversal and trace-pinning tasks over many lives with
 confidence intervals. The results and decisions are in docs/settling.md, sections 2.11, 5.8 and 6.
+
+Phase 3 adds three modules and two extensions:
+
+- `board.olang` simulates the PYNQ-Z2 engine bit for bit in integers - Q1.15 weights and activities, Q4.14 potentials,
+  exact 48-bit sums, a table for `tanh` and one for the cross-entropy's exponential - from a descriptor table, so it is
+  the reference a hardware engine is checked against (golden vectors: `Dump`). Lessons can settle on it while the
+  contrast and the optimizer run in the circuit (4.4's split). Its equilibria are within a third of the derived bound of
+  the exact ones, and MNIST taught through it matches F32 to a few hundredths (91.1% certified at `T = 0.25`, 93.4% at
+  `T = 0.05`, answers agreeing on 99.99-100%).
+- `store.olang` is the sparse-code store (a random expansion, the top 5% of cells, a delta-rule table).
+- `sparse.olang` holds CSR matrices (products in both directions, the contrast sampled at the synapses), top-k and the
+  store's gather and scatter.
+- A circuit's projections can be stored as compressed sparse rows (automatically at a density of at most 0.25, where a
+  lesson is 1.6-2x as fast) or given as a wiring; a readout can be split into softmax groups, and an agent
+  chooses one action per group.
+
+`make board` runs `examples/mnist_board.olang`; `make sparse` runs `bench/sparse.olang`. Results and decisions:
+docs/settling.md sections 2.12, 5.9 and 6 (decisions 31-47).
