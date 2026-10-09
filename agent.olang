@@ -10,7 +10,6 @@
 #   a calm one settles once, answers greedily and changes nothing that learns.
 # Step(obs, reward) is one moment (1.8). Nothing is allocated per moment.
 
-import "std/io"
 import "std/json"
 import "std/linalg"
 import "std/math"
@@ -97,7 +96,7 @@ fn (m mut Memory<<T>>&) unit(x Array<T>&) {
 }
 
 # (k S)_a for the store at s (the persistent one, or the fast one times its pending decay), in F64
-fn (m Memory<<T>>&) at(s Array<T>&, scale F64, a I64) F64 {
+fn (m Memory<<T>>&) recall(s Array<T>&, scale F64, a I64) F64 {
     sum F64 = 0.0
     for i in range m.Keys { sum += F64(m.key[i]) * F64(s[i * m.Actions + a]) }
     return sum * scale
@@ -107,7 +106,9 @@ fn (m Memory<<T>>&) at(s Array<T>&, scale F64, a I64) F64 {
 fn (m mut Memory<<T>>&) Read(x Array<T>&, out mut Array<T>&) {
     m.unit(x)
     like T
-    for a in range m.Actions { out[a] = linalg.Cast(m.Gain * (m.at(m.c, 1.0, a) + m.at(m.f, m.Pending, a)), like) }
+    for a in range m.Actions {
+        out[a] = linalg.Cast(m.Gain * (m.recall(m.c, 1.0, a) + m.recall(m.f, m.Pending, a)), like)
+    }
 }
 
 # writes value for action a at the key of x, the persistent store's step grown by surprise (|delta|)
@@ -120,9 +121,9 @@ fn (m mut Memory<<T>>&) Write(x Array<T>&, a I64, value F64, surprise F64) {
         m.Pending = 1.0
     }
     rate F64 = math.Min(1.0, m.Rate * (1.0 + surprise))
-    slow := linalg.Cast(rate * (value - m.at(m.c, 1.0, a)), like)
+    slow := linalg.Cast(rate * (value - m.recall(m.c, 1.0, a)), like)
     for i in range m.Keys { m.c[i * m.Actions + a] = m.c[i * m.Actions + a] + slow * m.key[i] }
-    fast := linalg.Cast(value - m.at(m.c, 1.0, a) - m.at(m.f, 1.0, a), like)
+    fast := linalg.Cast(value - m.recall(m.c, 1.0, a) - m.recall(m.f, 1.0, a), like)
     for i in range m.Keys { m.f[i * m.Actions + a] = m.f[i * m.Actions + a] + fast * m.key[i] }
 }
 
@@ -242,7 +243,7 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
     Width I64 = widthOf(hidden)
     phi mut Array<T>& = Array<T>(Width)                # this moment's hidden activities
     # the circuit is made by a function rather than recorded here: a constructor pushing onto a List of a field of its
-    # own puts the List's storage in its own scope, which closes when it returns (olang ef939ae, repro/ctorpush)
+    # own puts the List's storage in its own scope, which closes when it returns (olang ef939ae to 9621af3, repro/ctorpush)
     Net mut circuit.Circuit<T>& = circuitFor(phi, observations, actions, hidden, Config, rng)
     Sensors circuit.Region = circuit.Region(0)          # the regions, in the order circuitFor records them
     Context circuit.Region = circuit.Region(1)
@@ -273,7 +274,7 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
 
 # an agent that cannot go on - a call out of order: stops with what is wrong
 fn stop(what String&) {
-    try io.PrintErr("oann agent: " $what "\n") catch { }
+    eprintln("oann agent: " $what)
     fail
 }
 
@@ -682,7 +683,7 @@ test "arousal: calm once the critical period ends, aroused within a few moments 
     }
     assert first >= 600 and first <= 600 + 10                           # within 1 / Fast moments
     assert last < 900 and not a.Aroused                                  # and it falls back
-    try io.Print("arousal: aroused " $(first - 600) " moments after the change, calm again after " $(last - 600) "\n") catch { }
+    println("arousal: aroused " $(first - 600) " moments after the change, calm again after " $(last - 600))
 }
 
 test "memory: a read after a write returns the value, orthogonal keys do not interfere, overlapping ones by their dot" {
@@ -712,7 +713,7 @@ test "memory: a read after a write returns the value, orthogonal keys do not int
     for n in range 1, 30 {
         p.Write(x, 2, -0.4, 0.5)
         p.unit(x)
-        assert math.Abs(p.at(p.c, 1.0, 2) - (-0.4) * (1.0 - math.Pow(1.0 - rate, F64(n)))) < 1e-14
+        assert math.Abs(p.recall(p.c, 1.0, 2) - (-0.4) * (1.0 - math.Pow(1.0 - rate, F64(n)))) < 1e-14
     }
 }
 
@@ -822,7 +823,7 @@ test "a checkpoint restores a life exactly: the restored agent's moments are the
     for i in range a.Net.ParamCount { assert a.Net.ParamData()[i] == b.Net.ParamData()[i] and a.Elig.E[i] == b.Elig.E[i] }
     for i in range a.Mem.c.Len() { assert a.Mem.c[i] == b.Mem.c[i] and a.Mem.f[i] == b.Mem.f[i] }
     assert a.Mood.Level == b.Mood.Level and a.Draws == b.Draws and a.Opt.Steps == b.Opt.Steps and a.Calm == b.Calm
-    try io.Print("checkpoint: " $(a.Aroused) " aroused, " $(a.Calm) " calm, " $(a.Draws) " draws\n") catch { }
+    println("checkpoint: " $(a.Aroused) " aroused, " $(a.Calm) " calm, " $(a.Draws) " draws")
     assert a.Aroused > 1 and a.Calm > 1 and a.Draws > 1             # the stretch held both kinds of moment
     # a used agent cannot be restored into, and a file that is no checkpoint is refused
     refused Bool = false
@@ -852,6 +853,6 @@ test "an agent learns a contextual bandit: two contexts, two arms, the right arm
         obs[1] = 1.0 - obs[0]
         action = try a.Step(obs, r, true) catch { fail }
     }
-    try io.Print("bandit: " $right " of the last 499 moments right, " $(a.Calm) " calm, " $(a.Aroused) " aroused\n") catch { }
+    println("bandit: " $right " of the last 499 moments right, " $(a.Calm) " calm, " $(a.Aroused) " aroused")
     assert right > 450 and a.Calm > a.Aroused
 }
