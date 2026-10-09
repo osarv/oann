@@ -6,7 +6,7 @@ OLANG ?= /home/user/wt/oannc2/build/out
 # every module with test blocks
 TESTS = ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang datasets/mnist.olang
 
-.PHONY: test data bench mnist clean c-test c-mnist
+.PHONY: test data bench epoch mnist clean c-test c-mnist
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -21,6 +21,10 @@ data bench:
 mnist:
 	$(OLANG) -b examples/mnist_mlp.olang
 	./build/examples_mnist_mlp $(ARGS)
+
+# an epoch's time against C over OpenBLAS (bench/epoch.sh)
+epoch:
+	OLANG=$(OLANG) bench/epoch.sh
 
 clean:
 	rm -rf build

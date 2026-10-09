@@ -1,0 +1,59 @@
+# where an epoch of the MNIST perceptron's training goes: the time in filling batches, Forward, Backward and the
+# optimizer's Step, summed over an epoch (best of three). Arguments: threads (1)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn"
+import "../layers"
+import "../optim"
+import "../datasets/idx"
+import "../datasets/loader"
+import "../datasets/mnist"
+
+fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError {
+    args := os.Args()
+    threads I64 = 1
+    if args.Len() > 1 { threads = try args[1].ParseInt() }
+    data := try mnist.Load("data/mnist", mnist.Source)
+    g := nn.Graph<F32>(128, threads)
+    x := g.Input(784)
+    y := g.Classes()
+    net := layers.NewMlp(g, I64[784, 128, 10])
+    loss := g.SoftmaxCrossEntropy(net.Apply(g, x), y)
+    r := rand.Rand(1)
+    g.Plan(r)
+    o optim.AdamW<F32>&g = optim.AdamW<F32>(g)
+    l := loader.Loader(data.Train, 128, 1)
+    best := Array<I64>(4, 9223372036854775807)
+    for rep in range 3 {
+        spent := Array<I64>(4)
+        l.Epoch()
+        for b in range l.Batches() {
+            t0 := time.Now()
+            n := l.Fill(b, g.InputData(x), g.ClassData(y))
+            t1 := time.Now()
+            g.Forward(n)
+            t2 := time.Now()
+            g.Backward(loss)
+            t3 := time.Now()
+            o.Step(g)
+            t4 := time.Now()
+            spent[0] += t1 - t0
+            spent[1] += t2 - t1
+            spent[2] += t3 - t2
+            spent[3] += t4 - t3
+        }
+        for i in range 4 {
+            if spent[i] < best[i] { best[i] = spent[i] }
+        }
+    }
+    names := String&["fill", "forward", "backward", "step"]
+    total I64 = 0
+    for i in range 4 { total += best[i] }
+    for i in range 4 {
+        try io.Print($names[i] " " $(F64(best[i]) * 1e-9).Fixed(3) " s (" $(100.0 * F64(best[i]) / F64(total)).Fixed(1) "%)\n")
+    }
+    try io.Print("epoch " $(F64(total) * 1e-9).Fixed(3) " s\n")
+}
