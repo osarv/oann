@@ -721,14 +721,16 @@ fn (c mut Circuit<<T>>&) settle(p Phase, budget I64, tolerance F64, fresh Bool) 
 
 # the sweeps of a rate circuit's settle, in phase pi's candidate slot: with check, the residual of every state is
 # measured and the first that qualifies is committed (a refusal when none does within budget); without, budget
-# sweeps run and the state reached is committed, its residual reported. Damping: with Attempts above 1 the budget is
-# split into that many parts, the step halved in each - the residual tested is always the undamped one
+# sweeps run and the state reached is committed, its residual reported. The step is StepFor(the phase's nudge).
+# Damping: with Attempts above 1 the budget is split into that many parts, the step halved in each - the residual
+# tested is always the undamped one
 fn (c mut Circuit<<T>>&) relax(pi I64, budget I64, tolerance F64, check Bool) Settlement ? NotSettled {
     v := c.candidate(pi, 0)
     s := c.candidate(pi, 1)
     beta := c.nudges[pi]
     parts I64 = c.Attempts if c.Attempts > 1 else 1
-    dt F64 = c.Dt
+    base := c.StepFor(beta)
+    dt F64 = base
     for k in range budget + 1 {
         if check or k == budget {
             c.transport(s, true)
@@ -752,7 +754,7 @@ fn (c mut Circuit<<T>>&) relax(pi I64, budget I64, tolerance F64, check Bool) Se
             c.transport(s, true)
             if beta != 0.0 { c.addNudge(s, beta) }
         }
-        dt = c.Dt / F64(I64(1) << (k * parts / budget))
+        dt = base / F64(I64(1) << (k * parts / budget))
         c.step(v, s, dt)
     }
     unreachable
@@ -981,10 +983,37 @@ fn (c mut Circuit<<T>>&) Gain() F64 {
     return 0.0 if most == 0.0 else most * l
 }
 
-# the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual, or 1 where nothing is certified
-fn (c mut Circuit<<T>>&) Rate() F64 {
+# the largest slope of a nudge's force on its own neuron, per unit of beta: a CrossEntropy readout's force
+# onehot - softmax(s / T) falls by p (1 - p) / T <= 1 / (4 T) as s rises, a Squared one's y - s by 1
+fn (c Circuit<<T>>&) forceSlope() F64 {
+    worst F64 = 0.0
+    for i in range c.regions.Len() {
+        rg := c.regions[i]
+        if not (rg.Kind is Role.Readout) { continue }
+        match rg.Fit {
+            case Cost.CrossEntropy(temperature) { worst = math.Max(worst, 0.25 / temperature) }
+            case Cost.Squared { worst = math.Max(worst, 1.0) }
+        }
+    }
+    return worst
+}
+
+# the step of a sweep in a phase nudged with beta: Dt, and Dt / (1 + beta lambda) when beta > 0, lambda the force's
+# largest self-slope. A positive nudge pulls each readout neuron back toward its target, a negative feedback of up to
+# beta lambda on itself; at a full step it overshoots and swings (a period-2 cycle where beta lambda nears 1). The
+# smaller step keeps every diagonal entry of the sweep's Jacobian nonnegative, so the nudge then only damps and the
+# sweep contracts at 1 - dt (1 - kappa) as a free one does (exactly for Squared; for CrossEntropy the force's
+# off-diagonal terms, which cancel its diagonal ones while the readout's slopes are equal, may add up to
+# beta / (4 T) (1 - rho') more). A negative nudge pushes away and needs no smaller step
+fn (c Circuit<<T>>&) StepFor(beta F64) F64 {
+    return c.Dt if beta <= 0.0 else c.Dt / (1.0 + beta * c.forceSlope())
+}
+
+# the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual - of a free phase, or of one nudged
+# with beta (at its step) - or 1 where nothing is certified
+fn (c mut Circuit<<T>>&) Rate(beta F64 = 0) F64 {
     k := c.Gain()
-    return 1.0 if k >= 1.0 else 1.0 - c.Dt * (1.0 - k)
+    return 1.0 if k >= 1.0 else 1.0 - c.StepFor(beta) * (1.0 - k)
 }
 
 # scales every recurrent block by one factor so that the gain is target - all of them alike, which keeps a
@@ -1049,11 +1078,12 @@ fn (c mut Circuit<<T>>&) LessonTolerance(beta F64) F64 {
     return math.Max(beta * beta * beta * (1.0 - kappa) / 10.0, 100.0 * roundoff(like))
 }
 
-# the sweeps a settle to tolerance gets: twice what the certificate says a cold start needs (ln tolerance / ln q, q
-# held at most 0.95 when nothing is certified), and at least 128. A spiking circuit's: 32 windows
-fn (c mut Circuit<<T>>&) Budget(tolerance F64) I64 {
+# the sweeps a settle to tolerance gets, free or nudged with beta: twice what the certificate says a cold start needs
+# (ln tolerance / ln q, q held at most 0.95 when nothing is certified), and at least 128. A spiking circuit's: 32
+# windows
+fn (c mut Circuit<<T>>&) Budget(tolerance F64, beta F64 = 0) I64 {
     if c.Spiking { return 32 * c.window }
-    q F64 = math.Min(c.Rate(), 0.95)
+    q F64 = math.Min(c.Rate(beta), 0.95)
     need F64 = 2.0 * math.Log(tolerance) / math.Log(q)
     return I64(math.Max(128.0, math.Ceil(need)))
 }
@@ -1172,7 +1202,7 @@ fn (c mut Circuit<<T>>&) DriveGrad(reg Region, out mut Array<<T>>&, beta F64, ce
 fn (c mut Circuit<<T>>&) Teach(n I64, l Lesson) I64 ? NotSettled {
     c.Use(n)
     tolerance F64 = l.Tolerance if l.Tolerance > 0.0 else c.LessonTolerance(l.Beta)
-    budget I64 = l.Budget if l.Budget > 0 else c.Budget(tolerance)
+    budget I64 = l.Budget if l.Budget > 0 else c.Budget(tolerance, l.Beta)
     c.Nudge(Phase.Free, 0)
     free := try c.settle(Phase.Free, budget, tolerance, true)
     sweeps I64 = free.Sweeps
@@ -1477,6 +1507,41 @@ test "the certificate: one equilibrium from any start, and its bounds hold sweep
         assert c.Potential(Phase.Scratch).MaxAbsDifference(star) <= tau / (1.0 - kappa) + 1e-13
         assert F64(st.Sweeps) <= math.Ceil(math.Log(tau / r0) / math.Log(q))
     }
+}
+
+test "a nudged phase steps at Dt / (1 + beta lambda) and contracts at the certified rate" {
+    c := Circuit<F64>(2)
+    x := c.Input(3)
+    h := c.Hidden(5)
+    o := c.Readout(2, Cost.Squared)
+    c.Project(x, h, Wiring.OneWay)
+    c.Project(h, h)
+    c.Project(h, o)
+    r := rand.Rand(8)
+    c.Plan(r)
+    c.Certify(0.8)
+    randomize(c, r, 1.0)
+    t := c.TargetData(o)
+    for j in range t.Len() { t[j] = r.Uniform(-1.0, 1.0) }
+    try c.Settle(Phase.Free, 4000, 1e-12) catch { fail }
+    beta F64 = 1.0
+    assert c.StepFor(beta) == 0.5 and c.StepFor(-beta) == 1.0
+    q := c.Rate(beta)
+    assert math.Abs(q - 0.9) < 1e-12
+    res := Array<F64>(2)
+    c.Warm(Phase.Plus, Phase.Free)
+    c.Nudge(Phase.Plus, beta)
+    r0 := c.Residual(Phase.Plus, res)
+    assert r0 > 0.1
+    qk F64 = 1.0
+    for k in range 1, 60 {
+        c.Run(Phase.Plus, 1)
+        qk = qk * q
+        assert c.Residual(Phase.Plus, res) <= qk * r0 + 1e-13
+    }
+    c.Warm(Phase.Plus, Phase.Free)
+    st := try c.Settle(Phase.Plus, 4000, 1e-9) catch { fail }
+    assert st.Dt == 0.5 and F64(st.Sweeps) <= math.Ceil(math.Log(1e-9 / r0) / math.Log(q))
 }
 
 test "with strong positive feedback a settle qualifies or refuses - never a state that does not qualify" {
@@ -1806,4 +1871,37 @@ test "a spiking circuit settles to its rate model's equilibrium, and its spike-c
     try io.Print("spiking against its rate model: rates within " $meanField ", a lesson of " $sweeps " steps, signs agree on "
         $agree " of the " $large " larger entries, largest difference " $spread " of the largest entry\n") catch { }
     assert meanField < 0.015 and agree == large and large >= 8 and spread < 0.35
+}
+
+test "a settling circuit learns XOR by equilibrium propagation" {
+    c := Circuit<F64>(4)
+    x := c.Input(2)
+    h := c.Hidden(8)
+    o := c.Readout(2)
+    c.Project(x, h, Wiring.OneWay)
+    c.Project(h, o)
+    r := rand.Rand(1)
+    c.Plan(r)
+    c.Certify(0.9)
+    d := c.DriveData(x)
+    classes := c.LabelData(o)
+    for b in range 4 {
+        p I64 = b / 2
+        q I64 = b % 2
+        d[2 * b] = 1.0 if p == 1 else -1.0
+        d[2 * b + 1] = 1.0 if q == 1 else -1.0
+        classes[b] = I32(p ^ q)
+    }
+    opt := Adam<F64>(c, 0.05)
+    sweeps I64 = 0
+    for k in range 400 {
+        sweeps += try c.Teach(4, Lesson()) catch { fail }
+        opt.Step(c)
+    }
+    try c.Settle(Phase.Free, 1000, 1e-6) catch { fail }
+    predicted := Array<I32>(4)
+    c.Predict(Phase.Free, o, predicted)
+    for b in range 4 { assert predicted[b] == classes[b] }
+    assert c.Loss(Phase.Free) < 0.01
+    try io.Print("XOR: loss " $(c.Loss(Phase.Free)) " after 400 lessons, " $(F64(sweeps) / 400.0) " sweeps a lesson\n") catch { }
 }
