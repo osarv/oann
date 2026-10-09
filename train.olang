@@ -3,8 +3,10 @@
 # the graph's input, and every buffer is the graph's.
 
 import "nn"
+import "layers"
 import "optim"
 import "datasets/loader"
+import "datasets/text"
 
 # the handles a classifier's loop needs: its input, the classes, the logits and the loss
 type Classifier struct(X nn.Var, Y nn.Var, Logits nn.Var, Loss nn.Var) {
@@ -49,4 +51,57 @@ fn Evaluate(g mut nn.Graph<F32>&, c Classifier&, l mut loader.Loader&) (F64, F64
         seen += n
     }
     return total / F64(seen), F64(right) / F64(seen)
+}
+
+# ---- language models ----
+
+# the handles a language model's loop needs: the tokens in, the targets (each token's next one), the logits and the
+# loss. The graph's batch is B sequences of T tokens
+type LanguageModel struct(Tokens nn.Var, Targets nn.Var, Logits nn.Var, Loss nn.Var, T I64) {
+    Tokens
+    Targets
+    Logits
+    Loss
+    T
+}
+
+# a GPT on g (layers.NewTransformer, tied embeddings) for a vocabulary of "vocab" tokens and sequences of T: its
+# tokens, targets, logits and loss
+fn Gpt(g mut nn.Graph<F32>&, vocab I64, T I64, width I64, heads I64, depth I64, dropout F64 = 0.0) LanguageModel {
+    tok := g.Tokens()
+    y := g.Classes()
+    logits := layers.NewTransformer(g, vocab, T, width, heads, depth, true, dropout).Apply(g, tok)
+    return LanguageModel(tok, y, logits, g.SoftmaxCrossEntropy(logits, y), T)
+}
+
+# one training step on B random windows of w, B * T being the graph's batch: forward, backward, the gradient clipped
+# to norm "clip" (none when 0), and a step of o at "rate". Gives the loss and the gradient's norm before clipping
+fn LmStep(g mut nn.Graph<F32>&, m LanguageModel&, w mut text.Windows&, o mut <O optim.Optimizer<F32>>&, rate F64,
+        clip F64) (F64, F64) {
+    g.Training = true
+    w.Random(g.TokenData(m.Tokens), g.ClassData(m.Targets), g.Batch / m.T)
+    g.Forward(g.Batch)
+    g.Backward(m.Loss)
+    norm F64 = optim.ClipGradNorm(g, clip) if clip > 0.0 else 0.0
+    o.SetRate(rate)
+    o.Step(g)
+    return F64(g.Scalar(m.Loss)), norm
+}
+
+# the mean loss over the first "batches" batches of w's ordered pass (all of it when it is shorter), dropout off - the
+# same windows every time, so two evaluations compare
+fn LmEvaluate(g mut nn.Graph<F32>&, m LanguageModel&, w text.Windows&, batches I64) F64 {
+    g.Training = false
+    B I64 = g.Batch / m.T
+    total F64 = 0.0
+    seen I64 = 0
+    for b in range batches {
+        n := w.At(b * B, g.TokenData(m.Tokens), g.ClassData(m.Targets), B)
+        if n == 0 { break }
+        g.Forward(n * m.T)
+        total += F64(g.Scalar(m.Loss)) * F64(n)
+        seen += n
+    }
+    g.Training = true
+    return total / F64(seen)
 }

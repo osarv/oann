@@ -1,0 +1,33 @@
+# A lambda that captures a function value and calls it - the way a helper composes a kernel from a caller's lambda,
+# "fn(d, g, v) { return d + f(g, v) }" - leaves an indirect call per element: the captured code pointer is a value in
+# the closure's environment, not followed to its lambda even when everything is inlined into one function, so the
+# loop neither inlines f nor vectorizes. The same loop with the lambda written out runs several times faster. Found in
+# ops.olang's backward2, whose accumulating form cost a GELU backward 30-60 ns an element against 8 written out.
+# Expected: both loops alike. Actual (build with -b and run): "captured" several times "direct".
+import "std/io"
+import "std/linalg"
+import "std/time"
+
+fn direct(dx linalg.Matrix<F32>&, dy linalg.Matrix<F32>&, s linalg.Matrix<F32>&) {
+    dx.Map3(dx, dy, s, fn(d, g, v) { return d + g * v })
+}
+
+fn through(dx linalg.Matrix<F32>&, dy linalg.Matrix<F32>&, s linalg.Matrix<F32>&, f fn(g F32, v F32) F32) {
+    dx.Map3(dx, dy, s, fn(d, g, v) { return d + f(g, v) })
+}
+
+fn main() ? io.IoError {
+    dx := linalg.Full(1024, 512, F32(0.0))
+    dy := linalg.Full(1024, 512, F32(0.5))
+    s := linalg.Full(1024, 512, F32(2.0))
+    for round in range 3 {
+        t0 := time.Now()
+        for i in range 20 { direct(dx, dy, s) }
+        t1 := time.Now()
+        for i in range 20 { through(dx, dy, s, fn(g, v) { return g * v }) }
+        t2 := time.Now()
+        try io.Print("ns an element: direct " $(F64(t1 - t0) / 10485760.0).Fixed(2) ", captured "
+            $(F64(t2 - t1) / 10485760.0).Fixed(2) "\n")
+    }
+    assert dx.Get(0, 0) == 120.0
+}

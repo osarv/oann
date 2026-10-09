@@ -77,6 +77,128 @@ fn (m Mlp&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
     return h
 }
 
+# ---- transformers ----
+#
+# A decoder-only transformer as GPT-2 has it (Radford et al.), on a batch of B sequences of T tokens held as B * T rows:
+# a token embedding plus a learned position, then blocks of pre-normalized attention and a GELU perceptron, each
+# added back to its input, a final normalization, and logits over the vocabulary - by the token embedding itself
+# (tied, as GPT-2 does) or a matrix of its own. Starting values are GPT-2's: weights and embeddings normal with
+# deviation 0.02, the two projections back into the residual stream 0.02 / sqrt(2 * layers), biases zero, gains one.
+# Weight decay applies to the weights and embeddings, not to biases and gains.
+
+# a dense layer with the given starting values, weight decay on the weights only
+fn NewDenseWith(g mut nn.Graph<<T>>&, inputs I64, outputs I64, weights nn.Init, bias nn.Init) Dense {
+    w := g.Param(outputs, inputs, weights, true)
+    b := g.Param(1, outputs, bias, false)
+    return Dense(w, b, inputs, outputs)
+}
+
+# a row-wise normalization's parameters: a gain (ones) and, for layer normalization, a bias (zeros), 1 x width each,
+# neither decayed. Rms: root-mean-square normalization, which has no bias (Bias is then -1)
+type Norm struct(Gain nn.Var, Bias nn.Var, Rms Bool) {
+    Gain
+    Bias
+    Rms
+}
+
+fn NewNorm(g mut nn.Graph<<T>>&, width I64, rms Bool = false) Norm {
+    gain := g.Param(1, width, nn.Init.Constant(1.0), false)
+    if rms { return Norm(gain, nn.Var(-1), true) }
+    return Norm(gain, g.Param(1, width, nn.Init.Zeros, false), false)
+}
+
+fn (n Norm&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
+    if n.Rms { return g.RmsNorm(x, n.Gain) }
+    return g.LayerNorm(x, n.Gain, n.Bias)
+}
+
+# a transformer block, pre-normalized: h = x + O(attention(Q(n1), K(n1), V(n1))), n1 = Norm1(x); then y = h +
+# Down(gelu(Up(Norm2(h)))), Up four times as wide as the block and gelu GPT-2's, through tanh. With dropout, both
+# branches are dropped out before they are added back
+type AttentionBlock struct(Norm1 Norm, Q Dense, K Dense, V Dense, O Dense, Norm2 Norm, Up Dense, Down Dense, Heads I64,
+        T I64, Drop F64) {
+    Norm1
+    Q
+    K
+    V
+    O
+    Norm2
+    Up
+    Down
+    Heads
+    T
+    Drop
+}
+
+# a block of width D with "heads" heads over sequences of T rows; "layers", the blocks the network has, scales the
+# starting values of the two projections back into the residual stream (GPT-2's 1 / sqrt(2 * layers))
+fn NewAttentionBlock(g mut nn.Graph<<T>>&, D I64, heads I64, T I64, layers I64 = 1, dropout F64 = 0.0,
+        rms Bool = false) AttentionBlock {
+    w := nn.Init.Normal(0.0, 0.02)
+    out := nn.Init.Normal(0.0, 0.02 / math.Sqrt(F64(2 * layers)))
+    z := nn.Init.Zeros
+    n1 := NewNorm(g, D, rms)
+    q := NewDenseWith(g, D, D, w, z)
+    k := NewDenseWith(g, D, D, w, z)
+    v := NewDenseWith(g, D, D, w, z)
+    o := NewDenseWith(g, D, D, out, z)
+    n2 := NewNorm(g, D, rms)
+    up := NewDenseWith(g, D, 4 * D, w, z)
+    down := NewDenseWith(g, 4 * D, D, out, z)
+    return AttentionBlock(n1, q, k, v, o, n2, up, down, heads, T, dropout)
+}
+
+fn (b AttentionBlock&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
+    n := b.Norm1.Apply(g, x)
+    a := g.Attention(b.Q.Apply(g, n), b.K.Apply(g, n), b.V.Apply(g, n), b.Heads, b.T, true)
+    h := g.Add(x, dropped(g, b.O.Apply(g, a), b.Drop))
+    m := g.GeluTanh(b.Up.Apply(g, b.Norm2.Apply(g, h)))
+    return g.Add(h, dropped(g, b.Down.Apply(g, m), b.Drop))
+}
+
+# x through dropout, or x itself when p is 0
+fn dropped(g mut nn.Graph<<T>>&, x nn.Var, p F64) nn.Var {
+    if p > 0.0 { return g.Dropout(x, p) }
+    return x
+}
+
+# a decoder-only transformer over a vocabulary of Vocab tokens, sequences of T, width D: an embedding, positions, the
+# blocks, a final normalization and the logits. Head is the matrix the logits are taken against (Vocab x D) - the
+# token embedding itself when Tied
+type Transformer struct(Vocab I64, T I64, Width I64, Embedding nn.Var, Positions nn.Var, Final Norm, Head nn.Var,
+        Drop F64) {
+    Vocab
+    T
+    Width
+    Embedding
+    Positions
+    Final
+    Head
+    Drop
+    Blocks mut List<AttentionBlock>& = List<AttentionBlock>()
+}
+
+fn NewTransformer(g mut nn.Graph<<T>>&, V I64, T I64, D I64, heads I64, layers I64, tied Bool = true,
+        dropout F64 = 0.0, rms Bool = false) Transformer {
+    w := nn.Init.Normal(0.0, 0.02)
+    emb := g.Param(V, D, w, true)
+    pos := g.Param(T, D, w, true)
+    blocks := List<AttentionBlock>()
+    for i in range layers { blocks.Push(NewAttentionBlock(g, D, heads, T, layers, dropout, rms)) }
+    final := NewNorm(g, D, rms)
+    head nn.Var = emb if tied else g.Param(V, D, w, true)
+    t Transformer&return = Transformer(V, T, D, emb, pos, final, head, dropout)
+    for b in blocks { t.Blocks.Push(b) }
+    return t
+}
+
+# the logits of each row's next token, from a Tokens() node: a batch of rows, Vocab wide
+fn (t Transformer&) Apply(g mut nn.Graph<<T>>&, tokens nn.Var) nn.Var {
+    h := dropped(g, g.Positions(g.Embedding(tokens, t.Embedding), t.Positions), t.Drop)
+    for b in t.Blocks { h = b.Apply(g, h) }
+    return g.Product(t.Final.Apply(g, h), t.Head, false, true)
+}
+
 test "a perceptron registers its layers' parameters and records them in order" {
     g := nn.Graph<F64>(8)
     x := g.Input(4)
@@ -90,3 +212,33 @@ test "a perceptron registers its layers' parameters and records them in order" {
     bound F64 = 1.0 / math.Sqrt(4.0)
     assert w.Max() <= bound and w.Min() >= -bound and w.MaxAbs() > 0.0
 }
+
+test "a transformer's gradients agree with central differences, tied and not, with dropout, on a short batch" {
+    for variant in range 3 {
+        g := nn.Graph<F64>(8)
+        tok := g.Tokens()
+        y := g.Classes()
+        t := NewTransformer(g, 7, 4, 8, 2, 2, variant != 1, 0.1 if variant == 2 else 0.0, variant == 1)
+        loss := g.SoftmaxCrossEntropy(t.Apply(g, tok), y)
+        r := rand.Rand(21)
+        g.Plan(r)
+        # embeddings 56 + 32; per block four 8 x 8 projections with biases, the 8 -> 32 -> 8 perceptron and two norms;
+        # the final norm; with variant 1 a head of its own and no biases in the norms
+        assert g.ParamCount == I64[1848, 1864, 1848][variant]
+        # the starting values are small enough that every gradient is small: spread the parameters out so the check
+        # sees a network that does something
+        p := g.Params()
+        for i in range p.Cols { p.Data[i] = p.Data[i] * 10.0 + 0.1 * r.Normal() }
+        td := g.TokenData(tok)
+        yd := g.ClassData(y)
+        for i in range 8 {
+            td[i] = I32(r.Below(7))
+            yd[i] = I32(r.Below(7))
+        }
+        # a deep network's loss curves more: the central difference's own error (h^2 truncation against 1 / h
+        # rounding) bottoms out at 1e-6 to 4e-6 here, against errors near 1 for a wrong backward
+        assert nn.GradientError(g, loss, 8) < 1e-5
+        assert nn.GradientError(g, loss, 4) < 1e-5
+    }
+}
+

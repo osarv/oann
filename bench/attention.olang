@@ -1,0 +1,98 @@
+# attention's forward and backward (ops.Attention, written as dot products and updates over each head's strided
+# view) against the same forward made of matrix products - kernels.Gemm on the same views, one call per sequence and
+# head, Q K^T then P V, the softmax between - which is what a batched strided Gemm in std/linalg would run in one call.
+# Both are timed over B sequences of T rows, D columns in "heads" heads; their outputs are compared. Arguments: B, T, D,
+# heads, repetitions (16 64 128 4 20)
+
+import "std/io"
+import "std/linalg"
+import "std/math"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ops"
+import "../kernels"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len() { return fallback }
+    return try args[i].ParseInt()
+}
+
+# causal attention by products: S = scale Q K^T (all of it, then the upper triangle masked), P = softmax(S), Y = P V
+fn byGemm(y linalg.Matrix<F32>&, q linalg.Matrix<F32>&, k linalg.Matrix<F32>&, v linalg.Matrix<F32>&, heads I64, T I64,
+        probs linalg.Matrix<F32>&, work mut Array<F32>&) {
+    dh I64 = q.Cols / heads
+    scale F64 = 1.0 / math.Sqrt(F64(dh))
+    for s in range q.Rows / T {
+        for h in range heads {
+            p := probs.RowRange((s * heads + h) * T, (s * heads + h + 1) * T)
+            qs := q.Block(s * T, h * dh, T, dh)
+            ks := k.Block(s * T, h * dh, T, dh)
+            vs := v.Block(s * T, h * dh, T, dh)
+            kernels.Gemm(p, qs, false, ks, true, scale, 0, 1, work)
+            for i in range T {
+                row := p.Row(i)
+                top F32 = row[0]
+                for j in range 1, i + 1 { top = math.Max(top, row[j]) }
+                total F32 = 0.0
+                for j in range i + 1 {
+                    e := math.Exp(row[j] - top)
+                    row[j] = e
+                    total += e
+                }
+                for j in range i + 1 { row[j] = row[j] / total }
+                for j in range i + 1, T { row[j] = 0.0 }
+            }
+            kernels.Gemm(y.Block(s * T, h * dh, T, dh), p, false, vs, false, 1, 0, 1, work)
+        }
+    }
+}
+
+fn main() ? io.IoError + ParseError {
+    args := os.Args()
+    B := try number(args, 1, 16)
+    T := try number(args, 2, 64)
+    D := try number(args, 3, 128)
+    heads := try number(args, 4, 4)
+    reps := try number(args, 5, 20)
+    r := rand.Rand(1)
+    n I64 = B * T
+    q := linalg.Matrix<F32>(n, D)
+    k := linalg.Matrix<F32>(n, D)
+    v := linalg.Matrix<F32>(n, D)
+    q.FillNormal(r, 0.0, 1.0)
+    k.FillNormal(r, 0.0, 1.0)
+    v.FillNormal(r, 0.0, 1.0)
+    y := linalg.Matrix<F32>(n, D)
+    y2 := linalg.Matrix<F32>(n, D)
+    probs := linalg.Matrix<F32>(n * heads, T)
+    probs2 := linalg.Matrix<F32>(n * heads, T)
+    dy := linalg.Matrix<F32>(n, D)
+    dy.FillNormal(r, 0.0, 1.0)
+    dq := linalg.Matrix<F32>(n, D)
+    dk := linalg.Matrix<F32>(n, D)
+    dv := linalg.Matrix<F32>(n, D)
+    scratch := Array<F32>(T * T)
+    like F32 = 0.0
+    work := Array<F32>(kernels.GemmSpace(T, T, T, 1, like))
+    best := Array<I64>(3, 9223372036854775807)
+    for round in range 3 {
+        t0 := time.Now()
+        for i in range reps { ops.Attention(y, q, k, v, heads, T, true, probs, 1) }
+        t1 := time.Now()
+        for i in range reps { ops.AttentionBackward(dy, q, k, v, heads, T, true, probs, dq, false, dk, false, dv, false, scratch, 1) }
+        t2 := time.Now()
+        for i in range reps { byGemm(y2, q, k, v, heads, T, probs2, work) }
+        t3 := time.Now()
+        spent := I64[t1 - t0, t2 - t1, t3 - t2]
+        for i in range 3 {
+            if spent[i] < best[i] { best[i] = spent[i] }
+        }
+    }
+    dh I64 = D / heads
+    causal F64 = F64(B * heads) * F64(T * (T + 1) / 2) * F64(dh) * 2.0   # multiply-adds of the causal half, both products
+    try io.Print("B " $B ", T " $T ", D " $D ", " $heads " heads: forward " $(F64(best[0]) * 1e-6 / F64(reps)).Fixed(2)
+        " ms (" $(2.0 * causal * F64(reps) / F64(best[0])).Fixed(2) " GFLOPS on the causal half), backward "
+        $(F64(best[1]) * 1e-6 / F64(reps)).Fixed(2) " ms, forward by Gemm per head "
+        $(F64(best[2]) * 1e-6 / F64(reps)).Fixed(2) " ms; outputs differ by " $y.MaxAbsDifference(y2) "\n")
+}
