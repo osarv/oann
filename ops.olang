@@ -20,12 +20,19 @@ fn beta(acc Bool) F64 {
     return 1.0 if acc else 0.0
 }
 
-# dx = f(dy, s), or dx += f(dy, s): an element-wise local gradient f of the output's gradient and one saved matrix
+# dx = f(dy, s), or dx += f(dy, s): an element-wise local gradient f of the output's gradient and one saved matrix.
+# The loops call f themselves: wrapped in a lambda of its own ("d + f(g, v)") it stayed an indirect call per element,
+# six times as slow (repro/capturedfn)
 fn backward2(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<<T>>&, s linalg.Matrix<<T>>&, f fn(g <T>, v <T>) <T>) {
-    if acc {
-        dx.Map3(dx, dy, s, fn(d, g, v) { return d + f(g, v) })
-    } else {
-        dx.Map2(dy, s, f)
+    for r in range dx.Rows {
+        o := dx.Row(r)
+        a := dy.Row(r)
+        b := s.Row(r)
+        if acc {
+            for c in range o.Len() { o[c] = o[c] + f(a[c], b[c]) }
+        } else {
+            for c in range o.Len() { o[c] = f(a[c], b[c]) }
+        }
     }
 }
 
