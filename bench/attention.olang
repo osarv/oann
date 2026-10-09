@@ -137,17 +137,21 @@ fn main() ? io.IoError + ParseError {
     dv2 := linalg.Matrix<F32>(n, D)
     scratch := Array<F32>(ops.AttentionScratch(T, D / heads))
     wss := Array<linalg.GemmWorkspace<F32>>(1, linalg.GemmWorkspace<F32>())
-    ops.WarmAttention(wss, T, D / heads)
+    z F32 = 0.0
+    ops.WarmAttention(wss, T, D / heads, z)
     times := Array<I64>(4 * rounds)               # the loops' forward, the Gemms', then the two backwards, by round
     for round in range rounds {
         t0 := time.Now()
         for i in range reps { loops(y, q, k, v, heads, T, probs) }
         t1 := time.Now()
-        for i in range reps { ops.Attention(y2, q, k, v, heads, T, true, probs2, scratch, 1, wss) }
+        for i in range reps { ops.Attention(y2, q, k, v, heads, T, true, probs2, scratch, 1, wss, z) }
         t2 := time.Now()
         for i in range reps { loopsBackward(dy, q, k, v, heads, T, probs, dq, dk, dv, scratch) }
         t3 := time.Now()
-        for i in range reps { ops.AttentionBackward(dy, q, k, v, heads, T, true, probs2, dq2, false, dk2, false, dv2, false, scratch, 1, wss) }
+        for i in range reps {
+            ops.AttentionBackward(dy, q, k, v, heads, T, true, probs2, dq2, false, dk2, false, dv2, false, scratch, 1,
+                wss, z)
+        }
         t4 := time.Now()
         times[0 * rounds + round] = t1 - t0
         times[1 * rounds + round] = t2 - t1

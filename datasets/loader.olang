@@ -3,6 +3,7 @@
 # caller's or made once - filling a batch allocates nothing.
 
 import "std/rand"
+import "../kernels"
 
 # Count samples of Width unsigned-byte features each, and a class in [0, Classes) per sample. A feature reads as
 # F32(byte) * Scale + Shift - so the defaults put a byte into [0, 1], and a mean m and standard deviation s of those
@@ -49,8 +50,10 @@ fn (l mut Loader&) Epoch() {
 }
 
 # fills x with batch b's features, one row of Width after another, and y with their classes, and gives how many
-# samples the batch holds. x must have room for Size rows and y for Size classes
-fn (l Loader&) Fill(b I64, x mut Array<F32>&, y mut Array<I32>&) I64 {
+# samples the batch holds. x must have room for Size rows and y for Size classes. A feature is computed in F32 and
+# rounded once to x's type - BF16 for a mixed-precision graph
+fn (l Loader&) Fill(b I64, x mut Array<<T>>&, y mut Array<I32>&) I64 {
+    like T
     s := l.set
     first I64 = b * l.Size
     n I64 = l.Size
@@ -60,7 +63,7 @@ fn (l Loader&) Fill(b I64, x mut Array<F32>&, y mut Array<I32>&) I64 {
         i I64 = l.order[first + k] if l.filled else first + k
         row := s.Features[i * w:(i + 1) * w]
         out := x[k * w:(k + 1) * w]
-        for j in range w { out[j] = F32(row[j]) * s.Scale + s.Shift }
+        for j in range w { out[j] = kernels.Down(F32(row[j]) * s.Scale + s.Shift, like) }
         y[k] = I32(s.Labels[i])
     }
     return n

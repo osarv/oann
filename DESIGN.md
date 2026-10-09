@@ -10,7 +10,7 @@ with no cost the code does not show, natural language, minimal syntax. Concretel
 allocates nothing of its own**, every hot loop is a GEMM or one pass over memory, and a model is written the way a
 PyTorch or Flax user would expect.
 
-**State (phase 3):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
+**State (phase 5):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
 the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epochs (phase 2). **Transformers are
 built** (section 11): tokens, embeddings, learned positions, layer and RMS normalization, fused multi-head attention,
 dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
@@ -21,7 +21,11 @@ pooling (im2col and one product for the whole batch), and a small CNN on MNIST. 
 docs/settling.md): phases 1 and 2 - circuits that settle, learning by free and nudged phases, a spiking variant, and an
 agent with memories and arousal. **Built with olang 9621af3** (section 8): code for this machine by default (AVX-512
 with FMA here) and every product through std/linalg's `GemmWorkspace` - an MNIST epoch went from 2.39 s to 0.69, now
-ahead of the C reference over OpenBLAS (0.93 s, interleaved), and a transformer step from 512 ms to ~200.
+ahead of the C reference over OpenBLAS (0.93 s, interleaved), and a transformer step from 512 ms to ~200. **Phase 5**
+(section 18): attention's products on std/linalg's `Gemm` (attention 1.5x faster at context 64, 2x at 256), and mixed
+precision - a `Graph<BF16>` stores everything in BF16 and computes in F32 with F32 master weights, matching F32's
+accuracy on MNIST and the character model with half the arena; on this compiler it runs 3.4-4.1x slower, its narrowing
+to BF16 being a library call per element (repro/bf16narrow).
 
 ## 1. The operand: Matrix
 
@@ -39,8 +43,9 @@ is no N-d tensor - data is interpreted in one place only, by the operation that 
   channels last (im2col into a workspace, one GEMM for the whole batch: section 16); attention reads rows as `B x T`
   tokens and its heads as column blocks (section 11).
 
-oann is generic over the element type: MNIST trains in `F32`, the gradient checks run in `F64`, and `BF16` storage with
-`F32` accumulation is the mixed-precision path (std/linalg already accumulates `F16`/`BF16` products in `F32`).
+oann is generic over the element type: MNIST trains in `F32`, the gradient checks run in `F64`, and a `Graph<BF16>` is
+mixed precision - every value and gradient stored in BF16, every operation computed in F32, the parameters' masters in
+F32 (section 18).
 
 ## 2. Automatic differentiation: a recorded graph, replayed every step
 
@@ -108,6 +113,7 @@ parameters or a second loss need no new backward code.
 | `g.Save(path)`, `g.Load(path)` | the parameter region to and from a file | `state_dict` |
 | `checkpoint.Save(g, path, names, dtype)`, `checkpoint.Load(g, path, names)` | the parameters as safetensors, by name | `save_file`, `load_state_dict` |
 | `g.Profiling`, `g.Times` | time per kind of operation, forward and backward | `torch.profiler` |
+| `nn.Graph<BF16>(...)`, `g.Masters()`, `g.SyncParams()` | mixed precision: BF16 storage, F32 computation, F32 masters | `autocast(dtype=torch.bfloat16)`, roughly |
 
 `Product` and `Multiply` are the builders of `MatMul` and `Mul`: olang reserves the operator methods' names (`MatMul`
 is `@`, `Mul` is `*`) for every method of every type, so a graph cannot have methods called that (repro/operatornames).
@@ -150,7 +156,8 @@ dead once its producer's backward has run) is a planner change, made when a mode
 ## 3. Operations (`ops.olang`)
 
 The kernels are plain functions on `linalg.Matrix<T>&`, forward and backward per primitive, usable without a graph -
-which is what an eager mode would call too.
+which is what an eager mode would call too. A kernel that computes takes the type it computes in as a last parameter,
+`z <A>` - the graph's own type for F32 and F64, F32 for a BF16 graph (section 18).
 
 | op | forward | backward |
 |---|---|---|
@@ -169,7 +176,7 @@ which is what an eager mode would call too.
 | `LayerNorm(x, g, b)` | per row `(x - mean) rstd g + b`; mean and rstd saved | `rstd (dy g - mean(dy g) - xhat mean(dy g xhat))`, column sums |
 | `RmsNorm(x, g)` | per row `x rinv g`; `rinv` saved | `rinv (dy g - xn mean(dy g xn))`, column sums |
 | `Attention(q, k, v, heads, T, causal)` | per sequence and head `softmax(Q K^T / sqrt(dh)) V`, probabilities saved | `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO` |
-| `Dropout(x, p)` | `x mask`, mask `1/(1-p)` or 0, kept | `dy mask` |
+| `Dropout(x, p)` | `x mask / (1 - p)`, mask 1 or 0 (exact in any type), kept | `dy mask / (1 - p)` |
 | `Conv2d(x, w, b, shape)` | im2col, then `cols w^T + b` - one GEMM for the batch (`conv.olang`) | `db` = column sums, `dw = dY^T cols` (patches rebuilt), `dcols = dY w`, col2im |
 | `MaxPool2d(x, pool)` | each window's maximum per channel; where it was, kept | the gradient added where the maximum was |
 
@@ -250,6 +257,8 @@ type Regularizer enum {
   costs MNIST five points, below).
 - **`Sgd<T>(g, rate = 0.01, Momentum = 0, Nesterov = false, Reg = WeightDecay(0))`**, PyTorch's semantics (decay added
   to the gradient, momentum buffer, Nesterov's look-ahead).
+- On a BF16 graph both step its F32 masters, from the BF16 gradients read up into F32, with their state in F32, then
+  round the masters into the graph (`SyncParams`); the projection regularizer is F32 and F64 only (section 18).
 
 The tests check AdamW's first steps against a hand computation, SGD's momentum, and the projection's formula against
 its definition, on a small `F64` graph.
@@ -587,8 +596,8 @@ region in it); resident memory grows by 68-76 kB over the first 20 steps and by 
 
 ### What remains
 
-- **Mixed precision** - BF16 storage with F32 master weights - not started: the graph is generic over one element type
-  (section 14). (std/linalg's BF16 product packs into a `GemmWorkspace` now, widening to F32 as it packs.)
+- **Mixed precision** is built (section 18): a `Graph<BF16>`, parity in accuracy, half the arena - and slower on this
+  compiler, whose narrowing to BF16 is a library call per element.
 - Dropout of attention's probabilities (nanoGPT's `attn_dropout`): only the residual branches and the embedding are
   dropped out.
 - A tiled attention that recomputes `P` in the backward instead of saving `T x T` per head (memory at long contexts),
@@ -641,9 +650,8 @@ multi-index - not used by oann, whose element access is `Get`/`Set` and runs of 
    scale with the learning rate and whether it should apply to every dense layer or only some.
 2. An eager mode beside the graph, for models whose structure depends on their data - not before a model needs one.
 3. oann as an importable package (`github.com/OWNER/oann/nn`) - the layout already is one module per concern.
-4. Mixed precision (BF16 storage, F32 master weights): the graph is generic over one element type, so it needs either
-   a second arena of BF16 copies the products read (std/linalg's BF16 product packs into a `GemmWorkspace` too,
-   widening to F32 as it packs) or a graph with a type per node. Not started (section 11).
+4. ~~Mixed precision~~ - built as one storage type per graph, F32 inside every kernel and F32 masters beside the arena
+   (section 18), rather than BF16 copies the products read or a type per node.
 5. View nodes - a node whose value is a column block of another's, no storage of its own - would give fused QKV (one
    product of width 3D) and splitting heads at no cost; the "written" flag per node would then need to be per block.
 
@@ -983,10 +991,107 @@ medians of 8 runs alternating the build before and after, `bench/abstep.py`):
 (At 256, medians of 6 runs of 5 steps.) Attention is 1.5x faster at context 64 and 2.05x at 256; the step 1.08x and
 1.45x. The products and the rest of the graph did not move (96-100 and 22 ms at 64).
 
+### Mixed precision: BF16 storage, F32 computation, F32 masters
+
+`nn.Graph<BF16>` is a mixed-precision graph. Every value, gradient and saved matrix is held in BF16 - the arena is
+half an F32 graph's - and every operation is computed in F32. The parameters' F32 masters live beside the arena:
+
+- Each kernel takes the type it computes in as a last parameter, `z <A>`: the graph's own type for F32 and F64, F32 for
+  BF16 (std/linalg's reductions use the same pattern). It reads each stored element up into `A`, computes in `A` -
+  sums, softmaxes, normalizations, the losses' log-sum-exp included - and rounds each result it stores down once
+  (`kernels.Up`, `kernels.Down`). For an F32 or F64 graph both are nothing.
+- The products are std/linalg's BF16 `Gemm`. It reads its operands where they are, widens them to F32 as it packs them,
+  and accumulates in F32.
+- `Plan` draws the parameters' starting values into the masters - the very numbers an F32 graph draws from the same
+  generator - and rounds them into the arena.
+- An optimizer steps the masters from the BF16 gradients, read up into F32, with its moments in F32. It then rounds the
+  masters into the arena (`SyncParams`).
+- A checkpoint is the masters. A BF16 graph's raw checkpoint is an F32 graph's, and safetensors written as `Same` are
+  F32, so a model trained in BF16 loads into an F32 graph for decoding (`examples/charlm.olang` does) and back.
+- A loss's value is kept in F64 (`g.Scalar`), whatever the storage type: rounded to BF16 it would have three digits.
+
+`make mnist ARGS="10 adamw 1 1 bf16"` and `make charlm ARGS="2000 1 1 0 500 bf16"` train in it (a last argument
+`bf16`, for `bench/lm.olang` and `bench/train.olang` too). Not built: a BF16 graph's projection regularizer (it steps W
+in the graph's own type; refused with a message), convolutions computing in F32 (they compile for BF16 and compute in
+it), decoding in BF16 (decoding graphs are F32), and F16 (below).
+
+**The choice, against the two designs section 14 listed:**
+
+1. *A second arena of BF16 copies that the products read* - PyTorch's autocast, more or less. The activations stay in
+   F32, so it saves no memory: it adds the copies. Every product gains a narrowing pass per operand, and its output is
+   BF16 to be widened back. Its one gain is a product reading half the bytes, and std/linalg's packing already reads
+   its operands once. On this CPU it is the slowest of the three and the largest.
+2. *A graph with a type per node* - the general form: autocast keeps normalizations, softmaxes and losses in F32. But
+   every kernel would take each operand in either type (a three-input op in up to eight instantiations), and `Value`,
+   `Grad`, the "written" flags and the planner would all carry a type. What it would add over the choice is F32
+   *storage* for those nodes; their *computation* is in F32 already. The parity below says that storage is not needed
+   at this size.
+3. **One storage type per graph, F32 inside every kernel, F32 masters - the choice.** It is Micikevicius et al.'s
+   recipe ("Mixed Precision Training": FP16 storage, FP32 master weights, FP32 accumulation) with BF16, whose exponent
+   is F32's (Kalamkar et al., "A Study of BFLOAT16 for Deep Learning Training"). The arena halves - 86.0 MB to 46.1 for
+   the transformer, its 3.2 MB of masters included; 1.42 to 1.10 MB for the perceptron, whose parameters dominate. The
+   products read BF16 where it lies. The code is the F32 code with a witness.
+
+**Loss scaling: not needed, and not built.** BF16 has F32's exponent. Over 30 steps of the character model, its
+smallest nonzero parameter gradient was 2.7e-13 (after clipping), and BF16's smallest normal number is 1.2e-38: nothing
+underflowed. In F16, 34% of the same gradients would have been subnormal (below 6.1e-5) and 0.4% would have flushed to
+zero (below 6e-8). A `Graph<F16>` would need loss scaling, and is not offered.
+
+**Parity** (olang edf8238, one thread, the same seeds, AdamW as in sections 8 and 11):
+
+| | F32 | BF16 storage, F32 masters |
+|---|---|---|
+| MNIST perceptron, test accuracy after 10 epochs, seeds 1 / 2 / 3 | 97.79% / 97.69% / 97.79% | 97.87% / 97.69% / 97.78% |
+| the same, test loss | 0.0721 / 0.0745 / 0.0722 | 0.0718 / 0.0748 / 0.0708 |
+| MNIST with SGD (lr 0.05, momentum 0.9), seed 1 | 97.86%, loss 0.0729 | 97.83%, loss 0.0719 |
+| character model (section 11), validation loss at step 250 / 500 / 750 / 1000 | 2.3825 / 2.2186 / 2.0828 / 2.0032 | 2.3817 / 2.2181 / 2.0882 / 2.0029 |
+| the same at step 1250 / 1500 / 1750 / 2000 | 1.9575 / 1.8779 / 1.8220 / **1.8063** | 1.9622 / 1.8790 / 1.8221 / **1.8077** |
+| its training loss at step 1000 / 2000 (the mean of the last 50 steps) | 1.9224 / 1.7023 | 1.9223 / 1.7030 |
+
+The two character models run side by side, each on one thread, at a load of 5: the F32 run gave exactly section 11's
+losses (1,108 s then; 394 s, 197 ms a step, now), the BF16 run took 1,187 s (594 ms a step). Its validation losses stay
+within 0.006 of F32's all the way and end 0.0014 above them. Its sample, generated by an F32 decoding graph from the
+BF16 run's masters, reads as section 11's does.
+
+**Speed: slower on this compiler, and why.** Interleaved on the shared machine (load 5): an MNIST epoch (`bench/train`,
+the best of three epochs, medians of 5 runs) **0.63 s in F32, 2.11 in BF16**; a transformer step (`bench/abstep.py`,
+medians of 4 runs) **157 ms in F32, 650 in BF16** - products 102 against 366 ms, attention 29 against 119, the rest
+of the graph 23 against 160. Neither the format nor this design costs that - narrowing does:
+
+- **Narrowing to BF16 is a call per element** (`repro/bf16narrow.olang`). `BF16(x)` - an F32 rounded to BF16 - is a
+  call of the C library's `__truncsfbf2`, 10-14 ns an element, never vectorized (widening is an integer shift, 1 ns).
+  std/linalg's BF16 product rounds every result it writes through it: a `1024 x 512 x 128` product took 8.2 ms in BF16
+  against 1.3 in F32 - most of the products' difference above.
+- **Narrowing by bits is exact but scalar.** oann's own kernels round by the bits instead (`kernels.ToBF16`: the same
+  bits as `BF16(x)` on every input tried, 1.3-2 ns an element). But `BF16FromBits` goes through an empty inline asm (the
+  compiler's guard against an InstCombine bug), and no loop vectorizes through it. A pass with little arithmetic costs
+  1.5 ns an element against F32's 0.5; GELU, whose `FastTanh` vectorizes in F32, runs scalar at 22-27 ns against
+  1.5-1.9 - most of "the rest" above.
+
+With narrowing as cheap as widening, a BF16 product would cost about what an F32 one does (its packing widens anyway),
+and the element-wise passes would move half the bytes. That is a compiler change; oann's side is in place. The F32 and
+F64 graphs are unchanged by the witness: interleaved against the build before it, an MNIST epoch 0.61 against 0.63 s
+and a transformer step 183 against 173 ms (medians, load 5 - noise both ways).
+
+**Checked**: a BF16 graph of every kind of kernel - dense layers, GELU, layer and RMS normalization, causal attention
+over two heads, a residual add, softmax cross-entropy - against the same network in F64 from the very values the BF16
+graph computes with: the loss within 9e-5 relative and the parameter gradients within 0.7% (bounds 1e-3 and 2e-2), on
+a full and a short batch. The masters start where an F32 graph's parameters do, bit for bit. AdamW and SGD on a BF16
+graph move masters by steps BF16 cannot hold (1 - 1e-4 rounds back to 1), until they show in the graph. Checkpoints,
+raw and safetensors, load between BF16 and F32 graphs exactly. `kernels.ToBF16` gives `BF16(x)`'s bits for zeros,
+ties, subnormals, the largest finite values, infinities and NaN (and all 4,194,304 normal draws of the reproducer).
+
 ### olang issues found in phase 5 (repro/)
 
 - `repro/spawncall.olang` - a task spawned as an immediately called lambda, `spawn fn() { ... }()` in a loop, that
   captures two references and the loop's variable sees wrong captures: hundreds to thousands of 25,600 elements
   wrong. `spawn fn() { ... }` is refused for capturing the loop's variable (P2), so the called form seems to slip past
   that check. `ops.parallel`'s form - the lambda made once, outside the join - is right, and is what attention uses.
+- `repro/bf16narrow.olang` - narrowing to BF16 is a C library call per element, 10-14 ns, and the bits route stays scalar
+  (`BF16FromBits` goes through an empty asm): std/linalg's BF16 products run 2-6.5x slower than F32's, and BF16 training
+  3.4-4.1x slower (above). oann narrows by bits in its own kernels.
+- `repro/capturedvalue.olang` - a lambda capturing values runs ten times as slow as one declaring them, once the
+  function handing it to `Map` is called from a larger one (a dispatch of eight operations; the graph's forward): GELU's
+  pass went from 1.1 to 10.6 ms at 1024 x 512 with two captured type witnesses. oann's lambdas declare the witnesses
+  they need (`w A`, `like T`).
 

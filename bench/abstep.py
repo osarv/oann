@@ -2,6 +2,7 @@
 # each one's step, attention forward and backward, products and the rest of the graph, in ms a step: an A/B that
 # a machine shared with other work does not tilt toward whichever build ran during a quiet spell.
 # python3 -I bench/abstep.py ROUNDS STEPS THREADS BUILD_A BUILD_B [the model: layers width heads context sequences]
+# A build may carry arguments of its own after commas, put after the model's: build/bench_lm,bf16
 import re
 import statistics
 import subprocess
@@ -14,7 +15,8 @@ keys = ["step", "attention forward", "attention backward", "products", "rest"]
 seen = {b: {k: [] for k in keys} for b in builds}
 for r in range(rounds):
     for b in (builds if r % 2 == 0 else builds[::-1]):
-        out = subprocess.run([b, steps, threads] + model, capture_output=True, text=True, check=True).stdout
+        path, *own = b.split(",")
+        out = subprocess.run([path, steps, threads] + model + own, capture_output=True, text=True, check=True).stdout
         d = seen[b]
         d["step"].append(float(re.search(r"a step ([\d.]+) ms", out).group(1)))
         m = re.search(r"^Attention\s+([\d.]+)\s+([\d.]+)", out, re.M)

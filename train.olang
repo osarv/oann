@@ -17,7 +17,7 @@ type Classifier struct(X nn.Var, Y nn.Var, Logits nn.Var, Loss nn.Var) {
 }
 
 # one epoch: every batch of l once, in a new order, forward, backward and a step of o after each. Gives the mean loss
-fn Epoch(g mut nn.Graph<F32>&, c Classifier&, l mut loader.Loader&, o mut <O optim.Optimizer<F32>>&) F64 {
+fn Epoch(g mut nn.Graph<<T>>&, c Classifier&, l mut loader.Loader&, o mut <O optim.Optimizer<T>>&) F64 {
     l.Epoch()
     total F64 = 0.0
     seen I64 = 0
@@ -26,14 +26,14 @@ fn Epoch(g mut nn.Graph<F32>&, c Classifier&, l mut loader.Loader&, o mut <O opt
         g.Forward(n)
         g.Backward(c.Loss)
         o.Step(g)
-        total += F64(g.Scalar(c.Loss)) * F64(n)
+        total += g.Scalar(c.Loss) * F64(n)
         seen += n
     }
     return total / F64(seen)
 }
 
 # the mean loss and the fraction classified right over every sample of l, forward only
-fn Evaluate(g mut nn.Graph<F32>&, c Classifier&, l mut loader.Loader&) (F64, F64) {
+fn Evaluate(g mut nn.Graph<<T>>&, c Classifier&, l mut loader.Loader&) (F64, F64) {
     l.Epoch()
     predicted := Array<I32>(g.Batch)
     total F64 = 0.0
@@ -42,7 +42,7 @@ fn Evaluate(g mut nn.Graph<F32>&, c Classifier&, l mut loader.Loader&) (F64, F64
     for b in range l.Batches() {
         n := l.Fill(b, g.InputData(c.X), g.ClassData(c.Y))
         g.Forward(n)
-        total += F64(g.Scalar(c.Loss)) * F64(n)
+        total += g.Scalar(c.Loss) * F64(n)
         g.Value(c.Logits).ArgMaxRows(predicted[:n])
         classes := g.ClassData(c.Y)
         for i in range n {
@@ -67,7 +67,7 @@ type LanguageModel struct(Tokens nn.Var, Targets nn.Var, Logits nn.Var, Loss nn.
 
 # a GPT on g (layers.NewTransformer, tied embeddings) for a vocabulary of "vocab" tokens and sequences of T: its
 # tokens, targets, logits and loss
-fn Gpt(g mut nn.Graph<F32>&, vocab I64, T I64, width I64, heads I64, depth I64, dropout F64 = 0.0) LanguageModel {
+fn Gpt(g mut nn.Graph<<E>>&, vocab I64, T I64, width I64, heads I64, depth I64, dropout F64 = 0.0) LanguageModel {
     tok := g.Tokens()
     y := g.Classes()
     logits := layers.NewTransformer(g, vocab, T, width, heads, depth, true, dropout).Apply(g, tok)
@@ -76,7 +76,7 @@ fn Gpt(g mut nn.Graph<F32>&, vocab I64, T I64, width I64, heads I64, depth I64, 
 
 # one training step on B random windows of w, B * T being the graph's batch: forward, backward, the gradient clipped
 # to norm "clip" (none when 0), and a step of o at "rate". Gives the loss and the gradient's norm before clipping
-fn LmStep(g mut nn.Graph<F32>&, m LanguageModel&, w mut text.Windows&, o mut <O optim.Optimizer<F32>>&, rate F64,
+fn LmStep(g mut nn.Graph<<E>>&, m LanguageModel&, w mut text.Windows&, o mut <O optim.Optimizer<E>>&, rate F64,
         clip F64) (F64, F64) {
     g.Training = true
     w.Random(g.TokenData(m.Tokens), g.ClassData(m.Targets), g.Batch / m.T)
@@ -85,12 +85,12 @@ fn LmStep(g mut nn.Graph<F32>&, m LanguageModel&, w mut text.Windows&, o mut <O 
     norm F64 = optim.ClipGradNorm(g, clip) if clip > 0.0 else 0.0
     o.SetRate(rate)
     o.Step(g)
-    return F64(g.Scalar(m.Loss)), norm
+    return g.Scalar(m.Loss), norm
 }
 
 # the mean loss over the first "batches" batches of w's ordered pass (all of it when it is shorter), dropout off - the
 # same windows every time, so two evaluations compare
-fn LmEvaluate(g mut nn.Graph<F32>&, m LanguageModel&, w text.Windows&, batches I64) F64 {
+fn LmEvaluate(g mut nn.Graph<<E>>&, m LanguageModel&, w text.Windows&, batches I64) F64 {
     g.Training = false
     B I64 = g.Batch / m.T
     total F64 = 0.0
@@ -99,7 +99,7 @@ fn LmEvaluate(g mut nn.Graph<F32>&, m LanguageModel&, w text.Windows&, batches I
         n := w.At(b * B, g.TokenData(m.Tokens), g.ClassData(m.Targets), B)
         if n == 0 { break }
         g.Forward(n * m.T)
-        total += F64(g.Scalar(m.Loss)) * F64(n)
+        total += g.Scalar(m.Loss) * F64(n)
         seen += n
     }
     g.Training = true

@@ -1,0 +1,90 @@
+# A lambda that captures values - here two zero values that only name types, as a kernel computing in another type
+# than it stores carries them - runs ten times as slow as the same lambda declaring them inside its body, once the
+# function giving it to linalg's Map is itself called from a larger one: a dispatch over eight operations below, the
+# graph's forward in oann. Called directly, or from a dispatch of two, both run alike. Found moving oann's kernels onto
+# a compute type (mixed precision): GELU's pass through the graph went from 1.1 to 10.6 ms (forward) and 1.2 to 13.8
+# (backward) at 1024 x 512, and back when the witnesses moved inside the lambdas. Likely the same mechanism as
+# repro/capturedfn: the call through the captured environment stays a call per element unless everything inlines.
+# Expected: "captured" as fast as "declared". Actual (build with -b and run): captured 20-24 ns an element, declared
+# 1.8-2.1.
+# Status: reproduces on olang edf8238. Workaround (ops.olang): lambdas declare the witnesses they need (w A, like T).
+import "std/linalg"
+import "std/rand"
+import "std/time"
+
+fn gelu(x <A>) A { return 0.5 * x * (1.0 + linalg.FastTanh(0.7978845608028654 * (x + 0.044715 * x * x * x))) }
+
+# the lambda captures two zero values that only name types
+fn captured(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
+    like T
+    y.Map(x, fn(s) { return linalg.Cast(gelu(linalg.Cast(s, z)), like) })
+}
+
+# the same, the zero values declared inside the lambda
+fn declared(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
+    y.Map(x, fn(s) {
+        w A
+        like T
+        return linalg.Cast(gelu(linalg.Cast(s, w)), like)
+    })
+}
+
+type Op enum {
+    Captured
+    Declared
+    Add
+    Sub
+    Mul
+    Scale(k F64)
+    Neg
+    Copy
+}
+
+type Box<T> struct(n I64) {
+    a mut linalg.Matrix<T> = linalg.Matrix<T>(n, 512)
+    b mut linalg.Matrix<T> = linalg.Matrix<T>(n, 512)
+    c mut linalg.Matrix<T> = linalg.Matrix<T>(n, 512)
+}
+
+fn (b mut Box<<T>>&) run(op Op) {
+    match T {
+        case F32 { b.runIn(op, F32(0)) }
+        nomatch {
+            like T
+            b.runIn(op, like)
+        }
+    }
+}
+
+fn (b mut Box<<T>>&) runIn(op Op, z <A>) {
+    match op {
+        case Op.Captured { captured(b.c, b.a, z) }
+        case Op.Declared { declared(b.c, b.a, z) }
+        case Op.Add { b.c.Map2(b.a, b.b, fn(p, q) { return p + q }) }
+        case Op.Sub { b.c.Map2(b.a, b.b, fn(p, q) { return p - q }) }
+        case Op.Mul { b.c.Map2(b.a, b.b, fn(p, q) { return p * q }) }
+        case Op.Scale(k) {
+            like T
+            kk := linalg.Cast(k, like)
+            b.c.Map(b.a, fn(p) { return kk * p })
+        }
+        case Op.Neg { b.c.Map(b.a, fn(p) { return -p }) }
+        case Op.Copy { b.c.Copy(b.a) }
+    }
+}
+
+fn main() ? {
+    b := Box<F32>(1024)
+    r := rand.Rand(1)
+    b.a.FillNormal(r, 0.0, 1.0)
+    ops := Op[Op.Captured, Op.Declared, Op.Add, Op.Sub, Op.Mul, Op.Scale(2.0), Op.Neg, Op.Copy]
+    for round in range 3 {
+        t0 := time.Now()
+        for i in range 10 { b.run(ops[0]) }
+        t1 := time.Now()
+        for i in range 10 { b.run(ops[1]) }
+        t2 := time.Now()
+        for k in range 2, 8 { b.run(ops[k]) }
+        println("captured " $(F64(t1 - t0) / 5242880.0).Fixed(2) " ns an element, declared " $(F64(t2 - t1) / 5242880.0).Fixed(2))
+    }
+}

@@ -1,5 +1,6 @@
 # where an epoch of the MNIST perceptron's training goes: the time in filling batches, Forward, Backward and the
-# optimizer's Step, summed over an epoch (best of three). Arguments: threads (1)
+# optimizer's Step, summed over an epoch (best of three). Arguments: threads (1); a last argument "bf16" runs it in
+# mixed precision (nn's Graph<BF16>)
 
 import "std/io"
 import "std/os"
@@ -13,18 +14,30 @@ import "../datasets/loader"
 import "../datasets/mnist"
 
 fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError {
-    args := os.Args()
+    all := os.Args()
+    bf16 Bool = all.Len() > 1 and all[all.Len() - 1] == "bf16"
+    args := all[:all.Len() - 1] if bf16 else all
+    if bf16 {
+        like BF16 = 0.0
+        try run(args, like)
+    } else {
+        like F32 = 0.0
+        try run(args, like)
+    }
+}
+
+fn run(args Array<String&>&, like <T>) ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError {
     threads I64 = 1
     if args.Len() > 1 { threads = try args[1].ParseInt() }
     data := try mnist.Load("data/mnist", mnist.Source)
-    g := nn.Graph<F32>(128, threads)
+    g := nn.Graph<T>(128, threads)
     x := g.Input(784)
     y := g.Classes()
     net := layers.NewMlp(g, I64[784, 128, 10])
     loss := g.SoftmaxCrossEntropy(net.Apply(g, x), y)
     r := rand.Rand(1)
     g.Plan(r)
-    o optim.AdamW<F32>&g = optim.AdamW<F32>(g)
+    o optim.AdamW<T>&g = optim.AdamW<T>(g)
     l := loader.Loader(data.Train, 128, 1)
     best := Array<I64>(4, 9223372036854775807)
     for rep in range 3 {
