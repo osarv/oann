@@ -21,9 +21,9 @@
 #
 # Teach: settle free; from there settle twice more, nudged toward the targets with +beta and -beta (a cost's force
 # added to the readout's total); the contrast of the two nudged states is minus the gradient of the cost at the free
-# equilibrium, to O(beta^2), and is written into the gradient region for an optimizer (Adam, below) - or, for learning
-# from a reward that comes later, added to an eligibility trace (Eligibility, below) that a broadcast error turns into
-# a step.
+# equilibrium, to O(beta^2), and is written into the gradient region for an optimizer (optim's FlatAdamW or FlatSgd,
+# stepping ParamData() from GradData()) - or, for learning from a reward that comes later, added to an eligibility
+# trace (Eligibility, below) that a broadcast error turns into a step.
 #
 # The neuron model is a closed enum. Rate neurons: tanh (the default), the hard sigmoid, linear (tests), and LifRate -
 # the steady firing rate of a leaky integrate-and-fire neuron, the rate model of the spiking one. Lif neurons spike:
@@ -34,6 +34,7 @@ import "std/io"
 import "std/linalg"
 import "std/math"
 import "std/rand"
+import "optim"
 
 # a region's handle and a projection's: indices into the circuit's records
 type Region I64
@@ -361,6 +362,16 @@ fn (c Circuit<<T>>&) Params() linalg.Matrix<<T>> {
 # every parameter's gradient, laid out as Params()
 fn (c Circuit<<T>>&) Grads() linalg.Matrix<<T>> {
     return linalg.View(c.mem, c.ParamCount, 1, c.ParamCount)
+}
+
+# every parameter as one array, and their gradients as another: what optim's flat optimizers step -
+# opt.Step(c.ParamData(), c.GradData())
+fn (c Circuit<<T>>&) ParamData() mut Array<<T>>&c {
+    return c.mem[0:c.ParamCount]
+}
+
+fn (c Circuit<<T>>&) GradData() mut Array<<T>>&c {
+    return c.mem[c.ParamCount:2 * c.ParamCount]
 }
 
 # where the caller puts a region's drive: Rows rows of its neurons, one after another. An input's drive is its
@@ -1350,45 +1361,6 @@ fn (c mut Circuit<<T>>&) Energy(p Phase, row I64) F64 {
     return e
 }
 
-# ---- Adam ----
-
-# Adam (Kingma and Ba) over the circuit's parameter region, in one pass with its moments laid out the same way:
-# m <- beta1 m + (1 - beta1) g, v <- beta2 v + (1 - beta2) g^2, p <- p - rate (m / (1 - beta1^t)) / (sqrt(v / (1 -
-# beta2^t)) + eps). A frozen synapse's gradient is always 0, so it never moves. Rate may change between steps
-type Adam<T> struct(c mut Circuit<<T>>&, rate F64 = 0.001, Beta1 F64 = 0.9, Beta2 F64 = 0.999, Eps F64 = 1e-8) {
-    Rate mut F64 = rate
-    Beta1
-    Beta2
-    Eps
-    Steps mut I64 = 0
-    m mut Array<<T>>& = Array<<T>>(c.ParamCount)
-    v mut Array<<T>>& = Array<<T>>(c.ParamCount)
-}
-
-# one step from the gradients the last Contrast (or Teach) left
-fn (o mut Adam<<T>>&) Step(c mut Circuit<<T>>&) {
-    o.Steps++
-    like <T>
-    b1 := linalg.Cast(o.Beta1, like)
-    b2 := linalg.Cast(o.Beta2, like)
-    c1 := linalg.Cast(1.0 - o.Beta1, like)
-    c2 := linalg.Cast(1.0 - o.Beta2, like)
-    corr1 F64 = 1.0 - math.Pow(o.Beta1, F64(o.Steps))
-    corr2 F64 = 1.0 - math.Pow(o.Beta2, F64(o.Steps))
-    stride := linalg.Cast(o.Rate / corr1, like)
-    root := linalg.Cast(1.0 / math.Sqrt(corr2), like)
-    eps := linalg.Cast(o.Eps, like)
-    at := c.ParamCount
-    for k in range c.ParamCount {
-        g <T> = c.mem[at + k]
-        mk <T> = b1 * o.m[k] + c1 * g
-        vk <T> = b2 * o.v[k] + c2 * g * g
-        o.m[k] = mk
-        o.v[k] = vk
-        c.mem[k] = c.mem[k] - stride * mk / (math.Sqrt(vk) * root + eps)
-    }
-}
-
 # ---- the eligibility trace ----
 
 # an eligibility trace over the circuit's parameters, for one stream (docs/settling.md 1.5, 2.5): E <- g E + contrast
@@ -2167,11 +2139,11 @@ test "a settling circuit learns XOR by equilibrium propagation" {
         d[2 * b + 1] = 1.0 if q == 1 else -1.0
         classes[b] = I32(p ^ q)
     }
-    opt := Adam<F64>(c, 0.05)
+    opt := optim.FlatAdamW<F64>(c.ParamCount, 0.05)
     sweeps I64 = 0
     for k in range 400 {
         sweeps += try c.Teach(4, Lesson()) catch { fail }
-        opt.Step(c)
+        opt.Step(c.ParamData(), c.GradData())
     }
     try c.Settle(Phase.Free, 1000, 1e-6) catch { fail }
     predicted := Array<I32>(4)
@@ -2202,11 +2174,11 @@ test "a spiking circuit learns XOR from spike-count contrasts" {
         d[2 * b + 1] = 1.0 if q == 1 else -1.0
         t[2 * b + (p ^ q)] = 0.2                    # spikes a step for the class, none for the other
     }
-    opt := Adam<F64>(c, 0.02)
+    opt := optim.FlatAdamW<F64>(c.ParamCount, 0.02)
     steps I64 = 0
     for k in range 200 {
         steps += try c.Teach(4, Lesson(1.0)) catch { fail }
-        opt.Step(c)
+        opt.Step(c.ParamData(), c.GradData())
     }
     predicted := Array<I32>(4)
     c.Predict(Phase.Free, o, predicted)
