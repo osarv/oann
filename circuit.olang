@@ -1387,6 +1387,46 @@ fn (o mut Adam<<T>>&) Step(c mut Circuit<<T>>&) {
     }
 }
 
+# ---- the eligibility trace ----
+
+# an eligibility trace over the circuit's parameters, for one stream (docs/settling.md 1.5, 2.5): E <- g E + contrast
+# at a moment that learns, E <- g E at a calm one - g being gamma lambda. A calm moment's decay is kept pending, one
+# number, and folded in at the next moment that learns, in the same pass that adds its contrast: a calm moment touches
+# no synapse. The actor's step is G = -delta E, from the broadcast error delta, for an optimizer
+type Eligibility<T> struct(c mut Circuit<<T>>&) {
+    e mut Array<<T>>& = Array<<T>>(c.ParamCount)
+    Pending mut F64 = 1.0                           # the decay not yet applied to e: the trace is Pending e
+}
+
+# a calm moment: E <- decay E, pending
+fn (t mut Eligibility<<T>>&) Decay(decay F64) {
+    t.Pending = t.Pending * decay
+}
+
+# a moment that learns: E <- decay E + the contrast the last Contrast (or Teach) left - read from the gradient region,
+# which holds -contrast - with the pending decay folded in, one pass over the parameters
+fn (t mut Eligibility<<T>>&) Add(c mut Circuit<<T>>&, decay F64) {
+    like <T>
+    k := linalg.Cast(t.Pending * decay, like)
+    at := c.ParamCount
+    for i in range c.ParamCount { t.e[i] = k * t.e[i] - c.mem[at + i] }
+    t.Pending = 1.0
+}
+
+# the trace's value of parameter i
+fn (t Eligibility<<T>>&) At(i I64) <T> {
+    like <T>
+    return linalg.Cast(t.Pending, like) * t.e[i]
+}
+
+# the actor's step from the broadcast error delta: G = -delta E, written into the gradient region
+fn (t Eligibility<<T>>&) Credit(c mut Circuit<<T>>&, delta F64) {
+    like <T>
+    k := linalg.Cast(-delta * t.Pending, like)
+    at := c.ParamCount
+    for i in range c.ParamCount { c.mem[at + i] = k * t.e[i] }
+}
+
 # ---- tests (docs/settling.md section 5), in F64 ----
 
 # every relaxing region's biases, and every region's drives, uniform in [-a, a)
@@ -1982,6 +2022,44 @@ test "three factors: the expected actor update with an exact baseline is T grad 
     }
     try io.Print("three factors: relative error " $(worst / top) " (largest element " $top ")\n") catch { }
     assert top > 1e-4 and worst / top < 1e-5
+}
+
+test "the eligibility trace: the lazy, fused pass is the explicit sum of past contrasts weighted by (gamma lambda)^age" {
+    c := Circuit<F64>(1)
+    r := rand.Rand(18)
+    gradientCircuit(c, r, false)
+    gl F64 = 0.891
+    lazy := Eligibility<F64>(c)
+    eager := Eligibility<F64>(c)
+    learns := Bool[true, false, false, true, false, true, true, false, false, false, true]
+    moments I64 = learns.Len()
+    history := Array<F64>(moments * c.ParamCount)   # each moment's contrast (0 at a calm one)
+    for m in range moments {
+        if learns[m] {
+            c.LabelData(Region(2))[0] = I32(m % 3)
+            try c.Teach(1, Lesson(0.5)) catch { fail }
+            for i in range c.ParamCount { history[m * c.ParamCount + i] = -c.Grads().Data[i] }
+            lazy.Add(c, gl)
+            eager.Add(c, gl)
+        } else {
+            lazy.Decay(gl)
+            eager.Decay(gl)
+            for i in range c.ParamCount { eager.e[i] = eager.Pending * eager.e[i] }  # applied at once
+            eager.Pending = 1.0
+        }
+    }
+    worst F64 = 0.0
+    gap F64 = 0.0
+    for i in range c.ParamCount {
+        explicit F64 = 0.0
+        for m in range moments { explicit += math.Pow(gl, F64(moments - 1 - m)) * history[m * c.ParamCount + i] }
+        worst = math.Max(worst, math.Abs(lazy.At(i) - explicit))
+        gap = math.Max(gap, math.Abs(lazy.At(i) - eager.At(i)))
+    }
+    assert worst < 1e-14 and gap < 1e-15
+    # and the actor's step is -delta E
+    lazy.Credit(c, 0.3)
+    for i in range c.ParamCount { assert math.Abs(c.Grads().Data[i] + 0.3 * lazy.At(i)) < 1e-16 }
 }
 
 test "with asymmetric feedback the contrast is no gradient: the theorem's symmetry is needed" {
