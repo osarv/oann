@@ -1,0 +1,60 @@
+# A loop storing BF16 elements into an array it reaches through a struct at every element - std/linalg's Map, Map2
+# and Map3 do this (dst.Data[i] = f(a.Data[i])) - does not vectorize: the BF16 store carries no type-based alias tag
+# (T36), so it may change the struct's array descriptor, which is then loaded again at every element and the loop's
+# bounds cannot be known ("loop not vectorized: cannot identify array bounds" from LLVM's remarks). F32 and F64
+# stores are tagged and the same loop vectorizes; so does the BF16 loop with the descriptor taken into a local first.
+# The element stores of I8, I16, U16, U32, F16 and BF16 are untagged in the emitted IR (U8, I32, I64, F32, F64 and Bool
+# are tagged - T36's original six). Found measuring mixed precision: a GELU pass over a 1024 x 512 BF16 matrix through
+# Map took 22 ns an element, 1.5 with the rows taken into locals (as F32 takes either way); nn's SyncParams, rounding
+# the F32 masters into the BF16 arena, tripled an MNIST step's optimizer time.
+# Expected: "through the struct" about as fast as "local" for BF16, as it is for F32. Actual (build with -b and run):
+# BF16 through the struct 2.2-3.0 ns an element, local 0.30-0.32; F32 0.56-0.81 either way.
+# Status: reproduces on olang db2af5d. Workaround (oann): ops.each1/each2/each3 in place of Map, and locals for the
+# arena's descriptors in nn.SyncParams and loader.Fill.
+import "std/linalg"
+import "std/time"
+
+fn up(x <S>, z <A>) A { return linalg.Cast(x, z) }
+
+# y = a + b through Map2: each element's store reached through y
+fn throughStruct(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&) {
+    like T
+    z F32 = 0.0
+    y.Map2(a, b, fn(p, q) { return linalg.Cast(up(p, z) + up(q, z), like) })
+}
+
+# the same with each array taken into a local first
+fn local(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&) {
+    like T
+    z F32 = 0.0
+    o := y.Data
+    p := a.Data
+    q := b.Data
+    for i in range y.Rows * y.Cols { o[i] = linalg.Cast(up(p[i], z) + up(q[i], z), like) }
+}
+
+fn bench(like <T>, name String&) {
+    a := linalg.Matrix<T>(1024, 512)
+    b := linalg.Matrix<T>(1024, 512)
+    y := linalg.Matrix<T>(1024, 512)
+    for i in range a.Data.Len() {
+        a.Data[i] = linalg.Cast(F64(i % 97) * 0.01, like)
+        b.Data[i] = linalg.Cast(F64(i % 89) * 0.02, like)
+    }
+    e F64 = F64(a.Data.Len() * 20)
+    t0 := time.Now()
+    for k in range 20 { throughStruct(y, a, b) }
+    t1 := time.Now()
+    for k in range 20 { local(y, a, b) }
+    t2 := time.Now()
+    println($name ": through the struct " $(F64(t1 - t0) / e).Fixed(2) " ns an element, local " $(F64(t2 - t1) / e).Fixed(2))
+}
+
+fn main() ? {
+    f F32 = 0.0
+    h BF16 = 0.0
+    for round in range 3 {
+        bench(f, "F32")
+        bench(h, "BF16")
+    }
+}

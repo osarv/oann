@@ -662,8 +662,8 @@ the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted 
    (im2col: 3.7-4.4 ms of each of the CNN's convolutions a step); `GemmPatches` takes the patches as the left operand
    only, and std/linalg measured a right-operand form slower than im2col and a product. And a path for thin depths:
    the first convolution's products (a depth of 9) run at 6-7 GFLOPS against 26-50 for the second's.
-4. **BF16 results without a call per element** - a compiler issue (repro/bf16narrow): std/linalg's BF16 products
-   round every result they write through the C library's `__truncsfbf2`.
+4. ~~BF16 results without a call per element~~ - done by olang db2af5d, which narrows inline: std/linalg's BF16
+   products are as fast as F32's (section 20).
 
 ## 14. Open questions
 
@@ -1382,3 +1382,42 @@ the whole layer API, and `NewDense` and `NewDenseWith` are two ways into one typ
 
 `condliteral` still reproduces (being fixed in olang); `fieldname`, `joinparen`, `nestedtry` and `tryindex` are reported
 as before.
+
+### BF16 again: as fast as F32
+
+Section 18 left mixed precision 3.4-4.1x slower than F32, every narrowing to BF16 a call into the C library. olang
+db2af5d narrows inline (integer arithmetic on the F32's bits, vectorized), which made std/linalg's BF16 products as fast
+as F32's - and showed what else had been hidden behind the calls:
+
+- **A BF16 element store carries no type-based alias tag** (`repro/narrowtbaa.olang`, new): olang tags the stores of
+  T36's original six types (U8, I32, I64, F32, F64, Bool) and not those of I8, I16, U16, U32, F16 or BF16, so a BF16
+  store may change any array descriptor. std/linalg's `Map`, `Map2` and `Map3` read their matrices' storage through
+  the matrices at every element; for F32 that load is hoisted and the loop vectorizes, for BF16 it is repeated and the
+  loop stays scalar ("cannot identify array bounds", LLVM's remark). GELU over a 1024 x 512 BF16 matrix took 22 ns an
+  element through `Map`, 1.5 with each row taken into a local first - as F32 takes either way; an element-wise add 2.1
+  against 0.29 (F32: 0.6). So the element-wise kernels go through `ops.each1`, `each2` and `each3`, `Map`'s loops with
+  the rows in locals, and `nn.SyncParams` (the F32 masters rounded into the arena after every step) and `loader.Fill`
+  take their arrays into locals before their loops: the optimizer's share of a BF16 MNIST epoch fell from 0.15 s to
+  0.05.
+- **`kernels.ToBF16` is gone**: `Down` is the plain conversion. Narrowing by the bits measured the same as `BF16(x)` in
+  every form tried (GELU 1.5-1.7 ns an element either way, MNIST epochs 0.66 and 0.69 s, transformer steps 219 and 213
+  ms - noise both ways), and the results are the same bits.
+- **The lambdas capture what they use**: the type witnesses `w A` and `like T` declared inside every element-wise
+  lambda (section 18's workaround for repro/capturedvalue) are captured again, `z` and a `like` declared beside the
+  call. Measured level: F32 steps 117 against 120 ms, GELU 3.6 / 4.5 against 3.8 / 4.5 ms forward / backward, MNIST
+  epochs 0.512 against 0.517 s.
+
+**Measured** (interleaved, the catch-up commit's build against this one, load 2.3-2.9; results bit for bit as before):
+
+| | F32 before | BF16 before | F32 after | BF16 after |
+|---|---|---|---|---|
+| MNIST epoch, s (`mnist_mlp`, 3 epochs a run, 8 runs) | 0.514 (0.49-0.54) | 0.634 (0.59-0.73) | 0.525 (0.48-0.56) | 0.569 (0.50-0.67) |
+| transformer step, ms (`bench/lm`, 10 steps, 8 runs) | 131 (113-155) | 215 (205-231) | 119 (112-132) | 115 (104-118) |
+| its products / attention / the rest | 89 / 20 / 20 | 75 / 20 / 116 | 80 / 18 / 19 | 72 / 20 / 20 |
+| its GELU forward / backward | 3.9 / 5.0 | 46.9 / 55.9 | 3.9 / 4.7 | 3.7 / 4.9 |
+
+(Section 18, on olang edf8238: an epoch 0.63 s in F32 and 2.11 in BF16, a step 157 and 650 ms.) A BF16 transformer step
+now costs what an F32 one does - its products a little less, its element-wise passes moving half the bytes (an add 0.58
+ms against 1.04), its normalizations a little more - with half the arena. An MNIST epoch in BF16 is 1.1x F32's
+(`bench/train`: fill 0.057 against 0.044 s, the optimizer 0.055 against 0.042, forward and backward 5-10% more), its
+products too small for the halved bytes to tell.

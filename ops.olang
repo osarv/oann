@@ -13,9 +13,10 @@
 # A kernel that computes takes the type it computes in as its last parameter, z <A> (a value of it, read for its type
 # only): the matrices' own type for F32 and F64, F32 for matrices of BF16 - mixed precision, DESIGN.md section 18. It
 # reads each stored element up into A, computes in A, and rounds each result down to the matrices' type once as it
-# stores it (kernels.Up and Down, here up and down); for a graph computing in its own type both are nothing. A lambda
-# given to Map declares the witnesses it needs (w A, like T) rather than capturing them: captured, they left GELU's
-# pass ten times as slow inside the graph's Forward.
+# stores it (kernels.Up and Down, here up and down); for a graph computing in its own type both are nothing. The
+# element-wise kernels pass their lambdas to each1, each2 and each3 (below), which capture z and like as any value:
+# until olang db2af5d a lambda had to declare such witnesses inside its body, captured ones leaving GELU's pass ten
+# times as slow inside the graph's Forward.
 
 import "std/linalg"
 import "std/math"
@@ -35,6 +36,42 @@ fn up(x <S>, z <A>) A {
 # x, computed, rounded to the type of like, the type stored
 fn down(x <A>, like <T>) T {
     return kernels.Down(x, like)
+}
+
+# y = f(x), f(a, b) or f(a, b, c), element by element - std/linalg's Map, Map2 and Map3 with each row's storage taken
+# into a local before its loop. Map reads its matrices' storage through them at every element, which costs nothing
+# where the compiler knows an element's store cannot change that storage (F32, F64) and keeps the loop scalar where it
+# does not (BF16 in olang db2af5d, whose stores carry no type-based alias tag: repro/narrowtbaa) - GELU over a 1024 x
+# 512 BF16 matrix took 22 ns an element through Map, 1.5 through these, as F32 does either way
+fn each1(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, f fn(v T) T) {
+    assert y.Rows == x.Rows and y.Cols == x.Cols
+    for r in range y.Rows {
+        o := y.Row(r)
+        p := x.Row(r)
+        for c in range o.Len() { o[c] = f(p[c]) }
+    }
+}
+
+fn each2(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, f fn(p T, q T) T) {
+    assert y.Rows == a.Rows and y.Cols == a.Cols and y.Rows == b.Rows and y.Cols == b.Cols
+    for r in range y.Rows {
+        o := y.Row(r)
+        p := a.Row(r)
+        q := b.Row(r)
+        for c in range o.Len() { o[c] = f(p[c], q[c]) }
+    }
+}
+
+fn each3(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, d linalg.Matrix<T>&, f fn(p T, q T, s T) T) {
+    assert y.Rows == a.Rows and y.Cols == a.Cols and y.Rows == b.Rows and y.Cols == b.Cols
+    assert y.Rows == d.Rows and y.Cols == d.Cols
+    for r in range y.Rows {
+        o := y.Row(r)
+        p := a.Row(r)
+        q := b.Row(r)
+        e := d.Row(r)
+        for c in range o.Len() { o[c] = f(p[c], q[c], e[c]) }
+    }
 }
 
 # dx = f(dy, s), or dx += f(dy, s): an element-wise local gradient f of the output's gradient and one saved matrix,
@@ -57,10 +94,9 @@ fn backward2(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<T>&, s linalg.Ma
 # dx = dy, or dx += dy
 fn pass(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<T>&, z <A>) {
     if acc {
-        dx.Map2(dx, dy, fn(d, g) {
-            w A
-            like T
-            return down(up(d, w) + up(g, w), like)
+        like T
+        each2(dx, dx, dy, fn(d, g) {
+            return down(up(d, z) + up(g, z), like)
         })
     } else {
         dx.Copy(dy)
@@ -140,10 +176,9 @@ fn AddRowBackward(dy linalg.Matrix<<T>>&, dx linalg.Matrix<T>&, accX Bool, db li
 
 # y = a + b
 fn Add(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
-    y.Map2(a, b, fn(p, q) {
-        w A
-        like T
-        return down(up(p, w) + up(q, w), like)
+    like T
+    each2(y, a, b, fn(p, q) {
+        return down(up(p, z) + up(q, z), like)
     })
 }
 
@@ -154,10 +189,9 @@ fn AddBackward(dy linalg.Matrix<<T>>&, da linalg.Matrix<T>&, accA Bool, db linal
 
 # y = a - b
 fn Sub(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
-    y.Map2(a, b, fn(p, q) {
-        w A
-        like T
-        return down(up(p, w) - up(q, w), like)
+    like T
+    each2(y, a, b, fn(p, q) {
+        return down(up(p, z) - up(q, z), like)
     })
 }
 
@@ -165,23 +199,21 @@ fn SubBackward(dy linalg.Matrix<<T>>&, da linalg.Matrix<T>&, accA Bool, db linal
     if da.Rows > 0 { pass(da, accA, dy, z) }
     if db.Rows > 0 {
         if accB {
-            db.Map2(db, dy, fn(d, g) {
-                w A
-                like T
-                return down(up(d, w) - up(g, w), like)
+            like T
+            each2(db, db, dy, fn(d, g) {
+                return down(up(d, z) - up(g, z), like)
             })
         } else {
-            db.Map(dy, fn(g) { return -g })
+            each1(db, dy, fn(g) { return -g })
         }
     }
 }
 
 # y = a * b, element by element
 fn Mul(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
-    y.Map2(a, b, fn(p, q) {
-        w A
-        like T
-        return down(up(p, w) * up(q, w), like)
+    like T
+    each2(y, a, b, fn(p, q) {
+        return down(up(p, z) * up(q, z), like)
     })
 }
 
@@ -193,21 +225,21 @@ fn MulBackward(dy linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&,
 
 # y = k x
 fn Scale(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, k <A>) {
-    y.Map(x, fn(v) {
-        like T
+    like T
+    each1(y, x, fn(v) {
         return down(k * up(v, k), like)
     })
 }
 
 fn ScaleBackward(dy linalg.Matrix<<T>>&, k <A>, dx linalg.Matrix<T>&, acc Bool) {
     if acc {
-        dx.Map2(dx, dy, fn(d, g) {
-            like T
+        like T
+        each2(dx, dx, dy, fn(d, g) {
             return down(up(d, k) + k * up(g, k), like)
         })
     } else {
-        dx.Map(dy, fn(g) {
-            like T
+        like T
+        each1(dx, dy, fn(g) {
             return down(k * up(g, k), like)
         })
     }
@@ -219,7 +251,7 @@ fn ScaleBackward(dy linalg.Matrix<<T>>&, k <A>, dx linalg.Matrix<T>&, acc Bool) 
 
 # y = max(x, 0)
 fn Relu(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&) {
-    y.Map(x, fn(v) { return v if v > 0.0 else 0.0 })
+    each1(y, x, fn(v) { return v if v > 0.0 else 0.0 })
 }
 
 fn ReluBackward(dy linalg.Matrix<<T>>&, y linalg.Matrix<T>&, dx linalg.Matrix<T>&, acc Bool, z <A>) {
@@ -228,8 +260,8 @@ fn ReluBackward(dy linalg.Matrix<<T>>&, y linalg.Matrix<T>&, dx linalg.Matrix<T>
 
 # y = x where x > 0, slope * x elsewhere
 fn LeakyRelu(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, slope <A>) {
-    y.Map(x, fn(v) {
-        like T
+    like T
+    each1(y, x, fn(v) {
         return v if v > 0.0 else down(slope * up(v, slope), like)
     })
 }
@@ -240,10 +272,9 @@ fn LeakyReluBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, slope <A>, dx 
 
 # y = x Phi(x), Phi the standard normal distribution: GELU as PyTorch defines it by default, through erf
 fn Gelu(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
-    y.Map(x, fn(s) {
-        w A
-        like T
-        v := up(s, w)
+    like T
+    each1(y, x, fn(s) {
+        v := up(s, z)
         return down(0.5 * v * (1.0 + math.Erf(v * 0.7071067811865476)), like)
     })
 }
@@ -261,29 +292,26 @@ fn GeluBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, dx linalg.Matrix<T>
 # GPT-2's activation, PyTorch's approximate="tanh"), within 1e-3 of the exact one everywhere. One vectorized pass, by
 # FastTanh, where the exact GELU's erf is a library call per element (8 times as long, measured in a transformer)
 fn GeluTanh(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
-    y.Map(x, fn(s) {
-        w A
-        like T
-        v := up(s, w)
+    like T
+    each1(y, x, fn(s) {
+        v := up(s, z)
         return down(0.5 * v * (1.0 + linalg.FastTanh(0.7978845608028654 * (v + 0.044715 * v * v * v))), like)
     })
 }
 
 # with u = c (x + a x^3) and t = tanh(u): dy/dx = (1 + t) / 2 + x (1 - t^2) c (1 + 3 a x^2) / 2. The lambdas go to
-# Map2 and Map3 directly rather than through backward2: one more function value in between and the inliner, inside the
+# each2 and each3 directly rather than through backward2: one more function value in between and the inliner, inside the
 # graph's large Backward, left a call per element (measured at five times the time)
 fn GeluTanhBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, dx linalg.Matrix<T>&, acc Bool, z <A>) {
     if acc {
-        dx.Map3(dx, dy, x, fn(d, g, v) {
-            w A
-            like T
-            return down(up(d, w) + up(g, w) * geluTanhSlope(up(v, w)), like)
+        like T
+        each3(dx, dx, dy, x, fn(d, g, v) {
+            return down(up(d, z) + up(g, z) * geluTanhSlope(up(v, z)), like)
         })
     } else {
-        dx.Map2(dy, x, fn(g, v) {
-            w A
-            like T
-            return down(up(g, w) * geluTanhSlope(up(v, w)), like)
+        like T
+        each2(dx, dy, x, fn(g, v) {
+            return down(up(g, z) * geluTanhSlope(up(v, z)), like)
         })
     }
 }
@@ -295,10 +323,9 @@ fn geluTanhSlope(v <A>) A {
 
 # y = 1 / (1 + e^-x)
 fn Sigmoid(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
-    y.Map(x, fn(v) {
-        w A
-        like T
-        return down(linalg.FastSigmoid(up(v, w)), like)
+    like T
+    each1(y, x, fn(v) {
+        return down(linalg.FastSigmoid(up(v, z)), like)
     })
 }
 
@@ -308,10 +335,9 @@ fn SigmoidBackward(dy linalg.Matrix<<T>>&, y linalg.Matrix<T>&, dx linalg.Matrix
 
 # y = tanh(x)
 fn Tanh(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
-    y.Map(x, fn(v) {
-        w A
-        like T
-        return down(linalg.FastTanh(up(v, w)), like)
+    like T
+    each1(y, x, fn(v) {
+        return down(linalg.FastTanh(up(v, z)), like)
     })
 }
 
@@ -896,26 +922,26 @@ fn MseBackward(dloss <A>, a linalg.Matrix<<T>>&, b linalg.Matrix<T>&, da linalg.
     k A = 2.0 * dloss / linalg.Cast(a.Rows * a.Cols, dloss)
     if da.Rows > 0 {
         if accA {
-            da.Map3(da, a, b, fn(d, p, q) {
-                like T
+            like T
+            each3(da, da, a, b, fn(d, p, q) {
                 return down(up(d, k) + k * (up(p, k) - up(q, k)), like)
             })
         } else {
-            da.Map2(a, b, fn(p, q) {
-                like T
+            like T
+            each2(da, a, b, fn(p, q) {
                 return down(k * (up(p, k) - up(q, k)), like)
             })
         }
     }
     if db.Rows > 0 {
         if accB {
-            db.Map3(db, a, b, fn(d, p, q) {
-                like T
+            like T
+            each3(db, db, a, b, fn(d, p, q) {
                 return down(up(d, k) - k * (up(p, k) - up(q, k)), like)
             })
         } else {
-            db.Map2(a, b, fn(p, q) {
-                like T
+            like T
+            each2(db, a, b, fn(p, q) {
                 return down(k * (up(q, k) - up(p, k)), like)
             })
         }
