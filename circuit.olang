@@ -1102,6 +1102,8 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
     n := c.Neurons
     zero <T>
     for i in range c.N * n { c.mem[c.diff + i] = c.mem[plus + i] - c.mem[minus + i] }
+    like <T>
+    k := linalg.Cast(scale, like)
     for i in range c.projections.Len() {
         pr := c.projections[i]
         g := c.WeightGrads(Projection(i))
@@ -1109,17 +1111,48 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
         if pr.Frozen { continue }
         pre := c.regions[pr.Pre]
         post := c.regions[pr.Post]
-        for b in range c.N {
-            row I64 = b * n
-            dPost I64 = c.diff + row + post.Col
-            sPre I64 = plus + row + pre.Col
-            if pr.Folded {
-                linalg.Ger(g, c.mem[dPost:dPost + post.Size], c.mem[sPre:sPre + pre.Size], scale, 1)
-            } else {
-                mPost I64 = minus + row + post.Col
-                dPre I64 = c.diff + row + pre.Col
-                linalg.Ger2(g, c.mem[dPost:dPost + post.Size], c.mem[sPre:sPre + pre.Size],
-                    c.mem[mPost:mPost + post.Size], c.mem[dPre:dPre + pre.Size], scale, 1)
+        # a row of the block at a time, summed over the batch's rows: the row stays in the first-level cache while
+        # the batch's activities stream past it (a sum over rows of rank-2 updates of the whole block would stream
+        # the block through the cache once per row)
+        # (four rows of the batch per pass over the row, so it is loaded and stored once for four of them)
+        quads I64 = c.N - c.N % 4
+        for r in range post.Size {
+            at I64 = c.ParamCount + pr.Offset + r * pre.Size
+            d I64 = c.diff + post.Col + r
+            for b in range 0, quads, 4 {
+                s0 I64 = plus + b * n + pre.Col
+                p0 <T> = k * c.mem[d + b * n]
+                p1 <T> = k * c.mem[d + (b + 1) * n]
+                p2 <T> = k * c.mem[d + (b + 2) * n]
+                p3 <T> = k * c.mem[d + (b + 3) * n]
+                if pr.Folded {
+                    for j in range pre.Size {
+                        c.mem[at + j] = c.mem[at + j] + ((p0 * c.mem[s0 + j] + p1 * c.mem[s0 + n + j]) + (p2 * c.mem[s0 + 2 * n + j] + p3 * c.mem[s0 + 3 * n + j]))
+                    }
+                } else {
+                    m I64 = minus + post.Col + r
+                    q0 <T> = k * c.mem[m + b * n]
+                    q1 <T> = k * c.mem[m + (b + 1) * n]
+                    q2 <T> = k * c.mem[m + (b + 2) * n]
+                    q3 <T> = k * c.mem[m + (b + 3) * n]
+                    e0 I64 = c.diff + b * n + pre.Col
+                    for j in range pre.Size {
+                        c.mem[at + j] = c.mem[at + j] + (((p0 * c.mem[s0 + j] + q0 * c.mem[e0 + j]) + (p1 * c.mem[s0 + n + j] + q1 * c.mem[e0 + n + j]))
+                            + ((p2 * c.mem[s0 + 2 * n + j] + q2 * c.mem[e0 + 2 * n + j]) + (p3 * c.mem[s0 + 3 * n + j] + q3 * c.mem[e0 + 3 * n + j])))
+                    }
+                }
+            }
+            for b in range quads, c.N {
+                row I64 = b * n
+                sPre I64 = plus + row + pre.Col
+                p <T> = k * c.mem[d + row]
+                if pr.Folded {
+                    for j in range pre.Size { c.mem[at + j] = c.mem[at + j] + p * c.mem[sPre + j] }
+                } else {
+                    q <T> = k * c.mem[minus + row + post.Col + r]
+                    dPre I64 = c.diff + row + pre.Col
+                    for j in range pre.Size { c.mem[at + j] = c.mem[at + j] + (p * c.mem[sPre + j] + q * c.mem[dPre + j]) }
+                }
             }
         }
         if pr.Mask >= 0 {
@@ -1128,8 +1161,6 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
             }
         }
     }
-    like <T>
-    k := linalg.Cast(scale, like)
     for i in range c.regions.Len() {
         rg := c.regions[i]
         at I64 = c.ParamCount + c.bias + rg.Col
@@ -1734,6 +1765,63 @@ fn gradientCircuit(c mut Circuit<F64>&, r mut rand.Rand&, oneWay Bool) {
     c.Certify(0.9)
     randomize(c, r, 1.0)
     for b in range c.Rows { c.LabelData(o)[b] = I32(r.Below(3)) }
+}
+
+test "the contrast written is its definition, mean over the rows of (s+_pre s+_post - s-_pre s-_post) / (2 beta)" {
+    c := Circuit<F64>(7)
+    x := c.Input(5)
+    h := c.Hidden(6)
+    o := c.Readout(3)
+    c.Project(x, h, Wiring.OneWay)
+    c.Project(h, h)
+    c.Project(h, o)
+    c.Project(o, h, Wiring.OneWay, 0.5)              # masked, one-way
+    frozen := c.Project(x, o, Wiring.OneWay, 1, true)
+    r := rand.Rand(15)
+    c.Plan(r)
+    for p in Phase[Phase.Free, Phase.Plus, Phase.Minus] {
+        v := c.Value(p)
+        for b in range 7 {
+            for j in range c.Neurons { v.Set(b, j, r.Uniform(-1.0, 1.0)) }
+            for j in range 5 { v.Set(b, j, c.Value(Phase.Free).Get(b, j)) }    # the inputs: one drive
+        }
+    }
+    beta F64 = 0.3
+    for centered in Bool[true, false] {
+        c.Contrast(beta, centered)
+        minus := Phase.Minus if centered else Phase.Free
+        sp := c.Value(Phase.Plus)
+        sm := c.Value(minus)
+        worst F64 = 0.0
+        for k in range c.projections.Len() {
+            pr := c.projections[k]
+            g := c.WeightGrads(Projection(k))
+            post := c.regions[pr.Post]
+            pre := c.regions[pr.Pre]
+            for i in range post.Size {
+                for j in range pre.Size {
+                    sum F64 = 0.0
+                    for b in range 7 {
+                        sum += sp.Get(b, pre.Col + j) * sp.Get(b, post.Col + i) - sm.Get(b, pre.Col + j) * sm.Get(b, post.Col + i)
+                    }
+                    want F64 = -sum / ((2.0 * beta if centered else beta) * 7.0)
+                    if pr.Frozen or (pr.Mask >= 0 and c.masks[pr.Mask + i * pre.Size + j] == 0) { want = 0.0 }
+                    worst = math.Max(worst, math.Abs(g.Get(i, j) - want))
+                }
+            }
+        }
+        for k in range 1, 3 {
+            rg := c.regions[k]
+            gb := c.BiasGrads(Region(k))
+            for j in range rg.Size {
+                sum F64 = 0.0
+                for b in range 7 { sum += sp.Get(b, rg.Col + j) - sm.Get(b, rg.Col + j) }
+                worst = math.Max(worst, math.Abs(gb[j] + sum / ((2.0 * beta if centered else beta) * 7.0)))
+            }
+        }
+        assert worst < 1e-14
+    }
+    assert c.WeightGrads(frozen).MaxAbs() == 0.0 and c.BiasGrads(x)[0] == 0.0
 }
 
 test "the centered contrast is the gradient of the cost at the free equilibrium, to O(beta^2)" {
