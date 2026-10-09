@@ -1,0 +1,92 @@
+# layers - building blocks that hold parameters. A layer is constructed on a graph, which registers its parameters
+# (with their starting values decided by an Init), and Apply records its operations on an input - so applying one
+# layer twice shares its parameters, and their gradients add up, as in PyTorch. A layer's shapes are given once, at
+# construction; Apply takes only handles.
+
+import "std/math"
+import "nn"
+import "std/rand"
+
+# the activation between two dense layers
+type Activation enum {
+    Identity
+    Relu
+    Gelu
+    Tanh
+    Sigmoid
+}
+
+# x with the activation applied
+fn Activate(g mut nn.Graph<<T>>&, x nn.Var, a Activation) nn.Var {
+    return match a {
+        case Activation.Identity => x
+        case Activation.Relu => g.Relu(x)
+        case Activation.Gelu => g.Gelu(x)
+        case Activation.Tanh => g.Tanh(x)
+        case Activation.Sigmoid => g.Sigmoid(x)
+    }
+}
+
+# PyTorch nn.Linear's starting values: weights and biases uniform in +-1/sqrt(inputs) - Kaiming's uniform rule with
+# the slope sqrt(5) PyTorch uses, which comes to that bound
+fn fanIn(inputs I64) nn.Init {
+    bound F64 = 1.0 / math.Sqrt(F64(inputs))
+    return nn.Init.Uniform(-bound, bound)
+}
+
+# a dense layer, y = x W^T + B: W is Out x In (PyTorch's layout), B one row of Out. Plain data - two handles - so
+# layers can be kept in lists and arrays; NewDense makes one on a graph
+type Dense struct(W nn.Var, B nn.Var, In I64, Out I64) {
+    W
+    B
+    In
+    Out
+}
+
+# a dense layer of inputs to outputs, its parameters registered on g: weight decay applies to W and not to B
+fn NewDense(g mut nn.Graph<<T>>&, inputs I64, outputs I64) Dense {
+    w := g.Param(outputs, inputs, fanIn(inputs), true)
+    b := g.Param(1, outputs, fanIn(inputs), false)
+    return Dense(w, b, inputs, outputs)
+}
+
+fn (d Dense&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
+    return g.Linear(x, d.W, d.B)
+}
+
+# a multilayer perceptron: dense layers of the given sizes - sizes[0] inputs, the last the outputs - with the
+# activation between every two of them and none after the last
+type Mlp struct(Act Activation) {
+    Act
+    Layers mut List<Dense>& = List<Dense>()
+}
+
+fn NewMlp(g mut nn.Graph<<T>>&, sizes Array<I64>&, act Activation = Activation.Relu) Mlp {
+    m Mlp&return = Mlp(act)
+    for i in range 1, sizes.Len() { m.Layers.Push(NewDense(g, sizes[i - 1], sizes[i])) }
+    return m
+}
+
+fn (m Mlp&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
+    h nn.Var = x
+    last I64 = m.Layers.Len() - 1
+    for i in range m.Layers.Len() {
+        h = m.Layers[i].Apply(g, h)
+        if i < last { h = Activate(g, h, m.Act) }
+    }
+    return h
+}
+
+test "a perceptron registers its layers' parameters and records them in order" {
+    g := nn.Graph<F64>(8)
+    x := g.Input(4)
+    m := NewMlp(g, I64[4, 6, 3], Activation.Tanh)
+    out := m.Apply(g, x)
+    r := rand.Rand(3)
+    g.Plan(r)
+    assert g.ParamCount == 4 * 6 + 6 + 6 * 3 + 3
+    assert g.Info(out).Cols == 3 and g.Info(out).Rows == 8
+    w := g.Value(m.Layers[0].W)
+    bound F64 = 1.0 / math.Sqrt(4.0)
+    assert w.Max() <= bound and w.Min() >= -bound and w.MaxAbs() > 0.0
+}

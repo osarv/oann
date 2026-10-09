@@ -4,7 +4,7 @@
 
 import "std/io"
 import "std/os"
-import "../clock"
+import "std/time"
 import "../datasets/idx"
 import "../datasets/loader"
 import "../datasets/mnist"
@@ -12,6 +12,10 @@ import "std/math"
 
 fn mb(bytes I64, seconds F64) F64 {
     return F64(bytes) / 1e6 / seconds
+}
+
+fn secs(t I64) F64 {
+    return F64(t) * 1e-9
 }
 
 fn histogram(labels Array<U8>&) Array<I64> {
@@ -22,13 +26,13 @@ fn histogram(labels Array<U8>&) Array<I64> {
 
 fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError {
     dir := "data/mnist"
-    t0 := clock.Now()
+    t0 := time.Now()
     try mnist.Fetch(dir, mnist.Source)
-    t1 := clock.Now()
+    t1 := time.Now()
     m := try mnist.Load(dir, mnist.Source)
-    t2 := clock.Now()
+    t2 := time.Now()
     fileBytes I64 = m.Train.Features.Len() + m.Train.Labels.Len() + m.Test.Features.Len() + m.Test.Labels.Len()
-    try io.Print("fetch " $(t1 - t0) " s, load " $(t2 - t1) " s: " $mb(fileBytes, t2 - t1) " MB/s parsed\n")
+    try io.Print("fetch " $secs(t1 - t0).Fixed(3) " s, load " $secs(t2 - t1).Fixed(3) " s: " $mb(fileBytes, secs(t2 - t1)).Fixed(0) " MB/s parsed\n")
 
     # what MNIST is known to hold
     assert m.Train.Count == 60000 and m.Test.Count == 10000 and m.Train.Width == 784 and m.Test.Width == 784
@@ -47,7 +51,7 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError {
     sum F64 = 0.0
     sq F64 = 0.0
     labelSum I64 = 0
-    t3 := clock.Now()
+    t3 := time.Now()
     l.Epoch()
     for b in range l.Batches() {
         n := l.Fill(b, x, y)
@@ -58,11 +62,11 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError {
         }
         for k in range n { labelSum += I64(y[k]) }
     }
-    t4 := clock.Now()
+    t4 := time.Now()
     count := F64(60000 * 784)
     mean F64 = sum / count
     sd := math.Sqrt(sq / count - mean * mean)
-    try io.Print("pixel mean " $mean " sd " $sd " (MNIST's: 0.1307, 0.3081)\n")
+    try io.Print("pixel mean " $mean.Fixed(5) " sd " $sd.Fixed(5) " (MNIST's: 0.1307, 0.3081)\n")
     assert mean > 0.1306 and mean < 0.1308 and sd > 0.3080 and sd < 0.3082
     expect I64 = 0
     for d in range 10 { expect += I64(d) * trainCounts[d] }
@@ -71,12 +75,12 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError {
     # filling alone, best of five epochs
     best F64 = 1e9
     for rep in range 5 {
-        a := clock.Now()
+        a := time.Now()
         l.Epoch()
         for b in range l.Batches() { l.Fill(b, x, y) }
-        e F64 = clock.Now() - a
+        e F64 = secs(time.Now() - a)
         if e < best { best = e }
     }
-    try io.Print("epoch of shuffled batches of 128 (checked) " $(t4 - t3) " s; filling alone " $best " s: ")
-    try io.Print($mb(60000 * 784 * 4, best) " MB/s of F32, " $(60000.0 / best) " samples/s\n")
+    try io.Print("epoch of shuffled batches of 128 (checked) " $secs(t4 - t3).Fixed(3) " s; filling alone " $best.Fixed(4) " s: ")
+    try io.Print($mb(60000 * 784 * 4, best).Fixed(0) " MB/s of F32, " $(60000.0 / best).Fixed(0) " samples/s\n")
 }

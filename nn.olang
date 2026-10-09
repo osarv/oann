@@ -1,0 +1,654 @@
+# nn - the recorded graph: a network built once, as a list of operations on matrices, then run forward and backward
+# every step with nothing allocated.
+#
+# Building a network records it: every operation - g.Linear(x, w, b), g.Relu(h), g.SoftmaxCrossEntropy(z, y) -
+# appends a node and gives its handle back, a Var, which later operations take as input. Plan() then lays every value,
+# gradient and saved intermediate out in one arena, allocates it once and initializes the parameters; from then on
+# Forward(n) runs the nodes in the order they were recorded and Backward(loss) runs their backward kernels (std ops)
+# in the reverse order, and neither allocates. A step may run on fewer rows than the graph was planned for (an
+# epoch's last, short batch): every batched node is then the view of its first n rows.
+#
+# A node is plain data - an operation and its inputs' handles, its shape, where its value and gradient are - so the
+# graph holds no references between nodes and is as easy to walk, plan or write out as an array. The operations are
+# a closed enum dispatched by match, which compiles to a switch.
+#
+# The arena's regions, in order: the parameters, contiguous in the order they were made (the optimizers' one flat
+# array, and a checkpoint's); their gradients, laid out the same; then every other node's value, its gradient when
+# it needs one, and what its backward needs kept. A gradient is written by the first operation contributing to it
+# and added to by the rest, so nothing is zeroed between steps.
+
+import "std/io"
+import "std/linalg"
+import "std/math"
+import "std/rand"
+import "ops"
+
+# a node's handle: an index into the graph's nodes
+type Var I64
+
+# how a parameter starts
+type Init enum {
+    Zeros
+    Constant(v F64)
+    Uniform(lo F64, hi F64)
+    Normal(mean F64, sd F64)
+}
+
+# what a node computes
+type Op enum {
+    Input                                           # a batch of rows the caller fills before each Forward
+    Classes                                         # a class index per row (I32), filled by the caller
+    Constant                                        # a matrix the caller sets, not trained: a target, a mask
+    Param(init Init, decay Bool)                    # a trainable matrix; decay: weight decay applies to it
+    MatMul(a Var, b Var, ta Bool, tb Bool)          # op(a) op(b)
+    Linear(x Var, w Var, b Var)                     # x w^T + b
+    AddRow(x Var, b Var)                            # x + b, b one row
+    Add(a Var, b Var)
+    Sub(a Var, b Var)
+    Mul(a Var, b Var)                               # element by element
+    Scale(x Var, k F64)
+    Relu(x Var)
+    LeakyRelu(x Var, slope F64)
+    Gelu(x Var)
+    Sigmoid(x Var)
+    Tanh(x Var)
+    Softmax(x Var)                                  # row by row
+    SoftmaxCrossEntropy(logits Var, classes Var)    # the mean over the rows: a 1 x 1 loss
+    Mse(a Var, b Var)                               # the mean of the squared differences: a 1 x 1 loss
+}
+
+# a recorded operation: what it is, its shape (Rows the planned batch when Batched), and where in the arena its value,
+# gradient and saved matrix are (-1: none)
+type Node struct(Kind Op, Rows I64, Cols I64, Batched Bool) {
+    Kind
+    Rows
+    Cols
+    Batched
+    Offset mut I64 = 0
+    GradOffset mut I64 = -1
+    SavedOffset mut I64 = -1
+}
+
+# a network of T elements, planned for batches of up to Batch rows; its products split over Threads tasks
+type Graph<T> struct(Batch I64, Threads I64 = 1) {
+    Batch
+    Threads
+    nodes mut List<Node>& = List<Node>()
+    mem mut Array<<T>>& = Array<<T>>(0)
+    classes mut Array<I32>& = Array<I32>(0)
+    written mut Array<Bool>& = Array<Bool>(0)
+    ParamCount mut I64 = 0          # the parameters' elements: the first region of the arena
+    N mut I64 = 0                   # the rows of a batched node in use - those the last Forward ran on
+    Training mut Bool = true        # dropout and its kind act only while training
+    planned mut Bool = false
+}
+
+# ---- recording ----
+
+# a shape that does not fit where it is used: the network is wrong, so this stops it with what is wrong
+fn mismatch(what String&) {
+    try io.PrintErr("oann: " $what "\n") catch { }
+    fail
+}
+
+fn (g mut Graph<<T>>&) add(kind Op, rows I64, cols I64, batched Bool) Var {
+    if g.planned { mismatch("the graph is planned already - operations are recorded before Plan") }
+    g.nodes.Push(Node(kind, rows, cols, batched))
+    return Var(g.nodes.Len() - 1)
+}
+
+# the node behind v
+fn (g Graph<<T>>&) Info(v Var) Node {
+    return g.nodes[v]
+}
+
+# how many nodes the graph has
+fn (g Graph<<T>>&) Size() I64 {
+    return g.nodes.Len()
+}
+
+fn (g Graph<<T>>&) shape(v Var) String {
+    n := g.nodes[v]
+    return $(n.Rows) "x" $(n.Cols)
+}
+
+# a batch input of cols features per row
+fn (g mut Graph<<T>>&) Input(cols I64) Var {
+    return g.add(Op.Input, g.Batch, cols, true)
+}
+
+# a class index per row of the batch
+fn (g mut Graph<<T>>&) Classes() Var {
+    return g.add(Op.Classes, g.Batch, 1, true)
+}
+
+# a rows x cols matrix the caller sets and nothing trains - a target, a mask, a fixed table
+fn (g mut Graph<<T>>&) Constant(rows I64, cols I64) Var {
+    return g.add(Op.Constant, rows, cols, false)
+}
+
+# a trainable rows x cols matrix, set by init when the graph is planned; weight decay applies to it when decay
+fn (g mut Graph<<T>>&) Param(rows I64, cols I64, init Init, decay Bool) Var {
+    return g.add(Op.Param(init, decay), rows, cols, false)
+}
+
+# op(a) op(b), op(m) being m or, where its flag is set, m's transpose - a matrix product (Product rather than MatMul,
+# which names the @ operator's method)
+fn (g mut Graph<<T>>&) Product(a Var, b Var, ta Bool, tb Bool) Var {
+    x := g.nodes[a]
+    y := g.nodes[b]
+    m I64 = x.Cols if ta else x.Rows
+    k I64 = x.Rows if ta else x.Cols
+    kb I64 = y.Cols if tb else y.Rows
+    n I64 = y.Rows if tb else y.Cols
+    if k != kb { mismatch("Product of " $g.shape(a) " and " $g.shape(b) ": the inner dimensions differ") }
+    if (ta and x.Batched) or (tb and y.Batched) { mismatch("Product: a batched operand cannot be transposed in the graph") }
+    return g.add(Op.MatMul(a, b, ta, tb), m, n, x.Batched and not ta)
+}
+
+# x w^T + b: w is out x in, b 1 x out
+fn (g mut Graph<<T>>&) Linear(x Var, w Var, b Var) Var {
+    xs := g.nodes[x]
+    ws := g.nodes[w]
+    bs := g.nodes[b]
+    if xs.Cols != ws.Cols or bs.Rows != 1 or bs.Cols != ws.Rows {
+        mismatch("Linear of " $g.shape(x) " by weights " $g.shape(w) " and bias " $g.shape(b))
+    }
+    return g.add(Op.Linear(x, w, b), xs.Rows, ws.Rows, xs.Batched)
+}
+
+# x + b, b one row added to every row
+fn (g mut Graph<<T>>&) AddRow(x Var, b Var) Var {
+    xs := g.nodes[x]
+    bs := g.nodes[b]
+    if bs.Rows != 1 or bs.Cols != xs.Cols { mismatch("AddRow of " $g.shape(x) " and " $g.shape(b)) }
+    return g.add(Op.AddRow(x, b), xs.Rows, xs.Cols, xs.Batched)
+}
+
+fn (g mut Graph<<T>>&) sameShape(name String&, a Var, b Var) {
+    x := g.nodes[a]
+    y := g.nodes[b]
+    if x.Rows != y.Rows or x.Cols != y.Cols or x.Batched != y.Batched {
+        mismatch($name " of " $g.shape(a) " and " $g.shape(b))
+    }
+}
+
+fn (g mut Graph<<T>>&) Add(a Var, b Var) Var {
+    g.sameShape("Add", a, b)
+    x := g.nodes[a]
+    return g.add(Op.Add(a, b), x.Rows, x.Cols, x.Batched)
+}
+
+fn (g mut Graph<<T>>&) Sub(a Var, b Var) Var {
+    g.sameShape("Sub", a, b)
+    x := g.nodes[a]
+    return g.add(Op.Sub(a, b), x.Rows, x.Cols, x.Batched)
+}
+
+# a * b, element by element
+fn (g mut Graph<<T>>&) Multiply(a Var, b Var) Var {
+    g.sameShape("Multiply", a, b)
+    x := g.nodes[a]
+    return g.add(Op.Mul(a, b), x.Rows, x.Cols, x.Batched)
+}
+
+fn (g mut Graph<<T>>&) Scale(x Var, k F64) Var {
+    xs := g.nodes[x]
+    return g.add(Op.Scale(x, k), xs.Rows, xs.Cols, xs.Batched)
+}
+
+fn (g mut Graph<<T>>&) like(kind Op, x Var) Var {
+    xs := g.nodes[x]
+    return g.add(kind, xs.Rows, xs.Cols, xs.Batched)
+}
+
+fn (g mut Graph<<T>>&) Relu(x Var) Var { return g.like(Op.Relu(x), x) }
+fn (g mut Graph<<T>>&) LeakyRelu(x Var, slope F64) Var { return g.like(Op.LeakyRelu(x, slope), x) }
+fn (g mut Graph<<T>>&) Gelu(x Var) Var { return g.like(Op.Gelu(x), x) }
+fn (g mut Graph<<T>>&) Sigmoid(x Var) Var { return g.like(Op.Sigmoid(x), x) }
+fn (g mut Graph<<T>>&) Tanh(x Var) Var { return g.like(Op.Tanh(x), x) }
+fn (g mut Graph<<T>>&) Softmax(x Var) Var { return g.like(Op.Softmax(x), x) }
+
+# the mean over the rows of the cross-entropy of softmax(logits) against the class of each row
+fn (g mut Graph<<T>>&) SoftmaxCrossEntropy(logits Var, classes Var) Var {
+    z := g.nodes[logits]
+    c := g.nodes[classes]
+    if not (c.Kind is Op.Classes) or c.Rows != z.Rows or not z.Batched {
+        mismatch("SoftmaxCrossEntropy of " $g.shape(logits) ": the classes must be a Classes() of the same batch")
+    }
+    return g.add(Op.SoftmaxCrossEntropy(logits, classes), 1, 1, false)
+}
+
+# the mean of (a - b)^2
+fn (g mut Graph<<T>>&) Mse(a Var, b Var) Var {
+    g.sameShape("Mse", a, b)
+    return g.add(Op.Mse(a, b), 1, 1, false)
+}
+
+# ---- planning ----
+
+# the inputs of an operation, -1 where it has fewer than three
+fn inputs(k Op) (I64, I64, I64) {
+    match k {
+        case Op.MatMul(a, b, _, _) { return a, b, -1 }
+        case Op.Linear(x, w, b) { return x, w, b }
+        case Op.AddRow(x, b), Op.Add(x, b), Op.Sub(x, b), Op.Mul(x, b), Op.Mse(x, b) { return x, b, -1 }
+        case Op.SoftmaxCrossEntropy(x, b) { return x, b, -1 }
+        case Op.Scale(x, _), Op.LeakyRelu(x, _) { return x, -1, -1 }
+        case Op.Relu(x), Op.Gelu(x), Op.Sigmoid(x), Op.Tanh(x), Op.Softmax(x) { return x, -1, -1 }
+        case Op.Input, Op.Classes, Op.Constant, Op.Param(_, _) { return -1, -1, -1 }
+    }
+}
+
+# the first input of an operation
+fn first(k Op) I64 {
+    a, _, _ := inputs(k)
+    return a
+}
+
+# lays the arena out, allocates it, and draws the parameters' starting values from r - after which the graph runs
+fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
+    count := g.nodes.Len()
+    needs := Array<Bool>(count)                 # whether a node's gradient is wanted: it depends on a parameter
+    params I64 = 0
+    for i in range count {
+        nd := g.nodes[i]
+        if nd.Kind is Op.Param {
+            needs[i] = true
+            nd.Offset = params
+            params += nd.Rows * nd.Cols
+            g.nodes[i] = nd
+            continue
+        }
+        a, b, c := inputs(nd.Kind)
+        needs[i] = (a >= 0 and needs[a]) or (b >= 0 and needs[b]) or (c >= 0 and needs[c])
+    }
+    at I64 = 2 * params
+    rows I64 = 0
+    for i in range count {
+        nd := g.nodes[i]
+        size I64 = nd.Rows * nd.Cols
+        match nd.Kind {
+            case Op.Param(_, _) { nd.GradOffset = params + nd.Offset }
+            case Op.Classes {
+                nd.Offset = rows
+                rows += nd.Rows
+            }
+            nomatch {
+                nd.Offset = at
+                at += size
+                if needs[i] {
+                    nd.GradOffset = at
+                    at += size
+                }
+                if nd.Kind is Op.SoftmaxCrossEntropy {
+                    z := g.nodes[first(nd.Kind)]
+                    nd.SavedOffset = at
+                    at += z.Rows * z.Cols
+                }
+            }
+        }
+        g.nodes[i] = nd
+    }
+    g.mem = Array<<T>>(at)
+    g.classes = Array<I32>(rows)
+    g.written = Array<Bool>(count)
+    g.ParamCount = params
+    g.N = g.Batch
+    g.planned = true
+    like <T>
+    for i in range count {
+        nd := g.nodes[i]
+        match nd.Kind {
+            case Op.Param(init, _) {
+                p := g.Value(Var(i))
+                match init {
+                    case Init.Zeros { }
+                    case Init.Constant(v) { p.Fill(linalg.Cast(v, like)) }
+                    case Init.Uniform(lo, hi) { p.FillUniform(r, lo, hi) }
+                    case Init.Normal(mean, sd) { p.FillNormal(r, mean, sd) }
+                }
+            }
+            nomatch { }
+        }
+    }
+}
+
+# ---- reading and writing values ----
+
+# the rows of a node in use: the batch's rows in use for a batched node, its own rows otherwise
+fn (g Graph<<T>>&) rows(nd Node&) I64 {
+    return g.N if nd.Batched else nd.Rows
+}
+
+# v's value, as a view of the arena: writing it writes the graph
+fn (g Graph<<T>>&) Value(v Var) linalg.Matrix<<T>> {
+    nd := g.nodes[v]
+    return linalg.View(g.mem, nd.Offset, g.rows(nd), nd.Cols)
+}
+
+# v's gradient, as a view of the arena - for a node that has one (a parameter, or anything depending on one)
+fn (g Graph<<T>>&) Grad(v Var) linalg.Matrix<<T>> {
+    nd := g.nodes[v]
+    assert nd.GradOffset >= 0
+    return linalg.View(g.mem, nd.GradOffset, g.rows(nd), nd.Cols)
+}
+
+# where the caller puts an input's batch: Batch rows of its columns, one after another
+fn (g Graph<<T>>&) InputData(v Var) mut Array<<T>>&g {
+    nd := g.nodes[v]
+    return g.mem[nd.Offset:nd.Offset + nd.Rows * nd.Cols]
+}
+
+# where the caller puts a batch's classes, one per row
+fn (g Graph<<T>>&) ClassData(v Var) mut Array<I32>&g {
+    nd := g.nodes[v]
+    return g.classes[nd.Offset:nd.Offset + nd.Rows]
+}
+
+# a loss's value: the 1 x 1 node's element
+fn (g Graph<<T>>&) Scalar(v Var) <T> {
+    return g.mem[g.nodes[v].Offset]
+}
+
+# every parameter, one after another as one 1 x ParamCount matrix - what an optimizer updates
+fn (g Graph<<T>>&) Params() linalg.Matrix<<T>> {
+    return linalg.View(g.mem, 0, 1, g.ParamCount)
+}
+
+# every parameter's gradient, laid out as Params() is
+fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<<T>> {
+    return linalg.View(g.mem, g.ParamCount, 1, g.ParamCount)
+}
+
+# ---- running ----
+
+# runs every node in the order recorded, on the first n rows of the batch (n at most Batch)
+fn (g mut Graph<<T>>&) Forward(n I64) {
+    if not g.planned { mismatch("Forward before Plan") }
+    if n < 1 or n > g.Batch { mismatch("Forward on " $n " rows of a graph planned for " $(g.Batch)) }
+    g.N = n
+    th := g.Threads
+    like <T>
+    for i in range g.nodes.Len() {
+        nd := g.nodes[i]
+        y := g.Value(Var(i))
+        match nd.Kind {
+            case Op.Input, Op.Classes, Op.Constant, Op.Param(_, _) { }
+            case Op.MatMul(a, b, ta, tb) { ops.MatMul(y, g.Value(a), ta, g.Value(b), tb, th) }
+            case Op.Linear(x, w, b) { ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th) }
+            case Op.AddRow(x, b) { ops.AddRow(y, g.Value(x), g.Value(b)) }
+            case Op.Add(a, b) { ops.Add(y, g.Value(a), g.Value(b)) }
+            case Op.Sub(a, b) { ops.Sub(y, g.Value(a), g.Value(b)) }
+            case Op.Mul(a, b) { ops.Mul(y, g.Value(a), g.Value(b)) }
+            case Op.Scale(x, k) { ops.Scale(y, g.Value(x), linalg.Cast(k, like)) }
+            case Op.Relu(x) { ops.Relu(y, g.Value(x)) }
+            case Op.LeakyRelu(x, slope) { ops.LeakyRelu(y, g.Value(x), linalg.Cast(slope, like)) }
+            case Op.Gelu(x) { ops.Gelu(y, g.Value(x)) }
+            case Op.Sigmoid(x) { ops.Sigmoid(y, g.Value(x)) }
+            case Op.Tanh(x) { ops.Tanh(y, g.Value(x)) }
+            case Op.Softmax(x) { ops.Softmax(y, g.Value(x)) }
+            case Op.SoftmaxCrossEntropy(z, c) {
+                y.Data[0] = ops.SoftmaxCrossEntropy(g.Value(z), g.classData(c), g.saved(Var(i)))
+            }
+            case Op.Mse(a, b) { y.Data[0] = ops.Mse(g.Value(a), g.Value(b)) }
+        }
+    }
+}
+
+# the classes of the rows in use
+fn (g Graph<<T>>&) classData(v Var) Array<I32>&g {
+    nd := g.nodes[v]
+    return g.classes[nd.Offset:nd.Offset + g.N]
+}
+
+# the matrix a loss keeps for its backward: the softmax of its logits' rows in use
+fn (g Graph<<T>>&) saved(v Var) linalg.Matrix<<T>> {
+    nd := g.nodes[v]
+    z := g.nodes[first(nd.Kind)]
+    return linalg.View(g.mem, nd.SavedOffset, g.N, z.Cols)
+}
+
+# v's gradient to write into for a contribution, or an empty matrix where v needs none; whether to add to it is
+# acc(v)
+fn (g Graph<<T>>&) gradOf(v I64) linalg.Matrix<<T>> {
+    if v < 0 or g.nodes[v].GradOffset < 0 { return linalg.View(g.mem, 0, 0, 0) }
+    return g.Grad(Var(v))
+}
+
+# whether a contribution to v's gradient adds to one already made this backward - and from now on, one has been
+fn (g Graph<<T>>&) acc(v I64) Bool {
+    if v < 0 { return false }
+    was := g.written[v]
+    g.written[v] = true
+    return was
+}
+
+# the gradients of loss - a 1 x 1 node - with respect to every node it depends on, parameters included, after a
+# Forward. A parameter's gradient is written afresh (zero where the loss does not depend on it); with accumulate
+# set it is added to the one already there instead, summing several batches' gradients before one update
+fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
+    top := g.nodes[loss]
+    if top.Rows != 1 or top.Cols != 1 or top.GradOffset < 0 {
+        mismatch("Backward from a node that is no loss depending on a parameter")
+    }
+    for i in range g.nodes.Len() { g.written[i] = accumulate and g.nodes[i].Kind is Op.Param }
+    g.mem[top.GradOffset] = 1.0
+    g.written[loss] = true
+    th := g.Threads
+    zero <T>
+    i I64 = loss
+    for i >= 0 {
+        nd := g.nodes[i]
+        if nd.GradOffset >= 0 and g.written[i] {
+            g.backward(Var(i), nd, th)
+        }
+        i--
+    }
+    for k in range g.nodes.Len() {
+        if g.nodes[k].Kind is Op.Param and not g.written[k] { g.Grad(Var(k)).Fill(zero) }
+    }
+}
+
+# node v's backward: its inputs' gradients from its own
+fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
+    dy := g.Grad(v)
+    like <T>
+    match nd.Kind {
+        case Op.Input, Op.Classes, Op.Constant, Op.Param(_, _) { }
+        case Op.MatMul(a, b, ta, tb) {
+            da := g.gradOf(a)
+            ca := g.acc(a)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.MatMulBackward(dy, g.Value(a), ta, g.Value(b), tb, da, ca, db, cb, th)
+        }
+        case Op.Linear(x, w, b) {
+            dx := g.gradOf(x)
+            cx := g.acc(x)
+            dw := g.gradOf(w)
+            cw := g.acc(w)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.LinearBackward(dy, g.Value(x), g.Value(w), dx, cx, dw, cw, db, cb, th)
+        }
+        case Op.AddRow(x, b) {
+            dx := g.gradOf(x)
+            cx := g.acc(x)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.AddRowBackward(dy, dx, cx, db, cb)
+        }
+        case Op.Add(a, b) {
+            da := g.gradOf(a)
+            ca := g.acc(a)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.AddBackward(dy, da, ca, db, cb)
+        }
+        case Op.Sub(a, b) {
+            da := g.gradOf(a)
+            ca := g.acc(a)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.SubBackward(dy, da, ca, db, cb)
+        }
+        case Op.Mul(a, b) {
+            da := g.gradOf(a)
+            ca := g.acc(a)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.MulBackward(dy, g.Value(a), g.Value(b), da, ca, db, cb)
+        }
+        case Op.Scale(x, k) {
+            if g.nodes[x].GradOffset >= 0 { ops.ScaleBackward(dy, linalg.Cast(k, like), g.Grad(x), g.acc(x)) }
+        }
+        case Op.Relu(x) {
+            if g.nodes[x].GradOffset >= 0 { ops.ReluBackward(dy, g.Value(v), g.Grad(x), g.acc(x)) }
+        }
+        case Op.LeakyRelu(x, slope) {
+            if g.nodes[x].GradOffset >= 0 { ops.LeakyReluBackward(dy, g.Value(x), linalg.Cast(slope, like), g.Grad(x), g.acc(x)) }
+        }
+        case Op.Gelu(x) {
+            if g.nodes[x].GradOffset >= 0 { ops.GeluBackward(dy, g.Value(x), g.Grad(x), g.acc(x)) }
+        }
+        case Op.Sigmoid(x) {
+            if g.nodes[x].GradOffset >= 0 { ops.SigmoidBackward(dy, g.Value(v), g.Grad(x), g.acc(x)) }
+        }
+        case Op.Tanh(x) {
+            if g.nodes[x].GradOffset >= 0 { ops.TanhBackward(dy, g.Value(v), g.Grad(x), g.acc(x)) }
+        }
+        case Op.Softmax(x) {
+            if g.nodes[x].GradOffset >= 0 { ops.SoftmaxBackward(dy, g.Value(v), g.Grad(x), g.acc(x)) }
+        }
+        case Op.SoftmaxCrossEntropy(z, c) {
+            if g.nodes[z].GradOffset >= 0 {
+                ops.SoftmaxCrossEntropyBackward(dy.Data[0], g.classData(c), g.saved(v), g.Grad(z), g.acc(z))
+            }
+        }
+        case Op.Mse(a, b) {
+            da := g.gradOf(a)
+            ca := g.acc(a)
+            db := g.gradOf(b)
+            cb := g.acc(b)
+            ops.MseBackward(dy.Data[0], g.Value(a), g.Value(b), da, ca, db, cb)
+        }
+    }
+}
+
+# ---- tests ----
+
+test "a graph records, plans and runs a small network" {
+    g := Graph<F64>(4)
+    x := g.Input(3)
+    y := g.Classes()
+    w := g.Param(2, 3, Init.Constant(0.5), true)
+    b := g.Param(1, 2, Init.Zeros, false)
+    h := g.Relu(g.Linear(x, w, b))
+    loss := g.SoftmaxCrossEntropy(h, y)
+    r := rand.Rand(1)
+    g.Plan(r)
+    assert g.ParamCount == 8
+    xd := g.InputData(x)
+    for i in range 12 { xd[i] = F64(i) }
+    yd := g.ClassData(y)
+    for i in range 4 { yd[i] = I32(i % 2) }
+    g.Forward(4)
+    assert g.Value(h).Get(1, 0) == 6.0
+    g.Backward(loss)
+    assert g.Grad(w).Get(0, 0) != 0.0
+}
+
+# the largest relative difference between the gradient Backward gives each parameter and the central difference of
+# the loss - a gradient check, in F64 where the difference is precise
+fn gradientError(g mut Graph<F64>&, loss Var, n I64) F64 {
+    g.Forward(n)
+    g.Backward(loss)
+    analytic := g.ParamGrads().Clone()
+    params := g.Params()
+    h F64 = 1e-6
+    worst F64 = 0.0
+    for i in range g.ParamCount {
+        old := params.Data[i]
+        params.Data[i] = old + h
+        g.Forward(n)
+        up := g.Scalar(loss)
+        params.Data[i] = old - h
+        g.Forward(n)
+        down := g.Scalar(loss)
+        params.Data[i] = old
+        numeric F64 = (up - down) / (2.0 * h)
+        a := analytic.Data[i]
+        scale F64 = math.Abs(numeric) + math.Abs(a)
+        if scale > 1e-7 {
+            e F64 = math.Abs(numeric - a) / scale
+            if e > worst { worst = e }
+        }
+    }
+    return worst
+}
+
+fn normal(g mut Graph<F64>&, rows I64, cols I64) Var {
+    return g.Param(rows, cols, Init.Normal(0.0, 1.0), true)
+}
+
+test "every operation's backward agrees with central differences" {
+    g := Graph<F64>(5)
+    a := normal(g, 3, 4)
+    b := normal(g, 4, 2)
+    bt := normal(g, 2, 4)
+    at := normal(g, 4, 3)
+    p1 := g.Product(a, b, false, false)          # 3 x 2
+    p2 := g.Product(a, bt, false, true)
+    p3 := g.Product(at, b, true, false)
+    p4 := g.Product(at, bt, true, true)
+    s := g.Add(g.Sub(p1, p2), g.Multiply(p3, g.Scale(p4, 0.7)))
+    row := normal(g, 1, 2)
+    acts := g.Add(g.Add(g.Relu(g.AddRow(s, row)), g.LeakyRelu(s, 0.1)), g.Add(g.Gelu(s), g.Sigmoid(s)))
+    t := g.Add(g.Tanh(acts), g.Softmax(acts))
+    target := normal(g, 3, 2)
+    unused := normal(g, 2, 2)
+    loss := g.Mse(t, target)
+    r := rand.Rand(5)
+    g.Plan(r)
+    assert gradientError(g, loss, 5) < 1e-6
+    assert g.Grad(unused).MaxAbs() == 0.0
+}
+
+test "a batched network's gradients agree, on a short batch and with a value used twice" {
+    g := Graph<F64>(6)
+    x := g.Input(4)
+    y := g.Classes()
+    w1 := normal(g, 5, 4)
+    b1 := normal(g, 1, 5)
+    w2 := normal(g, 3, 5)
+    b2 := normal(g, 1, 3)
+    h := g.Gelu(g.Linear(x, w1, b1))
+    twice := g.Add(h, g.Tanh(h))                  # h feeds two operations: its gradient is collected from both
+    logits := g.Linear(twice, w2, b2)
+    loss := g.SoftmaxCrossEntropy(logits, y)
+    r := rand.Rand(9)
+    g.Plan(r)
+    xd := g.InputData(x)
+    for i in range xd.Len() { xd[i] = r.Normal() }
+    yd := g.ClassData(y)
+    for i in range yd.Len() { yd[i] = I32(r.Below(3)) }
+    assert gradientError(g, loss, 6) < 1e-6
+    assert gradientError(g, loss, 4) < 1e-6        # the first four rows only
+}
+
+test "Backward with accumulate adds to the gradients already there" {
+    g := Graph<F64>(2)
+    w := normal(g, 2, 2)
+    target := normal(g, 2, 2)
+    loss := g.Mse(w, target)
+    r := rand.Rand(2)
+    g.Plan(r)
+    g.Forward(2)
+    g.Backward(loss)
+    once := g.Grad(w).Get(0, 1)
+    g.Backward(loss, true)
+    assert math.Abs(g.Grad(w).Get(0, 1) - 2.0 * once) < 1e-12
+    g.Backward(loss)
+    assert g.Grad(w).Get(0, 1) == once
+}

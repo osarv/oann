@@ -1,0 +1,300 @@
+# optim - optimizers: what turns a graph's gradients into a step for its parameters. Each one updates the parameter
+# region (nn's Params(), every parameter one after another) in one fused pass over flat arrays - PyTorch's fused
+# optimizers - with its state (momentum, the moment estimates) laid out the same way and made once, when the
+# optimizer is. Construct one after the graph is planned; Step(g) after each Backward.
+#
+# How weights are held back from growing is a Regularizer, so the same optimizer runs with either:
+# - WeightDecay(rate): decoupled weight decay (Loshchilov and Hutter's AdamW): each weight, not the biases, shrinks by
+#   rate * the learning rate each step;
+# - Projection(alpha, normalized): in place of weight decay, every dense layer y = x W^T + b takes the delta rule's
+#   step W <- W (I - alpha x x^T) on each input row x of the batch - for the batch, W <- W - (alpha / n) (W X^T) X,
+#   X the layer's n input rows, two products on what the graph already holds. It shrinks W only along the directions
+#   its inputs come from (Behrouz et al., "Nested Learning: The Illusion of Deep Learning Architectures"). normalized
+#   divides each row's term by |x|^2, making alpha a fraction of the projection onto x instead of a rate scaled by
+#   |x|^2. Off by default: whether to normalize and the default alpha are not settled - both are parameters.
+
+import "std/linalg"
+import "std/math"
+import "nn"
+
+# what a training loop asks of an optimizer: a step from the gradients the last Backward left (a constraint - AdamW
+# and Sgd satisfy it)
+type Optimizer<T> trait {
+    mut Step(g mut nn.Graph<<T>>&)
+}
+
+# how weights are held back
+type Regularizer enum {
+    WeightDecay(rate F64)
+    Projection(alpha F64, normalized Bool)
+}
+
+# ---- the input projection, shared by every optimizer ----
+
+# the workspace the projection needs: the largest dense layer's batch x outputs, and one norm per row
+type projectionSpace<T> struct(g mut nn.Graph<<T>>&) {
+    m mut Array<<T>>& = Array<<T>>(largestLinear(g))
+    norms mut Array<<T>>& = Array<<T>>(g.Batch)
+}
+
+fn largestLinear(g mut nn.Graph<<T>>&) I64 {
+    most I64 = 0
+    for i in range g.Size() {
+        nd := g.Info(nn.Var(i))
+        if nd.Kind is nn.Op.Linear and nd.Rows * nd.Cols > most { most = nd.Rows * nd.Cols }
+    }
+    return most
+}
+
+# W <- W - (alpha / n) (W X^T) X for every dense layer, from what the last Forward computed: W X^T is the layer's
+# output less its bias, Y - b, so it costs a pass over Y and one product. Uses W as Forward did, so it runs before
+# the step changes W
+fn project(g mut nn.Graph<<T>>&, alpha F64, normalized Bool, space mut projectionSpace<<T>>&) {
+    for i in range g.Size() {
+        nd := g.Info(nn.Var(i))
+        match nd.Kind {
+            case nn.Op.Linear(xv, wv, bv) {
+                x := g.Value(xv)
+                y := g.Value(nn.Var(i))
+                w := g.Value(wv)
+                b := g.Value(bv)
+                m := linalg.View(space.m, 0, y.Rows, y.Cols)
+                for r in range y.Rows {
+                    yr := y.Row(r)
+                    mr := m.Row(r)
+                    for c in range yr.Len() { mr[c] = yr[c] - b.Data[c] }
+                }
+                if normalized {
+                    norms := space.norms[:x.Rows]
+                    x.RowNorms(norms)
+                    for r in range m.Rows {
+                        n2 <T> = norms[r] * norms[r]
+                        if n2 > 0.0 {
+                            mr := m.Row(r)
+                            inv <T> = 1.0 / n2
+                            for c in range mr.Len() { mr[c] = mr[c] * inv }
+                        }
+                    }
+                }
+                linalg.Gemm(w, m, true, x, false, -alpha / F64(x.Rows), 1, g.Threads)
+            }
+            nomatch { }
+        }
+    }
+}
+
+# the rate of decoupled weight decay a regularizer asks for (none for the projection)
+fn decayRate(reg Regularizer) F64 {
+    return match reg {
+        case Regularizer.WeightDecay(rate) => rate
+        case Regularizer.Projection(_, _) => 0.0
+    }
+}
+
+# ---- AdamW ----
+
+# Adam with decoupled weight decay, as PyTorch's AdamW computes it: for each parameter p with gradient g, at step t,
+#   m <- beta1 m + (1 - beta1) g,   v <- beta2 v + (1 - beta2) g^2
+#   p <- p - rate (wd p)            (decoupled decay, weights only; with the projection regularizer, that instead)
+#   p <- p - rate (m / (1 - beta1^t)) / (sqrt(v / (1 - beta2^t)) + eps)
+# Rate may be changed between steps - a schedule
+type AdamW<T> struct(g mut nn.Graph<<T>>&, rate F64 = 0.001, Beta1 F64 = 0.9, Beta2 F64 = 0.999, Eps F64 = 1e-8,
+        Reg Regularizer = Regularizer.WeightDecay(0.01)) {
+    Rate mut F64 = rate
+    Beta1
+    Beta2
+    Eps
+    Reg
+    Steps mut I64 = 0                               # the steps taken
+    m mut Array<<T>>& = Array<<T>>(g.ParamCount)
+    v mut Array<<T>>& = Array<<T>>(g.ParamCount)
+    space mut projectionSpace<<T>>& = projectionSpace<<T>>(g)
+}
+
+# AdamW with the delta rule's input projection in place of weight decay (Regularizer.Projection) - alpha and whether it
+# is normalized by |x|^2 being its parameters
+fn AdamWProjected(g mut nn.Graph<<T>>&, rate F64 = 0.001, alpha F64 = 0.0001, normalized Bool = false) AdamW<<T>> {
+    return AdamW<<T>>(g, rate, 0.9, 0.999, 1e-8, Regularizer.Projection(alpha, normalized))
+}
+
+# one step from the gradients the last Backward left
+fn (o mut AdamW<<T>>&) Step(g mut nn.Graph<<T>>&) {
+    match o.Reg {
+        case Regularizer.Projection(alpha, normalized) { project(g, alpha, normalized, o.space) }
+        nomatch { }
+    }
+    o.Steps++
+    like <T>
+    b1 := linalg.Cast(o.Beta1, like)
+    b2 := linalg.Cast(o.Beta2, like)
+    c1 := linalg.Cast(1.0 - o.Beta1, like)
+    c2 := linalg.Cast(1.0 - o.Beta2, like)
+    corr1 F64 = 1.0 - math.Pow(o.Beta1, F64(o.Steps))
+    corr2 F64 = 1.0 - math.Pow(o.Beta2, F64(o.Steps))
+    step := linalg.Cast(o.Rate / corr1, like)               # the learning rate with the first moment's correction
+    root := linalg.Cast(1.0 / math.Sqrt(corr2), like)      # sqrt(v / corr2) is sqrt(v) times this
+    eps := linalg.Cast(o.Eps, like)
+    wd := decayRate(o.Reg)
+    p := g.Params().Data
+    gr := g.ParamGrads().Data
+    for i in range g.Size() {
+        nd := g.Info(nn.Var(i))
+        match nd.Kind {
+            case nn.Op.Param(_, decay) {
+                keep := linalg.Cast(1.0 - o.Rate * wd if decay else 1.0, like)
+                lo := nd.Offset
+                hi I64 = lo + nd.Rows * nd.Cols
+                for k in range lo, hi {
+                    gk := gr[k]
+                    mk <T> = b1 * o.m[k] + c1 * gk
+                    vk <T> = b2 * o.v[k] + c2 * gk * gk
+                    o.m[k] = mk
+                    o.v[k] = vk
+                    p[k] = keep * p[k] - step * mk / (math.Sqrt(vk) * root + eps)
+                }
+            }
+            nomatch { }
+        }
+    }
+}
+
+# ---- SGD ----
+
+# stochastic gradient descent as PyTorch's SGD computes it: g <- g + wd p (weight decay as an L2 term, weights only),
+# u <- momentum u + g, and p <- p - rate u - or, with nesterov, p <- p - rate (g + momentum u). With the projection
+# regularizer, that runs first in place of the L2 term
+type Sgd<T> struct(g mut nn.Graph<<T>>&, rate F64 = 0.01, Momentum F64 = 0, Nesterov Bool = false,
+        Reg Regularizer = Regularizer.WeightDecay(0)) {
+    Rate mut F64 = rate
+    Momentum
+    Nesterov
+    Reg
+    u mut Array<<T>>& = Array<<T>>(g.ParamCount if Momentum != 0.0 else 0)
+    space mut projectionSpace<<T>>& = projectionSpace<<T>>(g)
+}
+
+fn (o mut Sgd<<T>>&) Step(g mut nn.Graph<<T>>&) {
+    match o.Reg {
+        case Regularizer.Projection(alpha, normalized) { project(g, alpha, normalized, o.space) }
+        nomatch { }
+    }
+    like <T>
+    rate := linalg.Cast(o.Rate, like)
+    mu := linalg.Cast(o.Momentum, like)
+    wd := decayRate(o.Reg)
+    p := g.Params().Data
+    gr := g.ParamGrads().Data
+    for i in range g.Size() {
+        nd := g.Info(nn.Var(i))
+        match nd.Kind {
+            case nn.Op.Param(_, decay) {
+                l2 := linalg.Cast(wd if decay else 0.0, like)
+                lo := nd.Offset
+                hi I64 = lo + nd.Rows * nd.Cols
+                if o.Momentum == 0.0 {
+                    for k in range lo, hi { p[k] = p[k] - rate * (gr[k] + l2 * p[k]) }
+                } else if o.Nesterov {
+                    for k in range lo, hi {
+                        gk <T> = gr[k] + l2 * p[k]
+                        uk <T> = mu * o.u[k] + gk
+                        o.u[k] = uk
+                        p[k] = p[k] - rate * (gk + mu * uk)
+                    }
+                } else {
+                    for k in range lo, hi {
+                        uk <T> = mu * o.u[k] + gr[k] + l2 * p[k]
+                        o.u[k] = uk
+                        p[k] = p[k] - rate * uk
+                    }
+                }
+            }
+            nomatch { }
+        }
+    }
+}
+
+# ---- tests ----
+
+import "std/rand"
+
+# a graph whose loss is the mean of (w - t)^2 over two elements, so w's gradient is w - t
+fn quadratic(w0 F64, w1 F64) (nn.Graph<F64>, nn.Var, nn.Var) {
+    g nn.Graph<F64>&return = nn.Graph<F64>(1)
+    w := g.Param(1, 2, nn.Init.Zeros, true)
+    t := g.Constant(1, 2)
+    loss := g.Mse(w, t)
+    r := rand.Rand(1)
+    g.Plan(r)
+    g.Value(w).Set(0, 0, w0)
+    g.Value(w).Set(0, 1, w1)
+    g.Value(t).Set(0, 0, 1.0)
+    g.Value(t).Set(0, 1, -2.0)
+    return g, w, loss
+}
+
+test "AdamW takes PyTorch's steps, decaying only the weights" {
+    g, w, loss := quadratic(3.0, 0.5)
+    o := AdamW<F64>(g, 0.1, 0.9, 0.999, 1e-8, Regularizer.WeightDecay(0.5))
+    p F64 = 3.0
+    m F64 = 0.0
+    v F64 = 0.0
+    for step in range 1, 4 {
+        g.Forward(1)
+        g.Backward(loss)
+        grad F64 = p - 1.0
+        o.Step(g)
+        m = 0.9 * m + 0.1 * grad
+        v = 0.999 * v + 0.001 * grad * grad
+        p = p * (1.0 - 0.1 * 0.5)
+        p = p - 0.1 * (m / (1.0 - math.Pow(0.9, F64(step)))) / (math.Sqrt(v / (1.0 - math.Pow(0.999, F64(step)))) + 1e-8)
+        assert math.Abs(g.Value(w).Get(0, 0) - p) < 1e-12
+    }
+}
+
+test "SGD with momentum takes PyTorch's steps" {
+    g, w, loss := quadratic(3.0, 0.5)
+    o := Sgd<F64>(g, 0.1, 0.9)
+    p F64 = 3.0
+    u F64 = 0.0
+    for step in range 3 {
+        g.Forward(1)
+        g.Backward(loss)
+        o.Step(g)
+        u = 0.9 * u + (p - 1.0)
+        p = p - 0.1 * u
+        assert math.Abs(g.Value(w).Get(0, 0) - p) < 1e-12
+    }
+}
+
+test "the input projection takes W <- W - (alpha / n) (W X^T) X, in place of weight decay" {
+    g := nn.Graph<F64>(3)
+    x := g.Input(2)
+    w := g.Param(2, 2, nn.Init.Zeros, true)
+    b := g.Param(1, 2, nn.Init.Zeros, false)
+    y := g.Linear(x, w, b)
+    t := g.Input(2)
+    loss := g.Mse(y, t)
+    r := rand.Rand(1)
+    g.Plan(r)
+    xd := g.InputData(x)
+    for i in range 6 { xd[i] = F64(i + 1) * 0.5 }
+    wm := g.Value(w)
+    wm.Set(0, 0, 1.0)
+    wm.Set(0, 1, -1.0)
+    wm.Set(1, 0, 0.5)
+    wm.Set(1, 1, 2.0)
+    g.Value(b).Fill(0.25)
+    g.Forward(3)
+    g.Backward(loss)
+    # expected: the projection first, from W as Forward used it, then a plain gradient step
+    xs := g.Value(x).Clone()
+    want := wm.Clone()
+    proj := linalg.Matrix<F64>(2, 2)
+    linalg.Gemm(proj, xs, true, xs, false)                        # X^T X
+    step := want @ proj                                           # W X^T X
+    want.AddScaled(step, -0.05 / 3.0)
+    want.AddScaled(g.Grad(w), -0.1)
+    o := Sgd<F64>(g, 0.1, 0, false, Regularizer.Projection(0.05, false))
+    o.Step(g)
+    assert g.Value(w).MaxAbsDifference(want) < 1e-12
+}

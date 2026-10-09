@@ -1,0 +1,76 @@
+# MNIST with a 784-128-10 perceptron: ReLU between the layers, softmax cross-entropy, batches of 128, trained with
+# AdamW, then measured on the test set after every epoch. Arguments, all optional: the epochs (10), the optimizer -
+# adamw (weight decay 0.01), projected (AdamW with the input projection in place of weight decay; the next argument
+# its alpha, 1e-4) or sgd (momentum 0.9) - the seed (1) and the threads the products may use (1).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn"
+import "../layers"
+import "../optim"
+import "../train"
+import "../datasets/idx"
+import "../datasets/loader"
+import "../datasets/mnist"
+
+# the number argument i, or fallback when there are fewer arguments
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len() { return fallback }
+    return try args[i].ParseInt()
+}
+
+fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError {
+    args := os.Args()
+    epochs := try number(args, 1, 10)
+    names := String&["adamw", "projected", "sgd"]
+    kind I64 = 0
+    for i, name in names {
+        if args.Len() > 2 and args[2] == name { kind = i }
+    }
+    alpha F64 = 0.0001
+    seed := U64(try number(args, 3, 1))
+    threads := try number(args, 4, 1)
+    data := try mnist.Load("data/mnist", mnist.Source)
+
+    batch I64 = 128
+    g := nn.Graph<F32>(batch, threads)
+    x := g.Input(784)
+    y := g.Classes()
+    net := layers.NewMlp(g, I64[784, 128, 10])
+    logits := net.Apply(g, x)
+    loss := g.SoftmaxCrossEntropy(logits, y)
+    r := rand.Rand(seed)
+    g.Plan(r)
+    c := train.Classifier(x, y, logits, loss)
+
+    trainSet := loader.Loader(data.Train, batch, seed)
+    testSet := loader.Loader(data.Test, batch, seed, false)
+    try io.Print("784-128-10, " $g.ParamCount " parameters, " $names[kind] ", batches of " $batch "\n")
+    if kind == 2 {
+        o optim.Sgd<F32>&g = optim.Sgd<F32>(g, 0.05, 0.9)
+        try run(g, c, trainSet, testSet, o, epochs)
+    } else if kind == 1 {
+        o optim.AdamW<F32>&g = optim.AdamWProjected(g, 0.001, alpha)
+        try run(g, c, trainSet, testSet, o, epochs)
+    } else {
+        o optim.AdamW<F32>&g = optim.AdamW<F32>(g)
+        try run(g, c, trainSet, testSet, o, epochs)
+    }
+}
+
+fn run(g mut nn.Graph<F32>&, c train.Classifier&, trainSet mut loader.Loader&, testSet mut loader.Loader&,
+        o mut <O optim.Optimizer<F32>>&, epochs I64) ? io.IoError {
+    total I64 = 0
+    for e in range 1, epochs + 1 {
+        t0 := time.Now()
+        trainLoss := train.Epoch(g, c, trainSet, o)
+        spent := time.Since(t0)
+        total += spent
+        testLoss, accuracy := train.Evaluate(g, c, testSet)
+        try io.Print("epoch " $e ": train loss " $trainLoss.Fixed(4) ", test loss " $testLoss.Fixed(4) ", test accuracy ")
+        try io.Print($(100.0 * accuracy).Fixed(2) "%, " $(F64(spent) * 1e-9).Fixed(3) " s\n")
+    }
+    try io.Print("mean epoch " $(F64(total) * 1e-9 / F64(epochs)).Fixed(3) " s\n")
+}
