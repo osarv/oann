@@ -595,6 +595,7 @@ fn (c mut Circuit<<T>>&) Restrain(target F64 = 0.9)                        # pro
 fn (c mut Circuit<<T>>&) Energy(p Phase, row I64) F64
 fn (c Circuit<<T>>&) Value(p Phase) linalg.Matrix<<T>>                     # views of state, as g.Value(v)
 fn (c Circuit<<T>>&) Loss(p Phase) F64
+fn (t mut Eligibility<<T>>&) Add(c mut Circuit<<T>>&, decay F64)          # also Decay(decay), Credit(c, delta)
 fn (a mut Agent<<T>>&) Step(obs Array<<T>>&, reward <T>) I64 ? NotSettled   # phase 2
 fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) Settlement ? NotSettled    # phase 2: private; changes nothing
 ```
@@ -604,8 +605,9 @@ fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) Settlement ? NotSettled    # pha
 Settling networks follow the transformer work (section 6).
 
 1. **Done (2026-10-09, `circuit.olang`):** `Circuit` with `tanh` neurons, `Settle`/`Run`/`Residual`, the certificate,
-   supervised `Teach`, and the checks of 5.1-5.2.1-3 in F64; and the neuron enum with a working `Lif` variant (4.6).
-   Results in 2.10 and 5.
+   supervised `Teach`, and the checks of 5.1-5.2 in F64; the neuron enum with a working `Lif` variant (4.6); and, of
+   phase 2, the pieces phase 1's structures made cheap: the eligibility trace (`Eligibility`, lazy and fused) and the
+   checks of 5.2.4-5.2.6. Results in 2.10 and 5.7.
 2. The `Agent`: critic, `Trace`, `Memory`, `Arousal`, the moment loop, checkpoints; the end-to-end tasks of 5.5.
 3. The fixed-point simulation of the board engine (4.2, 5.6); the sparse-code store, extra readout groups, CSR
    projections for large circuits.
@@ -646,6 +648,9 @@ test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/
   `optim` steps an `nn.Graph`; a flat-region entry point there would let every oann optimizer serve both (follow-up).
 - **The encoder's gradient** is `DriveGrad(region, out, beta)`, of the mean cost over the rows, so it adds to a graph's
   loss gradient directly.
+- **The eligibility trace** (phase 2's first piece): `Eligibility<T>(c)` - `Decay(g)` at a calm moment multiplies one
+  pending number, `Add(c, g)` folds it in while adding the contrast `Teach` left (one pass), `Credit(c, delta)` writes
+  the actor's step `G = -delta E`. One stream: per-stream traces at batch `B` wait on open question 5.
 - **Spiking**: 4.6.
 - **Cost, measured** (784-128-10, batch 32, F32, on a shared four-core machine): a lesson about 4.5 ms - the folded
   constant 0.9 ms, about 40 sweeps over the three settles at about 70 us each, the contrast 0.7 ms, Adam 0.1 ms. The
@@ -971,6 +976,57 @@ fixtures above. On the board, the PL result must equal the simulation exactly (i
 the F64 result within the bound.
 
 ---
+
+### 5.7 Results of phase 1 (2026-10-09)
+
+All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest over the elements checked.
+
+- **5.1.1** One neuron, `v = w tanh(v) + d`, against bisection: within 1e-12 for `w` in {0.5, -0.8, 0.9, -0.3} and four
+  drives, at `tau = 1e-14`; the gain is `|w|` exactly.
+- **5.1.2** Linear neurons (seven relaxing, two lateral blocks, `kappa = 0.8`) against Gaussian elimination of
+  `(I - W) v = d + b + W_in d_in`, assembled independently from the blocks: within 1e-12.
+- **5.1.3** The certificate at `kappa = 0.8`: three random starts reach one equilibrium (1e-12); bounds (ii) and (iii)
+  hold at every one of 79 sweeps; (iv) and (v) at `tau` = 1e-3, 1e-6, 1e-9. A bistable circuit (gain 6), 30 starts
+  with budgets 0-29: some qualify, some refuse; every state returned qualifies, and every refusal leaves the committed
+  state bit for bit. A **nudged** phase (squared error, `beta = 1`) steps at `dt = 1/2` and its residual shrinks at
+  the certified `q_beta = 0.9` at every one of 59 sweeps.
+- **5.1.4** Energy: central differences of `E` against `-rho'(v) r` within 1e-8; 200 sweeps at `dt = 0.05` never
+  raise it; at the equilibrium its gradient is below 1e-9.
+- **5.1.5** Inputs in closed form against relaxing them as ordinary regions: within 1e-12.
+- **5.1.6** Damped (`dt = 1/2`, three attempts) and plain settles agree within 2e-12; a linear neuron with
+  self-weight -1 swings forever at `dt = 1` (refused, residual 1) and lands on `d / 2` in one damped step.
+- **5.2.1** The estimate against central differences of the free equilibrium's cost (three tanh inputs, four hidden
+  with a lateral block, three cross-entropy readouts, two rows), relative to the largest element:
+
+  | `beta` | 1e-1 | 1e-2 | 1e-3 |
+  |---|---|---|---|
+  | centered | 1.6e-3 | 1.6e-5 | 1.6e-7 |
+  | uncentered | 6.9e-2 | 6.8e-3 | 6.8e-4 |
+
+  slope 2 and slope 1 exactly; at `beta = 1e-3` with the rule's tolerance (1e-11, not a tight one) 1.6e-7.
+- **5.2.2** The drive's gradient, on a hidden region and through the source projection of a tanh input region:
+  1.9e-6 of the largest element, both.
+- **5.2.3** With the feedback a one-way block of its own (asymmetric): 0.88 - the estimate is no gradient.
+- **5.2.4** The policy score: the mean of the actions' contrasts under `pi` is 3.8e-7 of the largest, and an action's
+  contrast against central differences of `T log pi(a)` 1.0e-6.
+- **5.2.5** Three factors, the exact expected actor update with an exact baseline against `T grad J`: 7.3e-7.
+- **5.2.6** The eligibility trace (`Eligibility`, lazy and fused) against the explicit sum of past contrasts weighted
+  by `(gamma lambda)^age` over eleven moments: within 1e-14; lazy and eager decay within 1e-15.
+- **Spiking** (4.6): one Lif neuron's rate under six constant drives within the derived bound of the analytic rate
+  (e.g. 0.0455 against 0.0467 at drive 1.5, 0.274 against 0.281 at 6; none below the threshold). A small spiking
+  circuit's free rates are within 0.009 of its `LifRate` rate model's, and its spike-count contrast agrees in sign on
+  all 11 of the rate model's larger entries (the largest difference 0.23 of the largest entry).
+- **End to end, XOR** (rate, F64, eight hidden): every pattern right and the cost 9.6e-5 after 400 lessons, 9 sweeps a
+  lesson. **Spiking XOR** (window 256): every pattern right, cost 2.2e-5 after 200 lessons, the readouts on their
+  targets to a spike; about 1 080 steps a lesson.
+- **End to end, MNIST** (`examples/mnist_settle.olang`, F32, 784-128-10, batch 32, Adam 1e-3, `beta = 0.5`, test set):
+  95.69% after one epoch, 96.73% after three, 97.48% after ten (97.49% at nine); about 40 sweeps a lesson for the three
+  settles and 11-20 an answer; no lesson refused, though the gain rises to 15 - far outside the certified region,
+  where only the residual test vouches for a settle. 784-256-10: 97.57% after five epochs. Projected back into the
+  certified set after every step (`Restrain(0.9)`, what the board needs): 91.09% after three epochs, at 16 sweeps a
+  lesson and 4 an answer - the certificate bounds each readout neuron's input to 0.9, which the cross-entropy at
+  `T = 0.25` cannot separate ten classes well with; a deployed circuit wants a lower temperature or training aware of
+  the bound. An epoch takes 8.7 s on the shared machine (backprop's 784-128-10 epoch: 2.4 s; 2.10 says where it goes).
 
 ## 6. Decisions and open questions
 
