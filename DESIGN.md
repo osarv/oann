@@ -106,7 +106,7 @@ parameters or a second loss need no new backward code.
 is `@`, `Mul` is `*`) for every method of every type, so a graph cannot have methods called that (repro/operatornames).
 
 - **A shorter batch** (an epoch's last) runs on the first `n` rows of every batched node - views, nothing re-planned;
-  losses average over `n`.
+  losses average over `n`. With attention, `n` is whole sequences (a multiple of `T`).
 - **Gradients are written, then added to.** A `written` flag per node, reset each `Backward`, makes an op's first
   contribution to an input's gradient a write (`beta = 0` in a GEMM) and the rest additions (`beta = 1`), so no
   zero-fill pass runs. A parameter no path from the loss reaches is zero-filled; with `accumulate` set, parameters'
@@ -386,8 +386,8 @@ floats' `Bits()`; the parameter region is already one contiguous block. Paramete
 
 A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor type:
 
-- **Rows are tokens.** A batch of `B` sequences of `T` tokens is a `[B*T, D]` matrix, sequence `s` in rows `s T ... s T
-  + T - 1`; the graph is planned for `Batch = B*T` rows, and a node knows `T` where it needs it (attention, positions).
+- **Rows are tokens.** A batch of `B` sequences of `T` tokens is a `[B*T, D]` matrix, sequence `s` in the `T` rows from
+  `s T`; the graph is planned for `Batch = B*T` rows, and a node knows `T` where it needs it (attention, positions).
   The loss is `SoftmaxCrossEntropy` over the `B*T` rows of vocabulary logits, the classes each token's next one.
 - **Leaves and ops**: `Tokens()` (an `I32` per row, as `Classes()`); `Embedding(tokens, table)` (a gather; the
   backward scatter-adds into the table's gradient, so a token repeated in a batch sums); `Positions(x, table)` (learned:
@@ -421,8 +421,8 @@ A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor t
 - **Generation** (`generate.olang`): `Sample(logits, temperature, r)`; `Rerun` runs the last `T` tokens through a graph
   planned for one sequence for every new token; `Cached` runs each token once on a **graph for decoding**
   (`nn.Graph<F32>(T, 1, true)`): no gradients, and every attention keeps the keys and values of the positions so far
-  in its saved region - a key-value cache in the arena - so `Forward(n)` at `g.Pos` computes positions `Pos ... Pos + n
-  - 1` attending to everything cached, `Positions` adding row `Pos + r`. The prompt is one `Forward` (a prefill); when
+  in its saved region - a key-value cache in the arena - so `Forward(n)` at `g.Pos` computes the `n` positions from
+  `Pos`, each attending to everything cached, `Positions` adding row `Pos + r`. The prompt is one `Forward` (a prefill); when
   the context is full, the last `T / 2` tokens are run again to start a fresh cache. Checked: decoding a prefill and
   then token by token gives the logits of running the whole sequence, to 1e-12.
 - **Checkpoints**: `g.Save(path)`/`g.Load(path)` - the parameter region as it is (`oann`, the element width and the
@@ -521,6 +521,19 @@ large squares because these are narrow (k = 128) - so the step is the compiler's
 ms), the element-wise ops do not (they run on one thread). The arena is 87.2 MB, laid out once; resident memory grows
 by 70-84 kB over the first steps and by nothing after (100 steps measured). MNIST's epoch with the workspace `Gemm`:
 2.2 s (2.39 before), and it no longer grows.
+
+### olang issues found on the way (repro/)
+
+- `repro/chunkpool.olang` (phase 2) - std/linalg's `Gemm` leaks a chunk per packed product through the runtime's pool;
+  for a transformer 8.1 MB a step. Worked around by `kernels.Gemm`.
+- `repro/capturedfn.olang` - a lambda that captures a function value and calls it (`fn(d, g, v) { return d + f(g, v)
+  }`) leaves an indirect call per element even when everything is inlined: 3.1 ns an element against 0.55 written
+  out. `ops.backward2` now runs its loops itself.
+- `repro/ctorunstored.olang` - O26 counts an instance as referring to every reference its constructor was given, even
+  one it only reads: `return Counts(t)` with `t` a local is refused. `text.Load` declares its text `&return` instead.
+- Not issues, recorded for the language's records: `:=` from a comparison (`ta := t % 2 == 1`) still needs its type
+  written (D15 - being relaxed); a `match` value cannot give several results (`=> rows, cols`), so `savedShape` uses
+  statements; a text join's piece cannot be a conditional (`$` of a local holding it is).
 
 ### What remains
 
