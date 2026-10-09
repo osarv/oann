@@ -43,47 +43,49 @@ fn pass(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<T>&) {
 
 # ---- products ----
 
-# The products take "work", the workspace their packing panels go into (kernels.Gemm), so none of them allocates.
+# The products take "ws", the std/linalg workspace their packing panels go into, so none of them allocates once it
+# has grown to the largest product.
 
 # y = op(a) op(b), op(m) being m or, where its flag is set, m's transpose
 fn MatMul(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg.Matrix<T>&, tb Bool, threads I64,
-        work mut Array<T>&) {
-    kernels.Gemm(y, a, ta, b, tb, 1, 0, threads, work)
+        ws mut linalg.GemmWorkspace<T>&) {
+    ws.Gemm(y, a, ta, b, tb, 1, 0, threads)
 }
 
 # the gradients of y = op(a) op(b): for y = a b, da = dy b^T and db = a^T dy, and the transposes follow - every case
 # one product, transposes as Gemm's parameters
 fn MatMulBackward(dy linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg.Matrix<T>&, tb Bool,
-        da linalg.Matrix<T>&, accA Bool, db linalg.Matrix<T>&, accB Bool, threads I64, work mut Array<T>&) {
+        da linalg.Matrix<T>&, accA Bool, db linalg.Matrix<T>&, accB Bool, threads I64,
+        ws mut linalg.GemmWorkspace<T>&) {
     if da.Rows > 0 {
         if not ta {
-            kernels.Gemm(da, dy, false, b, not tb, 1, beta(accA), threads, work)     # a b: dy b^T; a b^T: dy b
+            ws.Gemm(da, dy, false, b, not tb, 1, beta(accA), threads)     # a b: dy b^T; a b^T: dy b
         } else {
-            kernels.Gemm(da, b, tb, dy, true, 1, beta(accA), threads, work)          # a^T b: b dy^T; a^T b^T: b^T dy^T
+            ws.Gemm(da, b, tb, dy, true, 1, beta(accA), threads)          # a^T b: b dy^T; a^T b^T: b^T dy^T
         }
     }
     if db.Rows > 0 {
         if not tb {
-            kernels.Gemm(db, a, not ta, dy, false, 1, beta(accB), threads, work)     # a b: a^T dy; a^T b: a dy
+            ws.Gemm(db, a, not ta, dy, false, 1, beta(accB), threads)     # a b: a^T dy; a^T b: a dy
         } else {
-            kernels.Gemm(db, dy, true, a, ta, 1, beta(accB), threads, work)          # a b^T: dy^T a; a^T b^T: dy^T a^T
+            ws.Gemm(db, dy, true, a, ta, 1, beta(accB), threads)          # a b^T: dy^T a; a^T b^T: dy^T a^T
         }
     }
 }
 
 # y = x w^T + b: a dense layer, w being out x in (PyTorch's layout) and b one row of out
 fn Linear(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, threads I64,
-        work mut Array<T>&) {
-    kernels.Gemm(y, x, false, w, true, 1, 0, threads, work)
+        ws mut linalg.GemmWorkspace<T>&) {
+    ws.Gemm(y, x, false, w, true, 1, 0, threads)
     y.AddRow(b)
 }
 
 # the gradients of y = x w^T + b: dx = dy w, dw = dy^T x, db = the column sums of dy
 fn LinearBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, dx linalg.Matrix<T>&,
         accX Bool, dw linalg.Matrix<T>&, accW Bool, db linalg.Matrix<T>&, accB Bool, threads I64,
-        work mut Array<T>&) {
-    if dx.Rows > 0 { kernels.Gemm(dx, dy, false, w, false, 1, beta(accX), threads, work) }
-    if dw.Rows > 0 { kernels.Gemm(dw, dy, true, x, false, 1, beta(accW), threads, work) }
+        ws mut linalg.GemmWorkspace<T>&) {
+    if dx.Rows > 0 { ws.Gemm(dx, dy, false, w, false, 1, beta(accX), threads) }
+    if dw.Rows > 0 { ws.Gemm(dw, dy, true, x, false, 1, beta(accW), threads) }
     if db.Rows > 0 { dy.ColumnSums(db, beta(accB)) }
 }
 
@@ -717,7 +719,8 @@ test "the kernels compute what they say" {
     w := m64(4, 3, F64[1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1])
     bias := m64(1, 4, F64[10, 20, 30, 40])
     z := linalg.Matrix<F64>(2, 4)
-    Linear(z, a, w, bias, 1, Array<F64>(0))
+    ws := linalg.GemmWorkspace<F64>()
+    Linear(z, a, w, bias, 1, ws)
     assert z.Get(0, 0) == 11.0 and z.Get(0, 3) == 42.0 and z.Get(1, 1) == 25.0
     probs := linalg.Matrix<F64>(2, 4)
     loss := SoftmaxCrossEntropy(z, I32[3, 1], probs)

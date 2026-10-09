@@ -14,9 +14,10 @@
 #
 # The arena's regions, in order: the parameters, contiguous in the order they were made (the optimizers' one flat
 # array, and a checkpoint's); their gradients, laid out the same; then every other node's value, its gradient when
-# it needs one, and what its backward needs kept; last the products' packing workspace and attention's backward
-# scratch. A gradient is written by the first operation contributing to it and added to by the rest, so nothing is
-# zeroed between steps.
+# it needs one, and what its backward needs kept; last attention's backward scratch and the convolutions' patches.
+# A gradient is written by the first operation contributing to it and added to by the rest, so nothing is zeroed
+# between steps. The products pack their operands into std/linalg's GemmWorkspace, which the graph keeps beside the
+# arena: it grows to the largest product during the first step, and allocates nothing after.
 
 import "std/io"
 import "std/linalg"
@@ -25,7 +26,6 @@ import "std/os"
 import "std/rand"
 import "std/time"
 import "ops"
-import "kernels"
 import "conv"
 
 # a node's handle: an index into the graph's nodes
@@ -144,8 +144,7 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     Training mut Bool = true        # dropout acts only while training
     Pos mut I64 = 0                 # the position of the batch's first row in its sequence (Positions)
     Rng mut rand.Rand = rand.Rand(0)  # dropout's generator, seeded from the one Plan is given
-    workOffset mut I64 = 0          # the products' packing workspace (kernels.Gemm)
-    workSize mut I64 = 0
+    ws mut linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()  # the products' packing panels
     scratchOffset mut I64 = 0       # attention's backward: a T x T matrix per task
     scratchSize mut I64 = 0
     colsOffset mut I64 = 0          # convolutions' patches (conv.Im2col): the largest one's, shared by all
@@ -179,7 +178,7 @@ fn (g Graph<<T>>&) Size() I64 {
     return g.nodes.Len()
 }
 
-# the elements of the arena Plan laid out: parameters, gradients, values, what backwards keep, workspace and scratch
+# the elements of the arena Plan laid out: parameters, gradients, values, what backwards keep, scratch and patches
 fn (g Graph<<T>>&) ArenaSize() I64 {
     return g.mem.Len()
 }
@@ -459,16 +458,12 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     }
     at I64 = 2 * params
     rows I64 = 0
-    widest I64 = 1                              # the largest dimension of any node: what a product can be
     scratch I64 = 0
-    cols I64 = 0                                # the largest convolution's patches, and its products' workspace
+    cols I64 = 0                                # the largest convolution's patches
     like T
-    convWork I64 = 0
     for i in range count {
         nd := g.nodes[i]
         size I64 = nd.Rows * nd.Cols
-        if nd.Rows > widest { widest = nd.Rows }
-        if nd.Cols > widest { widest = nd.Cols }
         match nd.Kind {
             case Op.Param(_, _) { nd.GradOffset = params + nd.Offset }
             case Op.Classes, Op.Tokens {
@@ -493,8 +488,6 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
                     }
                     case Op.Conv2d(_, _, _, s) {
                         if nd.Rows * s.Positions() * s.Patch() > cols { cols = nd.Rows * s.Positions() * s.Patch() }
-                        cw := conv.GemmSpace(s, nd.Rows, g.Threads, like)
-                        if cw > convWork { convWork = cw }
                     }
                     nomatch { }
                 }
@@ -502,10 +495,6 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
         }
         g.nodes[i] = nd
     }
-    g.workOffset = at
-    g.workSize = kernels.GemmSpace(widest, widest, widest, g.Threads, like)
-    if convWork > g.workSize { g.workSize = convWork }
-    at += g.workSize
     g.scratchOffset = at
     g.scratchSize = scratch
     at += scratch
@@ -573,11 +562,7 @@ fn (g Graph<<T>>&) TokenData(v Var) mut Array<I32>&g {
     return g.ClassData(v)
 }
 
-# the products' packing workspace, and attention's backward scratch: regions of the arena
-fn (g Graph<<T>>&) work() mut Array<T>&g {
-    return g.mem[g.workOffset:g.workOffset + g.workSize]
-}
-
+# attention's backward scratch: a region of the arena
 fn (g Graph<<T>>&) scratch() mut Array<T>&g {
     return g.mem[g.scratchOffset:g.scratchOffset + g.scratchSize]
 }
@@ -691,8 +676,8 @@ fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
     y := g.Value(node)
     match nd.Kind {
         case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
-        case Op.MatMul(a, b, ta, tb) { ops.MatMul(y, g.Value(a), ta, g.Value(b), tb, th, g.work()) }
-        case Op.Linear(x, w, b) { ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th, g.work()) }
+        case Op.MatMul(a, b, ta, tb) { ops.MatMul(y, g.Value(a), ta, g.Value(b), tb, th, g.ws) }
+        case Op.Linear(x, w, b) { ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th, g.ws) }
         case Op.AddRow(x, b) { ops.AddRow(y, g.Value(x), g.Value(b)) }
         case Op.Add(a, b) { ops.Add(y, g.Value(a), g.Value(b)) }
         case Op.Sub(a, b) { ops.Sub(y, g.Value(a), g.Value(b)) }
@@ -734,7 +719,7 @@ fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
         }
         case Op.Mse(a, b) { y.Data[0] = ops.Mse(g.Value(a), g.Value(b)) }
         case Op.Conv2d(x, w, b, s) {
-            conv.Conv2d(y, g.Value(x), g.Value(w), g.Value(b), s, g.patches(s, y.Rows), th, g.work())
+            conv.Conv2d(y, g.Value(x), g.Value(w), g.Value(b), s, g.patches(s, y.Rows), th, g.ws)
         }
         case Op.MaxPool2d(x, p) { conv.MaxPool2d(y, g.Value(x), p, g.saved(node), th) }
     }
@@ -813,7 +798,7 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
             ca := g.acc(a)
             db := g.gradOf(b)
             cb := g.acc(b)
-            ops.MatMulBackward(dy, g.Value(a), ta, g.Value(b), tb, da, ca, db, cb, th, g.work())
+            ops.MatMulBackward(dy, g.Value(a), ta, g.Value(b), tb, da, ca, db, cb, th, g.ws)
         }
         case Op.Linear(x, w, b) {
             dx := g.gradOf(x)
@@ -822,7 +807,7 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
             cw := g.acc(w)
             db := g.gradOf(b)
             cb := g.acc(b)
-            ops.LinearBackward(dy, g.Value(x), g.Value(w), dx, cx, dw, cw, db, cb, th, g.work())
+            ops.LinearBackward(dy, g.Value(x), g.Value(w), dx, cx, dw, cw, db, cb, th, g.ws)
         }
         case Op.AddRow(x, b) {
             dx := g.gradOf(x)
@@ -944,7 +929,7 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
             db := g.gradOf(b)
             cb := g.acc(b)
             conv.Conv2dBackward(dy, g.Value(x), g.Value(w), s, dx, cx, dw, cw, db, cb, g.patches(s, dy.Rows), th,
-                g.work())
+                g.ws)
         }
         case Op.MaxPool2d(x, p) {
             if g.nodes[x].GradOffset >= 0 { conv.MaxPool2dBackward(dy, g.saved(v), p, g.Grad(x), g.acc(x), th) }

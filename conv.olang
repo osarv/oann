@@ -21,7 +21,6 @@
 # PyTorch's choice), and its backward adds the gradient there.
 
 import "std/linalg"
-import "kernels"
 
 # a convolution of C-channel H x W images by OutC kernels of K x K, moved Stride pixels at a time over the images
 # padded with Pad zeros on every side
@@ -160,12 +159,12 @@ fn Col2im(dcols linalg.Matrix<<T>>&, s Shape&, dx linalg.Matrix<T>&, acc Bool, t
 }
 
 # y = the convolution of x by w plus b: x is n images (n x H W C), w OutC x C K K, b 1 x OutC, y n x OutH OutW OutC;
-# cols, (n OutH OutW) x (C K K), is the workspace the patches are written to, work the product's packing workspace
+# cols, (n OutH OutW) x (C K K), is the workspace the patches are written to, ws the product's packing workspace
 fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&,
-        cols linalg.Matrix<T>&, threads I64, work mut Array<T>&) {
+        cols linalg.Matrix<T>&, threads I64, ws mut linalg.GemmWorkspace<T>&) {
     Im2col(x, s, cols, threads)
     out := y.Reshape(y.Rows * s.Positions(), s.OutC)
-    kernels.Gemm(out, cols, false, w, true, 1, 0, threads, work)
+    ws.Gemm(out, cols, false, w, true, 1, 0, threads)
     out.AddRow(b)
 }
 
@@ -174,29 +173,17 @@ fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b lin
 # the patches. An empty gradient matrix is one not wanted; acc adds to one instead of writing it
 fn Conv2dBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, s Shape&,
         dx linalg.Matrix<T>&, accX Bool, dw linalg.Matrix<T>&, accW Bool, db linalg.Matrix<T>&, accB Bool,
-        cols linalg.Matrix<T>&, threads I64, work mut Array<T>&) {
+        cols linalg.Matrix<T>&, threads I64, ws mut linalg.GemmWorkspace<T>&) {
     g := dy.Reshape(dy.Rows * s.Positions(), s.OutC)
     if db.Rows > 0 { g.ColumnSums(db, 1.0 if accB else 0.0) }
     if dw.Rows > 0 {
         Im2col(x, s, cols, threads)
-        kernels.Gemm(dw, g, true, cols, false, 1, 1.0 if accW else 0.0, threads, work)
+        ws.Gemm(dw, g, true, cols, false, 1, 1.0 if accW else 0.0, threads)
     }
     if dx.Rows > 0 {
-        kernels.Gemm(cols, g, false, w, false, 1, 0, threads, work)
+        ws.Gemm(cols, g, false, w, false, 1, 0, threads)
         Col2im(cols, s, dx, accX, threads)
     }
-}
-
-# the packing workspace the products of a convolution over up to n images need (kernels.GemmSpace of each)
-fn GemmSpace(s Shape&, n I64, threads I64, like <T>) I64 {
-    m I64 = n * s.Positions()
-    a := kernels.GemmSpace(m, s.OutC, s.Patch(), threads, like)          # forward
-    b := kernels.GemmSpace(s.OutC, s.Patch(), m, threads, like)          # dw
-    c := kernels.GemmSpace(m, s.Patch(), s.OutC, threads, like)          # dcols
-    most I64 = a
-    if b > most { most = b }
-    if c > most { most = c }
-    return most
 }
 
 # ---- max pooling ----
@@ -342,8 +329,8 @@ test "a convolution through im2col and one product equals its definition: paddin
         for threads in range 1, 4, 2 {
             y := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
             cols := linalg.Matrix<F64>(n * shape.Positions(), shape.Patch())
-            work := Array<F64>(GemmSpace(shape, n, threads, 0.0))
-            Conv2d(y, x, w, b, shape, cols, threads, work)
+            ws := linalg.GemmWorkspace<F64>()
+            Conv2d(y, x, w, b, shape, cols, threads, ws)
             assert y.MaxAbsDifference(want) < 1e-12
         }
     }

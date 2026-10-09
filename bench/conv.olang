@@ -8,7 +8,6 @@ import "std/os"
 import "std/rand"
 import "std/time"
 import "../conv"
-import "../kernels"
 
 fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
     if i >= args.Len() { return fallback }
@@ -41,22 +40,22 @@ fn main() ? io.IoError + ParseError {
         dw := linalg.Matrix<F32>(s.OutC, s.Patch())
         db := linalg.Matrix<F32>(1, s.OutC)
         cols := linalg.Matrix<F32>(m, s.Patch())
-        work := Array<F32>(conv.GemmSpace(s, B, threads, F32(0)))
+        ws := linalg.GemmWorkspace<F32>()
         out := y.Reshape(m, s.OutC)
         times := Array<I64>(7)
         for rep in range reps {
             t0 := time.Now()
             conv.Im2col(x, s, cols, threads)
             t1 := time.Now()
-            kernels.Gemm(out, cols, false, w, true, 1, 0, threads, work)
+            ws.Gemm(out, cols, false, w, true, 1, 0, threads)
             t2 := time.Now()
             out.AddRow(b)
             t3 := time.Now()
             out.ColumnSums(db, 0)
             t4 := time.Now()
-            kernels.Gemm(dw, out, true, cols, false, 1, 0, threads, work)
+            ws.Gemm(dw, out, true, cols, false, 1, 0, threads)
             t5 := time.Now()
-            kernels.Gemm(cols, out, false, w, false, 1, 0, threads, work)
+            ws.Gemm(cols, out, false, w, false, 1, 0, threads)
             t6 := time.Now()
             conv.Col2im(cols, s, dx, false, threads)
             t7 := time.Now()
