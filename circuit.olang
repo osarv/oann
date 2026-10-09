@@ -1879,6 +1879,111 @@ test "the drive's gradient: -(s+ - s-) / (2 beta) on a free neuron, and through 
     }
 }
 
+# the free equilibrium's policy pi = softmax(s_out / T) in row 0, into pi (the readout is region 2)
+fn policy(c mut Circuit<F64>&, pi mut Array<F64>&, temperature F64) {
+    c.Nudge(Phase.Free, 0)
+    try c.Settle(Phase.Free, 20000, 1e-14) catch { fail }
+    a := c.Activity(Phase.Free, Region(2))
+    top F64 = a.Get(0, 0)
+    for j in range 1, pi.Len() { top = math.Max(top, a.Get(0, j)) }
+    sum F64 = 0.0
+    for j in range pi.Len() {
+        pi[j] = math.Exp((a.Get(0, j) - top) / temperature)
+        sum += pi[j]
+    }
+    for j in range pi.Len() { pi[j] = pi[j] / sum }
+}
+
+# every action's contrast: the gradient estimate of a lesson nudging toward action a, for each a, into scores (K rows of
+# the parameters)
+fn actionScores(c mut Circuit<F64>&, scores mut Array<F64>&, actions I64, beta F64) {
+    for a in range actions {
+        c.LabelData(Region(2))[0] = I32(a)
+        try c.Teach(1, Lesson(beta, 1e-13, 20000)) catch { fail }
+        g := c.Grads()
+        for i in range c.ParamCount { scores[a * c.ParamCount + i] = -g.Data[i] }    # the contrast: -G
+    }
+}
+
+test "the policy score: an action's contrast is T grad log pi(a), and their mean under pi vanishes" {
+    c := Circuit<F64>(1)
+    r := rand.Rand(16)
+    gradientCircuit(c, r, false)
+    k I64 = 3
+    temperature F64 = 0.25
+    scores := Array<F64>(k * c.ParamCount)
+    actionScores(c, scores, k, 0.001)
+    pi := Array<F64>(k)
+    policy(c, pi, temperature)
+    # their mean under pi vanishes: sum_a pi(a) T grad log pi(a) = T grad sum_a pi(a) = 0
+    top F64 = 0.0
+    mean F64 = 0.0
+    for i in range c.ParamCount {
+        m F64 = 0.0
+        for a in range k {
+            m += pi[a] * scores[a * c.ParamCount + i]
+            top = math.Max(top, math.Abs(scores[a * c.ParamCount + i]))
+        }
+        mean = math.Max(mean, math.Abs(m))
+    }
+    # the first action's against central differences of T log pi(0)
+    worst F64 = 0.0
+    p := c.Params()
+    h F64 = 1e-5
+    for i in range c.ParamCount {
+        old := p.Data[i]
+        p.Data[i] = old + h
+        policy(c, pi, temperature)
+        up F64 = temperature * math.Log(pi[0])
+        p.Data[i] = old - h
+        policy(c, pi, temperature)
+        down F64 = temperature * math.Log(pi[0])
+        p.Data[i] = old
+        worst = math.Max(worst, math.Abs((up - down) / (2.0 * h) - scores[i]))
+    }
+    try io.Print("policy score: mean under pi " $(mean / top) ", against T log pi " $(worst / top) " of the largest\n") catch { }
+    assert mean / top < 1e-5 and worst / top < 1e-5
+}
+
+test "three factors: the expected actor update with an exact baseline is T grad J, J the expected reward" {
+    c := Circuit<F64>(1)
+    r := rand.Rand(17)
+    gradientCircuit(c, r, false)
+    k I64 = 3
+    temperature F64 = 0.25
+    rewards := F64[1.0, -0.5, 0.25]
+    scores := Array<F64>(k * c.ParamCount)
+    actionScores(c, scores, k, 0.001)
+    pi0 := Array<F64>(k)                            # the policy at the parameters as they are
+    policy(c, pi0, temperature)
+    pi := Array<F64>(k)
+    baseline F64 = 0.0                              # V = J, the critic frozen at the exact mean reward
+    for a in range k { baseline += pi0[a] * rewards[a] }
+    p := c.Params()
+    h F64 = 1e-5
+    worst F64 = 0.0
+    top F64 = 0.0
+    for i in range c.ParamCount {
+        expected F64 = 0.0                          # sum_a pi(a) (r_a - V) contrast_a
+        for a in range k { expected += pi0[a] * (rewards[a] - baseline) * scores[a * c.ParamCount + i] }
+        old := p.Data[i]
+        p.Data[i] = old + h
+        policy(c, pi, temperature)
+        up F64 = 0.0
+        for a in range k { up += pi[a] * rewards[a] }
+        p.Data[i] = old - h
+        policy(c, pi, temperature)
+        down F64 = 0.0
+        for a in range k { down += pi[a] * rewards[a] }
+        p.Data[i] = old
+        numeric F64 = temperature * (up - down) / (2.0 * h)
+        worst = math.Max(worst, math.Abs(expected - numeric))
+        top = math.Max(top, math.Abs(numeric))
+    }
+    try io.Print("three factors: relative error " $(worst / top) " (largest element " $top ")\n") catch { }
+    assert top > 1e-4 and worst / top < 1e-5
+}
+
 test "with asymmetric feedback the contrast is no gradient: the theorem's symmetry is needed" {
     c := Circuit<F64>(2)
     r := rand.Rand(13)
