@@ -673,7 +673,10 @@ fn elementBytes(like <T>) I64 {
     }
 }
 
-# each row of the scores s (T x T) replaced by its softmax - over positions 0 ... i in row i when causal, zeros after
+# each row of the scores s (T x T) replaced by its softmax - over positions 0 ... i in row i when causal, zeros after.
+# The exponentials are std/linalg's FastExp (within 3e-7 relative in F32, 6e-16 in F64), a pass of their own that
+# vectorizes, and their sum a second pass in eight lanes: math.Exp, a library call per element, was half of attention's
+# forward, and a running sum beside the exponential kept the loop scalar whichever it called (DESIGN section 20)
 fn softmaxCausal(s linalg.Matrix<<T>>&, causal Bool, z <A>) {
     like T
     for i in range s.Rows {
@@ -683,13 +686,8 @@ fn softmaxCausal(s linalg.Matrix<<T>>&, causal Bool, z <A>) {
         for j in range 1, last {
             if up(row[j], z) > top { top = up(row[j], z) }
         }
-        total A = z
-        for j in range last {
-            e A = math.Exp(up(row[j], z) - top)
-            row[j] = down(e, like)
-            total = total + e
-        }
-        inv A = 1.0 / total
+        for j in range last { row[j] = down(linalg.FastExp(up(row[j], z) - top), like) }
+        inv A = 1.0 / kernels.SumIn(row, 0, last, z)
         for j in range last { row[j] = down(up(row[j], z) * inv, like) }
         for j in range last, s.Cols { row[j] = like }
     }

@@ -649,12 +649,10 @@ causal `Gemm`** (`GemmBatch` over `Batch<T>` - `Heads`, `Stacked`, `Triangular.R
 attention product), **an implicit GEMM for convolutions** (`GemmPatches`: the forward packs its patches straight from
 the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted - section 19). What it still needs:
 
-1. **A vectorized exponential for the softmax.** Attention's softmax (and `RowSoftmax`) calls `math.Exp` per element,
-   a library call that never vectorizes, and with the products batched it is about half of attention's forward: at
-   context 64 (16 sequences, 4 heads), the scores' product 0.35-0.6 ms, the softmax 1.0-2.0, `P V` 0.33-0.6. An
-   exponential of library accuracy that vectorizes - or a row softmax taking a length per row (a causal row's
-   positions) built on one - would halve the forward. `FastExp` (relative error 3e-7) was no faster in oann's loop,
-   its running sum keeping the loop scalar (section 18).
+1. ~~A vectorized exponential for the softmax~~ - std/linalg's `FastExp` is accurate enough for every check that
+   stands for it, and with its sum a pass of its own it vectorizes: attention's forward 1.3-1.9x faster (section 20).
+   (`math.Exp`, a library call per element, had been about half of attention's forward once the products were
+   batched; `FastExp` beside a running sum had been no faster, section 18.)
 2. **`ActivationSlope`, and the matrix `ActivationBackward` on it, for F32 and narrower types**: they do not compile
    (repro/condliteral - a compiler issue: the slope is a match whose ReLU value is a conditional of literals, taken for
    an F64 beside the F32 ones), so only F64 can use them; oann's own backward kernels serve meanwhile.
@@ -1421,3 +1419,31 @@ now costs what an F32 one does - its products a little less, its element-wise pa
 ms against 1.04), its normalizations a little more - with half the arena. An MNIST epoch in BF16 is 1.1x F32's
 (`bench/train`: fill 0.057 against 0.044 s, the optimizer 0.055 against 0.042, forward and backward 5-10% more), its
 products too small for the halved bytes to tell.
+
+### The softmax's exponential
+
+Section 19 left attention's forward mostly its softmax - `math.Exp`, a library call per element, beside a running sum
+- and section 13 asked std/linalg for an exponential that vectorizes. It has one: `FastExp`, olang arithmetic within
+3e-7 relative in F32 and 6e-16 in F64 (about 2.5 ulp; std/linalg's own measurement over two million points). Section
+18 had found it no faster in this loop, the running sum keeping the loop scalar; so `ops.softmaxCausal` now writes the
+exponentials in a pass of their own and sums them in a second, in eight lanes (`kernels.SumIn`). The row softmax of
+other graph nodes and the losses' log-sum-exp keep `math.Exp`: they are a few columns wide (classes, not positions).
+
+**Accurate enough, by the checks that stand for it**: the gradient checks against central differences in F64 (every
+attention test of `nn.olang`, causal and not, up to sequences of 130) pass as before; `make lmref ARGS=40` gives the
+same numbers as before to the digits printed - the losses within 1e-6 of numpy's over the 40 steps, the gradient norms
+within 2e-6; `bench/attention` finds the outputs and gradients within 7.2e-7 of its reference, which keeps `math.Exp`.
+
+**Faster** (interleaved medians, load 2.2-4.3; `bench/attention`, one thread, ms, 6 runs; `bench/lm`, ms a step, 4-6
+runs):
+
+| | `math.Exp` | `FastExp` |
+|---|---|---|
+| attention's forward, T 64, 16 sequences, causal / not | 1.98 / 3.18 | 1.49 / 1.86 |
+| attention's forward, T 256, 4 sequences, causal / not | 6.57 / 10.87 | 3.95 / 5.74 |
+| the transformer's attention forward, context 64, F32 / BF16 | 9.15 / 10.9 | 7.00 / 9.3 |
+| the same at context 256 (4 sequences), F32 | 26.1 | 16.8 |
+| a step, context 64, F32 / BF16; context 256, F32 | 129 / 123; 155 | 127 / 115; 149 |
+
+So decision 5 of section 19 is reversed: the softmax takes std/linalg's exponential, and section 13's first item is
+done.
