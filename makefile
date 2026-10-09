@@ -6,7 +6,7 @@ OLANG ?= /home/user/wt/oannc2/build/out
 # every module with test blocks
 TESTS = ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang datasets/mnist.olang
 
-.PHONY: test data bench epoch mnist clean c-test c-mnist
+.PHONY: test data bench epoch mnist clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -28,26 +28,3 @@ epoch:
 
 clean:
 	rm -rf build
-
-# the C version this replaces, kept until the olang one trains MNIST as well (it does not compile as it stands)
-CC = gcc
-CFLAGS = -Wall -Werror -Wextra -Wpedantic -g -DOP_MODE_BLAS
-LBINS = -lm -lopenblas -lcurl -lz
-SRCS = $(filter-out test.c mnistdemo.c, $(wildcard *.c))
-
-bin/%.o: %.c bin
-	$(CC) $(CFLAGS) -c $< -o $@
-
-bin/test%.o: %.c bin
-	$(CC) $(CFLAGS) -DTEST -c $< -o $@
-
-c-test: bin $(addprefix bin/test, $(addsuffix .o, $(basename $(SRCS))))
-	$(CC) $(CFLAGS) $(filter-out bin, $^) -o bin/out $(LBINS)
-	bin/out
-
-c-mnist: bin bin/mnistdemo.o $(addprefix bin/, $(addsuffix .o, $(basename $(SRCS))))
-	$(CC) $(CFLAGS) $(filter-out bin, $^) -o bin/out $(LBINS)
-	bin/out
-
-bin:
-	mkdir -p bin

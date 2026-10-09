@@ -1,358 +1,377 @@
 # oann - design
 
-oann is a neural-network library written in olang: layers, automatic differentiation, losses, optimizers, datasets and
-the training loop, on top of the standard library's 2-D `Matrix<T>` (std/linalg or std/matrix). The C version this
-replaces (dense layers, ReLU, softmax cross-entropy, AdamW, MNIST over OpenBLAS) is a rough reference for scope only:
-it does not compile as it stands, and its API is not carried over.
+oann is a neural-network library written in olang: a recorded graph with automatic differentiation, layers, losses,
+optimizers, datasets and the training loop, on top of the standard library's 2-D `Matrix<T>` (std/linalg) and its
+seeded generator (std/rand). The C version it replaces is gone; `bench/ref/mlp.c` is the one C file left, a reference
+trainer over OpenBLAS written for the benchmark.
 
 The yardstick is olang's own (PRINCIPLES.md in the olang repository): no manual memory management, C-like performance
 with no cost the code does not show, natural language, minimal syntax. Concretely for oann: **a training step
-allocates nothing**, every hot loop is a GEMM or one fused pass over memory, and the user writes a model the way
-PyTorch or Flax users would expect to.
+allocates nothing of its own**, every hot loop is a GEMM or one pass over memory, and a model is written the way a
+PyTorch or Flax user would expect.
+
+**State (phase 2):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
+the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epochs. **Next: transformers** (section
+11), then settling networks (docs/settling.md).
 
 ## 1. The operand: Matrix
 
-Every value oann computes with is a `Matrix<T>`: **rows are samples (the batch), columns are features**. There is no
-N-d tensor - data is interpreted in one place only, by the operation that consumes it.
+Every value oann computes with is a `linalg.Matrix<T>`: **rows are samples (the batch), columns are features**. There
+is no N-d tensor - data is interpreted in one place only, by the operation that consumes it.
 
-- **A sample is a row.** An MLP layer maps `[B, in]` to `[B, out]`; a loss reads one row per sample.
-- **Weights are `[out, in]`** (PyTorch's layout, so checkpoints map one to one onto PyTorch's and Hugging Face's):
-  a dense layer is `y = x W^T + b`, its backward `dx = dy W`, `dW = dy^T x`, `db` = the column sums of `dy`. All three
-  are one GEMM with transposes as parameters (BLAS style: `NT`, `NN`, `TN`) - nothing is ever transposed in memory.
-- **A bias is a `1 x C` matrix**, added to every row by an explicit row-broadcast operation; there is no implicit
-  broadcasting.
-- **Views are by row stride.** A range of rows (`m.Rows(0, n)`) and a block of columns (a stride larger than the
-  width) are views of the same storage, made without allocating.
-- **Structure beyond two dimensions lives in the operation's parameters.** A convolution is told its input's
-  `C, H, W` and reads each row as one image; it lowers to im2col into a planned workspace matrix and one GEMM. Attention
-  works on `[B*T, D]` matrices: each head is a column block (a strided view), and the per-head products are GEMMs on
-  those views. Neither needs a tensor type.
+- **A sample is a row.** A dense layer maps `[B, in]` to `[B, out]`; a loss reads one row per sample.
+- **Weights are `[out, in]`** (PyTorch's layout, so checkpoints map one to one onto PyTorch's): a dense layer is
+  `y = x W^T + b`, its backward `dx = dy W`, `dW = dy^T x`, `db` = the column sums of `dy` - each one `linalg.Gemm`
+  with transposes as parameters. Nothing is ever transposed in memory.
+- **A bias is a `1 x C` matrix**, added to every row by an explicit row operation; there is no implicit broadcasting.
+- **Views are by row stride.** A matrix is shape, stride and a reference to storage; `linalg.View(data, offset, rows,
+  cols)` makes one over the graph's arena without allocating, and a short batch is the view of its first rows.
+- **Structure beyond two dimensions lives in the operation.** A convolution reads each row as one `C x H x W` image
+  (im2col into a workspace, one GEMM); attention reads rows as `B x T` tokens and its heads as column blocks
+  (section 11).
 
-oann is generic over the element type `T` from the start (`Graph<T>`, `Dense<T>`): MNIST trains in `F32`, gradient
-checks run in `F64`, and `BF16`/`F16` storage with `F32` accumulation is the mixed-precision path later.
+oann is generic over the element type: MNIST trains in `F32`, the gradient checks run in `F64`, and `BF16` storage with
+`F32` accumulation is the mixed-precision path (std/linalg already accumulates `F16`/`BF16` products in `F32`).
 
-## 2. Automatic differentiation
+## 2. Automatic differentiation: a recorded graph, replayed every step
 
-### Decision: a recorded graph, replayed every step; each primitive has a hand-written backward
+The model is run **once**, against a `nn.Graph<T>`: every operation appends a node (an `Op` and its inputs' handles)
+and gives its handle, a `Var`, back. `g.Plan(r)` then decides which nodes need gradients, lays every value, gradient
+and saved intermediate out in **one arena**, allocates it once and draws the parameters' starting values from `r`. A
+training step is `Forward(n)` (the nodes in recorded order), `Backward(loss)` (in reverse, each op's vector-Jacobian
+product) and the optimizer's `Step(g)`, none of which allocates.
 
-The model is run **once**, at build time, against a `Graph`: every operation appends a node (an op and its input
-handles) and gets a handle back. `Plan()` then infers and checks every shape, decides which nodes need gradients,
-and lays every value, gradient and workspace buffer out in **one arena**, allocated once. A training step is
-`Forward(n)` (the nodes in recorded order) then `Backward(loss)` (in reverse, each op's vector-Jacobian product), then
-the optimizer's step - none of which allocates.
-
-Each primitive op has a hand-written backward (its VJP), as in every autograd system; the graph is what composes them,
-so a new model, a residual connection, parameter sharing or a custom loss needs no new backward code.
+Each primitive has a hand-written backward (in `ops.olang`); the graph composes them, so a residual connection, shared
+parameters or a second loss need no new backward code.
 
 ### The alternatives, and why not
 
-1. **Layer-level hand-written backward** (the C version, Caffe, Darknet): each layer type implements forward and
-   backward over its whole computation and a sequential container calls them. Simple and fast, but every new layer
-   needs its own backward written by hand, anything that is not a chain (a residual, a shared embedding, two losses)
-   needs a special layer, and losses and optimizers are special-cased. It does not compose, and olang's lack of
-   run-time interfaces would make the container an enum of every layer type there is.
-2. **An eager tape** (PyTorch's define-by-run): each op runs immediately and records itself with the tensors its
-   backward needs. Maximally flexible - Python control flow is the model - but every step allocates every activation
-   and tape node anew. olang's arenas would make that cheap (one block scope per step, reclaimed at its end), but not
-   free, and the per-step structure rules out planning: no buffer reuse, no fusion, no thread decisions made once.
-3. **A recorded static graph** (JAX's jit, XLA, TensorFlow graphs, TFLite's arena planner, tinygrad's schedule) - the
-   choice. Shapes are fixed per graph, which is what MLPs, CNNs and transformers training at a fixed batch size have;
-   a shape change (a new batch size, a sequence length) re-records, as a jit retraces.
+1. **Layer-level backward** (the old C version, Caffe, Darknet): every layer writes forward and backward over its whole
+   computation, and a container chains them. It does not compose - a residual, a shared embedding or two losses need
+   special layers - and without run-time interfaces the container would be an enum of every layer type.
+2. **An eager tape** (PyTorch's define-by-run): ops run as they are called and record themselves. olang's arenas
+   would make that cheap (one scope per step), but every step would rebuild every activation, and nothing could be
+   planned once: no buffer layout, no fusion, no thread decisions. Kept possible (section 12): the op set and kernels
+   are shared, so an eager tape can be added beside the graph.
+3. **A recorded static graph** (JAX's jit, XLA, TFLite's arena planner, tinygrad's schedule) - the choice. Shapes are
+   fixed per graph, which is what MLPs, CNNs and transformers trained at a fixed batch and sequence length have; a new
+   shape is a new plan.
 
 ### Why it fits olang
 
-- **Handles, not references.** A node is plain data: `Var` is a declared type over `I64` (nominal, so a handle is
-  never mixed up with a count, and it indexes the node table directly). The graph owns a `List<Node>` of numbers and
-  enums and one arena `Array<T>&`; nothing in the graph holds a reference, so olang's scope checker has nothing to
-  prove and the graph is trivially serializable - the same design as XLA's instruction ids or tinygrad's UOp lists.
-- **The op set is a closed enum, dispatched by `match`.** `Op` has one case per primitive with its inputs as
-  payload (`MatMul(a Var, b Var, transA Bool, transB Bool)`, `AddRow(x Var, bias Var)`, `Relu(x Var)`, ...). olang
-  compiles a `match` to a switch, which the olang benchmarks measured at C's speed - no virtual dispatch anywhere.
-  User-defined ops are one `Custom` case holding forward and backward function values.
-- **Views are values.** `g.Value(v)` and `g.Grad(v)` give a `Matrix<T>` view of the arena by value - no allocation,
-  checked by a prototype that ran two million forward passes in constant memory (1.9MB resident).
-- **No inheritance needed.** Layers are ordinary structs holding parameter handles with an `Apply(g, x) Var` method;
-  composition is ordinary code. Traits are used only as constraints (an optimizer passed to a training loop is a
-  `<O Optimizer>`), so everything is statically dispatched and inlined.
+- **Handles, not references.** `type Var I64` is nominal, so a handle is never mixed up with a count. A `Node` is plain
+  data (`Kind Op`, its shape, its value's, gradient's and saved matrix's offsets); the graph holds a `List<Node>` and
+  one arena `Array<T>&`, nothing in it refers to anything else, so the scope checker has nothing to prove.
+- **The op set is a closed enum dispatched by `match`** (a switch - no indirect calls):
+  `MatMul(a, b, ta, tb)`, `Linear(x, w, b)`, `AddRow(x, b)`, `Add`, `Sub`, `Mul`, `Scale(x, k)`, `Relu`,
+  `LeakyRelu(x, slope)`, `Gelu`, `Sigmoid`, `Tanh`, `Softmax`, `SoftmaxCrossEntropy(logits, classes)`, `Mse`, and the
+  leaves `Input`, `Classes`, `Constant`, `Param(init, decay)`.
+- **Views are values.** `g.Value(v)` and `g.Grad(v)` are `Matrix<T>` views of the arena, made per use for nothing.
+- **Traits only as constraints.** A training loop takes `o mut <O optim.Optimizer<F32>>&`, so the optimizer's step is a
+  direct, inlinable call.
 
 ### Graph semantics
 
 | oann | meaning | PyTorch analogue |
 |---|---|---|
-| `g := nn.Graph<F32>(128)` | a graph planned for batches of up to 128 rows | - |
-| `x := g.Input(784)` | a `[B, 784]` input the caller fills each step | a batch tensor |
-| `y := g.Classes()` | `B` class indices (`I32`) | `targets` |
-| `w := g.Param(out, in, init)` | a trainable `[out, in]` matrix | `nn.Parameter` |
-| `g.MatMul(a, b, transA, transB)`, `g.AddRow(x, b)`, `g.Relu(x)`, ... | record an op, give its handle | ops in `forward` |
-| `g.Plan()` | check shapes, lay out the arena, allocate it - once | `torch.compile` |
+| `g := nn.Graph<F32>(128, threads)` | a graph planned for batches of up to 128 rows; products split over `threads` tasks | - |
+| `x := g.Input(784)` | a `[B, 784]` input the caller fills each step (`g.InputData(x)`) | a batch tensor |
+| `y := g.Classes()` | `B` class indices, `I32` (`g.ClassData(y)`) | `targets` |
+| `t := g.Constant(r, c)` | a matrix the caller sets and nothing trains: a target, a mask | a tensor without grad |
+| `w := g.Param(out, in, init, decay)` | a trainable matrix; `decay`: weight decay applies to it | `nn.Parameter` |
+| `g.Linear(x, w, b)`, `g.Product(a, b, ta, tb)`, `g.Multiply(a, b)`, `g.Relu(h)`, ... | record an op, give its handle | ops in `forward` |
+| `g.Plan(r)` | lay out the arena, allocate it, initialize the parameters - once | `torch.compile` |
 | `g.Forward(n)` | run the batch's first `n` rows | `model(x)` |
 | `g.Backward(loss)` | parameter gradients of `loss`, written fresh | `zero_grad(); loss.backward()` |
-| `g.Backward(loss, accumulate)` | added to the gradients already there | `loss.backward()` without zeroing |
-| `g.Value(v)`, `g.Grad(v)` | views of a node's value and gradient | `.data`, `.grad` |
+| `g.Backward(loss, true)` | added to the gradients already there | `loss.backward()` without zeroing |
+| `g.Value(v)`, `g.Grad(v)`, `g.Scalar(loss)` | views of a node's value and gradient; a loss's number | `.data`, `.grad`, `.item()` |
+| `g.Params()`, `g.ParamGrads()` | every parameter (or gradient) as one flat matrix | `parameters()` flattened |
 
-- **A shorter batch** (the last of an epoch) runs on the first `n` rows of every batch-shaped buffer - views, no
-  reallocation; losses average over `n`.
-- **Gradients**: a node used by several ops gets the first contribution written and the rest added (decided at
-  `Plan` from use counts), so no zero-fill pass is needed; parameters' gradients are written fresh each `Backward`
-  unless accumulation is asked for (gradient accumulation over micro-batches).
-- **What needs a gradient** is decided at `Plan`: a node needs one when it depends on a parameter; inputs and labels
-  never do, so the first layer computes no `dx`.
-- **Training and evaluation**: `g.Training` switches dropout (and later batch-norm statistics); evaluation is
-  `Forward` alone.
+`Product` and `Multiply` are the builders of `MatMul` and `Mul`: olang reserves the operator methods' names (`MatMul`
+is `@`, `Mul` is `*`) for every method of every type, so a graph cannot have methods called that (repro/operatornames).
+
+- **A shorter batch** (an epoch's last) runs on the first `n` rows of every batched node - views, nothing re-planned;
+  losses average over `n`.
+- **Gradients are written, then added to.** A `written` flag per node, reset each `Backward`, makes an op's first
+  contribution to an input's gradient a write (`beta = 0` in a GEMM) and the rest additions (`beta = 1`), so no
+  zero-fill pass runs. A parameter no path from the loss reaches is zero-filled; with `accumulate` set, parameters'
+  gradients are added to instead (micro-batches).
+- **An absent gradient is an empty matrix.** A kernel's backward takes every input's gradient destination and skips
+  one with no rows (`if da.Rows > 0`) - an input, the classes or a constant has none, so the first layer computes no
+  `dx`. (A nullable `Matrix&` would have meant a reference built per call.)
+- **What needs a gradient** is decided at `Plan`: a node depending on a parameter.
 
 ### The arena
 
-One `Array<T>` per graph, in five regions, each laid out at `Plan`:
+One `Array<T>` per graph, laid out at `Plan`:
 
-1. **parameters**, contiguous in registration order - the optimizer's single flat view, and the checkpoint;
-2. **parameter gradients**, the same layout - one flat view for the fused optimizer step and for gradient clipping;
-3. **activations** (every batch-shaped node's value);
-4. **activation gradients**;
-5. **workspace** - what an op keeps for its backward (softmax probabilities, dropout masks, im2col buffers).
+1. **parameters**, contiguous in registration order - the optimizers' one flat array, and a checkpoint;
+2. **parameter gradients**, the same layout - one flat pass for the optimizer step and for gradient clipping;
+3. every other node's **value**, its **gradient** when it needs one, and what its backward keeps (softmax cross-entropy
+   keeps the probabilities).
 
-Class indices (`g.Classes()`) live in an `Array<I32>` beside it. Optimizer state (AdamW's `m` and `v`) is allocated
-by the optimizer, once, in the parameters' layout. Liveness-based
-reuse of regions 4 and 5 (a gradient is dead once its producer's backward has run) halves the memory of deep models;
-it is a planner change only, done when a model needs it.
+Class indices live in an `Array<I32>` beside it; optimizer state (AdamW's `m` and `v`, the projection's workspace) is
+made once, by the optimizer, in the parameters' layout. Liveness-based reuse of the activation region (a gradient is
+dead once its producer's backward has run) is a planner change, made when a model's memory needs it.
 
-## 3. Operations (the closed set, first round)
+## 3. Operations (`ops.olang`)
+
+The kernels are plain functions on `linalg.Matrix<T>&`, forward and backward per primitive, usable without a graph -
+which is what an eager mode would call too.
 
 | op | forward | backward |
 |---|---|---|
-| `MatMul(a, b, ta, tb)` | `op(a) op(b)`, one GEMM | two GEMMs with the transposes swapped |
-| `Linear(x, w, b)` | `x w^T + b`: GEMM, bias in the same pass | `dx = dy w`, `dw = dy^T x`, `db` = column sums |
+| `MatMul(a, b, ta, tb)` | `op(a) op(b)`, one GEMM | one GEMM per input, transposes swapped |
+| `Linear(x, w, b)` | `x w^T`, then the bias row | `dx = dy w`, `dw = dy^T x`, `db` = column sums |
 | `AddRow(x, b)` | every row plus `b` | `dx = dy`, `db` = column sums of `dy` |
-| `Add`, `Sub`, `Mul(a, b)` | elementwise, same shape | elementwise |
-| `Scale(x, c)` | `c x` | `c dy` |
-| `Relu`, `LeakyRelu(a)`, `Gelu` (erf, PyTorch's default; tanh form as an option), `Sigmoid`, `Tanh` | one pass | one pass reading the saved input or output |
-| `Softmax(x)` | row-wise, max-subtracted | `y (dy - rowsum(dy y))` |
-| `SoftmaxCrossEntropy(logits, classes)` | mean over rows of `-log softmax[class]`, log-sum-exp | `(softmax - onehot) / n`, fused, probabilities saved in the workspace |
+| `Add`, `Sub`, `Mul` | element by element, same shape | element by element |
+| `Scale(x, k)` | `k x` | `k dy` |
+| `Relu`, `LeakyRelu`, `Gelu` (erf, PyTorch's default), `Sigmoid`, `Tanh` | one `Map` pass (`FastSigmoid`/`FastTanh`) | one pass on the saved input or output |
+| `Softmax` | row-wise, max subtracted | `y (dy - rowsum(dy y))` |
+| `SoftmaxCrossEntropy(logits, classes)` | mean over rows of `log-sum-exp - z[class]`; probabilities saved | `(p - onehot) / n`, fused |
 | `Mse(a, b)` | mean of squared differences | `2 (a - b) / count` |
-| `Dropout(x, p)` (later) | mask from the graph's `Rand`, scaled by `1 / (1 - p)` | `dy` through the mask |
-| `Conv2d(x, w, b, C, H, W, k, stride, pad)` (later) | im2col into the workspace, one GEMM | GEMMs and col2im |
-| `LayerNorm`, `Embedding`, attention pieces (later) | | |
 
-Fusion is the planner's job, not the layers': `Linear` then `Relu` becomes one GEMM plus one epilogue pass
-(bias and activation), its backward one pass (`dpre = dy * relu'(y)`) before the GEMMs. Layers stay compositional;
-speed comes from `Plan`.
+Every backward is checked against central differences in `F64` (`nn.olang`'s tests: each op through a small graph,
+step 1e-6, agreement to 1e-6; a deliberately broken backward fails them). Fusion is the planner's job, later: `Linear`
+then an activation as one GEMM with an epilogue, needing a `Gemm` with an epilogue in std/linalg (section 13).
 
-## 4. Layers
+## 4. Layers (`layers.olang`)
 
-A layer is a struct holding its parameters' handles; constructing it registers them with the graph, and `Apply`
-records the ops. Shapes are given once, at construction:
+A layer is **plain data** - the handles of its parameters - made by a function that registers them on a graph, with
+an `Apply` that records its ops:
 
 ```olang
-type Dense<T> struct(g mut Graph<<T>>&, in I64, out I64, r mut Rand&) {
-    W Var = g.Param(out, in, Init.KaimingUniform, r)      # PyTorch nn.Linear's defaults
-    B Var = g.Param(1, out, Init.FanInUniform(in), r)
+type Dense struct(W nn.Var, B nn.Var, In I64, Out I64) { W  B  In  Out }
+
+fn NewDense(g mut nn.Graph<<T>>&, inputs I64, outputs I64) Dense {
+    w := g.Param(outputs, inputs, fanIn(inputs), true)      # weight decay on W, not on B
+    b := g.Param(1, outputs, fanIn(inputs), false)
+    return Dense(w, b, inputs, outputs)
 }
 
-fn (d Dense<<T>>&) Apply(g mut Graph<<T>>&, x Var) Var { return g.Linear(x, d.W, d.B) }
-
-type Mlp<T> struct(g mut Graph<<T>>&, r mut Rand&) {
-    l1 Dense<<T>> = Dense<<T>>(g, 784, 128, r)
-    l2 Dense<<T>> = Dense<<T>>(g, 128, 10, r)
-}
-
-fn (m Mlp<<T>>&) Apply(g mut Graph<<T>>&, x Var) Var { return m.l2.Apply(g, g.Relu(m.l1.Apply(g, x))) }
+fn (d Dense&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var { return g.Linear(x, d.W, d.B) }
 ```
 
-Applying a layer twice shares its parameters (their gradients add up), as in PyTorch. For the common chain there is
-`Sequential`, an enum of the built-in layer kinds (`Dense`, `Relu`, `Gelu`, `Dropout`, ...) - a closed set, because
-olang has no run-time interfaces yet; `any Layer&`, planned in olang, opens it later.
+`NewMlp(g, I64[784, 128, 10], Activation.Relu)` holds a `List<Dense>` and applies them with the activation between.
+Applying a layer twice shares its parameters. Starting values follow PyTorch's `nn.Linear`: weights and biases uniform
+in `+-1/sqrt(in)`, drawn from the `rand.Rand` given to `Plan`, so a run is reproducible from its seed.
 
-**Initialization** follows PyTorch's defaults so results are comparable: `nn.Linear`'s Kaiming-uniform weights
-(`U(-1/sqrt(in), 1/sqrt(in))`) and fan-in-uniform biases, with He-normal and Xavier/Glorot as options, all drawn from
-a seeded `Rand` passed in - so a run is reproducible from its seed.
+Why a factory function and not a constructor taking the graph: olang's zero values (D13c) are a constructor run on
+zeros, and a constructor reading through a reference parameter has none, so such a struct can never be a `List`
+element (repro/listzero). A plain-data layer has no such problem, and is serializable for free.
 
-## 5. Losses and optimizers
+## 5. Losses and optimizers (`optim.olang`)
 
-Losses are graph ops giving a `1 x 1` node: `SoftmaxCrossEntropy` (class indices, mean reduction - PyTorch's
-`CrossEntropyLoss`), `Mse`; `g.Value(loss)` reads the number.
+Losses are graph ops giving a `1 x 1` node: `SoftmaxCrossEntropy` (class indices, mean - PyTorch's
+`CrossEntropyLoss`) and `Mse`; `g.Scalar(loss)` reads the number.
 
-Optimizers update the parameter region **as one flat array** in one fused pass - PyTorch's fused/"foreach"
-optimizers, Apex's multi-tensor apply - with weight decay applied to the matrices that ask for it (by default the
-weights, not the biases):
-
-- `Sgd(lr, momentum = 0, nesterov = false, weightDecay = 0)`;
-- `AdamW(lr = 1e-3, beta1 = 0.9, beta2 = 0.999, eps = 1e-8, weightDecay = 0.01)` with PyTorch's semantics: decoupled
-  decay `p -= lr wd p`, then bias-corrected `m / (1 - b1^t)` and `v / (1 - b2^t)`, `p -= lr mhat / (sqrt(vhat) + eps)`.
-  (The C version had no bias correction and divided by `v` rather than its square root.)
-
-Each is a struct with `Step(g mut Graph<<T>>&)`; a training loop takes `opt mut <O Optimizer>&` (trait as constraint,
-statically dispatched). A learning-rate schedule is a function value `fn(step I64) F64`. Gradient clipping by global
-norm reads the gradient region's flat view.
-
-## 6. Training and evaluation
+Optimizers update the parameter region **as one flat array in one fused pass** (PyTorch's fused optimizers), with
+their state laid out the same way and made once. How weights are kept from growing is a `Regularizer`, so both
+optimizers run with either:
 
 ```olang
-fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError {
-    data := try mnist.Load("data/mnist", mnist.Source)
-    r := rand.Rand(1)
-    g := nn.Graph<F32>(128)
-    x := g.Input(784)
-    y := g.Classes()
-    model := layers.Mlp<F32>(g, r)
-    logits := model.Apply(g, x)
-    loss := g.SoftmaxCrossEntropy(logits, y)
-    g.Plan()
-    opt := optim.AdamW<F32>(g, 1e-3)
-    train := loader.Loader(data.Train, 128, 42)
-    for epoch in range 10 {
-        train.Epoch()
-        for b in range train.Batches() {
-            n := train.Fill(b, g.InputData(x), g.ClassData(y))
-            g.Forward(n)
-            g.Backward(loss)
-            opt.Step(g)
-        }
-        try io.Print("epoch " $epoch ": test accuracy " $nn.Accuracy(g, logits, y, data.Test) "\n")
-    }
+type Regularizer enum {
+    WeightDecay(rate F64)                  # decoupled: p -= lr * rate * p, on the parameters registered with decay
+    Projection(alpha F64, normalized Bool) # the delta rule's input projection, in place of weight decay
 }
 ```
 
-`nn.Accuracy` runs `Forward` over a set in batches and compares each row's argmax with its class. A `Fit` helper
-wraps the loop above for the common case (epochs, a schedule, a callback per epoch); the loop stays writable by hand.
+- **`AdamW<T>(g, rate = 0.001, Beta1 = 0.9, Beta2 = 0.999, Eps = 1e-8, Reg = WeightDecay(0.01))`**, PyTorch's
+  semantics: `m <- b1 m + (1 - b1) g`, `v <- b2 v + (1 - b2) g^2`, decoupled decay, then
+  `p -= lr (m / (1 - b1^t)) / (sqrt(v / (1 - b2^t)) + eps)` - one loop, `p = keep p - step m / (sqrt(v) root + eps)`
+  with the bias corrections folded into two scalars. `Rate` may change between steps (a schedule).
+- **`AdamWProjected(g, rate = 0.001, alpha = 1e-5, normalized = false)`** - AdamW with `Projection` in place of weight
+  decay (Behrouz et al., "Nested Learning: The Illusion of Deep Learning Architectures"): for every dense layer
+  `y = x W^T + b`, `W <- W (I - alpha x x^T) - lr * (Adam update)`, `x` the layer's **input**. For a batch of `n`
+  rows that is `W <- W - (alpha / n) (W X^T) X`, and `W X^T` is the transpose of `M = Y - b`, the layer's output less
+  its bias, which the forward pass already computed: so the projection is a pass over `Y - b` and **one** GEMM per
+  dense layer (`Gemm(W, M, transA = true, X, false, -alpha / n, beta = 1)`), run before the Adam step changes `W`. It
+  replaces weight decay. `normalized` divides each row's term by `|x|^2`. Both settings are parameters because neither
+  is settled (section 14).
+- **`Sgd<T>(g, rate = 0.01, Momentum = 0, Nesterov = false, Reg = WeightDecay(0))`**, PyTorch's semantics (decay added
+  to the gradient, momentum buffer, Nesterov's look-ahead).
 
-## 7. Datasets (built)
+The tests check AdamW's first steps against a hand computation, SGD's momentum, and the projection's formula against
+its definition, on a small `F64` graph.
 
-- `datasets/idx` reads the IDX format (big-endian header, unsigned bytes): parsing copies nothing - the elements are
-  a view of the file's bytes.
-- `datasets/loader`: `Labeled` holds a set as bytes (`Features`, `Labels`, `Width`, `Classes`) with a per-feature
-  `Scale` and `Shift` (default `1/255` and `0`, giving `[0, 1]`; a mean and deviation give standardization). `Loader`
-  makes a seeded random order each epoch (Fisher-Yates over an index array, xoshiro256**) and `Fill(b, x, y)` writes
-  batch `b`'s features as F32 rows and its classes into the caller's buffers, giving the batch's size (the last one is
-  short). Nothing is allocated per batch.
-- `datasets/mnist` fetches the four files with curl and gunzip into a cache directory (`data/mnist`, each step
-  written to a `.part` file and renamed when whole), validates shapes and labels, and loads both sets. Any dataset of
-  the MNIST family (Fashion-MNIST, KMNIST) is the same call with another address.
-- **The images stay bytes in memory** - 47MB for the training set, a quarter of F32's 188MB - and become F32 as a
-  batch is filled. Measured on the shared 4-core machine: the four files load at 530-830MB/s (C's `read` of the same
-  files: 950MB/s), and filling an epoch of shuffled batches of 128 runs at ~4GB/s of F32 produced (1.27M samples/s).
-  The data pipeline will be a rounding error beside the GEMMs.
+## 6. Training and evaluation (`train.olang`, `examples/mnist_mlp.olang`)
 
-Next: a `Dataset` trait (a constraint, as everything polymorphic in oann is) so `Loader<D>` takes other sources (CSV,
-images, token streams); augmentation as function values; and filling the next batch on a task while the step runs -
-`join { spawn train.Fill(b + 1, xNext, yNext) ... }` with double-buffered inputs.
+```olang
+data := try mnist.Load("data/mnist", mnist.Source)
+g := nn.Graph<F32>(128, threads)
+x := g.Input(784)
+y := g.Classes()
+net := layers.NewMlp(g, I64[784, 128, 10])
+logits := net.Apply(g, x)
+loss := g.SoftmaxCrossEntropy(logits, y)
+r := rand.Rand(seed)
+g.Plan(r)
+c := train.Classifier(x, y, logits, loss)
+o optim.AdamW<F32>&g = optim.AdamW<F32>(g)
+trainSet := loader.Loader(data.Train, 128, seed)
+testSet := loader.Loader(data.Test, 128, seed, false)
+for e in range 1, epochs + 1 {
+    trainLoss := train.Epoch(g, c, trainSet, o)         # Fill, Forward, Backward, Step per batch
+    testLoss, accuracy := train.Evaluate(g, c, testSet) # Forward per batch, ArgMaxRows against the classes
+}
+```
 
-## 8. Performance plan
+`make mnist ARGS="10 adamw 1 1"` runs it: epochs, optimizer (`adamw`, `projected`, `sgd`), seed, threads, and for
+`projected` its alpha and `1` to normalize.
 
-- **GEMM is the only heavy kernel**, and it is the matrix library's: packed, blocked, multithreaded with
-  `join`/`spawn`, writing into a destination with `beta` so gradient fan-in accumulates without temporaries.
-- **Every other op is one pass over memory**, fused where the planner can (bias + activation into the GEMM's epilogue,
-  the activation's derivative into the backward's first pass, the whole optimizer into one loop).
-- **No allocation per step**, and no zeroing passes (first-write gradients).
-- **Threads**: GEMM partitions its output, so results are deterministic for a given thread count; row-wise and flat
-  kernels split by rows above a size threshold, through the matrix library's parallel-rows helper.
-- **Target**: an epoch of the 784-128-10 MLP at the speed of a C trainer over OpenBLAS doing the same work, measured
-  against a small C reference (`bench/ref`) written for the purpose - the old C code cannot serve, since it does not
-  compile - and against PyTorch if it can be installed.
+## 7. Datasets (`datasets/`)
+
+- `datasets/idx` reads the IDX format; its elements are a view of the file's bytes.
+- `datasets/loader`: `Labeled` holds a set as bytes with a per-feature `Scale` and `Shift` (default `1/255` and `0`).
+  `Loader` makes a seeded order each epoch (Fisher-Yates, std/rand's xoshiro256**) and `Fill(b, x, y)` writes batch
+  `b` as F32 rows and classes into the graph's own buffers, giving its size (the last is short). Nothing is allocated
+  per batch.
+- `datasets/mnist` fetches the four files with curl and gunzip into `data/mnist` (each written to a `.part` file and
+  renamed when whole), validates them and loads both sets. Fashion-MNIST and KMNIST are the same call with another
+  address.
+- The images stay bytes (47MB, against 188MB as F32). The four files load at 520-830MB/s and filling shuffled batches
+  produces ~3.5-4GB/s of F32 (~1.2M samples/s) - 3% of an epoch.
+
+Next: a `Dataset` trait (a constraint) so `Loader<D>` takes other sources (text corpora for transformers), and filling
+the next batch on a task while the step runs.
+
+## 8. Results and performance (measured 2026-10-09)
+
+**Accuracy**, 784-128-10, ReLU, batches of 128, 10 epochs, test set:
+
+| optimizer | test accuracy |
+|---|---|
+| AdamW, lr 1e-3, decay 0.01 | 97.73% (seed 1), 97.71% (seed 2), 97.80% (seed 3); above 97% from epoch 5 |
+| SGD, lr 0.05, momentum 0.9 | 97.81% |
+| AdamW + projection, alpha 1e-5 | 97.74%, 97.53%, 97.84% (seeds 1-3) |
+| AdamW + projection, alpha 1e-4 / 1e-3 | 97.17% / 92.52% (too strong) |
+| AdamW + projection, normalized, alpha 1e-3 / 1e-2 | 97.79% / 97.74% |
+
+**The C reference** (`bench/ref/mlp.c`): the same network in C over OpenBLAS - same random numbers (xoshiro256**
+seeded by splitmix64), same initialization order, shuffle, scaling and AdamW - so its losses match oann's to four
+decimals in the first epoch, and the time is the comparison. PyTorch could not be installed: download.pytorch.org is
+refused by the container's network policy (403).
+
+**An epoch** (469 steps), seconds, medians of interleaved rounds (`make epoch`), on the shared 4-core machine at a
+load average of 4-5 (other jobs running, which is also why 4 threads lose):
+
+| | 1 thread | 4 threads |
+|---|---|---|
+| oann (olang, default target) | 2.39 | 2.90 |
+| oann, its IR relinked with `-march=native` | 1.92 | - |
+| C over OpenBLAS | 0.79 | 1.19 |
+
+Where oann's epoch goes (`bench/train.olang`): forward 43%, backward 50% - both nearly all GEMM - filling batches 3%,
+the optimizer 4%. The gap to OpenBLAS is therefore std/linalg's GEMM, and it is the instruction set: olang builds for
+baseline x86-64 (SSE2) and never contracts `a*b + c`, while OpenBLAS runs AVX-512 with FMA; std/linalg's GEMM is level
+with the same algorithm in C at that target. Closing it is a compiler direction (a native target, FMA contraction),
+not an oann one. The projection adds 0.6-1s an epoch (one GEMM per dense layer per step). Results are identical for
+every thread count (GEMM partitions its output).
+
+**Memory - one leak, not oann's.** A step allocates nothing of its own (checked: 200,000 forward passes of a graph
+whose products are not packed grow by nothing). But std/linalg's `Gemm` packs into two scratch arrays made in its own
+scope per call, and the runtime's chunk pool reuses only its head chunk: the B panel's chunk, taken first, ends up
+behind the A panel's and is never reused, so every packed product maps a new one. MNIST training grows ~540KB a step,
+~215MB an epoch (2.2GB over 10 epochs). Reproducer: `repro/chunkpool.olang` (no linalg - two scratch arrays, large
+then small). Fixes, both wanted: first-fit in the runtime's pool, and a `Gemm` taking a planned workspace (section 13).
 
 ## 9. Testing
 
-- Unit tests per module (`make test`), as olang `test` blocks.
-- **Gradient checks**: every op's backward against central finite differences, run in `F64` (the reason the graph is
-  generic over `T`), on small random shapes - the gradcheck PyTorch requires of its ops.
-- The MNIST pipeline is checked against what is known about the dataset (`make data`: counts, first labels, the class
-  histograms, mean 0.1307 and deviation 0.3081 of the pixels); training is checked end to end by a separate target
-  (accuracy above 97% on the test set), since it needs the downloaded data.
+- `make test`: each module's `test` blocks - the kernels against direct computations, every op's backward against
+  central differences in `F64` (a graph per op, a batched network on a short batch with fan-out, accumulation), the
+  layers' registration and initialization, the optimizers against hand computations, and the datasets.
+- `make data`: the MNIST pipeline against what is known about the dataset (counts, first labels, class histograms,
+  pixel mean 0.1307 and deviation 0.3081), timed.
+- `make mnist` trains end to end (needs the downloaded data); `make epoch` times it against C.
 
 ## 10. Serialization (later)
 
-Checkpoints as **safetensors** (8-byte header length, a JSON header naming each matrix's dtype, shape and byte range,
-then the raw little-endian data): interoperable with PyTorch and Hugging Face, simple to write with std's JSON and
-the floats' `Bits()`, and the parameter region is already one contiguous block. Layer parameters carry PyTorch's
-names (`l1.weight`, `l1.bias`).
+Checkpoints as **safetensors** (an 8-byte header length, a JSON header naming each matrix's dtype, shape and byte
+range, then the raw little-endian data): interoperable with PyTorch and Hugging Face, written with std/json and the
+floats' `Bits()`; the parameter region is already one contiguous block. Parameters carry PyTorch's names
+(`l1.weight`, `l1.bias`).
 
-## 11. Shapes as type parameters (when olang has const generics)
+## 11. Next: transformers
 
-olang will get `Matrix<T, R, C>`, each dimension a compile-time constant or known at run time. oann is shaped for it
-now: **a layer's shapes are given once, at construction, and `Apply` takes only handles**, and every builder checks
-shapes when it records. Then:
+The graph is shaped for a decoder-only transformer (GPT-2 style) trained on a token stream, without a tensor type:
 
-- `Dense<T, In, Out>` holds `W Matrix<T, Out, In>`;
-- a handle carries its column count, `Var<C>` (rows are the batch, known at run time);
-- `fn (d Dense<<T>, <In>, <Out>>&) Apply(g mut Graph<<T>>&, x Var<<In>>) Var<<Out>>` - a shape mismatch in a model
-  becomes a compile-time error, and the record-time check becomes a type equality.
+- **Rows are tokens.** A batch of `B` sequences of `T` tokens is a `[B*T, D]` matrix; the graph is planned for
+  `Batch = B*T` rows, and a node knows `T` where it needs it (attention, positions). The loss is the existing
+  `SoftmaxCrossEntropy` over `B*T` rows of vocabulary logits.
+- **New leaves and ops**:
+  - `Tokens()` - like `Classes()`, an `I32` per row;
+  - `Embedding(tokens, table)` - gather rows of a `[V, D]` parameter; backward scatter-adds into the table's gradient;
+  - `Positions(x, table, T)` - add row `t mod T` of a `[T, D]` parameter (learned positions); rotary positions as an
+    option inside attention;
+  - `LayerNorm(x, gain, bias)` and `RmsNorm(x, gain)` - row-wise, saving the row's mean and inverse deviation;
+  - `Attention(q, k, v, heads, T, causal)` - **one fused op**: per sequence and head, `softmax(q_h k_h^T / sqrt(d) +
+    mask) v_h`, heads being column blocks of `[B*T, D]` views (strided, no copies), each product a GEMM on those views;
+    the probabilities saved for the backward (`T x T` per head and sequence - the memory to watch), a tiled
+    (flash-style) form later for long sequences;
+  - `Dropout(x, p)` - a mask from the graph's own `Rand`, active while `g.Training`;
+  - `Gelu`, `Add` (residuals), `Linear` and `SoftmaxCrossEntropy` exist.
+- **Layers**: `NewAttentionBlock(g, D, heads)` (layer norm, the `q`/`k`/`v` and output projections, the MLP with
+  GELU, two residuals), `NewTransformer(g, V, T, D, heads, layers)`; weight tying of the embedding and the output
+  projection is applying the same parameter twice, which the graph already supports.
+- **Training**: AdamW with a warmup-then-cosine schedule (a function value giving the rate per step), gradient
+  clipping by global norm over `g.ParamGrads()`, and BF16 storage with F32 master weights and accumulation once the
+  F32 version matches a reference.
+- **A new shape is a new plan**: sequences are padded to `T` with the padded tokens' loss masked (a `Constant` mask
+  row), so one plan serves a run; generation, where `T` grows, uses a key-value cache in the graph's workspace.
+- Validation as for MNIST: every new backward against central differences in `F64`, then a small character-level
+  model trained against the same model in a reference.
 
-The graph's executor keeps run-time shapes (it is generic over all models), as JAX's traced programs keep shapes as
-data while its Python API checks them when tracing.
+## 12. Shapes as type parameters (when olang has const generics)
 
-## 12. Layout
+olang is getting `Matrix<T, R, C>`, each dimension a constant or known at run time. oann is ready for it: a layer's
+shapes are given once, at construction, and `Apply` takes only handles, so `Dense<T, In, Out>` can hold
+`W Matrix<T, Out, In>` and a handle carry its column count (`Var<C>`), making a shape mismatch in a model a
+compile-time error. The executor keeps run-time shapes, as JAX keeps shapes as data while checking them when tracing.
 
-```
-makefile            OLANG ?= the compiler; make test, make data (fetch + check + time MNIST), make clean
-rand.olang          seeded xoshiro256** (Rand: Next, Below, Float, Uniform, Normal, Shuffle)
-clock.olang         a monotonic clock for timing
-datasets/idx.olang      the IDX format
-datasets/loader.olang   Labeled sets and the Loader
-datasets/mnist.olang    fetching and loading MNIST
-nn.olang            Graph, Var, the ops (forward and backward), losses, Plan          (phase 2)
-layers.olang        Dense, Mlp, Sequential, initializers                              (phase 2)
-optim.olang         Sgd, AdamW, schedules                                             (phase 2)
-examples/           mnist_mlp.olang ...                                               (phase 2)
-bench/              data.olang (the pipeline), ref/ (C over OpenBLAS), train timing   (phase 2: training)
-repro/              minimal programs for olang compiler issues found here
-data/, build/       downloads and build output, not in git
-```
+## 13. What oann needs from std/linalg next
 
-Each file is one olang module, imported by its path relative to the importing file without the extension
-(`import "../datasets/mnist"`). `rand` and `clock` move to std when std grows `std/rand` and `std/time`.
+oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`, `Map`/`Map2`/`Map3`, `AddRow`,
+`ColumnSums(out, beta)`, `RowSoftmax`, `RowNorms`, `ArgMaxRows`, `Fill`, `FillUniform`/`FillNormal`, `Cast`, the
+`Fast*` functions. What it still needs:
 
-## 13. What oann needs from the matrix library
-
-oann does all its arithmetic through `Matrix<T>`; these are the forms it needs, with the signatures it would like.
-Every form with a destination writes into it and allocates nothing; the operator forms (`a @ b`, `a + b`) may
-allocate, for scripting. `T` is any float type, `F64` included (gradient checks), with `F32` accumulation for
-`BF16`/`F16`.
-
-```olang
-# construction and views - a view is a value (rows, cols, stride, a slice of storage): making one allocates nothing
-Matrix<T>(rows I64, cols I64)                                  # zero-filled, built where it lands
-matrix.View(data mut Array<<T>>&, offset I64, rows I64, cols I64, stride I64 = cols) Matrix<<T>>  # over storage
-                                                               # oann owns (its one arena per graph)
-m.Rows(lo I64, hi I64) Matrix<<T>>                             # a row range: the short last batch
-m.Cols(lo I64, hi I64) Matrix<<T>>                             # a column block by stride: attention heads
-m.Row(i I64) Array<<T>>&m                                      # one row as a slice, for row-wise kernels
-m.RowCount() I64, m.ColCount() I64, m.Stride() I64             # (or fields)
-m[r, c], m[r, c] = v                                           # needs At/SetAt with two operands (olang E31 has one)
-
-# BLAS level 3, the one heavy kernel: c = alpha op(a) op(b) + beta c, transposes as parameters, never in memory;
-# beta = 1 accumulates a gradient's second contribution with no temporary. Packed, blocked, threaded.
-matrix.Gemm(c mut Matrix<<T>>&, a Matrix<<T>>&, transA Bool, b Matrix<<T>>&, transB Bool, alpha <T> = 1.0, beta <T> = 0.0)
-# later: the same with an epilogue - c = act(alpha op(a) op(b) + rowBias) - for the fused Linear + activation
-
-# elementwise and row-broadcast, in place or into a destination (same shapes, or a 1 x C row)
-c.AddRow(bias Matrix<<T>>&)                                    # every row += bias
-c.ColumnSums(out mut Matrix<<T>>&, beta <T> = 0.0)             # out (1 x C) = sums over rows + beta out: db
-y.AddScaled(x Matrix<<T>>&, alpha <T>)                         # y += alpha x (axpy)
-m.Scale(alpha <T>), m.Fill(v <T>), m.Copy(src Matrix<<T>>&)
-dst.Map(src Matrix<<T>>&, f fn(x <T>) <T>)                     # activations, a lambda inlined into the loop
-dst.Map2(a Matrix<<T>>&, b Matrix<<T>>&, f fn(x <T>, y <T>) <T>)      # their backward: relu'(x) * dy
-dst.Map3(a, b, c, f fn(x <T>, y <T>, z <T>) <T>)               # fused optimizer updates (p, m, v from g)
-
-# reductions
-m.RowMax(out mut Array<<T>>&), m.RowSums(out mut Array<<T>>&)  # softmax and cross-entropy pieces
-m.ArgMaxRows(out mut Array<I32>&)                              # accuracy
-m.Sum() <T>, m.Dot(b Matrix<<T>>&) <T>, m.Norm() <T>           # loss values, gradient clipping
-
-# random fills, from a generator the caller seeds (reproducible runs): std/rand's Rand, shared with oann
-m.FillUniform(r mut Rand&, lo <T>, hi <T>), m.FillNormal(r mut Rand&, mean <T>, sd <T>)
-
-# threads for the kernels oann writes itself (row-wise softmax/cross-entropy, flat optimizer passes)
-matrix.ParallelRows(rows I64, grain I64, body fn(lo I64, hi I64))   # join/spawn over row blocks, inline when small
-```
+1. **`Gemm` into a caller's workspace**, so a planned graph gives the packing panels a place in its arena and a step
+   allocates nothing at all - and the leak in section 8 cannot happen whatever the runtime does.
+2. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass.
+3. **Batched strided `Gemm`** (one call for every head and sequence of attention) and a row-gather/scatter-add pair for
+   embeddings.
+4. **Two-operand indexing**, `m[r, c]` (olang's `At` takes one operand: repro/at2).
 
 ## 14. Open questions
 
-1. Static graph only, or also an eager mode later (PyTorch-style, every op run as it is called, a step's arena
-   reclaimed at its end) for models whose structure depends on their data? Default: static only; eager when a model
-   needs it.
-2. The seeded generator: one `std/rand` shared by the matrix library's random fills and oann (rather than each
-   having its own)? Recommended: yes - `Rand` here is ready to move.
-3. After the MNIST MLP, which direction first: convolutions (im2col), transformers (attention, layer norm,
-   embeddings, BF16), or spiking networks (the FPGA direction - LIF neurons as time-stepped ops)?
-4. Benchmarks: write a small C trainer over OpenBLAS as the reference (the old C version does not compile), and
-   install PyTorch's CPU wheel with pip (~200MB, not present) to compare against it too?
-5. Should oann be laid out to be imported as a remote package (`github.com/OWNER/oann/nn`) - one module per concern
-   at the top level, as above - or kept as an application repository for now?
+1. The projection's defaults: alpha (1e-5 here - 1e-4 already costs half a point and 1e-3 five), normalized or not
+   (normalized tolerates a 100x larger alpha), whether alpha should scale with the learning rate, and whether it should
+   apply to every dense layer or only some. All are parameters; the defaults stay until a study settles them.
+2. The GEMM gap to OpenBLAS (3x single-threaded) is the target instruction set; a native-target build mode (and FMA
+   contraction) in the compiler would close most of it.
+3. The chunk-pool leak (section 8): first-fit in the runtime, a workspace `Gemm`, or both.
+4. An eager mode beside the graph, for models whose structure depends on their data - not before a model needs one.
+5. oann as an importable package (`github.com/OWNER/oann/nn`) - the layout already is one module per concern.
+
+## 15. Layout
+
+```
+makefile                OLANG ?= the compiler; make test, data, mnist, epoch, clean
+nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward; the gradient checks
+ops.olang               the kernels: forward and backward per primitive, on Matrix
+layers.olang            Dense, Mlp, activations, PyTorch's initialization
+optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjected), Sgd
+train.olang             Classifier, Epoch, Evaluate
+datasets/idx.olang      the IDX format
+datasets/loader.olang   Labeled sets and the Loader
+datasets/mnist.olang    fetching and loading MNIST
+examples/mnist_mlp.olang
+bench/data.olang        the data pipeline, checked and timed
+bench/train.olang       where an epoch's time goes
+bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
+docs/settling.md        settling networks - the model after transformers
+repro/                  minimal programs for olang issues found here
+data/, build/           downloads and build output, not in git
+```
+
+Each file is one olang module, imported by its path relative to the importing file without the extension
+(`import "../datasets/mnist"`). Random numbers are std/rand's, times std/time's.
