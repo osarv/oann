@@ -243,7 +243,7 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
     Observations I64 = observations
     Actions I64 = actions
     Config
-    Seed U64 = seed
+    Seed mut U64 = seed                                 # the seed its life began from (a restore brings the saved one's)
     rng mut rand.Rand = rand.Rand(seed)
     Width I64 = widthOf(hidden)
     phi mut Array<T>& = Array<T>(Width)                # this moment's hidden activities
@@ -557,24 +557,35 @@ fn put(from Array<F64>&, into mut Array<<E>>&) {
     for i in range into.Len() { into[i] = linalg.Cast(from[i], zero) }
 }
 
-# the scalars a checkpoint keeps, in order
+# the scalars a checkpoint keeps, in order - the last ten the seed and the generator's state (std/rand's State: four
+# 64-bit words), each 64-bit word as its two 32-bit halves, which an F64 holds exactly
 fn (a Agent<<T>>&) scalars() Array<F64>& {
+    state := a.rng.State()
     out Array<F64>&return = F64[a.Elig.Pending, a.Judge.B, a.Judge.zb, a.Mem.Pending, a.Mood.Scale, a.Mood.Surprise,
         a.Mood.Recent, a.Mood.LongRun, a.Mood.Spread, a.Mood.Want, a.Mood.Level, F64(a.Mood.Outcomes),
         1.0 if a.Mood.Aroused else 0.0, 1.0 if a.lastAroused else 0.0, F64(a.LastAction), 1.0 if a.started else 0.0,
         F64(a.Opt.Steps), F64(a.Draws), F64(a.Moments), F64(a.Calm), F64(a.Aroused), F64(a.Sweeps), F64(a.Refused),
-        a.LastDelta, a.tolerance, F64(a.budget), F64(a.Seed >> 32), F64(a.Seed & U64(0xFFFFFFFF))]
+        a.LastDelta, a.tolerance, F64(a.budget), high(a.Seed), low(a.Seed), high(state[0]), low(state[0]), high(state[1]),
+        low(state[1]), high(state[2]), low(state[2]), high(state[3]), low(state[3])]
     return out
 }
+
+# a 64-bit word's high and low 32 bits, as numbers an F64 holds exactly; and the word made from them again
+fn high(x U64) F64 { return F64(x >> 32) }
+
+fn low(x U64) F64 { return F64(x & U64(0xFFFFFFFF)) }
+
+fn word(hi F64, lo F64) U64 { return (U64(hi) << 32) | U64(lo) }
 
 # writes everything the agent's next moments depend on to path, in the safetensors layout (all tensors F64, so an F32
 # agent's values round trip exactly): the circuit's parameters and its free and nudged states (the next moment's
 # contrast reads them), Adam's moments, the eligibility trace, the critic and its trace, the context trace, both
 # memories, the last moment's observation and features, and the scalars - arousal's statistics, pending decays,
-# counters, the pending action, and the generator as its seed and the numbers drawn from it
+# counters, the pending action, the seed, and the generator's state (version 2; version 1 kept the numbers drawn and
+# replayed them)
 fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
     g := gathering()
-    g.header.Push("{\"__metadata__\":{\"format\":\"oann.agent\",\"version\":\"1\",\"observations\":\"" $(a.Observations)
+    g.header.Push("{\"__metadata__\":{\"format\":\"oann.agent\",\"version\":\"2\",\"observations\":\"" $(a.Observations)
         "\",\"actions\":\"" $(a.Actions) "\",\"width\":\"" $(a.Width) "\",\"parameters\":\"" $(a.Net.ParamCount) "\"}")
     g.add("\"circuit.params\"", a.Net.ParamData())
     for k in range 4 {
@@ -596,16 +607,19 @@ fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
     try os.WriteFile(path, g.bytes())
 }
 
-# reads a checkpoint Save wrote into this agent, which must be new (made with the same shape, seed and settings, and
-# never begun): afterwards its moments are exactly those the saved agent's would have been
+# reads a checkpoint Save wrote into this agent, which must have the saved one's shape (observations, actions, hidden
+# regions, groups) and settings: afterwards its moments are exactly those the saved agent's would have been - its
+# generator put in the saved state, so whatever seed it was made with and whatever it has lived (a restore into the
+# agent that saved is a roll back)
 fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
-    if a.started or a.Moments > 0 or a.Draws > 0 { error CheckpointError.MISMATCH }
     text := try os.ReadFile(path)
     if text.Len() < 8 { error CheckpointError.FORMAT }
     n I64 = 0
     for k in range 8 { n = n | (I64(U8(text[k])) << (8 * k)) }
     if n < 2 or 8 + n > text.Len() { error CheckpointError.FORMAT }
     doc := try json.Parse(text[8:8 + n]) catch { error CheckpointError.FORMAT }
+    current := try isVersion(doc, "2") catch { error CheckpointError.FORMAT }
+    if not current { error CheckpointError.FORMAT }
     base I64 = 8 + n
     params := Array<F64>(a.Net.ParamCount)
     try fetch(doc, text, base, "circuit.params", params)
@@ -640,7 +654,6 @@ fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
     put(stores, a.Mem.f)
     v := Array<F64>(a.scalars().Len())
     try fetch(doc, text, base, "scalars", v)
-    if U64(v[26]) != (a.Seed >> 32) or U64(v[27]) != (a.Seed & U64(0xFFFFFFFF)) { error CheckpointError.MISMATCH }
     a.Elig.Pending = v[0]
     a.Judge.B = v[1]
     a.Judge.zb = v[2]
@@ -671,8 +684,17 @@ fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
     a.LastDelta = v[23]
     a.tolerance = v[24]
     a.budget = I64(v[25])
-    for i in range I64(v[17]) { a.rng.Float() }
+    a.Seed = word(v[26], v[27])
+    state Array<U64, 4>
+    for k in range 4 { state[k] = word(v[28 + 2 * k], v[29 + 2 * k]) }
+    a.rng.SetState(state)
     a.Draws = I64(v[17])
+}
+
+# whether a checkpoint's header names format version v in its metadata
+fn isVersion(doc json.Json&, v String&) Bool ? json.JsonError {
+    meta := try doc["__metadata__"]
+    return try (try meta["version"]).AsStr() == v
 }
 
 # ---- tests (docs/settling.md 5.3, 5.5) ----
@@ -839,22 +861,38 @@ test "a checkpoint restores a life exactly: the restored agent's moments are the
     try a.Save(path) catch { fail }
     late := Array<I64>(100)
     livedFrom(a, 151, 100, late)
-    b := little(s, 5)
+    # into a new agent made from another seed: the generator's saved state, not its seed, decides what it draws
+    b := little(s, 77)
     try b.Restore(path) catch { fail }
+    assert b.Seed == 5
     again := Array<I64>(100)
     livedFrom(b, 151, 100, again)
     for i in range 100 { assert late[i] == again[i] }
     for i in range a.Net.ParamCount { assert a.Net.ParamData()[i] == b.Net.ParamData()[i] and a.Elig.E[i] == b.Elig.E[i] }
     for i in range a.Mem.c.Len() { assert a.Mem.c[i] == b.Mem.c[i] and a.Mem.f[i] == b.Mem.f[i] }
     assert a.Mood.Level == b.Mood.Level and a.Draws == b.Draws and a.Opt.Steps == b.Opt.Steps and a.Calm == b.Calm
+    sa := a.rng.State()
+    sb := b.rng.State()
+    for k in range 4 { assert sa[k] == sb[k] }
     println("checkpoint: " $(a.Aroused) " aroused, " $(a.Calm) " calm, " $(a.Draws) " draws")
     assert a.Aroused > 1 and a.Calm > 1 and a.Draws > 1             # the stretch held both kinds of moment
-    # a used agent cannot be restored into, and a file that is no checkpoint is refused
+    # into the agent that saved it, 100 moments on: a roll back - it lives the same 100 moments again
+    try a.Restore(path) catch { fail }
+    livedFrom(a, 151, 100, again)
+    for i in range 100 { assert late[i] == again[i] }
+    # an agent of another shape, a version 1 checkpoint and a file that is no checkpoint are refused
+    wide := Agent<F64>(4, 2, I64[6], 5, s)
     refused Bool = false
-    try a.Restore(path) catch CheckpointError.MISMATCH { refused = true } catch { fail }
+    try wide.Restore(path) catch CheckpointError.MISMATCH { refused = true } catch { fail }
+    assert refused
+    text := try os.ReadFile(path) catch { fail }
+    old := text.Replace("\"version\":\"2\"", "\"version\":\"1\"")
+    try os.WriteFile(path, old) catch { fail }
+    c := little(s, 5)
+    refused = false
+    try c.Restore(path) catch CheckpointError.FORMAT { refused = true } catch { fail }
     assert refused
     try os.WriteFile(path, U8[3, 0, 0, 0, 0, 0, 0, 0, 120, 120, 120]) catch { fail }
-    c := little(s, 5)
     refused = false
     try c.Restore(path) catch CheckpointError.FORMAT { refused = true } catch { fail }
     assert refused
