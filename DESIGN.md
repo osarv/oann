@@ -10,7 +10,7 @@ with no cost the code does not show, natural language, minimal syntax. Concretel
 allocates nothing of its own**, every hot loop is a GEMM or one pass over memory, and a model is written the way a
 PyTorch or Flax user would expect.
 
-**State (phase 5):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
+**State (phase 6):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
 the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epochs (phase 2). **Transformers are
 built** (section 11): tokens, embeddings, learned positions, layer and RMS normalization, fused multi-head attention,
 dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
@@ -26,7 +26,12 @@ ahead of the C reference over OpenBLAS (0.93 s, interleaved), and a transformer 
 precision - a `Graph<BF16>` stores everything in BF16 and computes in F32 with F32 master weights, matching F32's
 accuracy on MNIST and the character model with half the arena; on this compiler it runs 3.4-4.1x slower, its narrowing
 to BF16 being a library call per element (repro/bf16narrow). A `Dataset` trait and `Loader<D>` over it, and a graph
-planned `Ahead` filling the next batch on a task while the current one trains.
+planned `Ahead` filling the next batch on a task while the current one trains. **Phase 6** (section 19, olang
+472373d): `mut` only where a reference's target is written (olang's permissions); attention's six products are each
+one std/linalg `GemmBatch` over the heads, causal ones confined to their triangle (attention 1.3x faster at context
+256, its forward now mostly the softmax's exponentials); the convolution's forward packs its patches straight from the
+images (`GemmPatches`: its forward 1.2x faster in the CNN, the same results bit for bit); `GemmAct` measured and not
+adopted.
 
 ## 1. The operand: Matrix
 
@@ -179,20 +184,20 @@ which is what an eager mode would call too. A kernel that computes takes the typ
 | `RmsNorm(x, g)` | per row `x rinv g`; `rinv` saved | `rinv (dy g - xn mean(dy g xn))`, column sums |
 | `Attention(q, k, v, heads, T, causal)` | per sequence and head `softmax(Q K^T / sqrt(dh)) V`, probabilities saved | `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO` |
 | `Dropout(x, p)` | `x mask / (1 - p)`, mask 1 or 0 (exact in any type), kept | `dy mask / (1 - p)` |
-| `Conv2d(x, w, b, shape)` | im2col, then `cols w^T + b` - one GEMM for the batch (`conv.olang`) | `db` = column sums, `dw = dY^T cols` (patches rebuilt), `dcols = dY w`, col2im |
+| `Conv2d(x, w, b, shape)` | `cols w^T + b` - one GEMM for the batch, its patches packed from the images (`conv.olang`) | `db` = column sums, `dw = dY^T cols` (patches made by im2col), `dcols = dY w`, col2im |
 | `MaxPool2d(x, pool)` | each window's maximum per channel; where it was, kept | the gradient added where the maximum was |
 
 Every backward is checked against central differences in `F64` (`nn.olang`'s tests: each op through a small graph,
 step 1e-6, agreement to 1e-6, the relative error floored at 1e-3 so a gradient near zero is compared absolutely - its
 difference's own rounding is about 1e-16 x loss / h; a deliberately broken backward fails them). Fusion is the
-planner's job, later: `Linear` then an activation as one GEMM with an epilogue, needing a `Gemm` with an epilogue in
-std/linalg (section 13).
+planner's job, later: `Linear` then an activation as one GEMM with an epilogue - std/linalg's `GemmAct`, measured in
+section 19 no faster at oann's sizes, so not yet.
 
 **The products go through std/linalg**: `ws.Gemm(...)` on the graph's `GemmWorkspace` (section 2), so they run at
 std/linalg's per-target tiles (AVX-512 with FMA on this machine) and a step allocates nothing. **Attention's products
-are too** - a `Gemm` per sequence and head on the heads' strided views, the whole `T x T` square even when causal
-(section 11). Only decoding with a key-value cache still runs dot products and updates over runs of arrays
-(`kernels.Dot`, `kernels.Axpy`), one new row at a time.
+are too** - one `GemmBatch` per product over every sequence and head of a part, the heads' strided views, causal ones
+confined to their triangle (sections 11 and 19). Only decoding with a key-value cache still runs dot products and
+updates over runs of arrays (`kernels.Dot`, `kernels.Axpy`), one new row at a time.
 
 ## 4. Layers (`layers.olang`)
 
@@ -413,9 +418,10 @@ for here.) The transformer's resident memory grows by 68-76 kB over its first 20
 - `make lmbench`: where a transformer's step goes, by kind of operation (the graph's own profiling).
 - `make mnist` trains end to end (needs the downloaded data); `make epoch` times it against C.
 - Phase 4 (section 16): `tokenizer.olang` (GPT-2's chunks, merge order and ties, round trips, JSON), `checkpoint.olang`
-  (safetensors in every dtype, each error, GPT-2's names), `conv.olang` (the convolution against its definition, col2im
-  as im2col's adjoint, max pooling) and `vision.olang` (convolution and pooling against central differences); `make
-  bpe` and `make safetensors` check the tokenizer and the format against independent Python implementations.
+  (safetensors in every dtype, each error, GPT-2's names), `conv.olang` (the convolution against its definition and,
+  since phase 6, its `GemmPatches` forward against im2col and a product bit for bit, col2im as im2col's adjoint, max
+  pooling) and `vision.olang` (convolution and pooling against central differences); `make bpe` and `make safetensors`
+  check the tokenizer and the format against independent Python implementations.
 
 ## 10. Serialization
 
@@ -443,22 +449,22 @@ A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor t
   `Y = P V`. The probabilities are saved for the backward (`T x T` per sequence and head - the memory to watch at long
   contexts; a tiled, recomputing form is the answer then). The backward: `dS = P (dO V^T - rowsum(dO V^T P)) / sqrt(dh)`,
   then `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO`, written in that order - the order their "written" flags were taken
-  in - so a node attending to itself (`q`, `k` or `v` the same node) adds its three contributions up. Sequences are
-  spread over the graph's threads; each task has its own scratch in the arena and its own `GemmWorkspace`.
-- **Attention's products are std/linalg's `Gemm`**, one per sequence and head and product (section 18): the forward's
-  `S = Q K^T / sqrt(dh)` and `Y = P V`, the backward's `dP = dO V^T`, `dQ`, `dK` and `dV` - six products of `T x T x dh`
-  on the heads' strided views, nothing copied but a transposed block (below). **Causal masking stays exact**: the whole
-  square of scores is computed, then each row's softmax runs over positions `0 ... i` and writes zeros after, and
-  `dS` is zero there too, so a later row enters no product (zero times a finite value adds nothing) - a row's output
-  and its gradients are bit for bit what they are without the later rows (checked). Half of every product is that
-  upper triangle, wasted; a batched, causal-aware `Gemm` in std/linalg (section 13) would skip it, and `attendHead` and
-  `attendHeadBackward` in `ops.olang` are all that would change. A product whose right operand is a head's `T x dh`
-  block takes it transposed into the task's scratch first: std/linalg computes a product of at most 64^3
-  multiply-adds directly when its right operand is not transposed, and at `T` 64 and `dh` 32 that ran 2.0-2.3x slower
-  than the transpose and a packed product together (17-21 us against 8-10, a head's `P V`). Before this the products
-  were dot products and updates over the heads' views (`kernels.Dot`, `kernels.Axpy`), computing only the causal half:
-  faster than a `Gemm` per head on the baseline target, slower on this machine's AVX-512 (`bench/attention.olang`,
-  section 18).
+  in - so a node attending to itself (`q`, `k` or `v` the same node) adds its three contributions up. The products are
+  spread over the graph's threads by std/linalg, the softmax and `dS` passes by `ops.parallel`; `dS` is one scratch
+  region of the arena, the size of the largest attention's `P`, and the products pack into the graph's own
+  `GemmWorkspace` (section 19).
+- **Attention's products are std/linalg's `GemmBatch`**, one call per product (section 19): the forward's
+  `S = Q K^T / sqrt(dh)` and `Y = P V`, the backward's `dP = dO V^T`, `dQ`, `dK` and `dV` - each over every sequence
+  and head of a part at once, `q.Heads(T, heads)` being the heads' strided column blocks (a group per sequence, a
+  member per head) and `probs.Stacked(T, heads)` their `T x T` weights, nothing copied. **Causal masking is exact by
+  construction**: the scores and `dP` are computed on and below the diagonal only (`Triangular.Result`), and `P` and
+  `dS` are read there only as the left operand of the other four (`Triangular.Left`), so no product ever sees a later
+  position, and half of each product is skipped. The softmax still writes `P`'s zeros above the diagonal. A part is
+  as many `T x T` matrices as keep `P` (and `dS`) in 512 KB of cache a task - at context 64 in F32, 32 matrices
+  forward and 16 backward a task (of 64 for 16 sequences in 4 heads), at 256 two and one - so each pass over a part
+  finds them where the last one left them. Before: a `Gemm` per sequence and head (phase 5, section 18), and before
+  that dot products and updates over the heads' views (`bench/attention.olang` keeps the per-head `Gemm`s as its
+  reference).
 - **Layers** (`layers.olang`): `NewTransformer(g, V, T, D, heads, layers, tied = true, dropout = 0, rms = false)` - a
   token embedding plus learned positions (dropout after), `layers` pre-normalized blocks, a final normalization and the
   logits against the embedding itself when tied (weight tying is applying one parameter twice: the head's product and
@@ -611,9 +617,12 @@ region in it); resident memory grows by 68-76 kB over the first 20 steps and by 
   compiler, whose narrowing to BF16 is a library call per element.
 - Dropout of attention's probabilities (nanoGPT's `attn_dropout`): only the residual branches and the embedding are
   dropped out.
-- A tiled attention that recomputes `P` in the backward instead of saving `T x T` per head (memory at long contexts),
-  and a batched causal `Gemm` under it (section 13).
-- Fused QKV and splitting heads with view nodes; a `Gemm` epilogue for bias and GELU (section 13).
+- A tiled attention that recomputes `P` in the backward instead of saving `T x T` per head (memory at long contexts);
+  the batched causal `Gemm` it would run on is std/linalg's `GemmBatch` (section 19).
+- Fused QKV and splitting heads with view nodes. (A `Gemm` epilogue for bias and GELU exists - std/linalg's `GemmAct` -
+  and was measured slower than the separate passes at the blocks' size: section 19.)
+- A vectorized exponential for attention's softmax: `math.Exp` is a library call per element, and with the products
+  batched it is about half of attention's forward (section 19).
 - Rotary positions; generating several sequences at once (a decoding graph of `B` sequences). (The byte-pair
   tokenizer is built: section 16.)
 - Reusing activation storage by liveness: the arena holds every activation and gradient - 87 MB for the model above.
@@ -628,40 +637,30 @@ compile-time error. The executor keeps run-time shapes, as JAX keeps shapes as d
 
 ## 13. What oann needs from std/linalg next
 
-oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `GemmWorkspace` and its `Gemm`, `Gemv`,
-`Map`/`Map2`/`Map3`, `AddRow`, `ColumnSums(out, beta)`, `RowSoftmax`, `RowNorms`, `ArgMaxRows`, `Fill`,
-`FillUniform`/`FillNormal`, `Cast`, the `Fast*` functions. Done since this list was written (olang 9621af3): **a
-`Gemm` into a caller's workspace** (`linalg.GemmWorkspace<T>`, which grows where it lives to the largest product
-given - the graph keeps one, and `kernels.olang`'s copy of the algorithm is gone), **micro-kernels for the machine**
-(per-target tiles, FMA where the target has it, the compiler building for the machine it runs on: an MNIST epoch
-2.39 -> 0.69 s, the transformer's products ~11 -> ~40 GFLOPS) and **two-operand indexing** (`m[r, c]`, E31's
-multi-index - not used by oann, whose element access is `Get`/`Set` and runs of rows). What it still needs:
+oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `GemmWorkspace` and its `Gemm`, `GemmBatch`
+and `GemmPatches`, `Gemv`, `Map`/`Map2`/`Map3`, `AddRow`, `ColumnSums(out, beta)`, `RowSoftmax`, `RowNorms`,
+`ArgMaxRows`, `Fill`, `FillUniform`/`FillNormal`, `Cast`, the `Fast*` functions. Done since this list was first
+written: **a `Gemm` into a caller's workspace** and **micro-kernels for the machine** (olang 9621af3: an MNIST epoch
+2.39 -> 0.69 s, the transformer's products ~11 -> ~40 GFLOPS), and with olang 472373d (section 19) **the batched,
+causal `Gemm`** (`GemmBatch` over `Batch<T>` - `Heads`, `Stacked`, `Triangular.Result` and `Left` - one call per
+attention product), **an implicit GEMM for convolutions** (`GemmPatches`: the forward packs its patches straight from
+the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted - section 19). What it still needs:
 
-1. **Batched strided `Gemm`, causal-aware** - every sequence and head of attention in one call, the products of a
-   lower-triangular block skipped. Attention runs on a `Gemm` per sequence and head now (section 18): 29 of ~150 ms a
-   step at context 64, 73 of ~180 at 256, growing as `T^2` - and half of each product is the upper triangle the
-   softmax then throws away. A batched causal `Gemm` would skip it and make one call where there are six per sequence
-   and head; `ops.attendHead` and `ops.attendHeadBackward` are where it goes in. **It exists now** (std/linalg's
-   `GemmBatch` over `Batch<T>` - `m.Heads(T, heads)` for q, k, v and their gradients, `m.Stacked(T, heads)` for `P`,
-   `Triangular.Result` computing only `j <= i`, `Triangular.Left` reading its left operand as lower-triangular), on an
-   olang newer than the edf8238 this phase was built with. Adopting it (section 18): `Attention` and
-   `AttentionBackward` make the six calls over every sequence and head at once, with std/linalg's threads, and run the
-   softmax and `dS` passes over `P`'s rows between them - those passes already write the zeros above the diagonal that
-   `Result` leaves uncomputed. What goes: the per-sequence tasks, their workspaces and `Plan`'s warm-up, and the
-   transposes; what changes: the scratch becomes one `dS` the size of `P` (`B heads T x T`), in place of a `T x T`
-   and a `dh x T` per task. Also: **std/linalg computes a product
-   of at most 64^3 multiply-adds directly** (no packing) when its right operand is not transposed, and on this
-   machine's AVX-512 that path is 3x slower than the packed one at attention's `64 x 32 x 64` (17-21 us against 6.5);
-   attention transposes its right operands to reach the packed path. The threshold wants lowering on wide targets.
-2. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass:
-   the bias row and GELU are two more passes over the widest activation (B T x 4D) - GELU's forward alone was 12.5 ms
-   of a 512 ms step and its backward 14.9, ~5%; with the products 3.5x faster on the native target, 12 of ~200 ms; and
-   **fused QKV** (one product of width 3D, attention reading q, k and v as column blocks) needs view nodes in oann's
-   graph, not linalg.
-3. **For convolutions** (section 16): a `Gemm` whose A panels are packed straight from the images (an implicit GEMM,
-   or a packing callback) - im2col and the product's packing copy every patch twice, and the patches matrix is the
-   largest convolution's whole im2col; and a path for thin products (a depth of 9 for a one-channel first layer runs
-   at half the rate of the others).
+1. **A vectorized exponential for the softmax.** Attention's softmax (and `RowSoftmax`) calls `math.Exp` per element,
+   a library call that never vectorizes, and with the products batched it is about half of attention's forward: at
+   context 64 (16 sequences, 4 heads), the scores' product 0.35-0.6 ms, the softmax 1.0-2.0, `P V` 0.33-0.6. An
+   exponential of library accuracy that vectorizes - or a row softmax taking a length per row (a causal row's
+   positions) built on one - would halve the forward. `FastExp` (relative error 3e-7) was no faster in oann's loop,
+   its running sum keeping the loop scalar (section 18).
+2. **`ActivationSlope`, and the matrix `ActivationBackward` on it, for F32 and narrower types**: they do not compile
+   (repro/condliteral - a compiler issue: the slope is a match whose ReLU value is a conditional of literals, taken for
+   an F64 beside the F32 ones), so only F64 can use them; oann's own backward kernels serve meanwhile.
+3. **A convolution's weight gradient from the images.** The backward still makes the patches for `dW = dY^T cols`
+   (im2col: 3.7-4.4 ms of each of the CNN's convolutions a step); `GemmPatches` takes the patches as the left operand
+   only, and std/linalg measured a right-operand form slower than im2col and a product. And a path for thin depths:
+   the first convolution's products (a depth of 9) run at 6-7 GFLOPS against 26-50 for the second's.
+4. **BF16 results without a call per element** - a compiler issue (repro/bf16narrow): std/linalg's BF16 products
+   round every result they write through the C library's `__truncsfbf2`.
 
 ## 14. Open questions
 
@@ -689,7 +688,8 @@ train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep,
 generate.olang          sampling; generation running the context again, and with a key-value cache
 tokenizer.olang         byte-level BPE: GPT-2's pre-tokenization, training, encoding, decoding, JSON
 checkpoint.olang        safetensors: Names (PyTorch's for the layers), Save and Load in F64, F32, F16 or BF16
-conv.olang              convolution (im2col, one product, col2im) and max pooling on images held as rows
+conv.olang              convolution (forward: one product of the patches packed from the images; backward: im2col,
+                        two products, col2im) and max pooling on images held as rows
 vision.olang            the convolution layer; the gradient checks of convolution and pooling
 circuit.olang           settling networks: Circuit (regions, projections dense or sparse, readout groups), settles,
                         the certificate, Teach, Eligibility; the neuron models, spiking included
@@ -713,10 +713,11 @@ bench/train.olang       where an epoch's time goes
 bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
 bench/lm.olang          where a transformer's step goes, by kind of operation
 bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
-bench/attention.olang   attention's Gemm per sequence and head against the dot-product loops it replaced
+bench/attention.olang   attention's batched products against a Gemm per sequence and head, causal or not
 bench/abstep.py         two builds of bench/lm.olang run in alternation: the medians of their steps
 bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
-bench/conv.olang        a convolution's passes timed: im2col, the three products, col2im
+bench/conv.olang        a convolution's passes timed: the forward by GemmPatches and as im2col and a product, the
+                        backward's im2col, two products and col2im
 bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against numpy
 bench/sparse.olang      sparse projections against dense ones, kernels and whole circuits
 docs/settling.md        settling networks - the model after transformers
@@ -875,17 +876,19 @@ stored them.
   weights are PyTorch's `Conv2d.weight` flattened, `OutC x (C K K)`, each kernel `[C][K][K]`, so a checkpoint maps
   onto PyTorch's by a reshape (a PyTorch model's flatten before its first dense layer is channels first, though: such
   a layer's columns need permuting).
-- **One product for the whole batch.** im2col writes every output position of every image as a row of the patch it
-  sees - `(n OutH OutW) x (C K K)`, zeros where the kernel hangs over the padding - and `Y = cols W^T + b` is one
-  product (std/linalg's, into the graph's workspace) and a bias row. With channels last, `Y`'s `OutC`-wide rows are the images' output rows one after
+- **One product for the whole batch.** The patch matrix has a row for every output position of every image, holding
+  the patch it sees - `(n OutH OutW) x (C K K)`, zeros where the kernel hangs over the padding - and `Y = cols W^T + b`
+  is one product and a bias row. With channels last, `Y`'s `OutC`-wide rows are the images' output rows one after
   another: the node's value *is* `Y`, reshaped, nothing transposed. Channels first would need a product per image, or
-  a transpose pass - which is why section 1's `C x H x W` plan changed.
+  a transpose pass - which is why section 1's `C x H x W` plan changed. Since phase 6 (section 19) the forward never
+  makes the patch matrix: std/linalg's `GemmPatches` packs it from the images as the product reads it, the bias added
+  as each block of `Y` is finished - exactly what im2col, the product and the bias gave.
 - **Backward**: `db` = the column sums of `dY`, `dW = dY^T cols`, `dcols = dY W` (only when the input wants a
   gradient - a network's first convolution skips it), then col2im adds every patch's gradient back to the pixels it
-  came from. The patches are **not kept**: the backward builds them again into the same region before `dW` (a pass
-  over memory, against products of the layer's size) and `dcols` then overwrites them, so a graph has **one patches
-  region, its largest convolution's**, shared by all of them; the graph's `GemmWorkspace` grows to their products in
-  the first step. For the MNIST network below, 128 x 784 x 9 F32 - 3.6 MB.
+  came from. The patches are **not kept**: the backward makes them (im2col) into a region before `dW` - which reads
+  them as its right operand, where `GemmPatches` takes them on the left only - and `dcols` then overwrites them, so a
+  graph has **one patches region, its largest convolution's**, shared by all of them; the graph's `GemmWorkspace`
+  grows to their products in the first step. For the MNIST network below, 128 x 784 x 9 F32 - 3.6 MB.
 - **im2col's innermost loop** is a pixel's channels, read in order - unless an image has fewer channels than the
   kernel is wide (a first layer, grey or RGB), when a window inside the image is copied a kernel row at a time,
   written in order with no test per element: 3.0 ms against 8.9-11.0 for a batch of 128 one-channel images, and the
@@ -898,8 +901,10 @@ stored them.
   `vision.NewConv(g, inC, outC, kernel, H, W, stride, padding)` draws PyTorch's starting values (uniform in
   `+-1/sqrt(C K K)`, weights and bias).
 
-**Checked**: the convolution through im2col and one product against its definition (four shapes - padding, strides 2
-and 3, 1 to 3 channels, 2x2 to 5x5 kernels - on one task and three), col2im as im2col's adjoint (`<im2col(x), c> =
+**Checked**: the convolution as one product of its patches against its definition (four shapes - padding, strides 2
+and 3, 1 to 3 channels, 2x2 to 5x5 kernels - on one task and three), the forward by `GemmPatches` equal bit for bit
+to im2col, the product and the bias (the CNN's two convolutions and two small shapes, F32 and F64, one task and
+three), col2im as im2col's adjoint (`<im2col(x), c> =
 <x, col2im(c)>`), max pooling against its definition; and through the graph in F64 against central differences: two
 convolutions reading one pooled value, a convolution applied twice (shared weights), overlapping 3x3 pools at stride
 2, padding with stride 2, a short batch, and the input gradients of 3- and 1-channel images that are parameters. A
@@ -1027,6 +1032,8 @@ board. Results and decisions: docs/settling.md sections 2.13, 5.10 and 6 (decisi
 ## 18. Phase 5: attention on products, mixed precision, a Dataset trait
 
 ### Attention through std/linalg's Gemm
+
+(Replaced in phase 6 by one `GemmBatch` per product over every sequence and head: section 19.)
 
 Attention's six products per sequence and head - `S = Q K^T`, `Y = P V`, `dP = dO V^T`, `dQ = dS K`, `dK = dS^T Q`,
 `dV = P^T dO` - are each one `ws.Gemm` on the heads' strided views (section 11), replacing the dot products and
@@ -1181,3 +1188,163 @@ for MNIST's batches); the examples other than MNIST's leave it off.
   function handing it to `Map` is called from a larger one (a dispatch of eight operations; the graph's forward): GELU's
   pass went from 1.1 to 10.6 ms at 1024 x 512 with two captured type witnesses. oann's lambdas declare the witnesses
   they need (`w A`, `like T`).
+
+## 19. Phase 6: olang 472373d - permissions, attention in batches, convolutions from the images
+
+Built with olang 472373d, measured 2026-10-09 between 20:00 and 21:00 CEST on the shared 4-core machine at a load
+average of 6-9 (other agents compiling and testing): every figure is an interleaved median or a range of them, and the
+ranges are wide.
+
+### Migrating: `mut` only where a reference's target is written
+
+olang's permissions batch made `mut` speak only about what a reference reaches: no `mut` before a by-value field,
+parameter or local, and a local written through needs `x mut T& = ...`. olang's `tools/perm_mut.py` migrated oann from
+the compiler's own diagnostics - 168 `mut` removed (mostly settings and counters in structs: `Rate F64 = 0.0003`), 45
+locals given `mut` - and nothing was left by hand: no `mut` before a by-value type variable meant the binding. The
+same pass found `examples/mnist_board.olang` not compiling since phase 5 made `Loader` generic (`evaluate` named it
+bare; it takes a `Loader<<D>>` now). `make test`: every test as before.
+
+### Attention: one `GemmBatch` per product
+
+Attention's six products - `S = Q K^T`, `Y = P V`, `dP = dO V^T`, `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO` - are each
+one std/linalg `GemmBatch` (`ops.Attention`, `ops.AttentionBackward`), over every sequence and head of a part at once:
+`q.Heads(T, heads)` is the heads' strided column blocks of `q` (a group per sequence, a member per head), and so for
+`k`, `v`, `y` and the gradients, and `probs.Stacked(T, heads)` is the weights as attention keeps them. Causal:
+
+- the scores and `dP` are computed on and below the diagonal only (`Triangular.Result`) - the rest neither computed nor
+  written; the softmax writes `P`'s zeros there all the same (it is a value its readers may look at whole), and `dS`'s
+  upper triangle is left as the product left it, never read;
+- `P` and `dS` are read on and below it only, as the left operand of the other four (`Triangular.Left`, `dK` and `dV`
+  with the transpose) - so no product ever sees a later position: causality is exact by construction, not by zeros.
+
+Between the calls run the softmax and `dS`'s pass, the part's sequences and heads spread over the graph's threads by
+`ops.parallel`; the products are spread by std/linalg. What went: the per-sequence tasks, a workspace per task, `Plan`'s
+warm-up, the transposed blocks (`GemmBatch` packs every product, so nothing falls to the unpacked path below 64^3) -
+the products pack into the graph's own `GemmWorkspace`, grown in the first step like every other product's. What
+came: `dS` as one scratch region of the arena the size of the largest attention's `P` (in place of a `T x T` and a
+`dh x T` per task) - the character model's arena 86.0 -> 87.0 MB.
+
+**A part at a time.** `GemmBatch` over every sequence and head at once was slower than a `Gemm` per head for a
+non-causal backward at `T` 256, as std/linalg's own measurement had warned: each pass - a product, the `dS` pass, the
+next product - streams every head's `P` and `dS` (4 MB each at 4 sequences of 4 heads) from memory again, where a head
+done back to back finds its 256 KB still in L2. So attention takes its `T x T` matrices a part at a time - a run of
+whole sequences, or a run of one sequence's heads - each part as many matrices as keep `P` (forward) or `P` and `dS`
+(backward) in 512 KB a task (`ops.attentionEach`: at `T` 64 in F32, 32 matrices forward and 16 backward a task; at 256,
+two and one). Measured on the backward at `T` 256 (4 sequences, 4 heads, one thread), the batches' time as a multiple
+of a `Gemm` per head's in the same process (three to five runs each):
+
+| matrices in a part (backward) | non-causal | causal |
+|---|---|---|
+| all 16 at once | 1.20-1.49x | 0.73-0.89x |
+| 4 (a sequence) | 1.02-1.25x | 0.65-0.73x |
+| 2 (1 MB of `P` and `dS`) | 0.97-1.11x | 0.59-0.75x |
+| **1 (512 KB)** | **0.87-1.02x** | **0.57-0.65x** |
+
+so a part is never measurably slower than per-head products, and keeps the batched calls everywhere else - at `T` 64
+the backward's part is 16 of the 64 matrices, and with four threads all 64. Results do not depend on the parts or the
+threads (a test compares them bit for bit).
+
+**Checked**: outputs and gradients equal the per-head `Gemm`s' bit for bit (`bench/attention.olang` compares them on
+every run: a difference of 0); the gradient checks of section 9 in F64 (sequences of 3, 8 and 130 - tiles straddling
+the diagonal and wholly above it), the causality test (rows before a changed one exactly as they were), one task
+against three at `T` 3 and at `T` 64 (where std/linalg splits the products too), a part at a time against all at once
+(heads in parts of one and of three); and the first 40 steps of the character model against numpy (`make lmref
+ARGS=40`): the same numbers as before, losses within 1e-6 and gradient norms within 2e-6.
+
+**Measured** (`bench/attention.olang`, ms, one thread, four runs of 9-15 rounds each, the batches against the per-head
+`Gemm`s of phase 5 in the same process; the ratio's median over the runs):
+
+| | forward, per head | forward, batches | ratio | backward, per head | backward, batches | ratio |
+|---|---|---|---|---|---|---|
+| T 64, 16 sequences, causal | 2.1-3.2 | 2.3-3.2 | 0.95 | 2.8-3.7 | 2.0-2.8 | 0.80 |
+| T 64, not causal | 3.1-4.9 | 3.0-4.8 | 0.97 | 2.7-3.9 | 2.2-3.7 | 0.92 |
+| T 256, 4 sequences, causal | 7.3-9.4 | 6.5-9.5 | 0.89 | 7.6-9.4 | 5.1-7.2 | 0.67 |
+| T 256, not causal | 12.0-15.2 | 11.1-15.0 | 0.95 | 8.8-11.3 | 7.7-10.5 | 0.89 |
+
+The backward gains most - three of its four products are causal, and the transposes are gone. The forward barely
+moves because it is mostly not products any more: at `T` 64 (16 sequences, 4 heads) the scores' product takes 0.35-0.6
+ms, `P V` 0.33-0.6, and the softmax between them 1.0-2.0 - `math.Exp`, a library call per element (section 13's first
+item). The transformer's step (`bench/abstep.py`, the build before and after alternating, the graph's own profiling):
+
+| context | attention before | attention after | step before | step after |
+|---|---|---|---|---|
+| 64 (16 sequences, 8 runs of 10 steps) | 26.1 ms (11.4 forward, 14.7 backward) | 25.1 (11.4, 13.7) | 165.6 ms | 155.2 |
+| 256 (4 sequences, 6 runs of 5 steps) | 78.4 (39.1, 39.3) | 60.5 (32.8, 27.7) | 206.4 | 190.4 |
+
+(The products, untouched, moved between 86 and 125 ms run to run: the steps' difference is mostly the machine.)
+Attention is 1.3x faster at context 256 and level at 64, where phase 5 had already made it a fifth of what it was.
+Four threads were not measured: on four cores loaded 6-9 a task waits for a core (section 11).
+
+### Convolutions: the forward from the images
+
+`conv.Conv2d` is one std/linalg `GemmPatches`: the product of the patch matrix and `W^T`, the patches packed from the
+images as the product reads them - never made - and the bias added as each block of the output is finished
+(`linalg.Activation.Identity`; the CNN's ReLU stays a node of its own). The result is **exactly** im2col's, the
+product's and `AddRow`'s (a test, F32 and F64; the CNN's first epoch prints the same losses and accuracy). The backward
+is unchanged: `dW = dY^T cols` reads the patches as its right operand, which `GemmPatches` does not take, so it makes
+them (im2col) into the graph's patches region as before.
+
+**Measured** (`bench/conv.olang`, ms for a batch of 128, three runs of 30 at a load of 8.5): the first convolution's
+forward **6.0-6.9 -> 3.7-4.5** (its im2col was 3.3-3.8 of it), the second's 10.7-11.2 -> 10.3-11.1 (9.9 -> 8.9 in an
+earlier run); a step of the two with their backwards 20-23 -> 18-20 and 37-39 -> 36-39 ms. In the CNN
+(`examples/mnist_cnn.olang ... profile`, two runs each, alternating): the convolutions' forward **7.35-7.77 -> 6.32-6.47
+s an epoch**, their backward 14.8-15.7 -> 14.9-15.2; whole epochs (six runs each, alternating) 30.5-34.7 s -> 29.9-34.6
+s, medians 32.8 -> 31.8 - within the machine's noise.
+
+### `GemmAct`: measured, not adopted
+
+std/linalg's `GemmAct` is a product with its bias and activation applied to each block of rows as it is finished.
+Against oann's separate passes (`Linear`, then the activation's node), forward, ms, two runs:
+
+| layer | separate | `GemmAct` |
+|---|---|---|
+| the perceptron's 128 x 784 -> 128, ReLU | 0.36-0.45 | 0.35-0.43 |
+| the transformer's 1024 x 128 -> 512, GELU (tanh) keeping the pre-activation | 2.56-2.91 | 2.72-3.19 |
+| the same, ReLU (no model of oann's) | 1.98 | 1.59-1.60 |
+
+The results are identical (std/linalg's GELU is oann's `GeluTanh` to the bit). It is level where oann could use it -
+the bias and ReLU passes over a 128 x 128 batch are ~10 us of a 0.35 ms product, ~5 ms of a 0.6 s epoch - and slower
+for the transformer's GELU, which also has to write the pre-activation for its backward. Using it would also take a
+fused graph node (`LinearAct`) whose value is the activation, while `AdamWProjected` reads a dense layer's
+pre-activation (`W X^T`, from the `Linear` node's value) for its projection: the node would have to keep it as well.
+And std/linalg's `ActivationBackward` does not compile for F32 (repro/condliteral). So the graph keeps `Linear` and the
+activations as separate nodes; the case for fusing is a wider ReLU layer, or ReLU after a convolution (`GemmPatches`
+with `Activation.Relu`, 1.4-1.5 s of the CNN's epoch), when one matters.
+
+### An MNIST epoch: unchanged
+
+Nothing on the perceptron's path changed: `examples/mnist_mlp.olang`, three epochs a run, six runs each alternating
+with the build before - 0.53-0.76 s an epoch before, 0.55-0.93 after, medians 0.66 and 0.67 at a load of 7.3-7.6.
+
+### Decisions
+
+1. **Attention's products are `GemmBatch`es, causal ones confined to their triangles** (`Result` for the scores and
+   `dP`, `Left` for the products reading `P` and `dS`), replacing a `Gemm` per sequence and head: identical results,
+   the backward 1.1-1.5x faster, less code (no tasks, workspaces, warm-up or transposes).
+2. **A part at a time, sized by cache** (512 KB of `P`, or `P` and `dS`, a task) rather than every sequence and head
+   at once: the one measured case where batching was slower - the non-causal backward at `T` 256 - becomes level or
+   faster, and every other case stays batched. The constant is this machine's L2 (1 MB a core) halved; it is one
+   number in `ops.olang`.
+3. **One workspace for every product** - attention's included - and **`dS` one region the size of the largest
+   attention's `P`**: 1 MB more arena for the character model, against a workspace and two matrices per task.
+4. **`P`'s zeros above the diagonal are still written** (the softmax's last loop), though no product reads them: the
+   saved weights stay a complete value. `dS`'s are not (scratch).
+5. **The softmax keeps `math.Exp`**: it is now about half of attention's forward, but a faster exponential is
+   std/linalg's (or the compiler's) to give, not oann's to approximate (section 13).
+6. **The convolution's forward is `GemmPatches`; its backward keeps im2col** (std/linalg measured the right-operand
+   form slower), and so the graph keeps its patches region.
+7. **`GemmAct` is not adopted** (above): level where usable, slower for GELU, and a fused node would have to keep the
+   pre-activation the projection reads.
+8. **The CNN's ReLU is not fused into `GemmPatches`** either, for the same reason as 7 - a node of its own keeps the
+   graph's kinds simple - though there it would save a pass (1.5 s of a 30 s epoch); recorded as the next fusion if one
+   is wanted.
+
+### olang issues (repro/)
+
+- New: `repro/condliteral.olang` - a conditional of literals (`1.0 if x > 0.0 else 0.0`) beside an F32 value in a match
+  or another conditional is taken for an F64, so the F32 value is an error; std/linalg's `ActivationSlope` is written
+  that way, and neither it nor `ActivationBackward` compiles for F32.
+- Run again on 472373d: `spawncall`, `bf16narrow` and `capturedvalue` still reproduce (being changed in olang's
+  wt-cgfix3), `genericctor` and `operatornames` too (wt-chk4); `fieldname`, `joinparen` (now reported as E11b, naming
+  `$(...)`), `nestedtry` and `tryindex` as before. `capturedfn`, `ctorpush` and `ctorunstored`, fixed since olang
+  edf8238, are deleted.
