@@ -8,7 +8,9 @@
 #   drive on the readout;
 # - an Arousal, the gate: an aroused moment samples its action, runs the nudged phases and learns from its outcome;
 #   a calm one settles once, answers greedily and changes nothing that learns.
-# Step(obs, reward) is one moment (1.8). Nothing is allocated per moment.
+# Step(obs, reward) is one moment (1.8). With Settings.Groups above 1 the readout is that many groups of the actions,
+# each its own softmax, and a moment chooses an action in each - a joint action, the product of the groups' policies,
+# its contrast the sum of theirs (circuit's readout groups). Nothing is allocated per moment.
 
 import "std/json"
 import "std/linalg"
@@ -228,12 +230,15 @@ type Settings struct() {
     Threshold mut F64 = 1.5             # theta
     Certified mut F64 = 0.9             # the gain the circuit is certified at when made
     Budget mut I64 = 128                # a settle's sweeps, at least
+    Groups mut I64 = 1                  # the readout's groups: an action chosen in each, together one joint action
 }
 
-# a life of observations observations and actions actions, with hidden regions of the given sizes, everything it draws
-# from its own generator seeded with seed. Its circuit: the observation and the context trace as input regions, one-way
-# into the first hidden region; the hidden regions reciprocal in a chain; the last reciprocal with the readout, one
-# neuron per action, its policy softmax(s / T); the memory's read a drive on the readout
+# a life of observations observations and actions actions (in each of Config.Groups groups), with hidden regions of the
+# given sizes, everything it draws from its own generator seeded with seed. Its circuit: the observation and the context
+# trace as input regions, one-way into the first hidden region; the hidden regions reciprocal in a chain; the last
+# reciprocal with the readout, one neuron per action of each group, each group's policy softmax(s / T); the memory's
+# read a drive on the readout (a value per action of each group). Step gives the joint action as one number,
+# sum over groups g of Chosen[g] actions^g - the action itself when there is one group
 type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64, Config Settings = Settings()) {
     Observations I64 = observations
     Actions I64 = actions
@@ -249,15 +254,17 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
     Context circuit.Region = circuit.Region(1)
     Inner circuit.Region = circuit.Region(2)            # the first hidden region; the others follow it
     Choice circuit.Region = circuit.Region(2 + hidden.Len())
+    Groups I64 = Config.Groups
     Elig mut circuit.Eligibility<T>& = circuit.Eligibility<T>(Net)
     Opt mut optim.FlatAdamW<T>& = optim.FlatAdamW<T>(Net.ParamCount, Config.Rate)
-    Mem mut Memory<T>& = Memory<T>(observations, actions, Config.MemoryDecay, Config.MemoryRate, Config.MemoryGain)
+    Mem mut Memory<T>& = Memory<T>(observations, actions * Groups, Config.MemoryDecay, Config.MemoryRate, Config.MemoryGain)
     Ctx mut Trace<T>& = Trace<T>(Width, Config.TraceRate, Config.TraceGain)
     Judge mut Critic<T>& = Critic<T>(Width, Config.CriticRate)
     Mood mut Arousal = Arousal(Config.Slow, Config.Fast, Config.Eps, Config.Critical, Config.Threshold)
     lastPhi mut Array<T>& = Array<T>(Width)            # the last moment's: its state's features
     lastKey mut Array<T>& = Array<T>(observations)     # the last moment's observation
-    probs mut Array<F64>& = Array<F64>(actions)
+    probs mut Array<F64>& = Array<F64>(actions * Groups)
+    Chosen mut Array<I64>& = Array<I64>(Groups)          # the last moment's action in each group
     LastAction mut I64 = -1
     lastAroused mut Bool = false                        # the last moment kept a contrast to learn from
     started mut Bool = false
@@ -294,7 +301,8 @@ fn circuitFor(like Array<<T>>&, observations I64, actions I64, hidden Array<I64>
     context := c.Input(widthOf(hidden))
     first := c.Hidden(hidden[0])
     for i in range 1, hidden.Len() { c.Hidden(hidden[i]) }
-    choice := c.Readout(actions, circuit.Cost.CrossEntropy(s.Temperature))
+    if s.Groups < 1 { stop("an agent's readout has at least one group") }
+    choice := c.Readout(actions * s.Groups, circuit.Cost.CrossEntropy(s.Temperature), circuit.Neuron.Rate(circuit.Rho.Tanh), s.Groups)
     c.Project(sensors, first, circuit.Wiring.OneWay)
     c.Project(context, first, circuit.Wiring.OneWay)
     for i in range 1, hidden.Len() { c.Project(circuit.Region(first + i - 1), circuit.Region(first + i)) }
@@ -335,44 +343,54 @@ fn (a mut Agent<<T>>&) features() {
     for i in range a.Width { a.phi[i] = v.Get(0, at + i) }
 }
 
-# the policy of the free state, softmax(s_out / T), into probs
+# the policy of the free state, softmax(s_out / T) of each group, into probs
 fn (a mut Agent<<T>>&) policy() {
     s := a.Net.Activity(circuit.Phase.Free, a.Choice)
-    top F64 = F64(s.Get(0, 0))
-    for j in range 1, a.Actions { top = math.Max(top, F64(s.Get(0, j))) }
-    sum F64 = 0.0
-    for j in range a.Actions {
-        a.probs[j] = math.Exp((F64(s.Get(0, j)) - top) / a.Config.Temperature)
-        sum += a.probs[j]
+    for g in range a.Groups {
+        at I64 = g * a.Actions
+        top F64 = F64(s.Get(0, at))
+        for j in range 1, a.Actions { top = math.Max(top, F64(s.Get(0, at + j))) }
+        sum F64 = 0.0
+        for j in range a.Actions {
+            a.probs[at + j] = math.Exp((F64(s.Get(0, at + j)) - top) / a.Config.Temperature)
+            sum += a.probs[at + j]
+        }
+        for j in range a.Actions { a.probs[at + j] = a.probs[at + j] / sum }
     }
-    for j in range a.Actions { a.probs[j] = a.probs[j] / sum }
 }
 
-# an action drawn from the policy, from the agent's generator
-fn (a mut Agent<<T>>&) sample() I64 {
+# an action of group g drawn from its policy, from the agent's generator
+fn (a mut Agent<<T>>&) sample(g I64) I64 {
     u := a.rng.Float()
     a.Draws++
     acc F64 = 0.0
     for j in range a.Actions - 1 {
-        acc += a.probs[j]
+        acc += a.probs[g * a.Actions + j]
         if u < acc { return j }
     }
     return a.Actions - 1
 }
 
-# the most probable action
-fn (a Agent<<T>>&) greedy() I64 {
+# group g's most probable action
+fn (a Agent<<T>>&) greedy(g I64) I64 {
     best I64 = 0
     for j in range 1, a.Actions {
-        if a.probs[j] > a.probs[best] { best = j }
+        if a.probs[g * a.Actions + j] > a.probs[g * a.Actions + best] { best = j }
     }
     return best
 }
 
-# an aroused moment's nudged phases toward action, +beta and -beta from the free state - what the next moment's
-# contrast reads; whether both qualified
-fn (a mut Agent<<T>>&) nudge(action I64) Bool {
-    a.Net.LabelData(a.Choice)[0] = I32(action)
+# the joint action of the groups' choices: sum over g of Chosen[g] Actions^g
+fn (a Agent<<T>>&) joint() I64 {
+    sum I64 = 0
+    for k in range a.Groups { sum = sum * a.Actions + a.Chosen[a.Groups - 1 - k] }
+    return sum
+}
+
+# an aroused moment's nudged phases toward the chosen actions (each group's), +beta and -beta from the free state -
+# what the next moment's contrast reads; whether both qualified
+fn (a mut Agent<<T>>&) nudge() Bool {
+    for g in range a.Groups { a.Net.LabelData(a.Choice)[g] = I32(a.Chosen[g]) }
     for k in range 2 {
         p := circuit.Phase.Plus if k == 0 else circuit.Phase.Minus
         a.Net.Warm(p, circuit.Phase.Free)
@@ -415,7 +433,7 @@ fn (a mut Agent<<T>>&) Step(obs Array<T>&, reward F64, terminal Bool = false) I6
     aroused := a.Mood.Update(delta, reward)
     decay F64 = a.Config.Gamma * a.Config.Lambda
     if a.lastAroused {
-        a.Mem.Write(a.lastKey, a.LastAction, reward, math.Abs(delta))
+        for g in range a.Groups { a.Mem.Write(a.lastKey, g * a.Actions + a.Chosen[g], reward, math.Abs(delta)) }
         a.Net.Contrast(a.Config.Beta)
         a.Elig.Add(a.Net, decay)
         a.Elig.Credit(a.Net, delta)
@@ -442,16 +460,16 @@ fn (a mut Agent<<T>>&) Step(obs Array<T>&, reward F64, terminal Bool = false) I6
 # context trace follows the hidden activity, and what the next moment learns from is kept
 fn (a mut Agent<<T>>&) act(obs Array<T>&, aroused Bool) I64 {
     a.policy()
-    action I64 = 0
     if aroused {
-        action = a.sample()
-        a.lastAroused = a.nudge(action)
+        for g in range a.Groups { a.Chosen[g] = a.sample(g) }
+        a.lastAroused = a.nudge()
         a.Aroused++
     } else {
-        action = a.greedy()
+        for g in range a.Groups { a.Chosen[g] = a.greedy(g) }
         a.lastAroused = false
         a.Calm++
     }
+    action := a.joint()
     a.Ctx.Follow(a.phi)
     for i in range a.Observations { a.lastKey[i] = obs[i] }
     for i in range a.Width { a.lastPhi[i] = a.phi[i] }
@@ -471,7 +489,8 @@ fn (a mut Agent<<T>>&) Imagine(obs Array<T>&) circuit.Settlement ? circuit.NotSe
     return try a.Net.Settle(circuit.Phase.Scratch, a.budget, a.tolerance)
 }
 
-# the policy of the last moment's free state (what it chose from)
+# the policy of the last moment's free state (what it chose from): action j's probability - with groups, group
+# j / Actions's action j % Actions
 fn (a Agent<<T>>&) Policy(j I64) F64 {
     return a.probs[j]
 }
@@ -637,6 +656,11 @@ fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
     a.Mood.Aroused = v[12] == 1.0
     a.lastAroused = v[13] == 1.0
     a.LastAction = I64(v[14])
+    rest I64 = a.LastAction
+    for g in range a.Groups {
+        a.Chosen[g] = rest % a.Actions if rest >= 0 else -1
+        rest = rest / a.Actions if rest >= 0 else -1
+    }
     a.started = v[15] == 1.0
     a.Opt.Steps = I64(v[16])
     a.Moments = I64(v[18])
@@ -855,4 +879,32 @@ test "an agent learns a contextual bandit: two contexts, two arms, the right arm
     }
     println("bandit: " $right " of the last 499 moments right, " $(a.Calm) " calm, " $(a.Aroused) " aroused")
     assert right > 450 and a.Calm > a.Aroused
+}
+
+test "an agent with two groups of actions learns both at once: each group's arm by context, one shared reward" {
+    s := Settings()
+    s.Groups = 2
+    a := Agent<F64>(4, 2, I64[8], 11, s)
+    obs := Array<F64>(4)
+    right := I64[0, 0]
+    c I64 = 0
+    obs[0] = 1.0
+    action := try a.Begin(obs) catch { fail }
+    for t in range 1, 2500 {
+        # group 0 should answer the context, group 1 its opposite; the reward is the mean of the two groups' +-1
+        g0 I64 = action % 2
+        g1 I64 = action / 2
+        assert g0 == a.Chosen[0] and g1 == a.Chosen[1]
+        r F64 = 0.5 * ((1.0 if g0 == c else -1.0) + (1.0 if g1 == 1 - c else -1.0))
+        if t > 2000 {
+            if g0 == c { right[0] = right[0] + 1 }
+            if g1 == 1 - c { right[1] = right[1] + 1 }
+        }
+        c = (t * 7 + t / 3) % 2
+        obs[0] = 1.0 if c == 0 else 0.0
+        obs[1] = 1.0 - obs[0]
+        action = try a.Step(obs, r, true) catch { fail }
+    }
+    println("two groups: " $(right[0]) " and " $(right[1]) " of the last 499 moments right, " $(a.Calm) " calm, " $(a.Aroused) " aroused")
+    assert right[0] > 450 and right[1] > 450
 }

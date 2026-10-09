@@ -1,0 +1,240 @@
+# store - the sparse-code store (docs/settling.md 1.6, 2.7): a cerebellum-style associative memory (Marr 1969; Albus
+# 1971; Kanerva 1988) from readings of Inputs numbers to predictions of Outputs. A reading minus its running mean is
+# projected by a fixed random matrix R (Cells x Inputs, entries N(0, 1 / Inputs)) onto Cells cells; the K strongest
+# are kept, rectified and scaled to unit length - the code - and a table of Cells rows of Outputs is read at the K
+# active rows only, and written by the delta rule at them:
+#
+#   z = R (x - mean),   code = unit(relu(top_K(z))),   y = code T,   T[active] += Rate code[active]^T (target - y)
+#
+# With a unit code and Rate 1 a write stores its target exactly (the read at the same reading is the target), and a
+# reading whose code shares no active cell with it is not disturbed at all: interference is only through shared
+# cells, by the dot of the codes. A smaller Rate averages noisy targets over about 1 / Rate visits (the delta rule is
+# stable for 0 < Rate < 2). Defaults (oann's): Cells = 20 Inputs and K = 5% of them, rounded up - the sparse expansion
+# of the fly's olfactory circuit (Dasgupta, Stevens and Navlakha 2017) - Rate 1, one exposure, and the running mean
+# following each write with weight MeanRate = 0.01 (about the last 100 writes). R's row i is drawn from a generator
+# of its own, seeded by the store's seed and i, so any row can be made again from the seed alone - on an FPGA, R need
+# not be stored (docs/settling.md 4.1). A read changes nothing; a write moves the mean first, then reads and writes at
+# the code of the moved mean. Nothing is allocated after the store is made.
+
+import "std/linalg"
+import "std/math"
+import "std/rand"
+import "sparse"
+
+type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I64 = 0, Rate F64 = 1, MeanRate F64 = 0.01) {
+    Inputs I64 = inputs
+    Outputs I64 = outputs
+    Seed U64 = seed
+    N I64 = Cells if Cells > 0 else 20 * inputs                 # the cells
+    K I64 = Active if Active > 0 else I64(math.Ceil(0.05 * F64(N)))    # the active cells of a code
+    Rate
+    MeanRate
+    assert N >= 1 and K >= 1 and K <= N and Outputs >= 1
+    R mut Array<T>& = Array<T>(N * inputs)                     # N x Inputs, row by row
+    fillProjection(R, N, inputs, seed)
+    Table mut Array<T>& = Array<T>(N * outputs)                # N x Outputs
+    Mean mut Array<T>& = Array<T>(inputs)
+    Writes mut I64 = 0
+    centered mut Array<T>& = Array<T>(inputs)
+    z mut Array<T>& = Array<T>(N)
+    work mut Array<T>& = Array<T>(N)
+    Idx mut Array<I32>& = Array<I32>(K)                        # the last code's cells, increasing
+    Code mut Array<T>& = Array<T>(K)                           # and their values (a selected cell may be 0)
+    y mut Array<T>& = Array<T>(outputs)
+    err mut Array<T>& = Array<T>(outputs)
+}
+
+# row i of the projection, into out (Inputs of them): N(0, 1 / Inputs) from the generator of seed and i - what an
+# engine regenerates instead of storing R
+fn ProjectionRow(seed U64, i I64, inputs I64, out mut Array<<T>>&, at I64) {
+    r := rand.Rand(seed ^ (U64(i + 1) * U64(0x9E3779B97F4A7C15)))
+    sd F64 = 1.0 / math.Sqrt(F64(inputs))
+    like T
+    for j in range inputs { out[at + j] = linalg.Cast(sd * r.Normal(), like) }
+}
+
+fn fillProjection(r mut Array<<T>>&, cells I64, inputs I64, seed U64) {
+    for i in range cells { ProjectionRow(seed, i, inputs, r, i * inputs) }
+}
+
+# the code of reading x at the mean as it is, into Idx and Code; gives the cells active (positive)
+fn (s mut Store<<T>>&) code(x Array<T>&) I64 {
+    for i in range s.Inputs { s.centered[i] = x[i] - s.Mean[i] }
+    linalg.Gemv(s.z, linalg.View(s.R, 0, s.N, s.Inputs), false, s.centered)
+    sparse.TopK(s.z, 0, s.N, s.K, s.Idx, s.work)
+    zero T
+    sum F64 = 0.0
+    active I64 = 0
+    for j in range s.K {
+        v T = s.z[I64(s.Idx[j])]
+        if v > zero {
+            s.Code[j] = v
+            sum += F64(v) * F64(v)
+            active++
+        } else {
+            s.Code[j] = zero
+        }
+    }
+    if sum > 0.0 {
+        like T
+        inv := linalg.Cast(1.0 / math.Sqrt(sum), like)
+        for j in range s.K { s.Code[j] = s.Code[j] * inv }
+    }
+    return active
+}
+
+# the store's prediction for reading x, into out (Outputs of them): code(x) T. Changes nothing but the workspace
+fn (s mut Store<<T>>&) Read(x Array<T>&, out mut Array<T>&) {
+    s.code(x)
+    sparse.GatherRowsWeighted(out, s.Table, s.Idx, s.Code, s.K)
+}
+
+# one write of target for reading x: the running mean moves toward x, then the table's active rows by the delta rule
+# toward target, at Rate. Gives the cells active
+fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&) I64 {
+    like T
+    m := linalg.Cast(s.MeanRate, like)
+    if s.MeanRate > 0.0 {
+        for i in range s.Inputs { s.Mean[i] = s.Mean[i] + m * (x[i] - s.Mean[i]) }
+    }
+    active := s.code(x)
+    sparse.GatherRowsWeighted(s.y, s.Table, s.Idx, s.Code, s.K)
+    for t in range s.Outputs { s.err[t] = target[t] - s.y[t] }
+    sparse.ScatterRank1(s.Table, s.Idx, s.Code, s.K, s.err, linalg.Cast(s.Rate, like))
+    s.Writes++
+    return active
+}
+
+# the table forgets everything (the projection and the mean stay)
+fn (s mut Store<<T>>&) Clear() {
+    zero T
+    for i in range s.Table.Len() { s.Table[i] = zero }
+}
+
+# ---- tests (docs/settling.md 5.3.2), in F64 ----
+
+# a reading of n numbers uniform in [-1, 1)
+fn reading(r mut rand.Rand&, n I64) Array<F64>& {
+    x Array<F64>&return = Array<F64>(n)
+    for i in range n { x[i] = r.Uniform(-1.0, 1.0) }
+    return x
+}
+
+test "a code has norm 1 and exactly K active cells, the K largest of the projection" {
+    s := Store<F64>(16, 3, 7)
+    assert s.N == 320 and s.K == 16
+    r := rand.Rand(1)
+    for trial in range 50 {
+        x := reading(r, 16)
+        active := s.code(x)
+        assert active == 16
+        norm F64 = 0.0
+        for j in range s.K { norm += s.Code[j] * s.Code[j] }
+        assert math.Abs(norm - 1.0) < 1e-14
+        # every unselected cell's projection is at most the least selected one's
+        least F64 = 1e300
+        for j in range s.K { least = math.Min(least, s.z[I64(s.Idx[j])]) }
+        selected := Array<Bool>(s.N)
+        for j in range s.K { selected[I64(s.Idx[j])] = true }
+        for c in range s.N {
+            if not selected[c] { assert s.z[c] <= least }
+        }
+    }
+    # the projection's rows are regenerated from the seed alone
+    row := Array<F64>(16)
+    ProjectionRow(7, 123, 16, row, 0)
+    for j in range 16 { assert row[j] == s.R[123 * 16 + j] }
+}
+
+test "a write at rate 1 is read back exactly; another reading is disturbed only through shared cells, by the codes' dot" {
+    s := Store<F64>(16, 3, 8, 0, 0, 1, 0)       # the mean held at 0, so both readings' codes stay as they are
+    r := rand.Rand(2)
+    for trial in range 20 {
+        x := reading(r, 16)
+        q := reading(r, 16)
+        target := reading(r, 3)
+        before := Array<F64>(3)
+        s.Read(q, before)
+        s.code(q)
+        qIdx := Array<I32>(s.K)
+        qCode := Array<F64>(s.K)
+        for j in range s.K {
+            qIdx[j] = s.Idx[j]
+            qCode[j] = s.Code[j]
+        }
+        y := Array<F64>(3)
+        s.Read(x, y)
+        s.Write(x, target)
+        # the dot of the two codes, over the cells they share
+        dot F64 = 0.0
+        shared I64 = 0
+        for a in range s.K {
+            for b in range s.K {
+                if qIdx[a] == s.Idx[b] {
+                    dot += qCode[a] * s.Code[b]
+                    shared++
+                }
+            }
+        }
+        out := Array<F64>(3)
+        s.Read(x, out)
+        for t in range 3 { assert math.Abs(out[t] - target[t]) < 1e-14 }
+        s.Read(q, out)
+        for t in range 3 { assert math.Abs(out[t] - before[t] - dot * (target[t] - y[t])) < 1e-14 }
+        if shared == 0 {
+            for t in range 3 { assert out[t] == before[t] }
+        }
+    }
+}
+
+test "the running mean follows the writes, and a smaller rate averages noisy targets" {
+    s := Store<F64>(4, 1, 9, 80, 4, 0.1, 0.25)
+    r := rand.Rand(3)
+    mean := Array<F64>(4)
+    x := F64[0.5, -0.25, 1.0, 0.0]
+    target := Array<F64>(1)
+    sum F64 = 0.0
+    out := Array<F64>(1)
+    for k in range 400 {
+        target[0] = 0.7 + r.Uniform(-0.2, 0.2)
+        s.Write(x, target)
+        for i in range 4 { mean[i] = mean[i] + 0.25 * (x[i] - mean[i]) }
+    }
+    for i in range 4 { assert math.Abs(s.Mean[i] - mean[i]) < 1e-14 }
+    # the mean has reached x itself, so x's centred reading is near 0: read the store at a fixed other reading instead
+    q := F64[1.0, 1.0, -1.0, 0.5]
+    for k in range 400 {
+        target[0] = 0.7 + r.Uniform(-0.2, 0.2)
+        s.Write(q, target)
+    }
+    s.Read(q, out)
+    println("rate 0.1 over noisy targets around 0.7: the store reads " $(out[0]))
+    assert math.Abs(out[0] - 0.7) < 0.05
+}
+
+test "capacity: one exposure each, readings stored one after another and read back" {
+    r := rand.Rand(4)
+    for n in I64[16, 64] {
+        s := Store<F64>(n, 2, 10, 0, 0, 1, 0)
+        xs := Array<F64>(1000 * n)
+        ys := Array<F64>(1000 * 2)
+        for i in range xs.Len() { xs[i] = r.Uniform(-1.0, 1.0) }
+        for i in range ys.Len() { ys[i] = r.Uniform(-1.0, 1.0) }
+        stored I64 = 0
+        out := Array<F64>(2)
+        line := StringBuilder()
+        for count in I64[10, 100, 1000] {
+            for k in range stored, count { s.Write(xs[k * n:(k + 1) * n], ys[2 * k:2 * k + 2]) }
+            stored = count
+            err F64 = 0.0
+            for k in range count {
+                s.Read(xs[k * n:(k + 1) * n], out)
+                err += (out[0] - ys[2 * k]) * (out[0] - ys[2 * k]) + (out[1] - ys[2 * k + 1]) * (out[1] - ys[2 * k + 1])
+            }
+            rms F64 = math.Sqrt(err / F64(2 * count))
+            line.Push(", " $count " stored: rms error " $rms.Fixed(3))
+            if count == 10 { assert rms < 0.3 }
+        }
+        println("inputs " $n " (" $(s.N) " cells, " $(s.K) " active)" $line.ToString() " (targets uniform in [-1, 1): rms 0.577 knows nothing)")
+    }
+}

@@ -6,9 +6,9 @@ OLANG ?= /home/user/wt/oannc2/build/out
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang \
 	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
-	vision.olang circuit.olang agent.olang
+	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -69,6 +69,19 @@ safetensors:
 	./build/bench_safetensors write build/safetensors
 	python3 -I bench/ref/safetensors_check.py build/safetensors
 	./build/bench_safetensors read build/safetensors
+
+# MNIST by a settling circuit the board can run, its lessons settled on the simulated board engine (board.olang) or in
+# F32, the test set answered both ways after every epoch - ARGS: epochs, board or float, samples, hidden, batch, seed,
+# rate, beta, temperature
+board:
+	$(OLANG) -b examples/mnist_board.olang
+	./build/examples_mnist_board $(ARGS)
+
+# a sparse projection's transport and contrast against a dense block's, by density (bench/sparse.olang) - ARGS: rounds,
+# threads
+sparse:
+	$(OLANG) -b bench/sparse.olang
+	./build/bench_sparse $(ARGS)
 
 # an epoch's time against C over OpenBLAS (bench/epoch.sh)
 epoch:
