@@ -845,7 +845,7 @@ so the board stays simulated.
 
 - *The slow part* is the gated linear recurrence unrolled over a window in an `nn.Graph`, a batch of sequences as its
   rows, every sequence starting at `h = 0`: per step two products and their gates (`Linear`, `Sigmoid`, `Tanh`,
-  `Multiply`), the readout `Linear`, and the window's loss the mean of the steps' `Mse`. `G`, `B` and `C` are
+  `Mul`), the readout `Linear`, and the window's loss the mean of the steps' `Mse`. `G`, `B` and `C` are
   Glorot-uniform, `g` starts at +1 (a gate keeping 73% of the state) and `b`, `c` at 0. Its gradient through the
   unrolled window is the graph's own backward (5.4.1).
 - *The store's read is no node of the graph.* Nothing flows back through it, so it enters as a shift of the slow

@@ -235,17 +235,17 @@ fn (g mut Graph<<T>>&) Param(rows I64, cols I64, init Init, decay Bool) Var {
     return g.add(Op.Param(init, decay), rows, cols, false)
 }
 
-# op(a) op(b), op(m) being m or, where its flag is set, m's transpose - a matrix product (Product rather than MatMul,
-# which names the @ operator's method)
-fn (g mut Graph<<T>>&) Product(a Var, b Var, ta Bool, tb Bool) Var {
+# op(a) op(b), op(m) being m or, where its flag is set, m's transpose - a matrix product. (Named Product until olang
+# took a method for the @ operator only when it has the operator's shape - one parameter - in db2af5d's E31)
+fn (g mut Graph<<T>>&) MatMul(a Var, b Var, ta Bool, tb Bool) Var {
     x := g.nodes[a]
     y := g.nodes[b]
     m I64 = x.Cols if ta else x.Rows
     k I64 = x.Rows if ta else x.Cols
     kb I64 = y.Cols if tb else y.Rows
     n I64 = y.Rows if tb else y.Cols
-    if k != kb { mismatch("Product of " $g.shape(a) " and " $g.shape(b) ": the inner dimensions differ") }
-    if (ta and x.Batched) or (tb and y.Batched) { mismatch("Product: a batched operand cannot be transposed in the graph") }
+    if k != kb { mismatch("MatMul of " $g.shape(a) " and " $g.shape(b) ": the inner dimensions differ") }
+    if (ta and x.Batched) or (tb and y.Batched) { mismatch("MatMul: a batched operand cannot be transposed in the graph") }
     return g.add(Op.MatMul(a, b, ta, tb), m, n, x.Batched and not ta)
 }
 
@@ -289,8 +289,8 @@ fn (g mut Graph<<T>>&) Sub(a Var, b Var) Var {
 }
 
 # a * b, element by element
-fn (g mut Graph<<T>>&) Multiply(a Var, b Var) Var {
-    g.sameShape("Multiply", a, b)
+fn (g mut Graph<<T>>&) Mul(a Var, b Var) Var {
+    g.sameShape("Mul", a, b)
     x := g.nodes[a]
     return g.add(Op.Mul(a, b), x.Rows, x.Cols, x.Batched)
 }
@@ -1160,11 +1160,11 @@ test "every operation's backward agrees with central differences" {
     b := normal(g, 4, 2)
     bt := normal(g, 2, 4)
     at := normal(g, 4, 3)
-    p1 := g.Product(a, b, false, false)          # 3 x 2
-    p2 := g.Product(a, bt, false, true)
-    p3 := g.Product(at, b, true, false)
-    p4 := g.Product(at, bt, true, true)
-    s := g.Add(g.Sub(p1, p2), g.Multiply(p3, g.Scale(p4, 0.7)))
+    p1 := g.MatMul(a, b, false, false)          # 3 x 2
+    p2 := g.MatMul(a, bt, false, true)
+    p3 := g.MatMul(at, b, true, false)
+    p4 := g.MatMul(at, bt, true, true)
+    s := g.Add(g.Sub(p1, p2), g.Mul(p3, g.Scale(p4, 0.7)))
     row := normal(g, 1, 2)
     acts := g.Add(g.Add(g.Relu(g.AddRow(s, row)), g.LeakyRelu(s, 0.1)), g.Add(g.Gelu(s), g.Sigmoid(s)))
     t := g.Add(g.Tanh(acts), g.Softmax(acts))
@@ -1224,7 +1224,7 @@ test "embedding, positions and both normalizations agree with central difference
     e := g.Positions(g.Embedding(tok, table), pos)
     h := g.LayerNorm(e, normal(g, 1, 4), normal(g, 1, 4))
     h2 := g.RmsNorm(g.Tanh(h), normal(g, 1, 4))
-    logits := g.Product(h2, table, false, true)   # the table again: tied weights, two contributions to its gradient
+    logits := g.MatMul(h2, table, false, true)   # the table again: tied weights, two contributions to its gradient
     loss := g.SoftmaxCrossEntropy(logits, y)
     r := rand.Rand(11)
     g.Plan(r)
@@ -1246,9 +1246,9 @@ test "embedding, positions and both normalizations agree with central difference
 test "attention agrees with central differences: causal and not, several heads, itself as q, k and v" {
     g := Graph<F64>(6)
     x := g.Input(4)
-    q := g.Product(x, normal(g, 4, 4), false, true)
-    k := g.Product(x, normal(g, 4, 4), false, true)
-    v := g.Product(x, normal(g, 4, 4), false, true)
+    q := g.MatMul(x, normal(g, 4, 4), false, true)
+    k := g.MatMul(x, normal(g, 4, 4), false, true)
+    v := g.MatMul(x, normal(g, 4, 4), false, true)
     a := g.Attention(q, k, v, 2, 3, true)
     b := g.Attention(a, a, a, 1, 3, false)
     target := g.Input(4)
@@ -1269,9 +1269,9 @@ test "attention agrees with central differences on longer sequences, the causal 
     for T in I64[8, 130] {
         g := Graph<F64>(2 * T)
         x := g.Input(16)
-        q := g.Product(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
-        k := g.Product(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
-        v := g.Product(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
+        q := g.MatMul(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
+        k := g.MatMul(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
+        v := g.MatMul(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
         heads I64 = 2 if T == 8 else 1
         a := g.Attention(q, k, v, heads, T, true)
         loss := g.Mse(g.Add(a, g.Attention(q, k, v, heads, T, false)), g.Input(16))
@@ -1303,7 +1303,7 @@ test "causal attention: a row's output depends on no later row" {
     h := Graph<F64>(32)
     hx := h.Input(8)
     w := h.Param(8, 8, Init.Normal(0.0, 0.5), true)
-    hq := h.Product(hx, w, false, false)
+    hq := h.MatMul(hx, w, false, false)
     ha := h.Attention(hq, hq, hx, 2, 32, true)
     hl := h.Mse(ha, h.Input(8))
     h.Plan(r)
@@ -1389,7 +1389,7 @@ test "attention split over tasks gives exactly what one task gives, forward and 
         for threads in range 1, 4, 2 {
             g := Graph<F64>(rows, threads)
             x := g.Input(cols)
-            q := g.Product(x, normal(g, cols, cols), false, true)
+            q := g.MatMul(x, normal(g, cols, cols), false, true)
             a := g.Attention(q, x, x, 2, T, true)
             loss := g.Mse(a, g.Input(cols))
             r := rand.Rand(17)
@@ -1420,7 +1420,7 @@ fn mixedNet(g mut Graph<<T>>&) (Var, Var, Var) {
     h := g.GeluTanh(g.Linear(x, w1, b1))
     n := g.LayerNorm(h, g.Param(1, 16, Init.Constant(1.0), false), g.Param(1, 16, Init.Zeros, false))
     wq := g.Param(16, 16, Init.Normal(0.0, 0.25), true)
-    a := g.Attention(g.Product(n, wq, false, true), n, n, 2, 8, true)
+    a := g.Attention(g.MatMul(n, wq, false, true), n, n, 2, 8, true)
     r := g.RmsNorm(g.Add(a, n), g.Param(1, 16, Init.Constant(1.0), false))
     logits := g.Linear(r, g.Param(5, 16, Init.Normal(0.0, 0.25), true), g.Param(1, 5, Init.Zeros, false))
     return x, y, g.SoftmaxCrossEntropy(logits, y)

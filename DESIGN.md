@@ -101,7 +101,7 @@ parameters or a second loss need no new backward code.
 | `y := g.Classes()` | `B` class indices, `I32` (`g.ClassData(y)`) | `targets` |
 | `t := g.Constant(r, c)` | a matrix the caller sets and nothing trains: a target, a mask | a tensor without grad |
 | `w := g.Param(out, in, init, decay)` | a trainable matrix; `decay`: weight decay applies to it | `nn.Parameter` |
-| `g.Linear(x, w, b)`, `g.Product(a, b, ta, tb)`, `g.Multiply(a, b)`, `g.Relu(h)`, ... | record an op, give its handle | ops in `forward` |
+| `g.Linear(x, w, b)`, `g.MatMul(a, b, ta, tb)`, `g.Mul(a, b)`, `g.Relu(h)`, ... | record an op, give its handle | ops in `forward` |
 | `g.Plan(r)` | lay out the arena, allocate it, initialize the parameters - once | `torch.compile` |
 | `g.Forward(n)` | run the batch's first `n` rows | `model(x)` |
 | `g.Backward(loss)` | parameter gradients of `loss`, written fresh | `zero_grad(); loss.backward()` |
@@ -122,8 +122,9 @@ parameters or a second loss need no new backward code.
 | `g.Ahead = true` before `Plan`; `g.NextInputData(x)`, `g.NextClassData(y)`, `g.Flip()` | a second region for every input, filled for the next step while this one runs | a `DataLoader` worker |
 | `nn.Graph<BF16>(...)`, `g.Masters()`, `g.SyncParams()` | mixed precision: BF16 storage, F32 computation, F32 masters | `autocast(dtype=torch.bfloat16)`, roughly |
 
-`Product` and `Multiply` are the builders of `MatMul` and `Mul`: olang reserves the operator methods' names (`MatMul`
-is `@`, `Mul` is `*`) for every method of every type, so a graph cannot have methods called that (repro/operatornames).
+`MatMul` and `Mul` record the ops of those names. Until olang db2af5d they were `Product` and `Multiply`: olang reserved
+the operator methods' names (`MatMul` is `@`, `Mul` is `*`) for every method of every type; since its E31 a method is
+the operator only in the operator's shape (one parameter), and the graph's take four and two (section 20).
 
 - **A shorter batch** (an epoch's last) runs on the first `n` rows of every batched node - views, nothing re-planned;
   losses average over `n`. With attention, `n` is whole sequences (a multiple of `T`).
@@ -227,10 +228,12 @@ PyTorch's Conv2d starting values. For transformers (section 11): `Norm` (layer o
 `Init` for the weights and one for the bias).
 
 Why a factory function and not a constructor taking the graph: a layer holds only handles, so it is the same for
-every element type, while the graph is generic (`Graph<T>`) - and a constructor of a non-generic type cannot take a
-generic parameter: the declaration is accepted and every call fails (repro/genericctor). (The first reason recorded
-here, that a constructor reading through a reference parameter left the struct no zero value and so no place in a
-`List`, went with olang a3ed507.) A plain-data layer is also serializable for free.
+every element type, while the graph is generic (`Graph<T>`) - and a constructor of a non-generic type could not take a
+generic parameter until olang db2af5d (its G10d: a constructor may introduce type variables its parameters use). The
+factories stay (section 20): a constructor would change only the spelling of oann's whole layer API, and `NewDense`
+and `NewDenseWith` are two ways into one type, which has one constructor. (The other reason once recorded here, that a
+constructor reading through a reference parameter left the struct no zero value and so no place in a `List`, went
+with olang a3ed507.) A plain-data layer is also serializable for free.
 
 ## 5. Losses and optimizers (`optim.olang`)
 
@@ -1348,3 +1351,34 @@ with the build before - 0.53-0.76 s an epoch before, 0.55-0.93 after, medians 0.
   wt-cgfix3), `genericctor` and `operatornames` too (wt-chk4); `fieldname`, `joinparen` (now reported as E11b, naming
   `$(...)`), `nestedtry` and `tryindex` as before. `capturedfn`, `ctorpush` and `ctorunstored`, fixed since olang
   edf8238, are deleted.
+
+## 20. Phase 7: olang db2af5d - the catch-up, BF16 again, sleep in the agent
+
+Built with olang db2af5d, measured 2026-10-09 between 22:00 and 02:00 CEST on the shared 4-core machine at the load
+averages given with each figure (other agents compiling and testing): every time is an interleaved median or a range
+of them.
+
+### Catching up
+
+`make test` on db2af5d passed all 118 tests with no change, and every example and benchmark built. Of the compiler's
+changes since 472373d, the one that could have changed oann's behaviour silently - `List` and `Map` are handles now, a
+copy naming the same collection - changes nothing here: every `List` a struct of oann's holds is a reference field
+already, and no local one is copied. Two names went back to what they always meant: the graph's matrix product and
+element-wise product are `g.MatMul(a, b, ta, tb)` and `g.Mul(a, b)` (they were `Product` and `Multiply` while olang
+reserved the operator methods' names for every method; its E31 now takes a method for an operator only in the
+operator's shape, and these take four and two parameters). The layers keep their factory functions (`NewDense`, ...)
+though a constructor may now take the generic graph (olang's G10d): a constructor would change only the spelling of
+the whole layer API, and `NewDense` and `NewDenseWith` are two ways into one type.
+
+`repro/` run again: five are fixed and deleted -
+
+- `genericctor` and `operatornames` compile and run (G10d, E31);
+- `spawncall`: no wrong element in three runs (was 2 816-10 752 of 25 600);
+- `bf16narrow`: `BF16(x)` 0.74-1.8 ns an element (was 8.7-10.1), a BF16 multiply-add 0.58-1.8 (was 24-27), the bits'
+  route 0.65-0.73, widening 0.87-2.8 - narrowing is now inline integer arithmetic on the F32's bits, and all 4 194 304
+  draws narrow alike both ways;
+- `capturedvalue`: a lambda capturing its type witnesses 1.9-2.1 ns an element, declaring them 1.6-2.2 (was 24-29
+  against 1.6-2.1) - function values cross calls as two words now.
+
+`condliteral` still reproduces (being fixed in olang); `fieldname`, `joinparen`, `nestedtry` and `tryindex` are reported
+as before.
