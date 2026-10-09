@@ -4,7 +4,7 @@
 OLANG ?= /home/user/wt/oannc2/build/out
 
 # every module with test blocks
-TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang \
+TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang datasets/loader.olang \
 	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang
 

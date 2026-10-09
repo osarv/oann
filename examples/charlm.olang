@@ -4,7 +4,9 @@
 # is measured every 250 steps on the same 160 windows of the held-out tenth; at the end the parameters are saved to
 # data/shakespeare/charlm.ckpt and a sample is generated.
 # Arguments, all optional: the steps (2000), the seed (1), the threads the products and attention may use (1), the
-# dropout (0), and the characters to generate (500).
+# dropout (0), and the characters to generate (500); and a last argument "bf16" to train in mixed precision - BF16
+# values, gradients and products' operands, F32 computation and master weights (nn's Graph<BF16>) - saving the masters
+# to data/shakespeare/charlm-bf16.ckpt.
 
 import "std/io"
 import "std/json"
@@ -30,7 +32,20 @@ fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
 }
 
 fn main() ? io.IoError + os.OsError + text.TextError + ParseError + json.JsonError {
-    args := os.Args()
+    all := os.Args()
+    bf16 Bool = all.Len() > 1 and all[all.Len() - 1] == "bf16"
+    args := all[:all.Len() - 1] if bf16 else all
+    if bf16 {
+        like BF16 = 0.0
+        try run(args, like, "data/shakespeare/charlm-bf16.ckpt")
+    } else {
+        like F32 = 0.0
+        try run(args, like, "data/shakespeare/charlm.ckpt")
+    }
+}
+
+fn run(args Array<String&>&, like <T>, checkpoint String&) ? io.IoError + os.OsError + text.TextError + ParseError +
+        json.JsonError {
     steps := try number(args, 1, 2000)
     seed := U64(try number(args, 2, 1))
     threads := try number(args, 3, 1)
@@ -42,17 +57,18 @@ fn main() ? io.IoError + os.OsError + text.TextError + ParseError + json.JsonErr
     try text.Fetch("data/shakespeare/input.txt", text.Shakespeare)
     c := try text.Load("data/shakespeare/input.txt")
 
-    g := nn.Graph<F32>(sequences * context, threads)
+    g := nn.Graph<T>(sequences * context, threads)
     m := train.Gpt(g, c.Size(), context, width, heads, depth, dropout)
     r := rand.Rand(seed)
     g.Plan(r)
-    o optim.AdamW<F32>&g = optim.AdamW<F32>(g, 1e-3, 0.9, 0.99, 1e-8, optim.Regularizer.WeightDecay(0.1))
+    o optim.AdamW<T>&g = optim.AdamW<T>(g, 1e-3, 0.9, 0.99, 1e-8, optim.Regularizer.WeightDecay(0.1))
     rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
     trainSet := text.Windows(c.Train(), context, seed)
     valSet := text.Windows(c.Val(), context)
     try io.Print("tiny Shakespeare: " $(c.Ids.Len()) " characters, a vocabulary of " $c.Size() "; " $depth " layers of "
         $width ", " $heads " heads, context " $context ", batches of " $sequences " x " $context ", " $g.ParamCount
-        " parameters, dropout " $dropout ", " $threads " threads\n")
+        " parameters, dropout " $dropout ", " $threads " threads, " $("BF16 with F32 masters" if g.HasMasters() else "F32")
+        ", an arena of " $(F64(g.ArenaBytes()) / 1048576.0).Fixed(1) " MB\n")
     try io.Print("step 0: validation loss " $train.LmEvaluate(g, m, valSet, 10).Fixed(4) "\n")
     spent I64 = 0
     windowLoss F64 = 0.0
@@ -75,13 +91,14 @@ fn main() ? io.IoError + os.OsError + text.TextError + ParseError + json.JsonErr
     try io.Print("trained " $steps " steps in " $seconds.Fixed(1) " s: " $(seconds * 1e3 / F64(steps)).Fixed(1)
         " ms a step, " $(F64(steps * g.Batch) / seconds).Fixed(0) " tokens a second\n")
 
-    try g.Save("data/shakespeare/charlm.ckpt")
+    try g.Save(checkpoint)
 
-    # a sample: the same model on a graph for decoding one sequence, its parameters copied over
+    # a sample: the same model on an F32 graph for decoding one sequence, its parameters (a BF16 graph's masters)
+    # loaded from the checkpoint
     gen := nn.Graph<F32>(context, 1, true)
     gm := train.Gpt(gen, c.Size(), context, width, heads, depth)
     gen.Plan(r)
-    gen.Params().Copy(g.Params())
+    try gen.Load(checkpoint) catch nn.CheckpointError { fail }
     t1 := time.Now()
     sample := try generate.Cached(gen, gm, c, "\n", count, 0.8, r)
     s1 := time.Since(t1)
