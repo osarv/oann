@@ -1,0 +1,97 @@
+# A character-level transformer on tiny Shakespeare: GPT-2's decoder blocks, 4 layers of width 128 with 4 heads over
+# sequences of 64 characters, batches of 16 sequences, tied embeddings - trained with AdamW (beta2 0.99, weight decay
+# 0.1) at a rate warmed up over 100 steps and then down a cosine, the gradient clipped to norm 1. The validation loss
+# is measured every 250 steps on the same 160 windows of the held-out tenth, and at the end a sample is generated.
+# Arguments, all optional: the steps (2000), the seed (1), the threads the products and attention may use (1), the
+# dropout (0), and the characters to generate (500).
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn"
+import "../layers"
+import "../optim"
+import "../train"
+import "../generate"
+import "../datasets/text"
+
+depth I64 = 4
+width I64 = 128
+heads I64 = 4
+context I64 = 64
+sequences I64 = 16
+
+# the number argument i, or fallback when there are fewer arguments
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len() { return fallback }
+    return try args[i].ParseInt()
+}
+
+# the model on g: its tokens, targets, logits and loss
+fn model(g mut nn.Graph<F32>&, vocab I64, dropout F64) train.LanguageModel {
+    tok := g.Tokens()
+    y := g.Classes()
+    t := layers.NewTransformer(g, vocab, context, width, heads, depth, true, dropout)
+    logits := t.Apply(g, tok)
+    return train.LanguageModel(tok, y, logits, g.SoftmaxCrossEntropy(logits, y), context)
+}
+
+fn main() ? io.IoError + os.OsError + text.TextError + ParseError + json.JsonError {
+    args := os.Args()
+    steps := try number(args, 1, 2000)
+    seed := U64(try number(args, 2, 1))
+    threads := try number(args, 3, 1)
+    dropout F64 = 0.0
+    if args.Len() > 4 { dropout = try (try json.Parse(args[4])).AsNum() }
+    count := try number(args, 5, 500)
+
+    try os.MkDirAll("data/shakespeare")
+    try text.Fetch("data/shakespeare/input.txt", text.Shakespeare)
+    c := try text.Load("data/shakespeare/input.txt")
+
+    g := nn.Graph<F32>(sequences * context, threads)
+    m := model(g, c.Size(), dropout)
+    r := rand.Rand(seed)
+    g.Plan(r)
+    o optim.AdamW<F32>&g = optim.AdamW<F32>(g, 1e-3, 0.9, 0.99, 1e-8, optim.Regularizer.WeightDecay(0.1))
+    rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
+    trainSet := text.Windows(c.Train(), context, seed)
+    valSet := text.Windows(c.Val(), context)
+    try io.Print("tiny Shakespeare: " $(c.Ids.Len()) " characters, a vocabulary of " $c.Size() "; " $depth " layers of "
+        $width ", " $heads " heads, context " $context ", batches of " $sequences " x " $context ", " $g.ParamCount
+        " parameters, dropout " $dropout ", " $threads " threads\n")
+    try io.Print("step 0: validation loss " $train.LmEvaluate(g, m, valSet, 10).Fixed(4) "\n")
+    spent I64 = 0
+    windowLoss F64 = 0.0
+    for step in range steps {
+        t0 := time.Now()
+        loss, norm := train.LmStep(g, m, trainSet, o, rate(step), 1.0)
+        spent += time.Since(t0)
+        windowLoss += loss
+        if (step + 1) % 50 == 0 {
+            try io.Print("step " $(step + 1) ": train loss " $(windowLoss / 50.0).Fixed(4) ", gradient norm "
+                $norm.Fixed(3) ", rate " $rate(step).Fixed(6) ", " $(F64(spent) * 1e-6 / F64(step + 1)).Fixed(1)
+                " ms a step\n")
+            windowLoss = 0.0
+        }
+        if (step + 1) % 250 == 0 or step + 1 == steps {
+            try io.Print("step " $(step + 1) ": validation loss " $train.LmEvaluate(g, m, valSet, 10).Fixed(4) "\n")
+        }
+    }
+    seconds F64 = F64(spent) * 1e-9
+    try io.Print("trained " $steps " steps in " $seconds.Fixed(1) " s: " $(seconds * 1e3 / F64(steps)).Fixed(1)
+        " ms a step, " $(F64(steps * g.Batch) / seconds).Fixed(0) " tokens a second\n")
+
+    # a sample: the same model on a graph of one sequence, its parameters copied over
+    gen := nn.Graph<F32>(context, threads)
+    gm := model(gen, c.Size(), 0.0)
+    gen.Plan(r)
+    gen.Params().Copy(g.Params())
+    t1 := time.Now()
+    sample := try generate.Rerun(gen, gm, c, "\n", count, 0.8, r)
+    s1 := time.Since(t1)
+    try io.Print("--- " $count " characters, temperature 0.8, " $(F64(count) / (F64(s1) * 1e-9)).Fixed(0)
+        " characters a second (the context run again for each) ---\n" $sample "\n---\n")
+}

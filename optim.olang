@@ -17,11 +17,40 @@
 import "std/linalg"
 import "std/math"
 import "nn"
+import "kernels"
 
-# what a training loop asks of an optimizer: a step from the gradients the last Backward left (a constraint - AdamW
-# and Sgd satisfy it)
+# what a training loop asks of an optimizer: a step from the gradients the last Backward left, and the learning rate
+# to take the next one with - a schedule's (a constraint - AdamW and Sgd satisfy it)
 type Optimizer<T> trait {
     mut Step(g mut nn.Graph<<T>>&)
+    mut SetRate(rate F64)
+}
+
+# ---- schedules and clipping ----
+
+# the learning rate at step 0, 1, ...: rising linearly to peak over the first "warmup" steps, then down half a cosine
+# to "floor" at step "total", and floor after - GPT-3's schedule (Brown et al.), as nanoGPT has it. A function value,
+# so a loop asks it for each step's rate and an optimizer knows nothing of it
+fn WarmupCosine(peak F64, warmup I64, total I64, floor F64 = 0.0) fn(step I64) F64 {
+    return fn(step) {
+        if step < warmup { return peak * F64(step + 1) / F64(warmup) }
+        if step >= total { return floor }
+        progress F64 = F64(step - warmup) / F64(total - warmup)
+        return floor + 0.5 * (1.0 + math.Cos(math.Pi * progress)) * (peak - floor)
+    }
+}
+
+# scales every parameter's gradient down, all by one factor, so that their Euclidean norm together is at most "max" -
+# PyTorch's clip_grad_norm_ (max / (norm + 1e-6) when the norm is above max). Gives the norm before clipping, summed
+# in F64
+fn ClipGradNorm(g mut nn.Graph<<T>>&, max F64) F64 {
+    grads := g.ParamGrads()
+    norm F64 = math.Sqrt(kernels.SquaresF64(grads.Data))
+    if norm > max {
+        like <T>
+        grads.Scale(linalg.Cast(max / (norm + 1e-6), like))
+    }
+    return norm
 }
 
 # how weights are held back
@@ -120,6 +149,8 @@ fn AdamWProjected(g mut nn.Graph<<T>>&, rate F64 = 0.001, alpha F64 = 0.001, nor
     return AdamW<<T>>(g, rate, 0.9, 0.999, 1e-8, Regularizer.Projection(alpha, normalized))
 }
 
+fn (o mut AdamW<<T>>&) SetRate(rate F64) { o.Rate = rate }
+
 # one step from the gradients the last Backward left
 fn (o mut AdamW<<T>>&) Step(g mut nn.Graph<<T>>&) {
     match o.Reg {
@@ -175,6 +206,8 @@ type Sgd<T> struct(g mut nn.Graph<<T>>&, rate F64 = 0.01, Momentum F64 = 0, Nest
     u mut Array<<T>>& = Array<<T>>(g.ParamCount if Momentum != 0.0 else 0)
     space mut projectionSpace<<T>>& = projectionSpace<<T>>(g)
 }
+
+fn (o mut Sgd<<T>>&) SetRate(rate F64) { o.Rate = rate }
 
 fn (o mut Sgd<<T>>&) Step(g mut nn.Graph<<T>>&) {
     match o.Reg {
@@ -301,3 +334,23 @@ test "the input projection takes W <- W - (alpha / n) (W X^T) X, in place of wei
     o.Step(g)
     assert g.Value(w).MaxAbsDifference(want) < 1e-12
 }
+
+test "the schedule warms up linearly, follows half a cosine down to its floor and stays there" {
+    rate := WarmupCosine(1.0, 10, 110, 0.1)
+    assert rate(0) == 0.1 and rate(4) == 0.5 and rate(9) == 1.0
+    assert rate(10) == 1.0 and math.Abs(rate(60) - 0.55) < 1e-12
+    assert rate(110) == 0.1 and rate(1000) == 0.1
+    assert rate(30) > rate(31)
+}
+
+test "ClipGradNorm scales the gradients to the norm asked for, and leaves smaller ones alone" {
+    g, w, loss := quadratic(4.0, 2.0)                # gradients w - t: 3 and 4, norm 5 (Mse: (2/2) (w - t))
+    g.Forward(1)
+    g.Backward(loss)
+    assert math.Abs(ClipGradNorm(g, 10.0) - 5.0) < 1e-12
+    assert g.Grad(w).Get(0, 0) == 3.0
+    assert math.Abs(ClipGradNorm(g, 1.0) - 5.0) < 1e-12
+    assert math.Abs(g.Grad(w).Norm() - 1.0) < 1e-6
+    assert math.Abs(g.Grad(w).Get(0, 1) / g.Grad(w).Get(0, 0) - 4.0 / 3.0) < 1e-12
+}
+

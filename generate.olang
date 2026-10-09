@@ -1,0 +1,51 @@
+# generate - text from a trained language model, one token at a time: each new token drawn from the softmax of the
+# logits at the last position (divided by a temperature), appended, and the model run again.
+#
+# Rerun runs the whole context through the model for every token - a graph planned for one sequence of T rows, its
+# parameters copied from the trained graph - so a token costs a forward pass of T rows.
+
+import "std/math"
+import "std/rand"
+import "nn"
+import "train"
+import "datasets/text"
+
+# a token drawn from the softmax of logits / temperature - the most likely one when temperature is 0
+fn Sample(logits Array<F32>&, temperature F64, r mut rand.Rand&) I32 {
+    best I64 = 0
+    for i in range 1, logits.Len() {
+        if logits[i] > logits[best] { best = i }
+    }
+    if temperature <= 0.0 { return I32(best) }
+    total F64 = 0.0
+    for x in logits { total += math.Exp((F64(x) - F64(logits[best])) / temperature) }
+    u F64 = r.Float() * total
+    for i in range logits.Len() {
+        u -= math.Exp((F64(logits[i]) - F64(logits[best])) / temperature)
+        if u < 0.0 { return I32(i) }
+    }
+    return I32(best)
+}
+
+# "prompt" and "count" tokens after it, generated on g - a graph of the model planned for one sequence (Batch = T),
+# its parameters those of the trained one - running the last T tokens (all of them while there are fewer) through it
+# for each new token
+fn Rerun(g mut nn.Graph<F32>&, m train.LanguageModel&, c text.Corpus&, prompt String&, count I64, temperature F64,
+        r mut rand.Rand&) String ? text.TextError {
+    T := m.T
+    ids := try c.Encode(prompt)
+    all := List<I32>()
+    for id in ids { all.Push(id) }
+    g.Training = false
+    tokens := g.TokenData(m.Tokens)
+    targets := g.ClassData(m.Targets)
+    for i in range T { targets[i] = -1 }
+    for i in range count {
+        n := all.Len()
+        L I64 = n if n < T else T
+        for t in range T { tokens[t] = all[n - L + t] if t < L else 0 }
+        g.Forward(T)
+        all.Push(Sample(g.Value(m.Logits).Row(L - 1), temperature, r))
+    }
+    return c.Decode(all.ToArray())
+}

@@ -113,8 +113,8 @@ fn (n Norm&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
 }
 
 # a transformer block, pre-normalized: h = x + O(attention(Q(n1), K(n1), V(n1))), n1 = Norm1(x); then y = h +
-# Down(gelu(Up(Norm2(h)))), Up four times as wide as the block. With dropout, both branches are dropped out before
-# they are added back
+# Down(gelu(Up(Norm2(h)))), Up four times as wide as the block and gelu GPT-2's, through tanh. With dropout, both
+# branches are dropped out before they are added back
 type AttentionBlock struct(Norm1 Norm, Q Dense, K Dense, V Dense, O Dense, Norm2 Norm, Up Dense, Down Dense, Heads I64,
         T I64, Drop F64) {
     Norm1
@@ -152,7 +152,7 @@ fn (b AttentionBlock&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var {
     n := b.Norm1.Apply(g, x)
     a := g.Attention(b.Q.Apply(g, n), b.K.Apply(g, n), b.V.Apply(g, n), b.Heads, b.T, true)
     h := g.Add(x, dropped(g, b.O.Apply(g, a), b.Drop))
-    m := g.Gelu(b.Up.Apply(g, b.Norm2.Apply(g, h)))
+    m := g.GeluTanh(b.Up.Apply(g, b.Norm2.Apply(g, h)))
     return g.Add(h, dropped(g, b.Down.Apply(g, m), b.Drop))
 }
 

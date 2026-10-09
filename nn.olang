@@ -22,6 +22,7 @@ import "std/io"
 import "std/linalg"
 import "std/math"
 import "std/rand"
+import "std/time"
 import "ops"
 import "kernels"
 
@@ -53,6 +54,7 @@ type Op enum {
     Relu(x Var)
     LeakyRelu(x Var, slope F64)
     Gelu(x Var)
+    GeluTanh(x Var)                                 # GELU through tanh, GPT-2's
     Sigmoid(x Var)
     Tanh(x Var)
     Softmax(x Var)                                  # row by row
@@ -64,6 +66,47 @@ type Op enum {
     Dropout(x Var, p F64)                           # while training, each element zeroed with probability p
     SoftmaxCrossEntropy(logits Var, classes Var)    # the mean over the rows: a 1 x 1 loss
     Mse(a Var, b Var)                               # the mean of the squared differences: a 1 x 1 loss
+}
+
+# ---- profiling ----
+
+# the kinds of operation, by name: KindOf numbers an operation's kind as its position here
+KindNames := String&[
+    "Input", "Classes", "Tokens", "Constant", "Param", "MatMul", "Linear", "AddRow", "Add", "Sub", "Mul", "Scale",
+    "Relu", "LeakyRelu", "Gelu", "GeluTanh", "Sigmoid", "Tanh", "Softmax", "Embedding", "Positions", "LayerNorm",
+    "RmsNorm", "Attention", "Dropout", "SoftmaxCrossEntropy", "Mse"
+]
+
+fn KindOf(k Op) I64 {
+    return match k {
+        case Op.Input => 0
+        case Op.Classes => 1
+        case Op.Tokens => 2
+        case Op.Constant => 3
+        case Op.Param(_, _) => 4
+        case Op.MatMul(_, _, _, _) => 5
+        case Op.Linear(_, _, _) => 6
+        case Op.AddRow(_, _) => 7
+        case Op.Add(_, _) => 8
+        case Op.Sub(_, _) => 9
+        case Op.Mul(_, _) => 10
+        case Op.Scale(_, _) => 11
+        case Op.Relu(_) => 12
+        case Op.LeakyRelu(_, _) => 13
+        case Op.Gelu(_) => 14
+        case Op.GeluTanh(_) => 15
+        case Op.Sigmoid(_) => 16
+        case Op.Tanh(_) => 17
+        case Op.Softmax(_) => 18
+        case Op.Embedding(_, _) => 19
+        case Op.Positions(_, _, _) => 20
+        case Op.LayerNorm(_, _, _, _) => 21
+        case Op.RmsNorm(_, _, _) => 22
+        case Op.Attention(_, _, _, _, _, _) => 23
+        case Op.Dropout(_, _) => 24
+        case Op.SoftmaxCrossEntropy(_, _) => 25
+        case Op.Mse(_, _) => 26
+    }
 }
 
 # a recorded operation: what it is, its shape (Rows the planned batch when Batched), and where in the arena its value,
@@ -95,6 +138,8 @@ type Graph<T> struct(Batch I64, Threads I64 = 1) {
     workSize mut I64 = 0
     scratchOffset mut I64 = 0       # attention's backward: a T x T matrix per task
     scratchSize mut I64 = 0
+    Profiling mut Bool = false      # with it set, Times collects where Forward and Backward spend their time:
+    Times mut Array<I64>& = Array<I64>(2 * KindNames.Len())  # ns, Times[2 k] forward, Times[2 k + 1] backward, kind k
     planned mut Bool = false
 }
 
@@ -225,6 +270,7 @@ fn (g mut Graph<<T>>&) like(kind Op, x Var) Var {
 fn (g mut Graph<<T>>&) Relu(x Var) Var { return g.like(Op.Relu(x), x) }
 fn (g mut Graph<<T>>&) LeakyRelu(x Var, slope F64) Var { return g.like(Op.LeakyRelu(x, slope), x) }
 fn (g mut Graph<<T>>&) Gelu(x Var) Var { return g.like(Op.Gelu(x), x) }
+fn (g mut Graph<<T>>&) GeluTanh(x Var) Var { return g.like(Op.GeluTanh(x), x) }
 fn (g mut Graph<<T>>&) Sigmoid(x Var) Var { return g.like(Op.Sigmoid(x), x) }
 fn (g mut Graph<<T>>&) Tanh(x Var) Var { return g.like(Op.Tanh(x), x) }
 fn (g mut Graph<<T>>&) Softmax(x Var) Var { return g.like(Op.Softmax(x), x) }
@@ -314,7 +360,7 @@ fn inputs(k Op) (I64, I64, I64) {
         case Op.AddRow(x, b), Op.Add(x, b), Op.Sub(x, b), Op.Mul(x, b), Op.Mse(x, b) { return x, b, -1 }
         case Op.SoftmaxCrossEntropy(x, b) { return x, b, -1 }
         case Op.Scale(x, _), Op.LeakyRelu(x, _) { return x, -1, -1 }
-        case Op.Relu(x), Op.Gelu(x), Op.Sigmoid(x), Op.Tanh(x), Op.Softmax(x) { return x, -1, -1 }
+        case Op.Relu(x), Op.Gelu(x), Op.GeluTanh(x), Op.Sigmoid(x), Op.Tanh(x), Op.Softmax(x) { return x, -1, -1 }
         case Op.Embedding(t, w), Op.Positions(t, w, _), Op.RmsNorm(t, w, _) { return t, w, -1 }
         case Op.LayerNorm(x, a, b, _), Op.Attention(x, a, b, _, _, _) { return x, a, b }
         case Op.Dropout(x, _) { return x, -1, -1 }
@@ -499,43 +545,55 @@ fn (g mut Graph<<T>>&) Forward(n I64) {
     if n < 1 or n > g.Batch { mismatch("Forward on " $n " rows of a graph planned for " $(g.Batch)) }
     g.N = n
     th := g.Threads
-    like <T>
     for i in range g.nodes.Len() {
         nd := g.nodes[i]
-        y := g.Value(Var(i))
-        match nd.Kind {
-            case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
-            case Op.MatMul(a, b, ta, tb) { ops.MatMul(y, g.Value(a), ta, g.Value(b), tb, th, g.work()) }
-            case Op.Linear(x, w, b) { ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th, g.work()) }
-            case Op.AddRow(x, b) { ops.AddRow(y, g.Value(x), g.Value(b)) }
-            case Op.Add(a, b) { ops.Add(y, g.Value(a), g.Value(b)) }
-            case Op.Sub(a, b) { ops.Sub(y, g.Value(a), g.Value(b)) }
-            case Op.Mul(a, b) { ops.Mul(y, g.Value(a), g.Value(b)) }
-            case Op.Scale(x, k) { ops.Scale(y, g.Value(x), linalg.Cast(k, like)) }
-            case Op.Relu(x) { ops.Relu(y, g.Value(x)) }
-            case Op.LeakyRelu(x, slope) { ops.LeakyRelu(y, g.Value(x), linalg.Cast(slope, like)) }
-            case Op.Gelu(x) { ops.Gelu(y, g.Value(x)) }
-            case Op.Sigmoid(x) { ops.Sigmoid(y, g.Value(x)) }
-            case Op.Tanh(x) { ops.Tanh(y, g.Value(x)) }
-            case Op.Softmax(x) { ops.Softmax(y, g.Value(x)) }
-            case Op.Embedding(t, w) { ops.Embedding(y, g.classData(t), g.Value(w)) }
-            case Op.Positions(x, w, T) { ops.Positions(y, g.Value(x), g.Value(w), T, g.Pos) }
-            case Op.LayerNorm(x, a, b, eps) {
-                ops.LayerNorm(y, g.Value(x), g.Value(a), g.Value(b), linalg.Cast(eps, like), g.saved(Var(i)))
-            }
-            case Op.RmsNorm(x, a, eps) { ops.RmsNorm(y, g.Value(x), g.Value(a), linalg.Cast(eps, like), g.saved(Var(i))) }
-            case Op.Attention(q, k, v, heads, T, causal) {
-                if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
-                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(Var(i)), th)
-            }
-            case Op.Dropout(x, p) {
-                if g.Training { ops.Dropout(y, g.Value(x), g.saved(Var(i)), p, g.Rng) } else { y.Copy(g.Value(x)) }
-            }
-            case Op.SoftmaxCrossEntropy(z, c) {
-                y.Data[0] = ops.SoftmaxCrossEntropy(g.Value(z), g.classData(c), g.saved(Var(i)))
-            }
-            case Op.Mse(a, b) { y.Data[0] = ops.Mse(g.Value(a), g.Value(b)) }
+        if g.Profiling {
+            t0 := time.Now()
+            g.forward(Var(i), nd, th)
+            g.Times[2 * KindOf(nd.Kind)] += time.Since(t0)
+        } else {
+            g.forward(Var(i), nd, th)
         }
+    }
+}
+
+# node v's forward: its value from its inputs'
+fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
+    like <T>
+    y := g.Value(node)
+    match nd.Kind {
+        case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
+        case Op.MatMul(a, b, ta, tb) { ops.MatMul(y, g.Value(a), ta, g.Value(b), tb, th, g.work()) }
+        case Op.Linear(x, w, b) { ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th, g.work()) }
+        case Op.AddRow(x, b) { ops.AddRow(y, g.Value(x), g.Value(b)) }
+        case Op.Add(a, b) { ops.Add(y, g.Value(a), g.Value(b)) }
+        case Op.Sub(a, b) { ops.Sub(y, g.Value(a), g.Value(b)) }
+        case Op.Mul(a, b) { ops.Mul(y, g.Value(a), g.Value(b)) }
+        case Op.Scale(x, k) { ops.Scale(y, g.Value(x), linalg.Cast(k, like)) }
+        case Op.Relu(x) { ops.Relu(y, g.Value(x)) }
+        case Op.LeakyRelu(x, slope) { ops.LeakyRelu(y, g.Value(x), linalg.Cast(slope, like)) }
+        case Op.Gelu(x) { ops.Gelu(y, g.Value(x)) }
+        case Op.GeluTanh(x) { ops.GeluTanh(y, g.Value(x)) }
+        case Op.Sigmoid(x) { ops.Sigmoid(y, g.Value(x)) }
+        case Op.Tanh(x) { ops.Tanh(y, g.Value(x)) }
+        case Op.Softmax(x) { ops.Softmax(y, g.Value(x)) }
+        case Op.Embedding(t, w) { ops.Embedding(y, g.classData(t), g.Value(w)) }
+        case Op.Positions(x, w, T) { ops.Positions(y, g.Value(x), g.Value(w), T, g.Pos) }
+        case Op.LayerNorm(x, a, b, eps) {
+            ops.LayerNorm(y, g.Value(x), g.Value(a), g.Value(b), linalg.Cast(eps, like), g.saved(node))
+        }
+        case Op.RmsNorm(x, a, eps) { ops.RmsNorm(y, g.Value(x), g.Value(a), linalg.Cast(eps, like), g.saved(node)) }
+        case Op.Attention(q, k, v, heads, T, causal) {
+            if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
+            ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), th)
+        }
+        case Op.Dropout(x, p) {
+            if g.Training { ops.Dropout(y, g.Value(x), g.saved(node), p, g.Rng) } else { y.Copy(g.Value(x)) }
+        }
+        case Op.SoftmaxCrossEntropy(z, c) {
+            y.Data[0] = ops.SoftmaxCrossEntropy(g.Value(z), g.classData(c), g.saved(node))
+        }
+        case Op.Mse(a, b) { y.Data[0] = ops.Mse(g.Value(a), g.Value(b)) }
     }
 }
 
@@ -585,7 +643,13 @@ fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
     for i >= 0 {
         nd := g.nodes[i]
         if nd.GradOffset >= 0 and g.written[i] {
-            g.backward(Var(i), nd, th)
+            if g.Profiling {
+                t0 := time.Now()
+                g.backward(Var(i), nd, th)
+                g.Times[2 * KindOf(nd.Kind) + 1] += time.Since(t0)
+            } else {
+                g.backward(Var(i), nd, th)
+            }
         }
         i--
     }
@@ -655,6 +719,9 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
         }
         case Op.Gelu(x) {
             if g.nodes[x].GradOffset >= 0 { ops.GeluBackward(dy, g.Value(x), g.Grad(x), g.acc(x)) }
+        }
+        case Op.GeluTanh(x) {
+            if g.nodes[x].GradOffset >= 0 { ops.GeluTanhBackward(dy, g.Value(x), g.Grad(x), g.acc(x)) }
         }
         case Op.Sigmoid(x) {
             if g.nodes[x].GradOffset >= 0 { ops.SigmoidBackward(dy, g.Value(v), g.Grad(x), g.acc(x)) }
@@ -932,5 +999,18 @@ test "dropout: a fixed mask's gradient agrees, the kept are scaled up, and off w
     g.Training = false
     g.Forward(8)
     assert g.Value(d).MaxAbsDifference(t) == 0.0
+}
+
+test "GELU through tanh agrees with central differences, and within 1e-3 of the exact GELU" {
+    g := Graph<F64>(4)
+    w := normal(g, 4, 8)
+    a := g.GeluTanh(g.Scale(w, 2.0))
+    b := g.Gelu(g.Scale(w, 2.0))
+    loss := g.Mse(a, normal(g, 4, 8))
+    r := rand.Rand(15)
+    g.Plan(r)
+    assert GradientError(g, loss, 4) < 1e-6
+    g.Forward(4)
+    assert g.Value(a).MaxAbsDifference(g.Value(b)) < 1e-3
 }
 
