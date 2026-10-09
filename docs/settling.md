@@ -64,8 +64,9 @@ cannot create an equilibrium that does not exist, and an equilibrium that is uns
 attracts however small `dt` is.
 
 **When it converges** (the contraction argument). Let `L = max rho'` (1 for `tanh` and the hard sigmoid), `rho_W` the
-largest absolute incoming weight sum of any neuron (its **incoming mass**, counting every block that feeds it, one-way
-inputs included, with their sources' activations bounded by 1), and `kappa = L rho_W` the feedback gain. If
+largest absolute incoming weight sum of any neuron (its **incoming mass**, counting every recurrent block that feeds
+it - a block whose source is an input region is folded into the constant `c`, and a constant does not enter the
+map's Lipschitz constant; *decided at implementation*, section 6), and `kappa = L rho_W` the feedback gain. If
 `kappa < 1` the map `T(v) = c + W rho(v)` is a contraction in the sup norm, so there is one equilibrium `v*`, and:
 
 ```text
@@ -85,7 +86,21 @@ For a cold start (`||r_0|| ~ 1`) and `tau = 1e-3`, the bound gives:
 A warm start (the previous equilibrium under a changed drive) begins with a smaller `r_0` and saves
 `ln(1/||r_0||) / ln(1/q)` sweeps. The condition is sufficient, not necessary: a trained circuit may leave the certified
 region (`kappa >= 1`), and then only the residual test and the refusal remain. Since `rho_W < 1` bounds every single
-weight, a certified circuit has `|W[e]| < 1` everywhere - a fact the hardware mapping uses (section 4).
+recurrent weight, a certified circuit has `|W[e]| < 1` on every recurrent synapse - a fact the hardware mapping uses
+(section 4); the folded input blocks are not bounded by the certificate, so the board's range argument (4.2) needs
+its own bound on them, the incoming mass with the inputs counted (phase 3).
+
+**A nudged phase** adds the force's own feedback. The force `beta f(s)` on a readout neuron falls as its activity
+rises - by `p (1 - p) / T <= 1 / (4 T)` per unit of `s` for the cross-entropy force, by 1 for the squared error - so a
+phase nudged with `beta > 0` has a negative self-feedback of up to `beta lambda` (`lambda = 1 / (4 T)` or 1) beside
+the circuit's gain. At a full step it overshoots: the sweep's Jacobian gets diagonal entries down to `-beta lambda`,
+and where `beta lambda` nears 1 the iteration swings in a period-2 cycle (measured: at `beta = 0.5`, `T = 0.25` a
+plus phase took 627 sweeps at `dt = 1` and 27 at `dt = 0.75`). *Decided at implementation*: a phase nudged with
+`beta > 0` steps at `dt_beta = dt / (1 + beta lambda)`, which keeps every diagonal entry of the sweep's Jacobian
+nonnegative; the nudge then only damps, and the sweep contracts at `q_beta = 1 - dt_beta (1 - kappa)` - exactly for
+the squared error (checked), and for the cross-entropy up to the force's off-diagonal terms, which cancel its diagonal
+ones while the readout's slopes `rho'` are equal and add at most `beta (1 - rho') / (4 T)` otherwise. A phase nudged
+with `beta < 0` pushes away from the target, a positive self-feedback, and keeps `dt`.
 
 **Energy** (Hopfield 1984). With symmetric effective weights, no adaptation and a monotone `rho`, the continuous
 dynamics descend
@@ -114,7 +129,7 @@ connectivity density, each with an optional frozen flag. A reciprocal projection
 lateral block.
 
 **Initialization.** Weights are drawn Glorot-uniform (Glorot & Bengio 2010) from a seeded generator and then
-**certified**: all weights are multiplied by one factor so that the largest incoming mass equals the target
+**certified**: all recurrent weights are multiplied by one factor so that the largest incoming mass equals the target
 `kappa_0`. oann's default is `kappa_0 = 0.9`, which by the table above bounds a cold settle at about 70 sweeps (at the
 default tolerances of 1.10). A Glorot draw is not certified by itself - its incoming mass grows like the square root of
 the fan-in - so the factor shrinks wide layers. Training may optionally project back into the certified set after each
@@ -176,7 +191,8 @@ and 1; a larger `beta` clears rounding noise and shortens the nudged phases, a s
 and small `beta` (1e-3) only in gradient checks, where `tau` follows the rule above. The step is taken by any oann
 optimizer on the gradient region; oann's default is Adam (Kingma & Ba 2015) at `lr = 1e-3`, `(0.9, 0.999)`, from
 DESIGN.md section 5. A nudged phase starts from `s0` and its initial residual is at most `beta`, so it needs about
-`ln(tau / beta) / ln q` sweeps.
+`ln(tau / beta) / ln q_beta` sweeps, at the nudged step of 1.2 (`q_beta = 0.933` at `beta = 0.5`, `T = 0.25`,
+`kappa = 0.9`: 86 sweeps at the lesson tolerance).
 
 ### 1.5 Reward learning: three factors (Barto, Sutton & Anderson 1983; Williams 1992; Izhikevich 2007; Frémaux & Gerstner 2016)
 
@@ -528,63 +544,114 @@ fn main() ? agent.NotSettled + io.IoError {
 }
 ```
 
-A custom circuit taught by contrast, batch 128:
+A custom circuit taught by contrast, batch 32 - as built (`circuit.olang`, `examples/mnist_settle.olang`):
 
 ```olang
-c := circuit.Circuit<F32>(128)                               # rows (the batch)
-pixels := c.Input(784)
-hidden := c.Region(256)
-digits := c.Readout(10)                                      # one softmax group
-c.Project(pixels, hidden, circuit.Wiring.OneWay, r)          # Glorot-uniform
-c.Project(hidden, digits, circuit.Wiring.Reciprocal, r)
-c.Plan()
-c.Certify(0.9)                                               # scale so every neuron's incoming mass is at most 0.9
-opt := optim.AdamW<F32>(c.Parameters(), 1e-3)
-lesson := circuit.Lesson(0.5, 0.25)                          # beta, T; tolerance and budget come from the certificate
-for b in train.Batches() {
+c := circuit.Circuit<F32>(32)                                # rows (the batch)
+pixels := c.Input(784)                                       # linear by default: the drive is the activity
+hidden := c.Hidden(128)                                      # tanh by default
+digits := c.Readout(10)                                      # one softmax group, CrossEntropy(T = 0.25)
+c.Project(pixels, hidden, circuit.Wiring.OneWay)
+c.Project(hidden, digits)                                    # Reciprocal by default
+c.Plan(r)                                                    # lays out the arena, draws Glorot-uniform weights
+c.Certify(0.9)                                               # scale the recurrent blocks to a gain of 0.9
+opt := circuit.Adam<F32>(c, 1e-3)
+lesson := circuit.Lesson(0.5)                                # beta; tolerance and budget come from the certificate
+for b in range train.Batches() {
     n := train.Fill(b, c.DriveData(pixels), c.LabelData(digits))
     try c.Teach(n, lesson)                                   # free, +beta, -beta, contrast into the gradient region
-    opt.Step()
+    opt.Step(c)
 }
 ```
 
-The core surface:
+The core surface, as built:
 
 ```olang
-type Phase enum {
-    Free
-    Plus
-    Minus
-    Scratch
-}
+type Phase enum { Free  Plus  Minus  Scratch }               # one per line in the source
+type Rho enum { Tanh  HardSigmoid  Linear  LifRate(leak F64, threshold F64) }
+type Neuron enum { Rate(rho Rho)  Lif(leak F64, threshold F64, synapse F64, window I64) }
+type Cost enum { CrossEntropy(temperature F64)  Squared }
+type Wiring enum { OneWay  Reciprocal }
+error NotSettled { BUDGET  NONFINITE }
 
-error NotSettled {
-    BUDGET          # the sweeps ran out before every row met the tolerance
-    NONFINITE
-}
-
-fn (c mut Circuit<<T>>&) Settle(p Phase, budget I64, tolerance <T>) Settlement ? NotSettled  # qualified, warm
+fn (c mut Circuit<<T>>&) Input(size I64, model Neuron = Neuron.Rate(Rho.Linear)) Region
+fn (c mut Circuit<<T>>&) Hidden(size I64, model Neuron = Neuron.Rate(Rho.Tanh)) Region
+fn (c mut Circuit<<T>>&) Readout(size I64, fit Cost = Cost.CrossEntropy(0.25), model Neuron = ...) Region
+fn (c mut Circuit<<T>>&) Project(pre Region, post Region, kind Wiring = Reciprocal, density F64 = 1, frozen Bool = false) Projection
+fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&)
+fn (c mut Circuit<<T>>&) Settle(p Phase, budget I64, tolerance F64) Settlement ? NotSettled  # qualified, warm
 fn (c mut Circuit<<T>>&) Run(p Phase, sweeps I64) Settlement               # finite phase, residual reported
 fn (c mut Circuit<<T>>&) Warm(p Phase, from Phase)                         # a nudged phase starts from the free state
-fn (c mut Circuit<<T>>&) Nudge(p Phase, group Region, beta <T>, temperature <T>)  # toward LabelData(group)
-fn (c mut Circuit<<T>>&) Residual(p Phase, out mut Array<<T>>&)           # per row, no settling
-fn (c mut Circuit<<T>>&) Contrast(beta <T>)                                # Plus/Minus -> gradient region
-fn (c mut Circuit<<T>>&) Value(p Phase) Matrix<<T>>                        # views of state, as g.Value(v)
-fn (c Circuit<<T>>&) Rate() <T>                                            # the certified q, or 1 when not certified
-fn (a mut Agent<<T>>&) Step(obs Array<<T>>&, reward <T>) I64 ? NotSettled
-fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) Settlement ? NotSettled   # private; changes nothing
+fn (c mut Circuit<<T>>&) Nudge(p Phase, beta F64)                          # every readout, by its Cost
+fn (c mut Circuit<<T>>&) Residual(p Phase, out mut Array<<T>>&) F64        # per row, no settling
+fn (c mut Circuit<<T>>&) Totals(p Phase) linalg.Matrix<<T>>                # every neuron's total input
+fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true)          # Plus/Minus -> gradient region
+fn (c mut Circuit<<T>>&) Teach(n I64, l Lesson) I64 ? NotSettled           # free, +beta, -beta, contrast
+fn (c mut Circuit<<T>>&) DriveGrad(reg Region, out mut Array<<T>>&, beta F64, centered Bool = true)
+fn (c mut Circuit<<T>>&) Gain() F64                                        # kappa
+fn (c mut Circuit<<T>>&) Rate(beta F64 = 0) F64                            # q (of a phase nudged with beta), or 1
+fn (c mut Circuit<<T>>&) Certify(target F64 = 0.9)                         # one factor on every recurrent block
+fn (c mut Circuit<<T>>&) Restrain(target F64 = 0.9)                        # project back into the certified set
+fn (c mut Circuit<<T>>&) Energy(p Phase, row I64) F64
+fn (c Circuit<<T>>&) Value(p Phase) linalg.Matrix<<T>>                     # views of state, as g.Value(v)
+fn (c Circuit<<T>>&) Loss(p Phase) F64
+fn (a mut Agent<<T>>&) Step(obs Array<<T>>&, reward <T>) I64 ? NotSettled   # phase 2
+fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) Settlement ? NotSettled    # phase 2: private; changes nothing
 ```
 
 ### 2.9 Phases of work
 
 Settling networks follow the transformer work (section 6).
 
-1. `Circuit` with `tanh` neurons, `Settle`/`Run`/`Residual`, the certificate, supervised `Teach`, and the checks of
-   5.1-5.2 in F64.
+1. **Done (2026-10-09, `circuit.olang`):** `Circuit` with `tanh` neurons, `Settle`/`Run`/`Residual`, the certificate,
+   supervised `Teach`, and the checks of 5.1-5.2.1-3 in F64; and the neuron enum with a working `Lif` variant (4.6).
+   Results in 2.10 and 5.
 2. The `Agent`: critic, `Trace`, `Memory`, `Arousal`, the moment loop, checkpoints; the end-to-end tasks of 5.5.
 3. The fixed-point simulation of the board engine (4.2, 5.6); the sparse-code store, extra readout groups, CSR
    projections for large circuits.
 4. The consolidator and `Sleep` on the `Graph`; the PYNQ-Z2 overlay; further neuron models (spiking, section 4.6).
+
+### 2.10 As built: phase 1
+
+One module, `circuit.olang`: the circuit, its neurons, learning, an Adam over its parameters, and its tests (`make
+test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/mnist_settle.olang` run it end to end.
+
+- **Records and one arena.** Regions and projections are plain records in `List`s, their handles numbers.
+  `Plan(r)` lays out one `Array<T>`: the parameters (each projection's `[post, pre]` block in recording order, then a
+  bias per neuron - an input's is unused), their gradients in the same layout, each region's drive (`Rows x size`,
+  contiguous, so a loader fills it as it fills a graph's input), the squared-error readouts' targets, four phases of
+  two slots of state, and the workspace (the constant, the totals, spike counts, `dS`, the per-row residuals, the
+  masses). Classes are an `Array<I32>`, connectivity masks an `Array<U8>`. A settle, a lesson, a contrast and an Adam
+  step allocate nothing.
+- **The double buffer is a transaction.** A phase has a committed slot and a candidate slot. A settle copies the
+  committed state into the candidate, sweeps there in place (the totals are their own workspace, so a sweep needs no
+  second copy of the state) and commits by flipping the phase's slot; a refusal leaves the committed state as it was,
+  bit for bit (checked).
+- **A sweep**: the totals - the constant plus each recurrent block's transport (`linalg.Gemv` per batch row; a
+  reciprocal block's two directions read the one `[post, pre]` block, as rows dotted and as rows added) plus the
+  nudge; a pass for the residual of every row; on qualifying, the commit; otherwise a pass stepping `v += dt r`,
+  `s = rho(v)` (`linalg.FastTanh`). The residual has its own pass so that the committed state is the one whose
+  residual was measured.
+- **The constant** (drives, biases, folded blocks) is made once per settle, and once per lesson: the nudged phases
+  reuse the free phase's. Input regions take `v = d`, `s = rho(d)`; they have no bias, since their state does not
+  differ between phases and so no contrast could teach one.
+- **Damping** (`Attempts`) splits the budget into parts with `dt` halved in each, continuing from where the last part
+  ended. **Nudged phases** step at `dt / (1 + beta lambda)` (1.2).
+- **Budgets and tolerances**: `LessonTolerance(beta)` is 1.4's rule with `kappa` held at most 0.9, so that a circuit
+  trained out of the certified region still has one; `Budget(tolerance, beta)` is twice the certified cold need
+  (`q` held at most 0.95) and at least 128. Tolerances and nudges are `F64`, as std/linalg's `alpha` and `beta` are.
+- **The contrast** is the rank-2 form, computed a block row at a time with four batch rows per pass over the row, so
+  the row stays in the first-level cache; masked synapses and frozen blocks get 0. Checked against its definition.
+- **The optimizer** is `circuit.Adam<T>` over the parameter region, Kingma and Ba's update in one pass. oann's
+  `optim` steps an `nn.Graph`; a flat-region entry point there would let every oann optimizer serve both (follow-up).
+- **The encoder's gradient** is `DriveGrad(region, out, beta)`, of the mean cost over the rows, so it adds to a graph's
+  loss gradient directly.
+- **Spiking**: 4.6.
+- **Cost, measured** (784-128-10, batch 32, F32, on a shared four-core machine): a lesson about 4.5 ms - the folded
+  constant 0.9 ms, about 40 sweeps over the three settles at about 70 us each, the contrast 0.7 ms, Adam 0.1 ms. The
+  folded 784-wide block is a matrix-vector product per batch row, read 32 times; std/linalg's blocked `Gemm` would do
+  it at several times the speed but allocates its packing panels per call in this compiler, and the runtime's chunk
+  pool then leaks them (DESIGN.md section 8) - the workspace `Gemm` now on olang master is the fix to take up.
 
 ---
 
@@ -786,11 +853,44 @@ The rate neuron is a leaky integrator, a LIF neuron without spikes, stepped in t
 DESIGN section 14 question 3 imagines. Replacing `s` by spike trains turns each GEMV into event-driven column
 accumulation (additions, no multiplies), and the contrast into correlations of spike counts in the two phases; spiking
 variants of equilibrium propagation exist in the literature (O'Connor, Gavves and Welling 2019; EqSpike, Martin et al.
-2021 - to be checked before relying on them). On this board an accumulate-only lane costs LUTs, not a DSP, so the 220-DSP
+2021 - to be checked before relying on them; neither could be reached from this environment, so what follows is built
+from the LIF neuron's textbook dynamics and this document's own phases). On this board an accumulate-only lane costs LUTs, not a DSP, so the 220-DSP
 limit stops being the cap on parallelism and BRAM ports become it. The cost is variance: estimating a small contrast
 from spike counts needs long integration windows, multiplying the sweep count. The design consequence for oann is small
 and worth taking now: the neuron model is a closed enum in the plan (`Neuron.Rate(...)`, later `Neuron.Lif(...)`), so the
 settle loop, phases, contrast and moment loop do not change when spikes arrive.
+
+**As built (phase 1, the user's "we want spiking set up").** `Neuron.Lif(leak, threshold, synapse, window)` is a
+working variant, not a stub. A spiking circuit's Hidden and Readout neurons are all `Lif`; its inputs stay rate-coded
+(`s = rho(d)`, folded into a constant current). One sweep is one time step:
+
+```text
+syn    <- syn + synapse (W . spikes_{t-1} - syn)        a synaptic current per neuron, through the same transport
+I       = c + syn  (+ beta f(trace) on a nudged readout)
+u      <- u + leak (I - u)                              leak = the step over the membrane time constant
+spike   = u >= threshold ;  u <- u - threshold if spike  reset by subtraction, at most one spike a step
+trace  <- trace + (4 / window) (spike - trace)          a running rate, what a nudge's force reads
+```
+
+A settle runs whole **windows**; at a window's end the activity `s` becomes the window's spike count per step, and a
+row's residual is the largest change of a rate since the window before. It qualifies when every row's rates have
+stopped moving to within the tolerance (default `2 / window`: two spikes); refusal, commit, warm starts, phases and
+`Contrast` are the rate circuit's, read on spike counts. Two choices were forced by measurement: the force reads the
+**rate trace**, updated every step, because a force recomputed once a window from the window's rates swung from
+window to window where the rate curve is steep (residual stuck at 0.023); and reset is **by subtraction**, which
+keeps the discrete-time rate within one step's period of the continuous-time formula instead of rounding the period
+up to a whole step (a staircase rate curve, whose small nudges change no count at all).
+
+`Rho.LifRate(leak, threshold)` is the rate model of these neurons: `s = 1 / (tau ln(v / (v - threshold)))` above the
+threshold, 0 below, at most 1, with `tau = -1 / ln(1 - leak)` - the steady rate under the constant drive `v`. A rate
+circuit of `LifRate` neurons is the mean field the spiking one is compared with.
+
+**Limits, stated.** No certificate: the rate curve's slope is unbounded at the threshold, so `Gain` is infinite and a
+spiking settle has only its empirical window test. No refractory period, one spike a step at most, deterministic
+neurons (no noise), inputs as constant currents rather than spike trains, the transport dense (a product on a 0/1
+vector, not the event-driven accumulation of the board). Spike-count contrasts are noisy where the feedback that
+carries them is weak - hidden neurons' contrasts need long windows; a neuron near its threshold fires on fluctuations
+its rate model ignores; and a lesson costs `window`s of steps, about 1 000 steps at `window = 256` once warm.
 
 ---
 
@@ -884,20 +984,48 @@ the F64 result within the bound.
    slices and 140 BRAM36 blocks, about 4.9 Mbit; Vivado and Vitis HLS; PYNQ overlays driven from the ARM cores).
    Consequences in section 4: 16-bit fixed point on certified circuits, a 64-lane descriptor-driven engine, at most
    about 197 k resident 16-bit weights, learning on the ARM cores by default.
+3. **Spiking set up from the start** (the user, answering open question 4: "We want spiking set up"): the neuron model
+   is a closed enum with a working leaky integrate-and-fire variant (4.6), aimed at the PYNQ-Z2.
+
+**Taken at implementation (phase 1, 2026-10-09)** - details within the design, each recorded where it applies:
+
+4. **Where it lives**: `circuit.olang` inside oann (open question 2, as recommended).
+5. **The gain counts recurrent synapses only** (1.2): a folded input block is a constant of the map, so it neither
+   enters `kappa` nor is scaled by `Certify`, which multiplies every recurrent block by one factor. (The document had
+   counted input blocks too; that bounds `|v|` for the board, which needs it as a separate check, but it is not the
+   contraction's constant, and certifying with it would have shrunk the 784-wide input blocks to near nothing.)
+6. **A phase nudged with `beta > 0` steps at `dt / (1 + beta lambda)`** (1.2), `lambda` the force's largest self-slope
+   (`1 / (4 T)` cross-entropy, 1 squared error) - without it the default lesson (`beta = 0.5`, `T = 0.25`) refused
+   every plus phase on XOR. `Rate(beta)` and `Budget(tolerance, beta)` use that step.
+7. **Input regions** are linear by default (the drive is the activity) and have no bias; any region may take a drive.
+8. **Handles and recording follow `Graph`**: `Plan(r)` draws the weights (Glorot-uniform, masked by a Bernoulli draw
+   where `density < 1`), `Project` takes no generator; the method making a hidden region is `Hidden` (the sketch's
+   `Region` would read as a constructor of the handle type).
+9. **The double buffer is per phase, committed and candidate** (2.10); a sweep runs in place in the candidate.
+10. **Damping continues** from where an attempt ended rather than restarting from the warm start.
+11. **Tolerances, nudges and certificate targets are `F64`**, whatever `T` is, as std/linalg's `alpha`/`beta` are.
+12. **`LessonTolerance` holds `kappa` at most 0.9** and `Budget` is twice the certified need (q at most 0.95), at least 128.
+13. **The nudge** is per phase and applies to every readout by its own `Cost`; a cross-entropy readout reads
+    `LabelData`, a squared-error one `TargetData`. The temperature lives in the readout's cost.
+14. **`circuit.Adam`** steps the parameter region until oann's optimizers take a flat region.
+15. **`DriveGrad`** is the gradient of the cost averaged over the rows, as `Contrast`'s is.
+16. **Spiking** (4.6): rates as spike counts over windows; residual = a rate's change from the last window; the
+    nudge reads a per-neuron rate trace (time constant a quarter window); reset by subtraction; a synaptic current
+    per neuron; `LifRate` as the rate model; the default `LifNeuron(leak 0.1, threshold 1, synapse 0.25, window 256)`.
 
 **Open questions**
 
 1. **Scope and order within settling networks.** Recommended: the circuit and the agent (phases 1-2) first; the
    sparse-code store, readout groups and sparse connectivity next; the consolidator and sleep last, on the existing
    `Graph`.
-2. **Where it lives.** Modules inside oann (`circuit`, `agent`, `memory`, `arousal`) sharing `Matrix` and the planner, or
-   a separate package depending on oann? Recommended: inside oann.
+2. *(Taken: inside oann - decision 4.)* **Where it lives.** Modules inside oann (`circuit`, `agent`, `memory`,
+   `arousal`) sharing `Matrix` and the planner, or a separate package depending on oann? Recommended: inside oann.
 3. **Vector math in olang.** Write fast `tanh`/`exp` approximations in the matrix library (no language change), or take up
    vectorized math functions as an olang question (X8 now forbids replacing a library call)? Recommended: library now;
    the transformer round is the first real test, and the olang question is raised if the library version is not fast
    enough there.
-4. **Spiking.** Should the neuron model be a pluggable enum from the first version (recommended; costs one `match`), and
-   is a LIF model with spike-count contrasts the spiking direction you mean?
+4. *(Answered: yes - decision 3.)* **Spiking.** Should the neuron model be a pluggable enum from the first version
+   (recommended; costs one `match`), and is a LIF model with spike-count contrasts the spiking direction you mean?
 5. **Batched lives.** Is a single continuing stream enough at first, or are batched streams (`B` rows sharing weights,
    per-row eligibility) needed early for faster experiments? Recommended: `B = 1` first; the arena already plans `B` rows.
 6. **Learning on the board.** PS-only learning with quantized copies pushed to the PL (the default of 4.4), or the fused

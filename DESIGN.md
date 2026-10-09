@@ -376,3 +376,14 @@ data/, build/           downloads and build output, not in git
 
 Each file is one olang module, imported by its path relative to the importing file without the extension
 (`import "../datasets/mnist"`). Random numbers are std/rand's, times std/time's.
+
+## 16. Settling networks (`circuit.olang`)
+
+Beside the graph, `circuit.Circuit<T>` is the second recorded structure: a network of regions whose neurons settle to
+an equilibrium, taught by equilibrium propagation (contrasting a free settle with nudged ones) - same `Matrix`, same
+one-arena discipline, nothing allocated per settle, lesson or step. Its neuron model is a closed enum with rate
+neurons and a working leaky integrate-and-fire variant. Phase 1 is built: the circuit, the certificate and refusal,
+`Teach`, gradient checks in F64 (the estimate's error falls as beta^2), XOR with rate and with spiking neurons, and
+MNIST at 97.5% with a 784-128-10 circuit. The design, the decisions taken building it and the measurements are
+docs/settling.md (sections 2.10, 4.6, 5.7, 6). `make test` runs its checks; `examples/xor_settle.olang`,
+`examples/xor_spiking.olang` and `examples/mnist_settle.olang` run it end to end.
