@@ -593,10 +593,13 @@ region in it); resident memory grows by 68-76 kB over the first 20 steps and by 
   fixed the pool (O8b) and gave std/linalg `GemmWorkspace`; the reproducer and the copy are gone.
 - `repro/capturedfn.olang` - a lambda that captures a function value and calls it (`fn(d, g, v) { return d + f(g, v)
   }`) leaves an indirect call per element even when everything is inlined: 3.1 ns an element against 0.55 written
-  out (still on 9621af3: 3.7-4.9 against 0.6-1.1 at a load of 8). `ops.backward2` runs its loops itself.
+  out (still on 9621af3: 3.7-4.9 against 0.6-1.1 at a load of 8). `ops.backward2` runs its loops itself. Fixed by olang
+  edf8238 (function values became a code and environment pair; 0.54-0.77 against 0.53-0.58 on 472373d); the reproducer
+  is gone.
 - `repro/ctorunstored.olang` - O26 counts an instance as referring to every reference its constructor was given, even
   one it only reads: `return Counts(t)` with `t` a local is refused (still on 9621af3). `text.Load` declares its text
-  `&return` instead.
+  `&return` instead. Fixed by olang edf8238, as was phase 5's `repro/ctorpush.olang` (docs/settling.md); both
+  reproducers are gone.
 - Not issues, recorded for the language's records: `:=` from a comparison (`ta := t % 2 == 1`) needed its type
   written (D15 - relaxed since: `:=` takes any settled expression); a `match` value cannot give several results
   (`=> rows, cols`), so `savedShape` uses statements; a text join's piece cannot be a conditional (`$` of a local
