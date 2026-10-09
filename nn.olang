@@ -754,13 +754,12 @@ test "a graph records, plans and runs a small network" {
 # the largest relative difference between the gradient Backward gives each parameter and the central difference of
 # the loss - a gradient check, in F64 where the difference is precise. Every Forward starts from the same dropout
 # generator, so a network with dropout is checked against one fixed mask
-fn gradientError(g mut Graph<F64>&, loss Var, n I64) F64 {
+fn GradientError(g mut Graph<F64>&, loss Var, n I64, h F64 = 1e-6) F64 {
     rng := g.Rng
     g.Forward(n)
     g.Backward(loss)
     analytic := g.ParamGrads().Clone()
     params := g.Params()
-    h F64 = 1e-6
     worst F64 = 0.0
     for i in range g.ParamCount {
         old := params.Data[i]
@@ -807,7 +806,7 @@ test "every operation's backward agrees with central differences" {
     loss := g.Mse(t, target)
     r := rand.Rand(5)
     g.Plan(r)
-    assert gradientError(g, loss, 5) < 1e-6
+    assert GradientError(g, loss, 5) < 1e-6
     assert g.Grad(unused).MaxAbs() == 0.0
 }
 
@@ -829,8 +828,8 @@ test "a batched network's gradients agree, on a short batch and with a value use
     for i in range xd.Len() { xd[i] = r.Normal() }
     yd := g.ClassData(y)
     for i in range yd.Len() { yd[i] = I32(r.Below(3)) }
-    assert gradientError(g, loss, 6) < 1e-6
-    assert gradientError(g, loss, 4) < 1e-6        # the first four rows only
+    assert GradientError(g, loss, 6) < 1e-6
+    assert GradientError(g, loss, 4) < 1e-6        # the first four rows only
 }
 
 test "Backward with accumulate adds to the gradients already there" {
@@ -866,8 +865,8 @@ test "embedding, positions and both normalizations agree with central difference
     for i in range 6 { td[i] = I32(I32[3, 1, 3, 0, 4, 3][i]) }
     yd := g.ClassData(y)
     for i in range 6 { yd[i] = I32[1, 3, -1, 4, 4, 0][i] }
-    assert gradientError(g, loss, 6) < 1e-6
-    assert gradientError(g, loss, 3) < 1e-6
+    assert GradientError(g, loss, 6) < 1e-6
+    assert GradientError(g, loss, 3) < 1e-6
     # the padding row changes nothing: the loss is the mean over the other five rows
     g.Forward(6)
     with := g.Scalar(loss)
@@ -893,8 +892,8 @@ test "attention agrees with central differences: causal and not, several heads, 
     for i in range xd.Len() { xd[i] = r.Normal() }
     td := g.InputData(target)
     for i in range td.Len() { td[i] = r.Normal() }
-    assert gradientError(g, loss, 6) < 1e-6
-    assert gradientError(g, loss, 3) < 1e-6
+    assert GradientError(g, loss, 6) < 1e-6
+    assert GradientError(g, loss, 3) < 1e-6
 }
 
 test "causal attention: a row's output depends on no later row" {
@@ -921,7 +920,7 @@ test "dropout: a fixed mask's gradient agrees, the kept are scaled up, and off w
     loss := g.Mse(d, target)
     r := rand.Rand(14)
     g.Plan(r)
-    assert gradientError(g, loss, 8) < 1e-6
+    assert GradientError(g, loss, 8) < 1e-6
     g.Forward(8)
     dropped I64 = 0
     t := g.Value(th)
