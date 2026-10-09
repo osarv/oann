@@ -382,35 +382,158 @@ range, then the raw little-endian data): interoperable with PyTorch and Hugging 
 floats' `Bits()`; the parameter region is already one contiguous block. Parameters carry PyTorch's names
 (`l1.weight`, `l1.bias`).
 
-## 11. Next: transformers
+## 11. Transformers (phase 3)
 
-The graph is shaped for a decoder-only transformer (GPT-2 style) trained on a token stream, without a tensor type:
+A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor type:
 
-- **Rows are tokens.** A batch of `B` sequences of `T` tokens is a `[B*T, D]` matrix; the graph is planned for
-  `Batch = B*T` rows, and a node knows `T` where it needs it (attention, positions). The loss is the existing
-  `SoftmaxCrossEntropy` over `B*T` rows of vocabulary logits.
-- **New leaves and ops**:
-  - `Tokens()` - like `Classes()`, an `I32` per row;
-  - `Embedding(tokens, table)` - gather rows of a `[V, D]` parameter; backward scatter-adds into the table's gradient;
-  - `Positions(x, table, T)` - add row `t mod T` of a `[T, D]` parameter (learned positions); rotary positions as an
-    option inside attention;
-  - `LayerNorm(x, gain, bias)` and `RmsNorm(x, gain)` - row-wise, saving the row's mean and inverse deviation;
-  - `Attention(q, k, v, heads, T, causal)` - **one fused op**: per sequence and head, `softmax(q_h k_h^T / sqrt(d) +
-    mask) v_h`, heads being column blocks of `[B*T, D]` views (strided, no copies), each product a GEMM on those views;
-    the probabilities saved for the backward (`T x T` per head and sequence - the memory to watch), a tiled
-    (flash-style) form later for long sequences;
-  - `Dropout(x, p)` - a mask from the graph's own `Rand`, active while `g.Training`;
-  - `Gelu`, `Add` (residuals), `Linear` and `SoftmaxCrossEntropy` exist.
-- **Layers**: `NewAttentionBlock(g, D, heads)` (layer norm, the `q`/`k`/`v` and output projections, the MLP with
-  GELU, two residuals), `NewTransformer(g, V, T, D, heads, layers)`; weight tying of the embedding and the output
-  projection is applying the same parameter twice, which the graph already supports.
-- **Training**: AdamW with a warmup-then-cosine schedule (a function value giving the rate per step), gradient
-  clipping by global norm over `g.ParamGrads()`, and BF16 storage with F32 master weights and accumulation once the
-  F32 version matches a reference.
-- **A new shape is a new plan**: sequences are padded to `T` with the padded tokens' loss masked (a `Constant` mask
-  row), so one plan serves a run; generation, where `T` grows, uses a key-value cache in the graph's workspace.
-- Validation as for MNIST: every new backward against central differences in `F64`, then a small character-level
-  model trained against the same model in a reference.
+- **Rows are tokens.** A batch of `B` sequences of `T` tokens is a `[B*T, D]` matrix, sequence `s` in rows `s T ... s T
+  + T - 1`; the graph is planned for `Batch = B*T` rows, and a node knows `T` where it needs it (attention, positions).
+  The loss is `SoftmaxCrossEntropy` over the `B*T` rows of vocabulary logits, the classes each token's next one.
+- **Leaves and ops**: `Tokens()` (an `I32` per row, as `Classes()`); `Embedding(tokens, table)` (a gather; the
+  backward scatter-adds into the table's gradient, so a token repeated in a batch sums); `Positions(x, table)` (learned:
+  row `(Pos + r) mod T` of a `[T, D]` parameter); `LayerNorm(x, gain, bias)` and `RmsNorm(x, gain)` (row-wise, `eps`
+  1e-5, the biased variance as PyTorch has it, each row's statistics saved); `Attention(q, k, v, heads, T, causal)`;
+  `Dropout(x, p)` (inverted, from the graph's own generator, off when `g.Training` is false); `GeluTanh` (GPT-2's
+  GELU); a negative class marks a padding row the loss ignores (PyTorch's `ignore_index`: the mean is over the rows
+  counted, and a batch of padding alone has a loss of zero).
+- **Attention is one fused op.** Head `h` is columns `h D / heads ...` of `q`, `k`, `v` - a strided view, nothing
+  copied - and per sequence and head `P = softmax(Q K^T / sqrt(dh))` (row `i` over positions `0 ... i` when causal),
+  `Y = P V`. The probabilities are saved for the backward (`T x T` per sequence and head - the memory to watch at long
+  contexts; a tiled, recomputing form is the answer then). The backward: `dS = P (dO V^T - rowsum(dO V^T P)) / sqrt(dh)`,
+  then `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO`, written in that order - the order their "written" flags were taken
+  in - so a node attending to itself (`q`, `k` or `v` the same node) adds its three contributions up. Sequences are
+  spread over the graph's threads; each task has its own `T x T` scratch in the arena. The products are dot products and
+  updates over the heads' views (`kernels.Dot`, `kernels.Axpy`) rather than a `Gemm` per sequence and head: at these
+  sizes packing costs more than it saves, and the loops compute only the causal half (`bench/attention.olang`: 4.4 ms
+  against 6.6 forward at B 16, T 64, D 128, 4 heads; 21.6 against 27.6 at T 256).
+- **Layers** (`layers.olang`): `NewTransformer(g, V, T, D, heads, layers, tied = true, dropout = 0, rms = false)` - a
+  token embedding plus learned positions (dropout after), `layers` pre-normalized blocks, a final normalization and the
+  logits against the embedding itself when tied (weight tying is applying one parameter twice: the head's product and
+  the embedding's scatter-add both add into its gradient), a `V x D` matrix of its own otherwise. `NewAttentionBlock`:
+  `h = x + O(attention(Q n, K n, V n))`, `n = norm1(x)`; `y = h + Down(gelu(Up(norm2(h))))`, `Up` 4D wide, dropout on
+  both branches. GPT-2's starting values (weights and embeddings `N(0, 0.02)`, the two projections into the residual
+  stream `N(0, 0.02 / sqrt(2 layers))`, biases 0, gains 1) and nanoGPT's decay groups (weights and embeddings decayed,
+  biases and gains not). `q`, `k` and `v` are three products, not one of width 3D: that needs view nodes (section 14).
+- **GELU through tanh, not erf**, in the blocks: the exact GELU's `erf` is a library call per element - 14-25 ns an
+  element, 62 ms of a 510 ms step - where the tanh form (GPT-2's own) runs through `FastTanh` in one pass at 5-8 ns.
+  Both are ops; the tanh form is within 1e-3 of the exact one.
+- **Training**: AdamW (beta2 0.99, decay 0.1), `optim.WarmupCosine` for the rate, `optim.ClipGradNorm` to 1.
+- **Generation** (`generate.olang`): `Sample(logits, temperature, r)`; `Rerun` runs the last `T` tokens through a graph
+  planned for one sequence for every new token; `Cached` runs each token once on a **graph for decoding**
+  (`nn.Graph<F32>(T, 1, true)`): no gradients, and every attention keeps the keys and values of the positions so far
+  in its saved region - a key-value cache in the arena - so `Forward(n)` at `g.Pos` computes positions `Pos ... Pos + n
+  - 1` attending to everything cached, `Positions` adding row `Pos + r`. The prompt is one `Forward` (a prefill); when
+  the context is full, the last `T / 2` tokens are run again to start a fresh cache. Checked: decoding a prefill and
+  then token by token gives the logits of running the whole sequence, to 1e-12.
+- **Checkpoints**: `g.Save(path)`/`g.Load(path)` - the parameter region as it is (`oann`, the element width and the
+  count, then little-endian bits); safetensors when a model has to leave oann (section 10).
+
+### Validation
+
+Every new backward agrees with central differences in `F64` (section 9). Against a reference: `bench/ref/charlm.py`
+is the character model again in numpy, F64, with a hand-written backward, started from the **same parameters** -
+xoshiro256** and splitmix64 in Python, the same draws in the same order, rounded to F32 as oann stores them - and fed
+the **same windows**, with the same AdamW, schedule and clipping. The first ten steps (`make lmref`), oann in F32
+against numpy in F64:
+
+| step | loss, oann | loss, numpy | gradient norm, oann | gradient norm, numpy |
+|---|---|---|---|---|
+| 1 | 4.211253 | 4.211253 | 7.050046 | 7.050046 |
+| 2 | 4.181737 | 4.181737 | 6.326455 | 6.326455 |
+| 5 | 4.033323 | 4.033323 | 5.406032 | 5.406031 |
+| 10 | 3.751469 | 3.751469 | 1.995772 | 1.995772 |
+| 20 | 3.552264 | 3.552264 | 1.526185 | 1.526185 |
+| 40 | 3.034891 | 3.034891 | 1.233417 | 1.233417 |
+
+Over 40 steps the losses differ by at most 1e-6 and the norms by 2e-6 - what F32 against F64 arithmetic allows - so
+the forward, every backward, AdamW, the schedule and the clipping are the reference's. One thing this found: the
+gradient norm summed in `F32` came out 3.5e-5 low (a long sum of small squares drops their low bits), so
+`ClipGradNorm` sums in `F64`. PyTorch could not be installed (the proxy refuses pip and download.pytorch.org); numpy
+2.5 was there.
+
+### Results: a character-level model on tiny Shakespeare
+
+`make charlm ARGS="2000 1 2"`: 4 layers of width 128, 4 heads, context 64, batches of 16 sequences (1,024 tokens),
+tied embeddings, 809,856 parameters, dropout 0; AdamW at 1e-3 (beta2 0.99, decay 0.1) warmed up over 100 steps and down
+a cosine to 1e-4 at step 2,000, the gradient clipped to norm 1; seed 1, 2 threads. tiny Shakespeare was fetched with
+curl through the environment's proxy (1,115,394 characters, a vocabulary of 65; the first 90% trained on, the last 10%
+validated on - the same 10 batches of 16 windows each time). Losses in nats per character:
+
+| step | train (mean of the last 50 steps) | validation |
+|---|---|---|
+| 0 | - | 4.2086 (ln 65 = 4.174) |
+| 250 | 2.4134 | 2.3825 |
+| 500 | 2.1998 | 2.2186 |
+| 750 | 2.0541 | 2.0828 |
+| 1000 | 1.9224 | 2.0032 |
+| 1250 | 1.8402 | 1.9575 |
+| 1500 | 1.7713 | 1.8779 |
+| 1750 | 1.7041 | 1.8220 |
+| 2000 | 1.7023 | 1.8063 |
+
+2,000 steps (2M tokens, about two passes over the training text) took 1,108 s - 554 ms a step, **1,849 tokens a
+second** - on the shared 4-core machine at a load average of 6 to 9 (other agents compiling and testing). Still falling
+when the schedule ended: a longer run, a larger model and dropout are the obvious next steps (nanoGPT's 10.7M-parameter
+"baby GPT" reaches 1.47 after 5,000 steps of 16K tokens).
+
+A sample (`examples/charlm_sample.olang`: 500 characters after a newline, temperature 0.8, the key-value cache):
+
+```
+Pears Richmpy'd, had lies his are pinter and morige:
+Where the with my lordiety hims thee flown.
+
+NORGEOs:
+Hard, poor night inter a clird it.
+
+Secourrongel:
+There as contranted you the fair him to liash,
+The pring sweets he place on murd, if hor know you sins,
+Bold in with blood and my streen have thou
+with no she be behose farbels fear the men with preoving to bid
+Not for a son the see that she fintlew on shoul,
+Disss of the relikess, thou rady now the load the Glotheres,
+I'll pord to my foul m
+```
+
+Generation: **2,138 characters a second with the key-value cache, 92 running the context again** (23x; one thread,
+at a load of 3). Greedily the two give the same 58 characters while the context is not full; after that they differ
+by design (the cache restarts from the last 32 tokens, the rerun keeps the last 64).
+
+### Where a step goes
+
+`make lmbench ARGS="20 1"` - the graph's own profiling, ms a step, one thread, at a load average of 2.6:
+
+| | forward | backward |
+|---|---|---|
+| `Linear` (12 products a step forward, 24 backward) | 138.5 | 281.5 |
+| `MatMul` (the tied head) | 1.5 | 3.0 |
+| `Attention` | 20.3 | 24.7 |
+| `GeluTanh` | 12.5 | 14.9 |
+| `LayerNorm` | 2.9 | 4.2 |
+| `Add` (residuals) | 1.3 | 1.8 |
+| the loss, embedding, positions | 0.8 | 0.3 |
+| clipping, AdamW | 4.0 (together) | |
+
+A step is **512 ms: products 83%, attention 9%, the rest of the graph 8%**, clipping and the optimizer under 1%. The
+products run at ~11 GFLOPS (4.8 GFLOP a step) - std/linalg's GEMM on the default SSE2 target, slower than its 14-17 on
+large squares because these are narrow (k = 128) - so the step is the compiler's instruction set, as MNIST's epoch was
+(section 8). Two threads: 399 ms (2,566 tokens a second), four: 344 ms (2,977) - the products scale (424, 326, 275
+ms), the element-wise ops do not (they run on one thread). The arena is 87.2 MB, laid out once; resident memory grows
+by 70-84 kB over the first steps and by nothing after (100 steps measured). MNIST's epoch with the workspace `Gemm`:
+2.2 s (2.39 before), and it no longer grows.
+
+### What remains
+
+- **Mixed precision** - BF16 storage with F32 master weights - not started: the graph is generic over one element type
+  (section 14), and std/linalg's BF16 product allocates per call (the leak) and widens while packing.
+- Dropout of attention's probabilities (nanoGPT's `attn_dropout`): only the residual branches and the embedding are
+  dropped out.
+- A tiled attention that recomputes `P` in the backward instead of saving `T x T` per head (memory at long contexts),
+  and a batched causal `Gemm` under it (section 13).
+- Fused QKV and splitting heads with view nodes; a `Gemm` epilogue for bias and GELU (section 13).
+- Rotary positions; a byte-pair tokenizer; generating several sequences at once (a decoding graph of `B` sequences).
+- Reusing activation storage by liveness: the arena holds every activation and gradient - 87 MB for the model above.
+- Element-wise ops over threads: at four threads they are 40 of the 344 ms.
 
 ## 12. Shapes as type parameters (when olang has const generics)
 
@@ -431,16 +554,20 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
    (`kernels.olang`, ~250 lines) that should go when this exists. Wanted shape: `GemmSpace(m, n, k, threads)` and
    `Gemm(c, a, ta, b, tb, alpha, beta, threads, work)`.
 2. **Batched strided `Gemm`, causal-aware** - every sequence and head of attention in one call, the products of a
-   lower-triangular block skipped. Attention is 8% of a step at context 64 and grows as `T^2`; oann's dot-product
+   lower-triangular block skipped. Attention is 9% of a step at context 64 and grows as `T^2`; oann's dot-product
    kernels run it at 3-4 GFLOPS on the causal half, against ~12 for `Gemm` on large products, and a `Gemm` per head
    is slower still (6.6 ms against 4.4 forward at B 16, T 64; 27.6 against 21.6 at T 256 - packing costs more than
-   it saves at these sizes). Expected: attention 2-3x faster, ~5% of a step at T 64, ~15-20% at T 256.
+   it saves at these sizes). A batched causal `Gemm` at the products' ~11 GFLOPS would run these about 3x faster -
+   ~30 of attention's 45 ms a step at T 64 - and matters more at longer contexts, where attention's share grows.
 3. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass:
-   the bias row and GELU are two more passes over the widest activation (B T x 4D), ~15 ms of a 550 ms step; and
+   the bias row and GELU are two more passes over the widest activation (B T x 4D) - GELU's forward alone is 12.5 ms of
+   a 512 ms step, its backward 14.9 - so ~5%; and
    **fused QKV** (one product of width 3D, attention reading q, k and v as column blocks) needs view nodes in oann's
    graph, not linalg.
-4. **Vectorizing exp and tanh on the target** - `FastTanh` costs ~5 ns an element on the default SSE2 target, which
-   keeps GELU at ~25 ms a step; the native target (AVX2, FMA) is the compiler's (pending).
+4. **Micro-kernels for the machine** (AVX2/AVX-512 with FMA - std/linalg's per-CPU kernels, with the compiler's
+   native target): the products are 83% of a transformer's step at ~11 GFLOPS, and OpenBLAS ran MNIST's 3x faster by
+   its instruction set alone (section 8) - the largest lever on a step, ~2x or more. The same target is what
+   vectorizes `FastTanh` cheaply (~5 ns an element on SSE2: GELU's 27 ms a step).
 5. **Two-operand indexing**, `m[r, c]` - now in olang (E31 multi-index), not yet used by oann.
 
 ## 14. Open questions

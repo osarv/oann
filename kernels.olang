@@ -103,7 +103,8 @@ type tile<A> struct() {
 
 # the micro-kernels: C[i, j] = alpha * sum over k of ap[k][i] * bp[k][j] + beta * C[i, j] for one 4 x NR tile, rows
 # and cols saying how much of it is inside C. Tile sizes are literals, so the accumulators stay in registers
-fn micro4x12(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>, beta <T>, c mut Array<<T>>&, co I64, ldc I64, rows I64, cols I64) {
+fn micro4x12(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>, beta <T>, c mut Array<<T>>&,
+        co I64, ldc I64, rows I64, cols I64) {
     acc := tile<<T>>()
     for k in range depth {
         for i in range 4 {
@@ -118,7 +119,8 @@ fn micro4x12(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T
     storeTile(out, 12, alpha, beta, c, co, ldc, rows, cols)
 }
 
-fn micro4x6(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>, beta <T>, c mut Array<<T>>&, co I64, ldc I64, rows I64, cols I64) {
+fn micro4x6(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>, beta <T>, c mut Array<<T>>&,
+        co I64, ldc I64, rows I64, cols I64) {
     acc := tile<<T>>()
     for k in range depth {
         for i in range 4 {
@@ -147,7 +149,8 @@ fn storeTile(t tile<<T>>&, ts I64, alpha <T>, beta <T>, c mut Array<<T>>&, co I6
 }
 
 # rows i0 .. i1 of C for one packed block of B: each task's share of a product, packing A's rows into its own ap
-fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I64, cols I64, alpha <T>, ap mut Array<<T>>&, bp Array<<T>>&, beta <T>, c mut Array<<T>>&, ldc I64, j0 I64) {
+fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I64, cols I64, alpha <T>,
+        ap mut Array<<T>>&, bp Array<<T>>&, beta <T>, c mut Array<<T>>&, ldc I64, j0 I64) {
     nr := tileCols(alpha)
     for ic in range i0, i1, mc {
         rows I64 = lesser(mc, i1 - ic)
@@ -157,10 +160,12 @@ fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I
                 co I64 = (ic + ir) * ldc + j0 + jr
                 match <T> {
                     case F64, I64, U64 {
-                        micro4x6(depth, ap, ir * depth, bp, jr * depth, alpha, beta, c, co, ldc, lesser(4, rows - ir), lesser(nr, cols - jr))
+                        micro4x6(depth, ap, ir * depth, bp, jr * depth, alpha, beta, c, co, ldc, lesser(4,
+                            rows - ir), lesser(nr, cols - jr))
                     }
                     nomatch {
-                        micro4x12(depth, ap, ir * depth, bp, jr * depth, alpha, beta, c, co, ldc, lesser(4, rows - ir), lesser(nr, cols - jr))
+                        micro4x12(depth, ap, ir * depth, bp, jr * depth, alpha, beta, c, co, ldc, lesser(4,
+                            rows - ir), lesser(nr, cols - jr))
                     }
                 }
             }
@@ -169,7 +174,8 @@ fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I
 }
 
 # a small product without packing: each row of C updated from rows of B (B not transposed)
-fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I64, b Array<<T>>&, ldb I64, beta <T>, c mut Array<<T>>&, ldc I64) {
+fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I64, b Array<<T>>&, ldb I64,
+        beta <T>, c mut Array<<T>>&, ldc I64) {
     z <T>
     for i in range m {
         ci I64 = i * ldc
@@ -188,7 +194,8 @@ fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I6
 
 # out[i * os] = alpha * sum over p < len of M(i, p) v[p] + beta * out[i * os]: a matrix-vector product in either
 # orientation, M(i, p) being mat[i * rs + p * cs] and v[p] vec[p * vs]
-fn gemv(rows I64, len I64, alpha <T>, mat Array<<T>>&, rs I64, cs I64, vec Array<<T>>&, vs I64, beta <T>, out mut Array<<T>>&, os I64) {
+fn gemv(rows I64, len I64, alpha <T>, mat Array<<T>>&, rs I64, cs I64, vec Array<<T>>&, vs I64, beta <T>,
+        out mut Array<<T>>&, os I64) {
     z <T>
     if cs == 1 and vs == 1 {
         for i in range rows {
@@ -230,7 +237,8 @@ fn gemm(transA Bool, transB Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&,
         if m <= 4 {
             for i in range m {
                 x := a[i:] if transA else a[i * lda:]
-                gemv(n, k, alpha, b, ldb if transB else 1, 1 if transB else ldb, x, lda if transA else 1, beta, c[i * ldc:], 1)
+                gemv(n, k, alpha, b, ldb if transB else 1, 1 if transB else ldb, x, lda if transA else 1, beta,
+                    c[i * ldc:], 1)
             }
         } else {
             gemv(m, k, alpha, a, 1 if transA else lda, lda if transA else 1, b, 1 if transB else ldb, beta, c, ldc)
@@ -263,7 +271,8 @@ fn gemm(transA Bool, transB Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&,
                     for t in range tasks {
                         lo I64 = t * share
                         hi I64 = lesser(m, lo + share)
-                        if lo < hi { spawn gemmRows(transA, a, lda, lo, hi, pc, depth, cols, alpha, ap[t * panel:(t + 1) * panel], bp, bt, c, ldc, jc) }
+                        if lo < hi { spawn gemmRows(transA, a, lda, lo, hi, pc, depth, cols, alpha,
+                            ap[t * panel:(t + 1) * panel], bp, bt, c, ldc, jc) }
                     }
                 }
             }

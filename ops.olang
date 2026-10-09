@@ -80,7 +80,8 @@ fn Linear(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, b
 
 # the gradients of y = x w^T + b: dx = dy w, dw = dy^T x, db = the column sums of dy
 fn LinearBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, dx linalg.Matrix<<T>>&,
-        accX Bool, dw linalg.Matrix<<T>>&, accW Bool, db linalg.Matrix<<T>>&, accB Bool, threads I64, work mut Array<<T>>&) {
+        accX Bool, dw linalg.Matrix<<T>>&, accW Bool, db linalg.Matrix<<T>>&, accB Bool, threads I64,
+        work mut Array<<T>>&) {
     if dx.Rows > 0 { kernels.Gemm(dx, dy, false, w, false, 1, beta(accX), threads, work) }
     if dw.Rows > 0 { kernels.Gemm(dw, dy, true, x, false, 1, beta(accW), threads, work) }
     if db.Rows > 0 { dy.ColumnSums(db, beta(accB)) }
@@ -426,7 +427,9 @@ fn Attention(y linalg.Matrix<<T>>&, q linalg.Matrix<<T>>&, k linalg.Matrix<<T>>&
     scale <T> = 1.0 / math.Sqrt(linalg.Cast(dh, like))
     parallel(q.Rows / T, threads, fn(task, lo, hi) {
         for s in range lo, hi {
-            for h in range heads { attendHead(y, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale) }
+            for h in range heads {
+                attendHead(y, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale)
+            }
         }
     })
 }
@@ -519,8 +522,8 @@ fn AttentionBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<<T>>&, k linalg.Mat
         ds := scratch[task * T * T:(task + 1) * T * T]
         for s in range lo, hi {
             for h in range heads {
-                attendHeadBackward(dy, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale, dq, accQ,
-                    dk, accK, dv, accV, ds)
+                attendHeadBackward(dy, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale, dq,
+                    accQ, dk, accK, dv, accV, ds)
             }
         }
     })
