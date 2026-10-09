@@ -1,0 +1,221 @@
+# The end-to-end tasks of docs/settling.md 5.5: settling agents living a contextual bandit, against the analytic
+# optimum, over many seeds with confidence intervals.
+#
+# The world: K contexts, each a random unit observation of 16 numbers (so contexts overlap), and 4 arms; the arm
+# pulled pays 1 with its probability and -1 otherwise (rewards scaled to [-1, 1], 1.5) - each context's best arm with
+# probability 0.8, the others drawn in [0.1, 0.5].
+# A moment: the agent sees a context drawn at random, chooses an arm, and learns the reward at the next moment (each
+# pull is an episode of its own). Regret is the probability of paying of the best arm less that of the arm chosen
+# (half the difference of their expected rewards).
+#
+# Tasks (the first argument): bandit - the world as it is; reversal - halfway through, each context's best and worst
+# arms swap; pinning - the bandit with no context trace, the default gain and 8 times it: where history tells nothing,
+# a trace can only pin the policy, and the rate at which an agent repeats its last action when the context's best
+# arm changed detects it (1.6). watch - one life's moments around a reversal, printed.
+# Further arguments, all optional: moments (2000), seeds (20), contexts (4), hidden neurons (64), block (100); then any
+# of the agent's settings as name=value (threshold, critical, rate, memoryrate, fast, slow, beta, criticrate,
+# tracegain, memorygain, temperature).
+
+import "std/io"
+import "std/json"
+import "std/math"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../agent"
+import "../circuit"
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.JsonError {
+    if i >= args.Len() { return fallback }
+    return try (try json.Parse(args[i])).AsNum()
+}
+
+# K contexts of observations, arms arms each with a probability of paying
+type Bandit struct(contexts I64, size I64, arms I64, seed U64) {
+    Contexts I64 = contexts
+    Size I64 = size
+    Arms I64 = arms
+    rng mut rand.Rand = rand.Rand(seed)
+    Keys mut Array<F32>& = Array<F32>(contexts * size)
+    Pay mut Array<F64>& = Array<F64>(contexts * arms)
+    for c in range contexts {
+        norm F64 = 0.0
+        for j in range size {
+            x := rng.Normal()
+            Keys[c * size + j] = F32(x)
+            norm += x * x
+        }
+        for j in range size { Keys[c * size + j] = F32(F64(Keys[c * size + j]) / math.Sqrt(norm)) }
+        best := rng.Below(arms)
+        for a in range arms { Pay[c * arms + a] = 0.8 if a == best else rng.Uniform(0.1, 0.5) }
+    }
+}
+
+# context c's observation
+fn (w Bandit&) Observe(c I64) Array<F32>&w {
+    return w.Keys[c * w.Size:(c + 1) * w.Size]
+}
+
+# the arm of context c that pays most, and what it pays
+fn (w Bandit&) Best(c I64) (I64, F64) {
+    best I64 = 0
+    for a in range 1, w.Arms {
+        if w.Pay[c * w.Arms + a] > w.Pay[c * w.Arms + best] { best = a }
+    }
+    return best, w.Pay[c * w.Arms + best]
+}
+
+# a pull of arm a in context c: 1 or -1
+fn (w mut Bandit&) Pull(c I64, a I64) F64 {
+    return 1.0 if w.rng.Float() < w.Pay[c * w.Arms + a] else -1.0
+}
+
+# each context's best and worst arms swap what they pay
+fn (w mut Bandit&) Reverse() {
+    for c in range w.Contexts {
+        best I64 = 0
+        worst I64 = 0
+        for a in range 1, w.Arms {
+            if w.Pay[c * w.Arms + a] > w.Pay[c * w.Arms + best] { best = a }
+            if w.Pay[c * w.Arms + a] < w.Pay[c * w.Arms + worst] { worst = a }
+        }
+        t := w.Pay[c * w.Arms + best]
+        w.Pay[c * w.Arms + best] = w.Pay[c * w.Arms + worst]
+        w.Pay[c * w.Arms + worst] = t
+    }
+}
+
+# one life's measures per block of moments: regret, the fraction of calm moments, arousal's level; and over the
+# whole life the rate of repeating the last action when the best arm changed, and the sweeps a moment took
+type Life struct(blocks I64) {
+    Regret mut Array<F64>& = Array<F64>(blocks)
+    Calm mut Array<F64>& = Array<F64>(blocks)
+    Level mut Array<F64>& = Array<F64>(blocks)
+    Repeats mut F64 = 0.0
+    Sweeps mut F64 = 0.0
+    Refused mut I64 = 0
+}
+
+# the settings with every name=value argument from position 7 on applied
+fn settings(args Array<String&>&) agent.Settings ? json.JsonError {
+    s := agent.Settings()
+    for i in range 7, args.Len() {
+        at := try args[i].Find("=") catch { continue }
+        name := args[i][:at]
+        v := try (try json.Parse(args[i][at + 1:])).AsNum()
+        if name == "threshold" { s.Threshold = v }
+        if name == "critical" { s.Critical = I64(v) }
+        if name == "rate" { s.Rate = v }
+        if name == "memoryrate" { s.MemoryRate = v }
+        if name == "fast" { s.Fast = v }
+        if name == "slow" { s.Slow = v }
+        if name == "beta" { s.Beta = v }
+        if name == "criticrate" { s.CriticRate = v }
+        if name == "tracegain" { s.TraceGain = v }
+        if name == "memorygain" { s.MemoryGain = v }
+        if name == "temperature" { s.Temperature = v }
+    }
+    return s
+}
+
+# a life of moments moments in a world of seed, reversed halfway when reversal
+fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Bool, s agent.Settings, watch Bool = false) Life {
+    life Life&return = Life(moments / block)
+    w := Bandit(contexts, 16, 4, seed)
+    a := agent.Agent<F32>(16, 4, I64[hidden], seed + 7919, s)
+    pick := rand.Rand(seed + 104729)
+    c := pick.Below(contexts)
+    action := try a.Begin(w.Observe(c)) catch circuit.NotSettled { life.Refused++ } default 0
+    changes I64 = 0
+    repeats I64 = 0
+    lastBest I64 = -1
+    lastAction I64 = -1
+    for t in range moments {
+        if reversal and t == moments / 2 { w.Reverse() }
+        best, top := w.Best(c)
+        life.Regret[t / block] += (top - w.Pay[c * w.Arms + action]) / F64(block)
+        if lastBest >= 0 and best != lastBest {
+            changes++
+            if action == lastAction { repeats++ }
+        }
+        lastBest = best
+        lastAction = action
+        reward := w.Pull(c, action)
+        c = pick.Below(contexts)
+        next := try a.Step(w.Observe(c), reward, true) catch circuit.NotSettled { life.Refused++ } default action
+        if watch and t >= moments / 2 - 5 and t < moments / 2 + 60 {
+            try io.Print($t ": context " $c " arm " $action " best " $best " reward " $reward " delta " $(a.LastDelta).Fixed(2)
+                " surprise " $(a.Mood.Surprise).Fixed(2) " want " $(a.Mood.Want).Fixed(2) " level " $(a.Mood.Level).Fixed(2)
+                " aroused " $(a.Mood.Aroused) "\n") catch { }
+        }
+        life.Calm[t / block] += (0.0 if a.Mood.Aroused else 1.0) / F64(block)
+        life.Level[t / block] += a.Mood.Level / F64(block)
+        action = next
+    }
+    life.Repeats = F64(repeats) / F64(changes if changes > 0 else 1)
+    life.Sweeps = F64(a.Sweeps) / F64(moments)
+    return life
+}
+
+# the mean of x over n lives and the half-width of its 95% confidence interval (1.96 standard errors)
+fn interval(x Array<F64>&) (F64, F64) {
+    n F64 = F64(x.Len())
+    mean F64 = 0.0
+    for v in x { mean += v }
+    mean = mean / n
+    sq F64 = 0.0
+    for v in x { sq += (v - mean) * (v - mean) }
+    return mean, 1.96 * math.Sqrt(sq / (n - 1.0) / n)
+}
+
+fn show(x Array<F64>&) String {
+    m, h := interval(x)
+    return $m.Fixed(3) " +- " $h.Fixed(3)
+}
+
+fn main() ? io.IoError + json.JsonError {
+    args := os.Args()
+    task := args[1] if args.Len() > 1 else "bandit"
+    moments := I64(try number(args, 2, 2000))
+    seeds := I64(try number(args, 3, 20))
+    contexts := I64(try number(args, 4, 4))
+    hidden := I64(try number(args, 5, 64))
+    block := I64(try number(args, 6, 100))
+    blocks I64 = moments / block
+    base := try settings(args)
+    if task == "watch" {
+        live(1, moments, block, contexts, hidden, true, base, true)
+        return
+    }
+    gains := F64[0.0, base.TraceGain, 8.0 * base.TraceGain] if task == "pinning" else F64[base.TraceGain]
+    for gain in gains {
+        s agent.Settings = base
+        s.TraceGain = gain
+        t0 := time.Now()
+        regret := Array<F64>(seeds * blocks)
+        calm := Array<F64>(seeds * blocks)
+        level := Array<F64>(seeds * blocks)
+        repeats := Array<F64>(seeds)
+        sweeps := Array<F64>(seeds)
+        refused I64 = 0
+        for k in range seeds {
+            life := live(U64(k + 1), moments, block, contexts, hidden, task == "reversal", s)
+            for b in range blocks {
+                regret[b * seeds + k] = life.Regret[b]
+                calm[b * seeds + k] = life.Calm[b]
+                level[b * seeds + k] = life.Level[b]
+            }
+            repeats[k] = life.Repeats
+            sweeps[k] = life.Sweeps
+            refused += life.Refused
+        }
+        try io.Print($task " - " $seeds " lives of " $moments " moments, " $contexts " contexts, 4 arms, hidden " $hidden
+            ", trace gain " $gain " (" $(F64(time.Since(t0)) * 1e-9).Fixed(1) " s, " $refused " refused settles)\n")
+        try io.Print("block      regret            calm              arousal level\n")
+        for b in range blocks {
+            try io.Print($((b + 1) * block) "  " $show(regret[b * seeds:(b + 1) * seeds]) "  " $show(calm[b * seeds:(b + 1) * seeds])
+                "  " $show(level[b * seeds:(b + 1) * seeds]) "\n")
+        }
+        try io.Print("repeats of the last action when the best arm changed: " $show(repeats) "; sweeps a moment " $show(sweeps) "\n\n")
+    }
+}

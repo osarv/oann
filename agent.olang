@@ -204,24 +204,27 @@ fn (c mut Critic<<T>>&) Clear() {
 
 # ---- the agent (1.8) ----
 
-# an agent's settings, oann's defaults (docs/settling.md 1.4-1.7, 1.10): set the fields before making the agent
+# an agent's settings, oann's defaults (docs/settling.md 1.4-1.7, 1.10): set the fields before making the agent. Four
+# are the end-to-end tasks' tuning of the document's starting values (5.5, decision 21): the actor's rate (0.001
+# there), the persistent memory's c_0 (0.02), arousal's Slow (0.01) and Threshold (2) - with those a noisy bandit's
+# agent turned calm for good within its critical period and never recovered from a reversal
 type Settings struct() {
     Beta mut F64 = 0.5                  # an aroused moment's nudged phases
     Temperature mut F64 = 0.25          # the policy softmax(s_out / T), and the readout's cost
     Gamma mut F64 = 0.99
     Lambda mut F64 = 0.9
-    Rate mut F64 = 0.001                # Adam's, for the actor
+    Rate mut F64 = 0.0003               # Adam's, for the actor
     CriticRate mut F64 = 0.1
     TraceRate mut F64 = 0.3             # the context trace: a_tr
     TraceGain mut F64 = 1.0             # kappa_tr
     MemoryDecay mut F64 = 0.95          # phi
-    MemoryRate mut F64 = 0.02           # c_0
+    MemoryRate mut F64 = 0.2            # c_0
     MemoryGain mut F64 = 1.0            # g
-    Slow mut F64 = 0.01                 # arousal (1.7)
-    Fast mut F64 = 0.1
+    Slow mut F64 = 0.003                # arousal (1.7): alpha_s
+    Fast mut F64 = 0.1                  # alpha_f
     Eps mut F64 = 0.001
-    Critical mut I64 = 100
-    Threshold mut F64 = 2.0
+    Critical mut I64 = 100              # t_0
+    Threshold mut F64 = 1.5             # theta
     Certified mut F64 = 0.9             # the gain the circuit is certified at when made
     Budget mut I64 = 128                # a settle's sweeps, at least
 }
@@ -236,22 +239,21 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
     Config
     Seed U64 = seed
     rng mut rand.Rand = rand.Rand(seed)
-    Net mut circuit.Circuit<<T>>& = circuit.Circuit<<T>>(1)
-    Sensors circuit.Region = Net.Input(observations)
     Width I64 = widthOf(hidden)
-    Context circuit.Region = Net.Input(Width)
-    Inner circuit.Region = addHidden(Net, hidden)   # the first hidden region; the others follow it
-    Choice circuit.Region = Net.Readout(actions, circuit.Cost.CrossEntropy(Config.Temperature))
-    wire(Net, Sensors, Context, Inner, hidden.Len(), Choice)
-    Net.Plan(rng)
-    Net.Certify(Config.Certified)
+    phi mut Array<<T>>& = Array<<T>>(Width)            # this moment's hidden activities
+    # the circuit is made by a function rather than recorded here: a constructor pushing onto a List of a field of its
+    # own puts the List's storage in its own scope, which closes when it returns (olang ef939ae, repro/ctorpush)
+    Net mut circuit.Circuit<<T>>& = circuitFor(phi, observations, actions, hidden, Config, rng)
+    Sensors circuit.Region = circuit.Region(0)          # the regions, in the order circuitFor records them
+    Context circuit.Region = circuit.Region(1)
+    Inner circuit.Region = circuit.Region(2)            # the first hidden region; the others follow it
+    Choice circuit.Region = circuit.Region(2 + hidden.Len())
     Elig mut circuit.Eligibility<<T>>& = circuit.Eligibility<<T>>(Net)
     Opt mut optim.FlatAdamW<<T>>& = optim.FlatAdamW<<T>>(Net.ParamCount, Config.Rate)
     Mem mut Memory<<T>>& = Memory<<T>>(observations, actions, Config.MemoryDecay, Config.MemoryRate, Config.MemoryGain)
     Ctx mut Trace<<T>>& = Trace<<T>>(Width, Config.TraceRate, Config.TraceGain)
     Judge mut Critic<<T>>& = Critic<<T>>(Width, Config.CriticRate)
     Mood mut Arousal = Arousal(Config.Slow, Config.Fast, Config.Eps, Config.Critical, Config.Threshold)
-    phi mut Array<<T>>& = Array<<T>>(Width)            # this moment's hidden activities
     lastPhi mut Array<<T>>& = Array<<T>>(Width)        # the last moment's: its state's features
     lastKey mut Array<<T>>& = Array<<T>>(observations) # the last moment's observation
     probs mut Array<F64>& = Array<F64>(actions)
@@ -282,19 +284,23 @@ fn widthOf(sizes Array<I64>&) I64 {
     return sum
 }
 
-# every hidden region, recorded one after another so their activities are one run of columns; gives the first
-fn addHidden(c mut circuit.Circuit<<T>>&, sizes Array<I64>&) circuit.Region {
-    first := c.Hidden(sizes[0])
-    for i in range 1, sizes.Len() { c.Hidden(sizes[i]) }
-    return first
-}
-
-fn wire(c mut circuit.Circuit<<T>>&, sensors circuit.Region, context circuit.Region, first circuit.Region, count I64,
-        choice circuit.Region) {
+# an agent's circuit of T (like's elements), planned and certified: the observation (region 0) and the context (1) as inputs, one-way into the
+# first hidden region (2); the hidden regions, recorded one after another so their activities are one run of
+# columns, reciprocal in a chain; the last reciprocal with the readout (2 + the hidden regions)
+fn circuitFor(like Array<<T>>&, observations I64, actions I64, hidden Array<I64>&, s Settings, r mut rand.Rand&) circuit.Circuit<<T>>& {
+    c circuit.Circuit<<T>>&return = circuit.Circuit<<T>>(1)
+    sensors := c.Input(observations)
+    context := c.Input(widthOf(hidden))
+    first := c.Hidden(hidden[0])
+    for i in range 1, hidden.Len() { c.Hidden(hidden[i]) }
+    choice := c.Readout(actions, circuit.Cost.CrossEntropy(s.Temperature))
     c.Project(sensors, first, circuit.Wiring.OneWay)
     c.Project(context, first, circuit.Wiring.OneWay)
-    for i in range 1, count { c.Project(circuit.Region(first + i - 1), circuit.Region(first + i)) }
-    c.Project(circuit.Region(first + count - 1), choice)
+    for i in range 1, hidden.Len() { c.Project(circuit.Region(first + i - 1), circuit.Region(first + i)) }
+    c.Project(circuit.Region(first + hidden.Len() - 1), choice)
+    c.Plan(r)
+    c.Certify(s.Certified)
+    return c
 }
 
 # the life tolerance (docs/settling.md 1.10): every logit of the policy within T / 40 of its equilibrium, so each
