@@ -1,0 +1,77 @@
+# XOR learned by a spiking circuit: Lif hidden and readout neurons whose activities are spike counts over a window,
+# taught by the same equilibrium propagation as rate neurons (circuit.Teach: a free settle, nudged ones at +beta and
+# -beta, the contrast of their spike counts) and Adam. Each readout neuron is taught a rate of 0.2 spikes a step for
+# its class and none otherwise. Arguments, all optional: the lessons (300), the hidden neurons (8), the window (256),
+# the seed (1), the learning rate (0.02), beta (1).
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../circuit"
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.JsonError {
+    if i >= args.Len() { return fallback }
+    return try (try json.Parse(args[i])).AsNum()
+}
+
+fn main() ? io.IoError + json.JsonError {
+    args := os.Args()
+    lessons := I64(try number(args, 1, 300))
+    hidden := I64(try number(args, 2, 8))
+    window := I64(try number(args, 3, 256))
+    seed := U64(try number(args, 4, 1))
+    rate := try number(args, 5, 0.02)
+    beta := try number(args, 6, 1)
+    lif := circuit.LifNeuron(0.1, 1.0, 0.25, window)
+    c := circuit.Circuit<F32>(4)
+    x := c.Input(2)
+    h := c.Hidden(hidden, lif)
+    o := c.Readout(2, circuit.Cost.Squared, lif)
+    c.Project(x, h, circuit.Wiring.OneWay)
+    c.Project(h, o)
+    r := rand.Rand(seed)
+    c.Plan(r)
+    bh := c.Bias(h)
+    for j in range hidden { bh[j] = 1.2 }
+    bo := c.Bias(o)
+    for j in range 2 { bo[j] = 1.0 }
+    d := c.DriveData(x)
+    t := c.TargetData(o)
+    for b in range 4 {
+        p I64 = b / 2
+        q I64 = b % 2
+        d[2 * b] = 1.0 if p == 1 else -1.0
+        d[2 * b + 1] = 1.0 if q == 1 else -1.0
+        class I64 = p ^ q
+        t[2 * b + class] = 0.2
+        t[2 * b + 1 - class] = 0.0
+    }
+    opt := circuit.Adam<F32>(c, rate)
+    lesson := circuit.Lesson(beta)
+    predicted := Array<I32>(4)
+    steps I64 = 0
+    refused I64 = 0
+    t0 := time.Now()
+    for k in range 1, lessons + 1 {
+        taught := try c.Teach(4, lesson) catch circuit.NotSettled { refused++ } default -1
+        if taught >= 0 {
+            steps += taught
+            opt.Step(c)
+        }
+        if k % 25 == 0 or k == lessons {
+            c.Predict(circuit.Phase.Free, o, predicted)
+            right I64 = 0
+            for b in range 4 {
+                if I64(predicted[b]) == ((b / 2) ^ (b % 2)) { right++ }
+            }
+            a := c.Activity(circuit.Phase.Free, o)
+            try io.Print("lesson " $k ": loss " $(c.Loss(circuit.Phase.Free)).Fixed(5) ", " $right "/4 right, readout rates "
+                $(a.Get(0, 0)).Fixed(3) "/" $(a.Get(0, 1)).Fixed(3) " " $(a.Get(1, 0)).Fixed(3) "/" $(a.Get(1, 1)).Fixed(3) " "
+                $(a.Get(2, 0)).Fixed(3) "/" $(a.Get(2, 1)).Fixed(3) " " $(a.Get(3, 0)).Fixed(3) "/" $(a.Get(3, 1)).Fixed(3)
+                ", steps a lesson " $(F64(steps) / F64(k - refused)).Fixed(0) ", refused " $refused "\n")
+        }
+    }
+    try io.Print($(F64(time.Since(t0)) * 1e-9).Fixed(2) " s\n")
+}

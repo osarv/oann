@@ -1993,3 +1993,37 @@ test "a settling circuit learns XOR by equilibrium propagation" {
     assert c.Loss(Phase.Free) < 0.01
     try io.Print("XOR: loss " $(c.Loss(Phase.Free)) " after 400 lessons, " $(F64(sweeps) / 400.0) " sweeps a lesson\n") catch { }
 }
+
+test "a spiking circuit learns XOR from spike-count contrasts" {
+    lif := LifNeuron(0.1, 1.0, 0.25, 256)
+    c := Circuit<F64>(4)
+    x := c.Input(2)
+    h := c.Hidden(8, lif)
+    o := c.Readout(2, Cost.Squared, lif)
+    c.Project(x, h, Wiring.OneWay)
+    c.Project(h, o)
+    r := rand.Rand(1)
+    c.Plan(r)
+    for j in range 8 { c.Bias(h)[j] = 1.2 }
+    for j in range 2 { c.Bias(o)[j] = 1.0 }
+    d := c.DriveData(x)
+    t := c.TargetData(o)
+    for b in range 4 {
+        p I64 = b / 2
+        q I64 = b % 2
+        d[2 * b] = 1.0 if p == 1 else -1.0
+        d[2 * b + 1] = 1.0 if q == 1 else -1.0
+        t[2 * b + (p ^ q)] = 0.2                    # spikes a step for the class, none for the other
+    }
+    opt := Adam<F64>(c, 0.02)
+    steps I64 = 0
+    for k in range 200 {
+        steps += try c.Teach(4, Lesson(1.0)) catch { fail }
+        opt.Step(c)
+    }
+    predicted := Array<I32>(4)
+    c.Predict(Phase.Free, o, predicted)
+    for b in range 4 { assert I64(predicted[b]) == ((b / 2) ^ (b % 2)) }
+    assert c.Loss(Phase.Free) < 1e-3
+    try io.Print("spiking XOR: loss " $(c.Loss(Phase.Free)) " after 200 lessons, " $(F64(steps) / 200.0) " steps a lesson\n") catch { }
+}
