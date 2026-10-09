@@ -1,21 +1,22 @@
-# conv - two-dimensional convolution and max pooling on images held as rows, through im2col and one product.
+# conv - two-dimensional convolution and max pooling on images held as rows, as one product of their patches.
 #
 # An image is one row of a batched matrix, its pixels in row-major order with the channels of a pixel together - H x W
 # x C, "channels last" (NHWC for the batch, TensorFlow's default layout). A convolution's weights are PyTorch's,
 # OutC x (C K K) with each output channel's kernel as [C][K][K] - Conv2d.weight flattened - so a checkpoint maps onto
 # PyTorch's one to one; its output rows are again channels last, OutH x OutW x OutC.
 #
-# Channels last is what makes a whole batch one product. im2col writes every output position of every image as a row
-# of the patch it sees - the C K K inputs under the kernel, zero where the kernel hangs over the edge - into a
-# (n OutH OutW) x (C K K) matrix; then
-#     Y = cols W^T + b           (n OutH OutW) x OutC, one Gemm and a bias row
+# Channels last is what makes a whole batch one product. The patch matrix has a row for every output position of
+# every image, holding the patch it sees - the C K K inputs under the kernel, zero where the kernel hangs over the
+# edge - so it is (n OutH OutW) x (C K K); then
+#     Y = cols W^T + b           (n OutH OutW) x OutC, one product and a bias row
 # and Y's rows, OutC wide, are exactly the n images' output rows one after another - nothing is transposed. The
-# backward reads the same matrices the other way:
+# forward never makes the patch matrix: std/linalg's GemmPatches packs it straight from the images as the product
+# reads it, the bias added as each block of Y is finished. The backward reads the same matrices the other way:
 #     db = the column sums of dY       dW = dY^T cols       dcols = dY W
-# and col2im adds every patch's gradient back to the pixels it came from (patches overlap, so they add up). The
-# patches are not kept from the forward pass: the backward builds them again into the same workspace - one pass over
-# memory, against a product per layer - so a network needs one workspace, its largest convolution's, however many
-# layers it has.
+# and col2im adds every patch's gradient back to the pixels it came from (patches overlap, so they add up). There
+# im2col makes the patches into a workspace - dW reads them as the product's right operand, which GemmPatches does not
+# take - and dcols overwrites them, so a network needs one workspace, its largest convolution's, however many layers it
+# has.
 #
 # Max pooling keeps, for each output, which position of its window held the maximum (the first, when several do -
 # PyTorch's choice), and its backward adds the gradient there.
@@ -159,13 +160,15 @@ fn Col2im(dcols linalg.Matrix<<T>>&, s Shape&, dx linalg.Matrix<T>&, acc Bool, t
 }
 
 # y = the convolution of x by w plus b: x is n images (n x H W C), w OutC x C K K, b 1 x OutC, y n x OutH OutW OutC;
-# cols, (n OutH OutW) x (C K K), is the workspace the patches are written to, ws the product's packing workspace
-fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&,
-        cols linalg.Matrix<T>&, threads I64, ws mut linalg.GemmWorkspace<T>&) {
-    Im2col(x, s, cols, threads)
+# ws the product's packing workspace. One std/linalg GemmPatches: the product of the patches and w^T with the bias
+# added, the patches packed straight from the images as the product reads them - never made - so the forward writes
+# no patch matrix and reads the images where im2col and the product's packing read them twice; exactly what Im2col,
+# Gemm and AddRow give (a test)
+fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&, threads I64,
+        ws mut linalg.GemmWorkspace<T>&) {
     out := y.Reshape(y.Rows * s.Positions(), s.OutC)
-    ws.Gemm(out, cols, false, w, true, 1, 0, threads)
-    out.AddRow(b)
+    patches := linalg.Patches<T>(x, s.C, s.H, s.W, s.K, s.Stride, s.Pad)
+    ws.GemmPatches(out, patches, w, true, b, linalg.Activation.Identity, 1, 0, threads)
 }
 
 # the gradients of y = conv(x, w) + b: db the column sums of dy (as OutC-wide rows), dw = dy^T cols with the patches
@@ -313,7 +316,7 @@ fn direct(x linalg.Matrix<F64>&, w linalg.Matrix<F64>&, b linalg.Matrix<F64>&, s
     return y
 }
 
-test "a convolution through im2col and one product equals its definition: padding, strides, channels, threads" {
+test "a convolution as one product of its patches equals its definition: padding, strides, channels, threads" {
     r := rand.Rand(61)
     for shape in Shape[Shape(1, 5, 5, 2, 3, 1, 1), Shape(3, 7, 6, 4, 3, 2, 1), Shape(2, 4, 4, 3, 2, 1, 0),
             Shape(2, 9, 9, 5, 5, 3, 2)] {
@@ -328,10 +331,55 @@ test "a convolution through im2col and one product equals its definition: paddin
         want := direct(x, w, b, shape)
         for threads in range 1, 4, 2 {
             y := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
-            cols := linalg.Matrix<F64>(n * shape.Positions(), shape.Patch())
             ws := linalg.GemmWorkspace<F64>()
-            Conv2d(y, x, w, b, shape, cols, threads, ws)
+            Conv2d(y, x, w, b, shape, threads, ws)
             assert y.MaxAbsDifference(want) < 1e-12
+        }
+    }
+}
+
+# the forward as it was made before GemmPatches: im2col, one product of the patches, the bias
+fn byIm2col(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&,
+        threads I64) {
+    cols := linalg.Matrix<T>(x.Rows * s.Positions(), s.Patch())
+    Im2col(x, s, cols, threads)
+    out := y.Reshape(y.Rows * s.Positions(), s.OutC)
+    ws := linalg.GemmWorkspace<T>()
+    ws.Gemm(out, cols, false, w, true, 1, 0, threads)
+    out.AddRow(b)
+}
+
+test "the forward through GemmPatches gives exactly what im2col, a product and the bias give, in F32 and F64" {
+    r := rand.Rand(63)
+    # the CNN example's two convolutions on a batch larger than a product's block of rows, and smaller shapes
+    for shape in Shape[Shape(1, 28, 28, 16, 3, 1, 1), Shape(16, 14, 14, 32, 3, 1, 1), Shape(3, 7, 6, 4, 3, 2, 1),
+            Shape(2, 9, 9, 5, 5, 3, 2)] {
+        n I64 = 40
+        x := linalg.Matrix<F32>(n, shape.H * shape.W * shape.C)
+        x.FillNormal(r, 0.0, 1.0)
+        w := linalg.Matrix<F32>(shape.OutC, shape.Patch())
+        w.FillNormal(r, 0.0, 0.3)
+        b := linalg.Matrix<F32>(1, shape.OutC)
+        b.FillNormal(r, 0.0, 1.0)
+        x64 := linalg.Matrix<F64>(n, x.Cols)
+        w64 := linalg.Matrix<F64>(w.Rows, w.Cols)
+        b64 := linalg.Matrix<F64>(1, b.Cols)
+        x64.Convert(x)
+        w64.Convert(w)
+        b64.Convert(b)
+        for threads in range 1, 4, 2 {
+            want := linalg.Matrix<F32>(n, shape.Positions() * shape.OutC)
+            byIm2col(want, x, w, b, shape, threads)
+            y := linalg.Matrix<F32>(n, shape.Positions() * shape.OutC)
+            ws := linalg.GemmWorkspace<F32>()
+            Conv2d(y, x, w, b, shape, threads, ws)
+            assert y == want
+            want64 := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
+            byIm2col(want64, x64, w64, b64, shape, threads)
+            y64 := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
+            ws64 := linalg.GemmWorkspace<F64>()
+            Conv2d(y64, x64, w64, b64, shape, threads, ws64)
+            assert y64 == want64
         }
     }
 }
