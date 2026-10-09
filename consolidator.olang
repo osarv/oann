@@ -1,0 +1,532 @@
+# consolidator - sleep: the slow learner and its offline consolidation (docs/settling.md 1.9, 2.7). Complementary
+# learning systems (McClelland, McNaughton and O'Reilly 1995): a fast store takes in experience at once, and a slow
+# learner integrates it by interleaved replay offline. Here the fast part is the sparse-code store (store.olang) and
+# the slow part a gated linear recurrence on nn's Graph, its weights trained by backpropagation through time over a
+# window of steps:
+#
+#   l = sigmoid(g + G u),  z = tanh(B u + b),  h = l h_prev + (1 - l) z           the slow weights g, G, B, b
+#   m = the store's read at [alpha u, rho h]                                        no gradient flows through it
+#   y = C h + c + m                                                                  and C, c
+#
+# The gates depend on the input only, so the state is linear in its predecessor (QRNN-style, Bradbury et al. 2017;
+# gating as in Cho et al. 2014). alpha and rho scale the input and the state so that the two halves of the store's key
+# weigh alike (defaults 1 / sqrt of their widths).
+#
+# A sequence is Window steps of Inputs numbers, and Window steps of Outputs targets; each starts from h = 0. Batches of
+# sequences run as the rows of one graph, the window unrolled in it.
+#
+# - Day(u, y, n): n observed sequences. The slow part predicts, the store reads at each step's key, and the slow weights
+#   take one step of gradient descent (BPTT) on the window's mean squared error of the whole output, y - m being the
+#   slow part's target - what the store does not already hold - the step chosen by a backtracking line search from
+#   DayRate (halved until the loss falls by at least 1e-4 of the step's first-order prediction, at most Halvings times;
+#   none taken if it never does). Then each step writes, once, the residual y - (C h + c) of the slow part as it now
+#   is into the store at its key (the delta rule, one exposure). The sequences' inputs are kept: the cues a night
+#   replays.
+# - Sleep(passes): the night, over every cue kept. It dreams each cue once - the free path, the store included, frozen
+#   as targets - then teaches the slow weights the cue-to-dream pairs, the store excluded, for passes passes (Adam,
+#   started afresh each night, batches in an order drawn from the consolidator's generator: replay, Wilson and
+#   McNaughton 1994; pseudorehearsal, Robins 1995). At dawn the store's table is cleared and rewritten with each dream's
+#   residual from what the slow weights now produce at the new keys (fast weights to deblur old memories, Hinton and
+#   Plaut 1987), in passes until every residual reads back (dawn, below): it holds only what the slow weights did not
+#   absorb, and slow + store still recall the dreams.
+#
+# Sleep consolidates what the system produces, mistakes included - it does not correct the store. The asymmetry is
+# deliberate and stated (1.9): the day is local, the night backpropagation through time.
+
+import "std/linalg"
+import "std/math"
+import "std/rand"
+import "nn"
+import "optim"
+import "store"
+
+# a consolidator's settings (oann's defaults, docs/settling.md 6, decisions 56 and 58-60): set the fields before making one
+type SleepSettings struct() {
+    Alpha mut F64 = 0.0                 # the store's key: alpha u; 0 is 1 / sqrt(Inputs)
+    Rho mut F64 = 0.0                   # and rho h; 0 is 1 / sqrt(Hidden)
+    DayRate mut F64 = 0.0               # a day's line search starts at this step; 0: the slow weights learn only at night
+    Halvings mut I64 = 10               # and halves it at most this many times
+    NightRate mut F64 = 0.01            # Adam's rate at night
+    Passes mut I64 = 60                 # passes over the dreams a night
+    Cells mut I64 = 0                   # the store's cells (0: 150 per number of its key)
+    Active mut I64 = 0                  # its active cells (0: 0.5% of the cells, at least 16 - sparse enough to separate tasks)
+    MeanRate mut F64 = 0.0              # its running mean's rate: 0, a key centred at 0 by its scales already
+    GateBias mut F64 = 1.0              # g starts here: a gate keeping 73% of the state, remembering more than it forgets
+    DawnPasses mut I64 = 100            # dawn's passes of writes over the residuals, at most
+    DawnTolerance mut F64 = 0.001       # and the largest error of a read it stops at
+}
+
+type Consolidator<T> struct(inputs I64, outputs I64, hidden I64, window I64, batch I64, seed U64,
+        Config SleepSettings = SleepSettings()) {
+    Inputs I64 = inputs
+    Outputs I64 = outputs
+    Hidden I64 = hidden
+    Window I64 = window
+    Batch I64 = batch
+    Config
+    Alpha F64 = Config.Alpha if Config.Alpha > 0.0 else 1.0 / math.Sqrt(F64(inputs))
+    Rho F64 = Config.Rho if Config.Rho > 0.0 else 1.0 / math.Sqrt(F64(hidden))
+    rng mut rand.Rand = rand.Rand(seed)
+    nodes mut Array<I64>& = Array<I64>(4 * window + 2)     # each step's input, target, state and output; h0, the loss
+    like mut Array<T>& = Array<T>(1)
+    Slow mut nn.Graph<T>& = slowFor(like, inputs, outputs, hidden, window, batch, Config.GateBias, nodes, rng)
+    cells I64 = Config.Cells if Config.Cells > 0 else 150 * (inputs + hidden)
+    Fast mut store.Store<T>& = store.Store<T>(inputs + hidden, outputs, seed ^ U64(0x5EEDF00D), cells,
+        Config.Active if Config.Active > 0 else (16 if cells < 3200 else (cells + 199) / 200), 1, Config.MeanRate)
+    Night mut optim.FlatAdamW<T>& = optim.FlatAdamW<T>(Slow.ParamCount, Config.NightRate)
+    cues mut List<T>& = List<T>()                           # every sequence's inputs seen by day, one after another
+    Dreams mut Array<T>& = Array<T>(0)                      # the last night's dreams, laid out as its cues' targets
+    saved mut Array<T>& = Array<T>(Slow.ParamCount)         # the line search's starting point
+    key mut Array<T>& = Array<T>(inputs + hidden)
+    codeIdx mut Array<I32>& = Array<I32>(0)                 # dawn's codes and residuals, one per step of every cue
+    codes mut Array<T>& = Array<T>(0)
+    residuals mut Array<T>& = Array<T>(0)
+    read mut Array<T>& = Array<T>(outputs)
+    target mut Array<T>& = Array<T>(outputs)
+    Days mut I64 = 0
+    Nights mut I64 = 0
+    Steps mut I64 = 0                   # day steps taken by the line search
+    Declined mut I64 = 0                # day steps it gave up
+    DayLoss mut F64 = 0.0               # the last day's loss of the slow part against its target, before its step
+    NightLoss mut F64 = 0.0             # the last night's mean loss over its last pass
+    DawnError mut F64 = 0.0             # the largest error of a read of a residual after the last dawn
+    DawnPassesTaken mut I64 = 0         # and the passes it took
+}
+
+# a consolidator that is asked something it cannot do: stops with what is wrong
+fn wrong(what String&) {
+    eprintln("oann consolidator: " $what)
+    fail
+}
+
+# the slow part, recorded and planned: the window unrolled over batch rows, the weights Glorot-uniform from r and the
+# gate's bias at gateBias. nodes gets each step's input, target, state and output, then h0 and the loss
+fn slowFor(like Array<<T>>&, inputs I64, outputs I64, hidden I64, window I64, batch I64, gateBias F64, nodes mut Array<I64>&,
+        r mut rand.Rand&) nn.Graph<T>& {
+    g nn.Graph<T>&return = nn.Graph<T>(batch)
+    a F64 = math.Sqrt(6.0 / F64(inputs + hidden))
+    gw := g.Param(hidden, inputs, nn.Init.Uniform(-a, a), false)
+    gb := g.Param(1, hidden, nn.Init.Constant(gateBias), false)
+    bw := g.Param(hidden, inputs, nn.Init.Uniform(-a, a), false)
+    bb := g.Param(1, hidden, nn.Init.Zeros, false)
+    c F64 = math.Sqrt(6.0 / F64(hidden + outputs))
+    cw := g.Param(outputs, hidden, nn.Init.Uniform(-c, c), false)
+    cb := g.Param(1, outputs, nn.Init.Zeros, false)
+    h0 := g.Input(hidden)
+    h := h0
+    loss nn.Var = nn.Var(-1)
+    for t in range window {
+        u := g.Input(inputs)
+        y := g.Input(outputs)
+        l := g.Sigmoid(g.Linear(u, gw, gb))
+        z := g.Tanh(g.Linear(u, bw, bb))
+        h = g.Add(z, g.Multiply(l, g.Sub(h, z)))                # l h_prev + (1 - l) z
+        out := g.Linear(h, cw, cb)
+        e := g.Mse(out, y)
+        loss = e if t == 0 else g.Add(loss, e)
+        nodes[4 * t] = u
+        nodes[4 * t + 1] = y
+        nodes[4 * t + 2] = h
+        nodes[4 * t + 3] = out
+    }
+    nodes[4 * window] = h0
+    nodes[4 * window + 1] = g.Scale(loss, 1.0 / F64(window))
+    g.Plan(r)
+    return g
+}
+
+# the window's loss: the mean over its steps of the mean squared error of the slow part's output against the targets
+fn (k Consolidator<<T>>&) Loss() nn.Var {
+    return nn.Var(k.nodes[4 * k.Window + 1])
+}
+
+fn (k Consolidator<<T>>&) step(t I64, part I64) nn.Var {
+    return nn.Var(k.nodes[4 * t + part])
+}
+
+# the sequences seen by day and kept for the nights
+fn (k Consolidator<<T>>&) Cues() I64 {
+    return k.cues.Len() / (k.Window * k.Inputs)
+}
+
+# the inputs of the cues kept, sequence after sequence (Window steps of Inputs each), as a new array
+fn (k Consolidator<<T>>&) CueInputs() Array<T>& {
+    out Array<T>&return = k.cues.ToArray()
+    return out
+}
+
+# sequence s of u (Window steps of Inputs each, sequence after sequence) into row r of the graph's inputs
+fn (k mut Consolidator<<T>>&) putInputs(u Array<T>&, s I64, r I64) {
+    for t in range k.Window {
+        d := k.Slow.InputData(k.step(t, 0))
+        from I64 = (s * k.Window + t) * k.Inputs
+        for j in range k.Inputs { d[r * k.Inputs + j] = u[from + j] }
+    }
+}
+
+# the slow part over n sequences (n at most Batch) of u, from h = 0: its outputs and states are the graph's values
+fn (k mut Consolidator<<T>>&) run(u Array<T>&, first I64, n I64) {
+    if n < 1 or n > k.Batch { wrong("a run of " $n " sequences on a consolidator of batches of " $(k.Batch)) }
+    for r in range n { k.putInputs(u, first + r, r) }
+    k.Slow.Forward(n)
+}
+
+# the store's key of row r at step t of the last run: [alpha u, rho h]
+fn (k mut Consolidator<<T>>&) keyOf(r I64, t I64) {
+    like T
+    alpha := linalg.Cast(k.Alpha, like)
+    rho := linalg.Cast(k.Rho, like)
+    u := k.Slow.Value(k.step(t, 0))
+    h := k.Slow.Value(k.step(t, 2))
+    for j in range k.Inputs { k.key[j] = alpha * u.Get(r, j) }
+    for j in range k.Hidden { k.key[k.Inputs + j] = rho * h.Get(r, j) }
+}
+
+# the outputs of n sequences of u from sequence first on (n at most Batch), into out (laid out as targets: Window
+# steps of Outputs per sequence): the slow part's, plus the store's read when withStore - what the consolidator recalls
+fn (k mut Consolidator<<T>>&) Predict(u Array<T>&, first I64, n I64, out mut Array<T>&, withStore Bool = true) {
+    k.run(u, first, n)
+    for r in range n {
+        for t in range k.Window {
+            y := k.Slow.Value(k.step(t, 3))
+            at I64 = (r * k.Window + t) * k.Outputs
+            for j in range k.Outputs { out[at + j] = y.Get(r, j) }
+            if withStore {
+                k.keyOf(r, t)
+                k.Fast.Read(k.key, k.read)
+                for j in range k.Outputs { out[at + j] = out[at + j] + k.read[j] }
+            }
+        }
+    }
+}
+
+# Predict for any number of sequences, a batch at a time
+fn (k mut Consolidator<<T>>&) PredictAll(u Array<T>&, count I64, out mut Array<T>&, withStore Bool = true) {
+    per I64 = k.Window * k.Outputs
+    for first in range 0, count, k.Batch {
+        n I64 = k.Batch if count - first > k.Batch else count - first
+        k.Predict(u, first, n, out[first * per:(first + n) * per], withStore)
+    }
+}
+
+# one day of n observed sequences (at most Batch): inputs u and targets y, laid out sequence after sequence. The slow
+# weights step on what the store does not hold, then the store takes the slow part's residuals, and the inputs are kept
+fn (k mut Consolidator<<T>>&) Day(u Array<T>&, y Array<T>&, n I64) {
+    k.run(u, 0, n)
+    # the slow part's targets: the observed outputs less what the store reads at each step's key
+    for r in range n {
+        for t in range k.Window {
+            k.keyOf(r, t)
+            k.Fast.Read(k.key, k.read)
+            d := k.Slow.InputData(k.step(t, 1))
+            at I64 = (r * k.Window + t) * k.Outputs
+            for j in range k.Outputs { d[r * k.Outputs + j] = y[at + j] - k.read[j] }
+        }
+    }
+    k.Slow.Forward(n)
+    k.DayLoss = F64(k.Slow.Scalar(k.Loss()))
+    if k.Config.DayRate > 0.0 { k.descend(n) }
+    # the store takes the residual of the slow part as it now is, at the keys it now gives
+    k.run(u, 0, n)
+    for r in range n {
+        for t in range k.Window {
+            k.keyOf(r, t)
+            y0 := k.Slow.Value(k.step(t, 3))
+            at I64 = (r * k.Window + t) * k.Outputs
+            for j in range k.Outputs { k.target[j] = y[at + j] - y0.Get(r, j) }
+            k.Fast.Write(k.key, k.target)
+        }
+    }
+    for i in range n * k.Window * k.Inputs { k.cues.Push(u[i]) }
+    k.Days++
+}
+
+# one step of gradient descent on the loss the last Forward of n rows left, by a backtracking line search: from
+# DayRate, halved until the loss falls by at least 1e-4 times the step times the gradient's squared norm (Armijo), at
+# most Halvings times - and no step at all when it never does
+fn (k mut Consolidator<<T>>&) descend(n I64) {
+    loss := k.Loss()
+    k.Slow.Backward(loss)
+    before := F64(k.Slow.Scalar(loss))
+    p := k.Slow.Params().Data
+    g := k.Slow.ParamGrads().Data
+    norm F64 = 0.0
+    for i in range k.Slow.ParamCount {
+        k.saved[i] = p[i]
+        norm += F64(g[i]) * F64(g[i])
+    }
+    if norm == 0.0 { return }
+    like T
+    eta F64 = k.Config.DayRate
+    for h in range k.Config.Halvings + 1 {
+        e := linalg.Cast(eta, like)
+        for i in range k.Slow.ParamCount { p[i] = k.saved[i] - e * g[i] }
+        k.Slow.Forward(n)
+        if F64(k.Slow.Scalar(loss)) <= before - 1e-4 * eta * norm {
+            k.Steps++
+            return
+        }
+        eta = 0.5 * eta
+    }
+    for i in range k.Slow.ParamCount { p[i] = k.saved[i] }
+    k.Declined++
+}
+
+# a night over every cue kept by day: dream, consolidate, rewrite the store (Sleep's header). Gives the mean loss of the
+# slow part against the dreams over the last pass
+fn (k mut Consolidator<<T>>&) Sleep(passes I64 = 0) F64 {
+    cues := k.cues.ToArray()
+    return k.SleepOn(cues, k.Cues(), passes)
+}
+
+# a night over the given cues: count sequences of Window steps of Inputs (Sleep replays the ones kept by day)
+fn (k mut Consolidator<<T>>&) SleepOn(cues Array<T>&, count I64, passes I64 = 0) F64 {
+    if count < 1 { return 0.0 }
+    rounds I64 = passes if passes > 0 else k.Config.Passes
+    per I64 = k.Window * k.Outputs
+    # dusk: every cue dreamed once, the store included, and frozen
+    k.Dreams = Array<T>(count * per)
+    k.PredictAll(cues, count, k.Dreams, true)
+    # the night: the slow weights taught the dreams, the store excluded - Adam started afresh, batches shuffled
+    batches I64 = (count + k.Batch - 1) / k.Batch
+    order := Array<I64>(batches)
+    for b in range batches { order[b] = b }
+    zero T
+    for i in range k.Night.M.Len() {
+        k.Night.M[i] = zero
+        k.Night.V[i] = zero
+    }
+    k.Night.Steps = 0
+    k.Night.SetRate(k.Config.NightRate)
+    last F64 = 0.0
+    for pass in range rounds {
+        k.rng.Shuffle(order)
+        sum F64 = 0.0
+        for b in order {
+            first I64 = b * k.Batch
+            n I64 = k.Batch if count - first > k.Batch else count - first
+            for r in range n {
+                k.putInputs(cues, first + r, r)
+                for t in range k.Window {
+                    d := k.Slow.InputData(k.step(t, 1))
+                    at I64 = ((first + r) * k.Window + t) * k.Outputs
+                    for j in range k.Outputs { d[r * k.Outputs + j] = k.Dreams[at + j] }
+                }
+            }
+            k.Slow.Forward(n)
+            sum += F64(k.Slow.Scalar(k.Loss())) * F64(n)
+            k.Slow.Backward(k.Loss())
+            k.Night.Step(k.Slow.Params().Data, k.Slow.ParamGrads().Data)
+        }
+        last = sum / F64(count)
+    }
+    k.NightLoss = last
+    # dawn: the store rewritten with what the slow weights did not absorb, at the keys they now give
+    k.dawn(cues, count)
+    k.Nights++
+    return last
+}
+
+# dawn: the store's table cleared and rewritten with every step's residual, the dream less the slow part's output, at
+# the key the slow part now gives - passes of the delta rule over all of them (Kaczmarz's method: each write makes its
+# own read exact and disturbs the others' through shared cells), until every read is within DawnTolerance of its
+# residual or DawnPasses passes are done; one pass would leave each read disturbed by every later write sharing a cell.
+# Each key is coded once (the store's mean is not moved by dawn's writes), so a pass costs a gather and a scatter a step
+fn (k mut Consolidator<<T>>&) dawn(cues Array<T>&, count I64) {
+    steps I64 = count * k.Window
+    a I64 = k.Fast.K
+    k.codeIdx = Array<I32>(steps * a)
+    k.codes = Array<T>(steps * a)
+    k.residuals = Array<T>(steps * k.Outputs)
+    idx := Array<I32>(a)
+    code := Array<T>(a)
+    for first in range 0, count, k.Batch {
+        n I64 = k.Batch if count - first > k.Batch else count - first
+        k.run(cues, first, n)
+        for r in range n {
+            for t in range k.Window {
+                k.keyOf(r, t)
+                k.Fast.Encode(k.key, idx, code)
+                y0 := k.Slow.Value(k.step(t, 3))
+                i I64 = (first + r) * k.Window + t
+                for j in range a {
+                    k.codeIdx[i * a + j] = idx[j]
+                    k.codes[i * a + j] = code[j]
+                }
+                for j in range k.Outputs { k.residuals[i * k.Outputs + j] = k.Dreams[i * k.Outputs + j] - y0.Get(r, j) }
+            }
+        }
+    }
+    k.Fast.Clear()
+    k.DawnPassesTaken = 0
+    for pass in range k.Config.DawnPasses {
+        for i in range steps {
+            k.Fast.WriteCode(k.codeIdx[i * a:(i + 1) * a], k.codes[i * a:(i + 1) * a], k.residuals[i * k.Outputs:(i + 1) * k.Outputs])
+        }
+        k.DawnPassesTaken++
+        worst F64 = 0.0
+        for i in range steps {
+            k.Fast.ReadCode(k.codeIdx[i * a:(i + 1) * a], k.codes[i * a:(i + 1) * a], k.read)
+            for j in range k.Outputs { worst = math.Max(worst, math.Abs(F64(k.read[j] - k.residuals[i * k.Outputs + j]))) }
+        }
+        k.DawnError = worst
+        if worst <= k.Config.DawnTolerance { return }
+    }
+}
+
+# ---- tests (docs/settling.md 5.4), in F64 ----
+
+# n sequences of the flip-flop of docs/settling.md 5.10: each step a symbol - set (dimension 0), reset (1) or hold (2,
+# twice as likely as the other two together... 0.2, 0.2, 0.6) - and, when contexts, the context bit in dimension 3
+# (drawn per sequence: 0 for task A, 1 for task B, or ctx when it is 0 or 1); the target is +1 after a set and -1 after
+# a reset (the other way round in context 1), held through the holds, 0 before the first. Into u and y
+fn flipFlops(r mut rand.Rand&, n I64, window I64, inputs I64, ctx I64, u mut Array<F64>&, y mut Array<F64>&) {
+    for s in range n {
+        c I64 = ctx if ctx >= 0 else r.Below(2)
+        state F64 = 0.0
+        for t in range window {
+            x F64 = r.Float()
+            sym I64 = 0 if x < 0.2 else (1 if x < 0.4 else 2)
+            at I64 = (s * window + t) * inputs
+            for j in range inputs { u[at + j] = 0.0 }
+            u[at + sym] = 1.0
+            if inputs > 3 { u[at + 3] = F64(c) }
+            sign F64 = 1.0 if c == 0 else -1.0
+            if sym == 0 { state = sign }
+            if sym == 1 { state = -sign }
+            y[s * window + t] = state
+        }
+    }
+}
+
+# the fraction of the steps with a target other than 0 whose output has the target's sign
+fn agreement(out Array<F64>&, y Array<F64>&) F64 {
+    right I64 = 0
+    counted I64 = 0
+    for i in range y.Len() {
+        if y[i] == 0.0 { continue }
+        counted++
+        if (out[i] > 0.0) == (y[i] > 0.0) { right++ }
+    }
+    return F64(right) / F64(counted)
+}
+
+test "the slow part's gradient through the unrolled window agrees with central differences" {
+    s := SleepSettings()
+    k := Consolidator<F64>(4, 2, 5, 6, 3, 1, s)
+    r := rand.Rand(2)
+    for t in range 6 {
+        u := k.Slow.InputData(k.step(t, 0))
+        y := k.Slow.InputData(k.step(t, 1))
+        for i in range u.Len() { u[i] = r.Uniform(-1.0, 1.0) }
+        for i in range y.Len() { y[i] = r.Uniform(-1.0, 1.0) }
+    }
+    h0 := k.Slow.InputData(nn.Var(k.nodes[4 * k.Window]))
+    for i in range h0.Len() { h0[i] = r.Uniform(-0.5, 0.5) }
+    worst := nn.GradientError(k.Slow, k.Loss(), 3)
+    println("the gated recurrence over 6 steps: largest relative gradient error " $worst)
+    assert worst < 1e-6
+}
+
+test "a day's line search lowers the window's loss, or leaves the slow weights as they were" {
+    s := SleepSettings()
+    s.DayRate = 4.0                                 # too long a first step: the search must halve it
+    k := Consolidator<F64>(4, 1, 6, 8, 8, 2, s)
+    r := rand.Rand(3)
+    u := Array<F64>(8 * 8 * 4)
+    y := Array<F64>(8 * 8)
+    for trial in range 5 {
+        flipFlops(r, 8, 8, 4, 0, u, y)
+        k.run(u, 0, 8)
+        for row in range 8 {
+            for t in range 8 { k.Slow.InputData(k.step(t, 1))[row] = y[row * 8 + t] }
+        }
+        k.Slow.Forward(8)
+        before := k.Slow.Scalar(k.Loss())
+        params := k.Slow.Params().Clone()
+        steps := k.Steps
+        k.descend(8)
+        k.Slow.Forward(8)
+        after := k.Slow.Scalar(k.Loss())
+        if k.Steps > steps {
+            assert after < before
+        } else {
+            assert after == before and k.Slow.Params().MaxAbsDifference(params) == 0.0
+        }
+    }
+    assert k.Steps > 0
+}
+
+test "a night: the slow part alone learns the dreams, and the dawn store keeps slow and store recalling them" {
+    s := SleepSettings()
+    s.DayRate = 0.5
+    s.DawnPasses = 100
+    s.Cells = 7200                                  # a store large enough to hold every residual apart (5.10)
+    s.Active = 36
+    k := Consolidator<F64>(4, 1, 8, 8, 8, 3, s)
+    r := rand.Rand(4)
+    u := Array<F64>(8 * 8 * 4)
+    y := Array<F64>(8 * 8)
+    # sequences of random readings with random targets: every step's key its own, nothing for a rule to capture
+    for d in range 3 {
+        for i in range u.Len() { u[i] = r.Uniform(-1.0, 1.0) }
+        for i in range y.Len() { y[i] = r.Uniform(-1.0, 1.0) }
+        k.Day(u, y, 8)
+    }
+    count := k.Cues()
+    cues := k.cues.ToArray()
+    before := Array<F64>(count * 8)
+    k.PredictAll(cues, count, before, true)
+    loss := k.Sleep(400)
+    # the dreams are exactly what the consolidator recalled before the night
+    for i in range before.Len() { assert k.Dreams[i] == before[i] }
+    slow := Array<F64>(count * 8)
+    whole := Array<F64>(count * 8)
+    k.PredictAll(cues, count, slow, false)
+    k.PredictAll(cues, count, whole, true)
+    slowGap F64 = 0.0
+    recallGap F64 = 0.0
+    for i in range before.Len() {
+        slowGap += (slow[i] - before[i]) * (slow[i] - before[i])
+        recallGap += (whole[i] - before[i]) * (whole[i] - before[i])
+    }
+    slowGap = math.Sqrt(slowGap / F64(before.Len()))
+    recallGap = math.Sqrt(recallGap / F64(before.Len()))
+    println("a night over " $count " cues of random targets: the slow part alone within " $slowGap " of the dreams (rms; "
+        "its last pass's loss " $loss "), slow and store within " $recallGap " - dawn's writes read back within "
+        $(k.DawnError) " after " $(k.DawnPassesTaken) " passes")
+    assert math.Abs(slowGap * slowGap - loss) < 0.1 * loss and recallGap < 0.05 * slowGap and k.DawnError < 0.01
+}
+
+test "nights: the slow part alone generalizes better night after night, beyond what a store alone does" {
+    window I64 = 10
+    r := rand.Rand(5)
+    held I64 = 128
+    hu := Array<F64>(held * window * 4)
+    hy := Array<F64>(held * window)
+    flipFlops(r, held, window, 4, 0, hu, hy)
+    k := Consolidator<F64>(4, 1, 12, window, 16, 6)
+    q := SleepSettings()
+    alone := Consolidator<F64>(4, 1, 12, window, 16, 6, q)
+    u := Array<F64>(16 * window * 4)
+    y := Array<F64>(16 * window)
+    out := Array<F64>(held * window)
+    k.PredictAll(hu, held, out, false)
+    first := agreement(out, hy)
+    line := StringBuilder()
+    line.Push("before any night: the slow part alone " $(100.0 * first).Fixed(1) "%")
+    last F64 = 0.0
+    for night in range 3 {
+        flipFlops(r, 16, window, 4, 0, u, y)
+        k.Day(u, y, 16)
+        alone.Day(u, y, 16)
+        k.Sleep()
+        k.PredictAll(hu, held, out, false)
+        last = agreement(out, hy)
+        line.Push("; after night " $(night + 1) " " $(100.0 * last).Fixed(1) "%")
+    }
+    alone.PredictAll(hu, held, out, true)
+    byStore := agreement(out, hy)
+    println("new sequences, " $line.ToString() "; a store alone after the same days " $(100.0 * byStore).Fixed(1) "%")
+    assert last > first and last >= 0.95 and last > byStore
+}
