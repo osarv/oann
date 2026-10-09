@@ -180,14 +180,16 @@ type Regularizer enum {
   semantics: `m <- b1 m + (1 - b1) g`, `v <- b2 v + (1 - b2) g^2`, decoupled decay, then
   `p -= lr (m / (1 - b1^t)) / (sqrt(v / (1 - b2^t)) + eps)` - one loop, `p = keep p - step m / (sqrt(v) root + eps)`
   with the bias corrections folded into two scalars. `Rate` may change between steps (a schedule).
-- **`AdamWProjected(g, rate = 0.001, alpha = 1e-5, normalized = false)`** - AdamW with `Projection` in place of weight
+- **`AdamWProjected(g, rate = 0.001, alpha = 1e-3, normalized = true)`** - AdamW with `Projection` in place of weight
   decay (Behrouz et al., "Nested Learning: The Illusion of Deep Learning Architectures"): for every dense layer
   `y = x W^T + b`, `W <- W (I - alpha x x^T) - lr * (Adam update)`, `x` the layer's **input**. For a batch of `n`
   rows that is `W <- W - (alpha / n) (W X^T) X`, and `W X^T` is the transpose of `M = Y - b`, the layer's output less
   its bias, which the forward pass already computed: so the projection is a pass over `Y - b` and **one** GEMM per
   dense layer (`Gemm(W, M, transA = true, X, false, -alpha / n, beta = 1)`), run before the Adam step changes `W`. It
-  replaces weight decay. `normalized` divides each row's term by `|x|^2`. Both settings are parameters because neither
-  is settled (section 14).
+  replaces weight decay. `normalized` divides each row's term by `|x|^2`, so alpha is the fraction of each weight row's
+  component along an input's direction removed per step, whatever the inputs' scale - the default (the user's call,
+  2026-10-09), because one alpha then fits every layer: unnormalized, alpha must shrink with `|x|^2` (1e-3 already
+  costs MNIST five points, below).
 - **`Sgd<T>(g, rate = 0.01, Momentum = 0, Nesterov = false, Reg = WeightDecay(0))`**, PyTorch's semantics (decay added
   to the gradient, momentum buffer, Nesterov's look-ahead).
 
@@ -343,9 +345,8 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
 
 ## 14. Open questions
 
-1. The projection's defaults: alpha (1e-5 here - 1e-4 already costs half a point and 1e-3 five), normalized or not
-   (normalized tolerates a 100x larger alpha), whether alpha should scale with the learning rate, and whether it should
-   apply to every dense layer or only some. All are parameters; the defaults stay until a study settles them.
+1. The projection: normalized, alpha 1e-3 by default (97.79% on MNIST, section 8); still open whether alpha should
+   scale with the learning rate and whether it should apply to every dense layer or only some.
 2. The GEMM gap to OpenBLAS (3x single-threaded) is the target instruction set; a native-target build mode (and FMA
    contraction) in the compiler would close most of it.
 3. The chunk-pool leak (section 8): first-fit in the runtime, a workspace `Gemm`, or both.
