@@ -21,6 +21,7 @@
 import "std/io"
 import "std/linalg"
 import "std/math"
+import "std/os"
 import "std/rand"
 import "std/time"
 import "ops"
@@ -121,10 +122,14 @@ type Node struct(Kind Op, Rows I64, Cols I64, Batched Bool) {
     SavedOffset mut I64 = -1
 }
 
-# a network of T elements, planned for batches of up to Batch rows; its products split over Threads tasks
-type Graph<T> struct(Batch I64, Threads I64 = 1) {
+# a network of T elements, planned for batches of up to Batch rows; its products split over Threads tasks. A graph
+# for Decoding runs forward only, one sequence at a time and a few rows at a time: each Attention keeps the keys and
+# values of every position so far (a key-value cache in the arena), and a Forward of n rows at Pos computes positions
+# Pos ... Pos + n - 1 attending to all of them - generation without running the context again
+type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     Batch
     Threads
+    Decoding
     nodes mut List<Node>& = List<Node>()
     mem mut Array<<T>>& = Array<<T>>(0)
     classes mut Array<I32>& = Array<I32>(0)
@@ -385,7 +390,10 @@ fn (g Graph<<T>>&) savedShape(nd Node&, inUse Bool) (I64, I64) {
         }
         case Op.LayerNorm(_, _, _, _) { return rows, 2 }
         case Op.RmsNorm(_, _, _) { return rows, 1 }
-        case Op.Attention(_, _, _, heads, T, _) { return rows * heads, T }
+        case Op.Attention(_, _, _, heads, T, _) {
+            if g.Decoding { return 2 * T * nd.Cols + T, 1 }     # the cache: keys and values, T x Cols each, and scores
+            return rows * heads, T
+        }
         case Op.Dropout(_, _) { return rows, nd.Cols }
         nomatch { return 0, 0 }
     }
@@ -406,7 +414,7 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
             continue
         }
         a, b, c := inputs(nd.Kind)
-        needs[i] = (a >= 0 and needs[a]) or (b >= 0 and needs[b]) or (c >= 0 and needs[c])
+        needs[i] = not g.Decoding and ((a >= 0 and needs[a]) or (b >= 0 and needs[b]) or (c >= 0 and needs[c]))
     }
     at I64 = 2 * params
     rows I64 = 0
@@ -537,6 +545,69 @@ fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<<T>> {
     return linalg.View(g.mem, g.ParamCount, 1, g.ParamCount)
 }
 
+# ---- checkpoints ----
+# The parameters as one file: "oann" and the element width (4 or 8) as eight bytes, the parameter count as eight bytes,
+# then the parameters' bits, little-endian, in the order they were registered - the arena's first region as it is. A
+# graph built the same way loads it back whatever its batch.
+
+error CheckpointError {
+    MALFORMED          # not a checkpoint, or one of another element type or size
+}
+
+# the parameters of g written to "path"
+fn (g Graph<<T>>&) Save(path String&) ? os.OsError {
+    like <T>
+    width I64 = elementWidth(like)
+    out := Array<U8>(16 + width * g.ParamCount)
+    magic := "oann"
+    for i in range 4 { out[i] = U8(magic[i]) }
+    out[4] = U8(width)
+    putWord(out, 8, U64(g.ParamCount), 8)
+    for i in range g.ParamCount {
+        bits U64 = match <T> {
+            case F32 => U64(g.mem[i].Bits())
+            case F64 => g.mem[i].Bits()
+        }
+        putWord(out, 16 + i * width, bits, width)
+    }
+    try os.WriteFile(path, out)
+}
+
+# the parameters of g read from "path", written by Save from a graph with the same parameters
+fn (g mut Graph<<T>>&) Load(path String&) ? os.OsError + CheckpointError {
+    data := try os.ReadFile(path)
+    like <T>
+    width I64 = elementWidth(like)
+    if data.Len() != 16 + width * g.ParamCount or data[:4] != "oann" or I64(U8(data[4])) != width {
+        error CheckpointError.MALFORMED
+    }
+    if getWord(data, 8, 8) != U64(g.ParamCount) { error CheckpointError.MALFORMED }
+    for i in range g.ParamCount {
+        bits := getWord(data, 16 + i * width, width)
+        g.mem[i] = match <T> {
+            case F32 => U32(bits).F32FromBits()
+            case F64 => bits.F64FromBits()
+        }
+    }
+}
+
+fn elementWidth(like <T>) I64 {
+    return match <T> {
+        case F32 => 4
+        case F64 => 8
+    }
+}
+
+fn putWord(out mut Array<U8>&, at I64, v U64, width I64) {
+    for b in range width { out[at + b] = U8((v >> U64(8 * b)) & 255) }
+}
+
+fn getWord(data String&, at I64, width I64) U64 {
+    v U64 = 0
+    for b in range width { v = v | (U64(U8(data[at + b])) << U64(8 * b)) }
+    return v
+}
+
 # ---- running ----
 
 # runs every node in the order recorded, on the first n rows of the batch (n at most Batch)
@@ -584,8 +655,19 @@ fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
         }
         case Op.RmsNorm(x, a, eps) { ops.RmsNorm(y, g.Value(x), g.Value(a), linalg.Cast(eps, like), g.saved(node)) }
         case Op.Attention(q, k, v, heads, T, causal) {
-            if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
-            ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), th)
+            if g.Decoding {
+                if not causal or g.Pos < 0 or g.Pos + g.N > T {
+                    mismatch("decoding positions " $(g.Pos) " ... " $(g.Pos + g.N - 1) " of causal attention over " $T)
+                }
+                o := nd.SavedOffset
+                keys := linalg.View(g.mem, o, T, nd.Cols)
+                values := linalg.View(g.mem, o + T * nd.Cols, T, nd.Cols)
+                scores := g.mem[o + 2 * T * nd.Cols:o + 2 * T * nd.Cols + T]
+                ops.AttentionCached(y, g.Value(q), g.Value(k), g.Value(v), heads, g.Pos, keys, values, scores)
+            } else {
+                if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
+                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), th)
+            }
         }
         case Op.Dropout(x, p) {
             if g.Training { ops.Dropout(y, g.Value(x), g.saved(node), p, g.Rng) } else { y.Copy(g.Value(x)) }
@@ -630,6 +712,7 @@ fn (g Graph<<T>>&) acc(v I64) Bool {
 # Forward. A parameter's gradient is written afresh (zero where the loss does not depend on it); with accumulate
 # set it is added to the one already there instead, summing several batches' gradients before one update
 fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
+    if g.Decoding { mismatch("Backward on a graph for decoding") }
     top := g.nodes[loss]
     if top.Rows != 1 or top.Cols != 1 or top.GradOffset < 0 {
         mismatch("Backward from a node that is no loss depending on a parameter")
@@ -1012,5 +1095,26 @@ test "GELU through tanh agrees with central differences, and within 1e-3 of the 
     assert GradientError(g, loss, 4) < 1e-6
     g.Forward(4)
     assert g.Value(a).MaxAbsDifference(g.Value(b)) < 1e-3
+}
+
+test "a checkpoint saves the parameters and loads them back into a graph built the same way" {
+    a := Graph<F32>(4)
+    wa := a.Param(3, 5, Init.Normal(0.0, 1.0), true)
+    a.Param(1, 5, Init.Uniform(-1.0, 1.0), false)
+    r := rand.Rand(16)
+    a.Plan(r)
+    try a.Save("build/nn_checkpoint") catch { fail }
+    b := Graph<F32>(8)
+    wb := b.Param(3, 5, Init.Zeros, true)
+    b.Param(1, 5, Init.Zeros, false)
+    b.Plan(r)
+    try b.Load("build/nn_checkpoint") catch { fail }
+    assert b.Params().MaxAbsDifference(a.Params()) == 0.0 and b.Value(wb).Get(2, 4) == a.Value(wa).Get(2, 4)
+    c := Graph<F32>(4)
+    c.Param(3, 4, Init.Zeros, true)
+    c.Plan(r)
+    bad := false
+    try c.Load("build/nn_checkpoint") catch CheckpointError { bad = true } catch { }
+    assert bad
 }
 
