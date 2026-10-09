@@ -54,7 +54,7 @@ fn (s Shape&) Valid() Bool {
 # "threads" tasks. The innermost loop is a pixel's channels, read in order - unless there are fewer channels than the
 # kernel is wide (an image's first layer), when it is a kernel row's pixels, written in order, for every window inside
 # the image: three times as fast for one channel, measured
-fn Im2col(x linalg.Matrix<<T>>&, s Shape&, cols linalg.Matrix<<T>>&, threads I64) {
+fn Im2col(x linalg.Matrix<<T>>&, s Shape&, cols linalg.Matrix<T>&, threads I64) {
     assert cols.Cols == s.Patch() and cols.Rows == x.Rows * s.Positions() and x.Cols == s.H * s.W * s.C
     C := s.C
     K := s.K
@@ -66,7 +66,7 @@ fn Im2col(x linalg.Matrix<<T>>&, s Shape&, cols linalg.Matrix<<T>>&, threads I64
     OW := s.OutW
     KK I64 = K * K
     linalg.ParallelRows(x.Rows, 1, threads, fn(lo, hi) {
-        z <T>
+        z T
         for b in range lo, hi {
             img := x.Row(b)
             for oy in range OH {
@@ -107,7 +107,7 @@ fn Im2col(x linalg.Matrix<<T>>&, s Shape&, cols linalg.Matrix<<T>>&, threads I64
 }
 
 # the reverse of Im2col: every patch element added back into dx's pixel it was read from (dx = that, when not acc)
-fn Col2im(dcols linalg.Matrix<<T>>&, s Shape&, dx linalg.Matrix<<T>>&, acc Bool, threads I64) {
+fn Col2im(dcols linalg.Matrix<<T>>&, s Shape&, dx linalg.Matrix<T>&, acc Bool, threads I64) {
     C := s.C
     K := s.K
     H := s.H
@@ -118,7 +118,7 @@ fn Col2im(dcols linalg.Matrix<<T>>&, s Shape&, dx linalg.Matrix<<T>>&, acc Bool,
     OW := s.OutW
     KK I64 = K * K
     linalg.ParallelRows(dx.Rows, 1, threads, fn(lo, hi) {
-        z <T>
+        z T
         for b in range lo, hi {
             img := dx.Row(b)
             if not acc {
@@ -161,8 +161,8 @@ fn Col2im(dcols linalg.Matrix<<T>>&, s Shape&, dx linalg.Matrix<<T>>&, acc Bool,
 
 # y = the convolution of x by w plus b: x is n images (n x H W C), w OutC x C K K, b 1 x OutC, y n x OutH OutW OutC;
 # cols, (n OutH OutW) x (C K K), is the workspace the patches are written to, work the product's packing workspace
-fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, b linalg.Matrix<<T>>&, s Shape&,
-        cols linalg.Matrix<<T>>&, threads I64, work mut Array<<T>>&) {
+fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&,
+        cols linalg.Matrix<T>&, threads I64, work mut Array<T>&) {
     Im2col(x, s, cols, threads)
     out := y.Reshape(y.Rows * s.Positions(), s.OutC)
     kernels.Gemm(out, cols, false, w, true, 1, 0, threads, work)
@@ -172,9 +172,9 @@ fn Conv2d(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, b
 # the gradients of y = conv(x, w) + b: db the column sums of dy (as OutC-wide rows), dw = dy^T cols with the patches
 # built again, then dcols = dy w into the same workspace and col2im into dx - in that order, since dcols overwrites
 # the patches. An empty gradient matrix is one not wanted; acc adds to one instead of writing it
-fn Conv2dBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, s Shape&,
-        dx linalg.Matrix<<T>>&, accX Bool, dw linalg.Matrix<<T>>&, accW Bool, db linalg.Matrix<<T>>&, accB Bool,
-        cols linalg.Matrix<<T>>&, threads I64, work mut Array<<T>>&) {
+fn Conv2dBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, s Shape&,
+        dx linalg.Matrix<T>&, accX Bool, dw linalg.Matrix<T>&, accW Bool, db linalg.Matrix<T>&, accB Bool,
+        cols linalg.Matrix<T>&, threads I64, work mut Array<T>&) {
     g := dy.Reshape(dy.Rows * s.Positions(), s.OutC)
     if db.Rows > 0 { g.ColumnSums(db, 1.0 if accB else 0.0) }
     if dw.Rows > 0 {
@@ -219,7 +219,7 @@ fn (p Pool&) Valid() Bool {
 # y = the maximum of each window, per channel: x n x H W C, y n x OutH OutW C; where keeps, for each output, the
 # window position ky K + kx that held it (the first of equals, in row-major order). The innermost loop is a pixel's
 # channels, in order
-fn MaxPool2d(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, p Pool&, where linalg.Matrix<<T>>&, threads I64) {
+fn MaxPool2d(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, p Pool&, where linalg.Matrix<T>&, threads I64) {
     C := p.C
     K := p.K
     W := p.W
@@ -227,8 +227,8 @@ fn MaxPool2d(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, p Pool&, where linalg
     OH := p.OutH
     OW := p.OutW
     linalg.ParallelRows(x.Rows, 1, threads, fn(lo, hi) {
-        like <T>
-        z <T>
+        like T
+        z T
         for b in range lo, hi {
             img := x.Row(b)
             out := y.Row(b)
@@ -245,7 +245,7 @@ fn MaxPool2d(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, p Pool&, where linalg
                         for kx in range K {
                             if ky + kx > 0 {
                                 at I64 = ((oy * S + ky) * W + ox * S + kx) * C
-                                place <T> = linalg.Cast(ky * K + kx, like)
+                                place T = linalg.Cast(ky * K + kx, like)
                                 for c in range C {
                                     v := img[at + c]
                                     if v > out[o + c] {
@@ -263,7 +263,7 @@ fn MaxPool2d(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, p Pool&, where linalg
 }
 
 # dx = 0 with each output's gradient added at the input its maximum came from (dx += that, when acc)
-fn MaxPool2dBackward(dy linalg.Matrix<<T>>&, where linalg.Matrix<<T>>&, p Pool&, dx linalg.Matrix<<T>>&, acc Bool,
+fn MaxPool2dBackward(dy linalg.Matrix<<T>>&, where linalg.Matrix<T>&, p Pool&, dx linalg.Matrix<T>&, acc Bool,
         threads I64) {
     C := p.C
     K := p.K
@@ -272,7 +272,7 @@ fn MaxPool2dBackward(dy linalg.Matrix<<T>>&, where linalg.Matrix<<T>>&, p Pool&,
     OH := p.OutH
     OW := p.OutW
     linalg.ParallelRows(dx.Rows, 1, threads, fn(lo, hi) {
-        z <T>
+        z T
         for b in range lo, hi {
             img := dx.Row(b)
             if not acc {

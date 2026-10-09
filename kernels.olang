@@ -24,7 +24,7 @@ fn greater(a I64, b I64) I64 { return a if a > b else b }
 
 # the columns of the micro-kernel's tile for element type T: 12 for four-lane types, 6 for two-lane ones
 fn tileCols(z <T>) I64 {
-    return match <T> {
+    return match T {
         case F64, I64, U64 => 6
         nomatch => 12
     }
@@ -44,17 +44,17 @@ fn GemmSpace(m I64, n I64, k I64, threads I64, like <T>) I64 {
 
 # c = alpha * op(a) op(b) + beta * c, as std/linalg's Gemm computes it (beta 0 never reads c; c must not overlap a or
 # b), its packing panels in "work" - at least GemmSpace of the product's dimensions - so nothing is allocated
-fn Gemm(c linalg.Matrix<<T>>&, a linalg.Matrix<<T>>&, transA Bool, b linalg.Matrix<<T>>&, transB Bool, alpha F64,
-        beta F64, threads I64, work mut Array<<T>>&) {
+fn Gemm(c linalg.Matrix<<T>>&, a linalg.Matrix<T>&, transA Bool, b linalg.Matrix<T>&, transB Bool, alpha F64,
+        beta F64, threads I64, work mut Array<T>&) {
     am I64 = a.Cols if transA else a.Rows
     k I64 = a.Rows if transA else a.Cols
     bk I64 = b.Cols if transB else b.Rows
     bn I64 = b.Rows if transB else b.Cols
     assert k == bk and c.Rows == am and c.Cols == bn, "Gemm: shapes"
-    match <T> {
+    match T {
         case F16, BF16, F8E4M3, F8E5M2 { linalg.Gemm(c, a, transA, b, transB, alpha, beta, threads) }
         nomatch {
-            like <T>
+            like T
             gemm(transA, transB, c.Rows, c.Cols, k, linalg.Cast(alpha, like), a.Data, a.Stride, b.Data, b.Stride,
                 linalg.Cast(beta, like), c.Data, c.Stride, threads, work)
         }
@@ -63,13 +63,13 @@ fn Gemm(c linalg.Matrix<<T>>&, a linalg.Matrix<<T>>&, transA Bool, b linalg.Matr
 
 # A[i0 : i0 + rows, p0 : p0 + depth] (or of A's transpose) packed into ap as panels of mr rows: panel r holds, for
 # each k, the mr values of rows r * mr ... r * mr + mr - 1 of column k; rows past the end are zeros
-fn packA(transA Bool, a Array<<T>>&, lda I64, i0 I64, p0 I64, rows I64, depth I64, mr I64, ap mut Array<<T>>&) {
-    z <T>
+fn packA(transA Bool, a Array<<T>>&, lda I64, i0 I64, p0 I64, rows I64, depth I64, mr I64, ap mut Array<T>&) {
+    z T
     for r in range 0, rows, mr {
         base I64 = r * depth
         for k in range depth {
             for i in range mr {
-                v <T> = z
+                v T = z
                 if r + i < rows {
                     v = a[(p0 + k) * lda + i0 + r + i] if transA else a[(i0 + r + i) * lda + p0 + k]
                 }
@@ -80,13 +80,13 @@ fn packA(transA Bool, a Array<<T>>&, lda I64, i0 I64, p0 I64, rows I64, depth I6
 }
 
 # B[p0 : p0 + depth, j0 : j0 + cols] (or of B's transpose) packed into bp as panels of nr columns
-fn packB(transB Bool, b Array<<T>>&, ldb I64, p0 I64, j0 I64, depth I64, cols I64, nr I64, bp mut Array<<T>>&) {
-    z <T>
+fn packB(transB Bool, b Array<<T>>&, ldb I64, p0 I64, j0 I64, depth I64, cols I64, nr I64, bp mut Array<T>&) {
+    z T
     for c in range 0, cols, nr {
         base I64 = c * depth
         for k in range depth {
             for j in range nr {
-                v <T> = z
+                v T = z
                 if c + j < cols {
                     v = b[(j0 + c + j) * ldb + p0 + k] if transB else b[(p0 + k) * ldb + j0 + c + j]
                 }
@@ -98,37 +98,37 @@ fn packB(transB Bool, b Array<<T>>&, ldb I64, p0 I64, j0 I64, depth I64, cols I6
 
 # a tile of accumulators, kept in registers by the micro-kernels (an inline array, indexed only at constants)
 type tile<A> struct() {
-    v mut Array<<A>> = Array<<A>>(48)
+    v mut Array<A, 48>
 }
 
 # the micro-kernels: C[i, j] = alpha * sum over k of ap[k][i] * bp[k][j] + beta * C[i, j] for one 4 x NR tile, rows
 # and cols saying how much of it is inside C. Tile sizes are literals, so the accumulators stay in registers
-fn micro4x12(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>, beta <T>, c mut Array<<T>>&,
+fn micro4x12(depth I64, ap Array<<T>>&, ao I64, bp Array<T>&, bo I64, alpha T, beta T, c mut Array<T>&,
         co I64, ldc I64, rows I64, cols I64) {
-    acc := tile<<T>>()
+    acc := tile<T>()
     for k in range depth {
         for i in range 4 {
             ai := ap[ao + k * 4 + i]
             for j in range 12 { acc.v[i * 12 + j] += ai * bp[bo + k * 12 + j] }
         }
     }
-    out := tile<<T>>()
+    out := tile<T>()
     for i in range 4 {
         for j in range 12 { out.v[i * 12 + j] = acc.v[i * 12 + j] }
     }
     storeTile(out, 12, alpha, beta, c, co, ldc, rows, cols)
 }
 
-fn micro4x6(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>, beta <T>, c mut Array<<T>>&,
+fn micro4x6(depth I64, ap Array<<T>>&, ao I64, bp Array<T>&, bo I64, alpha T, beta T, c mut Array<T>&,
         co I64, ldc I64, rows I64, cols I64) {
-    acc := tile<<T>>()
+    acc := tile<T>()
     for k in range depth {
         for i in range 4 {
             ai := ap[ao + k * 4 + i]
             for j in range 6 { acc.v[i * 6 + j] += ai * bp[bo + k * 6 + j] }
         }
     }
-    out := tile<<T>>()
+    out := tile<T>()
     for i in range 4 {
         for j in range 6 { out.v[i * 6 + j] = acc.v[i * 6 + j] }
     }
@@ -136,7 +136,7 @@ fn micro4x6(depth I64, ap Array<<T>>&, ao I64, bp Array<<T>>&, bo I64, alpha <T>
 }
 
 # C[i, j] = alpha * t[i, j] + beta * C[i, j] for the rows x cols part of a tile held in t, row stride ts
-fn storeTile(t tile<<T>>&, ts I64, alpha <T>, beta <T>, c mut Array<<T>>&, co I64, ldc I64, rows I64, cols I64) {
+fn storeTile(t tile<<T>>&, ts I64, alpha T, beta T, c mut Array<T>&, co I64, ldc I64, rows I64, cols I64) {
     if beta == 0 {
         for i in range rows {
             for j in range cols { c[co + i * ldc + j] = alpha * t.v[i * ts + j] }
@@ -149,8 +149,8 @@ fn storeTile(t tile<<T>>&, ts I64, alpha <T>, beta <T>, c mut Array<<T>>&, co I6
 }
 
 # rows i0 .. i1 of C for one packed block of B: each task's share of a product, packing A's rows into its own ap
-fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I64, cols I64, alpha <T>,
-        ap mut Array<<T>>&, bp Array<<T>>&, beta <T>, c mut Array<<T>>&, ldc I64, j0 I64) {
+fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I64, cols I64, alpha T,
+        ap mut Array<T>&, bp Array<T>&, beta T, c mut Array<T>&, ldc I64, j0 I64) {
     nr := tileCols(alpha)
     for ic in range i0, i1, mc {
         rows I64 = lesser(mc, i1 - ic)
@@ -158,7 +158,7 @@ fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I
         for jr in range 0, cols, nr {
             for ir in range 0, rows, 4 {
                 co I64 = (ic + ir) * ldc + j0 + jr
-                match <T> {
+                match T {
                     case F64, I64, U64 {
                         micro4x6(depth, ap, ir * depth, bp, jr * depth, alpha, beta, c, co, ldc, lesser(4,
                             rows - ir), lesser(nr, cols - jr))
@@ -174,9 +174,9 @@ fn gemmRows(transA Bool, a Array<<T>>&, lda I64, i0 I64, i1 I64, p0 I64, depth I
 }
 
 # a small product without packing: each row of C updated from rows of B (B not transposed)
-fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I64, b Array<<T>>&, ldb I64,
-        beta <T>, c mut Array<<T>>&, ldc I64) {
-    z <T>
+fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<T>&, lda I64, b Array<T>&, ldb I64,
+        beta T, c mut Array<T>&, ldc I64) {
+    z T
     for i in range m {
         ci I64 = i * ldc
         if beta == z {
@@ -185,7 +185,7 @@ fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I6
             for j in range n { c[ci + j] = beta * c[ci + j] }
         }
         for p in range k {
-            aip <T> = alpha * (a[p * lda + i] if transA else a[i * lda + p])
+            aip T = alpha * (a[p * lda + i] if transA else a[i * lda + p])
             bp I64 = p * ldb
             for j in range n { c[ci + j] = c[ci + j] + aip * b[bp + j] }
         }
@@ -194,12 +194,12 @@ fn gemmDirect(transA Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I6
 
 # out[i * os] = alpha * sum over p < len of M(i, p) v[p] + beta * out[i * os]: a matrix-vector product in either
 # orientation, M(i, p) being mat[i * rs + p * cs] and v[p] vec[p * vs]
-fn gemv(rows I64, len I64, alpha <T>, mat Array<<T>>&, rs I64, cs I64, vec Array<<T>>&, vs I64, beta <T>,
-        out mut Array<<T>>&, os I64) {
-    z <T>
+fn gemv(rows I64, len I64, alpha <T>, mat Array<T>&, rs I64, cs I64, vec Array<T>&, vs I64, beta T,
+        out mut Array<T>&, os I64) {
+    z T
     if cs == 1 and vs == 1 {
         for i in range rows {
-            d <T> = alpha * Dot(mat, i * rs, vec, 0, len)
+            d T = alpha * Dot(mat, i * rs, vec, 0, len)
             out[i * os] = d if beta == z else d + beta * out[i * os]
         }
         return
@@ -209,23 +209,23 @@ fn gemv(rows I64, len I64, alpha <T>, mat Array<<T>>&, rs I64, cs I64, vec Array
     }
     if rs == 1 and os == 1 {
         for p in range len {
-            vp <T> = alpha * vec[p * vs]
+            vp T = alpha * vec[p * vs]
             col I64 = p * cs
             for i in range rows { out[i] = out[i] + vp * mat[col + i] }
         }
         return
     }
     for i in range rows {
-        acc <T> = z
+        acc T = z
         for p in range len { acc = acc + mat[i * rs + p * cs] * vec[p * vs] }
         out[i * os] = out[i * os] + alpha * acc
     }
 }
 
-fn gemm(transA Bool, transB Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&, lda I64, b Array<<T>>&, ldb I64,
-        beta <T>, c mut Array<<T>>&, ldc I64, threads I64, work mut Array<<T>>&) {
+fn gemm(transA Bool, transB Bool, m I64, n I64, k I64, alpha <T>, a Array<T>&, lda I64, b Array<T>&, ldb I64,
+        beta T, c mut Array<T>&, ldc I64, threads I64, work mut Array<T>&) {
     if m == 0 or n == 0 { return }
-    z <T>
+    z T
     nr := tileCols(alpha)
     if k == 0 {
         for i in range m {
@@ -263,7 +263,7 @@ fn gemm(transA Bool, transB Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&,
         for pc in range 0, k, kc {
             depth I64 = lesser(kc, k - pc)
             packB(transB, b, ldb, pc, jc, depth, cols, nr, bp)
-            bt <T> = beta if pc == 0 else 1
+            bt T = beta if pc == 0 else 1
             if tasks == 1 {
                 gemmRows(transA, a, lda, 0, m, pc, depth, cols, alpha, ap, bp, bt, c, ldc, jc)
             } else {
@@ -284,11 +284,11 @@ fn gemm(transA Bool, transB Bool, m I64, n I64, k I64, alpha <T>, a Array<<T>>&,
 
 # eight partial sums, combined pairwise at the end - what lets a sum of floats run in vector registers
 type lanes<A> struct() {
-    v mut Array<<A>> = Array<<A>>(16)
+    v mut Array<A, 16>
 }
 
-fn (l lanes<<A>>&) total() <A> {
-    out := lanes<<A>>()
+fn (l lanes<<A>>&) total() A {
+    out := lanes<A>()
     for i in range 8 { out.v[i] = l.v[i] }
     h I64 = 4
     for h >= 1 {
@@ -299,27 +299,27 @@ fn (l lanes<<A>>&) total() <A> {
 }
 
 # the sum of x[xf + i] * y[yf + i] for i < n, in eight lanes
-fn Dot(x Array<<T>>&, xf I64, y Array<<T>>&, yf I64, n I64) <T> {
-    acc := lanes<<T>>()
+fn Dot(x Array<<T>>&, xf I64, y Array<T>&, yf I64, n I64) T {
+    acc := lanes<T>()
     whole I64 = n - n % 8
     for i in range 0, whole, 8 {
         for j in range 8 { acc.v[j] = acc.v[j] + x[xf + i + j] * y[yf + i + j] }
     }
-    z <T>
-    rest <T> = z
+    z T
+    rest T = z
     for i in range whole, n { rest = rest + x[xf + i] * y[yf + i] }
     return acc.total() + rest
 }
 
 # the sum of x[from + i] for i < n, in eight lanes
-fn Sum(x Array<<T>>&, from I64, n I64) <T> {
-    acc := lanes<<T>>()
+fn Sum(x Array<<T>>&, from I64, n I64) T {
+    acc := lanes<T>()
     whole I64 = n - n % 8
     for i in range 0, whole, 8 {
         for j in range 8 { acc.v[j] = acc.v[j] + x[from + i + j] }
     }
-    z <T>
-    rest <T> = z
+    z T
+    rest T = z
     for i in range whole, n { rest = rest + x[from + i] }
     return acc.total() + rest
 }
@@ -339,7 +339,7 @@ fn SquaresF64(x Array<<T>>&) F64 {
 }
 
 # y[yf + i] = y[yf + i] + alpha * x[xf + i] for i < n - BLAS's axpy on two runs
-fn Axpy(y mut Array<<T>>&, yf I64, alpha <T>, x Array<<T>>&, xf I64, n I64) {
+fn Axpy(y mut Array<<T>>&, yf I64, alpha T, x Array<T>&, xf I64, n I64) {
     for i in range n { y[yf + i] = y[yf + i] + alpha * x[xf + i] }
 }
 

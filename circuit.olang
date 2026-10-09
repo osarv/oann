@@ -143,7 +143,7 @@ type Circuit<T> struct(Rows I64) {
     Rows
     regions mut List<regionRec>& = List<regionRec>()
     projections mut List<projectionRec>& = List<projectionRec>()
-    mem mut Array<<T>>& = Array<<T>>(0)
+    mem mut Array<T>& = Array<T>(0)
     labels mut Array<I32>& = Array<I32>(0)
     masks mut Array<U8>& = Array<U8>(0)
     current mut Array<I64>& = Array<I64>(4)     # each phase's committed slot, 0 or 1
@@ -307,11 +307,11 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
     at += 4 * rows
     c.mass = at
     at += n
-    c.mem = Array<<T>>(at)
+    c.mem = Array<T>(at)
     c.labels = Array<I32>(labelAt)
     c.masks = Array<U8>(maskAt)
     c.planned = true
-    zero <T>
+    zero T
     for i in range c.projections.Len() {
         p := c.projections[i]
         w := c.Weights(Projection(i))
@@ -330,53 +330,53 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
 # ---- parameters, data and state ----
 
 # a projection's weights, post x pre, as a view of the arena
-fn (c Circuit<<T>>&) Weights(p Projection) linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) Weights(p Projection) linalg.Matrix<T> {
     pr := c.projections[p]
     return linalg.View(c.mem, pr.Offset, c.regions[pr.Post].Size, c.regions[pr.Pre].Size)
 }
 
 # a projection's gradient (the last Contrast's), laid out as its weights
-fn (c Circuit<<T>>&) WeightGrads(p Projection) linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) WeightGrads(p Projection) linalg.Matrix<T> {
     pr := c.projections[p]
     return linalg.View(c.mem, c.ParamCount + pr.Offset, c.regions[pr.Post].Size, c.regions[pr.Pre].Size)
 }
 
 # a region's biases (an Input region's are not used: its state is rho(drive))
-fn (c Circuit<<T>>&) Bias(reg Region) mut Array<<T>>&c {
+fn (c Circuit<<T>>&) Bias(reg Region) mut Array<T>&c {
     rg := c.regions[reg]
     return c.mem[c.bias + rg.Col:c.bias + rg.Col + rg.Size]
 }
 
 # a region's bias gradients
-fn (c Circuit<<T>>&) BiasGrads(reg Region) mut Array<<T>>&c {
+fn (c Circuit<<T>>&) BiasGrads(reg Region) mut Array<T>&c {
     rg := c.regions[reg]
     at I64 = c.ParamCount + c.bias + rg.Col
     return c.mem[at:at + rg.Size]
 }
 
 # every parameter, one after another, as a 1 x ParamCount matrix - what an optimizer updates
-fn (c Circuit<<T>>&) Params() linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) Params() linalg.Matrix<T> {
     return linalg.View(c.mem, 0, 1, c.ParamCount)
 }
 
 # every parameter's gradient, laid out as Params()
-fn (c Circuit<<T>>&) Grads() linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) Grads() linalg.Matrix<T> {
     return linalg.View(c.mem, c.ParamCount, 1, c.ParamCount)
 }
 
 # every parameter as one array, and their gradients as another: what optim's flat optimizers step -
 # opt.Step(c.ParamData(), c.GradData())
-fn (c Circuit<<T>>&) ParamData() mut Array<<T>>&c {
+fn (c Circuit<<T>>&) ParamData() mut Array<T>&c {
     return c.mem[0:c.ParamCount]
 }
 
-fn (c Circuit<<T>>&) GradData() mut Array<<T>>&c {
+fn (c Circuit<<T>>&) GradData() mut Array<T>&c {
     return c.mem[c.ParamCount:2 * c.ParamCount]
 }
 
 # where the caller puts a region's drive: Rows rows of its neurons, one after another. An input's drive is its
 # activity's argument; any other region's is added to its neurons' totals (a memory read, an encoder's output)
-fn (c Circuit<<T>>&) DriveData(reg Region) mut Array<<T>>&c {
+fn (c Circuit<<T>>&) DriveData(reg Region) mut Array<T>&c {
     rg := c.regions[reg]
     return c.mem[rg.Drive:rg.Drive + c.Rows * rg.Size]
 }
@@ -389,7 +389,7 @@ fn (c Circuit<<T>>&) LabelData(reg Region) mut Array<I32>&c {
 }
 
 # where the caller puts a Squared readout's targets, Rows rows of its neurons
-fn (c Circuit<<T>>&) TargetData(reg Region) mut Array<<T>>&c {
+fn (c Circuit<<T>>&) TargetData(reg Region) mut Array<T>&c {
     rg := c.regions[reg]
     if rg.Target < 0 { wrong("TargetData of a region that is no Squared readout") }
     return c.mem[rg.Target:rg.Target + c.Rows * rg.Size]
@@ -425,17 +425,17 @@ fn (c Circuit<<T>>&) candidate(pi I64, k I64) I64 {
 }
 
 # phase p's activities s, the rows in use by every neuron, as a view of its committed state (writing it writes it)
-fn (c Circuit<<T>>&) Value(p Phase) linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) Value(p Phase) linalg.Matrix<T> {
     return linalg.View(c.mem, c.committed(phaseIndex(p), 1), c.N, c.Neurons)
 }
 
 # phase p's potentials v (a spiking circuit's membrane potentials)
-fn (c Circuit<<T>>&) Potential(p Phase) linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) Potential(p Phase) linalg.Matrix<T> {
     return linalg.View(c.mem, c.committed(phaseIndex(p), 0), c.N, c.Neurons)
 }
 
 # one region's columns of phase p's activities
-fn (c Circuit<<T>>&) Activity(p Phase, reg Region) linalg.Matrix<<T>> {
+fn (c Circuit<<T>>&) Activity(p Phase, reg Region) linalg.Matrix<T> {
     rg := c.regions[reg]
     return linalg.View(c.mem, c.committed(phaseIndex(p), 1) + rg.Col, c.N, rg.Size, c.Neurons)
 }
@@ -451,7 +451,7 @@ fn (c mut Circuit<<T>>&) copyRun(from I64, to I64, n I64) {
 }
 
 fn (c mut Circuit<<T>>&) zeroRun(at I64, n I64) {
-    zero <T>
+    zero T
     for i in range n { c.mem[at + i] = zero }
 }
 
@@ -504,7 +504,7 @@ fn slopeOf(model Neuron) F64 {
 
 # s = rho(v) for n elements at vAt, written at sAt
 fn (c mut Circuit<<T>>&) activate(model Neuron, vAt I64, sAt I64, n I64) {
-    like <T>
+    like T
     match model {
         case Neuron.Rate(f) {
             match f {
@@ -513,7 +513,7 @@ fn (c mut Circuit<<T>>&) activate(model Neuron, vAt I64, sAt I64, n I64) {
                 }
                 case Rho.HardSigmoid {
                     for i in range n {
-                        x <T> = c.mem[vAt + i]
+                        x T = c.mem[vAt + i]
                         c.mem[sAt + i] = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
                     }
                 }
@@ -528,33 +528,33 @@ fn (c mut Circuit<<T>>&) activate(model Neuron, vAt I64, sAt I64, n I64) {
 }
 
 # v += dt (total - v), s = rho(v): one sweep's step for n elements of a rate region
-fn (c mut Circuit<<T>>&) stepRun(f Rho, vAt I64, sAt I64, tAt I64, n I64, h <T>) {
-    like <T>
+fn (c mut Circuit<<T>>&) stepRun(f Rho, vAt I64, sAt I64, tAt I64, n I64, h T) {
+    like T
     match f {
         case Rho.Tanh {
             for i in range n {
-                x <T> = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
+                x T = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
                 c.mem[vAt + i] = x
                 c.mem[sAt + i] = linalg.FastTanh(x)
             }
         }
         case Rho.HardSigmoid {
             for i in range n {
-                x <T> = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
+                x T = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
                 c.mem[vAt + i] = x
                 c.mem[sAt + i] = 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
             }
         }
         case Rho.Linear {
             for i in range n {
-                x <T> = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
+                x T = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
                 c.mem[vAt + i] = x
                 c.mem[sAt + i] = x
             }
         }
         case Rho.LifRate(leak, threshold) {
             for i in range n {
-                x <T> = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
+                x T = c.mem[vAt + i] + h * (c.mem[tAt + i] - c.mem[vAt + i])
                 c.mem[vAt + i] = x
                 c.mem[sAt + i] = linalg.Cast(LifRateOf(F64(x), leak, threshold), like)
             }
@@ -627,7 +627,7 @@ fn (c mut Circuit<<T>>&) transport(x I64, withConstant Bool) {
 # readout, target - s for a Squared one
 fn (c mut Circuit<<T>>&) addNudge(s I64, beta F64) {
     n := c.Neurons
-    like <T>
+    like T
     k := linalg.Cast(beta, like)
     for i in range c.regions.Len() {
         rg := c.regions[i]
@@ -639,14 +639,14 @@ fn (c mut Circuit<<T>>&) addNudge(s I64, beta F64) {
                 case Cost.CrossEntropy(temperature) {
                     y I64 = I64(c.labels[rg.Labels + b])
                     inv := linalg.Cast(1.0 / temperature, like)
-                    top <T> = c.mem[at]
+                    top T = c.mem[at]
                     for j in range 1, rg.Size { top = math.Max(top, c.mem[at + j]) }
-                    sum <T> = 0.0
+                    sum T = 0.0
                     for j in range rg.Size { sum = sum + linalg.FastExp((c.mem[at + j] - top) * inv) }
-                    scale <T> = 1.0 / sum
+                    scale T = 1.0 / sum
                     for j in range rg.Size {
-                        p <T> = linalg.FastExp((c.mem[at + j] - top) * inv) * scale
-                        target <T> = 1.0 if j == y else 0.0
+                        p T = linalg.FastExp((c.mem[at + j] - top) * inv) * scale
+                        target T = 1.0 if j == y else 0.0
                         c.mem[to + j] = c.mem[to + j] + k * (target - p)
                     }
                 }
@@ -664,9 +664,9 @@ fn (c mut Circuit<<T>>&) addNudge(s I64, beta F64) {
 fn (c mut Circuit<<T>>&) measure(v I64) F64 {
     n := c.Neurons
     worst F64 = 0.0
-    zero <T>
+    zero T
     for b in range c.N {
-        best <T> = zero
+        best T = zero
         for i in range c.regions.Len() {
             rg := c.regions[i]
             if rg.Kind is Role.Input { continue }
@@ -684,7 +684,7 @@ fn (c mut Circuit<<T>>&) measure(v I64) F64 {
 # one sweep's step for every row in use: v += dt (total - v), s = rho(v)
 fn (c mut Circuit<<T>>&) step(v I64, s I64, dt F64) {
     n := c.Neurons
-    like <T>
+    like T
     h := linalg.Cast(dt, like)
     for i in range c.regions.Len() {
         rg := c.regions[i]
@@ -787,7 +787,7 @@ fn (c mut Circuit<<T>>&) Run(p Phase, sweeps I64) Settlement {
 
 # the totals of phase p's committed state - every neuron's input from the state, with its phase's nudge - for the
 # rows in use, as a view of the workspace (valid until the next settle); the residual is Totals - Potential
-fn (c mut Circuit<<T>>&) Totals(p Phase) linalg.Matrix<<T>> {
+fn (c mut Circuit<<T>>&) Totals(p Phase) linalg.Matrix<T> {
     if c.Spiking { wrong("Totals of a spiking circuit") }
     pi := phaseIndex(p)
     v := c.committed(pi, 0)
@@ -801,7 +801,7 @@ fn (c mut Circuit<<T>>&) Totals(p Phase) linalg.Matrix<<T>> {
 
 # each row's residual max |total - v| at phase p's committed state, into out (N of them), without settling; gives the
 # largest. For a spiking circuit, the residuals its last settle ended on
-fn (c mut Circuit<<T>>&) Residual(p Phase, out mut Array<<T>>&) F64 {
+fn (c mut Circuit<<T>>&) Residual(p Phase, out mut Array<T>&) F64 {
     pi := phaseIndex(p)
     worst F64 = 0.0
     if c.Spiking {
@@ -867,7 +867,7 @@ fn (c mut Circuit<<T>>&) spikes(pi I64, budget I64, tolerance F64, check Bool) S
 # and total becomes the constant plus the synaptic current
 fn (c mut Circuit<<T>>&) currents(syn I64) {
     n := c.Neurons
-    like <T>
+    like T
     for i in range c.regions.Len() {
         rg := c.regions[i]
         if rg.Kind is Role.Input { continue }
@@ -877,7 +877,7 @@ fn (c mut Circuit<<T>>&) currents(syn I64) {
                 for b in range c.N {
                     at I64 = b * n + rg.Col
                     for j in range rg.Size {
-                        y <T> = c.mem[syn + at + j] + k * (c.mem[c.total + at + j] - c.mem[syn + at + j])
+                        y T = c.mem[syn + at + j] + k * (c.mem[c.total + at + j] - c.mem[syn + at + j])
                         c.mem[syn + at + j] = y
                         c.mem[c.total + at + j] = c.mem[c.constant + at + j] + y
                     }
@@ -894,7 +894,7 @@ fn (c mut Circuit<<T>>&) currents(syn I64) {
 # swings from window to window)
 fn (c mut Circuit<<T>>&) fire(v I64, spk I64, trace I64) {
     n := c.Neurons
-    like <T>
+    like T
     one := linalg.Cast(1.0, like)
     follow := linalg.Cast(math.Min(1.0, 4.0 / F64(c.window)), like)
     for i in range c.regions.Len() {
@@ -907,10 +907,10 @@ fn (c mut Circuit<<T>>&) fire(v I64, spk I64, trace I64) {
                 for b in range c.N {
                     at I64 = b * n + rg.Col
                     for j in range rg.Size {
-                        u <T> = c.mem[v + at + j] + k * (c.mem[c.total + at + j] - c.mem[v + at + j])
+                        u T = c.mem[v + at + j] + k * (c.mem[c.total + at + j] - c.mem[v + at + j])
                         fired Bool = u >= th
                         c.mem[v + at + j] = u - th if fired else u
-                        x <T> = one if fired else like
+                        x T = one if fired else like
                         c.mem[spk + at + j] = x
                         c.mem[c.count + at + j] = c.mem[c.count + at + j] + x
                         c.mem[trace + at + j] = c.mem[trace + at + j] + follow * (x - c.mem[trace + at + j])
@@ -926,17 +926,17 @@ fn (c mut Circuit<<T>>&) fire(v I64, spk I64, trace I64) {
 # rate; gives the largest of the rows
 fn (c mut Circuit<<T>>&) rates(s I64) F64 {
     n := c.Neurons
-    like <T>
+    like T
     per := linalg.Cast(1.0 / F64(c.window), like)
     worst F64 = 0.0
     for b in range c.N {
-        best <T> = like
+        best T = like
         for i in range c.regions.Len() {
             rg := c.regions[i]
             if rg.Kind is Role.Input { continue }
             at I64 = b * n + rg.Col
             for j in range rg.Size {
-                r <T> = c.mem[c.count + at + j] * per
+                r T = c.mem[c.count + at + j] * per
                 best = math.Max(best, math.Abs(r - c.mem[s + at + j]))
                 c.mem[s + at + j] = r
             }
@@ -954,7 +954,7 @@ fn (c mut Circuit<<T>>&) rates(s I64) F64 {
 # pre (a lateral block's both, a bound on |W + W^T|)
 fn (c mut Circuit<<T>>&) masses() {
     n := c.Neurons
-    zero <T>
+    zero T
     for i in range n { c.mem[c.mass + i] = zero }
     for i in range c.projections.Len() {
         pr := c.projections[i]
@@ -963,9 +963,9 @@ fn (c mut Circuit<<T>>&) masses() {
         post := c.regions[pr.Post]
         pre := c.regions[pr.Pre]
         for r in range w.Rows {
-            row <T> = zero
+            row T = zero
             for j in range w.Cols {
-                a <T> = math.Abs(w.Data[r * w.Stride + j])
+                a T = math.Abs(w.Data[r * w.Stride + j])
                 row = row + a
                 if pr.Kind is Wiring.Reciprocal { c.mem[c.mass + pre.Col + j] = c.mem[c.mass + pre.Col + j] + a }
             }
@@ -1035,7 +1035,7 @@ fn (c mut Circuit<<T>>&) Certify(target F64 = 0.9) {
     k := c.Gain()
     if k == 0.0 { return }
     if not (k <= 1e300) { wrong("Certify: these neurons have no bounded slope, so no gain to certify") }
-    like <T>
+    like T
     f := linalg.Cast(target / k, like)
     for i in range c.projections.Len() {
         if not c.projections[i].Folded { c.Weights(Projection(i)).Scale(f) }
@@ -1050,7 +1050,7 @@ fn (c mut Circuit<<T>>&) Restrain(target F64 = 0.9) {
     c.masses()
     l := c.slope()
     if not (l <= 1e300) { wrong("Restrain: these neurons have no bounded slope, so no gain to restrain") }
-    like <T>
+    like T
     factors := Array<F64>(c.projections.Len())
     for i in range c.projections.Len() {
         pr := c.projections[i]
@@ -1076,7 +1076,7 @@ fn (c mut Circuit<<T>>&) Restrain(target F64 = 0.9) {
 
 # the unit roundoff of T
 fn roundoff(like <T>) F64 {
-    return match <T> {
+    return match T {
         case F32 => 5.960464477539063e-8
         case F64 => 1.1102230246251565e-16
     }
@@ -1087,7 +1087,7 @@ fn roundoff(like <T>) F64 {
 # the certified region still gets a tolerance. A spiking circuit's: two spikes a window
 fn (c mut Circuit<<T>>&) LessonTolerance(beta F64) F64 {
     if c.Spiking { return 2.0 / F64(c.window) }
-    like <T>
+    like T
     kappa F64 = math.Min(c.Gain(), 0.9)
     return math.Max(beta * beta * beta * (1.0 - kappa) / 10.0, 100.0 * roundoff(like))
 }
@@ -1114,9 +1114,9 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
     minus := c.committed(2 if centered else 0, 1)
     scale F64 = -1.0 / ((2.0 * beta if centered else beta) * F64(c.N))
     n := c.Neurons
-    zero <T>
+    zero T
     for i in range c.N * n { c.mem[c.diff + i] = c.mem[plus + i] - c.mem[minus + i] }
-    like <T>
+    like T
     k := linalg.Cast(scale, like)
     for i in range c.projections.Len() {
         pr := c.projections[i]
@@ -1135,20 +1135,20 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
             d I64 = c.diff + post.Col + r
             for b in range 0, quads, 4 {
                 s0 I64 = plus + b * n + pre.Col
-                p0 <T> = k * c.mem[d + b * n]
-                p1 <T> = k * c.mem[d + (b + 1) * n]
-                p2 <T> = k * c.mem[d + (b + 2) * n]
-                p3 <T> = k * c.mem[d + (b + 3) * n]
+                p0 T = k * c.mem[d + b * n]
+                p1 T = k * c.mem[d + (b + 1) * n]
+                p2 T = k * c.mem[d + (b + 2) * n]
+                p3 T = k * c.mem[d + (b + 3) * n]
                 if pr.Folded {
                     for j in range pre.Size {
                         c.mem[at + j] = c.mem[at + j] + ((p0 * c.mem[s0 + j] + p1 * c.mem[s0 + n + j]) + (p2 * c.mem[s0 + 2 * n + j] + p3 * c.mem[s0 + 3 * n + j]))
                     }
                 } else {
                     m I64 = minus + post.Col + r
-                    q0 <T> = k * c.mem[m + b * n]
-                    q1 <T> = k * c.mem[m + (b + 1) * n]
-                    q2 <T> = k * c.mem[m + (b + 2) * n]
-                    q3 <T> = k * c.mem[m + (b + 3) * n]
+                    q0 T = k * c.mem[m + b * n]
+                    q1 T = k * c.mem[m + (b + 1) * n]
+                    q2 T = k * c.mem[m + (b + 2) * n]
+                    q3 T = k * c.mem[m + (b + 3) * n]
                     e0 I64 = c.diff + b * n + pre.Col
                     for j in range pre.Size {
                         c.mem[at + j] = c.mem[at + j] + (((p0 * c.mem[s0 + j] + q0 * c.mem[e0 + j]) + (p1 * c.mem[s0 + n + j] + q1 * c.mem[e0 + n + j]))
@@ -1159,11 +1159,11 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
             for b in range quads, c.N {
                 row I64 = b * n
                 sPre I64 = plus + row + pre.Col
-                p <T> = k * c.mem[d + row]
+                p T = k * c.mem[d + row]
                 if pr.Folded {
                     for j in range pre.Size { c.mem[at + j] = c.mem[at + j] + p * c.mem[sPre + j] }
                 } else {
-                    q <T> = k * c.mem[minus + row + post.Col + r]
+                    q T = k * c.mem[minus + row + post.Col + r]
                     dPre I64 = c.diff + row + pre.Col
                     for j in range pre.Size { c.mem[at + j] = c.mem[at + j] + (p * c.mem[sPre + j] + q * c.mem[dPre + j]) }
                 }
@@ -1191,15 +1191,15 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
 # from the nudged phases as Contrast reads them: -(s+ - s-) / (2 beta N) on a relaxing neuron (its drive is added to
 # its total), and for an input region through the folded blocks it feeds, -rho'(d) (dS_post W) / (2 beta N) - the
 # gradient an encoder feeding the circuit needs ("settling inside, backprop outside")
-fn (c mut Circuit<<T>>&) DriveGrad(reg Region, out mut Array<<T>>&, beta F64, centered Bool = true) {
+fn (c mut Circuit<<T>>&) DriveGrad(reg Region, out mut Array<T>&, beta F64, centered Bool = true) {
     rg := c.regions[reg]
     plus := c.committed(1, 1)
     minus := c.committed(2 if centered else 0, 1)
     scale F64 = -1.0 / ((2.0 * beta if centered else beta) * F64(c.N))
     n := c.Neurons
-    like <T>
+    like T
     k := linalg.Cast(scale, like)
-    zero <T>
+    zero T
     if not (rg.Kind is Role.Input) {
         for b in range c.N {
             at I64 = b * n + rg.Col
@@ -1227,8 +1227,8 @@ fn (c mut Circuit<<T>>&) DriveGrad(reg Region, out mut Array<<T>>&, beta F64, ce
                 at I64 = plus + b * n + rg.Col
                 d I64 = rg.Drive + b * rg.Size
                 for j in range rg.Size {
-                    x <T> = c.mem[at + j]
-                    slope <T> = match f {
+                    x T = c.mem[at + j]
+                    slope T = match f {
                         case Rho.Tanh => 1.0 - x * x
                         case Rho.HardSigmoid => 1.0 if c.mem[d + j] > 0.0 and c.mem[d + j] < 1.0 else 0.0
                         case Rho.Linear => 1.0
@@ -1367,8 +1367,8 @@ fn (c mut Circuit<<T>>&) Energy(p Phase, row I64) F64 {
 # at a moment that learns, E <- g E at a calm one - g being gamma lambda. A calm moment's decay is kept pending, one
 # number, and folded in at the next moment that learns, in the same pass that adds its contrast: a calm moment touches
 # no synapse. The actor's step is G = -delta E, from the broadcast error delta, for an optimizer
-type Eligibility<T> struct(c mut Circuit<<T>>&) {
-    E mut Array<<T>>& = Array<<T>>(c.ParamCount)
+type Eligibility<T> struct(c mut Circuit<T>&) {
+    E mut Array<T>& = Array<T>(c.ParamCount)
     Pending mut F64 = 1.0                           # the decay not yet applied to E: the trace is Pending E
 }
 
@@ -1379,8 +1379,8 @@ fn (t mut Eligibility<<T>>&) Decay(decay F64) {
 
 # a moment that learns: E <- decay E + the contrast the last Contrast (or Teach) left - read from the gradient region,
 # which holds -contrast - with the pending decay folded in, one pass over the parameters
-fn (t mut Eligibility<<T>>&) Add(c mut Circuit<<T>>&, decay F64) {
-    like <T>
+fn (t mut Eligibility<<T>>&) Add(c mut Circuit<T>&, decay F64) {
+    like T
     k := linalg.Cast(t.Pending * decay, like)
     at := c.ParamCount
     for i in range c.ParamCount { t.E[i] = k * t.E[i] - c.mem[at + i] }
@@ -1389,20 +1389,20 @@ fn (t mut Eligibility<<T>>&) Add(c mut Circuit<<T>>&, decay F64) {
 
 # the trace forgets: an episode ended
 fn (t mut Eligibility<<T>>&) Clear() {
-    zero <T>
+    zero T
     for i in range t.E.Len() { t.E[i] = zero }
     t.Pending = 1.0
 }
 
 # the trace's value of parameter i
-fn (t Eligibility<<T>>&) At(i I64) <T> {
-    like <T>
+fn (t Eligibility<<T>>&) At(i I64) T {
+    like T
     return linalg.Cast(t.Pending, like) * t.E[i]
 }
 
 # the actor's step from the broadcast error delta: G = -delta E, written into the gradient region
-fn (t Eligibility<<T>>&) Credit(c mut Circuit<<T>>&, delta F64) {
-    like <T>
+fn (t Eligibility<<T>>&) Credit(c mut Circuit<T>&, delta F64) {
+    like T
     k := linalg.Cast(-delta * t.Pending, like)
     at := c.ParamCount
     for i in range c.ParamCount { c.mem[at + i] = k * t.E[i] }

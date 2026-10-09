@@ -136,7 +136,7 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     Threads
     Decoding
     nodes mut List<Node>& = List<Node>()
-    mem mut Array<<T>>& = Array<<T>>(0)
+    mem mut Array<T>& = Array<T>(0)
     classes mut Array<I32>& = Array<I32>(0)
     written mut Array<Bool>& = Array<Bool>(0)
     ParamCount mut I64 = 0          # the parameters' elements: the first region of the arena
@@ -462,7 +462,7 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     widest I64 = 1                              # the largest dimension of any node: what a product can be
     scratch I64 = 0
     cols I64 = 0                                # the largest convolution's patches, and its products' workspace
-    like <T>
+    like T
     convWork I64 = 0
     for i in range count {
         nd := g.nodes[i]
@@ -512,7 +512,7 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     g.colsOffset = at
     g.colsSize = cols
     at += cols
-    g.mem = Array<<T>>(at)
+    g.mem = Array<T>(at)
     g.classes = Array<I32>(rows)
     g.written = Array<Bool>(count)
     g.ParamCount = params
@@ -544,20 +544,20 @@ fn (g Graph<<T>>&) rows(nd Node&) I64 {
 }
 
 # v's value, as a view of the arena: writing it writes the graph
-fn (g Graph<<T>>&) Value(v Var) linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) Value(v Var) linalg.Matrix<T> {
     nd := g.nodes[v]
     return linalg.View(g.mem, nd.Offset, g.rows(nd), nd.Cols)
 }
 
 # v's gradient, as a view of the arena - for a node that has one (a parameter, or anything depending on one)
-fn (g Graph<<T>>&) Grad(v Var) linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) Grad(v Var) linalg.Matrix<T> {
     nd := g.nodes[v]
     assert nd.GradOffset >= 0
     return linalg.View(g.mem, nd.GradOffset, g.rows(nd), nd.Cols)
 }
 
 # where the caller puts an input's batch: Batch rows of its columns, one after another
-fn (g Graph<<T>>&) InputData(v Var) mut Array<<T>>&g {
+fn (g Graph<<T>>&) InputData(v Var) mut Array<T>&g {
     nd := g.nodes[v]
     return g.mem[nd.Offset:nd.Offset + nd.Rows * nd.Cols]
 }
@@ -574,31 +574,31 @@ fn (g Graph<<T>>&) TokenData(v Var) mut Array<I32>&g {
 }
 
 # the products' packing workspace, and attention's backward scratch: regions of the arena
-fn (g Graph<<T>>&) work() mut Array<<T>>&g {
+fn (g Graph<<T>>&) work() mut Array<T>&g {
     return g.mem[g.workOffset:g.workOffset + g.workSize]
 }
 
-fn (g Graph<<T>>&) scratch() mut Array<<T>>&g {
+fn (g Graph<<T>>&) scratch() mut Array<T>&g {
     return g.mem[g.scratchOffset:g.scratchOffset + g.scratchSize]
 }
 
 # a convolution's patches for n images, in the region every convolution shares
-fn (g Graph<<T>>&) patches(s conv.Shape&, n I64) linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) patches(s conv.Shape&, n I64) linalg.Matrix<T> {
     return linalg.View(g.mem, g.colsOffset, n * s.Positions(), s.Patch())
 }
 
 # a loss's value: the 1 x 1 node's element
-fn (g Graph<<T>>&) Scalar(v Var) <T> {
+fn (g Graph<<T>>&) Scalar(v Var) T {
     return g.mem[g.nodes[v].Offset]
 }
 
 # every parameter, one after another as one 1 x ParamCount matrix - what an optimizer updates
-fn (g Graph<<T>>&) Params() linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) Params() linalg.Matrix<T> {
     return linalg.View(g.mem, 0, 1, g.ParamCount)
 }
 
 # every parameter's gradient, laid out as Params() is
-fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<T> {
     return linalg.View(g.mem, g.ParamCount, 1, g.ParamCount)
 }
 
@@ -613,7 +613,7 @@ error CheckpointError {
 
 # the parameters of g written to "path"
 fn (g Graph<<T>>&) Save(path String&) ? os.OsError {
-    like <T>
+    like T
     width I64 = elementWidth(like)
     out := Array<U8>(16 + width * g.ParamCount)
     magic := "oann"
@@ -621,7 +621,7 @@ fn (g Graph<<T>>&) Save(path String&) ? os.OsError {
     out[4] = U8(width)
     putWord(out, 8, U64(g.ParamCount), 8)
     for i in range g.ParamCount {
-        bits U64 = match <T> {
+        bits U64 = match T {
             case F32 => U64(g.mem[i].Bits())
             case F64 => g.mem[i].Bits()
         }
@@ -633,7 +633,7 @@ fn (g Graph<<T>>&) Save(path String&) ? os.OsError {
 # the parameters of g read from "path", written by Save from a graph with the same parameters
 fn (g mut Graph<<T>>&) Load(path String&) ? os.OsError + CheckpointError {
     data := try os.ReadFile(path)
-    like <T>
+    like T
     width I64 = elementWidth(like)
     if data.Len() != 16 + width * g.ParamCount or data[:4] != "oann" or I64(U8(data[4])) != width {
         error CheckpointError.MALFORMED
@@ -641,7 +641,7 @@ fn (g mut Graph<<T>>&) Load(path String&) ? os.OsError + CheckpointError {
     if getWord(data, 8, 8) != U64(g.ParamCount) { error CheckpointError.MALFORMED }
     for i in range g.ParamCount {
         bits := getWord(data, 16 + i * width, width)
-        g.mem[i] = match <T> {
+        g.mem[i] = match T {
             case F32 => U32(bits).F32FromBits()
             case F64 => bits.F64FromBits()
         }
@@ -649,7 +649,7 @@ fn (g mut Graph<<T>>&) Load(path String&) ? os.OsError + CheckpointError {
 }
 
 fn elementWidth(like <T>) I64 {
-    return match <T> {
+    return match T {
         case F32 => 4
         case F64 => 8
     }
@@ -687,7 +687,7 @@ fn (g mut Graph<<T>>&) Forward(n I64) {
 
 # node v's forward: its value from its inputs'
 fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
-    like <T>
+    like T
     y := g.Value(node)
     match nd.Kind {
         case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
@@ -748,7 +748,7 @@ fn (g Graph<<T>>&) classData(v Var) Array<I32>&g {
 
 # the matrix an operation keeps for its backward, for the rows in use: a loss's softmax, a normalization's row
 # statistics, attention's probabilities, dropout's mask
-fn (g Graph<<T>>&) saved(v Var) linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) saved(v Var) linalg.Matrix<T> {
     nd := g.nodes[v]
     sr, sc := g.savedShape(nd, true)
     return linalg.View(g.mem, nd.SavedOffset, sr, sc)
@@ -756,7 +756,7 @@ fn (g Graph<<T>>&) saved(v Var) linalg.Matrix<<T>> {
 
 # v's gradient to write into for a contribution, or an empty matrix where v needs none; whether to add to it is
 # acc(v)
-fn (g Graph<<T>>&) gradOf(v I64) linalg.Matrix<<T>> {
+fn (g Graph<<T>>&) gradOf(v I64) linalg.Matrix<T> {
     if v < 0 or g.nodes[v].GradOffset < 0 { return linalg.View(g.mem, 0, 0, 0) }
     return g.Grad(Var(v))
 }
@@ -782,7 +782,7 @@ fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
     g.mem[top.GradOffset] = 1.0
     g.written[loss] = true
     th := g.Threads
-    zero <T>
+    zero T
     i I64 = loss
     for i >= 0 {
         nd := g.nodes[i]
@@ -805,7 +805,7 @@ fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
 # node v's backward: its inputs' gradients from its own
 fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
     dy := g.Grad(v)
-    like <T>
+    like T
     match nd.Kind {
         case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
         case Op.MatMul(a, b, ta, tb) {
