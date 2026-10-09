@@ -16,7 +16,7 @@ built** (section 11): tokens, embeddings, learned positions, layer and RMS norma
 dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
 with a key-value cache - every backward checked against central differences, the first training steps equal to the same
 model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Phase 4** (section 16):
-a byte-level BPE tokenizer, and the transformer trained on its tokens. **Next: settling networks** (docs/settling.md).
+a byte-level BPE tokenizer, and the transformer trained on its tokens; safetensors checkpoints. **Next: settling networks** (docs/settling.md).
 
 ## 1. The operand: Matrix
 
@@ -100,6 +100,7 @@ parameters or a second loss need no new backward code.
 | a negative class | a padding row the loss ignores, the mean over the rest | `ignore_index` |
 | `nn.Graph<F32>(T, 1, true)`, `g.Pos` | a graph for decoding: forward only, a key-value cache per attention | `past_key_values` |
 | `g.Save(path)`, `g.Load(path)` | the parameter region to and from a file | `state_dict` |
+| `checkpoint.Save(g, path, names, dtype)`, `checkpoint.Load(g, path, names)` | the parameters as safetensors, by name | `save_file`, `load_state_dict` |
 | `g.Profiling`, `g.Times` | time per kind of operation, forward and backward | `torch.profiler` |
 
 `Product` and `Multiply` are the builders of `MatMul` and `Mul`: olang reserves the operator methods' names (`MatMul`
@@ -376,12 +377,12 @@ the runtime's pool, and a `Gemm` taking a workspace in std/linalg (section 13).
 - `make lmbench`: where a transformer's step goes, by kind of operation (the graph's own profiling).
 - `make mnist` trains end to end (needs the downloaded data); `make epoch` times it against C.
 
-## 10. Serialization (later)
+## 10. Serialization
 
-Checkpoints as **safetensors** (an 8-byte header length, a JSON header naming each matrix's dtype, shape and byte
-range, then the raw little-endian data): interoperable with PyTorch and Hugging Face, written with std/json and the
-floats' `Bits()`; the parameter region is already one contiguous block. Parameters carry PyTorch's names
-(`l1.weight`, `l1.bias`).
+Checkpoints as **safetensors** (`checkpoint.olang`, section 16): an 8-byte header length, a JSON header naming each
+matrix's dtype, shape and byte range, then the raw little-endian data - interoperable with PyTorch, numpy and Hugging
+Face, written with the floats' `Bits()`. Parameters carry PyTorch's names (`0.weight`, `h.3.attn.q_proj.bias`) given by
+a `checkpoint.Names`. `g.Save`/`g.Load` stay as the raw parameter region, for oann alone.
 
 ## 11. Transformers (phase 3)
 
@@ -427,7 +428,7 @@ A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor t
   the context is full, the last `T / 2` tokens are run again to start a fresh cache. Checked: decoding a prefill and
   then token by token gives the logits of running the whole sequence, to 1e-12.
 - **Checkpoints**: `g.Save(path)`/`g.Load(path)` - the parameter region as it is (`oann`, the element width and the
-  count, then little-endian bits); safetensors when a model has to leave oann (section 10).
+  count, then little-endian bits); safetensors when a model has to leave oann (section 16).
 
 ### Validation
 
@@ -604,7 +605,8 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
 ## 15. Layout
 
 ```
-makefile                OLANG ?= the compiler; make test, data, mnist, epoch, charlm, lmbench, lmref, bpe, bpelm, clean
+makefile                OLANG ?= the compiler; make test, data, mnist, epoch, charlm, lmbench, lmref, bpe, bpelm,
+                        safetensors, clean
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
@@ -614,6 +616,7 @@ optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjec
 train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep, LmEvaluate
 generate.olang          sampling; generation running the context again, and with a key-value cache
 tokenizer.olang         byte-level BPE: GPT-2's pre-tokenization, training, encoding, decoding, JSON
+checkpoint.olang        safetensors: Names (PyTorch's for the layers), Save and Load in F64, F32, F16 or BF16
 datasets/idx.olang      the IDX format
 datasets/loader.olang   Labeled sets and the Loader
 datasets/mnist.olang    fetching and loading MNIST
@@ -629,6 +632,7 @@ bench/lm.olang          where a transformer's step goes, by kind of operation
 bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
 bench/attention.olang   attention's kernels against a Gemm per sequence and head
 bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
+bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against numpy
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
@@ -637,7 +641,7 @@ data/, build/           downloads and build output, not in git
 Each file is one olang module, imported by its path relative to the importing file without the extension
 (`import "../datasets/mnist"`). Random numbers are std/rand's, times std/time's.
 
-## 16. Phase 4: byte-pair tokens
+## 16. Phase 4: byte-pair tokens, safetensors
 
 ### Byte-level BPE (`tokenizer.olang`)
 
@@ -734,4 +738,47 @@ Nay, which heaven of my banish, drowns moes was
 
 Found on the way: `text.Windows.At` past the end of an ordered pass gave a negative count, which `LmEvaluate`'s
 `n == 0` test let through as a `Forward` of negative rows - it gives 0 now (evaluating a whole part asks past the end).
+
+### safetensors (`checkpoint.olang`)
+
+Hugging Face's format for tensors, so a model can leave oann for PyTorch, numpy or JAX, or come in from them: eight
+bytes holding the header's length, little-endian; the header, JSON naming every tensor's `dtype`, `shape` and
+`data_offsets` (its byte range of what follows), padded with spaces to a multiple of eight; then the tensors' elements,
+row by row, little-endian.
+
+```olang
+names := checkpoint.Names()
+names.AddTransformer(t, "")                       # GPT-2's names; AddDense, AddNorm, AddMlp for the other layers
+try checkpoint.Save(g, "model.safetensors", names, checkpoint.Dtype.BF16)
+try checkpoint.Load(g, "model.safetensors", names)
+```
+
+- **Names** are given to parameters, not kept by the graph: a `Names` maps parameter handles to text, and the layer
+  helpers use PyTorch's: a dense layer's `weight` and `bias`, a perceptron as `nn.Sequential` numbers it (`0`, `2`,
+  ...: an activation between every two), a transformer GPT-2's (`wte`, `wpe`, `h.I.ln_1`, `h.I.attn.q_proj`, ...,
+  `h.I.mlp.c_fc`, `h.I.mlp.c_proj`, `ln_f`, `lm_head` when untied - q, k and v are three products here, so they are
+  named as Llama's are). A parameter given no name is `param.K`, K its place among the parameters. Keeping names out of
+  the graph leaves `nn.olang` and its nodes plain data; two parameters given one name are an error (`DUPLICATE`).
+- **Layout** is PyTorch's: weights `[out, in]` (nn.Linear's; note GPT-2's own Conv1D checkpoints are `[in, out]`), and
+  a parameter of one row - a bias, a gain - is written as a vector, `[cols]`, as PyTorch holds it; either form reads
+  back. A tied head is the embedding itself, so it is one tensor, as Hugging Face writes tied weights. The metadata is
+  `{"format": "pt"}`, which Hugging Face's loaders look for.
+- **Types**: `Dtype.F64`, `F32`, `F16`, `BF16`, or `Same`, the graph's own (the default). Writing rounds once - every
+  element is exact as an F64, then rounded to the narrower type, nearest and ties to even - and reading converts any of
+  the four into the graph's type the same way.
+- **Loading is strict**, as PyTorch's `load_state_dict` is by default: every parameter must be in the file with its
+  shape and size (`MISSING`, `SHAPE`), the file may hold nothing else (`UNEXPECTED`), a header that is not JSON of
+  tensors or a range outside the data is `MALFORMED`, and another dtype is `DTYPE`.
+
+**Checked** by the module's tests - a perceptron saved in every dtype and loaded into another graph (bit-exact in its
+own type, equal to the rounded values in F16 and BF16), each error, a transformer's names and its tied head - and
+**independently** by `make safetensors`: `bench/ref/safetensors_check.py`, a reader and writer of its own on `struct`,
+`json` and `numpy` alone (no safetensors package - pip is blocked here, and the point is a second implementation), reads
+oann's files in all four dtypes, checks the header (its length, the space padding, data ranges covering the data with no
+hole or overlap) and compares **every element bit by bit** with the values rounded by numpy (F32, F16) and by
+round-to-nearest-even on the F32 bits (BF16, which numpy lacks) - signed zeros, an F32 subnormal, F16's largest value
+and the first past it (infinity), an F16 underflow, near F32's largest, BF16 ties - 144 elements. Then it writes a file
+of its own - a tensor per dtype, in an order of its own, F16 subnormals and an F64 subnormal, a one-row parameter as a
+vector, metadata of its own, an unpadded header - which oann loads into an F64 graph exactly: 27 of 27 values as numpy
+stored them.
 

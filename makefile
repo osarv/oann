@@ -5,9 +5,9 @@ OLANG ?= /home/user/wt/oannc2/build/out
 
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang \
-	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang
+	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang
 
-.PHONY: test data bench epoch mnist charlm lmbench lmref bpe bpelm clean
+.PHONY: test data bench epoch mnist charlm lmbench lmref bpe bpelm safetensors clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -54,6 +54,14 @@ bpe:
 	$(OLANG) -b bench/bpe.olang
 	./build/bench_bpe $(or $(ARGS),512) build/bpe_olang.txt
 	python3 -I bench/ref/bpe.py data/shakespeare/input.txt $(or $(ARGS),512) build/bpe_olang.txt
+
+# safetensors checked against a reader and writer of numpy's (bench/ref/safetensors_check.py): oann's files in every
+# dtype bit by bit, and numpy's file loaded back exactly
+safetensors:
+	$(OLANG) -b bench/safetensors.olang
+	./build/bench_safetensors write build/safetensors
+	python3 -I bench/ref/safetensors_check.py build/safetensors
+	./build/bench_safetensors read build/safetensors
 
 # an epoch's time against C over OpenBLAS (bench/epoch.sh)
 epoch:
