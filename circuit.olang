@@ -1368,8 +1368,8 @@ fn (c mut Circuit<<T>>&) Energy(p Phase, row I64) F64 {
 # number, and folded in at the next moment that learns, in the same pass that adds its contrast: a calm moment touches
 # no synapse. The actor's step is G = -delta E, from the broadcast error delta, for an optimizer
 type Eligibility<T> struct(c mut Circuit<<T>>&) {
-    e mut Array<<T>>& = Array<<T>>(c.ParamCount)
-    Pending mut F64 = 1.0                           # the decay not yet applied to e: the trace is Pending e
+    E mut Array<<T>>& = Array<<T>>(c.ParamCount)
+    Pending mut F64 = 1.0                           # the decay not yet applied to E: the trace is Pending E
 }
 
 # a calm moment: E <- decay E, pending
@@ -1383,14 +1383,21 @@ fn (t mut Eligibility<<T>>&) Add(c mut Circuit<<T>>&, decay F64) {
     like <T>
     k := linalg.Cast(t.Pending * decay, like)
     at := c.ParamCount
-    for i in range c.ParamCount { t.e[i] = k * t.e[i] - c.mem[at + i] }
+    for i in range c.ParamCount { t.E[i] = k * t.E[i] - c.mem[at + i] }
+    t.Pending = 1.0
+}
+
+# the trace forgets: an episode ended
+fn (t mut Eligibility<<T>>&) Clear() {
+    zero <T>
+    for i in range t.E.Len() { t.E[i] = zero }
     t.Pending = 1.0
 }
 
 # the trace's value of parameter i
 fn (t Eligibility<<T>>&) At(i I64) <T> {
     like <T>
-    return linalg.Cast(t.Pending, like) * t.e[i]
+    return linalg.Cast(t.Pending, like) * t.E[i]
 }
 
 # the actor's step from the broadcast error delta: G = -delta E, written into the gradient region
@@ -1398,7 +1405,7 @@ fn (t Eligibility<<T>>&) Credit(c mut Circuit<<T>>&, delta F64) {
     like <T>
     k := linalg.Cast(-delta * t.Pending, like)
     at := c.ParamCount
-    for i in range c.ParamCount { c.mem[at + i] = k * t.e[i] }
+    for i in range c.ParamCount { c.mem[at + i] = k * t.E[i] }
 }
 
 # ---- tests (docs/settling.md section 5), in F64 ----
@@ -2018,7 +2025,7 @@ test "the eligibility trace: the lazy, fused pass is the explicit sum of past co
         } else {
             lazy.Decay(gl)
             eager.Decay(gl)
-            for i in range c.ParamCount { eager.e[i] = eager.Pending * eager.e[i] }  # applied at once
+            for i in range c.ParamCount { eager.E[i] = eager.Pending * eager.E[i] }  # applied at once
             eager.Pending = 1.0
         }
     }
