@@ -4,7 +4,7 @@
 OLANG ?= /home/user/wt/oannc2/build/out
 
 # every module with test blocks
-TESTS = ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang datasets/mnist.olang
+TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang datasets/mnist.olang
 
 .PHONY: test data bench epoch mnist clean
 

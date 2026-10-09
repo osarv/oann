@@ -12,6 +12,8 @@
 
 import "std/linalg"
 import "std/math"
+import "std/rand"
+import "kernels"
 
 # Gemm's beta for a gradient written (0) or added (1)
 fn beta(acc Bool) F64 {
@@ -34,42 +36,46 @@ fn pass(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<<T>>&) {
 
 # ---- products ----
 
+# The products take "work", the workspace their packing panels go into (kernels.Gemm), so none of them allocates.
+
 # y = op(a) op(b), op(m) being m or, where its flag is set, m's transpose
-fn MatMul(y linalg.Matrix<<T>>&, a linalg.Matrix<<T>>&, ta Bool, b linalg.Matrix<<T>>&, tb Bool, threads I64) {
-    linalg.Gemm(y, a, ta, b, tb, 1, 0, threads)
+fn MatMul(y linalg.Matrix<<T>>&, a linalg.Matrix<<T>>&, ta Bool, b linalg.Matrix<<T>>&, tb Bool, threads I64,
+        work mut Array<<T>>&) {
+    kernels.Gemm(y, a, ta, b, tb, 1, 0, threads, work)
 }
 
 # the gradients of y = op(a) op(b): for y = a b, da = dy b^T and db = a^T dy, and the transposes follow - every case
 # one product, transposes as Gemm's parameters
 fn MatMulBackward(dy linalg.Matrix<<T>>&, a linalg.Matrix<<T>>&, ta Bool, b linalg.Matrix<<T>>&, tb Bool,
-        da linalg.Matrix<<T>>&, accA Bool, db linalg.Matrix<<T>>&, accB Bool, threads I64) {
+        da linalg.Matrix<<T>>&, accA Bool, db linalg.Matrix<<T>>&, accB Bool, threads I64, work mut Array<<T>>&) {
     if da.Rows > 0 {
         if not ta {
-            linalg.Gemm(da, dy, false, b, not tb, 1, beta(accA), threads)        # a b: dy b^T; a b^T: dy b
+            kernels.Gemm(da, dy, false, b, not tb, 1, beta(accA), threads, work)     # a b: dy b^T; a b^T: dy b
         } else {
-            linalg.Gemm(da, b, tb, dy, true, 1, beta(accA), threads)             # a^T b: b dy^T; a^T b^T: b^T dy^T
+            kernels.Gemm(da, b, tb, dy, true, 1, beta(accA), threads, work)          # a^T b: b dy^T; a^T b^T: b^T dy^T
         }
     }
     if db.Rows > 0 {
         if not tb {
-            linalg.Gemm(db, a, not ta, dy, false, 1, beta(accB), threads)        # a b: a^T dy; a^T b: a dy
+            kernels.Gemm(db, a, not ta, dy, false, 1, beta(accB), threads, work)     # a b: a^T dy; a^T b: a dy
         } else {
-            linalg.Gemm(db, dy, true, a, ta, 1, beta(accB), threads)             # a b^T: dy^T a; a^T b^T: dy^T a^T
+            kernels.Gemm(db, dy, true, a, ta, 1, beta(accB), threads, work)          # a b^T: dy^T a; a^T b^T: dy^T a^T
         }
     }
 }
 
 # y = x w^T + b: a dense layer, w being out x in (PyTorch's layout) and b one row of out
-fn Linear(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, b linalg.Matrix<<T>>&, threads I64) {
-    linalg.Gemm(y, x, false, w, true, 1, 0, threads)
+fn Linear(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, b linalg.Matrix<<T>>&, threads I64,
+        work mut Array<<T>>&) {
+    kernels.Gemm(y, x, false, w, true, 1, 0, threads, work)
     y.AddRow(b)
 }
 
 # the gradients of y = x w^T + b: dx = dy w, dw = dy^T x, db = the column sums of dy
 fn LinearBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, w linalg.Matrix<<T>>&, dx linalg.Matrix<<T>>&,
-        accX Bool, dw linalg.Matrix<<T>>&, accW Bool, db linalg.Matrix<<T>>&, accB Bool, threads I64) {
-    if dx.Rows > 0 { linalg.Gemm(dx, dy, false, w, false, 1, beta(accX), threads) }
-    if dw.Rows > 0 { linalg.Gemm(dw, dy, true, x, false, 1, beta(accW), threads) }
+        accX Bool, dw linalg.Matrix<<T>>&, accW Bool, db linalg.Matrix<<T>>&, accB Bool, threads I64, work mut Array<<T>>&) {
+    if dx.Rows > 0 { kernels.Gemm(dx, dy, false, w, false, 1, beta(accX), threads, work) }
+    if dw.Rows > 0 { kernels.Gemm(dw, dy, true, x, false, 1, beta(accW), threads, work) }
     if db.Rows > 0 { dy.ColumnSums(db, beta(accB)) }
 }
 
@@ -205,13 +211,337 @@ fn SoftmaxBackward(dy linalg.Matrix<<T>>&, y linalg.Matrix<<T>>&, dx linalg.Matr
     }
 }
 
+# ---- sequences: embeddings, positions, normalization, attention, dropout ----
+# A batch of sequences is a matrix of rows: B sequences of T tokens are B * T rows, sequence s in rows s * T ... s * T +
+# T - 1, so a row's position in its sequence is its index modulo T.
+
+# y's row r = table's row tokens[r]: an embedding, the lookup of each token's vector. A token outside the table aborts,
+# as a slice out of range does
+fn Embedding(y linalg.Matrix<<T>>&, tokens Array<I32>&, table linalg.Matrix<<T>>&) {
+    for r in range y.Rows {
+        src := table.Row(I64(tokens[r]))
+        dst := y.Row(r)
+        for c in range dst.Len() { dst[c] = src[c] }
+    }
+}
+
+# the table's gradient: dy's row r added into row tokens[r] - a scatter-add, rows for repeated tokens summing
+fn EmbeddingBackward(dy linalg.Matrix<<T>>&, tokens Array<I32>&, dtable linalg.Matrix<<T>>&, acc Bool) {
+    z <T>
+    if not acc { dtable.Fill(z) }
+    for r in range dy.Rows {
+        g := dy.Row(r)
+        d := dtable.Row(I64(tokens[r]))
+        for c in range d.Len() { d[c] = d[c] + g[c] }
+    }
+}
+
+# y's row r = x's row r + table's row (first + r) mod T: a learned position added to each token's vector, the batch's
+# row 0 being at position "first" of its sequence (0 when training, the next position when decoding)
+fn Positions(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, table linalg.Matrix<<T>>&, T I64, first I64) {
+    for r in range y.Rows {
+        p := table.Row((first + r) % T)
+        a := x.Row(r)
+        d := y.Row(r)
+        for c in range d.Len() { d[c] = a[c] + p[c] }
+    }
+}
+
+fn PositionsBackward(dy linalg.Matrix<<T>>&, T I64, first I64, dx linalg.Matrix<<T>>&, accX Bool,
+        dtable linalg.Matrix<<T>>&, accT Bool) {
+    if dx.Rows > 0 { pass(dx, accX, dy) }
+    if dtable.Rows > 0 {
+        z <T>
+        if not accT { dtable.Fill(z) }
+        for r in range dy.Rows {
+            g := dy.Row(r)
+            d := dtable.Row((first + r) % T)
+            for c in range d.Len() { d[c] = d[c] + g[c] }
+        }
+    }
+}
+
+# row r of y = (x_r - mean_r) / sqrt(var_r + eps) * gain + bias, mean and variance over the row's columns (the biased
+# variance, as PyTorch's LayerNorm takes it); stats keeps each row's mean and 1 / sqrt(var + eps) for the backward
+fn LayerNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, gain linalg.Matrix<<T>>&, bias linalg.Matrix<<T>>&,
+        eps <T>, stats linalg.Matrix<<T>>&) {
+    like <T>
+    n := linalg.Cast(x.Cols, like)
+    g := gain.Row(0)
+    b := bias.Row(0)
+    for r in range x.Rows {
+        a := x.Row(r)
+        mean <T> = kernels.Sum(a, 0, a.Len()) / n
+        var <T> = like
+        for c in range a.Len() { var = var + (a[c] - mean) * (a[c] - mean) }
+        rstd <T> = 1.0 / math.Sqrt(var / n + eps)
+        d := y.Row(r)
+        for c in range d.Len() { d[c] = (a[c] - mean) * rstd * g[c] + b[c] }
+        stats.Set(r, 0, mean)
+        stats.Set(r, 1, rstd)
+    }
+}
+
+# with xhat = (x - mean) rstd and g = dy * gain: dx = rstd (g - mean(g) - xhat mean(g xhat)), row by row; dgain = the
+# column sums of dy * xhat, dbias those of dy
+fn LayerNormBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, gain linalg.Matrix<<T>>&,
+        stats linalg.Matrix<<T>>&, dx linalg.Matrix<<T>>&, accX Bool, dgain linalg.Matrix<<T>>&, accG Bool,
+        dbias linalg.Matrix<<T>>&, accB Bool) {
+    like <T>
+    n := linalg.Cast(x.Cols, like)
+    gn := gain.Row(0)
+    if dgain.Rows > 0 and not accG { dgain.Fill(like) }
+    for r in range x.Rows {
+        a := x.Row(r)
+        d := dy.Row(r)
+        mean := stats.Get(r, 0)
+        rstd := stats.Get(r, 1)
+        if dgain.Rows > 0 {
+            dg := dgain.Row(0)
+            for c in range a.Len() { dg[c] = dg[c] + d[c] * (a[c] - mean) * rstd }
+        }
+        if dx.Rows > 0 {
+            sg <T> = like
+            sgx <T> = like
+            for c in range a.Len() {
+                gc <T> = d[c] * gn[c]
+                sg = sg + gc
+                sgx = sgx + gc * (a[c] - mean) * rstd
+            }
+            mg <T> = sg / n
+            mgx <T> = sgx / n
+            o := dx.Row(r)
+            if accX {
+                for c in range a.Len() { o[c] = o[c] + rstd * (d[c] * gn[c] - mg - (a[c] - mean) * rstd * mgx) }
+            } else {
+                for c in range a.Len() { o[c] = rstd * (d[c] * gn[c] - mg - (a[c] - mean) * rstd * mgx) }
+            }
+        }
+    }
+    if dbias.Rows > 0 { dy.ColumnSums(dbias, beta(accB)) }
+}
+
+# row r of y = x_r / sqrt(mean(x_r^2) + eps) * gain - root-mean-square normalization (Zhang and Sennrich), no mean
+# taken out and no bias; stats keeps each row's 1 / sqrt(mean + eps)
+fn RmsNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, gain linalg.Matrix<<T>>&, eps <T>, stats linalg.Matrix<<T>>&) {
+    like <T>
+    n := linalg.Cast(x.Cols, like)
+    g := gain.Row(0)
+    for r in range x.Rows {
+        a := x.Row(r)
+        rinv <T> = 1.0 / math.Sqrt(kernels.Dot(a, 0, a, 0, a.Len()) / n + eps)
+        d := y.Row(r)
+        for c in range d.Len() { d[c] = a[c] * rinv * g[c] }
+        stats.Set(r, 0, rinv)
+    }
+}
+
+# with xn = x rinv and g = dy * gain: dx = rinv (g - xn mean(g xn)); dgain = the column sums of dy * xn
+fn RmsNormBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, gain linalg.Matrix<<T>>&, stats linalg.Matrix<<T>>&,
+        dx linalg.Matrix<<T>>&, accX Bool, dgain linalg.Matrix<<T>>&, accG Bool) {
+    like <T>
+    n := linalg.Cast(x.Cols, like)
+    gn := gain.Row(0)
+    if dgain.Rows > 0 and not accG { dgain.Fill(like) }
+    for r in range x.Rows {
+        a := x.Row(r)
+        d := dy.Row(r)
+        rinv := stats.Get(r, 0)
+        if dgain.Rows > 0 {
+            dg := dgain.Row(0)
+            for c in range a.Len() { dg[c] = dg[c] + d[c] * a[c] * rinv }
+        }
+        if dx.Rows > 0 {
+            sgx <T> = like
+            for c in range a.Len() { sgx = sgx + d[c] * gn[c] * a[c] * rinv }
+            m <T> = sgx / n
+            o := dx.Row(r)
+            if accX {
+                for c in range a.Len() { o[c] = o[c] + rinv * (d[c] * gn[c] - a[c] * rinv * m) }
+            } else {
+                for c in range a.Len() { o[c] = rinv * (d[c] * gn[c] - a[c] * rinv * m) }
+            }
+        }
+    }
+}
+
+# body(task, lo, hi) for 0 .. count split into consecutive runs, one per task, at most "threads" of them; with one run
+# body runs on the calling thread. Runs do not overlap, so a body writing only its own part needs no synchronisation
+fn parallel(count I64, threads I64, body fn(task I64, lo I64, hi I64)) {
+    tasks I64 = threads if threads < count else count
+    if tasks <= 1 {
+        body(0, 0, count)
+        return
+    }
+    share I64 = (count + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo I64 = t * share
+            hi I64 = lo + share if lo + share < count else count
+            if lo < hi { spawn body(t, lo, hi) }
+        }
+    }
+}
+
+# multi-head scaled dot-product attention (Vaswani et al.), fused: q, k and v are n x D, n = sequences * T, and head h
+# is columns h * D / heads ... of each - a strided view of the rows, nothing copied. For each sequence and head,
+#   P = softmax(Q K^T / sqrt(D / heads)), causal: row i attends to positions 0 ... i only
+#   Y = P V
+# probs keeps every P, row (s * heads + h) * T + i holding row i of sequence s's head h - T * T numbers per sequence and
+# head, the memory to watch. Sequences are spread over "threads" tasks
+fn Attention(y linalg.Matrix<<T>>&, q linalg.Matrix<<T>>&, k linalg.Matrix<<T>>&, v linalg.Matrix<<T>>&, heads I64,
+        T I64, causal Bool, probs linalg.Matrix<<T>>&, threads I64) {
+    dh I64 = q.Cols / heads
+    like <T>
+    scale <T> = 1.0 / math.Sqrt(linalg.Cast(dh, like))
+    parallel(q.Rows / T, threads, fn(task, lo, hi) {
+        for s in range lo, hi {
+            for h in range heads { attendHead(y, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale) }
+        }
+    })
+}
+
+# one sequence's one head: rows r0 ... r0 + T - 1 and columns c0 ... c0 + dh - 1 of q, k, v and y; its probabilities
+# from row p0 of probs (a row past the causal limit holds zeros there)
+fn attendHead(y linalg.Matrix<<T>>&, q linalg.Matrix<<T>>&, k linalg.Matrix<<T>>&, v linalg.Matrix<<T>>&,
+        probs linalg.Matrix<<T>>&, p0 I64, r0 I64, c0 I64, dh I64, T I64, causal Bool, scale <T>) {
+    z <T>
+    P := probs.Data
+    for i in range T {
+        qo I64 = (r0 + i) * q.Stride + c0
+        po I64 = (p0 + i) * probs.Stride
+        last I64 = i + 1 if causal else T
+        top <T> = z
+        for j in range last {
+            s <T> = scale * kernels.Dot(q.Data, qo, k.Data, (r0 + j) * k.Stride + c0, dh)
+            P[po + j] = s
+            if j == 0 or s > top { top = s }
+        }
+        total <T> = z
+        for j in range last {
+            e <T> = math.Exp(P[po + j] - top)
+            P[po + j] = e
+            total = total + e
+        }
+        inv <T> = 1.0 / total
+        for j in range last { P[po + j] = P[po + j] * inv }
+        for j in range last, T { P[po + j] = z }
+        yo I64 = (r0 + i) * y.Stride + c0
+        for c in range dh { y.Data[yo + c] = z }
+        for j in range last { kernels.Axpy(y.Data, yo, P[po + j], v.Data, (r0 + j) * v.Stride + c0, dh) }
+    }
+}
+
+# the gradients of attention, per sequence and head, with dO the head's block of dy and dS = P * (dO V^T - rowsum(dO
+# V^T * P)) / sqrt(dh) (softmax's backward, scaled):
+#   dQ = dS K,   dK = dS^T Q,   dV = P^T dO
+# written in that order - q's, then k's, then v's - which is the order their "acc" flags were taken in, so attention of
+# a node with itself (q, k or v the same) adds its contributions up. scratch holds one T x T dS per task
+fn AttentionBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<<T>>&, k linalg.Matrix<<T>>&, v linalg.Matrix<<T>>&,
+        heads I64, T I64, causal Bool, probs linalg.Matrix<<T>>&, dq linalg.Matrix<<T>>&, accQ Bool,
+        dk linalg.Matrix<<T>>&, accK Bool, dv linalg.Matrix<<T>>&, accV Bool, scratch mut Array<<T>>&, threads I64) {
+    dh I64 = q.Cols / heads
+    like <T>
+    scale <T> = 1.0 / math.Sqrt(linalg.Cast(dh, like))
+    parallel(q.Rows / T, threads, fn(task, lo, hi) {
+        ds := scratch[task * T * T:(task + 1) * T * T]
+        for s in range lo, hi {
+            for h in range heads {
+                attendHeadBackward(dy, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale, dq, accQ,
+                    dk, accK, dv, accV, ds)
+            }
+        }
+    })
+}
+
+fn attendHeadBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<<T>>&, k linalg.Matrix<<T>>&, v linalg.Matrix<<T>>&,
+        probs linalg.Matrix<<T>>&, p0 I64, r0 I64, c0 I64, dh I64, T I64, causal Bool, scale <T>,
+        dq linalg.Matrix<<T>>&, accQ Bool, dk linalg.Matrix<<T>>&, accK Bool, dv linalg.Matrix<<T>>&, accV Bool,
+        ds mut Array<<T>>&) {
+    z <T>
+    P := probs.Data
+    for i in range T {
+        go I64 = (r0 + i) * dy.Stride + c0
+        po I64 = (p0 + i) * probs.Stride
+        last I64 = i + 1 if causal else T
+        dot <T> = z
+        for j in range last {
+            dp <T> = kernels.Dot(dy.Data, go, v.Data, (r0 + j) * v.Stride + c0, dh)
+            ds[i * T + j] = dp
+            dot = dot + dp * P[po + j]
+        }
+        for j in range last { ds[i * T + j] = scale * P[po + j] * (ds[i * T + j] - dot) }
+    }
+    if dq.Rows > 0 {
+        for i in range T {
+            o I64 = (r0 + i) * dq.Stride + c0
+            if not accQ {
+                for c in range dh { dq.Data[o + c] = z }
+            }
+            last I64 = i + 1 if causal else T
+            for j in range last { kernels.Axpy(dq.Data, o, ds[i * T + j], k.Data, (r0 + j) * k.Stride + c0, dh) }
+        }
+    }
+    if dk.Rows > 0 {
+        if not accK { zeroBlock(dk, r0, c0, T, dh) }
+        for i in range T {
+            last I64 = i + 1 if causal else T
+            qo I64 = (r0 + i) * q.Stride + c0
+            for j in range last { kernels.Axpy(dk.Data, (r0 + j) * dk.Stride + c0, ds[i * T + j], q.Data, qo, dh) }
+        }
+    }
+    if dv.Rows > 0 {
+        if not accV { zeroBlock(dv, r0, c0, T, dh) }
+        for i in range T {
+            last I64 = i + 1 if causal else T
+            go I64 = (r0 + i) * dy.Stride + c0
+            po I64 = (p0 + i) * probs.Stride
+            for j in range last { kernels.Axpy(dv.Data, (r0 + j) * dv.Stride + c0, P[po + j], dy.Data, go, dh) }
+        }
+    }
+}
+
+fn zeroBlock(m linalg.Matrix<<T>>&, r0 I64, c0 I64, rows I64, cols I64) {
+    z <T>
+    for r in range rows {
+        o I64 = (r0 + r) * m.Stride + c0
+        for c in range cols { m.Data[o + c] = z }
+    }
+}
+
+# y = x * mask, each element of mask 1 / (1 - p) with probability 1 - p and 0 otherwise, drawn from r (inverted
+# dropout: what is kept is scaled up, so nothing changes when it is off). mask is kept for the backward
+fn Dropout(y linalg.Matrix<<T>>&, x linalg.Matrix<<T>>&, mask linalg.Matrix<<T>>&, p F64, r mut rand.Rand&) {
+    like <T>
+    keep := linalg.Cast(1.0 / (1.0 - p), like)
+    for row in range x.Rows {
+        a := x.Row(row)
+        m := mask.Row(row)
+        d := y.Row(row)
+        for c in range a.Len() {
+            k <T> = keep if r.Float() >= p else like
+            m[c] = k
+            d[c] = a[c] * k
+        }
+    }
+}
+
+fn DropoutBackward(dy linalg.Matrix<<T>>&, mask linalg.Matrix<<T>>&, dx linalg.Matrix<<T>>&, acc Bool) {
+    backward2(dx, acc, dy, mask, fn(g, m) { return g * m })
+}
+
 # ---- losses: each gives the mean over the rows in use, and keeps what its backward needs ----
 
 # the mean over the rows of -log softmax(z)[class] - PyTorch's CrossEntropyLoss - computed through the log-sum-exp, so
-# a large logit neither overflows nor takes a log of zero; probs keeps each row's softmax for the backward
+# a large logit neither overflows nor takes a log of zero; probs keeps each row's softmax for the backward. A row whose
+# class is negative is padding (PyTorch's ignore_index): it adds nothing, the mean is over the other rows, and a batch
+# of padding alone has a loss of zero
 fn SoftmaxCrossEntropy(z linalg.Matrix<<T>>&, classes Array<I32>&, probs linalg.Matrix<<T>>&) <T> {
     total F64 = 0.0
+    counted I64 = 0
     for r in range z.Rows {
+        k := I64(classes[r])
+        if k < 0 { continue }
         x := z.Row(r)
         p := probs.Row(r)
         top <T> = x[0]
@@ -224,22 +554,38 @@ fn SoftmaxCrossEntropy(z linalg.Matrix<<T>>&, classes Array<I32>&, probs linalg.
         }
         inv <T> = 1.0 / s
         for c in range p.Len() { p[c] = p[c] * inv }
-        k := I64(classes[r])
         total += F64(math.Log(s) + top - x[k])
+        counted++
     }
     like <T>
-    return linalg.Cast(total / F64(z.Rows), like)
+    return linalg.Cast(total / F64(counted) if counted > 0 else 0.0, like)
 }
 
-# dz = (softmax(z) - onehot(class)) * dloss / rows
+# the rows a loss counts: those whose class is not negative
+fn countedRows(classes Array<I32>&) I64 {
+    n I64 = 0
+    for c in classes {
+        if c >= 0 { n++ }
+    }
+    return n
+}
+
+# dz = (softmax(z) - onehot(class)) * dloss / counted rows; zero on a padding row
 fn SoftmaxCrossEntropyBackward(dloss <T>, classes Array<I32>&, probs linalg.Matrix<<T>>&, dz linalg.Matrix<<T>>&,
         acc Bool) {
     like <T>
-    k <T> = dloss / linalg.Cast(probs.Rows, like)
+    n := countedRows(classes)
+    k <T> = dloss / linalg.Cast(n if n > 0 else 1, like)
     for r in range probs.Rows {
         p := probs.Row(r)
         d := dz.Row(r)
         c := I64(classes[r])
+        if c < 0 {
+            if not acc {
+                for j in range p.Len() { d[j] = like }
+            }
+            continue
+        }
         if acc {
             for j in range p.Len() { d[j] = d[j] + k * p[j] }
         } else {
@@ -296,7 +642,7 @@ test "the kernels compute what they say" {
     w := m64(4, 3, F64[1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1])
     bias := m64(1, 4, F64[10, 20, 30, 40])
     z := linalg.Matrix<F64>(2, 4)
-    Linear(z, a, w, bias, 1)
+    Linear(z, a, w, bias, 1, Array<F64>(0))
     assert z.Get(0, 0) == 11.0 and z.Get(0, 3) == 42.0 and z.Get(1, 1) == 25.0
     probs := linalg.Matrix<F64>(2, 4)
     loss := SoftmaxCrossEntropy(z, I32[3, 1], probs)
