@@ -155,7 +155,7 @@ type Circuit<T> struct(Rows I64) {
     Sweeps mut I64 = 0                          # every sweep (or step) of every committed settle
     planned mut Bool = false
     window mut I64 = 1                          # a spiking circuit's window
-    arrays mut I64 = 2                          # arrays per slot: v and s, and for Lif the synaptic currents and spikes
+    arrays mut I64 = 2                          # arrays per slot: v and s; for Lif also synaptic currents, spikes, rate traces
     bias mut I64 = 0                            # where things are in the arena
     state mut I64 = 0
     constant mut I64 = 0
@@ -287,7 +287,7 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
         c.regions[i] = rg
     }
     whole I64 = rows * n
-    c.arrays = 4 if c.Spiking else 2
+    c.arrays = 5 if c.Spiking else 2
     c.state = at
     at += 8 * c.arrays * whole                          # four phases, two slots each
     c.constant = at
@@ -397,7 +397,8 @@ fn phaseIndex(p Phase) I64 {
     }
 }
 
-# where array k (0 the potentials v, 1 the activities s, 2 synaptic currents, 3 spikes) of phase pi's slot starts
+# where array k (0 the potentials v, 1 the activities s, 2 synaptic currents, 3 spikes, 4 rate traces) of phase pi's
+# slot starts
 fn (c Circuit<<T>>&) slotAt(pi I64, slot I64, k I64) I64 {
     return c.state + ((pi * 2 + slot) * c.arrays + k) * c.Rows * c.Neurons
 }
@@ -804,8 +805,9 @@ fn (c mut Circuit<<T>>&) Residual(p Phase, out mut Array<<T>>&) F64 {
 # ---- spiking ----
 
 # the steps of a spiking circuit's settle, in phase pi's candidate slot, a window at a time: each step the synaptic
-# currents follow the spikes of the step before (through the same transport as rates), every Lif neuron integrates
-# its current and spikes; at a window's end the activities become its spike counts per step, and a row's residual is
+# currents follow the spikes of the step before (through the same transport as rates), a nudged readout's current
+# gains beta times its cost's force at its neurons' rate traces, every Lif neuron integrates its current and spikes;
+# at a window's end the activities become its spike counts per step, and a row's residual is
 # the largest change of a rate since the window before. With check the first window whose change is within tolerance
 # in every row is committed; without, the windows run and the last is committed
 fn (c mut Circuit<<T>>&) spikes(pi I64, budget I64, tolerance F64, check Bool) Settlement ? NotSettled {
@@ -813,6 +815,7 @@ fn (c mut Circuit<<T>>&) spikes(pi I64, budget I64, tolerance F64, check Bool) S
     s := c.candidate(pi, 1)
     syn := c.candidate(pi, 2)
     spk := c.candidate(pi, 3)
+    trace := c.candidate(pi, 4)
     beta := c.nudges[pi]
     w := c.window
     windows I64 = budget / w if budget >= w else 1
@@ -822,8 +825,8 @@ fn (c mut Circuit<<T>>&) spikes(pi I64, budget I64, tolerance F64, check Bool) S
         for t in range w {
             c.transport(spk, false)
             c.currents(syn)
-            if beta != 0.0 { c.addNudge(s, beta) }
-            c.fire(v, spk)
+            if beta != 0.0 { c.addNudge(trace, beta) }
+            c.fire(v, spk, trace)
         }
         steps += w
         worst := c.rates(s)
@@ -870,11 +873,15 @@ fn (c mut Circuit<<T>>&) currents(syn I64) {
     }
 }
 
-# a step of every Lif neuron: u += leak (current - u); a spike when u reaches the threshold, which u then loses
-fn (c mut Circuit<<T>>&) fire(v I64, spk I64) {
+# a step of every Lif neuron: u += leak (current - u); a spike when u reaches the threshold, which u then loses; and
+# its rate trace, a running mean of its spikes over about a quarter of a window - what a nudge's force reads, so that
+# the force follows the spikes step by step rather than jumping once a window (which, where the rate curve is steep,
+# swings from window to window)
+fn (c mut Circuit<<T>>&) fire(v I64, spk I64, trace I64) {
     n := c.Neurons
     like <T>
     one := linalg.Cast(1.0, like)
+    follow := linalg.Cast(math.Min(1.0, 4.0 / F64(c.window)), like)
     for i in range c.regions.Len() {
         rg := c.regions[i]
         if rg.Kind is Role.Input { continue }
@@ -888,8 +895,10 @@ fn (c mut Circuit<<T>>&) fire(v I64, spk I64) {
                         u <T> = c.mem[v + at + j] + k * (c.mem[c.total + at + j] - c.mem[v + at + j])
                         fired Bool = u >= th
                         c.mem[v + at + j] = u - th if fired else u
-                        c.mem[spk + at + j] = one if fired else like
-                        c.mem[c.count + at + j] = c.mem[c.count + at + j] + (one if fired else like)
+                        x <T> = one if fired else like
+                        c.mem[spk + at + j] = x
+                        c.mem[c.count + at + j] = c.mem[c.count + at + j] + x
+                        c.mem[trace + at + j] = c.mem[trace + at + j] + follow * (x - c.mem[trace + at + j])
                     }
                 }
             }
@@ -1724,4 +1733,77 @@ test "with asymmetric feedback the contrast is no gradient: the theorem's symmet
     e := estimateError(c, reference, Lesson(0.001, 1e-13, 20000))
     try io.Print("one-way feedback: relative error " $e "\n") catch { }
     assert e > 0.1
+}
+
+test "a Lif neuron under a constant drive fires at the rate the analytic formula gives" {
+    window I64 = 4000
+    leak F64 = 0.05
+    c := Circuit<F64>(6)
+    h := c.Hidden(1, LifNeuron(leak, 1.0, 1.0, window))
+    r := rand.Rand(14)
+    c.Plan(r)
+    drives := F64[0.5, 0.98, 1.05, 1.5, 2.5, 6.0]
+    for b in range 6 { c.DriveData(h)[b] = drives[b] }
+    st := try c.Settle(Phase.Free, 40 * window, 2.0 / F64(window)) catch { fail }
+    assert st.Qualified and st.Sweeps >= 2 * window
+    for b in range 6 {
+        rate := c.Value(Phase.Free).Get(b, 0)
+        f := LifRateOf(drives[b], leak, 1.0)
+        try io.Print("drive " $drives[b] ": " $rate " spikes a step, analytic " $f "\n") catch { }
+        # every interval between spikes is within one step of the continuous-time period 1 / f, so the rate is
+        # within f^2 / (1 - f) of f - and the count over a window within one spike
+        if f == 0.0 { assert rate == 0.0 } else { assert math.Abs(rate - f) <= f * f / (1.0 - f) + 1.0 / F64(window) }
+    }
+}
+
+# a circuit for comparing spiking neurons with their rate model: two inputs, five hidden neurons, two readout neurons
+# taught by squared error, the hidden and readout reciprocal; every relaxing neuron biased above its threshold
+fn lifCircuit(c mut Circuit<F64>&, model Neuron, r mut rand.Rand&) {
+    x := c.Input(2)
+    h := c.Hidden(5, model)
+    o := c.Readout(2, Cost.Squared, model)
+    c.Project(x, h, Wiring.OneWay)
+    c.Project(h, o)
+    c.Plan(r)
+    c.Weights(Projection(1)).Scale(2.0)
+    for j in range 5 { c.Bias(h)[j] = 1.3 + 0.1 * F64(j) }
+    for j in range 2 { c.Bias(o)[j] = 1.5 }
+    d := c.DriveData(x)
+    for j in range d.Len() { d[j] = r.Uniform(0.0, 1.0) }
+    t := c.TargetData(o)
+    t[0] = 0.15
+    t[1] = 0.02
+    t[2] = 0.02
+    t[3] = 0.15
+}
+
+test "a spiking circuit settles to its rate model's equilibrium, and its spike-count contrast has the same signs" {
+    lif := LifNeuron(0.1, 1.0, 0.1, 20000)
+    a := Circuit<F64>(2)
+    ra := rand.Rand(21)
+    lifCircuit(a, lif, ra)
+    b := Circuit<F64>(2)                            # the same circuit of rate neurons with the Lif rate curve
+    rb := rand.Rand(21)
+    lifCircuit(b, Neuron.Rate(Rho.LifRate(0.1, 1.0)), rb)
+    b.Attempts = 4
+    try a.Settle(Phase.Free, 40 * 20000, 2.0 / 20000.0) catch { fail }
+    try b.Settle(Phase.Free, 20000, 1e-12) catch { fail }
+    meanField F64 = a.Value(Phase.Free).MaxAbsDifference(b.Value(Phase.Free))
+    sweeps := try a.Teach(2, Lesson(1.0)) catch { fail }
+    try b.Teach(2, Lesson(1.0, 1e-12, 20000)) catch { fail }
+    ga := a.Grads()
+    gb := b.Grads()
+    top F64 = gb.MaxAbs()
+    agree I64 = 0
+    large I64 = 0
+    for i in range a.ParamCount {
+        if math.Abs(gb.Data[i]) > 0.1 * top {
+            large++
+            if (ga.Data[i] > 0.0) == (gb.Data[i] > 0.0) { agree++ }
+        }
+    }
+    spread F64 = ga.MaxAbsDifference(gb) / top
+    try io.Print("spiking against its rate model: rates within " $meanField ", a lesson of " $sweeps " steps, signs agree on "
+        $agree " of the " $large " larger entries, largest difference " $spread " of the largest entry\n") catch { }
+    assert meanField < 0.015 and agree == large and large >= 8 and spread < 0.35
 }
