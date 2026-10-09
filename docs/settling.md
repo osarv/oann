@@ -261,8 +261,10 @@ read: drive[readout] += g k (C + F)                        a linear drive into t
   and rate 1, the read after a write returns `v` exactly (`k k^T = 1`); orthogonal keys do not interfere and
   overlapping keys interfere by `dot(q, k)`; repeated writes move `C` toward `v` geometrically, as
   `(1 - c')^n`. Surprise-weighted consolidation follows the finding that arousal strengthens the consolidation of what
-  caused it (McGaugh 2004). Defaults (oann's): `phi = 0.95` (a half-life of 13.5 moments), `c_0 = 0.02`, `g = 1`. This is
-  the online consolidation; sleep (1.9) is the slower, offline one.
+  caused it (McGaugh 2004). Defaults (oann's): `phi = 0.95` (a half-life of 13.5 moments), `c_0 = 0.02`, `g = 1` -
+  *`c_0 = 0.2` as built*, tuned on the tasks of 5.5 (decision 21). This is the online consolidation; sleep (1.9) is the
+  slower, offline one. *As built*, the fast decay is kept pending (one number, folded in at the next write), so a moment
+  that writes nothing touches neither matrix (5.3.4).
 - **Sparse-code store** (Marr 1969; Albus 1971; Kanerva 1988): a cerebellum-style associative memory used by the
   consolidator (1.9). A reading minus its running mean `x~` is projected by a fixed random matrix `R` onto `N` cells,
   the `k` strongest are kept, rectified and unit-normalized into a code; one table `T` per predicted field is read as
@@ -301,6 +303,10 @@ Defaults (oann's; none from the cited papers): `alpha_s = 0.01`, `alpha_f = 0.1`
 `eps_u = 1e-3` (rewards are scaled to `[-1, 1]`), `t_0 = 1 / alpha_s = 100` moments (a critical period, until `u_bar` is
 established), and `theta = 2`: when nothing is unusual `E[u] ~ 1` by construction of `u_bar`, so `level` hovers near 1 and
 `theta = 2` asks for errors twice the usual (or a full unit of disappointment). The `want` term is oann's own addition.
+*As built, tuned on the tasks of 5.5 (decision 21)*: `alpha_s = 0.003` and `theta = 1.5` (`t_0` stays 100). With the
+values above an agent in a noisy bandit turned calm for good at the end of its critical period, while its policy was
+still poor, and after a reversal was aroused for about 14 moments before disappointment habituated - too few for its
+learners to relearn. A slower long-run level keeps a lasting drop disappointing for longer.
 
 A **calm** moment is one qualified settle and a greedy answer: no nudged phases, no learning, no memory write; the
 eligibility trace only decays. An **aroused** moment samples from the policy, runs the nudged phases, keeps its
@@ -521,16 +527,16 @@ the store), freeze the dreams, train the slow weights on them with the store exc
 
 ### 2.8 API sketch (olang)
 
-An agent living one stream:
+An agent living one stream - as built (`agent.olang`, `examples/bandit_settle.olang`):
 
 ```olang
 import "agent"          # oann's modules, by path relative to the importing file (DESIGN section 12)
-import "rand"
+import "circuit"
 import "std/io"
 
-fn main() ? agent.NotSettled + io.IoError {
-    r := rand.Rand(7)
-    a := agent.Agent<F32>(16, 4, I64[64], r)       # 16 observation inputs, 4 actions, one hidden region of 64
+fn main() ? circuit.NotSettled + io.IoError {
+    s := agent.Settings()                          # defaults; set fields to change them
+    a := agent.Agent<F32>(16, 4, I64[64], 7, s)    # 16 observation inputs, 4 actions, one hidden region of 64, seed 7
     world := ContextBandit(1)
     obs := Array<F32>(16)
     world.Observe(obs)
@@ -538,9 +544,9 @@ fn main() ? agent.NotSettled + io.IoError {
     for moment in range 600 {
         reward := world.Act(action)                # execute, measure
         world.Observe(obs)
-        action = try a.Step(obs, reward)           # learn from it if the last moment was aroused, then choose again
+        action = try a.Step(obs, reward, true)     # learn from it if the last moment was aroused, then choose again
     }
-    try io.Print("calm " $a.Calm " aroused " $a.Aroused " sweeps " $a.Sweeps "\n")
+    try io.Print("calm " $(a.Calm) " aroused " $(a.Aroused) " sweeps " $(a.Sweeps) "\n")
 }
 ```
 
@@ -608,7 +614,9 @@ Settling networks follow the transformer work (section 6).
    supervised `Teach`, and the checks of 5.1-5.2 in F64; the neuron enum with a working `Lif` variant (4.6); and, of
    phase 2, the pieces phase 1's structures made cheap: the eligibility trace (`Eligibility`, lazy and fused) and the
    checks of 5.2.4-5.2.6. Results in 2.10 and 5.7.
-2. The `Agent`: critic, `Trace`, `Memory`, `Arousal`, the moment loop, checkpoints; the end-to-end tasks of 5.5.
+2. **Done (2026-10-09, `agent.olang`):** the `Agent` - critic, `Trace`, `Memory`, `Arousal`, the moment loop,
+   checkpoints - with the checks of 5.3 (all but the sparse-code store, which belongs to phase 3) and the end-to-end
+   tasks of 5.5. Results in 2.11 and 5.8.
 3. The fixed-point simulation of the board engine (4.2, 5.6); the sparse-code store, extra readout groups, CSR
    projections for large circuits.
 4. The consolidator and `Sleep` on the `Graph`; the PYNQ-Z2 overlay; further neuron models (spiking, section 4.6).
@@ -650,13 +658,54 @@ test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/
   loss gradient directly.
 - **The eligibility trace** (phase 2's first piece): `Eligibility<T>(c)` - `Decay(g)` at a calm moment multiplies one
   pending number, `Add(c, g)` folds it in while adding the contrast `Teach` left (one pass), `Credit(c, delta)` writes
-  the actor's step `G = -delta E`. One stream: per-stream traces at batch `B` wait on open question 5.
+  the actor's step `G = -delta E`. One stream (decision 19).
 - **Spiking**: 4.6.
 - **Cost, measured** (784-128-10, batch 32, F32, on a shared four-core machine): a lesson about 4.5 ms - the folded
   constant 0.9 ms, about 40 sweeps over the three settles at about 70 us each, the contrast 0.7 ms, Adam 0.1 ms. The
   folded 784-wide block is a matrix-vector product per batch row, read 32 times; std/linalg's blocked `Gemm` would do
   it at several times the speed but allocates its packing panels per call in this compiler, and the runtime's chunk
   pool then leaks them (DESIGN.md section 8) - the workspace `Gemm` now on olang master is the fix to take up.
+
+### 2.11 As built: phase 2 - the agent
+
+`agent.olang`: `Agent<T>` and its parts, each a struct of its own and checked on its own (5.3); the end-to-end tasks of
+5.5 are `examples/bandit_settle.olang`.
+
+- **Parts.** `Arousal` (1.7, plain data), `Memory<T>` (1.6: the persistent and fast `keys x actions` matrices, keys the
+  unit-normalized observation, the fast decay pending), `Trace<T>` (the context trace), `Critic<T>` (1.5: linear on the
+  hidden activities, its weights and trace in F64, the step normalized by `1 + |[phi, 1]|^2`), `circuit.Eligibility<T>`
+  (2.5) and `optim.FlatAdamW<T>` for the actor.
+- **The circuit.** The observation and the context trace are input regions, one-way into the first hidden region; the
+  hidden regions are reciprocal in a chain, the last reciprocal with the readout (one neuron per action, the policy
+  `softmax(s / T)`); the memories' read is the readout's drive. Certified at `kappa_0` when made.
+- **The moment** (1.8) is `Step(obs, reward, terminal)`. It settles free (warm, at the life tolerance) and measures the
+  TD error, clipped (`V(x_prev)` with the critic as it is now). It updates arousal. If the last moment was aroused, it
+  learns: the memory write; the contrast of the nudged phases kept from then; the eligibility (`E <- gamma lambda E +
+  contrast`); the actor's step on `-delta E`; the critic's step. Then it settles again on the moved weights. Otherwise
+  the traces only decay (the eligibility lazily). Finally it acts: sampled, with the nudged phases at `+-beta`, when
+  aroused; greedy when calm. `Begin(obs)` is the first moment. `Imagine(obs)` settles in the scratch phase and changes
+  nothing.
+- **Episodes.** A terminal outcome clears the eligibility and the critic's trace after learning from it. The context
+  trace persists (only `Ctx.Clear()` resets it).
+- **Refusals.** A refused free settle is a refused moment: no action, nothing written (`NotSettled`). A refused
+  nudged phase leaves the moment acted on but with no contrast to learn from. A refused settle after learning keeps the
+  state settled before it. All are counted in `Refused`.
+- **One stream** (open question 5): an agent lives one stream (`B = 1`); many lives are many agents.
+- **Checkpoints.** `Save(path)` / `Restore(path)` in the safetensors layout: an 8-byte header length, a JSON header,
+  and every tensor as F64 (so an F32 agent's values round-trip exactly).
+  - Saved: the parameters; the free state and the nudged states the next contrast reads; Adam's moments; the
+    eligibility; the critic and its trace; the context trace; both memories; the last moment's observation and
+    features; and the scalars (arousal's statistics, pending decays, counters, the pending action and the generator).
+  - std/rand gives no access to a generator's state, so the agent owns its generator (made from a seed) and the
+    checkpoint keeps the seed and the count of numbers drawn. A restore replays them, so it is into a new agent of the
+    same shape, seed and settings, and the restored agent then lives exactly the saved one's moments (checked).
+- **The circuit is made by a function** (`circuitFor`), not recorded in the agent's constructor. A constructor
+  that pushes onto a `List` of one of its own reference fields puts the list's storage in its own scope, which closes
+  when it returns: a use-after-free in olang ef939ae (`repro/ctorpush.olang`). Recording the circuit in the constructor
+  crashed an agent several moments later, once a loop body allocated text over the freed chunk.
+- **Cost, measured.** The small agent of 1.10 (16 + 64 inputs, 64 hidden, 4 actions; 5.6 k parameters) takes about
+  15 us a moment and 4-5 sweeps a moment in the bandit (warm starts, drives far from the rails): 160 000 moments in
+  2.4 s.
 
 ---
 
@@ -1032,6 +1081,60 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
   90.48% after two; about 1 870 steps a lesson and 780 an answer, 45-66 s a pass. Learning works on spike counts;
   it is slow and noisy beside the rate circuit, as 4.6 expects (long windows, many steps).
 
+### 5.8 Results of phase 2 (2026-10-09)
+
+`agent.olang`'s tests (F64), and `examples/bandit_settle.olang` (F32) for 5.5.
+
+- **5.3.1 Memory.**
+  - A read after a write at a unit key returns the value (1e-15).
+  - An orthogonal key reads exactly 0.
+  - An overlapping key reads `0.7 dot(q, k)` (1e-15).
+  - The fast store fades by `phi` per moment.
+  - Repeated writes bring the persistent store to the value as `(1 - c')^n` (1e-14).
+- **5.3.3 Arousal.**
+  - Three outcomes agree with values computed by hand, independently (1e-12).
+  - In a step-change scenario the agent is aroused through the critical period, calm after it (level 0.99), aroused
+    2 moments after the change, and calm again 142 moments later.
+- **5.3.4 Calm moments** leave the parameters, Adam's state, the eligibility, the critic and both memories bit for bit
+  as they were. The critic converges to the reward.
+- **Checkpoints.** A restored agent lives exactly the saved one's next 100 moments: actions, parameters, eligibility,
+  memories, arousal and draws, over a stretch of both calm and aroused moments. A used agent and a file that is no
+  checkpoint are refused.
+- **5.5, the contextual bandit**:
+  - Setup: 4 contexts as overlapping random unit observations of 16; 4 arms; rewards of -1 or +1, the best arm paying
+    with probability 0.8 and the others 0.1-0.5; 40 lives of 4 000 moments; mean with 95% interval. Regret is in
+    probability of paying (a uniformly random choice: 0.375).
+  - Regret: 0.190 +- 0.010 over the first 250 moments, 0.055 +- 0.016 over the next, then 0.03-0.05 to the end.
+  - Calm moments: 7% in the critical period, then 82-93%. The arousal level falls from 7.8 to about 1.1.
+  - A test with two contexts and deterministic rewards: every one of the last 499 moments right.
+- **5.5, the reversal** (the same, each context's best and worst arms swapping at moment 2 000):
+  - Regret: 0.042 over the 250 moments before the swap, 0.230 +- 0.023 over the 250 after, then 0.085, and back to
+    0.065-0.075 by moment 4 000.
+  - Calm moments: 87% before, 40% after the swap, back to 94-97%.
+  - The arousal level: 1.13 before, 1.71 after the swap, back to 1.08.
+- **5.5, trace pinning** (the bandit, where history tells nothing; context-trace gains 0, 1 and 8; 40 lives; the
+  last 2 000 moments). The rate of repeating the last action when the context's best arm changed detects it:
+
+  | | gain 0 | gain 1 (default) | gain 8 |
+  |---|---|---|---|
+  | memory on: regret | 0.025 | 0.046 | 0.047 |
+  | memory on: repeat rate | 0.05 | 0.11 | 0.10 |
+  | actor alone (memory gain 0): regret | 0.034 | 0.141 | 0.321 |
+  | actor alone: repeat rate | 0.15 | 0.60 | 0.87 |
+
+  The default trace already pins the actor partly, and a strong one nearly always repeats. The memory's direct drive
+  on the readout masks most of it, because the trace acts on the hidden layer, which the memory bypasses.
+- **With the document's own defaults** (decision 21):
+  - The bandit's regret plateaued at 0.11, because the agent was calm for good from moment 100.
+  - The reversal never recovered (0.53 to the end).
+  - A faster actor (Adam 1e-2) collapsed onto one action whatever the context (repeat rate 0.85-0.93), even when always
+    aroused.
+  - Always aroused, the actor alone reaches regret 0.017 by moment 4 000 at Adam 3e-4.
+- **What the gate does not do**: it detects change, not suboptimality. Disappointment is relative to a long-run level
+  that adapts, so a lasting drop eventually reads as normal, and calm moments never explore. With the tuned values the
+  learners relearn within the aroused stretch a change provokes, but there is a floor (regret about 0.03-0.05 in the
+  bandit, a little higher after a reversal) where a still-imperfect policy no longer surprises the agent.
+
 ## 6. Decisions and open questions
 
 **Decided**
@@ -1067,11 +1170,40 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
 12. **`LessonTolerance` holds `kappa` at most 0.9** and `Budget` is twice the certified need (q at most 0.95), at least 128.
 13. **The nudge** is per phase and applies to every readout by its own `Cost`; a cross-entropy readout reads
     `LabelData`, a squared-error one `TargetData`. The temperature lives in the readout's cost.
-14. **`circuit.Adam`** steps the parameter region until oann's optimizers take a flat region.
+14. *(Superseded by decision 17.)* **`circuit.Adam`** steps the parameter region until oann's optimizers take a flat region.
 15. **`DriveGrad`** is the gradient of the cost averaged over the rows, as `Contrast`'s is.
 16. **Spiking** (4.6): rates as spike counts over windows; residual = a rate's change from the last window; the
     nudge reads a per-neuron rate trace (time constant a quarter window); reset by subtraction; a synaptic current
     per neuron; `LifRate` as the rate model; the default `LifNeuron(leak 0.1, threshold 1, synapse 0.25, window 256)`.
+
+**Taken in phase 2 (2026-10-09)**
+
+17. **optim takes flat regions**: `FlatAdamW` and `FlatSgd` step any `params`/`grads` pair of arrays, sharing their
+    loops with `AdamW` and `Sgd` (decision 14's follow-up); `circuit.Adam` is gone, circuits expose `ParamData()` and
+    `GradData()`.
+18. **The agent's circuit** (2.11): observation and context trace one-way into the first hidden region, a reciprocal
+    chain, the memories' read a drive on the readout, the critic on every hidden activity.
+19. **One stream per agent** (open question 5): the moment loop needs no per-stream eligibility; many lives are many
+    agents.
+20. **The fast memory's decay is lazy**, so calm moments touch no memory (5.3.4). The context trace follows every
+    moment (it is activity, not learning). The critic's trace only decays on calm moments.
+21. **Tuned defaults**: actor's Adam `3e-4` (was `1e-3`), `c_0 = 0.2` (was 0.02), `alpha_s = 0.003` (was 0.01),
+    `theta = 1.5` (was 2), measured on the reversal task (5.8). With the starting values the agent stopped learning at
+    the end of its critical period and never recovered from a reversal.
+22. **Rewards in 5.5 are -1 or +1**, the range 1.5 asks for. With 0 or 1 every tried arm looked better than an untried
+    one (the memory stores rewards, an untried arm reads 0), which favoured repeating.
+23. **A terminal outcome** clears the eligibility and the critic's trace after learning from it; the context trace
+    persists.
+24. **Arousal reads the clipped TD error**, and `V(x_prev)` is evaluated with the critic as it is when the outcome
+    arrives.
+25. **Refusals** (2.11): a refused free settle refuses the moment; a refused nudged phase or re-settle keeps the
+    moment, counted.
+26. **The agent owns its generator** (made from a seed), so a checkpoint can carry it as the seed and the numbers drawn.
+    std/rand exposes no state, so a restore replays the draws and goes into a new agent of the same shape and seed.
+27. **Checkpoints** are written in the safetensors layout, with every tensor stored as F64 (2.11).
+28. **The critic's weights are F64** whatever `T` is.
+29. **The circuit is made by a function**, working around repro/ctorpush.
+30. **Pinning is detected** by the rate of repeating the last action when the best arm changed (5.8).
 
 **Open questions**
 
@@ -1086,13 +1218,19 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
    enough there.
 4. *(Answered: yes - decision 3.)* **Spiking.** Should the neuron model be a pluggable enum from the first version
    (recommended; costs one `match`), and is a LIF model with spike-count contrasts the spiking direction you mean?
-5. **Batched lives.** Is a single continuing stream enough at first, or are batched streams (`B` rows sharing weights,
-   per-row eligibility) needed early for faster experiments? Recommended: `B = 1` first; the arena already plans `B` rows.
+5. *(Taken: `B = 1` - decision 19.)* **Batched lives.** Is a single continuing stream enough at first, or are
+   batched streams (`B` rows sharing weights, per-row eligibility) needed early for faster experiments? Recommended:
+   `B = 1` first; the arena already plans `B` rows.
 6. **Learning on the board.** PS-only learning with quantized copies pushed to the PL (the default of 4.4), or the fused
    on-chip update pass for small cores from the start? Recommended: PS-only first.
 7. **ARM-side software.** Cross-compile olang to the board's ARM cores (an olang item: `TargetArch` is the host's today),
    or keep the PS side a thin driver with all logic in the exported plan? Recommended: raise the olang item when the
    board work starts; thin driver until then.
+8. **Exploration in calm moments** (from 5.8). The arousal gate detects change, not suboptimality, so a policy that is
+   still imperfect when it stops surprising the agent stays so: a regret floor of about 0.03-0.05 in the bandit. Two
+   ways out, both changes to the model: sample rather than act greedily in calm moments (exploration without learning,
+   at no cost to calm's "no synapse touched"), or let arousal also rise with the policy's entropy. Recommended: try the
+   first. Default: as specified (greedy when calm).
 
 ---
 

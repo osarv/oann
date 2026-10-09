@@ -642,3 +642,17 @@ neurons and a working leaky integrate-and-fire variant. Phase 1 is built: the ci
 MNIST at 97.5% with a 784-128-10 circuit. The design, the decisions taken building it and the measurements are
 docs/settling.md (sections 2.10, 4.6, 5.7, 6). `make test` runs its checks; `examples/xor_settle.olang`,
 `examples/xor_spiking.olang` and `examples/mnist_settle.olang` run it end to end.
+
+Phase 2 is built in `agent.olang`. `agent.Agent<T>` is a circuit living one moment at a time, with these parts:
+
+- a three-factor actor: the circuit, an eligibility trace and a TD error;
+- a linear critic;
+- a context trace;
+- a fast and a persistent associative memory;
+- an arousal gate. Calm moments act greedily and touch no synapse; aroused moments explore and learn.
+
+An agent's whole state checkpoints to a safetensors file and restores exactly. `optim.FlatAdamW`/`FlatSgd` step a
+circuit's flat parameter region with the same loops `AdamW`/`Sgd` use.
+
+`examples/bandit_settle.olang` runs the contextual bandit, reversal and trace-pinning tasks over many lives with
+confidence intervals. The results and decisions are in docs/settling.md, sections 2.11, 5.8 and 6.
