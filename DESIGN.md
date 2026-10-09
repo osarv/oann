@@ -17,7 +17,11 @@ dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient c
 with a key-value cache - every backward checked against central differences, the first training steps equal to the same
 model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Phase 4** (section 16):
 a byte-level BPE tokenizer, and the transformer trained on its tokens; safetensors checkpoints; convolution and max
-pooling (im2col and one product for the whole batch), and a small CNN on MNIST. **Settling networks** (section 17, docs/settling.md): phases 1 and 2 - circuits that settle, learning by free and nudged phases, a spiking variant, and an agent with memories and arousal.
+pooling (im2col and one product for the whole batch), and a small CNN on MNIST. **Settling networks** (section 17,
+docs/settling.md): phases 1 and 2 - circuits that settle, learning by free and nudged phases, a spiking variant, and an
+agent with memories and arousal. **Built with olang 9621af3** (section 8): code for this machine by default (AVX-512
+with FMA here) and every product through std/linalg's `GemmWorkspace` - an MNIST epoch went from 2.39 s to 0.69, now
+ahead of the C reference over OpenBLAS (0.93 s, interleaved), and a transformer step from 512 ms to ~200.
 
 ## 1. The operand: Matrix
 
@@ -131,11 +135,12 @@ One `Array<T>` per graph, laid out at `Plan`:
 3. every other node's **value**, its **gradient** when it needs one, and what its backward keeps (softmax cross-entropy
    its probabilities, the normalizations each row's statistics, attention its probabilities - `T x T` per sequence and
    head - and dropout its mask; in a graph for decoding, attention's key-value cache);
-4. the products' **packing workspace** (`kernels.Gemm`, sized once from the graph's largest dimension and its
-   convolutions' products), attention's backward **scratch** (one `T x T` matrix per task), and the convolutions'
-   **patches** (one region, the largest convolution's im2col matrix, shared by all of them).
+4. attention's backward **scratch** (one `T x T` matrix per task) and the convolutions' **patches** (one region, the
+   largest convolution's im2col matrix, shared by all of them).
 
-Class indices live in an `Array<I32>` beside it; optimizer state (AdamW's `m` and `v`, the projection's workspace) is
+The products pack their operands into a `linalg.GemmWorkspace<T>` the graph keeps beside the arena: it grows, where
+the graph lives, to the largest product during the first step, and allocates nothing after. Class indices live in an
+`Array<I32>` beside it; optimizer state (AdamW's `m` and `v`, the projection's workspace) is
 made once, by the optimizer, in the parameters' layout. Liveness-based reuse of the activation region (a gradient is
 dead once its producer's backward has run) is a planner change, made when a model's memory needs it.
 
@@ -171,11 +176,12 @@ difference's own rounding is about 1e-16 x loss / h; a deliberately broken backw
 planner's job, later: `Linear` then an activation as one GEMM with an epilogue, needing a `Gemm` with an epilogue in
 std/linalg (section 13).
 
-**The products go through `kernels.Gemm`**, std/linalg's algorithm with its packing panels in the graph's workspace -
-a stopgap for the workspace `Gemm` std/linalg lacks (section 8, memory). **Attention's products are written as dot
-products and updates** on each head's strided view (`kernels.Dot`, `kernels.Axpy`): a head's products are small (`T x
-T x dh`), and these loops compute only the causal half - measured faster than a packed `Gemm` per sequence and head
-(section 11).
+**The products go through std/linalg**: `ws.Gemm(...)` on the graph's `GemmWorkspace` (section 2), so they run at
+std/linalg's per-target tiles (AVX-512 with FMA on this machine) and a step allocates nothing. **Attention's products
+are written as dot products and updates** on each head's strided view (`kernels.Dot`, `kernels.Axpy` - the one thing
+`kernels.olang` still holds, as std/linalg exports no dot product over runs of arrays): a head's products are small
+(`T x T x dh`) and these loops compute only the causal half. That was measured faster than a packed `Gemm` per
+sequence and head on the old baseline target; on the native target it no longer is (section 11).
 
 ## 4. Layers (`layers.olang`)
 
@@ -204,9 +210,11 @@ PyTorch's Conv2d starting values. For transformers (section 11): `Norm` (layer o
 `NewTransformer(g, V, T, D, heads, layers, tied, dropout, rms)`, with GPT-2's starting values (`NewDenseWith` takes an
 `Init` for the weights and one for the bias).
 
-Why a factory function and not a constructor taking the graph: olang's zero values (D13c) are a constructor run on
-zeros, and a constructor reading through a reference parameter has none, so such a struct can never be a `List`
-element (repro/listzero). A plain-data layer has no such problem, and is serializable for free.
+Why a factory function and not a constructor taking the graph: a layer holds only handles, so it is the same for
+every element type, while the graph is generic (`Graph<T>`) - and a constructor of a non-generic type cannot take a
+generic parameter: the declaration is accepted and every call fails (repro/genericctor). (The first reason recorded
+here, that a constructor reading through a reference parameter left the struct no zero value and so no place in a
+`List`, went with olang a3ed507.) A plain-data layer is also serializable for free.
 
 ## 5. Losses and optimizers (`optim.olang`)
 
@@ -321,47 +329,51 @@ the step runs.
 
 ## 8. Results and performance (measured 2026-10-09)
 
-**Accuracy**, 784-128-10, ReLU, batches of 128, 10 epochs, test set:
+**Accuracy**, 784-128-10, ReLU, batches of 128, 10 epochs, test set. First measured with olang ef939ae (baseline
+x86-64); the rows run again with olang 9621af3 (this machine's AVX-512, its products' multiply-adds fused, so the last
+bits of every product differ and a run drifts a little from the old one):
 
-| optimizer | test accuracy |
-|---|---|
-| AdamW, lr 1e-3, decay 0.01 | 97.73% (seed 1), 97.71% (seed 2), 97.80% (seed 3); above 97% from epoch 5 |
-| SGD, lr 0.05, momentum 0.9 | 97.81% |
-| AdamW + projection, alpha 1e-5 | 97.74%, 97.53%, 97.84% (seeds 1-3) |
-| AdamW + projection, alpha 1e-4 / 1e-3 | 97.17% / 92.52% (too strong) |
-| AdamW + projection, normalized, alpha 1e-3 / 1e-2 | 97.79% / 97.74% |
+| optimizer | test accuracy, ef939ae | 9621af3 |
+|---|---|---|
+| AdamW, lr 1e-3, decay 0.01 | 97.73% (seed 1), 97.71% (seed 2), 97.80% (seed 3); above 97% from epoch 5 | 97.79%, 97.69%, 97.79% |
+| SGD, lr 0.05, momentum 0.9 | 97.81% | 97.86% |
+| AdamW + projection, alpha 1e-5 | 97.74%, 97.53%, 97.84% (seeds 1-3) | |
+| AdamW + projection, alpha 1e-4 / 1e-3 | 97.17% / 92.52% (too strong) | |
+| AdamW + projection, normalized, alpha 1e-3 / 1e-2 | 97.79% / 97.74% | 97.83% / - |
 
 **The C reference** (`bench/ref/mlp.c`): the same network in C over OpenBLAS - same random numbers (xoshiro256**
 seeded by splitmix64), same initialization order, shuffle, scaling and AdamW - so its losses match oann's to four
 decimals in the first epoch, and the time is the comparison. PyTorch could not be installed: download.pytorch.org is
 refused by the container's network policy (403).
 
-**An epoch** (469 steps), seconds, medians of interleaved rounds (`make epoch`), on the shared 4-core machine at a
-load average of 4-5 (other jobs running, which is also why 4 threads lose):
+**An epoch** (469 steps), seconds, medians of interleaved rounds (`make epoch`), on the shared 4-core machine - with
+olang ef939ae at a load average of 4-5, with 9621af3 at 10-12 (other agents compiling: the 4-thread figures lose to
+the oversubscription, OpenBLAS's worst):
 
-| | 1 thread | 4 threads |
-|---|---|---|
-| oann (olang, default target) | 2.39 | 2.90 |
-| oann, its IR relinked with `-march=native` | 1.92 | - |
-| C over OpenBLAS | 0.79 | 1.19 |
+| | 1 thread, ef939ae | 4 threads, ef939ae | 1 thread, 9621af3 | 4 threads, 9621af3 |
+|---|---|---|---|---|
+| oann, built for this machine (olang's default since 9621af3) | - | - | **0.69** | 1.57 |
+| oann, built for baseline x86-64 (the default before; `-a x86-64` since) | 2.39 | 2.90 | 2.24 | - |
+| oann, ef939ae's IR relinked with `-march=native` | 1.92 | - | - | - |
+| C over OpenBLAS | 0.79 | 1.19 | 0.93 | 4.53 |
 
-Where oann's epoch goes (`bench/train.olang`): forward 43%, backward 50% - both nearly all GEMM - filling batches 3%,
-the optimizer 4%. The gap to OpenBLAS is therefore std/linalg's GEMM, and it is the instruction set: olang builds for
-baseline x86-64 (SSE2) and never contracts `a*b + c`, while OpenBLAS runs AVX-512 with FMA; std/linalg's GEMM is level
-with the same algorithm in C at that target. Closing it is a compiler direction (a native target, FMA contraction),
-not an oann one. The projection adds 0.6-1s an epoch (one GEMM per dense layer per step). Results are identical for
+What changed is olang: 9621af3 builds for the machine it runs on (B12) and std/linalg tiles its GEMM for it (12 x 32
+F32 accumulators in AVX-512 registers, multiply-adds fused where the target has FMA), and oann's products now go
+through std/linalg's `GemmWorkspace` instead of a copy of its old 4 x 12 SSE kernel - a copy that, built native, ran
+3x slower (5.1-5.4 s an epoch: LLVM's SLP vectorizer grouped its accumulators across rows at 512 bits). At this
+problem size - 128 x 784 x 128, 128 x 128 x 10 - the native GEMM runs past OpenBLAS's, single-threaded and
+interleaved. Where the epoch goes now (`bench/train.olang`, best of three, at a load of 12): forward 47%, backward 35%,
+the optimizer 10%, filling batches 8% - 0.60 s in all; with the products this much faster, filling and the optimizer
+(3% and 4% before) are a sixth of the epoch. The projection
+adds ~0.3 s an epoch (one GEMM per dense layer per step, into a workspace of its own). Results are identical for
 every thread count (GEMM partitions its output).
 
-**Memory - a leak, not oann's, now worked around.** A step allocates nothing of its own (checked: 200,000 forward
-passes of a graph whose products are not packed grow by nothing). But std/linalg's `Gemm` packs into two scratch arrays
-made in its own scope per call, and the runtime's chunk pool reuses only its head chunk: the B panel's chunk, taken
-first, ends up behind the A panel's and is never reused, so every packed product maps a new one. MNIST training grew
-~540KB a step, ~215MB an epoch (2.2GB over 10 epochs); the transformer of section 11, with a few hundred products a
-step, grew **8.1MB a step** (243.6MB over 30 steps - a 2,000-step run would have taken 16GB). Reproducer:
-`repro/chunkpool.olang` (no linalg - two scratch arrays, large then small). **Worked around in phase 3:**
-`kernels.Gemm` is std/linalg's algorithm with its panels in the graph's arena, and the same transformer grows by 72kB
-over the first 30 steps and nothing after - a step allocates nothing at all. Fixes still wanted upstream: first-fit in
-the runtime's pool, and a `Gemm` taking a workspace in std/linalg (section 13).
+**Memory.** A step allocates nothing: the arena is laid out once, and the products pack into the graph's
+`GemmWorkspace`, which reaches its size in the first step. (Before olang 9621af3 std/linalg's `Gemm` packed into
+scratch arrays of its own scope, and the runtime's chunk pool, reusing only its head chunk, mapped a new B panel for
+every product - 8.1 MB a step for the transformer of section 11. oann carried a copy of the algorithm packing into its
+arena until the runtime's pool was fixed (olang O8b, size classes) and std/linalg gained `GemmWorkspace`, both asked
+for here.) The transformer's resident memory grows by 68-76 kB over its first 20 steps and by nothing after.
 
 ## 9. Testing
 
@@ -376,8 +388,7 @@ the runtime's pool, and a `Gemm` taking a workspace in std/linalg (section 13).
   tanh; a whole two-layer transformer tied and untied, with dropout and with RMS normalization (`layers.olang` - a
   deep network's own central-difference error bottoms out at 1e-6 to 4e-6, so its bound is 1e-5); causality (a row's
   output does not change with a later row); the key-value cache against running the whole sequence (`generate.olang`,
-  to 1e-12); the workspace `Gemm` against std/linalg's for every transpose, beta, size and thread count
-  (`kernels.olang`); the schedule, clipping, checkpoints and the text corpus.
+  to 1e-12); the schedule, clipping, checkpoints and the text corpus.
 - `make lmref`: the first steps of the character model - losses and gradient norms - against the same model, the same
   starting values, windows, AdamW, schedule and clipping in numpy (`bench/ref/charlm.py`, F64).
 - `make lmbench`: where a transformer's step goes, by kind of operation (the graph's own profiling).
@@ -415,9 +426,15 @@ A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor t
   then `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO`, written in that order - the order their "written" flags were taken
   in - so a node attending to itself (`q`, `k` or `v` the same node) adds its three contributions up. Sequences are
   spread over the graph's threads; each task has its own `T x T` scratch in the arena. The products are dot products and
-  updates over the heads' views (`kernels.Dot`, `kernels.Axpy`) rather than a `Gemm` per sequence and head: at these
-  sizes packing costs more than it saves, and the loops compute only the causal half (`bench/attention.olang`: 4.4 ms
-  against 6.6 forward at B 16, T 64, D 128, 4 heads; 21.6 against 27.6 at T 256).
+  updates over the heads' views (`kernels.Dot`, `kernels.Axpy`) rather than a `Gemm` per sequence and head: on the
+  baseline target packing cost more than it saved, and the loops compute only the causal half (`bench/attention.olang`
+  with olang ef939ae, load 2-3: 4.4 ms against 6.6 forward at B 16, T 64, D 128, 4 heads; 21.6 against 27.6 at T 256).
+  **On the native target that has turned round** (olang 9621af3, interleaved at a load of 13): the loops 5.2-6.3 ms
+  against 3.8-4.8 for a `Gemm` per head at T 64, and 75-114 against 42-54 at T 256 - the products 1.3x and ~2x faster
+  though they compute the whole square. The loops themselves run about as fast as on the baseline target (75-94 ms
+  native against 68-79 at T 256, interleaved); the GEMM is what got faster. Moving attention onto products (forward
+  `S = Q K^T`, `Y = P V`; backward `dP = dO V^T`, `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO`) is the next step for it,
+  with a workspace per task.
 - **Layers** (`layers.olang`): `NewTransformer(g, V, T, D, heads, layers, tied = true, dropout = 0, rms = false)` - a
   token embedding plus learned positions (dropout after), `layers` pre-normalized blocks, a final normalization and the
   logits against the embedding itself when tied (weight tying is applying one parameter twice: the head's product and
@@ -451,14 +468,15 @@ against numpy in F64:
 | step | loss, oann | loss, numpy | gradient norm, oann | gradient norm, numpy |
 |---|---|---|---|---|
 | 1 | 4.211253 | 4.211253 | 7.050046 | 7.050046 |
-| 2 | 4.181737 | 4.181737 | 6.326455 | 6.326455 |
+| 2 | 4.181737 | 4.181737 | 6.326454 | 6.326455 |
 | 5 | 4.033323 | 4.033323 | 5.406032 | 5.406031 |
 | 10 | 3.751469 | 3.751469 | 1.995772 | 1.995772 |
 | 20 | 3.552264 | 3.552264 | 1.526185 | 1.526185 |
 | 40 | 3.034891 | 3.034891 | 1.233417 | 1.233417 |
 
 Over 40 steps the losses differ by at most 1e-6 and the norms by 2e-6 - what F32 against F64 arithmetic allows - so
-the forward, every backward, AdamW, the schedule and the clipping are the reference's. One thing this found: the
+the forward, every backward, AdamW, the schedule and the clipping are the reference's. (Run again with olang 9621af3,
+whose products fuse their multiply-adds: the same bounds, one norm in the table moving by its last digit.) One thing this found: the
 gradient norm summed in `F32` came out 3.5e-5 low (a long sum of small squares drops their low bits), so
 `ClipGradNorm` sums in `F64`. PyTorch could not be installed (the proxy refuses pip and download.pytorch.org); numpy
 2.5 was there.
@@ -484,7 +502,8 @@ validated on - the same 10 batches of 16 windows each time). Losses in nats per 
 | 2000 | 1.7023 | 1.8063 |
 
 2,000 steps (2M tokens, about two passes over the training text) took 1,108 s - 554 ms a step, **1,849 tokens a
-second** - on the shared 4-core machine at a load average of 6 to 9 (other agents compiling and testing). Still falling
+second** - on the shared 4-core machine at a load average of 6 to 9 (other agents compiling and testing), with olang
+ef939ae; built by 9621af3 for this machine a step is ~200 ms, 4,900-5,200 tokens a second on one thread (below). Still falling
 when the schedule ended: a longer run, a larger model and dropout are the obvious next steps (nanoGPT's 10.7M-parameter
 "baby GPT" reaches 1.47 after 5,000 steps of 16K tokens).
 
@@ -513,44 +532,56 @@ by design (the cache restarts from the last 32 tokens, the rerun keeps the last 
 
 ### Where a step goes
 
-`make lmbench ARGS="20 1"` - the graph's own profiling, ms a step, one thread, at a load average of 2.6:
+`make lmbench ARGS="20 1"` - the graph's own profiling, ms a step, one thread: with olang ef939ae (baseline x86-64) at
+a load average of 2.6, and with 9621af3 (this machine's AVX-512) at 13 - one of five runs, which gave 195-241 ms a
+step:
 
-| | forward | backward |
-|---|---|---|
-| `Linear` (12 products a step forward, 24 backward) | 138.5 | 281.5 |
-| `MatMul` (the tied head) | 1.5 | 3.0 |
-| `Attention` | 20.3 | 24.7 |
-| `GeluTanh` | 12.5 | 14.9 |
-| `LayerNorm` | 2.9 | 4.2 |
-| `Add` (residuals) | 1.3 | 1.8 |
-| the loss, embedding, positions | 0.8 | 0.3 |
-| clipping, AdamW | 4.0 (together) | |
+| | forward, ef939ae | backward, ef939ae | forward, 9621af3 | backward, 9621af3 |
+|---|---|---|---|---|
+| `Linear` (12 products a step forward, 24 backward) | 138.5 | 281.5 | 37.9 | 81.7 |
+| `MatMul` (the tied head) | 1.5 | 3.0 | 0.7 | 0.8 |
+| `Attention` | 20.3 | 24.7 | 28.2 | 27.3 |
+| `GeluTanh` | 12.5 | 14.9 | 5.3 | 6.9 |
+| `LayerNorm` | 2.9 | 4.2 | 4.1 | 5.0 |
+| `Add` (residuals) | 1.3 | 1.8 | 1.5 | 2.2 |
+| the loss, embedding, positions | 0.8 | 0.3 | 1.2 | 0.5 |
+| clipping, AdamW | 4.0 (together) | | 3.7 (together) | |
 
-A step is **512 ms: products 83%, attention 9%, the rest of the graph 8%**, clipping and the optimizer under 1%. The
-products run at ~11 GFLOPS (4.8 GFLOP a step) - std/linalg's GEMM on the default SSE2 target, slower than its 14-17 on
-large squares because these are narrow (k = 128) - so the step is the compiler's instruction set, as MNIST's epoch was
-(section 8). Two threads: 399 ms (2,566 tokens a second), four: 344 ms (2,977) - the products scale (424, 326, 275
-ms), the element-wise ops do not (they run on one thread). The arena is 87.2 MB, laid out once; resident memory grows
-by 70-84 kB over the first steps and by nothing after (100 steps measured). MNIST's epoch with the workspace `Gemm`:
-2.2 s (2.39 before), and it no longer grows.
+With ef939ae a step was **512 ms: products 83%, attention 9%, the rest of the graph 8%**, clipping and the optimizer
+under 1%; the products ran at ~11 GFLOPS (4.8 GFLOP a step) - std/linalg's GEMM on the SSE2 target, slower than its
+14-17 on large squares because these are narrow (k = 128). Two threads: 399 ms (2,566 tokens a second), four: 344 ms
+(2,977) - the products scaled (424, 326, 275 ms), the element-wise ops did not (they run on one thread).
+
+With 9621af3 a step is **~200 ms - 4,900-5,200 tokens a second on one thread, 2.5x the old step - products 58%,
+attention 27%, the rest of the graph 13%**: the products run at ~40 GFLOPS (std/linalg's 12 x 32 AVX-512 tile with
+FMA), and GELU's `FastTanh` pass, on the wider vectors, fell from 27 to 12 ms. Attention, a third of what is left, did not
+move - its dot products were already vector loops - and a `Gemm` per sequence and head now beats them (section 11's
+attention bullet, section 13). On two or four threads this load made the products 2.4x *slower* (277 and 273 ms of a
+350 ms step): every product joins its tasks at each block, and with 13 runnable processes on 4 cores a task waits
+for a core - the same oversubscription that took OpenBLAS's 4-thread MNIST epoch from 0.93 to 4.53 s (section 8);
+thread scaling wants measuring on a quiet machine. The arena is 86.0 MB, laid out once (87.2 with the old packing
+region in it); resident memory grows by 68-76 kB over the first 20 steps and by nothing after.
 
 ### olang issues found on the way (repro/)
 
-- `repro/chunkpool.olang` (phase 2) - std/linalg's `Gemm` leaks a chunk per packed product through the runtime's pool;
-  for a transformer 8.1 MB a step. Worked around by `kernels.Gemm`.
+- `repro/chunkpool.olang` (phase 2) - std/linalg's `Gemm` leaked a chunk per packed product through the runtime's
+  pool; for a transformer 8.1 MB a step. Worked around by a copy of the algorithm (`kernels.Gemm`) until olang 9621af3
+  fixed the pool (O8b) and gave std/linalg `GemmWorkspace`; the reproducer and the copy are gone.
 - `repro/capturedfn.olang` - a lambda that captures a function value and calls it (`fn(d, g, v) { return d + f(g, v)
   }`) leaves an indirect call per element even when everything is inlined: 3.1 ns an element against 0.55 written
-  out. `ops.backward2` now runs its loops itself.
+  out (still on 9621af3: 3.7-4.9 against 0.6-1.1 at a load of 8). `ops.backward2` runs its loops itself.
 - `repro/ctorunstored.olang` - O26 counts an instance as referring to every reference its constructor was given, even
-  one it only reads: `return Counts(t)` with `t` a local is refused. `text.Load` declares its text `&return` instead.
-- Not issues, recorded for the language's records: `:=` from a comparison (`ta := t % 2 == 1`) still needs its type
-  written (D15 - being relaxed); a `match` value cannot give several results (`=> rows, cols`), so `savedShape` uses
-  statements; a text join's piece cannot be a conditional (`$` of a local holding it is).
+  one it only reads: `return Counts(t)` with `t` a local is refused (still on 9621af3). `text.Load` declares its text
+  `&return` instead.
+- Not issues, recorded for the language's records: `:=` from a comparison (`ta := t % 2 == 1`) needed its type
+  written (D15 - relaxed since: `:=` takes any settled expression); a `match` value cannot give several results
+  (`=> rows, cols`), so `savedShape` uses statements; a text join's piece cannot be a conditional (`$` of a local
+  holding it is).
 
 ### What remains
 
 - **Mixed precision** - BF16 storage with F32 master weights - not started: the graph is generic over one element type
-  (section 14), and std/linalg's BF16 product allocates per call (the leak) and widens while packing.
+  (section 14). (std/linalg's BF16 product packs into a `GemmWorkspace` now, widening to F32 as it packs.)
 - Dropout of attention's probabilities (nanoGPT's `attn_dropout`): only the residual branches and the embedding are
   dropped out.
 - A tiled attention that recomputes `P` in the backward instead of saving `T x T` per head (memory at long contexts),
@@ -570,32 +601,27 @@ compile-time error. The executor keeps run-time shapes, as JAX keeps shapes as d
 
 ## 13. What oann needs from std/linalg next
 
-oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`, `Map`/`Map2`/`Map3`, `AddRow`,
-`ColumnSums(out, beta)`, `RowSoftmax`, `RowNorms`, `ArgMaxRows`, `Fill`, `FillUniform`/`FillNormal`, `Cast`, the
-`Fast*` functions. What it still needs:
+oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `GemmWorkspace` and its `Gemm`, `Gemv`,
+`Map`/`Map2`/`Map3`, `AddRow`, `ColumnSums(out, beta)`, `RowSoftmax`, `RowNorms`, `ArgMaxRows`, `Fill`,
+`FillUniform`/`FillNormal`, `Cast`, the `Fast*` functions. Done since this list was written (olang 9621af3): **a
+`Gemm` into a caller's workspace** (`linalg.GemmWorkspace<T>`, which grows where it lives to the largest product
+given - the graph keeps one, and `kernels.olang`'s copy of the algorithm is gone), **micro-kernels for the machine**
+(per-target tiles, FMA where the target has it, the compiler building for the machine it runs on: an MNIST epoch
+2.39 -> 0.69 s, the transformer's products ~11 -> ~40 GFLOPS) and **two-operand indexing** (`m[r, c]`, E31's
+multi-index - not used by oann, whose element access is `Get`/`Set` and runs of rows). What it still needs:
 
-1. **`Gemm` into a caller's workspace**, so a planned graph gives the packing panels a place in its arena and a step
-   allocates nothing at all - and the leak in section 8 cannot happen whatever the runtime does. **Needed**: without
-   it a transformer's training grew 8.1MB a step; oann now carries a copy of std/linalg's algorithm with a workspace
-   (`kernels.olang`, ~250 lines) that should go when this exists. Wanted shape: `GemmSpace(m, n, k, threads)` and
-   `Gemm(c, a, ta, b, tb, alpha, beta, threads, work)`.
-2. **Batched strided `Gemm`, causal-aware** - every sequence and head of attention in one call, the products of a
-   lower-triangular block skipped. Attention is 9% of a step at context 64 and grows as `T^2`; oann's dot-product
-   kernels run it at 3-4 GFLOPS on the causal half, against ~12 for `Gemm` on large products, and a `Gemm` per head
-   is slower still (6.6 ms against 4.4 forward at B 16, T 64; 27.6 against 21.6 at T 256 - packing costs more than
-   it saves at these sizes). A batched causal `Gemm` at the products' ~11 GFLOPS would run these about 3x faster -
-   ~30 of attention's 45 ms a step at T 64 - and matters more at longer contexts, where attention's share grows.
-3. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass:
-   the bias row and GELU are two more passes over the widest activation (B T x 4D) - GELU's forward alone is 12.5 ms of
-   a 512 ms step, its backward 14.9 - so ~5%; and
+1. **Batched strided `Gemm`, causal-aware** - every sequence and head of attention in one call, the products of a
+   lower-triangular block skipped. Attention was 9% of a step at context 64 on the baseline target and is 27% on the
+   native one (55 of ~200 ms), growing as `T^2`; oann's dot-product kernels run it at 3-4 GFLOPS on the causal half,
+   and on the native target a plain `Gemm` per sequence and head already beats them (1.3x at T 64, ~2x at T 256,
+   section 11) although it computes the whole square. A batched causal `Gemm` would add skipping the upper triangle
+   (half the work) and one call's overhead instead of one per head - and matters more at longer contexts.
+2. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass:
+   the bias row and GELU are two more passes over the widest activation (B T x 4D) - GELU's forward alone was 12.5 ms
+   of a 512 ms step and its backward 14.9, ~5%; with the products 3.5x faster on the native target, 12 of ~200 ms; and
    **fused QKV** (one product of width 3D, attention reading q, k and v as column blocks) needs view nodes in oann's
    graph, not linalg.
-4. **Micro-kernels for the machine** (AVX2/AVX-512 with FMA - std/linalg's per-CPU kernels, with the compiler's
-   native target): the products are 83% of a transformer's step at ~11 GFLOPS, and OpenBLAS ran MNIST's 3x faster by
-   its instruction set alone (section 8) - the largest lever on a step, ~2x or more. The same target is what
-   vectorizes `FastTanh` cheaply (~5 ns an element on SSE2: GELU's 27 ms a step).
-5. **Two-operand indexing**, `m[r, c]` - now in olang (E31 multi-index), not yet used by oann.
-6. **For convolutions** (section 16): a `Gemm` whose A panels are packed straight from the images (an implicit GEMM,
+3. **For convolutions** (section 16): a `Gemm` whose A panels are packed straight from the images (an implicit GEMM,
    or a packing callback) - im2col and the product's packing copy every patch twice, and the patches matrix is the
    largest convolution's whole im2col; and a path for thin products (a depth of 9 for a one-channel first layer runs
    at half the rate of the others).
@@ -604,16 +630,12 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
 
 1. The projection: normalized, alpha 1e-3 by default (97.79% on MNIST, section 8); still open whether alpha should
    scale with the learning rate and whether it should apply to every dense layer or only some.
-2. The GEMM gap to OpenBLAS (3x single-threaded) is the target instruction set; a native-target build mode (and FMA
-   contraction) in the compiler would close most of it.
-3. The chunk-pool leak (section 8): worked around in oann by `kernels.Gemm`; upstream, first-fit in the runtime, a
-   workspace `Gemm` in std/linalg, or both - and then `kernels.olang`'s copy goes.
-4. An eager mode beside the graph, for models whose structure depends on their data - not before a model needs one.
-5. oann as an importable package (`github.com/OWNER/oann/nn`) - the layout already is one module per concern.
-6. Mixed precision (BF16 storage, F32 master weights): the graph is generic over one element type, so it needs either
-   a second arena of BF16 copies the products read (and std/linalg's BF16 product into a workspace - today it
-   allocates per call and widens while packing) or a graph with a type per node. Not started (section 11).
-7. View nodes - a node whose value is a column block of another's, no storage of its own - would give fused QKV (one
+2. An eager mode beside the graph, for models whose structure depends on their data - not before a model needs one.
+3. oann as an importable package (`github.com/OWNER/oann/nn`) - the layout already is one module per concern.
+4. Mixed precision (BF16 storage, F32 master weights): the graph is generic over one element type, so it needs either
+   a second arena of BF16 copies the products read (std/linalg's BF16 product packs into a `GemmWorkspace` too,
+   widening to F32 as it packs) or a graph with a type per node. Not started (section 11).
+5. View nodes - a node whose value is a column block of another's, no storage of its own - would give fused QKV (one
    product of width 3D) and splitting heads at no cost; the "written" flag per node would then need to be per block.
 
 ## 15. Layout
@@ -624,7 +646,7 @@ makefile                OLANG ?= the compiler; make test, data, mnist, cnn, epoc
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
-kernels.olang           Gemm into a workspace (std/linalg's algorithm), Dot, Axpy, Sum, SquaresF64
+kernels.olang           Dot, Axpy, Sum over runs of arrays (attention's), SquaresF64
 layers.olang            Dense, Mlp, activations, PyTorch's initialization; Norm, AttentionBlock, Transformer
 optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjected), Sgd; WarmupCosine, ClipGradNorm
 train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep, LmEvaluate
@@ -809,15 +831,15 @@ stored them.
   a layer's columns need permuting).
 - **One product for the whole batch.** im2col writes every output position of every image as a row of the patch it
   sees - `(n OutH OutW) x (C K K)`, zeros where the kernel hangs over the padding - and `Y = cols W^T + b` is one
-  `kernels.Gemm` and a bias row. With channels last, `Y`'s `OutC`-wide rows are the images' output rows one after
+  product (std/linalg's, into the graph's workspace) and a bias row. With channels last, `Y`'s `OutC`-wide rows are the images' output rows one after
   another: the node's value *is* `Y`, reshaped, nothing transposed. Channels first would need a product per image, or
   a transpose pass - which is why section 1's `C x H x W` plan changed.
 - **Backward**: `db` = the column sums of `dY`, `dW = dY^T cols`, `dcols = dY W` (only when the input wants a
   gradient - a network's first convolution skips it), then col2im adds every patch's gradient back to the pixels it
   came from. The patches are **not kept**: the backward builds them again into the same region before `dW` (a pass
   over memory, against products of the layer's size) and `dcols` then overwrites them, so a graph has **one patches
-  region, its largest convolution's**, shared by all of them; the packing workspace is sized for the convolutions'
-  products too. For the MNIST network below, 128 x 784 x 9 F32 - 3.6 MB.
+  region, its largest convolution's**, shared by all of them; the graph's `GemmWorkspace` grows to their products in
+  the first step. For the MNIST network below, 128 x 784 x 9 F32 - 3.6 MB.
 - **im2col's innermost loop** is a pixel's channels, read in order - unless an image has fewer channels than the
   kernel is wide (a first layer, grey or RGB), when a window inside the image is copied a kernel row at a time,
   written in order with no test per element: 3.0 ms against 8.9-11.0 for a batch of 128 one-channel images, and the
@@ -825,7 +847,7 @@ stored them.
 - **`MaxPool2d(x, C, H, W, k, stride)`** keeps, as its saved matrix, where each maximum was in its window (`ky K +
   kx`, exact in any float type; the first of equal values, as PyTorch picks); the backward adds each gradient there,
   so overlapping windows add up. No padding yet. A pixel's channels are the innermost loop here too.
-- Images are split over the graph's threads (`linalg.ParallelRows`), the products by `kernels.Gemm`. Builders:
+- Images are split over the graph's threads (`linalg.ParallelRows`), the products by std/linalg's `Gemm`. Builders:
   `g.Conv2d(x, w, b, inC, outC, kernel, stride, padding, H, W)`, `g.MaxPool2d(x, C, H, W, kernel, stride)`; the layer
   `vision.NewConv(g, inC, outC, kernel, H, W, stride, padding)` draws PyTorch's starting values (uniform in
   `+-1/sqrt(C K K)`, weights and bias).
@@ -839,34 +861,44 @@ deliberately broken col2im fails both graph checks.
 
 **MNIST** (`make cnn ARGS="10 1 1"`, `examples/mnist_cnn.olang`): a 3x3 convolution 1->16 (padding 1), ReLU, 2x2 max
 pooling, a 3x3 convolution 16->32, ReLU, 2x2 max pooling, a dense layer 1568->10 - 20,490 parameters - with softmax
-cross-entropy, AdamW at 1e-3 and batches of 128, seed 1, one thread, at a load average of 3-6:
+cross-entropy, AdamW at 1e-3 and batches of 128, seed 1, one thread - with olang ef939ae at a load average of 3-6, and
+again with 9621af3 (products for this machine, multiply-adds fused) at 10-21:
 
 | epoch | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
 |---|---|---|---|---|---|---|---|---|---|---|
-| test accuracy, % | 96.97 | 97.83 | 98.42 | 98.55 | 98.78 | 98.41 | 98.52 | 98.81 | 98.83 | **98.84** |
-| test loss | 0.0994 | 0.0652 | 0.0474 | 0.0442 | 0.0385 | 0.0457 | 0.0416 | 0.0351 | 0.0349 | 0.0334 |
+| test accuracy, %, ef939ae | 96.97 | 97.83 | 98.42 | 98.55 | 98.78 | 98.41 | 98.52 | 98.81 | 98.83 | **98.84** |
+| test loss, ef939ae | 0.0994 | 0.0652 | 0.0474 | 0.0442 | 0.0385 | 0.0457 | 0.0416 | 0.0351 | 0.0349 | 0.0334 |
+| test accuracy, %, 9621af3 | 96.97 | 97.78 | 98.44 | 98.54 | 98.78 | 98.42 | 98.54 | 98.87 | 98.81 | **98.82** |
+| test loss, 9621af3 | 0.0994 | 0.0650 | 0.0471 | 0.0444 | 0.0383 | 0.0451 | 0.0412 | 0.0351 | 0.0347 | 0.0334 |
 
 against the 784-128-10 perceptron's **97.73%** after its 10 epochs (101,770 parameters, section 8). An epoch takes
-**54-61 s** (57.6 s on average over the ten; 54.1 s after max pooling's channel loop moved inside), against the
-perceptron's 2.2 s: the network does 0.76 GFLOP a step to the perceptron's 0.05. Results are identical bit for bit on
+**54-61 s** with ef939ae (57.6 s on average over the ten; 54.1 s after max pooling's channel loop moved inside), and
+**37-53 s with 9621af3** (42.9 on average, at a load of 10-21 - other agents compiling; the epochs at the lower load
+took 37-41 s), against the perceptron's 0.69 s: the network does 0.76 GFLOP a step to the perceptron's 0.05. Results are identical bit for bit on
 one and two threads (two were slower on the oversubscribed machine). **A step allocates nothing**: resident memory
 116,748 kB after step 10, 116,756 after step 100, 116,760 after every epoch to the tenth (4,690 steps); the arena is
 63 MB, laid out once.
 
-Where the first epoch goes (`ARGS="1 1 1 16 32 profile"`): the convolutions 46.0 s (forward 17.5, backward 28.5),
-max pooling 4.6, ReLU 2.4, the dense layer 1.0. Split by pass (`bench/conv.olang`, ms for a batch of 128):
+Where the first epoch goes (`ARGS="1 1 1 16 32 profile"`, ef939ae): the convolutions 46.0 s (forward 17.5, backward
+28.5), max pooling 4.6, ReLU 2.4, the dense layer 1.0. Split by pass (`bench/conv.olang`, ms for a batch of 128; for
+9621af3 the median of three runs at a load of 10):
 
 | | im2col (twice) | forward product | dW | dcols | col2im | bias and its sums |
 |---|---|---|---|---|---|---|
-| conv 1->16 on 28x28 | 6.3 | 5.4 (5.4 GFLOPS) | 4.7 (6.1) | 4.6 (6.3) | 3.0 | 1.7 |
-| conv 16->32 on 14x14 | 8.8 | 21.6 (10.7) | 19.6 (11.8) | 18.5 (12.5) | 4.1 | 0.9 |
+| conv 1->16 on 28x28, ef939ae | 6.3 | 5.4 (5.4 GFLOPS) | 4.7 (6.1) | 4.6 (6.3) | 3.0 | 1.7 |
+| conv 16->32 on 14x14, ef939ae | 8.8 | 21.6 (10.7) | 19.6 (11.8) | 18.5 (12.5) | 4.1 | 0.9 |
+| conv 1->16 on 28x28, 9621af3 | 9.5 | 5.4 (5.3) | 8.7 (3.3) | 4.7 (6.1) | 4.3 | 2.4 |
+| conv 16->32 on 14x14, 9621af3 | 10.1 | 8.5 (27.1) | 11.5 (20.2) | 6.2 (37.6) | 4.7 | 0.7 |
 
-(In the network the first convolution needs no `dcols` or col2im - its input is the images.) The second
-convolution's products run at 11-12 GFLOPS, std/linalg's GEMM rate on this target (section 8): the epoch is the
-instruction set again. The first's run at half that, because a depth of 9 (`C K K` for one channel) is too thin for a
-packed product - the case for a direct convolution, or a small-depth path in `Gemm`. And im2col plus the product's
-own packing copies every patch twice: a `Gemm` that packs its A panels straight from the images (an implicit GEMM)
-would skip the patches matrix and both passes over it.
+(In the network the first convolution needs no `dcols` or col2im - its input is the images.) With ef939ae the second
+convolution's products ran at 11-12 GFLOPS, std/linalg's GEMM rate on the SSE2 target; with 9621af3 they run at 20-38
+at a load of 10, and the epoch is now spread over the passes rather than the products: im2col, col2im and max
+pooling are passes over memory the target does not change. The first convolution's products stay at 3-6 GFLOPS: a
+depth of 9 (`C K K` for one channel) is too thin for a packed product, and its `dW` (16 x 9, depth 100,352) is mostly
+padding in the native 12 x 32 tile, slower than the old 4 x 12 one - the case for a direct convolution, or a
+small-depth path in `Gemm`. And im2col plus the product's own packing copies every patch twice: a `Gemm` that packs
+its A panels straight from the images (an implicit GEMM) would skip the patches matrix and both passes over it - the
+larger lever now that the products are fast.
 
 ### olang issues found in phase 4 (repro/)
 
@@ -879,7 +911,7 @@ No compiler bug: everything phase 4 needed compiled as the spec says. Two fricti
 
 And two limits worth a library: no regular expressions, so GPT-2's pre-tokenization pattern is a hand-written scanner;
 and no Unicode character classes in std, so `\p{L}` and `\p{N}` became byte classes (exact on ASCII text). Also met
-again: `:=` from a comparison needs its type written (D15).
+again: `:=` from a comparison needed its type written (D15 - relaxed in olang 9621af3).
 
 
 ## 17. Settling networks (`circuit.olang`)

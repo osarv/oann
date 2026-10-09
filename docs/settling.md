@@ -637,11 +637,11 @@ test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/
   committed state into the candidate, sweeps there in place (the totals are their own workspace, so a sweep needs no
   second copy of the state) and commits by flipping the phase's slot; a refusal leaves the committed state as it was,
   bit for bit (checked).
-- **A sweep**: the totals - the constant plus each recurrent block's transport (`linalg.Gemv` per batch row; a
-  reciprocal block's two directions read the one `[post, pre]` block, as rows dotted and as rows added) plus the
-  nudge; a pass for the residual of every row; on qualifying, the commit; otherwise a pass stepping `v += dt r`,
-  `s = rho(v)` (`linalg.FastTanh`). The residual has its own pass so that the committed state is the one whose
-  residual was measured.
+- **A sweep**: the totals - the constant plus each recurrent block's transport (one product for the batch's rows, a
+  `Gemv` per row before olang 9621af3; a reciprocal block's two directions read the one `[post, pre]` block, as `W^T`
+  and as `W`) plus the nudge; a pass for the residual of every row; on qualifying, the commit; otherwise a pass
+  stepping `v += dt r`, `s = rho(v)` (`linalg.FastTanh`). The residual has its own pass so that the committed state is
+  the one whose residual was measured.
 - **The constant** (drives, biases, folded blocks) is made once per settle, and once per lesson: the nudged phases
   reuse the free phase's. Input regions take `v = d`, `s = rho(d)`; they have no bias, since their state does not
   differ between phases and so no contrast could teach one.
@@ -660,11 +660,13 @@ test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/
   pending number, `Add(c, g)` folds it in while adding the contrast `Teach` left (one pass), `Credit(c, delta)` writes
   the actor's step `G = -delta E`. One stream (decision 19).
 - **Spiking**: 4.6.
-- **Cost, measured** (784-128-10, batch 32, F32, on a shared four-core machine): a lesson about 4.5 ms - the folded
-  constant 0.9 ms, about 40 sweeps over the three settles at about 70 us each, the contrast 0.7 ms, Adam 0.1 ms. The
-  folded 784-wide block is a matrix-vector product per batch row, read 32 times; std/linalg's blocked `Gemm` would do
-  it at several times the speed but allocates its packing panels per call in this compiler, and the runtime's chunk
-  pool then leaks them (DESIGN.md section 8) - the workspace `Gemm` now on olang master is the fix to take up.
+- **Cost, measured** (784-128-10, batch 32, F32, on a shared four-core machine, olang ef939ae): a lesson about 4.5
+  ms - the folded constant 0.9 ms, about 40 sweeps over the three settles at about 70 us each, the contrast 0.7 ms,
+  Adam 0.1 ms. The folded 784-wide block was then a matrix-vector product per batch row, read 32 times, as was every
+  recurrent block's transport. Since olang 9621af3 each is **one product for the batch's rows** - `ws.Gemm` on a
+  `linalg.GemmWorkspace` the circuit keeps, packing nothing new after the first lesson - built for this machine: an
+  MNIST epoch 10.2 -> 8.1 s (medians of six interleaved runs at a load of 10-19), the first epoch's loss and accuracy
+  unchanged.
 
 ### 2.11 As built: phase 2 - the agent
 
@@ -1075,7 +1077,10 @@ All in F64, as `circuit.olang`'s tests, unless marked; errors are the largest ov
   certified set after every step (`Restrain(0.9)`, what the board needs): 91.09% after three epochs, at 16 sweeps a
   lesson and 4 an answer - the certificate bounds each readout neuron's input to 0.9, which the cross-entropy at
   `T = 0.25` cannot separate ten classes well with; a deployed circuit wants a lower temperature or training aware of
-  the bound. An epoch takes 8.7 s on the shared machine (backprop's 784-128-10 epoch: 2.4 s; 2.10 says where it goes).
+  the bound. An epoch took 8.7 s on the shared machine with olang ef939ae (backprop's 784-128-10 epoch: 2.4 s; 2.10
+  says where it goes); with 9621af3, the batch's products as one `Gemm` each, 8-11 s at a load of 10-14 (the first
+  epoch 7.8-8.6 s, later ones more sweeps a lesson) against backprop's 0.69 - and 97.48% again after ten epochs (the
+  epochs between within 0.2 points of the old run's: the products now round differently).
 - **End to end, spiking MNIST** (the same example with `window` 256: Lif hidden and readout neurons, squared error
   toward 0.2 spikes a step for the class, `beta = 1`, Adam 5e-3, 10 000 training samples): 89.73% after one pass,
   90.48% after two; about 1 870 steps a lesson and 780 an answer, 45-66 s a pass. Learning works on spike counts;
