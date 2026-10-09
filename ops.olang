@@ -541,60 +541,110 @@ fn parallel(count I64, threads I64, body fn(task I64, lo I64, hi I64)) {
 #   P = softmax(Q K^T / sqrt(D / heads)), causal: row i attends to positions 0 ... i only
 #   Y = P V
 # probs keeps every P, row (s * heads + h) * T + i holding row i of sequence s's head h - T * T numbers per sequence and
-# head, the memory to watch. Sequences are spread over "threads" tasks, task t packing its products into wss[t] and
-# using its own AttentionScratch(T, D / heads) elements of scratch
+# head, the memory to watch. A part of the sequences and heads at a time (attentionEach, below), each product is one
+# std/linalg GemmBatch over the part, its products spread over "threads" tasks and packed into ws; the softmax runs
+# between the two, the part's sequences and heads spread over the same tasks
 fn Attention(y linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&, heads I64,
-        T I64, causal Bool, probs linalg.Matrix<T>&, scratch mut Array<T>&, threads I64,
-        wss mut Array<linalg.GemmWorkspace<T>>&, z <A>) {
+        T I64, causal Bool, probs linalg.Matrix<T>&, threads I64, ws mut linalg.GemmWorkspace<T>&, z <A>) {
+    like T
+    scale F64 = 1.0 / math.Sqrt(F64(q.Cols / heads))
     dh I64 = q.Cols / heads
-    scale F64 = 1.0 / math.Sqrt(F64(dh))
-    per I64 = AttentionScratch(T, dh)
-    parallel(q.Rows / T, threads, fn(task, lo, hi) {
-        tr := linalg.View(scratch, task * per + T * T, dh, T)
-        for s in range lo, hi {
-            for h in range heads {
-                attendHead(y, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale, tr, wss[task],
-                    z)
-            }
-        }
-    })
-}
-
-# ---- attention's products ----
-# One sequence's one head is rows r0 ... r0 + T - 1 and columns c0 ... c0 + dh - 1 of q, k, v and y (and of their
-# gradients), its probabilities rows p0 ... p0 + T - 1 of probs. Its products are std/linalg's, one Gemm each on
-# those strided views - the whole T x T square even when causal, the upper triangle of the scores computed and then
-# dropped by the softmax, so that P's zeros there keep every row from seeing a later one exactly (0 times a finite
-# value adds nothing). A product whose right operand is a head's T x dh block takes it transposed into tr first (dh x
-# T, a pass over T dh elements): std/linalg computes a product of up to 64^3 multiply-adds with an untransposed right
-# operand directly rather than packed, and at T 64 and dh 32 that ran 2.0-2.3x slower than the transpose and a packed
-# product together. attendHead and attendHeadBackward are all of attention that knows how the products are made: a
-# batched, causal-aware Gemm (every sequence and head in one call, the upper triangle skipped - std/linalg's GemmBatch,
-# on an olang newer than this was built with) replaces them, and the per-sequence tasks in Attention and
-# AttentionBackward with them; softmaxCausal and the dS pass stay, between the calls (DESIGN.md section 13).
-
-# the scratch a task needs for heads of dh columns over sequences of T: dS (T x T) and a transposed block (dh x T)
-fn AttentionScratch(T I64, dh I64) I64 {
-    return T * T + dh * T
-}
-
-# dst (cols x rows) = src (rows x cols) transposed
-fn transpose(dst linalg.Matrix<<T>>&, src linalg.Matrix<T>&) {
-    for i in range src.Rows {
-        row := src.Row(i)
-        for j in range src.Cols { dst.Data[j * dst.Stride + i] = row[j] }
+    seqs I64 = q.Rows / T
+    each := attentionEach(seqs, heads, threads, T * T * elementBytes(like))
+    for i in range attentionParts(seqs, heads, each) {
+        r0, rows, h0, nh := attentionPart(i, seqs, heads, each, T)
+        c0 I64 = h0 * dh
+        w I64 = nh * dh
+        pr I64 = (r0 / T * heads + h0) * T
+        attendPart(y.Block(r0, c0, rows, w), q.Block(r0, c0, rows, w), k.Block(r0, c0, rows, w),
+            v.Block(r0, c0, rows, w), nh, T, causal, probs.RowRange(pr, pr + rows * nh), scale, threads, ws, z)
     }
 }
 
-# Y = softmax(scale Q K^T, causal) V for one sequence's one head, the probabilities kept in probs
-fn attendHead(y linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&,
-        probs linalg.Matrix<T>&, p0 I64, r0 I64, c0 I64, dh I64, T I64, causal Bool, scale F64,
-        tr linalg.Matrix<T>&, ws mut linalg.GemmWorkspace<T>&, z <A>) {
-    p := probs.RowRange(p0, p0 + T)
-    ws.Gemm(p, q.Block(r0, c0, T, dh), false, k.Block(r0, c0, T, dh), true, scale, 0, 1)
-    softmaxCausal(p, causal, z)
-    transpose(tr, v.Block(r0, c0, T, dh))
-    ws.Gemm(y.Block(r0, c0, T, dh), p, false, tr, true, 1, 0, 1)
+# attention over a part: every sequence's every head of q, k, v and y (T rows each, heads blocks of columns), their
+# weights stacked in probs
+fn attendPart(y linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&, heads I64,
+        T I64, causal Bool, probs linalg.Matrix<T>&, scale F64, threads I64, ws mut linalg.GemmWorkspace<T>&, z <A>) {
+    P := probs.Stacked(T, heads)
+    ws.GemmBatch(P, q.Heads(T, heads), false, k.Heads(T, heads), true, scale, 0, scoresTriangle(causal), 0, threads)
+    parallel(probs.Rows / T, threads, fn(task, lo, hi) {
+        for e in range lo, hi { softmaxCausal(probs.RowRange(e * T, (e + 1) * T), causal, z) }
+    })
+    ws.GemmBatch(y.Heads(T, heads), P, false, v.Heads(T, heads), false, 1, 0, weightsTriangle(causal), 0, threads)
+}
+
+# ---- attention's products ----
+# Attention's six products - S = Q K^T and Y = P V forward, dP = dO V^T, dQ = dS K, dK = dS^T Q and dV = P^T dO
+# backward - are each one std/linalg GemmBatch: q.Heads(T, heads) is every sequence's every head's T x D / heads
+# column block of q (a group per sequence, a member per head), and so for k, v, y and their gradients;
+# probs.Stacked(T, heads) is every sequence's every head's T x T weights, stacked in probs's rows as attention keeps
+# them, and so is dS in the scratch. Causal, a product makes or reads only what is on and below the diagonal: the
+# scores and dP are computed there only (Triangular.Result), and P and dS, zero above it, are read there only as the
+# left operand of the other four (Triangular.Left) - half of each product skipped, and no product ever sees a later
+# position, so causality is exact by construction rather than by zeros. The softmax writes P's zeros above the
+# diagonal all the same: P is a value its readers may look at whole.
+
+# the triangle a causal attention's scores and dP are confined to: they are computed on and below the diagonal only
+fn scoresTriangle(causal Bool) linalg.Triangular {
+    return linalg.Triangular.Result if causal else linalg.Triangular.None
+}
+
+# the triangle a causal attention's P and dS are read in: they are zero above the diagonal, never read there
+fn weightsTriangle(causal Bool) linalg.Triangular {
+    return linalg.Triangular.Left if causal else linalg.Triangular.None
+}
+
+# the scratch attention's backward needs over "rows" rows (n, the sequences times T) in heads: dS, as large as P
+fn AttentionScratch(rows I64, heads I64, T I64) I64 {
+    return rows * heads * T
+}
+
+# Attention and AttentionBackward take their T x T matrices a part at a time - a run of whole sequences, or a run of
+# one sequence's heads - each part as many matrices as keep what its passes go over in the tasks' caches: at most
+# attentionCache bytes of them a task, a matrix being P forward, P and dS backward. Each pass over a part (a product,
+# the softmax, the next product) then finds P and dS where the one before left them, where across every sequence and
+# head they would come from memory again each time: measured, a non-causal backward at T 256 ran 1.2-1.5 times as long
+# as a Gemm per head when all were taken at once, and 0.87-0.91 times in parts of one (DESIGN.md section 18)
+attentionCache I64 = 524288
+
+# how many matrices a part takes: as many as fit attentionCache bytes, a matrix "matrix" bytes, for each task
+fn attentionEach(seqs I64, heads I64, threads I64, matrix I64) I64 {
+    per I64 = attentionCache / matrix if attentionCache > matrix else 1
+    each I64 = per * threads if threads > 1 else per
+    return each if each < seqs * heads else seqs * heads
+}
+
+# the parts of seqs sequences in heads taken "each" matrices at a time
+fn attentionParts(seqs I64, heads I64, each I64) I64 {
+    if each >= heads {
+        per I64 = each / heads
+        return (seqs + per - 1) / per
+    }
+    return seqs * ((heads + each - 1) / each)
+}
+
+# part i: its first row and its rows (whole sequences of T), its first head and its heads
+fn attentionPart(i I64, seqs I64, heads I64, each I64, T I64) (I64, I64, I64, I64) {
+    if each >= heads {
+        per I64 = each / heads
+        s0 I64 = i * per
+        s1 I64 = s0 + per if s0 + per < seqs else seqs
+        return s0 * T, (s1 - s0) * T, 0, heads
+    }
+    runs I64 = (heads + each - 1) / each
+    s I64 = i / runs
+    h0 I64 = (i % runs) * each
+    h1 I64 = h0 + each if h0 + each < heads else heads
+    return s * T, T, h0, h1 - h0
+}
+
+# the bytes an element of like's type takes
+fn elementBytes(like <T>) I64 {
+    return match T {
+        case F64 => 8
+        case F32 => 4
+        nomatch => 2
+    }
 }
 
 # each row of the scores s (T x T) replaced by its softmax - over positions 0 ... i in row i when causal, zeros after
@@ -616,6 +666,21 @@ fn softmaxCausal(s linalg.Matrix<<T>>&, causal Bool, z <A>) {
         inv A = 1.0 / total
         for j in range last { row[j] = down(up(row[j], z) * inv, like) }
         for j in range last, s.Cols { row[j] = like }
+    }
+}
+
+# dP (T x T, in d) made dS = P * (dP - rowsum(dP * P)) * scale row by row - softmax's backward, scaled - for one
+# sequence's one head, p its weights; causal, row i only up to position i, the rest of d never read
+fn softmaxBackward(d linalg.Matrix<<T>>&, p linalg.Matrix<T>&, causal Bool, scale F64, z <A>) {
+    like T
+    sc := linalg.Cast(scale, z)
+    for i in range d.Rows {
+        dr := d.Row(i)
+        pr := p.Row(i)
+        last I64 = i + 1 if causal else d.Cols
+        dot A = z
+        for j in range last { dot = dot + up(dr[j], z) * up(pr[j], z) }
+        for j in range last { dr[j] = down(sc * up(pr[j], z) * (up(dr[j], z) - dot), like) }
     }
 }
 
@@ -661,76 +726,64 @@ fn AttentionCached(y linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T
     }
 }
 
-# the gradients of attention, per sequence and head, with dO the head's block of dy and dS = P * (dO V^T - rowsum(dO
-# V^T * P)) / sqrt(dh) (softmax's backward, scaled):
+# the gradients of attention, with dO the heads' blocks of dy and dS = P * (dO V^T - rowsum(dO V^T * P)) / sqrt(dh)
+# (softmax's backward, scaled):
 #   dQ = dS K,   dK = dS^T Q,   dV = P^T dO
 # written in that order - q's, then k's, then v's - which is the order their "acc" flags were taken in, so attention of
-# a node with itself (q, k or v the same) adds its contributions up. Task t packs its products into wss[t] and keeps
-# its dS and transposed blocks in its own AttentionScratch(T, D / heads) elements of scratch
+# a node with itself (q, k or v the same) adds its contributions up. A part of the sequences and heads at a time
+# (attentionEach, above), each product is one GemmBatch over the part, packed into ws, its products spread over
+# "threads" tasks, and so are dS's rows between them; dS is kept in scratch, at most AttentionScratch(n, heads, T)
+# elements
 fn AttentionBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&,
         heads I64, T I64, causal Bool, probs linalg.Matrix<T>&, dq linalg.Matrix<T>&, accQ Bool,
         dk linalg.Matrix<T>&, accK Bool, dv linalg.Matrix<T>&, accV Bool, scratch mut Array<T>&, threads I64,
-        wss mut Array<linalg.GemmWorkspace<T>>&, z <A>) {
+        ws mut linalg.GemmWorkspace<T>&, z <A>) {
+    like T
+    scale F64 = 1.0 / math.Sqrt(F64(q.Cols / heads))
     dh I64 = q.Cols / heads
-    scale F64 = 1.0 / math.Sqrt(F64(dh))
-    per I64 = AttentionScratch(T, dh)
-    parallel(q.Rows / T, threads, fn(task, lo, hi) {
-        ds := linalg.View(scratch, task * per, T, T)
-        tr := linalg.View(scratch, task * per + T * T, dh, T)
-        for s in range lo, hi {
-            for h in range heads {
-                attendHeadBackward(dy, q, k, v, probs, (s * heads + h) * T, s * T, h * dh, dh, T, causal, scale, dq,
-                    accQ, dk, accK, dv, accV, ds, tr, wss[task], z)
-            }
+    seqs I64 = q.Rows / T
+    each := attentionEach(seqs, heads, threads, 2 * T * T * elementBytes(like))
+    for i in range attentionParts(seqs, heads, each) {
+        r0, rows, h0, nh := attentionPart(i, seqs, heads, each, T)
+        pr I64 = (r0 / T * heads + h0) * T
+        c0 I64 = h0 * dh
+        w I64 = nh * dh
+        attendPartBackward(dy.Block(r0, c0, rows, w), q.Block(r0, c0, rows, w), k.Block(r0, c0, rows, w),
+            v.Block(r0, c0, rows, w), nh, T, causal, probs.RowRange(pr, pr + rows * nh),
+            part(dq, r0, c0, rows, w), accQ, part(dk, r0, c0, rows, w), accK, part(dv, r0, c0, rows, w), accV, scratch,
+            scale, threads, ws, z)
+    }
+}
+
+# m's block of rows r0 ... r0 + rows - 1 and columns c0 ... c0 + cols - 1, or m itself when it is empty (a gradient
+# not wanted)
+fn part(m linalg.Matrix<<T>>&, r0 I64, c0 I64, rows I64, cols I64) linalg.Matrix<T> {
+    return m.Block(r0, c0, rows, cols) if m.Rows > 0 else m
+}
+
+# attention's gradients over a part, as attendPart's forward
+fn attendPartBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&,
+        heads I64, T I64, causal Bool, probs linalg.Matrix<T>&, dq linalg.Matrix<T>&, accQ Bool,
+        dk linalg.Matrix<T>&, accK Bool, dv linalg.Matrix<T>&, accV Bool, scratch mut Array<T>&, scale F64,
+        threads I64, ws mut linalg.GemmWorkspace<T>&, z <A>) {
+    ds := linalg.View(scratch, 0, probs.Rows, T)
+    dS := ds.Stacked(T, heads)
+    dO := dy.Heads(T, heads)
+    ws.GemmBatch(dS, dO, false, v.Heads(T, heads), true, 1, 0, scoresTriangle(causal), 0, threads)
+    parallel(probs.Rows / T, threads, fn(task, lo, hi) {
+        for e in range lo, hi {
+            softmaxBackward(linalg.View(scratch, e * T * T, T, T), probs.RowRange(e * T, (e + 1) * T), causal, scale, z)
         }
     })
-}
-
-# one sequence's one head: dP = dO V^T into ds, made dS there row by row, then the three gradients' products
-fn attendHeadBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&,
-        probs linalg.Matrix<T>&, p0 I64, r0 I64, c0 I64, dh I64, T I64, causal Bool, scale F64,
-        dq linalg.Matrix<T>&, accQ Bool, dk linalg.Matrix<T>&, accK Bool, dv linalg.Matrix<T>&, accV Bool,
-        ds linalg.Matrix<T>&, tr linalg.Matrix<T>&, ws mut linalg.GemmWorkspace<T>&, z <A>) {
-    p := probs.RowRange(p0, p0 + T)
-    dO := dy.Block(r0, c0, T, dh)
-    ws.Gemm(ds, dO, false, v.Block(r0, c0, T, dh), true, 1, 0, 1)
-    like T
-    sc := linalg.Cast(scale, z)
-    for i in range T {
-        d := ds.Row(i)
-        pr := p.Row(i)
-        last I64 = i + 1 if causal else T
-        dot A = z
-        for j in range last { dot = dot + up(d[j], z) * up(pr[j], z) }
-        for j in range last { d[j] = down(sc * up(pr[j], z) * (up(d[j], z) - dot), like) }
-        for j in range last, T { d[j] = like }
-    }
+    left := weightsTriangle(causal)
     if dq.Rows > 0 {
-        transpose(tr, k.Block(r0, c0, T, dh))
-        ws.Gemm(dq.Block(r0, c0, T, dh), ds, false, tr, true, 1, beta(accQ), 1)
+        ws.GemmBatch(dq.Heads(T, heads), dS, false, k.Heads(T, heads), false, 1, beta(accQ), left, 0, threads)
     }
     if dk.Rows > 0 {
-        transpose(tr, q.Block(r0, c0, T, dh))
-        ws.Gemm(dk.Block(r0, c0, T, dh), ds, true, tr, true, 1, beta(accK), 1)
+        ws.GemmBatch(dk.Heads(T, heads), dS, true, q.Heads(T, heads), false, 1, beta(accK), left, 0, threads)
     }
     if dv.Rows > 0 {
-        transpose(tr, dO)
-        ws.Gemm(dv.Block(r0, c0, T, dh), p, true, tr, true, 1, beta(accV), 1)
-    }
-}
-
-# grows each of wss's workspaces to what attention's products over sequences of T rows and heads of dh columns need,
-# by running them once on zeros - so no task grows one, and a step allocates nothing
-fn WarmAttention(wss mut Array<linalg.GemmWorkspace<<T>>>&, T I64, dh I64, z <A>) {
-    a := linalg.Matrix<T>(T, dh)
-    p := linalg.Matrix<T>(T, T)
-    ds := linalg.Matrix<T>(T, T)
-    tr := linalg.Matrix<T>(dh, T)
-    out := linalg.Matrix<T>(T, dh)
-    for t in range wss.Len() {
-        attendHead(out, a, a, a, p, 0, 0, 0, dh, T, true, 1.0, tr, wss[t], z)
-        attendHeadBackward(a, a, a, a, p, 0, 0, 0, dh, T, true, 1.0, out, false, out, true, out, true, ds, tr, wss[t],
-            z)
+        ws.GemmBatch(dv.Heads(T, heads), probs.Stacked(T, heads), true, dO, false, 1, beta(accV), left, 0, threads)
     }
 }
 
@@ -895,4 +948,45 @@ test "the kernels compute what they say" {
     probs := linalg.Matrix<F64>(2, 4)
     loss := SoftmaxCrossEntropy(out, I32[3, 1], probs, z)
     assert loss > 0.0 and probs.Get(0, 3) > 0.99
+}
+
+test "attention a part at a time gives exactly what all of it at once gives, forward and backward" {
+    # sequences of 256 in F64: a part is one head (each 512 KB of P, 1 MB of P and dS), or three heads on three tasks
+    T I64 = 256
+    heads I64 = 4
+    n I64 = 2 * T
+    r := rand.Rand(5)
+    q := linalg.Matrix<F64>(n, 64)
+    k := linalg.Matrix<F64>(n, 64)
+    v := linalg.Matrix<F64>(n, 64)
+    dy := linalg.Matrix<F64>(n, 64)
+    q.FillNormal(r, 0.0, 1.0)
+    k.FillNormal(r, 0.0, 1.0)
+    v.FillNormal(r, 0.0, 1.0)
+    dy.FillNormal(r, 0.0, 1.0)
+    z F64 = 0.0
+    ws := linalg.GemmWorkspace<F64>()
+    scratch := Array<F64>(AttentionScratch(n, heads, T))
+    for causal in Bool[true, false] {
+        assert attentionEach(2, heads, 1, T * T * 8) == 1 and attentionEach(2, heads, 3, 2 * T * T * 8) == 3
+        y := linalg.Matrix<F64>(n, 64)
+        p := linalg.Matrix<F64>(n * heads, T)
+        dq := linalg.Matrix<F64>(n, 64)
+        dk := linalg.Matrix<F64>(n, 64)
+        dv := linalg.Matrix<F64>(n, 64)
+        scale F64 = 0.25
+        attendPart(y, q, k, v, heads, T, causal, p, scale, 1, ws, z)
+        attendPartBackward(dy, q, k, v, heads, T, causal, p, dq, false, dk, false, dv, false, scratch, scale, 1, ws, z)
+        for threads in I64[1, 3] {
+            y2 := linalg.Matrix<F64>(n, 64)
+            p2 := linalg.Matrix<F64>(n * heads, T)
+            dq2 := linalg.Matrix<F64>(n, 64)
+            dk2 := linalg.Matrix<F64>(n, 64)
+            dv2 := linalg.Matrix<F64>(n, 64)
+            Attention(y2, q, k, v, heads, T, causal, p2, threads, ws, z)
+            AttentionBackward(dy, q, k, v, heads, T, causal, p2, dq2, false, dk2, false, dv2, false, scratch, threads,
+                ws, z)
+            assert y2 == y and p2 == p and dq2 == dq and dk2 == dk and dv2 == dv
+        }
+    }
 }

@@ -151,9 +151,8 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     Training Bool = true            # dropout acts only while training
     Pos I64 = 0                     # the position of the batch's first row in its sequence (Positions)
     Rng rand.Rand = rand.Rand(0)      # dropout's generator, seeded from the one Plan is given
-    ws linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()      # the products' packing panels
-    attention mut Array<linalg.GemmWorkspace<T>>& = Array<linalg.GemmWorkspace<T>>(0)  # attention's, one per task
-    scratchOffset I64 = 0           # attention's: a T x T and a dh x T matrix per task
+    ws linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()      # the products' packing panels, attention's too
+    scratchOffset I64 = 0           # attention's backward's dS: as large as the largest attention's P
     scratchSize I64 = 0
     colsOffset I64 = 0              # convolutions' patches (conv.Im2col): the largest one's, shared by all
     colsSize I64 = 0
@@ -515,8 +514,8 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
                 }
                 match nd.Kind {
                     case Op.Attention(_, _, _, heads, T, _) {
-                        per := ops.AttentionScratch(T, nd.Cols / heads)
-                        if not g.Decoding and g.Threads * per > scratch { scratch = g.Threads * per }
+                        ds := ops.AttentionScratch(nd.Rows, heads, T)
+                        if not g.Decoding and ds > scratch { scratch = ds }
                     }
                     case Op.Conv2d(_, _, _, s) {
                         if nd.Rows * s.Positions() * s.Patch() > cols { cols = nd.Rows * s.Positions() * s.Patch() }
@@ -537,21 +536,6 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     g.classes = Array<I32>(rows)
     g.losses = Array<F64>(count)
     if g.HasMasters() { g.masters = Array<F32>(params) }
-    # attention's products pack into a workspace per task, grown here to what they need - not by the tasks
-    for i in range count {
-        nd := g.nodes[i]
-        match nd.Kind {
-            case Op.Attention(_, _, _, heads, T, _) {
-                if not g.Decoding {
-                    if g.attention.Len() == 0 {
-                        g.attention = Array<linalg.GemmWorkspace<T>>(g.Threads, linalg.GemmWorkspace<T>())
-                    }
-                    g.warm(T, nd.Cols / heads)
-                }
-            }
-            nomatch { }
-        }
-    }
     g.written = Array<Bool>(count)
     g.ParamCount = params
     g.N = g.Batch
@@ -581,17 +565,6 @@ fn initialize(p linalg.Matrix<<T>>&, init Init, r mut rand.Rand&) {
         case Init.Constant(v) { p.Fill(linalg.Cast(v, like)) }
         case Init.Uniform(lo, hi) { p.FillUniform(r, lo, hi) }
         case Init.Normal(mean, sd) { p.FillNormal(r, mean, sd) }
-    }
-}
-
-# grows attention's workspaces to what its products over sequences of T rows and heads of dh columns need
-fn (g mut Graph<<T>>&) warm(T I64, dh I64) {
-    match T {
-        case BF16 { ops.WarmAttention(g.attention, T, dh, F32(0)) }
-        nomatch {
-            like T
-            ops.WarmAttention(g.attention, T, dh, like)
-        }
     }
 }
 
@@ -878,8 +851,7 @@ fn (g mut Graph<<T>>&) forwardIn(node Var, nd Node&, th I64, z <A>) {
                 ops.AttentionCached(y, g.Value(q), g.Value(k), g.Value(v), heads, g.Pos, keys, values, scores)
             } else {
                 if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
-                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), g.scratch(), th,
-                    g.attention, z)
+                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), th, g.ws, z)
             }
         }
         case Op.Dropout(x, p) {
@@ -1083,7 +1055,7 @@ fn (g mut Graph<<T>>&) backwardIn(v Var, nd Node&, th I64, z <A>) {
             dw := g.gradOf(w)
             cw := g.acc(w)
             ops.AttentionBackward(dy, g.Value(q), g.Value(k), g.Value(w), heads, T, causal, g.saved(v), dq, cq, dk, ck,
-                dw, cw, g.scratch(), th, g.attention, z)
+                dw, cw, g.scratch(), th, g.ws, z)
         }
         case Op.Dropout(x, p) {
             if g.nodes[x].GradOffset >= 0 {
@@ -1291,8 +1263,9 @@ test "attention agrees with central differences: causal and not, several heads, 
     assert GradientError(g, loss, 3) < 1e-6
 }
 
-test "attention agrees with central differences through the packed products, on longer sequences" {
-    # T 8: the scores' products are packed, the rest computed directly; T 130 with heads of 16: every product packed
+test "attention agrees with central differences on longer sequences, the causal products confined to their triangles" {
+    # T 8 in two heads: a product a tile or two, straddling the diagonal; T 130 in heads of 16: tiles wholly above the
+    # diagonal skipped, the rest packed and blocked as a large product is
     for T in I64[8, 130] {
         g := Graph<F64>(2 * T)
         x := g.Input(16)
@@ -1325,8 +1298,8 @@ test "causal attention: a row's output depends on no later row" {
     xd[7] = 5.0
     g.Forward(4)
     assert g.Value(a).Get(1, 1) == before and g.Value(a).Get(0, 0) == 0.0
-    # the same through the packed products, which compute the whole square of scores: rows before the changed one
-    # are exactly what they were, forward and backward
+    # the same over a longer sequence, the products confined to their triangles: rows before the changed one are
+    # exactly what they were, forward and backward
     h := Graph<F64>(32)
     hx := h.Input(8)
     w := h.Param(8, 8, Init.Normal(0.0, 0.5), true)
@@ -1405,25 +1378,32 @@ test "a checkpoint saves the parameters and loads them back into a graph built t
 
 
 test "attention split over tasks gives exactly what one task gives, forward and backward" {
-    want := linalg.Matrix<F64>(1, 64)
-    wantLoss F64 = 0.0
-    for threads in range 1, 4, 2 {
-        g := Graph<F64>(12, threads)
-        x := g.Input(8)
-        q := g.Product(x, normal(g, 8, 8), false, true)
-        a := g.Attention(q, x, x, 2, 3, true)
-        loss := g.Mse(a, g.Input(8))
-        r := rand.Rand(17)
-        g.Plan(r)
-        xd := g.InputData(x)
-        for i in range xd.Len() { xd[i] = F64(i % 7) * 0.25 - 0.5 }
-        g.Forward(12)
-        g.Backward(loss)
-        if threads == 1 {
-            want.Copy(g.ParamGrads())
-            wantLoss = g.Scalar(loss)
-        } else {
-            assert g.ParamGrads().MaxAbsDifference(want) == 0.0 and g.Scalar(loss) == wantLoss
+    # sequences of 3 in two heads of 4 columns: products too small to split, the softmax and dS passes split; then 8
+    # sequences of 64 in two heads of 32 columns, large enough for std/linalg to split the products over the tasks too
+    for size in range 2 {
+        T I64 = 3 if size == 0 else 64
+        rows I64 = 12 if size == 0 else 512
+        cols I64 = 8 if size == 0 else 64
+        want := linalg.Matrix<F64>(1, cols * cols)
+        wantLoss F64 = 0.0
+        for threads in range 1, 4, 2 {
+            g := Graph<F64>(rows, threads)
+            x := g.Input(cols)
+            q := g.Product(x, normal(g, cols, cols), false, true)
+            a := g.Attention(q, x, x, 2, T, true)
+            loss := g.Mse(a, g.Input(cols))
+            r := rand.Rand(17)
+            g.Plan(r)
+            xd := g.InputData(x)
+            for i in range xd.Len() { xd[i] = F64(i % 7) * 0.25 - 0.5 }
+            g.Forward(rows)
+            g.Backward(loss)
+            if threads == 1 {
+                want.Copy(g.ParamGrads())
+                wantLoss = g.Scalar(loss)
+            } else {
+                assert g.ParamGrads().MaxAbsDifference(want) == 0.0 and g.Scalar(loss) == wantLoss
+            }
         }
     }
 }
