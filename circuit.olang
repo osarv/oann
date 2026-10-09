@@ -25,6 +25,11 @@
 # stepping ParamData() from GradData()) - or, for learning from a reward that comes later, added to an eligibility
 # trace (Eligibility, below) that a broadcast error turns into a step.
 #
+# A projection's block is dense - a [post, pre] matrix, through std/linalg's products - or, for large sparse wiring,
+# compressed sparse rows (sparse.Csr): only its synapses are stored, stepped and multiplied (Layout; Auto chooses by
+# density). A readout may be split into groups of equal size, each its own softmax: several classes, or several
+# actions chosen at once.
+#
 # The neuron model is a closed enum. Rate neurons: tanh (the default), the hard sigmoid, linear (tests), and LifRate -
 # the steady firing rate of a leaky integrate-and-fire neuron, the rate model of the spiking one. Lif neurons spike:
 # a sweep is a time step, their activity is their spike count over a window, and the same settle, phases, nudges and
@@ -34,6 +39,7 @@ import "std/linalg"
 import "std/math"
 import "std/rand"
 import "optim"
+import "sparse"
 
 # a region's handle and a projection's: indices into the circuit's records
 type Region I64
@@ -81,6 +87,13 @@ type Wiring enum {
     Reciprocal                              # both ways, through one block of weights: symmetric
 }
 
+# how a projection's synapses are stored
+type Layout enum {
+    Auto                                    # Sparse at a density of at most SparseBelow, else Dense
+    Dense                                   # a [post, pre] block, absent synapses as zeros (masked)
+    Sparse                                  # compressed sparse rows: the synapses alone
+}
+
 # the four states a circuit keeps
 type Phase enum {
     Free                                    # the answer to the drive
@@ -115,26 +128,35 @@ type Lesson struct(Beta F64 = 0.5, Tolerance F64 = 0, Budget I64 = 0, Centered B
 
 # ---- records ----
 
-type regionRec struct(Kind Role, Size I64, Model Neuron, Fit Cost) {
+type regionRec struct(Kind Role, Size I64, Model Neuron, Fit Cost, Groups I64 = 1) {
     Kind
     Size
     Model
     Fit
+    Groups                                  # a readout's softmax groups, Size / Groups neurons each
     Col mut I64 = 0                         # its first column of the state
     Drive mut I64 = 0                       # where its drive starts in the arena: Rows rows of Size
     Target mut I64 = -1                     # a Squared readout's targets in the arena, Rows rows of Size
-    Labels mut I64 = -1                     # a CrossEntropy readout's classes in labels, one per row
+    Labels mut I64 = -1                     # a CrossEntropy readout's classes in labels, Groups per row
 }
 
-type projectionRec struct(Pre Region, Post Region, Kind Wiring, Density F64, Frozen Bool) {
+type projectionRec struct(Pre Region, Post Region, Kind Wiring, Density F64, Frozen Bool, Store Layout,
+        Pairs I64 = -1, PairCount I64 = 0) {
     Pre
     Post
     Kind
     Density
     Frozen
-    Offset mut I64 = 0                      # its [post, pre] block in the parameter region
-    Mask mut I64 = -1                       # its [post, pre] connectivity in masks; -1 when dense
+    Store
+    Pairs                                   # a wired projection's (post, pre) pairs in wiredPost/wiredPre; -1 drawn
+    PairCount
+    Offset mut I64 = 0                      # its weights in the parameter region: [post, pre], or its Nnz entries
+    Mask mut I64 = -1                       # a dense block's [post, pre] connectivity in masks; -1 when complete
     Folded mut Bool = false                 # its source is an Input region: part of the per-settle constant
+    Sparse mut Bool = false                 # stored as compressed sparse rows
+    Ptr mut I64 = -1                        # its pattern's row starts in ptrs (post + 1); -1 when complete
+    Idx mut I64 = 0                         # its pattern's columns in idx
+    Nnz mut I64 = 0                         # its synapses
 }
 
 # a settling circuit of T elements, run on up to Rows rows at a time (a batch, or several streams)
@@ -145,6 +167,10 @@ type Circuit<T> struct(Rows I64) {
     mem mut Array<T>& = Array<T>(0)
     labels mut Array<I32>& = Array<I32>(0)
     masks mut Array<U8>& = Array<U8>(0)
+    ptrs mut Array<I64>& = Array<I64>(0)        # the sparse patterns' row starts, projection after projection
+    idx mut Array<I32>& = Array<I32>(0)         # and their columns
+    wiredPost mut List<I32>& = List<I32>()      # wired projections' synapses, (post, pre) pairs, until Plan
+    wiredPre mut List<I32>& = List<I32>()
     current mut Array<I64>& = Array<I64>(4)     # each phase's committed slot, 0 or 1
     nudges mut Array<F64>& = Array<F64>(4)      # each phase's nudge strength (+beta, -beta, 0)
     N mut I64 = Rows                            # the rows in use
@@ -167,6 +193,8 @@ type Circuit<T> struct(Rows I64) {
     residual mut I64 = 0
     lastResidual mut I64 = 0
     mass mut I64 = 0
+    feature mut I64 = -1                        # three Neurons x Rows batches, feature-major, for sparse blocks
+    sparseBlocks mut I64 = 0
     ws mut linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()  # the products' packing panels, grown once
 }
 
@@ -178,10 +206,11 @@ fn wrong(what String&) {
 
 # ---- recording ----
 
-fn (c mut Circuit<<T>>&) region(kind Role, size I64, model Neuron, fit Cost) Region {
+fn (c mut Circuit<<T>>&) region(kind Role, size I64, model Neuron, fit Cost, groups I64 = 1) Region {
     if c.planned { wrong("the circuit is planned already - regions are recorded before Plan") }
     if size < 1 { wrong("a region needs at least one neuron") }
-    c.regions.Push(regionRec(kind, size, model, fit))
+    if groups < 1 or size % groups != 0 { wrong("a readout's groups divide its neurons evenly") }
+    c.regions.Push(regionRec(kind, size, model, fit, groups))
     return Region(c.regions.Len() - 1)
 }
 
@@ -198,31 +227,106 @@ fn (c mut Circuit<<T>>&) Hidden(size I64, model Neuron = Neuron.Rate(Rho.Tanh)) 
 }
 
 # a region of size neurons read as the answer and nudged toward its targets by fit when learning: a class per row
-# (LabelData) for CrossEntropy, a target row (TargetData) for Squared
-fn (c mut Circuit<<T>>&) Readout(size I64, fit Cost = Cost.CrossEntropy(0.25), model Neuron = Neuron.Rate(Rho.Tanh)) Region {
-    return c.region(Role.Readout, size, model, fit)
+# (LabelData) for CrossEntropy, a target row (TargetData) for Squared. Split into groups of size / groups neurons, it
+# is that many softmaxes side by side - a class per group per row, each group's cost and force its own: several
+# answers at once, an agent's several actions
+fn (c mut Circuit<<T>>&) Readout(size I64, fit Cost = Cost.CrossEntropy(0.25), model Neuron = Neuron.Rate(Rho.Tanh),
+        groups I64 = 1) Region {
+    return c.region(Role.Readout, size, model, fit, groups)
 }
 
+# a region's softmax groups (1 unless a readout was split)
+fn (c Circuit<<T>>&) Groups(reg Region) I64 {
+    return c.regions[reg].Groups
+}
+
+# ---- what a circuit is made of, for those who read it: an exporter, the board engine (board.olang) ----
+
+# the regions recorded: Region(0) .. Region(Regions() - 1)
+fn (c Circuit<<T>>&) Regions() I64 { return c.regions.Len() }
+
+fn (c Circuit<<T>>&) RoleOf(reg Region) Role { return c.regions[reg].Kind }
+
+fn (c Circuit<<T>>&) SizeOf(reg Region) I64 { return c.regions[reg].Size }
+
+# its first column of the state (Plan numbers the neurons region by region)
+fn (c Circuit<<T>>&) ColumnOf(reg Region) I64 { return c.regions[reg].Col }
+
+fn (c Circuit<<T>>&) ModelOf(reg Region) Neuron { return c.regions[reg].Model }
+
+fn (c Circuit<<T>>&) FitOf(reg Region) Cost { return c.regions[reg].Fit }
+
+# the projections recorded: Projection(0) .. Projection(Projections() - 1)
+fn (c Circuit<<T>>&) Projections() I64 { return c.projections.Len() }
+
+fn (c Circuit<<T>>&) PreOf(p Projection) Region { return c.projections[p].Pre }
+
+fn (c Circuit<<T>>&) PostOf(p Projection) Region { return c.projections[p].Post }
+
+fn (c Circuit<<T>>&) WiringOf(p Projection) Wiring { return c.projections[p].Kind }
+
+# whether its source is an Input region, so that it is part of the per-settle constant (Plan decides it)
+fn (c Circuit<<T>>&) IsFolded(p Projection) Bool { return c.projections[p].Folded }
+
+fn (c Circuit<<T>>&) IsFrozen(p Projection) Bool { return c.projections[p].Frozen }
+
+# the strength of phase p's nudge (Nudge set it)
+fn (c Circuit<<T>>&) NudgeOf(p Phase) F64 { return c.nudges[phaseIndex(p)] }
+
 # synapses from every neuron of pre to every neuron of post (or, with density below 1, to a random fraction density
-# of them), one-way or reciprocal; frozen synapses keep their weights. A reciprocal projection of a region to itself is
-# a lateral block: its effective weights are W + W^T
+# of them - each pair independently), one-way or reciprocal; frozen synapses keep their weights. A reciprocal
+# projection of a region to itself is a lateral block: its effective weights are W + W^T. store says how the block is
+# kept: Auto is Sparse (compressed sparse rows) when the density is at most SparseBelow, Dense otherwise
 fn (c mut Circuit<<T>>&) Project(pre Region, post Region, kind Wiring = Wiring.Reciprocal, density F64 = 1,
-        frozen Bool = false) Projection {
+        frozen Bool = false, store Layout = Layout.Auto) Projection {
+    c.checkProjection(pre, post, kind)
+    if density <= 0.0 or density > 1.0 { wrong("Project: a density is in (0, 1]") }
+    c.projections.Push(projectionRec(pre, post, kind, density, frozen, store))
+    return Projection(c.projections.Len() - 1)
+}
+
+# synapses between the given pairs only - post neuron posts[k] receiving from pre neuron pres[k], numbered within the
+# regions, each pair once: a wiring diagram brought in from elsewhere. Kept Sparse unless store says Dense (or Auto
+# finds it dense enough)
+fn (c mut Circuit<<T>>&) ProjectWired(pre Region, post Region, posts Array<I32>&, pres Array<I32>&,
+        kind Wiring = Wiring.Reciprocal, frozen Bool = false, store Layout = Layout.Auto) Projection {
+    c.checkProjection(pre, post, kind)
+    if posts.Len() != pres.Len() or posts.Len() == 0 { wrong("ProjectWired: as many posts as pres, at least one") }
+    at := c.wiredPost.Len()
+    for k in range posts.Len() {
+        c.wiredPost.Push(posts[k])
+        c.wiredPre.Push(pres[k])
+    }
+    density F64 = F64(posts.Len()) / F64(c.regions[pre].Size * c.regions[post].Size)
+    if density > 1.0 { wrong("ProjectWired: more pairs than the block has synapses") }
+    c.projections.Push(projectionRec(pre, post, kind, density, frozen, store, at, posts.Len()))
+    return Projection(c.projections.Len() - 1)
+}
+
+fn (c Circuit<<T>>&) checkProjection(pre Region, post Region, kind Wiring) {
     if c.planned { wrong("the circuit is planned already - projections are recorded before Plan") }
     if pre < 0 or pre >= c.regions.Len() or post < 0 or post >= c.regions.Len() { wrong("Project: no such region") }
     if c.regions[post].Kind is Role.Input { wrong("Project into an Input region: nothing projects into an input") }
     if c.regions[pre].Kind is Role.Input and kind is Wiring.Reciprocal {
         wrong("a projection from an Input region is one-way: an input has no synapses into it")
     }
-    if density <= 0.0 or density > 1.0 { wrong("Project: a density is in (0, 1]") }
-    c.projections.Push(projectionRec(pre, post, kind, density, frozen))
-    return Projection(c.projections.Len() - 1)
 }
+
+# the density at or below which Auto keeps a projection's synapses as compressed sparse rows: well inside where the
+# sparse products beat the dense ones (measured, docs/settling.md 5.9) - a dense block reads every position, a sparse
+# one only its synapses, at an index each. A transport's crossover is near half the positions at one row and at 32; a
+# contrast's (a product sampled at the synapses, against dense products at the processor's peak) near a tenth at 32
+# rows, and a lesson runs tens of transports to its one contrast
+SparseBelow F64 = 0.25
 
 # ---- planning ----
 
 # lays the arena out, allocates it and draws the weights from r: each block Glorot-uniform (+-sqrt(6 / (pre + post))),
-# masked where its density is below 1; biases start at 0. Certify then scales the recurrent weights
+# biases at 0. A projection that is not complete - a density below 1, wired pairs, or stored Sparse - first gets its
+# pattern (drawn by sparse.DrawPattern, every pair at the density independently, before any weight is drawn), then a
+# weight per synapse in row order, Glorot over the expected fan-in and fan-out (+-sqrt(6 / (density (pre + post)))) -
+# the same weights whichever way it is stored, and at density 1 the same as a complete block's. Certify then scales the
+# recurrent weights
 fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
     if c.planned { wrong("Plan twice") }
     rows := c.Rows
@@ -252,15 +356,48 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
     c.Spiking = lifs > 0
     c.window = window if window > 0 else 1
     c.Neurons = n
+    # the patterns, compressed sparse rows whatever the layout (a dense block's mask is made from its pattern)
+    ptrCount I64 = 0
+    for i in range c.projections.Len() {
+        p := c.projections[i]
+        if p.Density < 1.0 or p.Pairs >= 0 or p.Store is Layout.Sparse { ptrCount += c.regions[p.Post].Size + 1 }
+    }
+    c.ptrs = Array<I64>(ptrCount)
+    cols := List<I32>()
+    posts := c.wiredPost.ToArray()
+    pres := c.wiredPre.ToArray()
+    ptrAt I64 = 0
+    for i in range c.projections.Len() {
+        p := c.projections[i]
+        post I64 = c.regions[p.Post].Size
+        pre I64 = c.regions[p.Pre].Size
+        p.Nnz = post * pre
+        if p.Density < 1.0 or p.Pairs >= 0 or p.Store is Layout.Sparse {
+            p.Ptr = ptrAt
+            p.Idx = cols.Len()
+            if p.Pairs >= 0 {
+                sparse.PatternOf(post, pre, posts[p.Pairs:p.Pairs + p.PairCount], pres[p.Pairs:p.Pairs + p.PairCount],
+                    c.ptrs[ptrAt:ptrAt + post + 1], cols)
+            } else {
+                sparse.DrawPattern(post, pre, p.Density, r, c.ptrs[ptrAt:ptrAt + post + 1], cols)
+            }
+            p.Nnz = cols.Len() - p.Idx
+            ptrAt += post + 1
+            p.Sparse = p.Store is Layout.Sparse or (p.Store is Layout.Auto and p.Density <= SparseBelow)
+        }
+        c.projections[i] = p
+    }
+    c.idx = cols.ToArray()
     at I64 = 0
     maskAt I64 = 0
     for i in range c.projections.Len() {
         p := c.projections[i]
         size I64 = c.regions[p.Post].Size * c.regions[p.Pre].Size
         p.Offset = at
-        at += size
+        at += p.Nnz if p.Sparse else size
         p.Folded = c.regions[p.Pre].Kind is Role.Input
-        if p.Density < 1.0 {
+        if p.Sparse { c.sparseBlocks++ }
+        if not p.Sparse and p.Nnz < size {
             p.Mask = maskAt
             maskAt += size
         }
@@ -279,7 +416,7 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
             match rg.Fit {
                 case Cost.CrossEntropy(_) {
                     rg.Labels = labelAt
-                    labelAt += rows
+                    labelAt += rows * rg.Groups
                 }
                 case Cost.Squared {
                     rg.Target = at
@@ -307,21 +444,36 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
     at += 4 * rows
     c.mass = at
     at += n
+    if c.sparseBlocks > 0 {
+        c.feature = at
+        at += 3 * whole
+    }
     c.mem = Array<T>(at)
     c.labels = Array<I32>(labelAt)
     c.masks = Array<U8>(maskAt)
     c.planned = true
-    zero T
+    like T
     for i in range c.projections.Len() {
         p := c.projections[i]
-        w := c.Weights(Projection(i))
-        limit F64 = math.Sqrt(6.0 / F64(w.Rows + w.Cols))
-        w.FillUniform(r, -limit, limit)
-        if p.Mask >= 0 {
-            m := linalg.View(c.masks, p.Mask, w.Rows, w.Cols)
-            m.FillBernoulli(r, p.Density)
-            for e in range w.Rows * w.Cols {
-                if c.masks[p.Mask + e] == 0 { w.Data[e] = zero }
+        post I64 = c.regions[p.Post].Size
+        pre I64 = c.regions[p.Pre].Size
+        if p.Ptr < 0 {
+            w := c.Weights(Projection(i))
+            limit F64 = math.Sqrt(6.0 / F64(w.Rows + w.Cols))
+            w.FillUniform(r, -limit, limit)
+            continue
+        }
+        limit F64 = math.Sqrt(6.0 / (p.Density * F64(post + pre)))
+        for row in range post {
+            for e in range c.ptrs[p.Ptr + row], c.ptrs[p.Ptr + row + 1] {
+                x := linalg.Cast(r.Uniform(-limit, limit), like)
+                if p.Sparse {
+                    c.mem[p.Offset + e] = x
+                } else {
+                    at2 I64 = row * pre + I64(c.idx[p.Idx + e])
+                    c.mem[p.Offset + at2] = x
+                    if p.Mask >= 0 { c.masks[p.Mask + at2] = 1 }
+                }
             }
         }
     }
@@ -329,16 +481,57 @@ fn (c mut Circuit<<T>>&) Plan(r mut rand.Rand&) {
 
 # ---- parameters, data and state ----
 
-# a projection's weights, post x pre, as a view of the arena
+# a dense projection's weights, post x pre, as a view of the arena
 fn (c Circuit<<T>>&) Weights(p Projection) linalg.Matrix<T> {
     pr := c.projections[p]
+    if pr.Sparse { wrong("Weights of a sparse projection - its synapses are SparseWeights") }
     return linalg.View(c.mem, pr.Offset, c.regions[pr.Post].Size, c.regions[pr.Pre].Size)
 }
 
-# a projection's gradient (the last Contrast's), laid out as its weights
+# a dense projection's gradient (the last Contrast's), laid out as its weights
 fn (c Circuit<<T>>&) WeightGrads(p Projection) linalg.Matrix<T> {
     pr := c.projections[p]
+    if pr.Sparse { wrong("WeightGrads of a sparse projection - its gradients are SparseWeightGrads") }
     return linalg.View(c.mem, c.ParamCount + pr.Offset, c.regions[pr.Post].Size, c.regions[pr.Pre].Size)
+}
+
+# whether a projection is stored as compressed sparse rows (Plan decides it, by its Layout)
+fn (c Circuit<<T>>&) IsSparse(p Projection) Bool {
+    return c.projections[p].Sparse
+}
+
+# a projection's synapses: post x pre for a complete block, fewer for one with a pattern
+fn (c Circuit<<T>>&) Synapses(p Projection) I64 {
+    return c.projections[p].Nnz
+}
+
+# a sparse projection's synapses, post x pre in compressed sparse rows, their values a view of the parameters
+fn (c Circuit<<T>>&) SparseWeights(p Projection) sparse.Csr<T> {
+    return c.csr(p, 0)
+}
+
+# a sparse projection's gradients, laid out as its synapses (the pattern is the same)
+fn (c Circuit<<T>>&) SparseWeightGrads(p Projection) sparse.Csr<T> {
+    return c.csr(p, c.ParamCount)
+}
+
+fn (c Circuit<<T>>&) csr(p Projection, from I64) sparse.Csr<T> {
+    pr := c.projections[p]
+    if not pr.Sparse { wrong("SparseWeights of a dense projection - its weights are Weights") }
+    post := c.regions[pr.Post].Size
+    at I64 = from + pr.Offset
+    return sparse.Csr<T>(post, c.regions[pr.Pre].Size, c.ptrs[pr.Ptr:pr.Ptr + post + 1], c.idx[pr.Idx:pr.Idx + pr.Nnz],
+        c.mem[at:at + pr.Nnz])
+}
+
+# a projection's weights scaled by f, every synapse alike
+fn (c mut Circuit<<T>>&) scaleBlock(i I64, f T) {
+    pr := c.projections[i]
+    if not pr.Sparse {
+        c.Weights(Projection(i)).Scale(f)
+        return
+    }
+    for e in range pr.Nnz { c.mem[pr.Offset + e] = c.mem[pr.Offset + e] * f }
 }
 
 # a region's biases (an Input region's are not used: its state is rho(drive))
@@ -381,11 +574,12 @@ fn (c Circuit<<T>>&) DriveData(reg Region) mut Array<T>&c {
     return c.mem[rg.Drive:rg.Drive + c.Rows * rg.Size]
 }
 
-# where the caller puts a CrossEntropy readout's classes, one per row
+# where the caller puts a CrossEntropy readout's classes, one per row - one per group per row, row after row, for a
+# readout split into groups (each group's class numbered within it)
 fn (c Circuit<<T>>&) LabelData(reg Region) mut Array<I32>&c {
     rg := c.regions[reg]
     if rg.Labels < 0 { wrong("LabelData of a region that is no CrossEntropy readout") }
-    return c.labels[rg.Labels:rg.Labels + c.Rows]
+    return c.labels[rg.Labels:rg.Labels + c.Rows * rg.Groups]
 }
 
 # where the caller puts a Squared readout's targets, Rows rows of its neurons
@@ -440,9 +634,26 @@ fn (c Circuit<<T>>&) Activity(p Phase, reg Region) linalg.Matrix<T> {
     return linalg.View(c.mem, c.committed(phaseIndex(p), 1) + rg.Col, c.N, rg.Size, c.Neurons)
 }
 
-# the class each row in use answers on a readout in phase p: the neuron most active
+# the class each row in use answers on a readout in phase p: the neuron most active - for a readout split into
+# groups, each group's (numbered within it), Groups per row
 fn (c Circuit<<T>>&) Predict(p Phase, reg Region, out mut Array<I32>&) {
-    c.Activity(p, reg).ArgMaxRows(out[:c.N])
+    rg := c.regions[reg]
+    if rg.Groups == 1 {
+        c.Activity(p, reg).ArgMaxRows(out[:c.N])
+        return
+    }
+    s := c.committed(phaseIndex(p), 1)
+    w I64 = rg.Size / rg.Groups
+    for b in range c.N {
+        for g in range rg.Groups {
+            at I64 = s + b * c.Neurons + rg.Col + g * w
+            best I64 = 0
+            for j in range 1, w {
+                if c.mem[at + j] > c.mem[at + best] { best = j }
+            }
+            out[b * rg.Groups + g] = I32(best)
+        }
+    }
 }
 
 # from[at .. at + n] to to[..]: within the arena
@@ -583,12 +794,19 @@ fn (c mut Circuit<<T>>&) prepare(v I64, s I64) {
             }
         }
     }
+    like T
+    one := linalg.Cast(1.0, like)
     for i in range c.projections.Len() {
         pr := c.projections[i]
         if not pr.Folded { continue }
-        w := c.Weights(Projection(i))
         pre := c.regions[pr.Pre]
         post := c.regions[pr.Post]
+        if pr.Sparse {
+            sw := c.SparseWeights(Projection(i))
+            for b in range c.N { sw.MulAdd(c.mem, s + b * n + pre.Col, 1, c.mem, c.constant + b * n + post.Col, 1, 1, one) }
+            continue
+        }
+        w := c.Weights(Projection(i))
         to := linalg.View(c.mem, c.constant + post.Col, c.N, post.Size, n)
         from := linalg.View(c.mem, s + pre.Col, c.N, pre.Size, n)
         c.ws.Gemm(to, from, false, w, true, 1, 1)
@@ -602,7 +820,7 @@ fn (c mut Circuit<<T>>&) transport(x I64, withConstant Bool) {
     if withConstant { c.copyRun(c.constant, c.total, c.N * n) } else { c.zeroRun(c.total, c.N * n) }
     for i in range c.projections.Len() {
         pr := c.projections[i]
-        if pr.Folded { continue }
+        if pr.Folded or pr.Sparse { continue }
         w := c.Weights(Projection(i))
         pre := c.regions[pr.Pre]
         post := c.regions[pr.Post]
@@ -614,6 +832,56 @@ fn (c mut Circuit<<T>>&) transport(x I64, withConstant Bool) {
             at := linalg.View(c.mem, x + post.Col, c.N, post.Size, n)
             c.ws.Gemm(back, at, false, w, false, 1, 1)
         }
+    }
+    if c.sparseBlocks > 0 { c.sparseTransport(x) }
+}
+
+# every sparse recurrent block's transport of the activities at x, added to the totals: for one row on the state as
+# it is (a row is a feature-major batch of width 1); for several, the activities transposed into feature-major, the
+# products there, and their sums transposed back - so each synapse is read once for the whole batch
+fn (c mut Circuit<<T>>&) sparseTransport(x I64) {
+    n := c.Neurons
+    like T
+    one := linalg.Cast(1.0, like)
+    if c.N == 1 {
+        for i in range c.projections.Len() {
+            pr := c.projections[i]
+            if not pr.Sparse or pr.Folded { continue }
+            w := c.SparseWeights(Projection(i))
+            pre := c.regions[pr.Pre]
+            post := c.regions[pr.Post]
+            w.MulAdd(c.mem, x + pre.Col, 1, c.mem, c.total + post.Col, 1, 1, one)
+            if pr.Kind is Wiring.Reciprocal { w.MulAddT(c.mem, x + post.Col, 1, c.mem, c.total + pre.Col, 1, 1, one) }
+        }
+        return
+    }
+    rows := c.Rows
+    xt := c.feature
+    tt := c.feature + n * rows
+    c.toFeatures(x, xt)
+    c.zeroRun(tt, n * rows)
+    for i in range c.projections.Len() {
+        pr := c.projections[i]
+        if not pr.Sparse or pr.Folded { continue }
+        w := c.SparseWeights(Projection(i))
+        pre := c.regions[pr.Pre]
+        post := c.regions[pr.Post]
+        w.MulAdd(c.mem, xt + pre.Col * rows, rows, c.mem, tt + post.Col * rows, rows, c.N, one)
+        if pr.Kind is Wiring.Reciprocal {
+            w.MulAddT(c.mem, xt + post.Col * rows, rows, c.mem, tt + pre.Col * rows, rows, c.N, one)
+        }
+    }
+    for b in range c.N {
+        for j in range n { c.mem[c.total + b * n + j] = c.mem[c.total + b * n + j] + c.mem[tt + j * rows + b] }
+    }
+}
+
+# the rows in use of the sample-major state at x (N x Neurons) into feature-major at to (Neurons x Rows)
+fn (c mut Circuit<<T>>&) toFeatures(x I64, to I64) {
+    n := c.Neurons
+    rows := c.Rows
+    for b in range c.N {
+        for j in range n { c.mem[to + j * rows + b] = c.mem[x + b * n + j] }
     }
 }
 
@@ -631,17 +899,22 @@ fn (c mut Circuit<<T>>&) addNudge(s I64, beta F64) {
             to I64 = c.total + b * n + rg.Col
             match rg.Fit {
                 case Cost.CrossEntropy(temperature) {
-                    y I64 = I64(c.labels[rg.Labels + b])
                     inv := linalg.Cast(1.0 / temperature, like)
-                    top T = c.mem[at]
-                    for j in range 1, rg.Size { top = math.Max(top, c.mem[at + j]) }
-                    sum T = 0.0
-                    for j in range rg.Size { sum = sum + linalg.FastExp((c.mem[at + j] - top) * inv) }
-                    scale T = 1.0 / sum
-                    for j in range rg.Size {
-                        p T = linalg.FastExp((c.mem[at + j] - top) * inv) * scale
-                        target T = 1.0 if j == y else 0.0
-                        c.mem[to + j] = c.mem[to + j] + k * (target - p)
+                    w I64 = rg.Size / rg.Groups
+                    for g in range rg.Groups {
+                        y I64 = I64(c.labels[rg.Labels + b * rg.Groups + g])
+                        ga I64 = at + g * w
+                        gt I64 = to + g * w
+                        top T = c.mem[ga]
+                        for j in range 1, w { top = math.Max(top, c.mem[ga + j]) }
+                        sum T = 0.0
+                        for j in range w { sum = sum + linalg.FastExp((c.mem[ga + j] - top) * inv) }
+                        scale T = 1.0 / sum
+                        for j in range w {
+                            p T = linalg.FastExp((c.mem[ga + j] - top) * inv) * scale
+                            target T = 1.0 if j == y else 0.0
+                            c.mem[gt + j] = c.mem[gt + j] + k * (target - p)
+                        }
                     }
                 }
                 case Cost.Squared {
@@ -953,9 +1226,25 @@ fn (c mut Circuit<<T>>&) masses() {
     for i in range c.projections.Len() {
         pr := c.projections[i]
         if pr.Folded { continue }
-        w := c.Weights(Projection(i))
         post := c.regions[pr.Post]
         pre := c.regions[pr.Pre]
+        if pr.Sparse {
+            sw := c.SparseWeights(Projection(i))
+            for r in range sw.Rows {
+                row T = zero
+                for e in range sw.Ptr[r], sw.Ptr[r + 1] {
+                    a T = math.Abs(sw.Values[e])
+                    row = row + a
+                    if pr.Kind is Wiring.Reciprocal {
+                        j I64 = c.mass + pre.Col + I64(sw.Idx[e])
+                        c.mem[j] = c.mem[j] + a
+                    }
+                }
+                c.mem[c.mass + post.Col + r] = c.mem[c.mass + post.Col + r] + row
+            }
+            continue
+        }
+        w := c.Weights(Projection(i))
         for r in range w.Rows {
             row T = zero
             for j in range w.Cols {
@@ -1032,7 +1321,7 @@ fn (c mut Circuit<<T>>&) Certify(target F64 = 0.9) {
     like T
     f := linalg.Cast(target / k, like)
     for i in range c.projections.Len() {
-        if not c.projections[i].Folded { c.Weights(Projection(i)).Scale(f) }
+        if not c.projections[i].Folded { c.scaleBlock(i, f) }
     }
 }
 
@@ -1064,7 +1353,7 @@ fn (c mut Circuit<<T>>&) Restrain(target F64 = 0.9) {
         }
     }
     for i in range c.projections.Len() {
-        if factors[i] < 1.0 { c.Weights(Projection(i)).Scale(linalg.Cast(factors[i], like)) }
+        if factors[i] < 1.0 { c.scaleBlock(i, linalg.Cast(factors[i], like)) }
     }
 }
 
@@ -1112,8 +1401,10 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
     for i in range c.N * n { c.mem[c.diff + i] = c.mem[plus + i] - c.mem[minus + i] }
     like T
     k := linalg.Cast(scale, like)
+    if c.sparseBlocks > 0 { c.sparseContrast(plus, minus, k) }
     for i in range c.projections.Len() {
         pr := c.projections[i]
+        if pr.Sparse { continue }
         g := c.WeightGrads(Projection(i))
         g.Fill(zero)
         if pr.Frozen { continue }
@@ -1181,6 +1472,43 @@ fn (c mut Circuit<<T>>&) Contrast(beta F64, centered Bool = true) {
     }
 }
 
+# the sparse blocks' part of Contrast: at each synapse only, k (sum over the rows of dS_post S+_pre + S-_post dS_pre) -
+# the products of the batches sampled at the pattern's entries, on the rows in use transposed into feature-major (for
+# one row, the state as it is); a folded block's dS_pre is 0
+fn (c mut Circuit<<T>>&) sparseContrast(plus I64, minus I64, k T) {
+    n := c.Neurons
+    rows := c.Rows
+    d I64 = c.diff
+    p I64 = plus
+    m I64 = minus
+    stride I64 = 1
+    if c.N > 1 {
+        d = c.feature
+        p = c.feature + n * rows
+        m = c.feature + 2 * n * rows
+        c.toFeatures(c.diff, d)
+        c.toFeatures(plus, p)
+        c.toFeatures(minus, m)
+        stride = rows
+    }
+    width I64 = c.N
+    for i in range c.projections.Len() {
+        pr := c.projections[i]
+        if not pr.Sparse { continue }
+        g I64 = c.ParamCount + pr.Offset
+        c.zeroRun(g, pr.Nnz)
+        if pr.Frozen { continue }
+        w := c.SparseWeights(Projection(i))
+        pre := c.regions[pr.Pre]
+        post := c.regions[pr.Post]
+        # element (j, t) of a batch at x is x + j * stride + t for feature-major, x + t * n + j for one row
+        w.Sampled(c.mem, g, c.mem, d + post.Col * stride, stride, c.mem, p + pre.Col * stride, stride, width, k, false)
+        if not pr.Folded {
+            w.Sampled(c.mem, g, c.mem, m + post.Col * stride, stride, c.mem, d + pre.Col * stride, stride, width, k, true)
+        }
+    }
+}
+
 # the gradient of the mean cost with respect to a region's drive, per row in use, into out (N rows of its neurons),
 # from the nudged phases as Contrast reads them: -(s+ - s-) / (2 beta N) on a relaxing neuron (its drive is added to
 # its total), and for an input region through the folded blocks it feeds, -rho'(d) (dS_post W) / (2 beta N) - the
@@ -1206,8 +1534,13 @@ fn (c mut Circuit<<T>>&) DriveGrad(reg Region, out mut Array<T>&, beta F64, cent
     for i in range c.projections.Len() {
         pr := c.projections[i]
         if pr.Pre != reg { continue }
-        w := c.Weights(Projection(i))
         post := c.regions[pr.Post]
+        if pr.Sparse {
+            sw := c.SparseWeights(Projection(i))
+            for b in range c.N { sw.MulAddT(c.mem, c.diff + b * n + post.Col, 1, out, b * rg.Size, 1, 1, k) }
+            continue
+        }
+        w := c.Weights(Projection(i))
         for b in range c.N {
             d I64 = c.diff + b * n + post.Col
             linalg.Gemv(out[b * rg.Size:(b + 1) * rg.Size], w, true, c.mem[d:d + post.Size], scale, 1)
@@ -1261,7 +1594,7 @@ fn (c mut Circuit<<T>>&) Teach(n I64, l Lesson) I64 ? NotSettled {
 }
 
 # the mean cost of phase p's state over the rows in use: T (logsumexp(s / T) - s_class / T) for a CrossEntropy
-# readout, 1/2 |s - y|^2 for a Squared one, summed over the readouts
+# readout (each group's, summed), 1/2 |s - y|^2 for a Squared one, summed over the readouts
 fn (c Circuit<<T>>&) Loss(p Phase) F64 {
     s := c.committed(phaseIndex(p), 1)
     n := c.Neurons
@@ -1273,12 +1606,16 @@ fn (c Circuit<<T>>&) Loss(p Phase) F64 {
             at I64 = s + b * n + rg.Col
             match rg.Fit {
                 case Cost.CrossEntropy(temperature) {
-                    top F64 = F64(c.mem[at])
-                    for j in range 1, rg.Size { top = math.Max(top, F64(c.mem[at + j])) }
-                    e F64 = 0.0
-                    for j in range rg.Size { e += math.Exp((F64(c.mem[at + j]) - top) / temperature) }
-                    y I64 = I64(c.labels[rg.Labels + b])
-                    sum += top + temperature * math.Log(e) - F64(c.mem[at + y])
+                    w I64 = rg.Size / rg.Groups
+                    for g in range rg.Groups {
+                        ga I64 = at + g * w
+                        top F64 = F64(c.mem[ga])
+                        for j in range 1, w { top = math.Max(top, F64(c.mem[ga + j])) }
+                        e F64 = 0.0
+                        for j in range w { e += math.Exp((F64(c.mem[ga + j]) - top) / temperature) }
+                        y I64 = I64(c.labels[rg.Labels + b * rg.Groups + g])
+                        sum += top + temperature * math.Log(e) - F64(c.mem[ga + y])
+                    }
                 }
                 case Cost.Squared {
                     g I64 = rg.Target + b * rg.Size
@@ -1344,9 +1681,19 @@ fn (c mut Circuit<<T>>&) Energy(p Phase, row I64) F64 {
     for i in range c.projections.Len() {
         pr := c.projections[i]
         if pr.Folded { continue }
-        w := c.Weights(Projection(i))
         post := c.regions[pr.Post]
         pre := c.regions[pr.Pre]
+        if pr.Sparse {
+            sw := c.SparseWeights(Projection(i))
+            for r in range sw.Rows {
+                sr F64 = F64(c.mem[act + post.Col + r])
+                for k in range sw.Ptr[r], sw.Ptr[r + 1] {
+                    e -= F64(sw.Values[k]) * sr * F64(c.mem[act + pre.Col + I64(sw.Idx[k])])
+                }
+            }
+            continue
+        }
+        w := c.Weights(Projection(i))
         for r in range w.Rows {
             sr F64 = F64(c.mem[act + post.Col + r])
             for j in range w.Cols { e -= F64(w.Data[r * w.Stride + j]) * sr * F64(c.mem[act + pre.Col + j]) }
@@ -2186,4 +2533,217 @@ test "a spiking circuit learns XOR from spike-count contrasts" {
     for b in range 4 { assert I64(predicted[b]) == ((b / 2) ^ (b % 2)) }
     assert c.Loss(Phase.Free) < 1e-3
     println("spiking XOR: loss " $(c.Loss(Phase.Free)) " after 200 lessons, " $(F64(steps) / 200.0) " steps a lesson")
+}
+
+# a circuit with every kind of block on a pattern, stored as store: tanh inputs one-way into a hidden region (folded),
+# the hidden region's lateral block and its reciprocal and one-way blocks with the readout - each at density 0.4 but
+# the folded one at 0.3 - certified at 0.8
+fn patterned(c mut Circuit<F64>&, r mut rand.Rand&, store Layout) {
+    x := c.Input(6, Neuron.Rate(Rho.Tanh))
+    h := c.Hidden(9)
+    o := c.Readout(4)
+    c.Project(x, h, Wiring.OneWay, 0.3, false, store)
+    c.Project(h, h, Wiring.Reciprocal, 0.4, false, store)
+    c.Project(h, o, Wiring.Reciprocal, 0.4, false, store)
+    c.Project(o, h, Wiring.OneWay, 0.4, false, store)
+    c.Plan(r)
+    c.Certify(0.8)
+    randomize(c, r, 1.0)
+    for b in range c.Rows { c.LabelData(o)[b] = I32(r.Below(4)) }
+}
+
+# a projection's gradient at synapse (i, j) whichever way it is stored, or 0 where there is none
+fn gradAt(c mut Circuit<F64>&, p Projection, i I64, j I64) F64 {
+    if not c.IsSparse(p) { return c.WeightGrads(p).Get(i, j) }
+    g := c.SparseWeightGrads(p)
+    for e in range g.Ptr[i], g.Ptr[i + 1] {
+        if I64(g.Idx[e]) == j { return g.Values[e] }
+    }
+    return 0.0
+}
+
+test "a sparse projection is the masked dense one: the same weights, equilibrium, contrast and drive gradient" {
+    for rows in I64[1, 3] {
+        a := Circuit<F64>(rows)
+        ra := rand.Rand(31)
+        patterned(a, ra, Layout.Dense)
+        b := Circuit<F64>(rows)
+        rb := rand.Rand(31)
+        patterned(b, rb, Layout.Sparse)
+        assert b.IsSparse(Projection(1)) and not a.IsSparse(Projection(1)) and b.Synapses(Projection(1)) == a.Synapses(Projection(1))
+        assert b.Synapses(Projection(0)) < 54 and b.ParamCount < a.ParamCount
+        # the same synapses with the same weights
+        for k in range 4 {
+            w := b.SparseWeights(Projection(k))
+            dense := Array<F64>(w.Rows * w.Cols)
+            w.Dense(dense)
+            assert a.Weights(Projection(k)).Data.Len() >= dense.Len()
+            for e in range dense.Len() { assert dense[e] == a.Weights(Projection(k)).Data[e] }
+        }
+        assert math.Abs(a.Gain() - b.Gain()) < 1e-14
+        try a.Settle(Phase.Free, 4000, 1e-13) catch { fail }
+        try b.Settle(Phase.Free, 4000, 1e-13) catch { fail }
+        assert a.Potential(Phase.Free).MaxAbsDifference(b.Potential(Phase.Free)) < 1e-12
+        try a.Teach(rows, Lesson(0.3, 1e-12, 4000)) catch { fail }
+        try b.Teach(rows, Lesson(0.3, 1e-12, 4000)) catch { fail }
+        worst F64 = 0.0
+        for k in range 4 {
+            p := Projection(k)
+            g := a.WeightGrads(p)
+            for i in range g.Rows {
+                for j in range g.Cols { worst = math.Max(worst, math.Abs(g.Get(i, j) - gradAt(b, p, i, j))) }
+            }
+        }
+        for j in range a.Neurons { worst = math.Max(worst, math.Abs(a.GradData()[a.ParamCount - a.Neurons + j] - b.GradData()[b.ParamCount - b.Neurons + j])) }
+        assert worst < 1e-10
+        da := Array<F64>(rows * 6)
+        db := Array<F64>(rows * 6)
+        a.DriveGrad(Region(0), da, 0.3)
+        b.DriveGrad(Region(0), db, 0.3)
+        for j in range da.Len() { assert math.Abs(da[j] - db[j]) < 1e-10 }
+        # and Restrain treats the stored synapses alike
+        a.Weights(Projection(2)).Scale(4.0)
+        b.scaleBlock(2, 4.0)
+        a.Restrain(0.7)
+        b.Restrain(0.7)
+        assert math.Abs(a.Gain() - b.Gain()) < 1e-14 and a.Gain() <= 0.7 + 1e-12
+    }
+}
+
+test "a wired projection holds the synapses it is given, and Auto keeps a sparse wiring sparse" {
+    c := Circuit<F64>(2)
+    x := c.Input(8)
+    h := c.Hidden(6)
+    posts := I32[3, 0, 5, 0]
+    pres := I32[2, 7, 0, 0]
+    p := c.ProjectWired(x, h, posts, pres, Wiring.OneWay)
+    q := c.Project(h, h, Wiring.Reciprocal, 1, false, Layout.Sparse)
+    r := rand.Rand(32)
+    c.Plan(r)
+    assert c.IsSparse(p) and c.Synapses(p) == 4 and c.IsSparse(q) and c.Synapses(q) == 36
+    w := c.SparseWeights(p)
+    dense := Array<F64>(48)
+    w.Dense(dense)
+    for i in range 6 {
+        for j in range 8 {
+            wired Bool = false
+            for k in range 4 {
+                if I64(posts[k]) == i and I64(pres[k]) == j { wired = true }
+            }
+            assert (dense[i * 8 + j] != 0.0) == wired
+        }
+    }
+    # the folded constant is the wired product: settle a circuit with no feedback and read it
+    for j in range 16 { c.DriveData(x)[j] = 0.125 * F64(j + 1) }
+    for e in range 36 { c.SparseWeights(q).Values[e] = 0.0 }
+    try c.Settle(Phase.Free, 100, 1e-14) catch { fail }
+    for b in range 2 {
+        for i in range 6 {
+            want F64 = 0.0
+            for j in range 8 { want += dense[i * 8 + j] * c.DriveData(x)[b * 8 + j] }
+            assert math.Abs(c.Potential(Phase.Free).Get(b, 8 + i) - want) < 1e-14
+        }
+    }
+}
+
+# a circuit for the grouped readout's checks: three tanh inputs, four hidden neurons with a lateral block, a readout of
+# two groups of three (cross-entropy at T = 0.25, each group its own softmax)
+fn groupedCircuit(c mut Circuit<F64>&, r mut rand.Rand&) {
+    x := c.Input(3, Neuron.Rate(Rho.Tanh))
+    h := c.Hidden(4)
+    o := c.Readout(6, Cost.CrossEntropy(0.25), Neuron.Rate(Rho.Tanh), 2)
+    c.Project(x, h, Wiring.OneWay)
+    c.Project(h, h)
+    c.Project(h, o)
+    c.Plan(r)
+    for i in range c.projections.Len() {
+        if not c.projections[i].Folded { c.Weights(Projection(i)).Scale(3.0) }
+    }
+    c.Certify(0.9)
+    randomize(c, r, 1.0)
+    for j in range c.LabelData(o).Len() { c.LabelData(o)[j] = I32(r.Below(3)) }
+}
+
+test "a readout split into groups: each group's cost and force its own, and the contrast is the gradient of their sum" {
+    c := Circuit<F64>(2)
+    r := rand.Rand(33)
+    groupedCircuit(c, r)
+    o := Region(2)
+    assert c.Groups(o) == 2 and c.LabelData(o).Len() == 4
+    # the loss is the two groups' cross-entropies, each over its own three neurons
+    try c.Settle(Phase.Free, 20000, 1e-14) catch { fail }
+    s := c.Activity(Phase.Free, o)
+    want F64 = 0.0
+    for b in range 2 {
+        for g in range 2 {
+            top F64 = -2.0
+            for j in range 3 { top = math.Max(top, s.Get(b, 3 * g + j)) }
+            e F64 = 0.0
+            for j in range 3 { e += math.Exp((s.Get(b, 3 * g + j) - top) / 0.25) }
+            want += top + 0.25 * math.Log(e) - s.Get(b, 3 * g + I64(c.LabelData(o)[2 * b + g]))
+        }
+    }
+    assert math.Abs(c.Loss(Phase.Free) - want / 2.0) < 1e-14
+    predicted := Array<I32>(4)
+    c.Predict(Phase.Free, o, predicted)
+    for b in range 2 {
+        for g in range 2 {
+            best I64 = 0
+            for j in range 1, 3 {
+                if s.Get(b, 3 * g + j) > s.Get(b, 3 * g + best) { best = j }
+            }
+            assert predicted[2 * b + g] == I32(best)
+        }
+    }
+    reference := Array<F64>(c.ParamCount)
+    lossGradient(c, reference, 1e-5)
+    e := estimateError(c, reference, Lesson(0.001, 1e-13, 20000))
+    println("two readout groups: the centered estimate against central differences " $e " of the largest element")
+    assert e < 1e-5
+}
+
+test "the policy score with two groups: a joint action's contrast is T grad log pi(a), pi the groups' product" {
+    c := Circuit<F64>(1)
+    r := rand.Rand(34)
+    groupedCircuit(c, r)
+    o := Region(2)
+    labels := c.LabelData(o)
+    labels[0] = 2
+    labels[1] = 0
+    try c.Teach(1, Lesson(0.001, 1e-13, 20000)) catch { fail }
+    score := Array<F64>(c.ParamCount)
+    for i in range c.ParamCount { score[i] = -c.GradData()[i] }
+    p := c.Params()
+    h F64 = 1e-5
+    worst F64 = 0.0
+    top F64 = 0.0
+    for i in range c.ParamCount {
+        old := p.Data[i]
+        p.Data[i] = old + h
+        up := 0.25 * jointLogPolicy(c, o)
+        p.Data[i] = old - h
+        down := 0.25 * jointLogPolicy(c, o)
+        p.Data[i] = old
+        numeric F64 = (up - down) / (2.0 * h)
+        worst = math.Max(worst, math.Abs(numeric - score[i]))
+        top = math.Max(top, math.Abs(numeric))
+    }
+    println("two groups' policy score: against T log pi(a) " $(worst / top) " of the largest")
+    assert worst / top < 1e-5
+}
+
+# log pi(a) of the joint action in row 0, the label of each group: the sum of the groups' log-probabilities
+fn jointLogPolicy(c mut Circuit<F64>&, o Region) F64 {
+    c.Nudge(Phase.Free, 0)
+    try c.Settle(Phase.Free, 20000, 1e-14) catch { fail }
+    s := c.Activity(Phase.Free, o)
+    sum F64 = 0.0
+    for g in range 2 {
+        top F64 = -2.0
+        for j in range 3 { top = math.Max(top, s.Get(0, 3 * g + j)) }
+        e F64 = 0.0
+        for j in range 3 { e += math.Exp((s.Get(0, 3 * g + j) - top) / 0.25) }
+        sum += (s.Get(0, 3 * g + I64(c.LabelData(o)[g])) - top) / 0.25 - math.Log(e)
+    }
+    return sum
 }
