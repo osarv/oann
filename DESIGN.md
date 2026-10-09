@@ -868,3 +868,16 @@ packed product - the case for a direct convolution, or a small-depth path in `Ge
 own packing copies every patch twice: a `Gemm` that packs its A panels straight from the images (an implicit GEMM)
 would skip the patches matrix and both passes over it.
 
+### olang issues found in phase 4 (repro/)
+
+No compiler bug: everything phase 4 needed compiled as the spec says. Two frictions, both spec-conforming:
+
+- `repro/nestedtry.olang` - a catch clause covers its own `try` only, so `try (try entry["shape"]).AsArr() catch {
+  ... }` - look a member up, then convert it - lets the lookup's error escape. `checkpoint.member` converts it first.
+- `repro/tryindex.olang` - `try doc[names[k]]` checks `names[k]` too (E16d), adding `BuiltinError` to what the try can
+  fail with, though only the lookup was meant. Naming the element first avoids it.
+
+And two limits worth a library: no regular expressions, so GPT-2's pre-tokenization pattern is a hand-written scanner;
+and no Unicode character classes in std, so `\p{L}` and `\p{N}` became byte classes (exact on ASCII text). Also met
+again: `:=` from a comparison needs its type written (D15).
+

@@ -1,0 +1,22 @@
+# A catch clause covers its own try only (E15a: "not through a call or a nested try"), so the common two-step JSON read
+# - look a member up, then convert it - cannot be guarded by one clause: in
+#     try (try entry["shape"]).AsArr() catch { error HeaderError.MALFORMED }
+# the clause takes AsArr's failure, while the lookup's inner try propagates JsonError out of the function, which does
+# not declare it. Found writing checkpoint.olang (reading a safetensors header, where every failure is MALFORMED).
+# Expected (or wished): one clause for the whole expression. Actual: error[R9] "JsonError can escape here". Workaround:
+# a helper that converts the lookup's error (checkpoint.member), so the outer try sees only the helper's own error.
+# Spec-conforming; recorded as friction.
+import "std/json"
+
+error HeaderError {
+    MALFORMED
+}
+
+fn shapeOf(entry json.Json&) Array<json.Json&>&entry ? HeaderError {
+    return try (try entry["shape"]).AsArr() catch { error HeaderError.MALFORMED }
+}
+
+fn main() ? HeaderError + json.JsonError {
+    doc := try json.Parse("{\"shape\": [2, 3]}")
+    assert (try shapeOf(doc)).Len() == 2
+}
