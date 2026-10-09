@@ -1,0 +1,134 @@
+# Loader - a labeled dataset held as bytes, and the batches training reads from it: a fresh random order each epoch
+# (seeded, so a run can be repeated exactly), features converted to F32 as each batch is filled. Every buffer is the
+# caller's or made once - filling a batch allocates nothing.
+
+import "../rand"
+
+# Count samples of Width unsigned-byte features each, and a class in [0, Classes) per sample. A feature reads as
+# F32(byte) * Scale + Shift - so the defaults put a byte into [0, 1], and a mean m and standard deviation s of those
+# are taken out by Scale = 1 / (255 s), Shift = -m / s
+type Labeled struct(Features Array<U8>&, Labels Array<U8>&, Width I64, Classes I64, Scale F32 = 1.0 / 255.0,
+        Shift F32 = 0.0) {
+    Features
+    Labels
+    Width
+    Classes
+    Scale
+    Shift
+    Count I64 = Labels.Len()
+}
+
+# sample i's features, as stored
+fn (s Labeled&) Row(i I64) Array<U8>&s {
+    return s.Features[i * s.Width:(i + 1) * s.Width]
+}
+
+# batches of "Size" samples from a set: in a new random order each epoch when "shuffle", in the stored order otherwise.
+# The last batch of an epoch holds what is left - fewer than Size when Size does not divide the set's Count
+type Loader struct(set Labeled&, Size I64, seed U64 = 1, shuffle Bool = true) {
+    set
+    Size
+    shuffle
+    rng mut rand.Rand = rand.Rand(seed)
+    order mut Array<I64>& = Array<I64>(set.Count)
+    filled mut Bool = false
+}
+
+# the number of batches an epoch has
+fn (l Loader&) Batches() I64 {
+    return (l.set.Count + l.Size - 1) / l.Size
+}
+
+# starts an epoch: a new order for the batches to come, when shuffling
+fn (l mut Loader&) Epoch() {
+    if not l.filled {
+        for i in range l.order.Len() { l.order[i] = i }
+        l.filled = true
+    }
+    if l.shuffle { l.rng.Shuffle(l.order) }
+}
+
+# fills x with batch b's features, one row of Width after another, and y with their classes, and gives how many
+# samples the batch holds. x must have room for Size rows and y for Size classes
+fn (l Loader&) Fill(b I64, x mut Array<F32>&, y mut Array<I32>&) I64 {
+    s := l.set
+    first I64 = b * l.Size
+    n I64 = l.Size
+    if first + n > s.Count { n = s.Count - first }
+    w := s.Width
+    for k in range n {
+        i I64 = l.order[first + k] if l.filled else first + k
+        row := s.Features[i * w:(i + 1) * w]
+        out := x[k * w:(k + 1) * w]
+        for j in range w { out[j] = F32(row[j]) * s.Scale + s.Shift }
+        y[k] = I32(s.Labels[i])
+    }
+    return n
+}
+
+# a set of n samples of width w whose features are the sample's index and whose class is the index modulo 10
+fn countingSet(n I64, w I64) Labeled {
+    features Array<U8>&return = Array<U8>(n * w)
+    labels Array<U8>&return = Array<U8>(n)
+    for i in range n {
+        for j in range w { features[i * w + j] = U8(i) }
+        labels[i] = U8(i % 10)
+    }
+    return Labeled(features, labels, w, 10)
+}
+
+test "a Labeled set knows its samples" {
+    s := countingSet(25, 4)
+    assert s.Count == 25 and s.Width == 4
+    assert s.Row(7)[3] == 7 and s.Labels[13] == 3
+}
+
+test "an unshuffled Loader gives the samples in order, the last batch short" {
+    s := countingSet(25, 4)
+    l := Loader(s, 10, default, false)
+    assert l.Batches() == 3
+    l.Epoch()
+    x := Array<F32>(40)
+    y := Array<I32>(10)
+    assert l.Fill(0, x, y) == 10
+    assert x[0] == 0.0 and x[4] == s.Scale and y[9] == 9
+    assert l.Fill(2, x, y) == 5
+    assert x[0] == F32(20) * s.Scale and x[19] == F32(24) * s.Scale and y[0] == 0 and y[4] == 4
+}
+
+test "a shuffled Loader gives every sample once an epoch, in an order its seed decides" {
+    s := countingSet(100, 3)
+    l := Loader(s, 8, 5)
+    x := Array<F32>(24)
+    y := Array<I32>(8)
+    first := Array<I32>(100)
+    for epoch in range 2 {
+        l.Epoch()
+        seen := Array<Bool>(100)
+        for b in range l.Batches() {
+            n := l.Fill(b, x, y)
+            for k in range n {
+                i := I64(x[3 * k] * 255.0 + 0.5)
+                assert not seen[i] and I64(y[k]) == i % 10
+                seen[i] = true
+                if epoch == 0 { first[b * 8 + k] = I32(i) }
+            }
+        }
+        assert seen.All(fn(v) { return v })
+    }
+    same := Loader(s, 8, 5)
+    same.Epoch()
+    same.Fill(0, x, y)
+    for k in range 8 { assert I32(x[3 * k] * 255.0 + 0.5) == first[k] }
+}
+
+test "Scale and Shift standardize the features" {
+    s := countingSet(4, 2)
+    t := Labeled(s.Features, s.Labels, 2, 10, 0.5, -1.0)
+    l := Loader(t, 4, default, false)
+    l.Epoch()
+    x := Array<F32>(8)
+    y := Array<I32>(4)
+    l.Fill(0, x, y)
+    assert x[0] == -1.0 and x[2] == -0.5 and x[7] == 0.5
+}
