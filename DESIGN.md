@@ -135,11 +135,14 @@ One `Array<T>` per graph, laid out at `Plan`:
 3. every other node's **value**, its **gradient** when it needs one, and what its backward keeps (softmax cross-entropy
    its probabilities, the normalizations each row's statistics, attention its probabilities - `T x T` per sequence and
    head - and dropout its mask; in a graph for decoding, attention's key-value cache);
-4. attention's backward **scratch** (one `T x T` matrix per task) and the convolutions' **patches** (one region, the
-   largest convolution's im2col matrix, shared by all of them).
+4. attention's **scratch** (per task, a `T x T` matrix for the backward's `dS` and a `dh x T` one for a transposed
+   block) and the convolutions' **patches** (one region, the largest convolution's im2col matrix, shared by all of
+   them).
 
 The products pack their operands into a `linalg.GemmWorkspace<T>` the graph keeps beside the arena: it grows, where
-the graph lives, to the largest product during the first step, and allocates nothing after. Class indices live in an
+the graph lives, to the largest product during the first step, and allocates nothing after. Attention's products run
+in tasks, so each task packs into a workspace of its own - one per thread, made by `Plan` and grown there, by running
+attention's products once on zeros, so that no task ever allocates. Class indices live in an
 `Array<I32>` beside it; optimizer state (AdamW's `m` and `v`, the projection's workspace) is
 made once, by the optimizer, in the parameters' layout. Liveness-based reuse of the activation region (a gradient is
 dead once its producer's backward has run) is a planner change, made when a model's memory needs it.
@@ -178,10 +181,9 @@ std/linalg (section 13).
 
 **The products go through std/linalg**: `ws.Gemm(...)` on the graph's `GemmWorkspace` (section 2), so they run at
 std/linalg's per-target tiles (AVX-512 with FMA on this machine) and a step allocates nothing. **Attention's products
-are written as dot products and updates** on each head's strided view (`kernels.Dot`, `kernels.Axpy` - the one thing
-`kernels.olang` still holds, as std/linalg exports no dot product over runs of arrays): a head's products are small
-(`T x T x dh`) and these loops compute only the causal half. That was measured faster than a packed `Gemm` per
-sequence and head on the old baseline target; on the native target it no longer is (section 11).
+are too** - a `Gemm` per sequence and head on the heads' strided views, the whole `T x T` square even when causal
+(section 11). Only decoding with a key-value cache still runs dot products and updates over runs of arrays
+(`kernels.Dot`, `kernels.Axpy`), one new row at a time.
 
 ## 4. Layers (`layers.olang`)
 
@@ -425,16 +427,21 @@ A decoder-only transformer (GPT-2's) trained on a token stream, with no tensor t
   contexts; a tiled, recomputing form is the answer then). The backward: `dS = P (dO V^T - rowsum(dO V^T P)) / sqrt(dh)`,
   then `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO`, written in that order - the order their "written" flags were taken
   in - so a node attending to itself (`q`, `k` or `v` the same node) adds its three contributions up. Sequences are
-  spread over the graph's threads; each task has its own `T x T` scratch in the arena. The products are dot products and
-  updates over the heads' views (`kernels.Dot`, `kernels.Axpy`) rather than a `Gemm` per sequence and head: on the
-  baseline target packing cost more than it saved, and the loops compute only the causal half (`bench/attention.olang`
-  with olang ef939ae, load 2-3: 4.4 ms against 6.6 forward at B 16, T 64, D 128, 4 heads; 21.6 against 27.6 at T 256).
-  **On the native target that has turned round** (olang 9621af3, interleaved at a load of 13): the loops 5.2-6.3 ms
-  against 3.8-4.8 for a `Gemm` per head at T 64, and 75-114 against 42-54 at T 256 - the products 1.3x and ~2x faster
-  though they compute the whole square. The loops themselves run about as fast as on the baseline target (75-94 ms
-  native against 68-79 at T 256, interleaved); the GEMM is what got faster. Moving attention onto products (forward
-  `S = Q K^T`, `Y = P V`; backward `dP = dO V^T`, `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO`) is the next step for it,
-  with a workspace per task.
+  spread over the graph's threads; each task has its own scratch in the arena and its own `GemmWorkspace`.
+- **Attention's products are std/linalg's `Gemm`**, one per sequence and head and product (section 18): the forward's
+  `S = Q K^T / sqrt(dh)` and `Y = P V`, the backward's `dP = dO V^T`, `dQ`, `dK` and `dV` - six products of `T x T x dh`
+  on the heads' strided views, nothing copied but a transposed block (below). **Causal masking stays exact**: the whole
+  square of scores is computed, then each row's softmax runs over positions `0 ... i` and writes zeros after, and
+  `dS` is zero there too, so a later row enters no product (zero times a finite value adds nothing) - a row's output
+  and its gradients are bit for bit what they are without the later rows (checked). Half of every product is that
+  upper triangle, wasted; a batched, causal-aware `Gemm` in std/linalg (section 13) would skip it, and `attendHead` and
+  `attendHeadBackward` in `ops.olang` are all that would change. A product whose right operand is a head's `T x dh`
+  block takes it transposed into the task's scratch first: std/linalg computes a product of at most 64^3
+  multiply-adds directly when its right operand is not transposed, and at `T` 64 and `dh` 32 that ran 2.0-2.3x slower
+  than the transpose and a packed product together (17-21 us against 8-10, a head's `P V`). Before this the products
+  were dot products and updates over the heads' views (`kernels.Dot`, `kernels.Axpy`), computing only the causal half:
+  faster than a `Gemm` per head on the baseline target, slower on this machine's AVX-512 (`bench/attention.olang`,
+  section 18).
 - **Layers** (`layers.olang`): `NewTransformer(g, V, T, D, heads, layers, tied = true, dropout = 0, rms = false)` - a
   token embedding plus learned positions (dropout after), `layers` pre-normalized blocks, a final normalization and the
   logits against the embedding itself when tied (weight tying is applying one parameter twice: the head's product and
@@ -611,11 +618,13 @@ given - the graph keeps one, and `kernels.olang`'s copy of the algorithm is gone
 multi-index - not used by oann, whose element access is `Get`/`Set` and runs of rows). What it still needs:
 
 1. **Batched strided `Gemm`, causal-aware** - every sequence and head of attention in one call, the products of a
-   lower-triangular block skipped. Attention was 9% of a step at context 64 on the baseline target and is 27% on the
-   native one (55 of ~200 ms), growing as `T^2`; oann's dot-product kernels run it at 3-4 GFLOPS on the causal half,
-   and on the native target a plain `Gemm` per sequence and head already beats them (1.3x at T 64, ~2x at T 256,
-   section 11) although it computes the whole square. A batched causal `Gemm` would add skipping the upper triangle
-   (half the work) and one call's overhead instead of one per head - and matters more at longer contexts.
+   lower-triangular block skipped. Attention runs on a `Gemm` per sequence and head now (section 18): 29 of ~150 ms a
+   step at context 64, 73 of ~180 at 256, growing as `T^2` - and half of each product is the upper triangle the
+   softmax then throws away. A batched causal `Gemm` would skip it and make one call where there are six per sequence
+   and head; `ops.attendHead` and `ops.attendHeadBackward` are where it goes in. Also: **std/linalg computes a product
+   of at most 64^3 multiply-adds directly** (no packing) when its right operand is not transposed, and on this
+   machine's AVX-512 that path is 3x slower than the packed one at attention's `64 x 32 x 64` (17-21 us against 6.5);
+   attention transposes its right operands to reach the packed path. The threshold wants lowering on wide targets.
 2. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass:
    the bias row and GELU are two more passes over the widest activation (B T x 4D) - GELU's forward alone was 12.5 ms
    of a 512 ms step and its backward 14.9, ~5%; with the products 3.5x faster on the native target, 12 of ~200 ms; and
@@ -646,7 +655,7 @@ makefile                OLANG ?= the compiler; make test, data, mnist, cnn, epoc
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
-kernels.olang           Dot, Axpy, Sum over runs of arrays (attention's), SquaresF64
+kernels.olang           Dot, Axpy, Sum over runs of arrays (decoding's attention, the normalizations), SquaresF64
 layers.olang            Dense, Mlp, activations, PyTorch's initialization; Norm, AttentionBlock, Transformer
 optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjected), Sgd; WarmupCosine, ClipGradNorm
 train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep, LmEvaluate
@@ -669,7 +678,8 @@ bench/train.olang       where an epoch's time goes
 bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
 bench/lm.olang          where a transformer's step goes, by kind of operation
 bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
-bench/attention.olang   attention's kernels against a Gemm per sequence and head
+bench/attention.olang   attention's Gemm per sequence and head against the dot-product loops it replaced
+bench/abstep.py         two builds of bench/lm.olang run in alternation: the medians of their steps
 bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
 bench/conv.olang        a convolution's passes timed: im2col, the three products, col2im
 bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against numpy
@@ -938,3 +948,45 @@ circuit's flat parameter region with the same loops `AdamW`/`Sgd` use.
 
 `examples/bandit_settle.olang` runs the contextual bandit, reversal and trace-pinning tasks over many lives with
 confidence intervals. The results and decisions are in docs/settling.md, sections 2.11, 5.8 and 6.
+
+## 18. Phase 5: attention on products, mixed precision
+
+### Attention through std/linalg's Gemm
+
+Attention's six products per sequence and head - `S = Q K^T`, `Y = P V`, `dP = dO V^T`, `dQ = dS K`, `dK = dS^T Q`,
+`dV = P^T dO` - are each one `ws.Gemm` on the heads' strided views (section 11), replacing the dot products and
+updates over the same views, which computed only the causal half. A task packs into a `GemmWorkspace` of its own
+(the graph keeps one per thread, grown at `Plan` by running the products once on zeros), and transposes a right
+operand into its scratch first where std/linalg would otherwise compute the product unpacked (section 13). The softmax
+stays `math.Exp` (a library call per element): `linalg.FastExp` in that loop measured slower, 3.6-3.8 ms against
+2.9-3.1 for the forward at T 64, the running sum keeping it from vectorizing.
+
+**Checked**: the gradient checks of section 9 (causal and not, two and four heads, a node attending to itself, short
+batches), and two more through the packed products - sequences of 8 (the scores packed, the rest direct) and 130
+(every product packed) against central differences in `F64` with a step of `1e-5` (at `1e-6` the differences' own
+rounding is already 4e-7 to 7e-7 of these gradients), and causality through the packed products: changing row 25 of a
+sequence of 32 leaves rows 0-19 of the output exactly as they were. The first 40 steps of the character model
+against numpy (`make lmref ARGS=40`): losses within 1e-6 and gradient norms within 2e-6, as before.
+
+**Measured** (olang edf8238, one thread, on the shared machine at a load average of 5-8): `bench/attention.olang`,
+16 sequences of 64, width 128, 4 heads, medians of 9 alternating rounds - the forward 4.6-6.0 ms by the loops against
+2.5-3.1 by `Gemm`s, the backward 4.5-5.2 against 3.1-3.7; at T 256 (16 sequences), 70-81 ms against 32-42 forward
+and 71-83 against 36-37 backward. Without the transposes the products below 64^3 ran unpacked and the backward at T 64
+was *slower* than the loops (6.0-7.5 ms against 4.5-5.1). The transformer step (`bench/lm.olang`, 10 steps after 3,
+medians of 8 runs alternating the build before and after, `bench/abstep.py`):
+
+| context | attention before | attention after | step before | step after |
+|---|---|---|---|---|
+| 64 (16 sequences) | 44.1 ms (21.6 forward, 22.5 backward) | 29.1 (13.4, 15.7) | 164.6 ms | 153.1 |
+| 256 (4 sequences) | 150.6 (76.2, 74.4) | 73.4 (35.7, 37.7) | 264.3 | 182.1 |
+
+(At 256, medians of 6 runs of 5 steps.) Attention is 1.5x faster at context 64 and 2.05x at 256; the step 1.08x and
+1.45x. The products and the rest of the graph did not move (96-100 and 22 ms at 64).
+
+### olang issues found in phase 5 (repro/)
+
+- `repro/spawncall.olang` - a task spawned as an immediately called lambda, `spawn fn() { ... }()` in a loop, that
+  captures two references and the loop's variable sees wrong captures: hundreds to thousands of 25,600 elements
+  wrong. `spawn fn() { ... }` is refused for capturing the loop's variable (P2), so the called form seems to slip past
+  that check. `ops.parallel`'s form - the lambda made once, outside the join - is right, and is what attention uses.
+

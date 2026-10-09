@@ -14,7 +14,7 @@
 #
 # The arena's regions, in order: the parameters, contiguous in the order they were made (the optimizers' one flat
 # array, and a checkpoint's); their gradients, laid out the same; then every other node's value, its gradient when
-# it needs one, and what its backward needs kept; last attention's backward scratch and the convolutions' patches.
+# it needs one, and what its backward needs kept; last attention's scratch and the convolutions' patches.
 # A gradient is written by the first operation contributing to it and added to by the rest, so nothing is zeroed
 # between steps. The products pack their operands into std/linalg's GemmWorkspace, which the graph keeps beside the
 # arena: it grows to the largest product during the first step, and allocates nothing after.
@@ -144,7 +144,8 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     Pos mut I64 = 0                 # the position of the batch's first row in its sequence (Positions)
     Rng mut rand.Rand = rand.Rand(0)  # dropout's generator, seeded from the one Plan is given
     ws mut linalg.GemmWorkspace<T> = linalg.GemmWorkspace<T>()  # the products' packing panels
-    scratchOffset mut I64 = 0       # attention's backward: a T x T matrix per task
+    attention mut Array<linalg.GemmWorkspace<T>>& = Array<linalg.GemmWorkspace<T>>(0)  # attention's, one per task
+    scratchOffset mut I64 = 0       # attention's: a T x T and a dh x T matrix per task
     scratchSize mut I64 = 0
     colsOffset mut I64 = 0          # convolutions' patches (conv.Im2col): the largest one's, shared by all
     colsSize mut I64 = 0
@@ -482,8 +483,9 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
                     at += sr * sc
                 }
                 match nd.Kind {
-                    case Op.Attention(_, _, _, _, T, _) {
-                        if needs[i] and g.Threads * T * T > scratch { scratch = g.Threads * T * T }
+                    case Op.Attention(_, _, _, heads, T, _) {
+                        per := ops.AttentionScratch(T, nd.Cols / heads)
+                        if not g.Decoding and g.Threads * per > scratch { scratch = g.Threads * per }
                     }
                     case Op.Conv2d(_, _, _, s) {
                         if nd.Rows * s.Positions() * s.Patch() > cols { cols = nd.Rows * s.Positions() * s.Patch() }
@@ -502,6 +504,21 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     at += cols
     g.mem = Array<T>(at)
     g.classes = Array<I32>(rows)
+    # attention's products pack into a workspace per task, grown here to what they need - not by the tasks
+    for i in range count {
+        nd := g.nodes[i]
+        match nd.Kind {
+            case Op.Attention(_, _, _, heads, T, _) {
+                if not g.Decoding {
+                    if g.attention.Len() == 0 {
+                        g.attention = Array<linalg.GemmWorkspace<T>>(g.Threads, linalg.GemmWorkspace<T>())
+                    }
+                    ops.WarmAttention(g.attention, T, nd.Cols / heads)
+                }
+            }
+            nomatch { }
+        }
+    }
     g.written = Array<Bool>(count)
     g.ParamCount = params
     g.N = g.Batch
@@ -561,7 +578,7 @@ fn (g Graph<<T>>&) TokenData(v Var) mut Array<I32>&g {
     return g.ClassData(v)
 }
 
-# attention's backward scratch: a region of the arena
+# attention's scratch: a region of the arena
 fn (g Graph<<T>>&) scratch() mut Array<T>&g {
     return g.mem[g.scratchOffset:g.scratchOffset + g.scratchSize]
 }
@@ -707,7 +724,8 @@ fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
                 ops.AttentionCached(y, g.Value(q), g.Value(k), g.Value(v), heads, g.Pos, keys, values, scores)
             } else {
                 if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
-                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), th)
+                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), g.scratch(), th,
+                    g.attention)
             }
         }
         case Op.Dropout(x, p) {
@@ -894,7 +912,7 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
             dw := g.gradOf(w)
             cw := g.acc(w)
             ops.AttentionBackward(dy, g.Value(q), g.Value(k), g.Value(w), heads, T, causal, g.saved(v), dq, cq, dk, ck,
-                dw, cw, g.scratch(), th)
+                dw, cw, g.scratch(), th, g.attention)
         }
         case Op.Dropout(x, _) {
             if g.nodes[x].GradOffset >= 0 {
@@ -1104,6 +1122,27 @@ test "attention agrees with central differences: causal and not, several heads, 
     assert GradientError(g, loss, 3) < 1e-6
 }
 
+test "attention agrees with central differences through the packed products, on longer sequences" {
+    # T 8: the scores' products are packed, the rest computed directly; T 130 with heads of 16: every product packed
+    for T in I64[8, 130] {
+        g := Graph<F64>(2 * T)
+        x := g.Input(16)
+        q := g.Product(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
+        k := g.Product(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
+        v := g.Product(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
+        heads I64 = 2 if T == 8 else 1
+        a := g.Attention(q, k, v, heads, T, true)
+        loss := g.Mse(g.Add(a, g.Attention(q, k, v, heads, T, false)), g.Input(16))
+        r := rand.Rand(18)
+        g.Plan(r)
+        xd := g.InputData(x)
+        for i in range xd.Len() { xd[i] = r.Normal() }
+        # a step of 1e-5: at 1e-6 the differences' own rounding is already 4e-7 to 7e-7 of these gradients
+        assert GradientError(g, loss, 2 * T, 1e-5) < 1e-6
+        assert GradientError(g, loss, T, 1e-5) < 1e-6
+    }
+}
+
 test "causal attention: a row's output depends on no later row" {
     g := Graph<F64>(4)
     x := g.Input(2)
@@ -1117,6 +1156,25 @@ test "causal attention: a row's output depends on no later row" {
     xd[7] = 5.0
     g.Forward(4)
     assert g.Value(a).Get(1, 1) == before and g.Value(a).Get(0, 0) == 0.0
+    # the same through the packed products, which compute the whole square of scores: rows before the changed one
+    # are exactly what they were, forward and backward
+    h := Graph<F64>(32)
+    hx := h.Input(8)
+    w := h.Param(8, 8, Init.Normal(0.0, 0.5), true)
+    hq := h.Product(hx, w, false, false)
+    ha := h.Attention(hq, hq, hx, 2, 32, true)
+    hl := h.Mse(ha, h.Input(8))
+    h.Plan(r)
+    hd := h.InputData(hx)
+    for i in range hd.Len() { hd[i] = r.Normal() }
+    h.Forward(32)
+    early := h.Value(ha).RowRange(0, 20).Clone()
+    for c in range 8 { hd[25 * 8 + c] = 7.0 }
+    h.Forward(32)
+    assert h.Value(ha).RowRange(0, 20).MaxAbsDifference(early) == 0.0
+    assert h.Value(ha).RowRange(25, 26).MaxAbsDifference(early.RowRange(0, 1)) != 0.0
+    h.Backward(hl)
+    assert GradientError(h, hl, 32) < 1e-6
 }
 
 test "dropout: a fixed mask's gradient agrees, the kept are scaled up, and off when not training" {
