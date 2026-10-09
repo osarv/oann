@@ -1118,3 +1118,27 @@ test "a checkpoint saves the parameters and loads them back into a graph built t
     assert bad
 }
 
+
+test "attention split over tasks gives exactly what one task gives, forward and backward" {
+    want := linalg.Matrix<F64>(1, 64)
+    wantLoss F64 = 0.0
+    for threads in range 1, 4, 2 {
+        g := Graph<F64>(12, threads)
+        x := g.Input(8)
+        q := g.Product(x, normal(g, 8, 8), false, true)
+        a := g.Attention(q, x, x, 2, 3, true)
+        loss := g.Mse(a, g.Input(8))
+        r := rand.Rand(17)
+        g.Plan(r)
+        xd := g.InputData(x)
+        for i in range xd.Len() { xd[i] = F64(i % 7) * 0.25 - 0.5 }
+        g.Forward(12)
+        g.Backward(loss)
+        if threads == 1 {
+            want.Copy(g.ParamGrads())
+            wantLoss = g.Scalar(loss)
+        } else {
+            assert g.ParamGrads().MaxAbsDifference(want) == 0.0 and g.Scalar(loss) == wantLoss
+        }
+    }
+}

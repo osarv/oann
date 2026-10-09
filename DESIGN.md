@@ -10,9 +10,13 @@ with no cost the code does not show, natural language, minimal syntax. Concretel
 allocates nothing of its own**, every hot loop is a GEMM or one pass over memory, and a model is written the way a
 PyTorch or Flax user would expect.
 
-**State (phase 2):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
-the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epochs. **Next: transformers** (section
-11), then settling networks (docs/settling.md).
+**State (phase 3):** the graph, its kernels, layers, softmax cross-entropy, SGD and both AdamW variants are built, and
+the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epochs (phase 2). **Transformers are
+built** (section 11): tokens, embeddings, learned positions, layer and RMS normalization, fused multi-head attention,
+dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
+with a key-value cache - every backward checked against central differences, the first training steps equal to the same
+model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Next: settling networks**
+(docs/settling.md).
 
 ## 1. The operand: Matrix
 
@@ -64,8 +68,10 @@ parameters or a second loss need no new backward code.
   one arena `Array<T>&`, nothing in it refers to anything else, so the scope checker has nothing to prove.
 - **The op set is a closed enum dispatched by `match`** (a switch - no indirect calls):
   `MatMul(a, b, ta, tb)`, `Linear(x, w, b)`, `AddRow(x, b)`, `Add`, `Sub`, `Mul`, `Scale(x, k)`, `Relu`,
-  `LeakyRelu(x, slope)`, `Gelu`, `Sigmoid`, `Tanh`, `Softmax`, `SoftmaxCrossEntropy(logits, classes)`, `Mse`, and the
-  leaves `Input`, `Classes`, `Constant`, `Param(init, decay)`.
+  `LeakyRelu(x, slope)`, `Gelu`, `GeluTanh`, `Sigmoid`, `Tanh`, `Softmax`, `Embedding(tokens, table)`,
+  `Positions(x, table, T)`, `LayerNorm(x, gain, bias, eps)`, `RmsNorm(x, gain, eps)`, `Attention(q, k, v, heads, T,
+  causal)`, `Dropout(x, p)`, `SoftmaxCrossEntropy(logits, classes)`, `Mse`, and the leaves `Input`, `Classes`,
+  `Tokens`, `Constant`, `Param(init, decay)`.
 - **Views are values.** `g.Value(v)` and `g.Grad(v)` are `Matrix<T>` views of the arena, made per use for nothing.
 - **Traits only as constraints.** A training loop takes `o mut <O optim.Optimizer<F32>>&`, so the optimizer's step is a
   direct, inlinable call.
@@ -86,6 +92,15 @@ parameters or a second loss need no new backward code.
 | `g.Backward(loss, true)` | added to the gradients already there | `loss.backward()` without zeroing |
 | `g.Value(v)`, `g.Grad(v)`, `g.Scalar(loss)` | views of a node's value and gradient; a loss's number | `.data`, `.grad`, `.item()` |
 | `g.Params()`, `g.ParamGrads()` | every parameter (or gradient) as one flat matrix | `parameters()` flattened |
+| `t := g.Tokens()` | a token per row, `I32` (`g.TokenData(t)`) | `input_ids` |
+| `g.Embedding(t, table)`, `g.Positions(x, table)` | gather the tokens' rows; add row `(Pos + r) mod T` | `nn.Embedding` |
+| `g.LayerNorm(x, gain, bias)`, `g.RmsNorm(x, gain)` | row-wise normalization | `nn.LayerNorm`, `nn.RMSNorm` |
+| `g.Attention(q, k, v, heads, T, causal)` | multi-head attention per sequence of `T` rows, fused | `scaled_dot_product_attention` |
+| `g.Dropout(x, p)`, `g.Training` | dropout from the graph's own `g.Rng`, off when `Training` is false | `nn.Dropout`, `.train()` |
+| a negative class | a padding row the loss ignores, the mean over the rest | `ignore_index` |
+| `nn.Graph<F32>(T, 1, true)`, `g.Pos` | a graph for decoding: forward only, a key-value cache per attention | `past_key_values` |
+| `g.Save(path)`, `g.Load(path)` | the parameter region to and from a file | `state_dict` |
+| `g.Profiling`, `g.Times` | time per kind of operation, forward and backward | `torch.profiler` |
 
 `Product` and `Multiply` are the builders of `MatMul` and `Mul`: olang reserves the operator methods' names (`MatMul`
 is `@`, `Mul` is `*`) for every method of every type, so a graph cannot have methods called that (repro/operatornames).
@@ -99,7 +114,10 @@ is `@`, `Mul` is `*`) for every method of every type, so a graph cannot have met
 - **An absent gradient is an empty matrix.** A kernel's backward takes every input's gradient destination and skips
   one with no rows (`if da.Rows > 0`) - an input, the classes or a constant has none, so the first layer computes no
   `dx`. (A nullable `Matrix&` would have meant a reference built per call.)
-- **What needs a gradient** is decided at `Plan`: a node depending on a parameter.
+- **What needs a gradient** is decided at `Plan`: a node depending on a parameter (none in a graph for decoding).
+- **Dropout is reproducible.** `Plan` seeds the graph's own generator `g.Rng` from the one it is given (after the
+  parameters, so their starting values do not change); a mask is drawn by each training `Forward` and kept for the
+  backward. Restoring `g.Rng` before a `Forward` replays a mask, which is how the gradient check checks dropout.
 
 ### The arena
 
@@ -108,7 +126,10 @@ One `Array<T>` per graph, laid out at `Plan`:
 1. **parameters**, contiguous in registration order - the optimizers' one flat array, and a checkpoint;
 2. **parameter gradients**, the same layout - one flat pass for the optimizer step and for gradient clipping;
 3. every other node's **value**, its **gradient** when it needs one, and what its backward keeps (softmax cross-entropy
-   keeps the probabilities).
+   its probabilities, the normalizations each row's statistics, attention its probabilities - `T x T` per sequence and
+   head - and dropout its mask; in a graph for decoding, attention's key-value cache);
+4. the products' **packing workspace** (`kernels.Gemm`, sized once from the graph's largest dimension) and attention's
+   backward **scratch** (one `T x T` matrix per task).
 
 Class indices live in an `Array<I32>` beside it; optimizer state (AdamW's `m` and `v`, the projection's workspace) is
 made once, by the optimizer, in the parameters' layout. Liveness-based reuse of the activation region (a gradient is
@@ -130,10 +151,25 @@ which is what an eager mode would call too.
 | `Softmax` | row-wise, max subtracted | `y (dy - rowsum(dy y))` |
 | `SoftmaxCrossEntropy(logits, classes)` | mean over rows of `log-sum-exp - z[class]`; probabilities saved | `(p - onehot) / n`, fused |
 | `Mse(a, b)` | mean of squared differences | `2 (a - b) / count` |
+| `GeluTanh` | GPT-2's GELU, `0.5 x (1 + tanh(c (x + 0.044715 x^3)))`, through `FastTanh` | one pass on the input |
+| `Embedding(tokens, table)` | gather: row `r` is the table's row `tokens[r]` | scatter-add into the table's gradient |
+| `Positions(x, table, T)` | `x` plus the table's row `(Pos + r) mod T` | `dx = dy`; scatter-add by position |
+| `LayerNorm(x, g, b)` | per row `(x - mean) rstd g + b`; mean and rstd saved | `rstd (dy g - mean(dy g) - xhat mean(dy g xhat))`, column sums |
+| `RmsNorm(x, g)` | per row `x rinv g`; `rinv` saved | `rinv (dy g - xn mean(dy g xn))`, column sums |
+| `Attention(q, k, v, heads, T, causal)` | per sequence and head `softmax(Q K^T / sqrt(dh)) V`, probabilities saved | `dQ = dS K`, `dK = dS^T Q`, `dV = P^T dO` |
+| `Dropout(x, p)` | `x mask`, mask `1/(1-p)` or 0, kept | `dy mask` |
 
 Every backward is checked against central differences in `F64` (`nn.olang`'s tests: each op through a small graph,
-step 1e-6, agreement to 1e-6; a deliberately broken backward fails them). Fusion is the planner's job, later: `Linear`
-then an activation as one GEMM with an epilogue, needing a `Gemm` with an epilogue in std/linalg (section 13).
+step 1e-6, agreement to 1e-6, the relative error floored at 1e-3 so a gradient near zero is compared absolutely - its
+difference's own rounding is about 1e-16 x loss / h; a deliberately broken backward fails them). Fusion is the
+planner's job, later: `Linear` then an activation as one GEMM with an epilogue, needing a `Gemm` with an epilogue in
+std/linalg (section 13).
+
+**The products go through `kernels.Gemm`**, std/linalg's algorithm with its packing panels in the graph's workspace -
+a stopgap for the workspace `Gemm` std/linalg lacks (section 8, memory). **Attention's products are written as dot
+products and updates** on each head's strided view (`kernels.Dot`, `kernels.Axpy`): a head's products are small (`T x
+T x dh`), and these loops compute only the causal half - measured faster than a packed `Gemm` per sequence and head
+(section 11).
 
 ## 4. Layers (`layers.olang`)
 
@@ -155,6 +191,11 @@ fn (d Dense&) Apply(g mut nn.Graph<<T>>&, x nn.Var) nn.Var { return g.Linear(x, 
 `NewMlp(g, I64[784, 128, 10], Activation.Relu)` holds a `List<Dense>` and applies them with the activation between.
 Applying a layer twice shares its parameters. Starting values follow PyTorch's `nn.Linear`: weights and biases uniform
 in `+-1/sqrt(in)`, drawn from the `rand.Rand` given to `Plan`, so a run is reproducible from its seed.
+
+For transformers (section 11): `Norm` (layer or RMS normalization's gain and bias), `AttentionBlock` and
+`Transformer`, built by `NewNorm`, `NewAttentionBlock(g, D, heads, T, layers, dropout, rms)` and `NewTransformer(g, V,
+T, D, heads, layers, tied, dropout, rms)`, with GPT-2's starting values (`NewDenseWith` takes an `Init` for the
+weights and one for the bias).
 
 Why a factory function and not a constructor taking the graph: olang's zero values (D13c) are a constructor run on
 zeros, and a constructor reading through a reference parameter has none, so such a struct can never be a `List`
@@ -196,6 +237,13 @@ type Regularizer enum {
 The tests check AdamW's first steps against a hand computation, SGD's momentum, and the projection's formula against
 its definition, on a small `F64` graph.
 
+**Schedules and clipping.** `WarmupCosine(peak, warmup, total, floor)` gives a function value - the rate at each step:
+linear up to `peak` over `warmup` steps, half a cosine down to `floor` at `total`, `floor` after (GPT-3's, as nanoGPT
+has it). The `Optimizer` trait gained `SetRate(rate)`, so a loop sets the step's rate and an optimizer knows nothing of
+schedules. `ClipGradNorm(g, max)` scales every gradient by one factor so their norm is at most `max` (PyTorch's
+`clip_grad_norm_`) and gives the norm before - summed in `F64`: a long `F32` sum of small squares drops their low bits
+and came out 3.5e-5 low against numpy.
+
 ## 6. Training and evaluation (`train.olang`, `examples/mnist_mlp.olang`)
 
 ```olang
@@ -221,6 +269,26 @@ for e in range 1, epochs + 1 {
 `make mnist ARGS="10 adamw 1 1"` runs it: epochs, optimizer (`adamw`, `projected`, `sgd`), seed, threads, and for
 `projected` its alpha and `1` to normalize.
 
+A language model's loop (`train.LanguageModel`, `train.Gpt`, `LmStep`, `LmEvaluate`, `examples/charlm.olang`):
+
+```olang
+c := try text.Load("data/shakespeare/input.txt")
+g := nn.Graph<F32>(16 * 64, threads)                      # 16 sequences of 64 characters
+m := train.Gpt(g, c.Size(), 64, 128, 4, 4)                # vocabulary, context, width, heads, layers
+g.Plan(r)
+o optim.AdamW<F32>&g = optim.AdamW<F32>(g, 1e-3, 0.9, 0.99, 1e-8, optim.Regularizer.WeightDecay(0.1))
+rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
+windows := text.Windows(c.Train(), 64, seed)
+for step in range steps {
+    loss, norm := train.LmStep(g, m, windows, o, rate(step), 1.0)   # random windows, clip to 1, a step
+}
+val := train.LmEvaluate(g, m, text.Windows(c.Val(), 64), 10)     # the same windows every time, dropout off
+```
+
+`make charlm ARGS="2000 1 2"` trains it (steps, seed, threads, dropout, characters to generate), saves
+`data/shakespeare/charlm.ckpt` and generates a sample; `examples/charlm_sample.olang` loads the checkpoint and
+generates with and without the key-value cache.
+
 ## 7. Datasets (`datasets/`)
 
 - `datasets/idx` reads the IDX format; its elements are a view of the file's bytes.
@@ -234,8 +302,14 @@ for e in range 1, epochs + 1 {
 - The images stay bytes (47MB, against 188MB as F32). The four files load at 520-830MB/s and filling shuffled batches
   produces ~3.5-4GB/s of F32 (~1.2M samples/s) - 3% of an epoch.
 
-Next: a `Dataset` trait (a constraint) so `Loader<D>` takes other sources (text corpora for transformers), and filling
-the next batch on a task while the step runs.
+- `datasets/text`: a `Corpus` of characters - its vocabulary (the distinct bytes, in byte order, so a text always gives
+  the same ids), the text as `I32` tokens, nanoGPT's 90/10 split into `Train()` and `Val()` - and `Windows` over a
+  token sequence: `Random` fills a batch of `B` windows of `T + 1` tokens at uniform offsets (nanoGPT's `get_batch`),
+  `At` the windows of an ordered pass, the inputs into the graph's tokens and each one's next token into its classes.
+  `Fetch` gets tiny Shakespeare with curl (written to a `.part` file and renamed).
+
+Next: a `Dataset` trait (a constraint) so one `Loader<D>` takes any source, a tokenizer beyond characters (byte-pair
+encoding), and filling the next batch on a task while the step runs.
 
 ## 8. Results and performance (measured 2026-10-09)
 
@@ -270,12 +344,16 @@ with the same algorithm in C at that target. Closing it is a compiler direction 
 not an oann one. The projection adds 0.6-1s an epoch (one GEMM per dense layer per step). Results are identical for
 every thread count (GEMM partitions its output).
 
-**Memory - one leak, not oann's.** A step allocates nothing of its own (checked: 200,000 forward passes of a graph
-whose products are not packed grow by nothing). But std/linalg's `Gemm` packs into two scratch arrays made in its own
-scope per call, and the runtime's chunk pool reuses only its head chunk: the B panel's chunk, taken first, ends up
-behind the A panel's and is never reused, so every packed product maps a new one. MNIST training grows ~540KB a step,
-~215MB an epoch (2.2GB over 10 epochs). Reproducer: `repro/chunkpool.olang` (no linalg - two scratch arrays, large
-then small). Fixes, both wanted: first-fit in the runtime's pool, and a `Gemm` taking a planned workspace (section 13).
+**Memory - a leak, not oann's, now worked around.** A step allocates nothing of its own (checked: 200,000 forward
+passes of a graph whose products are not packed grow by nothing). But std/linalg's `Gemm` packs into two scratch arrays
+made in its own scope per call, and the runtime's chunk pool reuses only its head chunk: the B panel's chunk, taken
+first, ends up behind the A panel's and is never reused, so every packed product maps a new one. MNIST training grew
+~540KB a step, ~215MB an epoch (2.2GB over 10 epochs); the transformer of section 11, with a few hundred products a
+step, grew **8.1MB a step** (243.6MB over 30 steps - a 2,000-step run would have taken 16GB). Reproducer:
+`repro/chunkpool.olang` (no linalg - two scratch arrays, large then small). **Worked around in phase 3:**
+`kernels.Gemm` is std/linalg's algorithm with its panels in the graph's arena, and the same transformer grows by 72kB
+over the first 30 steps and nothing after - a step allocates nothing at all. Fixes still wanted upstream: first-fit in
+the runtime's pool, and a `Gemm` taking a workspace in std/linalg (section 13).
 
 ## 9. Testing
 
@@ -284,6 +362,17 @@ then small). Fixes, both wanted: first-fit in the runtime's pool, and a `Gemm` t
   layers' registration and initialization, the optimizers against hand computations, and the datasets.
 - `make data`: the MNIST pipeline against what is known about the dataset (counts, first labels, class histograms,
   pixel mean 0.1307 and deviation 0.3081), timed.
+- Transformers (phase 3): every new backward against central differences in `F64` - embedding (with repeated tokens),
+  positions, both normalizations, the tied head, padding rows (`nn.olang`); attention causal and not, two and four
+  heads, a node attending to itself as q, k and v, on full and short batches; dropout with a fixed mask; GELU through
+  tanh; a whole two-layer transformer tied and untied, with dropout and with RMS normalization (`layers.olang` - a
+  deep network's own central-difference error bottoms out at 1e-6 to 4e-6, so its bound is 1e-5); causality (a row's
+  output does not change with a later row); the key-value cache against running the whole sequence (`generate.olang`,
+  to 1e-12); the workspace `Gemm` against std/linalg's for every transpose, beta, size and thread count
+  (`kernels.olang`); the schedule, clipping, checkpoints and the text corpus.
+- `make lmref`: the first steps of the character model - losses and gradient norms - against the same model, the same
+  starting values, windows, AdamW, schedule and clipping in numpy (`bench/ref/charlm.py`, F64).
+- `make lmbench`: where a transformer's step goes, by kind of operation (the graph's own profiling).
 - `make mnist` trains end to end (needs the downloaded data); `make epoch` times it against C.
 
 ## 10. Serialization (later)
@@ -337,11 +426,22 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
 `Fast*` functions. What it still needs:
 
 1. **`Gemm` into a caller's workspace**, so a planned graph gives the packing panels a place in its arena and a step
-   allocates nothing at all - and the leak in section 8 cannot happen whatever the runtime does.
-2. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass.
-3. **Batched strided `Gemm`** (one call for every head and sequence of attention) and a row-gather/scatter-add pair for
-   embeddings.
-4. **Two-operand indexing**, `m[r, c]` (olang's `At` takes one operand: repro/at2).
+   allocates nothing at all - and the leak in section 8 cannot happen whatever the runtime does. **Needed**: without
+   it a transformer's training grew 8.1MB a step; oann now carries a copy of std/linalg's algorithm with a workspace
+   (`kernels.olang`, ~250 lines) that should go when this exists. Wanted shape: `GemmSpace(m, n, k, threads)` and
+   `Gemm(c, a, ta, b, tb, alpha, beta, threads, work)`.
+2. **Batched strided `Gemm`, causal-aware** - every sequence and head of attention in one call, the products of a
+   lower-triangular block skipped. Attention is 8% of a step at context 64 and grows as `T^2`; oann's dot-product
+   kernels run it at 3-4 GFLOPS on the causal half, against ~12 for `Gemm` on large products, and a `Gemm` per head
+   is slower still (6.6 ms against 4.4 forward at B 16, T 64; 27.6 against 21.6 at T 256 - packing costs more than
+   it saves at these sizes). Expected: attention 2-3x faster, ~5% of a step at T 64, ~15-20% at T 256.
+3. **`Gemm` with an epilogue** - `c = act(alpha op(a) op(b) + bias row)` - so `Linear` plus an activation is one pass:
+   the bias row and GELU are two more passes over the widest activation (B T x 4D), ~15 ms of a 550 ms step; and
+   **fused QKV** (one product of width 3D, attention reading q, k and v as column blocks) needs view nodes in oann's
+   graph, not linalg.
+4. **Vectorizing exp and tanh on the target** - `FastTanh` costs ~5 ns an element on the default SSE2 target, which
+   keeps GELU at ~25 ms a step; the native target (AVX2, FMA) is the compiler's (pending).
+5. **Two-operand indexing**, `m[r, c]` - now in olang (E31 multi-index), not yet used by oann.
 
 ## 14. Open questions
 
@@ -349,26 +449,41 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
    scale with the learning rate and whether it should apply to every dense layer or only some.
 2. The GEMM gap to OpenBLAS (3x single-threaded) is the target instruction set; a native-target build mode (and FMA
    contraction) in the compiler would close most of it.
-3. The chunk-pool leak (section 8): first-fit in the runtime, a workspace `Gemm`, or both.
+3. The chunk-pool leak (section 8): worked around in oann by `kernels.Gemm`; upstream, first-fit in the runtime, a
+   workspace `Gemm` in std/linalg, or both - and then `kernels.olang`'s copy goes.
 4. An eager mode beside the graph, for models whose structure depends on their data - not before a model needs one.
 5. oann as an importable package (`github.com/OWNER/oann/nn`) - the layout already is one module per concern.
+6. Mixed precision (BF16 storage, F32 master weights): the graph is generic over one element type, so it needs either
+   a second arena of BF16 copies the products read (and std/linalg's BF16 product into a workspace - today it
+   allocates per call and widens while packing) or a graph with a type per node. Not started (section 11).
+7. View nodes - a node whose value is a column block of another's, no storage of its own - would give fused QKV (one
+   product of width 3D) and splitting heads at no cost; the "written" flag per node would then need to be per block.
 
 ## 15. Layout
 
 ```
-makefile                OLANG ?= the compiler; make test, data, mnist, epoch, clean
-nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward; the gradient checks
+makefile                OLANG ?= the compiler; make test, data, mnist, epoch, charlm, lmbench, lmref, clean
+nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
+                        profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
-layers.olang            Dense, Mlp, activations, PyTorch's initialization
-optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjected), Sgd
-train.olang             Classifier, Epoch, Evaluate
+kernels.olang           Gemm into a workspace (std/linalg's algorithm), Dot, Axpy, Sum, SquaresF64
+layers.olang            Dense, Mlp, activations, PyTorch's initialization; Norm, AttentionBlock, Transformer
+optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjected), Sgd; WarmupCosine, ClipGradNorm
+train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep, LmEvaluate
+generate.olang          sampling; generation running the context again, and with a key-value cache
 datasets/idx.olang      the IDX format
 datasets/loader.olang   Labeled sets and the Loader
 datasets/mnist.olang    fetching and loading MNIST
+datasets/text.olang     a character corpus, its split, and windows of tokens; fetching tiny Shakespeare
 examples/mnist_mlp.olang
+examples/charlm.olang   the character-level transformer on tiny Shakespeare, trained, saved and sampled
+examples/charlm_sample.olang  sampling from its checkpoint, with and without the cache
 bench/data.olang        the data pipeline, checked and timed
 bench/train.olang       where an epoch's time goes
 bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
+bench/lm.olang          where a transformer's step goes, by kind of operation
+bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
+bench/attention.olang   attention's kernels against a Gemm per sequence and head
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
