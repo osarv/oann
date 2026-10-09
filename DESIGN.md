@@ -15,8 +15,8 @@ the 784-128-10 perceptron trains on MNIST to 97.7-97.8% test accuracy in 10 epoc
 built** (section 11): tokens, embeddings, learned positions, layer and RMS normalization, fused multi-head attention,
 dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient clipping, checkpoints and generation
 with a key-value cache - every backward checked against central differences, the first training steps equal to the same
-model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Next: settling networks**
-(docs/settling.md).
+model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Phase 4** (section 16):
+a byte-level BPE tokenizer, and the transformer trained on its tokens. **Next: settling networks** (docs/settling.md).
 
 ## 1. The operand: Matrix
 
@@ -308,8 +308,9 @@ generates with and without the key-value cache.
   `At` the windows of an ordered pass, the inputs into the graph's tokens and each one's next token into its classes.
   `Fetch` gets tiny Shakespeare with curl (written to a `.part` file and renamed).
 
-Next: a `Dataset` trait (a constraint) so one `Loader<D>` takes any source, a tokenizer beyond characters (byte-pair
-encoding), and filling the next batch on a task while the step runs.
+Tokens beyond characters are `tokenizer.olang`'s byte-level BPE (section 16): its ids go into the same `Windows`.
+Next: a `Dataset` trait (a constraint) so one `Loader<D>` takes any source, and filling the next batch on a task while
+the step runs.
 
 ## 8. Results and performance (measured 2026-10-09)
 
@@ -544,7 +545,8 @@ by 70-84 kB over the first steps and by nothing after (100 steps measured). MNIS
 - A tiled attention that recomputes `P` in the backward instead of saving `T x T` per head (memory at long contexts),
   and a batched causal `Gemm` under it (section 13).
 - Fused QKV and splitting heads with view nodes; a `Gemm` epilogue for bias and GELU (section 13).
-- Rotary positions; a byte-pair tokenizer; generating several sequences at once (a decoding graph of `B` sequences).
+- Rotary positions; generating several sequences at once (a decoding graph of `B` sequences). (The byte-pair
+  tokenizer is built: section 16.)
 - Reusing activation storage by liveness: the arena holds every activation and gradient - 87 MB for the model above.
 - Element-wise ops over threads: at four threads they are 40 of the 344 ms.
 
@@ -602,7 +604,7 @@ oann does all its arithmetic through `linalg.Matrix<T>` - `View`, `Row`, `Gemm`,
 ## 15. Layout
 
 ```
-makefile                OLANG ?= the compiler; make test, data, mnist, epoch, charlm, lmbench, lmref, clean
+makefile                OLANG ?= the compiler; make test, data, mnist, epoch, charlm, lmbench, lmref, bpe, bpelm, clean
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
@@ -611,6 +613,7 @@ layers.olang            Dense, Mlp, activations, PyTorch's initialization; Norm,
 optim.olang             the Optimizer trait, Regularizer, AdamW (and AdamWProjected), Sgd; WarmupCosine, ClipGradNorm
 train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep, LmEvaluate
 generate.olang          sampling; generation running the context again, and with a key-value cache
+tokenizer.olang         byte-level BPE: GPT-2's pre-tokenization, training, encoding, decoding, JSON
 datasets/idx.olang      the IDX format
 datasets/loader.olang   Labeled sets and the Loader
 datasets/mnist.olang    fetching and loading MNIST
@@ -618,12 +621,14 @@ datasets/text.olang     a character corpus, its split, and windows of tokens; fe
 examples/mnist_mlp.olang
 examples/charlm.olang   the character-level transformer on tiny Shakespeare, trained, saved and sampled
 examples/charlm_sample.olang  sampling from its checkpoint, with and without the cache
+examples/bpelm.olang    the same transformer on 512 BPE tokens, per character against the character model
 bench/data.olang        the data pipeline, checked and timed
 bench/train.olang       where an epoch's time goes
 bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
 bench/lm.olang          where a transformer's step goes, by kind of operation
 bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
 bench/attention.olang   attention's kernels against a Gemm per sequence and head
+bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
@@ -631,3 +636,102 @@ data/, build/           downloads and build output, not in git
 
 Each file is one olang module, imported by its path relative to the importing file without the extension
 (`import "../datasets/mnist"`). Random numbers are std/rand's, times std/time's.
+
+## 16. Phase 4: byte-pair tokens
+
+### Byte-level BPE (`tokenizer.olang`)
+
+GPT-2's tokenizer - Sennrich et al.'s byte-pair encoding, run on bytes as Radford et al. run it: the 256 byte values
+are the first tokens and every later token is the merge of two earlier ones, so any bytes encode and decode back to
+themselves and there is no unknown token.
+
+- **Pre-tokenization** - the chunks merges never cross - is GPT-2's pattern,
+  `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+`, read by a hand-written scanner
+  (`ChunkEnd`; olang has no regular expressions) with byte classes standing for the Unicode ones: a letter is an ASCII
+  letter or any byte from 0x80 up (so a UTF-8 word stays one chunk), a digit is 0-9, whitespace the six ASCII spaces.
+  On ASCII text - tiny Shakespeare is ASCII - this is GPT-2's rule exactly; elsewhere it keeps a non-ASCII symbol or
+  punctuation mark with the letters around it, where GPT-2 would split it off.
+- **Training** (`tokenizer.Train(text, vocab)`) counts each distinct chunk once with its number of occurrences, then
+  merges the most frequent adjacent pair again and again, ties to the smaller pair (Hugging Face's rule). Pair counts
+  are kept up to date as chunks change, a heap with lazy deletion gives the most frequent, and every pair keeps a list
+  of the chunks it occurs in (a linked list in flat arrays), so a merge costs the chunks it touches, not the corpus.
+- **Encoding** (`t.Encode(text)`) applies a chunk's merges lowest rank first, leftmost first, with a heap over its
+  positions: the tokens of GPT-2's "merge every occurrence of the best pair, left to right" (a merge only ever makes
+  pairs of a later rank), in O(n log n) of the chunk's length - a megabyte of one letter is no harder than prose, where
+  the usual quadratic loop would not finish. Each distinct chunk's tokens are remembered for the rest of the text, as
+  GPT-2's encoder does. The ranks are an open-addressed table of pairs. `t.Decode(ids)` fails on an id the vocabulary
+  does not have (`TokenizerError.UNKNOWN`).
+- **Saving** is JSON, `t.Save(path)` and `tokenizer.Load(path)`: `{"format": "oann-bpe", "version": 1, "pretokenize":
+  "gpt2-ascii", "merges": [[32, 116], ...], "vocab": [...]}`. The merges, as pairs of ids, are what Load reads (each
+  checked to name only tokens made before it); the vocabulary is every token in GPT-2's printable form ("Ġthe" for
+  " the"), for a person to read.
+
+**Checked** by the module's tests (GPT-2's chunks on contractions, runs and spaces; the merge order and its ties; a
+round trip of random bytes of all 256 values, of random corpus text and of 100,000 of one letter; saving and loading)
+and **independently** by `bench/ref/bpe.py` (`make bpe`): the same pre-tokenization as a Python bytes regular
+expression, the plain algorithm (every pair counted again for every merge) and GPT-2's encoder. From tiny
+Shakespeare's training part both learn **the same merges** - 256 of 256 at a vocabulary of 512, 1,792 of 1,792 at
+2,048 - and give **the same validation tokens** (59,401 and 43,559).
+
+**Speed**, tiny Shakespeare's first 90% (1,003,854 bytes: 266,995 chunks, 14,134 distinct), one thread on the shared
+machine (load average 3-6, so ranges):
+
+| vocabulary | training | characters a token (training / validation part) | encoding the training part |
+|---|---|---|---|
+| 512 | 50-95 ms | 1.944 / 1.878 | 35-60 ms (17-28 MB/s) |
+| 1,024 | 131 ms | 2.442 / 2.257 | 63 ms |
+| 4,096 | 120 ms | 3.264 / 2.903 | 43 ms |
+| 8,192 | 152 ms | 3.535 / 3.186 | 50 ms |
+
+A merge costs only the chunks it touches, so 7,936 merges cost about what 256 do: training is mostly counting the
+chunks (10-15 ms) and building the pair lists. The Python reference takes 12 s at 512 and 80 s at 2,048.
+
+### A transformer on BPE tokens
+
+`examples/bpelm.olang` (`make bpelm ARGS="2000 1 2"`) is the character model of section 11 unchanged - 4 layers of
+width 128, 4 heads, a context of 64, batches of 16 sequences, tied embeddings, AdamW (beta2 0.99, decay 0.1) warmed up
+over 100 steps and down a cosine to 1e-4, clipping to 1, 2,000 steps, seed 1 - on 512 BPE tokens learned from the
+training part (867,072 parameters: the embedding is 57,216 larger). The split is the character model's, so both see the
+same text on each side. A loss per token becomes a loss per character as the total over the predicted tokens divided by
+the characters those tokens hold, counted on the very windows evaluated (nats a token / characters a token).
+
+| step | BPE, nats a token | BPE, nats a character | characters, nats a character |
+|---|---|---|---|
+| 0 | 6.2683 (ln 512 = 6.238) | 3.3206 | 4.2086 |
+| 250 | 3.8604 | 2.0450 | 2.3825 |
+| 500 | 3.6399 | 1.9282 | 2.2186 |
+| 750 | 3.4664 | 1.8363 | 2.0828 |
+| 1000 | 3.3325 | 1.7654 | 2.0032 |
+| 1250 | 3.1944 | 1.6922 | 1.9575 |
+| 1500 | 3.1254 | 1.6557 | 1.8779 |
+| 1750 | 3.0825 | 1.6329 | 1.8220 |
+| 2000 | 3.0242 | **1.6020** | **1.8063** |
+
+Each row is the first 10 batches of the model's own ordered pass, so the two columns cover different text (10,240 BPE
+tokens hold ~19,000 characters). Over the **whole validation part** (111,540 characters, the same text for both): the
+BPE model **3.1095 nats a token, 1.6559 a character**, the character model's checkpoint **1.8404 a character** - 10%
+lower for the same model, steps and batch shape. Some of that is context: 64 tokens are ~120 characters. 959 s on two
+threads at a load average of 4 (480 ms a step, 2,136 tokens - ~4,150 characters - a second); the wider head (512 logits
+against 65) costs little next to the blocks.
+
+A sample (`generate.CachedTokens` - the key-value cache on token ids, for any tokenizer; `generate.Cached` is it with a
+character corpus's encoding - 250 tokens, 512 characters, after a newline, temperature 0.8, 2,156 tokens a second):
+
+```
+I'll not him with your greations,
+But now you cannot be bound under against their after
+As or morrow; and I should else thee
+The is wours.
+
+DUKE VINCENTIO:
+Tow,, traitor, to must be clove, which, and a done:
+For she is the gentlemen?
+
+CAMILLO:
+I cannot I'll take it be her:
+Nay, which heaven of my banish, drowns moes was
+```
+
+Found on the way: `text.Windows.At` past the end of an ordered pass gave a negative count, which `LmEvaluate`'s
+`n == 0` test let through as a `Forward` of negative rows - it gives 0 now (evaluating a whole part asks past the end).
+

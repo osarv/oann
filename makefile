@@ -5,9 +5,9 @@ OLANG ?= /home/user/wt/oannc2/build/out
 
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang \
-	datasets/mnist.olang datasets/text.olang generate.olang
+	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang
 
-.PHONY: test data bench epoch mnist charlm lmbench lmref clean
+.PHONY: test data bench epoch mnist charlm lmbench lmref bpe bpelm clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -29,6 +29,12 @@ charlm:
 	$(OLANG) -b examples/charlm.olang
 	./build/examples_charlm $(ARGS)
 
+# the same transformer on byte-level BPE tokens (512, learned from the training part), its loss per character against
+# the character model's checkpoint - ARGS: steps, seed, threads, vocabulary, tokens to generate
+bpelm:
+	$(OLANG) -b examples/bpelm.olang
+	./build/examples_bpelm $(ARGS)
+
 # where a transformer's training step goes, operation by operation - ARGS: steps, threads, layers, width, heads,
 # context, sequences
 lmbench:
@@ -41,6 +47,13 @@ lmref:
 	./build/bench_lmref $(ARGS) > build/lmref_olang.txt
 	python3 -I bench/ref/charlm.py $(ARGS) > build/lmref_numpy.txt
 	paste build/lmref_olang.txt build/lmref_numpy.txt
+
+# byte-level BPE on tiny Shakespeare: training and encoding timed, and the merges and tokens checked against an
+# independent Python implementation (bench/ref/bpe.py) - ARGS: the vocabulary
+bpe:
+	$(OLANG) -b bench/bpe.olang
+	./build/bench_bpe $(or $(ARGS),512) build/bpe_olang.txt
+	python3 -I bench/ref/bpe.py data/shakespeare/input.txt $(or $(ARGS),512) build/bpe_olang.txt
 
 # an epoch's time against C over OpenBLAS (bench/epoch.sh)
 epoch:
