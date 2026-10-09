@@ -1,0 +1,23 @@
+# A use-after-free: a constructor that pushes onto a List held in one of its own reference fields puts the List's
+# chunk in the constructor's own scope, which closes when the constructor returns - the next allocation of the
+# caller's then writes over the List. Found building settling agents (agent.olang): the agent's constructor recorded
+# its circuit's regions (Push onto the circuit's List of regions) and the agent crashed in a later moment, once a
+# loop body allocated text (Fixed). Pushing after construction (h.items.Push(6) in main) is sound, and so is building
+# the List in a function called from the field's initializer (fn made() Inner& { ... }) - agent.olang does that.
+# Expected: "after a new array: 6" three times. Actual (olang ef939ae): a segmentation fault after the first line, or
+# a wrong value where the freed chunk is reused by something else.
+import "std/io"
+
+type Holder struct() {
+    items mut List<I64>& = List<I64>()
+    items.Push(6)
+}
+
+fn main() ? io.IoError {
+    h := Holder()
+    try io.Print("after construction: " $(h.items[0]) "\n")
+    for t in range 3 {
+        junk := Array<I64>(64, -1)
+        try io.Print("after a new array: " $(h.items[0]) "\n")
+    }
+}

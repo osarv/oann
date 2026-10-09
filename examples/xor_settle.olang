@@ -1,0 +1,62 @@
+# XOR learned by a settling circuit: two inputs, a hidden region, a readout of two classes, the hidden and readout
+# reciprocal - taught by equilibrium propagation (circuit.Teach: a free settle, two nudged ones, their contrast) and
+# Adam. Arguments, all optional: the lessons (300), the hidden neurons (8), the seed (1), the learning rate (0.05).
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "../circuit"
+import "../optim"
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.JsonError {
+    if i >= args.Len() { return fallback }
+    return try (try json.Parse(args[i])).AsNum()
+}
+
+fn main() ? io.IoError + json.JsonError {
+    args := os.Args()
+    lessons := I64(try number(args, 1, 300))
+    hidden := I64(try number(args, 2, 8))
+    seed := U64(try number(args, 3, 1))
+    rate := try number(args, 4, 0.05)
+    c := circuit.Circuit<F32>(4)
+    x := c.Input(2)
+    h := c.Hidden(hidden)
+    o := c.Readout(2)
+    c.Project(x, h, circuit.Wiring.OneWay)
+    c.Project(h, o)
+    r := rand.Rand(seed)
+    c.Plan(r)
+    c.Certify(0.9)
+    d := c.DriveData(x)
+    classes := c.LabelData(o)
+    for b in range 4 {
+        p I64 = b / 2
+        q I64 = b % 2
+        d[2 * b] = 1.0 if p == 1 else -1.0
+        d[2 * b + 1] = 1.0 if q == 1 else -1.0
+        classes[b] = I32(p ^ q)
+    }
+    opt := optim.FlatAdamW<F32>(c.ParamCount, rate)
+    lesson := circuit.Lesson()
+    predicted := Array<I32>(4)
+    sweeps I64 = 0
+    refused I64 = 0
+    for k in range 1, lessons + 1 {
+        taught := try c.Teach(4, lesson) catch circuit.NotSettled { refused++ } default 0
+        if taught > 0 {
+            sweeps += taught
+            opt.Step(c.ParamData(), c.GradData())
+        }
+        if k % 25 == 0 or k == lessons {
+            c.Predict(circuit.Phase.Free, o, predicted)
+            right I64 = 0
+            for b in range 4 {
+                if predicted[b] == classes[b] { right++ }
+            }
+            try io.Print("lesson " $k ": loss " $(c.Loss(circuit.Phase.Free)).Fixed(4) ", " $right "/4 right, gain "
+                $(c.Gain()).Fixed(3) ", sweeps per lesson " $(F64(sweeps) / F64(k - refused)).Fixed(1) ", refused " $refused "\n")
+        }
+    }
+}

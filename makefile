@@ -6,7 +6,7 @@ OLANG ?= /home/user/wt/oannc2/build/out
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang datasets/idx.olang datasets/loader.olang \
 	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
-	vision.olang
+	vision.olang circuit.olang agent.olang
 
 .PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors clean
 

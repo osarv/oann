@@ -177,18 +177,25 @@ fn (o mut AdamW<<T>>&) Step(g mut nn.Graph<<T>>&) {
             case nn.Op.Param(_, decay) {
                 keep := linalg.Cast(1.0 - o.Rate * wd if decay else 1.0, like)
                 lo := nd.Offset
-                hi I64 = lo + nd.Rows * nd.Cols
-                for k in range lo, hi {
-                    gk := gr[k]
-                    mk <T> = b1 * o.m[k] + c1 * gk
-                    vk <T> = b2 * o.v[k] + c2 * gk * gk
-                    o.m[k] = mk
-                    o.v[k] = vk
-                    p[k] = keep * p[k] - step * mk / (math.Sqrt(vk) * root + eps)
-                }
+                adamRun(p, gr, o.m, o.v, lo, lo + nd.Rows * nd.Cols, b1, b2, c1, c2, keep, step, root, eps)
             }
             nomatch { }
         }
+    }
+}
+
+# the AdamW update of p[lo:hi] from the gradients gr, the moments m and v laid out as p: keep is 1 - rate wd, step
+# the rate over the first moment's correction, root one over the square root of the second's - the one loop AdamW and
+# FlatAdamW both run
+fn adamRun(p mut Array<<T>>&, gr Array<<T>>&, m mut Array<<T>>&, v mut Array<<T>>&, lo I64, hi I64, b1 <T>, b2 <T>,
+        c1 <T>, c2 <T>, keep <T>, step <T>, root <T>, eps <T>) {
+    for k in range lo, hi {
+        gk := gr[k]
+        mk <T> = b1 * m[k] + c1 * gk
+        vk <T> = b2 * v[k] + c2 * gk * gk
+        m[k] = mk
+        v[k] = vk
+        p[k] = keep * p[k] - step * mk / (math.Sqrt(vk) * root + eps)
     }
 }
 
@@ -226,27 +233,80 @@ fn (o mut Sgd<<T>>&) Step(g mut nn.Graph<<T>>&) {
             case nn.Op.Param(_, decay) {
                 l2 := linalg.Cast(wd if decay else 0.0, like)
                 lo := nd.Offset
-                hi I64 = lo + nd.Rows * nd.Cols
-                if o.Momentum == 0.0 {
-                    for k in range lo, hi { p[k] = p[k] - rate * (gr[k] + l2 * p[k]) }
-                } else if o.Nesterov {
-                    for k in range lo, hi {
-                        gk <T> = gr[k] + l2 * p[k]
-                        uk <T> = mu * o.u[k] + gk
-                        o.u[k] = uk
-                        p[k] = p[k] - rate * (gk + mu * uk)
-                    }
-                } else {
-                    for k in range lo, hi {
-                        uk <T> = mu * o.u[k] + gr[k] + l2 * p[k]
-                        o.u[k] = uk
-                        p[k] = p[k] - rate * uk
-                    }
-                }
+                sgdRun(p, gr, o.u, lo, lo + nd.Rows * nd.Cols, rate, mu, l2, o.Momentum != 0.0, o.Nesterov)
             }
             nomatch { }
         }
     }
+}
+
+# the SGD update of p[lo:hi] from the gradients gr (plus l2 p), with momentum mu in u laid out as p when momentum -
+# the one loop Sgd and FlatSgd both run
+fn sgdRun(p mut Array<<T>>&, gr Array<<T>>&, u mut Array<<T>>&, lo I64, hi I64, rate <T>, mu <T>, l2 <T>, momentum Bool,
+        nesterov Bool) {
+    if not momentum {
+        for k in range lo, hi { p[k] = p[k] - rate * (gr[k] + l2 * p[k]) }
+    } else if nesterov {
+        for k in range lo, hi {
+            gk <T> = gr[k] + l2 * p[k]
+            uk <T> = mu * u[k] + gk
+            u[k] = uk
+            p[k] = p[k] - rate * (gk + mu * uk)
+        }
+    } else {
+        for k in range lo, hi {
+            uk <T> = mu * u[k] + gr[k] + l2 * p[k]
+            u[k] = uk
+            p[k] = p[k] - rate * uk
+        }
+    }
+}
+
+# ---- flat parameter regions ----
+
+# AdamW over any flat region of count parameters with its gradients in another array laid out alike - a settling
+# circuit's (circuit.Params().Data and Grads().Data), or anything else that is not a graph: the same step as AdamW's,
+# its moments made once here, Decay (decoupled, as AdamW's) applying to every element. Rate may change between steps
+type FlatAdamW<T> struct(count I64, rate F64 = 0.001, Beta1 F64 = 0.9, Beta2 F64 = 0.999, Eps F64 = 1e-8, Decay F64 = 0) {
+    Rate mut F64 = rate
+    Beta1
+    Beta2
+    Eps
+    Decay
+    Steps mut I64 = 0
+    M mut Array<<T>>& = Array<<T>>(count)           # the moments, readable for a checkpoint
+    V mut Array<<T>>& = Array<<T>>(count)
+}
+
+fn (o mut FlatAdamW<<T>>&) SetRate(rate F64) { o.Rate = rate }
+
+# one step of p from the gradients g, both of the region's count elements
+fn (o mut FlatAdamW<<T>>&) Step(p mut Array<<T>>&, g Array<<T>>&) {
+    o.Steps++
+    like <T>
+    corr1 F64 = 1.0 - math.Pow(o.Beta1, F64(o.Steps))
+    corr2 F64 = 1.0 - math.Pow(o.Beta2, F64(o.Steps))
+    adamRun(p, g, o.M, o.V, 0, o.M.Len(), linalg.Cast(o.Beta1, like), linalg.Cast(o.Beta2, like),
+        linalg.Cast(1.0 - o.Beta1, like), linalg.Cast(1.0 - o.Beta2, like), linalg.Cast(1.0 - o.Rate * o.Decay, like),
+        linalg.Cast(o.Rate / corr1, like), linalg.Cast(1.0 / math.Sqrt(corr2), like), linalg.Cast(o.Eps, like))
+}
+
+# SGD over any flat region of count parameters, as Sgd steps a graph's - Decay as an L2 term on every element
+type FlatSgd<T> struct(count I64, rate F64 = 0.01, Momentum F64 = 0, Nesterov Bool = false, Decay F64 = 0) {
+    Rate mut F64 = rate
+    Momentum
+    Nesterov
+    Decay
+    u mut Array<<T>>& = Array<<T>>(count if Momentum != 0.0 else 0)
+}
+
+fn (o mut FlatSgd<<T>>&) SetRate(rate F64) { o.Rate = rate }
+
+# one step of p from the gradients g, both of the region's count elements
+fn (o mut FlatSgd<<T>>&) Step(p mut Array<<T>>&, g Array<<T>>&) {
+    like <T>
+    sgdRun(p, g, o.u, 0, p.Len(), linalg.Cast(o.Rate, like), linalg.Cast(o.Momentum, like), linalg.Cast(o.Decay, like),
+        o.Momentum != 0.0, o.Nesterov)
 }
 
 # ---- tests ----
@@ -333,6 +393,29 @@ test "the input projection takes W <- W - (alpha / n) (W X^T) X, in place of wei
     o := Sgd<F64>(g, 0.1, 0, false, Regularizer.Projection(0.05, false))
     o.Step(g)
     assert g.Value(w).MaxAbsDifference(want) < 1e-12
+}
+
+test "the flat forms step an array as AdamW and Sgd step a graph's parameters" {
+    g, w, loss := quadratic(3.0, 0.5)
+    o := AdamW<F64>(g, 0.1, 0.9, 0.999, 1e-8, Regularizer.WeightDecay(0.5))
+    p := F64[3.0, 0.5]
+    flat := FlatAdamW<F64>(2, 0.1, 0.9, 0.999, 1e-8, 0.5)
+    h, hw, hloss := quadratic(3.0, 0.5)
+    s := Sgd<F64>(h, 0.1, 0.9, true)
+    q := F64[3.0, 0.5]
+    flatSgd := FlatSgd<F64>(2, 0.1, 0.9, true)
+    for step in range 4 {
+        g.Forward(1)
+        g.Backward(loss)
+        o.Step(g)
+        flat.Step(p, F64[p[0] - 1.0, p[1] + 2.0])
+        assert g.Value(w).Get(0, 0) == p[0] and g.Value(w).Get(0, 1) == p[1]
+        h.Forward(1)
+        h.Backward(hloss)
+        s.Step(h)
+        flatSgd.Step(q, F64[q[0] - 1.0, q[1] + 2.0])
+        assert h.Value(hw).Get(0, 0) == q[0] and h.Value(hw).Get(0, 1) == q[1]
+    }
 }
 
 test "the schedule warms up linearly, follows half a cosine down to its floor and stays there" {

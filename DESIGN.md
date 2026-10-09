@@ -17,7 +17,7 @@ dropout, padding rows, GPT-2's blocks, a warmup-then-cosine schedule, gradient c
 with a key-value cache - every backward checked against central differences, the first training steps equal to the same
 model in numpy to six decimals, and a character-level model trained on tiny Shakespeare. **Phase 4** (section 16):
 a byte-level BPE tokenizer, and the transformer trained on its tokens; safetensors checkpoints; convolution and max
-pooling (im2col and one product for the whole batch), and a small CNN on MNIST. **Next: settling networks** (docs/settling.md).
+pooling (im2col and one product for the whole batch), and a small CNN on MNIST. **Settling networks** (section 17, docs/settling.md): phases 1 and 2 - circuits that settle, learning by free and nudged phases, a spiking variant, and an agent with memories and arousal.
 
 ## 1. The operand: Matrix
 
@@ -881,3 +881,28 @@ And two limits worth a library: no regular expressions, so GPT-2's pre-tokenizat
 and no Unicode character classes in std, so `\p{L}` and `\p{N}` became byte classes (exact on ASCII text). Also met
 again: `:=` from a comparison needs its type written (D15).
 
+
+## 17. Settling networks (`circuit.olang`)
+
+Beside the graph, `circuit.Circuit<T>` is the second recorded structure: a network of regions whose neurons settle to
+an equilibrium, taught by equilibrium propagation (contrasting a free settle with nudged ones) - same `Matrix`, same
+one-arena discipline, nothing allocated per settle, lesson or step. Its neuron model is a closed enum with rate
+neurons and a working leaky integrate-and-fire variant. Phase 1 is built: the circuit, the certificate and refusal,
+`Teach`, gradient checks in F64 (the estimate's error falls as beta^2), XOR with rate and with spiking neurons, and
+MNIST at 97.5% with a 784-128-10 circuit. The design, the decisions taken building it and the measurements are
+docs/settling.md (sections 2.10, 4.6, 5.7, 6). `make test` runs its checks; `examples/xor_settle.olang`,
+`examples/xor_spiking.olang` and `examples/mnist_settle.olang` run it end to end.
+
+Phase 2 is built in `agent.olang`. `agent.Agent<T>` is a circuit living one moment at a time, with these parts:
+
+- a three-factor actor: the circuit, an eligibility trace and a TD error;
+- a linear critic;
+- a context trace;
+- a fast and a persistent associative memory;
+- an arousal gate. Calm moments act greedily and touch no synapse; aroused moments explore and learn.
+
+An agent's whole state checkpoints to a safetensors file and restores exactly. `optim.FlatAdamW`/`FlatSgd` step a
+circuit's flat parameter region with the same loops `AdamW`/`Sgd` use.
+
+`examples/bandit_settle.olang` runs the contextual bandit, reversal and trace-pinning tasks over many lives with
+confidence intervals. The results and decisions are in docs/settling.md, sections 2.11, 5.8 and 6.

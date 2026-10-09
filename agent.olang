@@ -1,0 +1,857 @@
+# agent - a life: one settling circuit acting continuously, learning from rewards that arrive after its actions
+# (docs/settling.md 1.5-1.8, 2.6). An Agent is the circuit (circuit.Circuit) with
+# - a Critic, a linear value of the hidden activities learned by TD(lambda);
+# - an eligibility trace over the circuit's parameters (circuit.Eligibility), to which every moment that learns adds
+#   the contrast of the action it took, and which the broadcast TD error turns into the actor's step;
+# - a context Trace, a running mean of the hidden activity fed back as a drive: short-term memory as a stimulus;
+# - a Memory, a fast and a persistent associative matrix from observations to the reward of each action, read as a
+#   drive on the readout;
+# - an Arousal, the gate: an aroused moment samples its action, runs the nudged phases and learns from its outcome;
+#   a calm one settles once, answers greedily and changes nothing that learns.
+# Step(obs, reward) is one moment (1.8). Nothing is allocated per moment.
+
+import "std/io"
+import "std/json"
+import "std/linalg"
+import "std/math"
+import "std/os"
+import "std/rand"
+import "circuit"
+import "optim"
+
+# ---- arousal (1.7) ----
+
+# the gate on learning and memory writes: a leaky running measure of unexpectedness and disappointment, updated once
+# per outcome. Scale tracks |delta| (slowly), Surprise is |delta| relative to it - about 1 on average - Recent and
+# LongRun the reward over about 1 / Fast and 1 / Slow moments, Spread the reward's spread, Want how far recent reward
+# fell below its long-run level in units of the spread (0 to 1): disappointment. Level is a running mean of
+# Surprise + Want; a moment is aroused in the critical period (the first Critical outcomes, before Scale means
+# anything) or when Level is at least Threshold - errors twice the usual, or a full unit of disappointment
+type Arousal struct(Slow F64 = 0.01, Fast F64 = 0.1, Eps F64 = 0.001, Critical I64 = 100, Threshold F64 = 2) {
+    Slow
+    Fast
+    Eps
+    Critical
+    Threshold
+    Scale mut F64 = 0.0
+    Surprise mut F64 = 0.0
+    Recent mut F64 = 0.0
+    LongRun mut F64 = 0.0
+    Spread mut F64 = 0.0
+    Want mut F64 = 0.0
+    Level mut F64 = 0.0
+    Outcomes mut I64 = 0                            # the outcomes seen before this one: t
+    Aroused mut Bool = true
+}
+
+# one outcome: the TD error delta (against the forecast made before acting) and the reward; gives whether the moment
+# it ends is aroused
+fn (a mut Arousal&) Update(delta F64, reward F64) Bool {
+    d F64 = math.Abs(delta)
+    a.Scale = a.Scale + a.Slow * (d - a.Scale)
+    a.Surprise = d / (a.Scale + a.Eps)
+    a.Recent = a.Recent + a.Fast * (reward - a.Recent)
+    a.LongRun = a.LongRun + a.Slow * (reward - a.LongRun)
+    a.Spread = a.Spread + a.Slow * (math.Abs(reward - a.LongRun) - a.Spread)
+    a.Want = math.Clamp((a.LongRun - a.Recent) / (a.Spread + a.Eps), 0.0, 1.0)
+    a.Level = a.Level + a.Fast * (a.Surprise + a.Want - a.Level)
+    a.Aroused = a.Outcomes < a.Critical or a.Level >= a.Threshold
+    a.Outcomes++
+    return a.Aroused
+}
+
+# ---- memory (1.6) ----
+
+# a fast and a persistent associative memory from keys (observations, unit-normalized) to a value per action - the
+# reward each action brought: the linear associator, written by the delta rule (Kohonen; Anderson; Widrow and Hoff),
+# two stores of different speed (complementary learning systems). Both are Keys x Actions. Per moment the fast one
+# decays, F <- Decay F - kept pending, one number, so a moment that writes nothing touches neither matrix. A write at
+# key k for action a with value v:
+#   C[:, a] += min(1, Rate (1 + surprise)) k^T (v - (k C)_a)        persistent: slow, weighted by surprise
+#   F[:, a] += k^T (v - (k (C + F))_a)                              fast: one shot - the read at k becomes v at once
+# and a read gives Gain k (C + F) - a drive on the readout
+type Memory<T> struct(keys I64, actions I64, Decay F64 = 0.95, Rate F64 = 0.02, Gain F64 = 1) {
+    Keys I64 = keys
+    Actions I64 = actions
+    Decay
+    Rate
+    Gain
+    c mut Array<<T>>& = Array<<T>>(keys * actions)
+    f mut Array<<T>>& = Array<<T>>(keys * actions)
+    Pending mut F64 = 1.0                           # the fast store is Pending f
+    key mut Array<<T>>& = Array<<T>>(keys)          # the unit key of the last read or write
+}
+
+# one moment's decay of the fast store
+fn (m mut Memory<<T>>&) Fade() {
+    m.Pending = m.Pending * m.Decay
+}
+
+# the key of x: x over its Euclidean norm (zero for a zero x), into the key workspace
+fn (m mut Memory<<T>>&) unit(x Array<<T>>&) {
+    sum F64 = 0.0
+    for i in range m.Keys { sum += F64(x[i]) * F64(x[i]) }
+    like <T>
+    inv := linalg.Cast(0.0 if sum == 0.0 else 1.0 / math.Sqrt(sum), like)
+    for i in range m.Keys { m.key[i] = x[i] * inv }
+}
+
+# (k S)_a for the store at s (the persistent one, or the fast one times its pending decay), in F64
+fn (m Memory<<T>>&) at(s Array<<T>>&, scale F64, a I64) F64 {
+    sum F64 = 0.0
+    for i in range m.Keys { sum += F64(m.key[i]) * F64(s[i * m.Actions + a]) }
+    return sum * scale
+}
+
+# Gain x (C + F), x unit-normalized: the stores' value of every action for x, into out (Actions of them)
+fn (m mut Memory<<T>>&) Read(x Array<<T>>&, out mut Array<<T>>&) {
+    m.unit(x)
+    like <T>
+    for a in range m.Actions { out[a] = linalg.Cast(m.Gain * (m.at(m.c, 1.0, a) + m.at(m.f, m.Pending, a)), like) }
+}
+
+# writes value for action a at the key of x, the persistent store's step grown by surprise (|delta|)
+fn (m mut Memory<<T>>&) Write(x Array<<T>>&, a I64, value F64, surprise F64) {
+    m.unit(x)
+    like <T>
+    if m.Pending != 1.0 {
+        k := linalg.Cast(m.Pending, like)
+        for i in range m.f.Len() { m.f[i] = k * m.f[i] }
+        m.Pending = 1.0
+    }
+    rate F64 = math.Min(1.0, m.Rate * (1.0 + surprise))
+    slow := linalg.Cast(rate * (value - m.at(m.c, 1.0, a)), like)
+    for i in range m.Keys { m.c[i * m.Actions + a] = m.c[i * m.Actions + a] + slow * m.key[i] }
+    fast := linalg.Cast(value - m.at(m.c, 1.0, a) - m.at(m.f, 1.0, a), like)
+    for i in range m.Keys { m.f[i * m.Actions + a] = m.f[i * m.Actions + a] + fast * m.key[i] }
+}
+
+# ---- the context trace (1.6) ----
+
+# short-term memory as a stimulus (Elman): after each action Value <- (1 - Rate) Value + Rate s_hidden, and the next
+# moment's drive on the context region is Gain Value
+type Trace<T> struct(size I64, Rate F64 = 0.3, Gain F64 = 1) {
+    Rate
+    Gain
+    Value mut Array<<T>>& = Array<<T>>(size)
+}
+
+# Value <- (1 - Rate) Value + Rate s
+fn (t mut Trace<<T>>&) Follow(s Array<<T>>&) {
+    like <T>
+    k := linalg.Cast(t.Rate, like)
+    for i in range t.Value.Len() { t.Value[i] = t.Value[i] + k * (s[i] - t.Value[i]) }
+}
+
+# out = Gain Value: the context region's drive
+fn (t Trace<<T>>&) Drive(out mut Array<<T>>&) {
+    like <T>
+    k := linalg.Cast(t.Gain, like)
+    for i in range t.Value.Len() { out[i] = k * t.Value[i] }
+}
+
+# a reset: the trace forgets
+fn (t mut Trace<<T>>&) Clear() {
+    zero <T>
+    for i in range t.Value.Len() { t.Value[i] = zero }
+}
+
+# ---- the critic (1.5) ----
+
+# a linear value of the features phi (the hidden activities): V = w . phi + b, learned by TD(lambda) with its own
+# trace z over [phi, 1] and a step normalized by 1 + |[phi, 1]|^2 (Widrow-Hoff). In F64 - a few numbers
+type Critic<T> struct(features I64, Rate F64 = 0.1) {
+    Rate
+    W mut Array<F64>& = Array<F64>(features)
+    B mut F64 = 0.0
+    z mut Array<F64>& = Array<F64>(features)
+    zb mut F64 = 0.0
+}
+
+# V(phi)
+fn (c Critic<<T>>&) Value(phi Array<<T>>&) F64 {
+    v F64 = c.B
+    for i in range c.W.Len() { v += c.W[i] * F64(phi[i]) }
+    return v
+}
+
+# a TD step: z <- decay z + [phi, 1], then [w, b] += Rate delta z / (1 + |[phi, 1]|^2), phi the features of the state
+# whose forecast delta corrects
+fn (c mut Critic<<T>>&) Learn(delta F64, phi Array<<T>>&, decay F64) {
+    norm F64 = 1.0
+    for i in range c.W.Len() {
+        x := F64(phi[i])
+        c.z[i] = decay * c.z[i] + x
+        norm += x * x
+    }
+    c.zb = decay * c.zb + 1.0
+    k F64 = c.Rate * delta / (1.0 + norm)
+    for i in range c.W.Len() { c.W[i] = c.W[i] + k * c.z[i] }
+    c.B = c.B + k * c.zb
+}
+
+# z <- decay z: a moment that does not learn
+fn (c mut Critic<<T>>&) Fade(decay F64) {
+    for i in range c.z.Len() { c.z[i] = decay * c.z[i] }
+    c.zb = decay * c.zb
+}
+
+# the trace forgets: an episode ended
+fn (c mut Critic<<T>>&) Clear() {
+    for i in range c.z.Len() { c.z[i] = 0.0 }
+    c.zb = 0.0
+}
+
+# ---- the agent (1.8) ----
+
+# an agent's settings, oann's defaults (docs/settling.md 1.4-1.7, 1.10): set the fields before making the agent. Four
+# are the end-to-end tasks' tuning of the document's starting values (5.5, decision 21): the actor's rate (0.001
+# there), the persistent memory's c_0 (0.02), arousal's Slow (0.01) and Threshold (2) - with those a noisy bandit's
+# agent turned calm for good within its critical period and never recovered from a reversal
+type Settings struct() {
+    Beta mut F64 = 0.5                  # an aroused moment's nudged phases
+    Temperature mut F64 = 0.25          # the policy softmax(s_out / T), and the readout's cost
+    Gamma mut F64 = 0.99
+    Lambda mut F64 = 0.9
+    Rate mut F64 = 0.0003               # Adam's, for the actor
+    CriticRate mut F64 = 0.1
+    TraceRate mut F64 = 0.3             # the context trace: a_tr
+    TraceGain mut F64 = 1.0             # kappa_tr
+    MemoryDecay mut F64 = 0.95          # phi
+    MemoryRate mut F64 = 0.2            # c_0
+    MemoryGain mut F64 = 1.0            # g
+    Slow mut F64 = 0.003                # arousal (1.7): alpha_s
+    Fast mut F64 = 0.1                  # alpha_f
+    Eps mut F64 = 0.001
+    Critical mut I64 = 100              # t_0
+    Threshold mut F64 = 1.5             # theta
+    Certified mut F64 = 0.9             # the gain the circuit is certified at when made
+    Budget mut I64 = 128                # a settle's sweeps, at least
+}
+
+# a life of observations observations and actions actions, with hidden regions of the given sizes, everything it draws
+# from its own generator seeded with seed. Its circuit: the observation and the context trace as input regions, one-way
+# into the first hidden region; the hidden regions reciprocal in a chain; the last reciprocal with the readout, one
+# neuron per action, its policy softmax(s / T); the memory's read a drive on the readout
+type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64, Config Settings = Settings()) {
+    Observations I64 = observations
+    Actions I64 = actions
+    Config
+    Seed U64 = seed
+    rng mut rand.Rand = rand.Rand(seed)
+    Width I64 = widthOf(hidden)
+    phi mut Array<<T>>& = Array<<T>>(Width)            # this moment's hidden activities
+    # the circuit is made by a function rather than recorded here: a constructor pushing onto a List of a field of its
+    # own puts the List's storage in its own scope, which closes when it returns (olang ef939ae, repro/ctorpush)
+    Net mut circuit.Circuit<<T>>& = circuitFor(phi, observations, actions, hidden, Config, rng)
+    Sensors circuit.Region = circuit.Region(0)          # the regions, in the order circuitFor records them
+    Context circuit.Region = circuit.Region(1)
+    Inner circuit.Region = circuit.Region(2)            # the first hidden region; the others follow it
+    Choice circuit.Region = circuit.Region(2 + hidden.Len())
+    Elig mut circuit.Eligibility<<T>>& = circuit.Eligibility<<T>>(Net)
+    Opt mut optim.FlatAdamW<<T>>& = optim.FlatAdamW<<T>>(Net.ParamCount, Config.Rate)
+    Mem mut Memory<<T>>& = Memory<<T>>(observations, actions, Config.MemoryDecay, Config.MemoryRate, Config.MemoryGain)
+    Ctx mut Trace<<T>>& = Trace<<T>>(Width, Config.TraceRate, Config.TraceGain)
+    Judge mut Critic<<T>>& = Critic<<T>>(Width, Config.CriticRate)
+    Mood mut Arousal = Arousal(Config.Slow, Config.Fast, Config.Eps, Config.Critical, Config.Threshold)
+    lastPhi mut Array<<T>>& = Array<<T>>(Width)        # the last moment's: its state's features
+    lastKey mut Array<<T>>& = Array<<T>>(observations) # the last moment's observation
+    probs mut Array<F64>& = Array<F64>(actions)
+    LastAction mut I64 = -1
+    lastAroused mut Bool = false                        # the last moment kept a contrast to learn from
+    started mut Bool = false
+    tolerance mut F64 = lifeTolerance(Net, Config.Temperature)
+    budget mut I64 = lifeBudget(Net, Config.Budget, tolerance)
+    LastDelta mut F64 = 0.0                             # the last moment's TD error, clipped
+    Draws mut I64 = 0                                   # numbers drawn for sampling since the generator was made
+    Moments mut I64 = 0
+    Calm mut I64 = 0
+    Aroused mut I64 = 0
+    Sweeps mut I64 = 0
+    Refused mut I64 = 0
+}
+
+# an agent that cannot go on - a call out of order: stops with what is wrong
+fn stop(what String&) {
+    try io.PrintErr("oann agent: " $what "\n") catch { }
+    fail
+}
+
+fn widthOf(sizes Array<I64>&) I64 {
+    if sizes.Len() == 0 { stop("an agent needs a hidden region") }
+    sum I64 = 0
+    for s in sizes { sum += s }
+    return sum
+}
+
+# an agent's circuit of T (like's elements), planned and certified: the observation (region 0) and the context (1) as inputs, one-way into the
+# first hidden region (2); the hidden regions, recorded one after another so their activities are one run of
+# columns, reciprocal in a chain; the last reciprocal with the readout (2 + the hidden regions)
+fn circuitFor(like Array<<T>>&, observations I64, actions I64, hidden Array<I64>&, s Settings, r mut rand.Rand&) circuit.Circuit<<T>>& {
+    c circuit.Circuit<<T>>&return = circuit.Circuit<<T>>(1)
+    sensors := c.Input(observations)
+    context := c.Input(widthOf(hidden))
+    first := c.Hidden(hidden[0])
+    for i in range 1, hidden.Len() { c.Hidden(hidden[i]) }
+    choice := c.Readout(actions, circuit.Cost.CrossEntropy(s.Temperature))
+    c.Project(sensors, first, circuit.Wiring.OneWay)
+    c.Project(context, first, circuit.Wiring.OneWay)
+    for i in range 1, hidden.Len() { c.Project(circuit.Region(first + i - 1), circuit.Region(first + i)) }
+    c.Project(circuit.Region(first + hidden.Len() - 1), choice)
+    c.Plan(r)
+    c.Certify(s.Certified)
+    return c
+}
+
+# the life tolerance (docs/settling.md 1.10): every logit of the policy within T / 40 of its equilibrium, so each
+# log-probability within 5%, is a residual of T (1 - kappa) / 40 - kappa held at most 0.9
+fn lifeTolerance(c mut circuit.Circuit<<T>>&, temperature F64) F64 {
+    return temperature * (1.0 - math.Min(c.Gain(), 0.9)) / 40.0
+}
+
+fn lifeBudget(c mut circuit.Circuit<<T>>&, least I64, tolerance F64) I64 {
+    n := c.Budget(tolerance)
+    return n if n > least else least
+}
+
+# the drives of a moment: the observation, the context trace, the memories' read of the observation on the readout
+fn (a mut Agent<<T>>&) drive(obs Array<<T>>&) {
+    d := a.Net.DriveData(a.Sensors)
+    for i in range a.Observations { d[i] = obs[i] }
+    a.Ctx.Drive(a.Net.DriveData(a.Context))
+    a.Mem.Read(obs, a.Net.DriveData(a.Choice))
+}
+
+fn (a mut Agent<<T>>&) settle(p circuit.Phase) ? circuit.NotSettled {
+    st := try a.Net.Settle(p, a.budget, a.tolerance)
+    a.Sweeps += st.Sweeps
+}
+
+# the hidden activities of the free state, into phi: the critic's features and what the context trace follows
+fn (a mut Agent<<T>>&) features() {
+    v := a.Net.Value(circuit.Phase.Free)
+    at I64 = a.Observations + a.Width
+    for i in range a.Width { a.phi[i] = v.Get(0, at + i) }
+}
+
+# the policy of the free state, softmax(s_out / T), into probs
+fn (a mut Agent<<T>>&) policy() {
+    s := a.Net.Activity(circuit.Phase.Free, a.Choice)
+    top F64 = F64(s.Get(0, 0))
+    for j in range 1, a.Actions { top = math.Max(top, F64(s.Get(0, j))) }
+    sum F64 = 0.0
+    for j in range a.Actions {
+        a.probs[j] = math.Exp((F64(s.Get(0, j)) - top) / a.Config.Temperature)
+        sum += a.probs[j]
+    }
+    for j in range a.Actions { a.probs[j] = a.probs[j] / sum }
+}
+
+# an action drawn from the policy, from the agent's generator
+fn (a mut Agent<<T>>&) sample() I64 {
+    u := a.rng.Float()
+    a.Draws++
+    acc F64 = 0.0
+    for j in range a.Actions - 1 {
+        acc += a.probs[j]
+        if u < acc { return j }
+    }
+    return a.Actions - 1
+}
+
+# the most probable action
+fn (a Agent<<T>>&) greedy() I64 {
+    best I64 = 0
+    for j in range 1, a.Actions {
+        if a.probs[j] > a.probs[best] { best = j }
+    }
+    return best
+}
+
+# an aroused moment's nudged phases toward action, +beta and -beta from the free state - what the next moment's
+# contrast reads; whether both qualified
+fn (a mut Agent<<T>>&) nudge(action I64) Bool {
+    a.Net.LabelData(a.Choice)[0] = I32(action)
+    for k in range 2 {
+        p := circuit.Phase.Plus if k == 0 else circuit.Phase.Minus
+        a.Net.Warm(p, circuit.Phase.Free)
+        a.Net.Nudge(p, a.Config.Beta if k == 0 else -a.Config.Beta)
+        try a.settle(p) catch circuit.NotSettled {
+            a.Refused++
+            return false
+        }
+    }
+    return true
+}
+
+# the first moment: an observation and no outcome yet. Gives the action
+fn (a mut Agent<<T>>&) Begin(obs Array<<T>>&) I64 ? circuit.NotSettled {
+    if a.started { stop("Begin twice") }
+    a.drive(obs)
+    try a.settle(circuit.Phase.Free)
+    a.features()
+    a.started = true
+    return a.act(obs, a.Mood.Aroused)
+}
+
+# one moment (docs/settling.md 1.8): the outcome of the last action - reward, and whether it ended an episode
+# (terminal: the value of what follows is 0, and the eligibility traces forget) - arrives with the next observation.
+# The agent settles on it (warm), measures the TD error and its arousal, learns from the outcome if the last moment
+# was aroused (memory write, the actor's step from delta and the eligibility, the critic's), settles again on the
+# moved weights, and chooses: sampled with the nudged phases when aroused, greedy when calm. Gives the action. Refuses
+# (NotSettled) when the free settle does not qualify, with nothing changed: no action, no write
+fn (a mut Agent<<T>>&) Step(obs Array<<T>>&, reward F64, terminal Bool = false) I64 ? circuit.NotSettled {
+    if not a.started { stop("Step before Begin") }
+    a.drive(obs)
+    try a.settle(circuit.Phase.Free) catch circuit.NotSettled {
+        a.Refused++
+        error circuit.NotSettled.BUDGET
+    }
+    a.features()
+    next F64 = 0.0 if terminal else a.Config.Gamma * a.Judge.Value(a.phi)
+    delta F64 = math.Clamp(reward + next - a.Judge.Value(a.lastPhi), -1.0, 1.0)
+    a.LastDelta = delta
+    aroused := a.Mood.Update(delta, reward)
+    decay F64 = a.Config.Gamma * a.Config.Lambda
+    if a.lastAroused {
+        a.Mem.Write(a.lastKey, a.LastAction, reward, math.Abs(delta))
+        a.Net.Contrast(a.Config.Beta)
+        a.Elig.Add(a.Net, decay)
+        a.Elig.Credit(a.Net, delta)
+        a.Opt.Step(a.Net.ParamData(), a.Net.GradData())
+        a.Judge.Learn(delta, a.lastPhi, decay)
+        a.tolerance = lifeTolerance(a.Net, a.Config.Temperature)
+        a.budget = lifeBudget(a.Net, a.Config.Budget, a.tolerance)
+        # the weights moved and the memory changed: settle again, warm (a refusal keeps the state just settled)
+        a.drive(obs)
+        try a.settle(circuit.Phase.Free) catch circuit.NotSettled { a.Refused++ }
+        a.features()
+    } else {
+        a.Elig.Decay(decay)
+        a.Judge.Fade(decay)
+    }
+    if terminal {
+        a.Elig.Clear()
+        a.Judge.Clear()
+    }
+    return a.act(obs, aroused)
+}
+
+# the choice of a moment settled on obs: sampled, with the nudged phases, when aroused; greedy when calm. Then the
+# context trace follows the hidden activity, and what the next moment learns from is kept
+fn (a mut Agent<<T>>&) act(obs Array<<T>>&, aroused Bool) I64 {
+    a.policy()
+    action I64 = 0
+    if aroused {
+        action = a.sample()
+        a.lastAroused = a.nudge(action)
+        a.Aroused++
+    } else {
+        action = a.greedy()
+        a.lastAroused = false
+        a.Calm++
+    }
+    a.Ctx.Follow(a.phi)
+    for i in range a.Observations { a.lastKey[i] = obs[i] }
+    for i in range a.Width { a.lastPhi[i] = a.phi[i] }
+    a.LastAction = action
+    a.Mem.Fade()
+    a.Moments++
+    return action
+}
+
+# settles obs in the scratch phase, from the free state, with the context trace and the memories as they are, and
+# changes nothing the agent keeps (the drives are rewritten by the next moment anyway): its answer is
+# a.Net.Activity(circuit.Phase.Scratch, a.Choice)
+fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) circuit.Settlement ? circuit.NotSettled {
+    a.drive(obs)
+    a.Net.Warm(circuit.Phase.Scratch, circuit.Phase.Free)
+    a.Net.Nudge(circuit.Phase.Scratch, 0)
+    return try a.Net.Settle(circuit.Phase.Scratch, a.budget, a.tolerance)
+}
+
+# the policy of the last moment's free state (what it chose from)
+fn (a Agent<<T>>&) Policy(j I64) F64 {
+    return a.probs[j]
+}
+
+# ---- checkpoints ----
+
+# a checkpoint that cannot be read back into this agent
+error CheckpointError {
+    FORMAT                              # not an agent's checkpoint: no header, or a tensor missing or misshapen
+    MISMATCH                            # an agent of another shape or seed, or one that has lived already
+}
+
+# a checkpoint as it is written: the header's text (safetensors' JSON) and the tensors' values one after another
+type gathering struct() {
+    header mut StringBuilder& = StringBuilder()
+    Values mut List<F64>& = List<F64>()
+}
+
+# a tensor of x's elements, as F64 - rows of them (one row when rows is 0)
+fn (g mut gathering&) add(name String&, x Array<<E>>&, rows I64 = 0) {
+    zero F64 = 0.0
+    start := g.Values.Len()
+    for v in x { g.Values.Push(linalg.Cast(v, zero)) }
+    shape := $(x.Len()) if rows == 0 else $rows "," $(x.Len() / rows)
+    g.header.Push("," $name ":{\"dtype\":\"F64\",\"shape\":[" $shape "],\"data_offsets\":[" $(8 * start) "," $(8 * g.Values.Len()) "]}")
+}
+
+# the file: the header's length (8 bytes, little-endian), the header padded with spaces to a multiple of 8, the data
+fn (g mut gathering&) bytes() Array<U8>& {
+    g.header.PushChar('}')
+    for g.header.Len() % 8 != 0 { g.header.PushChar(' ') }
+    text := g.header.ToString()
+    n := text.Len()
+    out Array<U8>&return = Array<U8>(8 + n + 8 * g.Values.Len())
+    for k in range 8 { out[k] = U8((U64(n) >> U64(8 * k)) & 255) }
+    for i in range n { out[8 + i] = U8(text[i]) }
+    for i in range g.Values.Len() {
+        bits := g.Values[i].Bits()
+        for k in range 8 { out[8 + n + 8 * i + k] = U8((bits >> U64(8 * k)) & 255) }
+    }
+    return out
+}
+
+# tensor name of a checkpoint (its header doc, its data from base in text) into out, which must be its length
+fn fetch(doc json.Json&, text String&, base I64, name String&, out mut Array<F64>&) ? CheckpointError {
+    entry := try doc[name] catch { error CheckpointError.FORMAT }
+    place := try entry["data_offsets"] catch { error CheckpointError.FORMAT }
+    offsets := try place.AsArr() catch { error CheckpointError.FORMAT }
+    if offsets.Len() != 2 { error CheckpointError.FORMAT }
+    b := try offsets[0].AsInt() catch { error CheckpointError.FORMAT }
+    e := try offsets[1].AsInt() catch { error CheckpointError.FORMAT }
+    if e - b != 8 * out.Len() { error CheckpointError.MISMATCH }
+    if b < 0 or base + e > text.Len() { error CheckpointError.FORMAT }
+    for i in range out.Len() {
+        bits U64 = 0
+        for k in range 8 { bits = bits | (U64(U8(text[base + b + 8 * i + k])) << U64(8 * k)) }
+        out[i] = bits.F64FromBits()
+    }
+}
+
+# into's elements from an F64 tensor's values
+fn put(from Array<F64>&, into mut Array<<E>>&) {
+    zero <E>
+    for i in range into.Len() { into[i] = linalg.Cast(from[i], zero) }
+}
+
+# the scalars a checkpoint keeps, in order
+fn (a Agent<<T>>&) scalars() Array<F64>& {
+    out Array<F64>&return = F64[a.Elig.Pending, a.Judge.B, a.Judge.zb, a.Mem.Pending, a.Mood.Scale, a.Mood.Surprise,
+        a.Mood.Recent, a.Mood.LongRun, a.Mood.Spread, a.Mood.Want, a.Mood.Level, F64(a.Mood.Outcomes),
+        1.0 if a.Mood.Aroused else 0.0, 1.0 if a.lastAroused else 0.0, F64(a.LastAction), 1.0 if a.started else 0.0,
+        F64(a.Opt.Steps), F64(a.Draws), F64(a.Moments), F64(a.Calm), F64(a.Aroused), F64(a.Sweeps), F64(a.Refused),
+        a.LastDelta, a.tolerance, F64(a.budget), F64(a.Seed >> 32), F64(a.Seed & U64(0xFFFFFFFF))]
+    return out
+}
+
+# writes everything the agent's next moments depend on to path, in the safetensors layout (all tensors F64, so an F32
+# agent's values round trip exactly): the circuit's parameters and its free and nudged states (the next moment's
+# contrast reads them), Adam's moments, the eligibility trace, the critic and its trace, the context trace, both
+# memories, the last moment's observation and features, and the scalars - arousal's statistics, pending decays,
+# counters, the pending action, and the generator as its seed and the numbers drawn from it
+fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
+    g := gathering()
+    g.header.Push("{\"__metadata__\":{\"format\":\"oann.agent\",\"version\":\"1\",\"observations\":\"" $(a.Observations)
+        "\",\"actions\":\"" $(a.Actions) "\",\"width\":\"" $(a.Width) "\",\"parameters\":\"" $(a.Net.ParamCount) "\"}")
+    g.add("\"circuit.params\"", a.Net.ParamData())
+    for k in range 4 {
+        p := circuit.Phase.Free if k < 2 else (circuit.Phase.Plus if k == 2 else circuit.Phase.Minus)
+        m := a.Net.Potential(p) if k == 0 else a.Net.Value(p)
+        g.add("\"circuit." $k "\"", m.Data[:a.Net.Neurons])
+    }
+    g.add("\"adam.m\"", a.Opt.M)
+    g.add("\"adam.v\"", a.Opt.V)
+    g.add("\"eligibility\"", a.Elig.E)
+    g.add("\"critic.w\"", a.Judge.W)
+    g.add("\"critic.z\"", a.Judge.z)
+    g.add("\"trace\"", a.Ctx.Value)
+    g.add("\"memory.persistent\"", a.Mem.c, a.Observations)
+    g.add("\"memory.fast\"", a.Mem.f, a.Observations)
+    g.add("\"last.key\"", a.lastKey)
+    g.add("\"last.features\"", a.lastPhi)
+    g.add("\"scalars\"", a.scalars())
+    try os.WriteFile(path, g.bytes())
+}
+
+# reads a checkpoint Save wrote into this agent, which must be new (made with the same shape, seed and settings, and
+# never begun): afterwards its moments are exactly those the saved agent's would have been
+fn (a mut Agent<<T>>&) Restore(path String&) ? os.OsError + CheckpointError {
+    if a.started or a.Moments > 0 or a.Draws > 0 { error CheckpointError.MISMATCH }
+    text := try os.ReadFile(path)
+    if text.Len() < 8 { error CheckpointError.FORMAT }
+    n I64 = 0
+    for k in range 8 { n = n | (I64(U8(text[k])) << (8 * k)) }
+    if n < 2 or 8 + n > text.Len() { error CheckpointError.FORMAT }
+    doc := try json.Parse(text[8:8 + n]) catch { error CheckpointError.FORMAT }
+    base I64 = 8 + n
+    params := Array<F64>(a.Net.ParamCount)
+    try fetch(doc, text, base, "circuit.params", params)
+    put(params, a.Net.ParamData())
+    row := Array<F64>(a.Net.Neurons)
+    for k in range 4 {
+        try fetch(doc, text, base, "circuit." $k, row)
+        p := circuit.Phase.Free if k < 2 else (circuit.Phase.Plus if k == 2 else circuit.Phase.Minus)
+        m := a.Net.Potential(p) if k == 0 else a.Net.Value(p)
+        put(row, m.Data[:a.Net.Neurons])
+    }
+    try fetch(doc, text, base, "adam.m", params)
+    put(params, a.Opt.M)
+    try fetch(doc, text, base, "adam.v", params)
+    put(params, a.Opt.V)
+    try fetch(doc, text, base, "eligibility", params)
+    put(params, a.Elig.E)
+    try fetch(doc, text, base, "critic.w", a.Judge.W)
+    try fetch(doc, text, base, "critic.z", a.Judge.z)
+    width := Array<F64>(a.Width)
+    try fetch(doc, text, base, "trace", width)
+    put(width, a.Ctx.Value)
+    try fetch(doc, text, base, "last.features", width)
+    put(width, a.lastPhi)
+    keys := Array<F64>(a.Observations)
+    try fetch(doc, text, base, "last.key", keys)
+    put(keys, a.lastKey)
+    stores := Array<F64>(a.Observations * a.Actions)
+    try fetch(doc, text, base, "memory.persistent", stores)
+    put(stores, a.Mem.c)
+    try fetch(doc, text, base, "memory.fast", stores)
+    put(stores, a.Mem.f)
+    v := Array<F64>(a.scalars().Len())
+    try fetch(doc, text, base, "scalars", v)
+    if U64(v[26]) != (a.Seed >> 32) or U64(v[27]) != (a.Seed & U64(0xFFFFFFFF)) { error CheckpointError.MISMATCH }
+    a.Elig.Pending = v[0]
+    a.Judge.B = v[1]
+    a.Judge.zb = v[2]
+    a.Mem.Pending = v[3]
+    a.Mood.Scale = v[4]
+    a.Mood.Surprise = v[5]
+    a.Mood.Recent = v[6]
+    a.Mood.LongRun = v[7]
+    a.Mood.Spread = v[8]
+    a.Mood.Want = v[9]
+    a.Mood.Level = v[10]
+    a.Mood.Outcomes = I64(v[11])
+    a.Mood.Aroused = v[12] == 1.0
+    a.lastAroused = v[13] == 1.0
+    a.LastAction = I64(v[14])
+    a.started = v[15] == 1.0
+    a.Opt.Steps = I64(v[16])
+    a.Moments = I64(v[18])
+    a.Calm = I64(v[19])
+    a.Aroused = I64(v[20])
+    a.Sweeps = I64(v[21])
+    a.Refused = I64(v[22])
+    a.LastDelta = v[23]
+    a.tolerance = v[24]
+    a.budget = I64(v[25])
+    for i in range I64(v[17]) { a.rng.Float() }
+    a.Draws = I64(v[17])
+}
+
+# ---- tests (docs/settling.md 5.3, 5.5) ----
+
+test "arousal follows its recursions: three outcomes computed by hand" {
+    a := Arousal()
+    want := F64[0.005, 83.33333333333333, 0.1, 0.01, 0.0099, 0.0, 8.333333333333334,
+        0.0069500000000000004, 25.157232704402517, 0.09, 0.0099, 0.0099, 0.0, 10.015723270440253,
+        0.014880500000000001, 50.37624759925695, -0.019000000000000017, -0.00019899999999999952, 0.01979901,
+        0.9039372547058739, 14.14216942879251]
+    outcomes := F64[0.5, 1.0, -0.2, 0.0, 0.8, -1.0]
+    for k in range 3 {
+        assert a.Update(outcomes[2 * k], outcomes[2 * k + 1])          # the critical period
+        got := F64[a.Scale, a.Surprise, a.Recent, a.LongRun, a.Spread, a.Want, a.Level]
+        for j in range 7 { assert math.Abs(got[j] - want[7 * k + j]) <= 1e-12 * math.Max(1.0, math.Abs(want[7 * k + j])) }
+    }
+}
+
+test "arousal: calm once the critical period ends, aroused within a few moments of a change, calm again after" {
+    a := Arousal()
+    first I64 = -1
+    last I64 = -1
+    for k in range 1200 {
+        sign F64 = 1.0 if k % 2 == 1 else -1.0
+        aroused := a.Update(0.1 * sign, 1.0) if k < 600 else a.Update(0.5 * sign, 0.0)
+        if k < 100 { assert aroused }                                    # the critical period
+        if k >= 100 and k < 600 { assert not aroused and a.Level < 2.0 }
+        if k >= 600 and aroused {
+            if first < 0 { first = k }
+            last = k
+        }
+    }
+    assert first >= 600 and first <= 600 + 10                           # within 1 / Fast moments
+    assert last < 900 and not a.Aroused                                  # and it falls back
+    try io.Print("arousal: aroused " $(first - 600) " moments after the change, calm again after " $(last - 600) "\n") catch { }
+}
+
+test "memory: a read after a write returns the value, orthogonal keys do not interfere, overlapping ones by their dot" {
+    m := Memory<F64>(4, 3)
+    x := F64[1.0, 2.0, 0.0, 0.0]
+    y := F64[0.0, 0.0, 3.0, 0.0]
+    q := F64[1.0, 1.0, 0.0, 0.0]
+    out := Array<F64>(3)
+    m.Write(x, 1, 0.7, 0.0)
+    m.Read(x, out)
+    assert math.Abs(out[1] - 0.7) < 1e-15 and out[0] == 0.0 and out[2] == 0.0
+    m.Read(y, out)
+    assert out[0] == 0.0 and out[1] == 0.0 and out[2] == 0.0
+    m.Read(q, out)
+    dot F64 = 3.0 / (math.Sqrt(5.0) * math.Sqrt(2.0))
+    assert math.Abs(out[1] - 0.7 * dot) < 1e-15
+    # the fast store fades by Decay a moment; the persistent one does not
+    slow F64 = 0.02 * 0.7
+    for n in range 1, 6 {
+        m.Fade()
+        m.Read(x, out)
+        assert math.Abs(out[1] - (slow + math.Pow(0.95, F64(n)) * (0.7 - slow))) < 1e-15
+    }
+    # repeated writes move the persistent store toward the value as (1 - c')^n, c' = min(1, c0 (1 + surprise))
+    p := Memory<F64>(4, 3)
+    rate F64 = 0.02 * (1.0 + 0.5)
+    for n in range 1, 30 {
+        p.Write(x, 2, -0.4, 0.5)
+        p.unit(x)
+        assert math.Abs(p.at(p.c, 1.0, 2) - (-0.4) * (1.0 - math.Pow(1.0 - rate, F64(n)))) < 1e-14
+    }
+}
+
+test "the critic: with every outcome an episode's end, V converges to the reward" {
+    c := Critic<F64>(3)
+    phi := F64[0.5, -0.25, 1.0]
+    for k in range 200 {
+        delta F64 = 0.8 - c.Value(phi)
+        c.Clear()
+        c.Learn(delta, phi, 0.891)
+    }
+    assert math.Abs(c.Value(phi) - 0.8) < 1e-6
+}
+
+# a small life: observations of four, two actions, a hidden region of eight; arousal set by the settings
+fn little(s Settings, seed U64) Agent<F64> {
+    a Agent<F64>&return = Agent<F64>(4, 2, I64[8], seed, s)
+    return a
+}
+
+test "calm moments change nothing that learns: parameters, optimizer, eligibility, critic and memories as they were" {
+    s := Settings()
+    s.Critical = 0
+    s.Threshold = 1e9                               # never aroused after the first moment
+    a := little(s, 3)
+    obs := F64[0.5, -0.3, 0.8, 0.1]
+    try a.Begin(obs) catch { fail }
+    try a.Step(obs, 1.0) catch { fail }             # learns from the first, aroused, moment
+    try a.Step(obs, 0.5) catch { fail }
+    params := Array<F64>(a.Net.ParamCount)
+    trace := Array<F64>(a.Net.ParamCount)
+    for i in range params.Len() {
+        params[i] = a.Net.ParamData()[i]
+        trace[i] = a.Elig.E[i]
+    }
+    c := Array<F64>(8)
+    f := Array<F64>(8)
+    for i in range 8 {
+        c[i] = a.Mem.c[i]
+        f[i] = a.Mem.f[i]
+    }
+    w := a.Judge.W[3]
+    steps := a.Opt.Steps
+    for k in range 5 {
+        obs[0] = F64(k) * 0.1
+        try a.Step(obs, F64(k)) catch { fail }
+        assert a.Mood.Aroused == false
+    }
+    for i in range params.Len() { assert a.Net.ParamData()[i] == params[i] and a.Elig.E[i] == trace[i] }
+    for i in range 8 { assert a.Mem.c[i] == c[i] and a.Mem.f[i] == f[i] }
+    assert a.Judge.W[3] == w and a.Opt.Steps == steps and a.Calm == 7 and a.Aroused == 1
+}
+
+test "Imagine settles an observation and changes nothing the agent keeps" {
+    a := little(Settings(), 4)
+    obs := F64[0.5, -0.3, 0.8, 0.1]
+    try a.Begin(obs) catch { fail }
+    first := try a.Step(obs, 1.0) catch { fail }
+    free := a.Net.Value(circuit.Phase.Free).Clone()
+    context := a.Ctx.Value[2]
+    try a.Imagine(F64[-1.0, 1.0, 0.0, 0.5]) catch { fail }
+    assert a.Net.Value(circuit.Phase.Free).MaxAbsDifference(free) == 0.0 and a.Ctx.Value[2] == context
+    assert a.Net.Activity(circuit.Phase.Scratch, a.Choice).MaxAbsDifference(a.Net.Activity(circuit.Phase.Free, a.Choice)) > 0.0
+    assert first >= 0
+}
+
+# a world for the checkpoint's test: moment t's observation, and what action pays at t
+fn scene(t I64, obs mut Array<F64>&) {
+    for j in range obs.Len() { obs[j] = math.Sin(F64(7 * t + 3 * j)) }
+}
+
+fn payoff(t I64, action I64) F64 {
+    return 1.0 if action == t % 2 else -1.0
+}
+
+# n moments of a's life from moment t0, its actions into acts
+fn livedFrom(a mut Agent<F64>&, t0 I64, n I64, acts mut Array<I64>&) {
+    obs := Array<F64>(4)
+    action := a.LastAction
+    for t in range t0, t0 + n {
+        r := payoff(t, action)
+        scene(t, obs)
+        action = try a.Step(obs, r, true) catch { fail }
+        acts[t - t0] = action
+    }
+}
+
+test "a checkpoint restores a life exactly: the restored agent's moments are the saved one's" {
+    s := Settings()
+    s.Critical = 60
+    s.Threshold = 3.0                               # some moments calm, some aroused
+    a := little(s, 5)
+    obs := Array<F64>(4)
+    scene(0, obs)
+    try a.Begin(obs) catch { fail }
+    early := Array<I64>(150)
+    livedFrom(a, 1, 150, early)
+    path := "build/agent_checkpoint_test.safetensors"
+    try a.Save(path) catch { fail }
+    late := Array<I64>(100)
+    livedFrom(a, 151, 100, late)
+    b := little(s, 5)
+    try b.Restore(path) catch { fail }
+    again := Array<I64>(100)
+    livedFrom(b, 151, 100, again)
+    for i in range 100 { assert late[i] == again[i] }
+    for i in range a.Net.ParamCount { assert a.Net.ParamData()[i] == b.Net.ParamData()[i] and a.Elig.E[i] == b.Elig.E[i] }
+    for i in range a.Mem.c.Len() { assert a.Mem.c[i] == b.Mem.c[i] and a.Mem.f[i] == b.Mem.f[i] }
+    assert a.Mood.Level == b.Mood.Level and a.Draws == b.Draws and a.Opt.Steps == b.Opt.Steps and a.Calm == b.Calm
+    try io.Print("checkpoint: " $(a.Aroused) " aroused, " $(a.Calm) " calm, " $(a.Draws) " draws\n") catch { }
+    assert a.Aroused > 1 and a.Calm > 1 and a.Draws > 1             # the stretch held both kinds of moment
+    # a used agent cannot be restored into, and a file that is no checkpoint is refused
+    refused Bool = false
+    try a.Restore(path) catch CheckpointError.MISMATCH { refused = true } catch { fail }
+    assert refused
+    try os.WriteFile(path, U8[3, 0, 0, 0, 0, 0, 0, 0, 120, 120, 120]) catch { fail }
+    c := little(s, 5)
+    refused = false
+    try c.Restore(path) catch CheckpointError.FORMAT { refused = true } catch { fail }
+    assert refused
+    try os.Remove(path) catch { }
+}
+
+test "an agent learns a contextual bandit: two contexts, two arms, the right arm paying 1 and the other -1" {
+    a := little(Settings(), 9)
+    obs := Array<F64>(4)
+    best := I64[1, 0]
+    right I64 = 0
+    c I64 = 0
+    obs[0] = 1.0
+    action := try a.Begin(obs) catch { fail }
+    for t in range 1, 1500 {
+        r F64 = 1.0 if action == best[c] else -1.0
+        if t > 1000 and r > 0.0 { right++ }
+        c = (t * 7 + t / 3) % 2
+        obs[0] = 1.0 if c == 0 else 0.0
+        obs[1] = 1.0 - obs[0]
+        action = try a.Step(obs, r, true) catch { fail }
+    }
+    try io.Print("bandit: " $right " of the last 499 moments right, " $(a.Calm) " calm, " $(a.Aroused) " aroused\n") catch { }
+    assert right > 450 and a.Calm > a.Aroused
+}
