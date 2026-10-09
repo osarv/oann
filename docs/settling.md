@@ -369,6 +369,15 @@ Sleep consolidates what the system produces, mistakes included; it does not corr
 asymmetry is deliberate and stated: the day is local (delta rule), the night is backpropagation through time. It reuses
 oann's graph machinery (2.7).
 
+*As built (phase 4, 2.13):* the slow part learns by day the observed output less the store's read, the gradient of the
+whole output's loss with nothing through the store; dawn writes the residuals in passes until they read back. Two of
+this section's choices proved to decide whether sleep helps at all (5.10): the slow weights' learning by day has to be
+slow (it is off by default - a day of new learning that moves them far corrupts the old memories' dreams before the
+night consolidates them), and the store has to separate patterns, much sparser than 1.6's 5% (0.5% of 150 cells per
+number of its key) - with 5% a new task's writes land on an old one's cells and the night consolidates the
+interference. Both are what complementary learning systems ask of the two learners: a slow neocortex, a hippocampus
+that separates patterns.
+
 ### 1.10 Sizes, budgets and cost
 
 **Planning classes** (oann's; the model fixes none):
@@ -527,7 +536,9 @@ The sparse-code store needs a top-k, a gather-weighted read and a `k`-row write 
 on a CPU (on an FPGA it can be regenerated from the seed instead, section 4). *Built in phase 3* (`store.olang`, 2.12);
 the consolidator and sleep are phase 4. The consolidator is a `Graph` model (the
 recurrent cell unrolled over a window, BPTT) with the store as a `Custom` op; `Sleep` is: dream the cues (forward with
-the store), freeze the dreams, train the slow weights on them with the store excluded, rewrite the store.
+the store), freeze the dreams, train the slow weights on them with the store excluded, rewrite the store. *Built in
+phase 4* (`consolidator.olang`, 2.13) - with no `Custom` op: nothing flows back through the store's read, so it enters
+as a shift of the slow part's target rather than as a node of the graph (decision 53).
 
 ### 2.8 API sketch (olang)
 
@@ -615,6 +626,12 @@ fn (a mut Agent<<T>>&) Imagine(obs Array<<T>>&) Settlement ? NotSettled    # pha
 fn Board(c mut Circuit<<T>>&) board.Engine&                                # phase 3: the board's engine, simulated
 fn (e mut Engine&) Teach(c mut Circuit<<T>>&, n I64, l Lesson) I64 ? NotSettled   # settles on the board, learns in c
 type Store<T> struct(inputs I64, outputs I64, seed U64, ...)                # phase 3: the sparse-code store
+fn (e Engine&) LifOf(region I64) Neuron                                     # phase 4: a Lif region as the board runs it
+type Consolidator<T> struct(inputs I64, outputs I64, hidden I64, window I64, batch I64, seed U64,
+        Config SleepSettings = SleepSettings())                             # phase 4: 1.9's slow part and store
+fn (k mut Consolidator<<T>>&) Day(u Array<<T>>&, y Array<<T>>&, n I64)      # phase 4: n sequences seen by day
+fn (k mut Consolidator<<T>>&) Sleep(passes I64 = 0) F64                     # phase 4: a night over every cue kept
+fn (k mut Consolidator<<T>>&) Predict(u Array<<T>>&, first I64, n I64, out mut Array<<T>>&, withStore Bool = true)
 ```
 
 ### 2.9 Phases of work
@@ -631,7 +648,10 @@ Settling networks follow the transformer work (section 6).
 3. **Done (2026-10-09, `board.olang`, `store.olang`, `sparse.olang`):** the fixed-point simulation of the board engine
    (4.2, 5.6), with lessons settled on it; the sparse-code store and the checks of 5.3.2; readout groups (circuit and
    agent); CSR projections for large circuits. Results in 2.12 and 5.9.
-4. The consolidator and `Sleep` on the `Graph`; the PYNQ-Z2 overlay; further neuron models (spiking, section 4.6).
+4. **Done (2026-10-09, `consolidator.olang`, spiking in `board.olang`), but for the overlay:** the consolidator and
+   `Sleep` on the `Graph` with the checks of 5.4 and sleep measured against interference; spiking neurons on the board
+   engine, validated against the floating-point ones; checkpoints that keep the generator's state; open questions 8 and
+   10 measured. The PYNQ-Z2 overlay waits for an FPGA toolchain. Results in 2.13 and 5.10.
 
 ### 2.10 As built: phase 1
 
@@ -710,9 +730,12 @@ test`); `examples/xor_settle.olang`, `examples/xor_spiking.olang` and `examples/
   - Saved: the parameters; the free state and the nudged states the next contrast reads; Adam's moments; the
     eligibility; the critic and its trace; the context trace; both memories; the last moment's observation and
     features; and the scalars (arousal's statistics, pending decays, counters, the pending action and the generator).
-  - std/rand gives no access to a generator's state, so the agent owns its generator (made from a seed) and the
-    checkpoint keeps the seed and the count of numbers drawn. A restore replays them, so it is into a new agent of the
-    same shape, seed and settings, and the restored agent then lives exactly the saved one's moments (checked).
+  - std/rand gave no access to a generator's state, so the agent owns its generator (made from a seed) and the
+    checkpoint kept the seed and the count of numbers drawn; a restore replayed them, so it went into a new agent of the
+    same shape, seed and settings, and the restored agent then lived exactly the saved one's moments (checked).
+    *Since phase 4* (decision 48) the checkpoint keeps the generator's state (`Rand.State`, version 2): a restore needs
+    no replay, so it goes into any agent of the same shape and settings - one made from another seed, or the agent that
+    saved it, rolled back - and the restored agent lives exactly the saved one's moments (checked both ways).
 - **The circuit is made by a function** (`circuitFor`), not recorded in the agent's constructor. A constructor
   that pushes onto a `List` of one of its own reference fields puts the list's storage in its own scope, which closes
   when it returns: a use-after-free in olang ef939ae (`repro/ctorpush.olang`). Recording the circuit in the constructor
@@ -757,7 +780,7 @@ ones. Results in 5.9; decisions 31-47.
   so one BRAM18 pair - interpolated linearly with an 8-bit fraction: `tanh`, and the hard sigmoid through the same
   table (exact between knots). Its largest error over all `2^18` inputs is 4.7e-5, 1.5 steps of Q1.15, within the
   derived 5.4e-5 (4.2's `h^2/8 max|tanh''|` plus the two roundings). Linear relaxing neurons and spiking circuits are not
-  for this engine (decision 36).
+  for this engine (decision 36; spiking circuits are, since phase 4: 2.13).
 - *The cross-entropy force* takes a softmax per group every sweep: `z = (s - max s) / T` rounded to Q5.14 and clamped at
   -16, a second table for `exp` over `[-16, 0]` (largest error 4.0e-5), their sum, and one division per neuron (decision
   37). The squared error's force is a subtraction.
@@ -808,6 +831,68 @@ block is stored dense (absent synapses as masked zeros) or sparse, and at densit
 `MulAddT` into pre, its contrast `Sampled` - the batch's products sampled at the synapses only - both on the rows in
 use transposed into feature-major once a sweep (one row is used as it is). The certificate, `Restrain`, `Energy` and
 `DriveGrad` all read sparse blocks. On the board a sparse block is stored densely (decision 46).
+
+### 2.13 As built: phase 4 - sleep, spiking on the board, checkpoints
+
+One new module and three extensions: `consolidator.olang` (1.9's consolidator and its nights), spiking neurons on the
+board engine (`board.olang`), code-level reads and writes in `store.olang`, and in `agent.olang` checkpoints that keep the
+generator's state and two options for open question 8. `examples/sleep_retention.olang` (`make sleep`) measures
+sleep - over nights, and against interference - and `examples/mnist_board.olang` takes a window to run a spiking
+circuit. Results in 5.10; decisions 48-61. Not built: the PYNQ-Z2 overlay - there is no FPGA toolchain on this machine,
+so the board stays simulated.
+
+**The consolidator (`consolidator.Consolidator<T>`)**, 1.9's, with its settings in `SleepSettings`.
+
+- *The slow part* is the gated linear recurrence unrolled over a window in an `nn.Graph`, a batch of sequences as its
+  rows, every sequence starting at `h = 0`: per step two products and their gates (`Linear`, `Sigmoid`, `Tanh`,
+  `Multiply`), the readout `Linear`, and the window's loss the mean of the steps' `Mse`. `G`, `B` and `C` are
+  Glorot-uniform, `g` starts at +1 (a gate keeping 73% of the state) and `b`, `c` at 0. Its gradient through the
+  unrolled window is the graph's own backward (5.4.1).
+- *The store's read is no node of the graph.* Nothing flows back through it, so it enters as a shift of the slow
+  part's target: the slow part learns `y - m`, whose gradient is that of the whole output's loss (decision 53). The
+  `Custom` op 2.7 planned was not needed. The store's key is `[alpha u, rho h]`, `alpha = 1 / sqrt(Inputs)`,
+  `rho = 1 / sqrt(Hidden)`.
+- *A day* (`Day(u, y, n)`): the slow part runs; at each step the store reads at its key, and `y - m` becomes the slow
+  part's target; with a `DayRate` the slow weights take one step of gradient descent on the window by a backtracking
+  line search (from `DayRate`, halved until the loss falls by at least `1e-4` of the step's first-order prediction, at
+  most `Halvings` times, no step if it never does - 1.9's line search); the slow part runs again and each step writes,
+  once, its residual `y - (C h + c)` into the store at its new key; the inputs are kept as cues.
+- *A night* (`Sleep(passes)`, or `SleepOn(cues, count, passes)`): dusk dreams every cue kept, the store included, and
+  freezes the dreams (`Dreams`); the night teaches the slow part the cue-to-dream pairs with the store excluded - Adam
+  started afresh (rate `NightRate`, 0.01), `Passes` passes (60), batches in an order drawn from the consolidator's own
+  generator; dawn clears the store's table and rewrites every step's residual, the dream less the slow part's output, at
+  the key the slow part now gives - in passes of the delta rule (Kaczmarz's method), each key coded once, until every
+  residual reads back within `DawnTolerance` (`1e-3`), at most `DawnPasses` (10). One pass leaves each read disturbed
+  by the later writes sharing a cell: on random targets it left `slow + store` no nearer the dreams than the slow part
+  alone; many passes hold the dreams' mistakes as faithfully as their truths (decision 56).
+- *Defaults chosen by measurement* (5.10): no slow learning by day (`DayRate = 0`; decision 58), and a store far
+  sparser than 1.6's - 150 cells per number of its key, 0.5% of them active, at least 16 (decision 59). The store gained
+  `Encode`, `ReadCode` and `WriteCode`, Read and Write at a code kept, for dawn's passes.
+- *Cost* (the retention task's sizes: a key of 27 numbers, 4 050 cells, 16 slow neurons, 12 steps; F64, at a load of
+  7-10): a day of 16 sequences 40-70 ms, most of it the store's codes (a product of 4 050 x 27 and a top-k a read
+  or a write); a night over 64 cues 0.29 s and over 128 cues 0.50 s with dawn allowed 100 passes and random targets
+  keeping it at them (6.3 s when each of 10 passes coded every key again).
+
+**Spiking neurons on the board engine** (4.6). `Board(c)` takes a spiking circuit: its Lif regions' descriptors carry
+their leak, threshold and synapse rate (a region's descriptor grew to 12 words), and the engine keeps per phase and slot
+the synaptic currents, the last step's spikes and the rate traces besides potentials and activities. A settle runs
+whole windows of integer time steps (4.6's step in the header of `board.olang`), the transport as events, and commits
+or refuses as the rate engine does; `Teach` settles a lesson's three phases so and reads them back (`Store` writes all
+five arrays of a phase, through the circuit's new `StateOf`). `LifOf(region)` gives a Lif region as the engine runs it,
+so a floating-point circuit compared with it can be made with exactly the engine's leak, threshold and synapse rate.
+The engine counts `Steps`, `Spikes` and `Events` (synaptic events: a spike's weights added). The golden vectors (version
+2) add the currents, spikes, traces and counts, and the window and the trace's step.
+
+**Checkpoints** (decision 48): an agent's checkpoint keeps its generator's state through std/rand's `State`/`SetState`
+(format version 2) instead of the numbers drawn; a restore goes into any agent of the saved one's shape and settings,
+whatever seed it was made with and whatever it has lived, and brings the saved seed. A version 1 checkpoint is refused.
+
+**Open question 8's remedies** are settings, both off: a calm moment may sample its action (`Settings.CalmSamples`), and
+arousal's level may follow the policy's entropy (`Settings.EntropyGain`, through a third input of `Arousal.Update`).
+Measured and not taken (decision 57).
+
+**Repro statuses.** `repro/ctorpush.olang` and `repro/ctorunstored.olang` are fixed by olang edf8238; their workarounds
+(`circuitFor`, datasets/text) need no change.
 
 ---
 
@@ -1063,6 +1148,19 @@ vector, not the event-driven accumulation of the board). Spike-count contrasts a
 carries them is weak - hidden neurons' contrasts need long windows; a neuron near its threshold fires on fluctuations
 its rate model ignores; and a lesson costs `window`s of steps, about 1 000 steps at `window = 256` once warm.
 
+**On the board (phase 4, 2.13).** The engine runs these neurons in integers - the same dynamics, a time step per
+sweep: per neuron a membrane potential and a synaptic current in Q4.14, the last step's spike (a bit), a rate trace in
+Q.24 and the window's spike count; per region its leak and synapse rate (Q.16) and its threshold (Q4.14). A step's
+transport is **events**: each spike of the step before adds its weights - a pre neuron's column into post, and for a
+reciprocal block a post neuron's row into pre - additions only, exact in the 48-bit accumulator. The current, the
+potential and the trace are each one rounding; a spike is `u >= threshold`, reset by subtraction; at a window's end a
+divider turns each count into a rate in Q1.15, and a row's residual is the largest change of a rate. The trace needs
+the finer format: following a rate over a window of 20 000 steps it moves by a twentieth of a step of Q1.15 a step,
+and a Q1.15 trace, rounding that, biased the force (5.10). The inputs stay rate-coded, folded into the constant as for
+rate neurons. Measured (5.10): one neuron within the derived bound of its analytic rate; a circuit's rates within
+1.6e-4 of the floating-point circuit carrying the board's values, its spike-count contrast as close to the rate model's
+as the floating-point one's; XOR and MNIST taught through it as through F32.
+
 ---
 
 ## 5. Validation
@@ -1127,6 +1225,9 @@ With `tanh` (smooth everywhere), symmetric weights, `T = 0.25`:
    holds the residual, so `slow + store` output on the cues is unchanged by consolidation (recall is preserved).
 3. A small finite-state sequence task: before and after a night, accuracy of the slow weights alone on held-out sequences
    rises over nights; the store alone stays where its exposures put it. The expected outcome is stated before the run.
+
+*As built (2.13):* `consolidator.olang`'s tests check 1-3 (and the day's line search) in F64; `examples/sleep_retention.olang`
+measures 3 over many lives and sleep against interference - a second task learned after a first. Results in 5.10.
 
 ### 5.5 End to end
 
@@ -1364,6 +1465,157 @@ many transports to a lesson's one contrast:
 0.25 2.0x and at 0.5 1.3x.) So `Auto` stores a projection sparse at a density of at most 0.25, where a lesson is still 1.6-2x and a settle 2.3x
 as fast; between 0.25 and 0.5 the two are close and the dense block keeps the batch's products at the arithmetic peak.
 
+### 5.10 Results of phase 4 (2026-10-09)
+
+`consolidator.olang`, `board.olang`, `store.olang` and `agent.olang`'s tests (F64); `examples/sleep_retention.olang`
+(F64), `examples/mnist_board.olang` and `examples/bandit_settle.olang` (F32); on the shared four-core machine with olang
+edf8238, at loads of 3-11 (accuracies and counts are deterministic; times are not, and are marked with their load).
+
+**Sleep (5.4).**
+
+- *5.4.1*: the gated recurrence over 6 steps of 3 rows against central differences: the largest relative error 5.1e-8.
+- *The day's line search*, from a step of 4 over five windows: every step it took lowered the loss, and where it took
+  none the weights stayed bit for bit.
+- *5.4.2*, on 24 cues of 8 steps of random readings with random targets (nothing for a rule to capture; a day's step of
+  0.5, 400 passes a night): the dreams are exactly what `slow + store` recalled before the night; the slow part alone
+  ends within 0.18 rms of them, its last pass's loss. After dawn, with a store large enough to hold every residual apart
+  (7 200 cells, 36 active) and 100 passes, `slow + store` is within 8.5e-4 rms of the dreams and every residual reads
+  back within 4.7e-3: recall is preserved. With the default store for this key (1 800 cells, 16 active) the codes of
+  similar keys share cells: 0.19 rms after one pass (no nearer than the slow part alone), 0.11 after 10, 0.026 after 100.
+- *5.4.3*, 20 lives of four days of 16 new flip-flop sequences (12 steps; 16 slow neurons; the task of
+  `examples/sleep_retention.olang`, below), accuracy on 512 new sequences. Expected, written before the first run: "the
+  slow part alone rises over nights from chance toward >90% on new sequences by the fourth night; a store alone (no slow
+  learning, no nights) stays near what its exposures give on new sequences (60-75%), little change". Measured:
+
+  | | before | night 1 | night 2 | night 3 | night 4 |
+  |---|---|---|---|---|---|
+  | the slow part alone | 51.9 +- 4.3 | 81.9 +- 3.4 | 94.5 +- 2.9 | 100.0 +- 0.0 | 100.0 +- 0.0 |
+  | slow and store | | 81.9 +- 3.2 | 93.7 +- 2.4 | 99.6 +- 0.3 | 99.9 +- 0.1 |
+  | a store alone, the same days, no nights | | 83.0 +- 2.9 | 84.8 +- 3.4 | 87.7 +- 3.1 | 88.7 +- 2.7 |
+
+  The slow part rose as expected. The store alone did better than expected and rose a little with its exposures: its
+  key carries the state of the slow part's untrained recurrence, which holds some history of the sequence - a random
+  reservoir it reads - but it holds no rule, and falls short of the slow part from the second night on.
+
+**Sleep against interference** (`examples/sleep_retention.olang`, 20 lives with 95% intervals). The task: a flip-flop
+(set, reset, hold at 0.2, 0.2, 0.6) and two tasks that share its symbols and conflict on them - task B's targets are
+task A's negated - told apart only by a context of 8 random signs each (decision 61). Four days of task A, then four of
+task B, 16 new sequences a day shown once; accuracy (%) on the sequences seen (recall) and on new ones. Four lives:
+days only (slow learning by day at a step of 0.05, no nights), a store alone (no slow learning, no nights), days and
+nights, and nights only (the default: no slow learning by day). Expected, written before the first run: "days only -
+after B, A's recall and new-A accuracy fall well below their end-of-A values; store alone - recall after A high, after
+B somewhat lower, new A low-moderate; days and nights / nights only - new A stays high (>85%) after B, recall of A
+stays high". Measured with the defaults (dawn at most 10 passes):
+
+| life | A after A: recall / new | A after B: recall / new (slow part alone) | B after B: recall / new |
+|---|---|---|---|
+| days only | 89.5 / 88.9 | 84.7 +- 3.1 / 84.4 (51.6) | 85.9 / 84.7 |
+| a store alone | 89.2 / 88.7 | 87.3 +- 2.3 / 87.2 (51.9) | 85.8 / 84.3 |
+| days and nights | 99.9 / 99.9 | 91.4 +- 6.2 / 90.9 (91.9) | 100.0 / 100.0 |
+| nights only (default) | 99.9 / 99.9 | 95.8 +- 5.4 / 96.0 (95.7) | 100.0 / 100.0 |
+
+With nights task B is learned completely and task A mostly kept - the slow part alone answers new A sequences at
+95.7% after a phase of the conflicting task, where without nights the slow part never learned A at all and the store
+alone keeps 87%. The interval is wide: some lives lose part of A - where the store's codes for A and B overlap, B's
+writes corrupt A's dreams before the night, and the night consolidates the corruption. What decides it, measured on
+the same 20 lives:
+
+- *Slow learning by day* (decision 58): at a step of 0.5, days and nights kept A at 32.7 +- 9.5 (days only: 74.2): one
+  day of B moved the slow weights so far that A's dreams were B's answers. At 0.05 it bought nothing measurable alone
+  (the slow part alone 55.9 after task A, against 51.9 for the store alone).
+- *The store's sparseness* (decision 59): with store.olang's default for this key (540 cells, 27 active, 5%) days and
+  nights kept 65.4 +- 12.5 and nights only 78.9 +- 10.5 - no better than a store alone with it (77.1). Twice the
+  default store separates more, at twice its cost: with dawn at 100 passes, where the default store kept 85.2 / 94.8
+  (days and nights / nights only), 8 100 cells kept 92.9 / 97.4 +- 4.4 with 20 active and 86.5 / 97.4 +- 2.6 with 41.
+- *Dawn's passes* (decision 56), A's recall after B, days and nights / nights only: one pass 93.2 / 94.2, three 93.7 /
+  94.0, ten 91.4 / 95.8, a hundred 85.2 / 94.8.
+- *How different the tasks look* (decision 61): with a context of one bit instead of eight signs, days and nights kept
+  A at 74.0 +- 8.3 and nights only 84.3 +- 7.1, against a store alone's 82.2: the store cannot tell the tasks apart,
+  so neither can the night.
+
+The first runs, before decisions 58 and 59, contradicted the expectation for both sleeping lives (days and nights
+keeping A at 18-37% with the store's 5% default and a day's step of 0.5); the expectation held once the slow weights
+were slow and the store sparse.
+
+**Spiking on the board (4.6).**
+
+- *One neuron* (leak 0.05 - 0.0500031 as the board holds it - threshold 1, window 4 000) against the analytic rate of
+  its quantized drive, within the bound of decision 51 at every drive: 0 and 0 spikes a step below the threshold (0.5,
+  0.98), then 0.01675 against 0.01685 (1.05), 0.04550 against 0.04669 (1.5), 0.10001 against 0.10042 (2.5) and 0.27426
+  against 0.28135 (6) - the discrete rate a little below the continuous one, as the circuit's floating-point neuron is.
+- *A circuit* (5.7's: two inputs, five hidden and two readout Lif neurons, leak 0.1, synapse 0.1, window 20 000): the
+  board's free rates within 1.6e-4 of the floating-point circuit carrying its values and Lif parameters; both within
+  0.0088 of their rate model's equilibrium. A lesson (`beta = 1`, 200 000 steps): its spike-count contrast agrees in sign
+  with the rate model's on all 11 of its larger entries, the largest difference 0.243 of the largest entry - the
+  floating-point circuit's own contrast: 11 of 11, 0.243 - and with the floating-point circuit's on all 15 of its larger
+  entries, differing by 0.053 of the largest. With a Q1.15 trace instead (decision 50) the board's contrast agreed with
+  the floating-point circuit's on only 12 of 15, differing by 0.55.
+- *Refusal and determinism*: a settle with one window and a tolerance of zero refuses and leaves the committed potentials,
+  currents and traces bit for bit; two engines of one circuit settle bit for bit alike; the golden vectors read back.
+- *XOR* (5.7's spiking XOR: eight hidden Lif neurons, window 256, squared error toward 0.2 spikes a step, Adam 0.02,
+  `beta = 1`, 200 lessons): settled in F64, 4/4 answered on the board, loss 2.0e-5, 1 080 steps a lesson; settled on the
+  board, 4/4, loss 1.4e-6, 1 087 steps a lesson.
+- *MNIST* (5.7's spiking circuit: 784-128-10, Lif hidden and readout neurons, window 256, squared error toward 0.2 spikes
+  a step for the class, `beta = 1`, Adam 5e-3, batch 32, 10 000 training samples a pass; test accuracy after passes 1 /
+  2 / 3, answered in F32 and on the board):
+
+  | lessons settled | F32 answers | board answers | answers agreeing | steps a lesson | a pass (load) |
+  |---|---|---|---|---|---|
+  | on the board | 88.28 / 89.61 / 91.59% | 88.03 / 89.82 / 91.46% | 97.9-98.4% | 1 894 - 1 827 | 53-74 s (4-8) |
+  | in F32 | 88.90 / 90.62 / 91.88% | 88.77 / 90.51 / 91.42% | 97.4-97.9% | 1 916 - 1 826 | 28-33 s (4-8) |
+
+  Phase 1's floating-point run: 89.73% after one pass, 90.48% after two. Settling the lessons on the board changes the
+  learning curve by a few tenths, as for rate circuits: the board teaches spiking circuits as F32 does. Answers agree on
+  about 98% rather than 99.99%: spike timing is chaotic, and where two readouts' rates are within a spike or two the
+  one rounding that moves a spike changes the answer. About 780 steps an answer. Per answering step a row, 25-30 of the
+  138 Lif neurons spike and cause 273-314 synaptic events - against the 2 560 multiply-adds of the rate engine's dense
+  recurrent transport (the 128 x 10 block, both ways) - additions only. On 64 accumulate lanes with 4.2's 40 cycles of
+  pipeline a step (*planning*), an answer would take about 780 x 45 = 35 000 cycles, 0.35 ms at 100 MHz, against 21 us
+  for the rate circuit's (5.9): spiking costs the board time in steps, and saves it multipliers. 6-15% of the hidden
+  neurons' constants clipped at Q4.14's range (decision 54), the circuit being uncertified and its input weights
+  growing as it learns.
+
+**Checkpoints.** A restore into an agent made from another seed lives exactly the saved one's next 100 moments, and a
+restore into the agent that saved, 100 moments on, lives them again (5.8's test, extended; the generator's four words
+compared). A checkpoint of another shape and one of version 1 are refused.
+
+**The temperature of a certified circuit (open question 10).** Restrained 784-128-10 MNIST (`Restrain(0.9)` after every
+step, batch 32, Adam 1e-3, `beta = 0.5`, lessons settled in F32), test accuracy after five epochs, four seeds (two at
+0.15), answered in F32 and on the board alike (agreeing on 99.98-100%):
+
+| `T` | accuracy | sweeps a lesson (epoch 1 / 5) | sweeps an answer |
+|---|---|---|---|
+| 0.25 | 91.28% (90.86-91.56) | 15.3 / 16.1 | 3.5-3.8 |
+| 0.15 | 93.08% (92.96-93.19) | 48 / 51 | 3.7-3.8 |
+| 0.1 | 93.67% (93.54-93.81) | 32 / 39 | 3.7-3.8 |
+| 0.05 | 93.88% (93.69-94.12) | 25 / 41 | 3.1 |
+
+0.05 is higher than 0.1 on every seed (by 0.15-0.31), for about the same sweeps a lesson and fewer an answer: decision
+55. (0.15 took more sweeps a lesson than both 0.1 and 0.05, on both seeds; not investigated.)
+
+**Calm moments (open question 8).** 5.5's bandit and reversal, 40 lives of 4 000 moments, blocks of 250, regret with
+95% intervals:
+
+| | greedy when calm (default) | sampling when calm |
+|---|---|---|
+| bandit, moments 500-2 000 | 0.030-0.042 | 0.054-0.062 |
+| bandit, moments 2 000-4 000 | 0.042-0.057 | 0.045-0.061 |
+| reversal, after the swap: first 250 | 0.229 +- 0.023 | 0.226 +- 0.021 |
+| reversal, then to moment 4 000 | 0.065-0.085 | 0.095-0.105 |
+| bandit, calm moments, moments 500-4 000 | 0.86-0.93 | 0.88-0.94 |
+
+Sampling when calm costs regret and buys nothing: a calm moment learns nothing from what it tried. The second remedy -
+arousal's level following `EntropyGain` times the policy's entropy over `ln(actions)` - means of the blocks:
+
+| entropy gain | bandit 750-2 000 | bandit 2 500-4 000 | reversal 2 500-4 000 | calm, bandit 2 500-4 000 |
+|---|---|---|---|---|
+| 0 (default) | 0.035 | 0.047 | 0.074 | 0.89 |
+| 1 | 0.049 | 0.042 | 0.068 | 0.81 |
+| 2 | 0.040 | 0.035 | 0.082 | 0.74 |
+| 4 | 0.056 | 0.033 | 0.087 | 0.65 |
+
+(each block's interval about +-0.013) - neither remedy is taken (decision 57).
+
 ## 6. Decisions and open questions
 
 **Decided**
@@ -1427,8 +1679,9 @@ as fast; between 0.25 and 0.5 the two are close and the dense block keeps the ba
     arrives.
 25. **Refusals** (2.11): a refused free settle refuses the moment; a refused nudged phase or re-settle keeps the
     moment, counted.
-26. **The agent owns its generator** (made from a seed), so a checkpoint can carry it as the seed and the numbers drawn.
-    std/rand exposes no state, so a restore replays the draws and goes into a new agent of the same shape and seed.
+26. *(Superseded by decision 48.)* **The agent owns its generator** (made from a seed), so a checkpoint can carry it as
+    the seed and the numbers drawn. std/rand exposes no state, so a restore replays the draws and goes into a new agent
+    of the same shape and seed.
 27. **Checkpoints** are written in the safetensors layout, with every tensor stored as F64 (2.11).
 28. **The critic's weights are F64** whatever `T` is.
 29. **The circuit is made by a function**, working around repro/ctorpush.
@@ -1452,7 +1705,7 @@ as fast; between 0.25 and 0.5 the two are close and the dense block keeps the ba
     a 48-bit constant per neuron per row held through the settle).
 36. **One activation unit, a table**: 1024 segments over `[-8, 8)`, each a base and a delta (two BRAM18 words), an
     8-bit interpolation fraction; the hard sigmoid uses the same table, exact between knots. Linear and `LifRate`
-    relaxing neurons and spiking circuits are refused by the engine (spiking is phase 4).
+    relaxing neurons and spiking circuits are refused by the engine (spiking is phase 4 - decision 49).
 37. **The cross-entropy force on the board**: `z = (s - max) / T` rounded to Q5.14 and clamped at -16, an exponential
     table of 1024 segments over `[-16, 0]`, a sum, and one division per neuron (to the nearest).
 38. **The board's tolerance** is `max(floor(tau 2^14), 5)` steps of Q4.14 - 4.2's `max(tau, 3e-4)`, the floor covering
@@ -1485,6 +1738,80 @@ as fast; between 0.25 and 0.5 the two are close and the dense block keeps the ba
 47. **The board runs whatever rate circuit it is given**, certified or not: the guarantees of 4.2 and 5.6 hold for
     certified circuits; an uncertified one is measured (5.9: the 96.6% MNIST circuit answers identically).
 
+**Taken in phase 4 (2026-10-09)**
+
+48. **Checkpoints keep the generator's state** (std/rand's `State`/`SetState`, format version 2; supersedes decision
+    26): a restore needs no replay, so it goes into any agent of the saved one's shape and settings - made from another
+    seed, or the agent that saved it, rolled back - and brings the saved seed (`Agent.Seed` is now mutable for it). A
+    version 1 checkpoint is refused rather than replayed; none exists outside the tests.
+49. **Spiking on the board engine** (4.6): Lif neurons in integers, the circuit's own dynamics a time step per sweep.
+    Formats: potential and synaptic current Q4.14 (the rate engine's potential format), leak and synapse rate Q.16,
+    threshold Q4.14, a spike one bit, the rate trace and its step Q.24, a window's count an integer; a rate is
+    `min((count << 15 + window / 2) / window, 2^15 - 1)` - a divider, rounding to the nearest - and the residual and
+    the tolerance are in steps of Q1.15, at least one (`SpikeTolerance`). The transport is events - each spike of the step
+    before adds its column of weights into post, and for a reciprocal block its row into pre - so a spiking lane adds and
+    never multiplies; exact in the 48-bit accumulator as the rate engine's sums are. The inputs stay rate-coded.
+50. **The rate trace is Q.24, finer than an activity.** A trace following a rate over a window of 20 000 steps moves by
+    about a twentieth of a step of Q1.15 a step, so a Q1.15 trace rounded its decay to a whole step and biased the
+    nudge's force: the spike-count contrast then agreed with the floating-point circuit's in sign on 12 of 15 large
+    entries, differing by 0.55 of the largest; with Q.24, on 15 of 15, differing by 0.053 (5.10). The force reads the
+    trace as an activity, `min(rnd(tr, 9), 2^15 - 1)`.
+51. **The spiking engine is checked statistically, not bit for bit against floating point** - spike timing is chaotic,
+    so a difference of one rounding becomes a spike a step early or late. The checks: one neuron against the analytic
+    rate, the per-step rounding stated as a drive error of `2^-15 / leak` (the rate lies between those of the drives that
+    far either side, each within `f^2 / (1 - f) + 1 / window` of the formula); a circuit against the floating-point one
+    carrying the board's values and Lif parameters (`LifOf`), and both against their rate model; the lesson's contrast
+    against the rate model's. A hardware engine is still checked against the simulation bit for bit (`Dump`).
+52. **A region's descriptor grows to 12 words** (leak, threshold and synapse rate of a Lif region, one word spare), and
+    the golden vectors are version 2: the currents, spikes, traces and counts of a spiking engine, and its window and
+    trace step among the scalars.
+53. **The store's read shifts the slow part's target; it is no node of the graph.** With no gradient through it, the
+    slow part learning `y - m` has exactly the gradient of the whole output `y = C h + c + m`, so 2.7's `Custom` op is not
+    needed. By day the store reads before the slow part steps and writes the residual of the slow part after it, at the
+    new key: the store holds what the slow weights miss as they now are.
+54. **A Lif current beyond Q4.14's range saturates on the board**, as a rate neuron's constant does (decision 34). For
+    a Lif neuron that is not harmless - a current of 8 fires about 0.79 spikes a step (leak 0.1, threshold 1) where one of
+    10 or more would fire every step - but it caps only rates far above the 0.2 a step MNIST's readout is taught; there
+    6-15% of the hidden neurons' constants clipped and the board answered as F32 did (5.10). Kept until a circuit needs
+    the range.
+55. **The readout temperature of a supervised circuit meant for the board is 0.05** (`board.Temperature`; open question
+    10). Measured over four seeds and five epochs of restrained MNIST: 93.9% against 93.7% at 0.1 (higher on every seed,
+    by 0.15-0.31) and 91.3% at 0.25, at about the sweeps a lesson of 0.1 (41 against 39) and fewer an answer (3.1 against
+    3.7). An agent's policy is another matter: its life tolerance `T (1 - kappa) / 40` falls below the board's floor
+    (`3.05e-4`) for `T` under about 0.12 at `kappa = 0.9`, so an agent on the board needs `T >= 0.12`; agents keep 0.25.
+56. **Dawn writes in passes over keys coded once** (Kaczmarz's method), until every residual reads back within `1e-3`, at
+    most 10 passes; dawn's writes do not move the store's mean. More passes recall the dreams more exactly - on random
+    targets one pass left `slow + store` no nearer the dreams than the slow part alone (0.19 rms either way), 10 passes
+    0.11, 100 passes 0.026 - but the dreams hold the day's interference too, and an exact dawn carries it from night to
+    night: with slow learning by day, task A's recall after task B fell from 93% (one to three passes) to 91% (10) and
+    85% (100); without it, the default, the passes changed nothing measurable (94-96%). 10 keeps most of the
+    exactness. A pass costs a gather and a scatter a step once keys are coded (a night over 128 cues 0.5 s at 100
+    passes, against 6.3 s coding every key every pass). Where the codes of similar keys share all their cells no number
+    of passes separates them.
+57. **Calm moments stay greedy, and arousal does not follow the policy's entropy** (open question 8's two remedies,
+    both measured over 40 lives, 5.10). Sampling in calm moments raised the bandit's regret floor (0.035 to 0.057 over
+    moments 750-2 000) and the reversal's (0.074 to 0.10 after it): exploration without learning costs choices and
+    teaches nothing. Arousal rising with the policy's normalized entropy lowered the bandit's late floor (0.047 to 0.033
+    at a gain of 4) but raised its early one (0.035 to 0.056), slowed recovery from a reversal at gains of 2 and 4 (0.074
+    to 0.082-0.087), and spent calm moments (89% to 58-65%) - no setting better at all three. `Settings.CalmSamples` and
+    `Settings.EntropyGain` keep both options, off.
+58. **No slow learning by day by default** (`DayRate = 0`): the line search of 1.9 is built, but measured over 20 lives
+    (5.10), a day's step of 0.5 let one day of task B move the slow weights so far that the night consolidated task A's
+    corrupted recall (A kept at 32.7%, against 95.8% with no learning by day), and a step of 0.05 bought nothing
+    measurable on its own (the slow part alone 55.9% after task A, against 51.9% for a store alone) while keeping less
+    of A (91.4%). A neocortex that learns slowly is what complementary learning systems assume.
+59. **The consolidator's store separates patterns**: 150 cells per number of its key, 0.5% of them active (at least 16) -
+    against 1.6's 20 cells per number and 5% (Dasgupta et al.'s fly). With 5% a second task's writes landed on the first
+    task's cells, the first task's dreams were the interference, and the night consolidated it: A kept at 78.9% with
+    nights against 95.8% (5.10). Hippocampal pattern separation by sparse coding is the corresponding requirement of
+    the theory. Twice the cells kept a little more (97.4%), at twice the cost of a code. store.olang's own default
+    stays: it is 1.6's, and the store alone does not consolidate.
+60. **A night replays every cue kept, from `h = 0`, with Adam started afresh** (rate 0.01, 60 passes, batches shuffled by
+    the consolidator's own generator, every sequence starting at `h = 0`). The consolidator forgets no cue; a cap or a
+    sampled replay waits for a task that needs it.
+61. **The retention task's tasks look different**: each has a context of 8 random signs beside the shared symbols, as two
+    surroundings of a life do - not one bit (5.10 measures one bit too).
+
 **Open questions**
 
 1. **Scope and order within settling networks.** Recommended: the circuit and the agent (phases 1-2) first; the
@@ -1509,15 +1836,33 @@ as fast; between 0.25 and 0.5 the two are close and the dense block keeps the ba
 8. **Exploration in calm moments** (from 5.8). The arousal gate detects change, not suboptimality, so a policy that is
    still imperfect when it stops surprising the agent stays so: a regret floor of about 0.03-0.05 in the bandit. Two
    ways out, both changes to the model: sample rather than act greedily in calm moments (exploration without learning,
-   at no cost to calm's "no synapse touched"), or let arousal also rise with the policy's entropy. Recommended: try the
-   first. Default: as specified (greedy when calm).
+   at no cost to calm's "no synapse touched"), or let arousal also rise with the policy's entropy. *Both were measured
+   and neither is taken (decision 57): the first raises the floor, the second trades a lower late floor for a higher
+   early one and slower recovery from a reversal.* Recommended: look for a signal of suboptimality that is not the
+   policy's own uncertainty - the critic's error over a longer window, say - when a task needs a lower floor. Default:
+   greedy when calm, arousal from surprise and disappointment only.
 9. **Sparse lanes on the board** (decision 46). A sparse block stored densely costs its full size in BRAM and cycles;
    lanes skipping absent synapses need an index per weight (about 10 bits) and break the one-weight-per-clock rhythm of
    a lane. Recommended: dense until a wiring diagram is to run on the board; then measure the densities involved.
    Default: dense.
-10. **A lower temperature for certified circuits** (from 5.9). Restrained MNIST gains 2.3 points at `T = 0.05`, at
-    about 2.4x the sweeps of a lesson at the end of training. Recommended: make `T = 0.1` the default for circuits
-    meant for the board (`Restrain` on), keep 0.25 otherwise. Default: 0.25 everywhere.
+10. *(Taken: 0.05 for supervised circuits meant for the board, measured - decision 55.)* **A lower temperature for
+    certified circuits** (from 5.9). Restrained MNIST gains 2.3 points at `T = 0.05`, at about 2.4x the sweeps of a
+    lesson at the end of training. Recommended: make `T = 0.1` the default for circuits meant for the board (`Restrain`
+    on), keep 0.25 otherwise. Default: 0.25 everywhere.
+11. **The consolidator and the agent.** The consolidator stands alone: its days are sequences given to it. An agent
+    could live its days into one - observations as inputs, the rewards of its actions as targets - and drive its readout
+    with the consolidator's recall beside its memories, sleeping between stretches of life. Recommended: when a task
+    needs the agent to keep what it learned across a change of surroundings (the retention of 5.10, lived); until then
+    the agent's persistent memory is its only consolidation (1.6). Default: separate.
+12. **The capacity of dawn's store.** A store that cannot hold every residual apart leaves its residue in the recall
+    after a night (decision 56); the cues kept also grow without bound (decision 60). Recommended: measure on the first
+    task that consolidates more than a few thousand steps - grow the store with its cues, or replay a sample. Default:
+    a fixed store, every cue kept.
+13. **Spiking on the board's lanes.** The simulation counts events (about 290 a step a row on MNIST against 2 560
+    multiply-adds of the rate engine's dense recurrent transport) but a lane design for them - which lane adds a spike's
+    column, how a reciprocal block's rows are read - is not made, nor whether Lif currents need a wider format than
+    Q4.14 (decision 54). Recommended: when a spiking circuit is to be synthesized. Default: the simulation only.
+
 
 ---
 

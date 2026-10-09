@@ -965,3 +965,24 @@ Phase 3 adds three modules and two extensions:
 
 `make board` runs `examples/mnist_board.olang`; `make sparse` runs `bench/sparse.olang`. Results and decisions:
 docs/settling.md sections 2.12, 5.9 and 6 (decisions 31-47).
+
+Phase 4 adds sleep and spiking on the board (all but the PYNQ-Z2 overlay, which waits for an FPGA toolchain):
+
+- `consolidator.olang` is 1.9's consolidator: a gated linear recurrence on an `nn.Graph` (the window unrolled, the
+  batch's sequences as rows, BPTT through the graph's own backward) beside the sparse-code store, which reads at the
+  key `[alpha u, rho h]` and enters the slow part's training as a shift of its target - no graph op. A day writes the
+  slow part's residuals into the store; a night dreams every cue kept, teaches the slow part the dreams with the store
+  excluded, and at dawn rewrites the store with what the slow part did not absorb (in passes until it reads back).
+  Sleep helps only with a slow neocortex and a pattern-separating hippocampus: learning by day is off by default and
+  the store is far sparser than the store's own default (0.5% active) - measured in docs/settling.md 5.10, where a
+  second task learned after a conflicting first leaves the first kept at 96% with nights (the second learned
+  completely) and 85-87% without (the second at 86%).
+- `board.olang` runs spiking circuits: integer Lif neurons, a time step per sweep, the transport as events (a spike
+  adds its weights - no multiplies), rates by a divider at a window's end; within 1.6e-4 of the floating-point circuit
+  carrying its values, and MNIST taught through it as through F32 (91.6% after three passes of 10 000 samples).
+- An agent's checkpoint keeps its generator's state (std/rand's `State`/`SetState`), so a restore needs no replay.
+- Measured open questions: a certified board circuit's readout temperature (0.05: 93.9% on MNIST against 91.3% at
+  0.25) and sampling in calm moments (it raises the bandit's regret, so calm moments stay greedy).
+
+`make sleep` runs `examples/sleep_retention.olang`; `make board ARGS=...` with a window runs spiking MNIST on the
+board. Results and decisions: docs/settling.md sections 2.13, 5.10 and 6 (decisions 48-61).

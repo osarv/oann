@@ -15,20 +15,25 @@
 # A sequence is Window steps of Inputs numbers, and Window steps of Outputs targets; each starts from h = 0. Batches of
 # sequences run as the rows of one graph, the window unrolled in it.
 #
-# - Day(u, y, n): n observed sequences. The slow part predicts, the store reads at each step's key, and the slow weights
-#   take one step of gradient descent (BPTT) on the window's mean squared error of the whole output, y - m being the
-#   slow part's target - what the store does not already hold - the step chosen by a backtracking line search from
-#   DayRate (halved until the loss falls by at least 1e-4 of the step's first-order prediction, at most Halvings times;
-#   none taken if it never does). Then each step writes, once, the residual y - (C h + c) of the slow part as it now
-#   is into the store at its key (the delta rule, one exposure). The sequences' inputs are kept: the cues a night
-#   replays.
+# - Day(u, y, n): n observed sequences. The slow part predicts, the store reads at each step's key, and - with a
+#   DayRate, off by default - the slow weights take one step of gradient descent (BPTT) on the window's mean squared
+#   error of the whole output, y - m being the slow part's target (what the store does not already hold), the step
+#   chosen by a backtracking line search from DayRate (halved until the loss falls by at least 1e-4 of the step's
+#   first-order prediction, at most Halvings times; none taken if it never does). Then each step writes, once, the
+#   residual y - (C h + c) of the slow part as it now is into the store at its key (the delta rule, one exposure). The
+#   sequences' inputs are kept: the cues a night replays.
 # - Sleep(passes): the night, over every cue kept. It dreams each cue once - the free path, the store included, frozen
 #   as targets - then teaches the slow weights the cue-to-dream pairs, the store excluded, for passes passes (Adam,
 #   started afresh each night, batches in an order drawn from the consolidator's generator: replay, Wilson and
 #   McNaughton 1994; pseudorehearsal, Robins 1995). At dawn the store's table is cleared and rewritten with each dream's
 #   residual from what the slow weights now produce at the new keys (fast weights to deblur old memories, Hinton and
-#   Plaut 1987), in passes until every residual reads back (dawn, below): it holds only what the slow weights did not
-#   absorb, and slow + store still recall the dreams.
+#   Plaut 1987), in passes until every residual reads back or DawnPasses are done (dawn, below): it holds only what the
+#   slow weights did not absorb, and slow + store recall the dreams again, as exactly as the store can.
+#
+# Two defaults decide whether sleep helps at all (docs/settling.md 5.10): the slow weights learn nothing by day (a day
+# of a new task that moves them corrupts the old tasks' dreams before the night consolidates them), and the store is
+# far sparser than store.olang's default (0.5% of its cells active), so that a new task's writes do not land on an old
+# one's cells.
 #
 # Sleep consolidates what the system produces, mistakes included - it does not correct the store. The asymmetry is
 # deliberate and stated (1.9): the day is local, the night backpropagation through time.
@@ -52,7 +57,7 @@ type SleepSettings struct() {
     Active mut I64 = 0                  # its active cells (0: 0.5% of the cells, at least 16 - sparse enough to separate tasks)
     MeanRate mut F64 = 0.0              # its running mean's rate: 0, a key centred at 0 by its scales already
     GateBias mut F64 = 1.0              # g starts here: a gate keeping 73% of the state, remembering more than it forgets
-    DawnPasses mut I64 = 100            # dawn's passes of writes over the residuals, at most
+    DawnPasses mut I64 = 10             # dawn's passes of writes over the residuals, at most
     DawnTolerance mut F64 = 0.001       # and the largest error of a read it stops at
 }
 
