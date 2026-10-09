@@ -1602,3 +1602,126 @@ test "damping changes the path, not the equilibrium, and removes a period-2 cycl
     s := try k.Settle(Phase.Free, 100, 1e-10) catch { fail }
     assert s.Qualified and s.Dt == 0.5 and math.Abs(k.Potential(Phase.Free).Get(0, 0) - 0.5) < 1e-12
 }
+
+# the free equilibrium's mean cost, settled tightly
+fn freeLoss(c mut Circuit<F64>&) F64 {
+    c.Nudge(Phase.Free, 0)
+    try c.Settle(Phase.Free, 20000, 1e-14) catch { fail }
+    return c.Loss(Phase.Free)
+}
+
+# the central difference, step h, of the free equilibrium's cost in every parameter
+fn lossGradient(c mut Circuit<F64>&, out mut Array<F64>&, h F64) {
+    p := c.Params()
+    for i in range c.ParamCount {
+        old := p.Data[i]
+        p.Data[i] = old + h
+        up := freeLoss(c)
+        p.Data[i] = old - h
+        down := freeLoss(c)
+        p.Data[i] = old
+        out[i] = (up - down) / (2.0 * h)
+    }
+}
+
+# the largest difference between the gradient estimate of a lesson and the reference, relative to the reference's
+# largest element
+fn estimateError(c mut Circuit<F64>&, reference Array<F64>&, l Lesson) F64 {
+    try c.Teach(c.N, l) catch { fail }
+    g := c.Grads()
+    worst F64 = 0.0
+    top F64 = 0.0
+    for i in range c.ParamCount {
+        worst = math.Max(worst, math.Abs(g.Data[i] - reference[i]))
+        top = math.Max(top, math.Abs(reference[i]))
+    }
+    return worst / top
+}
+
+# a circuit for the gradient checks: three tanh inputs, four hidden neurons with a lateral block, three readout
+# neurons (cross-entropy at T = 0.25); every recurrent block reciprocal unless oneWay, where the feedback is a block of
+# its own
+fn gradientCircuit(c mut Circuit<F64>&, r mut rand.Rand&, oneWay Bool) {
+    x := c.Input(3, Neuron.Rate(Rho.Tanh))
+    h := c.Hidden(4)
+    o := c.Readout(3)
+    c.Project(x, h, Wiring.OneWay)
+    if oneWay {
+        c.Project(h, o, Wiring.OneWay)
+        c.Project(o, h, Wiring.OneWay)
+    } else {
+        c.Project(h, h)
+        c.Project(h, o)
+    }
+    c.Plan(r)
+    for i in range c.projections.Len() {
+        if not c.projections[i].Folded { c.Weights(Projection(i)).Scale(3.0) }   # feedback worth having
+    }
+    c.Certify(0.9)
+    randomize(c, r, 1.0)
+    for b in range c.Rows { c.LabelData(o)[b] = I32(r.Below(3)) }
+}
+
+test "the centered contrast is the gradient of the cost at the free equilibrium, to O(beta^2)" {
+    c := Circuit<F64>(2)
+    r := rand.Rand(11)
+    gradientCircuit(c, r, false)
+    reference := Array<F64>(c.ParamCount)
+    lossGradient(c, reference, 1e-5)
+    centered := Array<F64>(3)
+    plain := Array<F64>(3)
+    for i, beta in F64[0.1, 0.01, 0.001] {
+        centered[i] = estimateError(c, reference, Lesson(beta, 1e-13, 20000, true))
+        plain[i] = estimateError(c, reference, Lesson(beta, 1e-13, 20000, false))
+        try io.Print("beta " $beta ": centered " $centered[i] ", uncentered " $plain[i] "\n") catch { }
+    }
+    # slope 2 on log-log for the centered estimate, 1 for the uncentered
+    assert centered[0] / centered[1] > 50.0 and centered[1] / centered[2] > 50.0
+    assert plain[0] / plain[1] > 5.0 and plain[0] / plain[1] < 20.0 and plain[1] / plain[2] > 5.0
+    assert centered[2] < 1e-5
+    # the default lesson tolerance, from the rule, keeps the phases' error at or below the bias
+    rule := estimateError(c, reference, Lesson(0.001))
+    try io.Print("beta 0.001 at the rule's tolerance " $(c.LessonTolerance(0.001)) ": " $rule "\n") catch { }
+    assert rule < 1e-5
+}
+
+test "the drive's gradient: -(s+ - s-) / (2 beta) on a free neuron, and through a source projection" {
+    c := Circuit<F64>(2)
+    r := rand.Rand(12)
+    gradientCircuit(c, r, false)
+    try c.Teach(2, Lesson(0.001, 1e-13, 20000)) catch { fail }
+    h F64 = 1e-5
+    for k in range 2 {
+        reg := Region(k)                            # the inputs, then the hidden region
+        size I64 = c.regions[k].Size
+        estimate := Array<F64>(2 * size)
+        c.DriveGrad(reg, estimate, 0.001)
+        d := c.DriveData(reg)
+        worst F64 = 0.0
+        top F64 = 0.0
+        for j in range 2 * size {
+            old := d[j]
+            d[j] = old + h
+            up := freeLoss(c)
+            d[j] = old - h
+            down := freeLoss(c)
+            d[j] = old
+            numeric F64 = (up - down) / (2.0 * h)
+            worst = math.Max(worst, math.Abs(numeric - estimate[j]))
+            top = math.Max(top, math.Abs(numeric))
+        }
+        try io.Print("drive of region " $k ": relative error " $(worst / top) "\n") catch { }
+        assert top > 1e-3 and worst / top < 1e-5
+    }
+}
+
+test "with asymmetric feedback the contrast is no gradient: the theorem's symmetry is needed" {
+    c := Circuit<F64>(2)
+    r := rand.Rand(13)
+    gradientCircuit(c, r, true)
+    reference := Array<F64>(c.ParamCount)
+    lossGradient(c, reference, 1e-5)
+    e := estimateError(c, reference, Lesson(0.001, 1e-13, 20000))
+    try io.Print("one-way feedback: relative error " $e "\n") catch { }
+    assert e > 0.1
+}
