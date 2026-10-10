@@ -266,7 +266,12 @@ read: drive[readout] += g k (C + F)                        a linear drive into t
   caused it (McGaugh 2004). Defaults (oann's): `phi = 0.95` (a half-life of 13.5 moments), `c_0 = 0.02`, `g = 1` -
   *`c_0 = 0.2` as built*, tuned on the tasks of 5.5 (decision 21). This is the online consolidation; sleep (1.9) is the
   slower, offline one. *As built*, the fast decay is kept pending (one number, folded in at the next write), so a moment
-  that writes nothing touches neither matrix (5.3.4).
+  that writes nothing touches neither matrix (5.3.4). *In a consolidating agent (phase 10, decision 77)* the read leaves
+  the readout: the consolidator's recall drives it alone, at gain 2.
+- **Pattern completion** (auto-association: Kohonen 1972, Anderson 1972; the hippocampus's completion of partial cues,
+  McClelland et al. 1995): a correlation-matrix memory of whole observations, `M <- M + eta (x x^T - M)`, completes an
+  observation whose numbers `u` are missing from the known ones `o` by the conditional mean
+  `x_u = M_uo (M_oo + nu I)^-1 x_o` - the agent is told which numbers are missing. *As built in phase 10* (2.16).
 - **Sparse-code store** (Marr 1969; Albus 1971; Kanerva 1988): a cerebellum-style associative memory used by the
   consolidator (1.9). A reading minus its running mean `x~` is projected by a fixed random matrix `R` onto `N` cells,
   the `k` strongest are kept, rectified and unit-normalized into a code; one table `T` per predicted field is read as
@@ -320,6 +325,7 @@ settles and a learning pass (1.10).
 
 ```text
 step(obs, reward):                                          one call per moment
+  obs <- obs completed where numbers are missing           (phase 10: Perceive)
   drive <- obs, context trace, memory read                 written in place
   settle free (warm) -> x', V(x')                          qualified at the life tolerance, or refuse
   delta = reward + gamma V(x') - V(x_prev)                 V(x') = 0 after a terminal outcome
@@ -382,7 +388,9 @@ that separates patterns.
 observation it acted on and the reward of the action it took, the only output observed - and its recall drives the
 readout beside the memories'. Its store is keyed by the observation alone, since a night moves the slow part's state.
 On the tasks of 5.11 the store kept the agent's answers across a change of surroundings and back; the nights added
-nothing, changing the recall only at observations never seen.
+nothing, changing the recall only at observations never seen. *Since phase 10 (2.16)* the recall drives the readout
+alone, at gain 2, and the slow part's share of it at observations the store has not seen is weighed by a bet learned
+from the outcomes there: `store + (f + (1 - f) Guess) slow`, `f` how much the days taught the store at the observation.
 
 *What an agent's nights are for (phase 9, 2.15, 5.12):* the slow part's generalization, where an observation is new but
 like old ones in the way a smooth learner captures and the store's sparse codes do not - a second surroundings sharing
@@ -675,6 +683,10 @@ Settling networks follow the transformer work (section 6).
    writing what they observed into its store by day, its recall a drive on the readout, `Sleep` between stretches of
    life; measured on the bandit, the reversal and the retention task lived. Results in 2.14 and 5.11.
 
+Phases 9 and 10 (2026-10-10) answered open questions 14-17 about an agent's consolidator - what its nights are for,
+which memory drives its readout, partial cues, and its generalization at unfamiliar observations: 2.15-2.16 and
+5.12-5.13.
+
 ### 2.10 As built: phase 1
 
 One module, `circuit.olang`: the circuit, its neurons, learning, an Adam over its parameters, and its tests (`make
@@ -942,7 +954,8 @@ line). Results in 5.11; decisions 62-71.
   the consolidator answers 0 where nothing was written - an action never tried - rather than the untrained part's
   noise.
 - **Its recall drives the readout.** At every settle the readout's drive is the memories' read plus `RecallGain` (1)
-  times the consolidator's recall - slow part and store - of the observation.
+  times the consolidator's recall - slow part and store - of the observation. *Since phase 10 (decision 77) the recall
+  alone, at `RecallGain` 2.*
 - **Sleep is the caller's to call:** `a.Sleep(passes)` runs a night over every cue kept, between stretches of life;
   when a stretch ends is the world's to know. `examples/bandit_settle.olang` sleeps every `night=` moments (500).
 - **Checkpoints carry it** - the slow weights, the store's table and mean, the cues and the generator's state; the
@@ -990,6 +1003,64 @@ measurements asked for. Results in 5.12; decisions 72-76.
 - **Paired lives** (`perlife=1` in both examples): two agents of one seed differing only in their nights live the same
   moments until the first night, so differences are taken life by life - intervals a third to a half as wide as the
   unpaired ones.
+
+### 2.16 As built: phase 10 - the readout's drive, partial observations, the slow part's bet (open questions 15-17)
+
+Phase 9 left three questions about how a consolidating agent reads what it remembers. Phase 10 builds a mechanism for
+each, measures it against the agent as it was, and keeps what pays. Results in 5.13; decisions 77-85.
+
+- **Which memory drives the readout (question 15).** A Weigher (`Settings.Weigh`) shares the readout's drive between the
+  associative memory's read `m` and the consolidator's recall `c` by how well each has forecast the outcomes lately -
+  the combination of forecasts of Bates and Granger (1969), for two forecasts the regression of the memory's error on
+  their difference, `Mix = E[(r - m)(c - m)] / E[(c - m)^2]`, the expectations running means over the moments that learn
+  (rate `WeighRate`, 0.1), clamped to `[0, 1]`; the drive is `G ((1 - Mix) m + Mix c)`. The noise the two errors share,
+  the reward's own spread, adds nothing to either mean, since both forecasts were made before the outcome. It works: on
+  every task the readout's regret falls, the recall's share settling at 0.94-0.97 and falling to 0.82 in the block after
+  a reversal. But a control decides the question differently: the recall alone, at the two gains' sum (2), does as well
+  as the weighing within the intervals everywhere, and better with 64 contexts - so what the associative memory added
+  beside a consolidator was drive, not information, and what hurt on the ring and coming back to conflicting
+  surroundings was its read, not a lack of weighing. *Decided (77)*: a consolidating agent's readout is driven by its
+  recall alone, at `RecallGain` 2 (`Settings.RecallAlone`, on); the memories are still written, and the weighing stays
+  an option. The gain itself matters more than the split - 3 and 4 measured lower still on the return and the
+  reversal - which is open question 18.
+- **Partial cues (question 16).** `Step`, `Begin` and `Imagine` take `known`, which numbers of an observation were
+  observed; with `Settings.Completion` (on) the agent completes the others before anything reads the observation
+  (`Perceive`, into `Seen`). The completer is a correlation-matrix memory of the whole observations the moments that
+  learn acted on (Kohonen 1972; Anderson 1972), `M` the running mean of `x x^T`, read auto-associatively: the missing
+  numbers are the linear least-squares estimate from the known ones, the conditional mean of a Gaussian of second
+  moments `M`, `x_u = M_uo (M_oo + nu I)^-1 x_o` with `nu = 0.01 tr(M) / n`, the known numbers kept. An observation in
+  the span of those learned is completed exactly whatever numbers are missing, provided the known ones tell the
+  directions apart; a number nothing learned relates to the known ones is completed as 0. It is learned by the moments
+  that learn - gated as the other memories are - from whole observations only, at `1 / count` until that falls to the
+  arousal's slow rate. Without a mask a completer cannot tell a partial observation from a new one: on the ring, half
+  the numbers zeroed leave a cue whose part outside the span of the observations learned is 0.67 of it, a return task's
+  new surroundings' observation 0.73 (computed for the tasks' geometry; decision 80). Whole observations pass untouched,
+  so an agent's life with them is the same with completion or without.
+- **Generalization as a bet (question 17).** The consolidator's store keeps, with `SleepSettings.Familiarity`, how
+  much its days have taught it: a second table beside its values, written by every day's write at the same cells and
+  rate toward 1 for the outputs observed, never faded, cleared or rewritten at dawn (`Store.ReadFamiliar`: per output,
+  0 where no day wrote at a reading's cells, toward 1 after writes there). The agent's recall of an action is then
+  `store + (f + (1 - f) Guess) slow` (`Consolidator.Parts`): where the days wrote, slow part and store as before; where
+  they did not, the slow part's generalization at weight `Guess`. A Guesser learns `Guess` from the outcomes: the
+  least-squares weight of the unfamiliar part `z = (1 - f) slow` in what the rest leaves of the outcome,
+  `r' = r - store - f slow`, over sums that forget by `1 - GuessRate` a moment that learns - recursive least squares
+  with a forgetting factor - from the prior 1 (the recall as without familiarity), the prior worth one unfamiliar
+  outcome of a guess of 1/2. So the first outcomes at a new surroundings' observations tell whether its guesses hold
+  there, and a familiar stretch forgets the evidence until the prior speaks again. *Decided (82, 83)*: on by default
+  for a consolidating agent (`Settings.Familiarity`, `GuessRate` 0.03).
+- **The tasks.** `examples/bandit_settle.olang` gained `mixed` - a life meeting both kinds of new surroundings: in
+  thirds A, B and C, each with a code of its own, one of B and C with A's answers and the other with each context's best
+  and worst arms swapped (sharing first in odd lives, conflicting first in even ones) - and both examples `missing=`
+  (a fraction of the moments whose observations lack numbers, the agent told which), `completion=`, `weigh=`,
+  `recallalone=`, `familiarity=`, `guess=` and `guessrate=`. `bench/paired.py` takes the paired differences of two runs'
+  `perlife=1` lines.
+- **Checkpoints** keep each mechanism's state when it is on - the Weigher's means and the last forecasts, the
+  familiarity table, the Guesser and the last recall's parts, the completer's matrix and count - with a metadata flag
+  for each; an agent refuses a checkpoint whose flags differ from its own settings.
+- **Cost.** Familiarity doubles the store's table (3 600 x 4 more numbers for the return task's observations) and adds a
+  gather at each recall and a scatter at each day's write; completion learns an `n x n` matrix at each moment that
+  learns (`n` the observation's numbers) and solves an `n_o x n_o` system for an observation with numbers missing.
+  Measured, about 4% on the return task and nothing on the ring (5.13).
 
 ---
 
@@ -1881,6 +1952,138 @@ a moment at a night every 500 moments. A transient store's fade is one multiplic
 a transient agent with a reservoir, saved with a fade pending, restores into an agent of another seed and lives its next
 100 moments, a night among them, exactly as the saved one.
 
+### 5.13 Results of phase 10 (2026-10-10)
+
+`examples/nights.olang` and `examples/bandit_settle.olang` (F32), olang ada716d's compiler (oannc5), the shared
+four-core machine. 40 lives a configuration, 80 for the mixed task; intervals 95%; every agent has 64 hidden neurons and
+a consolidator with 2.14's settings unless a row says otherwise; nights every 500 moments where a table says nights.
+Paired differences as in 5.12 (`bench/paired.py`). Columns are blocks of 250 moments named by their last moment.
+
+**Which memory drives the readout (question 15).** The agent as it was (both reads at gain 1), the weighed reads (the
+drive `2 ((1 - Mix) m + Mix c)`), the associative memory off with the recall at gain 1 (5.12's gain 0), and the
+recall alone at gain 2:
+
+| | ring, new points (test) | ring, lived anywhere | return: B begins | return: A again | reversal: after the swap | 64 contexts: 3 750-4 000 |
+|---|---|---|---|---|---|---|
+| both at 1 | 0.126 +- 0.013 | 0.127 +- 0.012 | 0.159 +- 0.019 | 0.069 +- 0.014 | 0.179 +- 0.018 | 0.228 +- 0.011 |
+| weighed | 0.043 +- 0.010 | 0.044 +- 0.007 | 0.120 +- 0.014 | 0.020 +- 0.008 | 0.153 +- 0.017 | 0.196 +- 0.016 |
+| the recall alone at 1 | 0.037 +- 0.008 | 0.045 +- 0.006 | 0.138 +- 0.014 | 0.021 +- 0.013 | 0.223 +- 0.023 | - |
+| **the recall alone at 2** | **0.031 +- 0.007** | **0.035 +- 0.006** | **0.108 +- 0.015** | **0.023 +- 0.011** | **0.161 +- 0.018** | **0.164 +- 0.010** |
+
+(no nights; the ring lived anywhere is moments 2 000-3 000, after the test.) Weighing beats both reads at 1 everywhere,
+by a third to two thirds - the reversal included, where the memory had helped (5.12): right after the swap the recall's
+share falls from 0.91 to 0.82 for a block and climbs back to 0.95 as the store relearns. Elsewhere it settles at
+0.94-0.97 (`WeighRate` 0.03 and 0.3 measure the same within the intervals). But the recall alone at the same total gain
+does as well within the intervals in every column and better beyond them on the 64 contexts - paired against the
+weighing: the ring's new points -0.012 +- 0.012 and lived -0.009 +- 0.008, B's start -0.012 +- 0.019, back in A
++0.002 +- 0.012, the reversal +0.008 +- 0.024, the 64 contexts' end -0.032 +- 0.017. So 5.12's finding that the
+memory helps after a reversal was the readout's drive, not the memory: the recall alone at gain 1 recovers slowly
+(0.223), at gain 2 as fast as both together (0.161). With nights and with noisy observations the same: the return with
+nights B's start 0.178 / 0.167 / 0.161 and back in A 0.079 / 0.034 / 0.025 (both / weighed / the recall at 2); noisy
+(`noise=0.1`, no nights) back in A 0.085 / 0.032 / 0.028. The transfer task's B begins at 0.030 / 0.023 / 0.015.
+
+**The drive's gain.** The recall alone, no nights:
+
+| gain | return: B begins | return: A again | reversal: after the swap | 64 contexts: 3 750-4 000 | ring, lived anywhere |
+|---|---|---|---|---|---|
+| 1 | 0.138 +- 0.014 | 0.021 +- 0.013 | 0.223 +- 0.023 | - | 0.045 +- 0.006 |
+| 1.5 | 0.118 +- 0.014 | 0.020 +- 0.009 | 0.170 +- 0.013 | 0.158 +- 0.010 | - |
+| 2 | 0.108 +- 0.015 | 0.023 +- 0.011 | 0.161 +- 0.018 | 0.164 +- 0.010 | 0.035 +- 0.006 |
+| 3 | 0.099 +- 0.015 | 0.012 +- 0.006 | 0.145 +- 0.016 | 0.157 +- 0.009 | 0.036 +- 0.005 |
+| 4 | 0.089 +- 0.012 | 0.007 +- 0.004 | 0.143 +- 0.016 | 0.160 +- 0.010 | 0.041 +- 0.006 (*) |
+
+(*) ring blocks 2 250-3 000 at gain 4 as at 2-3 within the intervals, its new points' test 0.035 against 0.031. The
+drive's gain is an inverse temperature on the recalled values - with values of rewards in `[-1, 1]` and the readout's
+`T = 0.25`, a gain of 1 makes a recalled difference of 0.6 a factor of about 11 in the policy's odds, a gain of 2 about
+120 - and on these stationary four-armed tasks greedier pays. That is a question of exploration, not of which memory
+(open question 18). An agent without a consolidator gains from a doubled memory gain too where one observation's answer
+changes - the reversal's block after the swap 0.229 +- 0.023 at 1, 0.181 +- 0.020 at 2 (paired -0.048 +- 0.028) - and
+nothing beyond the intervals elsewhere (the return -0.015 to -0.030 +- 0.019-0.032, the ring and both bandits within
++-0.005).
+
+**Partial cues (question 16).** Observations lacking numbers, the agent told which (`known`), with and without
+completion. The test's partial cues (the training points with half their numbers missing; consolidator, nights) and
+lives where half the moments' observations each lack every number with probability 1/2 (`missing=0.5`; the ring with
+`partial`'s half):
+
+| | whole observations | half missing | half missing, completed |
+|---|---|---|---|
+| ring test, partial cues: the answer, the recall (the recall alone at 2) | 0.030 / 0.028 (the seen points) | 0.144 / 0.145 | **0.030 / 0.029** |
+| the same, both reads at 1 | 0.139 / 0.039 (seen) | 0.219 / 0.148 | **0.140 / 0.040** |
+| ring, training (moments 250-2 000) | 0.036 +- 0.010 | 0.108 +- 0.007 | **0.043 +- 0.010** |
+| ring, lived anywhere (2 000-3 000) | 0.031 +- 0.006 | 0.087 +- 0.005 | **0.036 +- 0.008** |
+| bandit, no consolidator (250-4 000) | 0.042 +- 0.009 | 0.061 +- 0.009 | **0.041 +- 0.007** |
+| bandit, a consolidator (250-4 000) | 0.011 +- 0.005 | 0.029 +- 0.004 | **0.007 +- 0.003** |
+| return with nights: B begins | 0.161 +- 0.015 | 0.243 +- 0.018 | **0.180 +- 0.015** |
+| return with nights: A again | 0.025 +- 0.010 | 0.112 +- 0.021 | **0.044 +- 0.016** |
+| return with nights: the rest of A (4 250-6 000) | 0.008 +- 0.005 | 0.093 +- 0.017 | **0.008 +- 0.006** |
+
+(the recall alone at 2 unless a row says otherwise, familiarity off - its test 0.030 at the seen points against 5.12's
+0.139, decision 77.) Completion answers a partial cue of a point seen as the point itself: the ring's observations lie
+in a plane of the 16 numbers, so any 8 of them tell where on the ring the point is, and the conditional mean puts it
+there - the answer's regret 0.030, the whole point's. Lived, completed observations cost what whole ones do within the
+intervals (paired, the ring lived +0.005 +- 0.008, the bandit without a consolidator -0.002 +- 0.011); uncompleted
+ones cost from half as much again (the bandit without a consolidator) to eleven times as much (the rest of the
+return's A). The return task's B starts dearer half missing even
+completed (0.180 against 0.161): what is missing includes B's code, and the completer, having learned only A until
+then, fills it with A's.
+
+**Generalization as a bet (question 17).** The recall alone at 2, nights every 500 moments; the mixed task (80 lives:
+each life meets one new surroundings sharing A's answers and one conflicting with them) by kind of surroundings, its
+first 250 moments and the next 250:
+
+| | conflicting: first | conflicting: next | sharing: first | sharing: next |
+|---|---|---|---|---|
+| the guess at weight 1 (the agent as it was) | 0.167 +- 0.013 | 0.044 +- 0.013 | 0.051 +- 0.015 | 0.019 +- 0.008 |
+| at weight 0 | 0.124 +- 0.012 | 0.037 +- 0.011 | 0.066 +- 0.011 | 0.019 +- 0.009 |
+| **learned, `GuessRate` 0.03** | **0.111 +- 0.011** | **0.029 +- 0.010** | **0.047 +- 0.012** | **0.018 +- 0.008** |
+| learned, 0.1 | 0.123 +- 0.012 | 0.043 +- 0.011 | 0.047 +- 0.011 | 0.019 +- 0.008 |
+
+Paired against weight 1: weight 0 -0.043 +- 0.016 where the new surroundings conflict and +0.015 +- 0.015 where they
+share; learned at 0.03, -0.056 +- 0.013 and -0.004 +- 0.011. The tasks of 5.12 (paired against weight 1): the transfer's
+B start (0.015) +0.039 +- 0.012 at weight 0 and +0.006 +- 0.005 learned; the return with nights' B start (0.161) -0.049
++- 0.020 and -0.039 +- 0.019; the ring's partial cues +0.021 +- 0.010 at weight 0, -0.003 +- 0.006 learned, its lived
+regret +0.008 +- 0.005 and -0.001 +- 0.004; the reversal, the bandit and the 64 contexts learned within +-0.007. The
+learned weight ends a life at 0.76-0.95: the first outcomes at a conflicting surroundings' observations send it down for
+as long as they last, and a familiar stretch brings it back toward 1. On the agent as it was (both reads at 1) the bet
+weighed less - the guess was half of a drive beside a memory read pulling elsewhere - and learning it bought nothing
+beyond the intervals (mixed, 40 lives: -0.017 +- 0.019 conflicting, -0.016 +- 0.019 sharing).
+
+**The agent as it was against the agent as it is** (2.14's settings, both reads at gain 1, against the defaults now:
+the recall alone at 2, familiarity with the learned guess, completion; nights every 500 moments; paired):
+
+| | as it was | as it is | paired |
+|---|---|---|---|
+| ring: new points (test) | 0.113 +- 0.013 | **0.029 +- 0.008** | -0.085 +- 0.014 |
+| ring: lived anywhere | 0.113 +- 0.011 | **0.030 +- 0.007** | -0.083 +- 0.012 |
+| ring, half the moments half missing: lived anywhere | 0.163 +- 0.005 | **0.040 +- 0.009** | -0.122 +- 0.011 |
+| ring, the same: partial cues (test) | 0.243 +- 0.009 | **0.042 +- 0.013** | -0.201 +- 0.017 |
+| return: B begins | 0.178 +- 0.017 | **0.121 +- 0.018** | -0.057 +- 0.020 |
+| return: A again | 0.079 +- 0.014 | **0.023 +- 0.009** | -0.056 +- 0.014 |
+| return, noisy (`noise=0.1`): B begins / A again | 0.193 / 0.097 | **0.146 / 0.043** | -0.047 +- 0.016 / -0.054 +- 0.018 |
+| reversal: after the swap | 0.179 +- 0.018 | **0.156 +- 0.014** | -0.024 +- 0.022 |
+| transfer: B begins | 0.030 +- 0.009 | **0.021 +- 0.009** | -0.009 +- 0.014 |
+| mixed (80 lives): conflicting, first 250 moments | 0.187 +- 0.011 | **0.111 +- 0.011** | -0.076 +- 0.014 |
+| mixed: sharing, first 250 moments | 0.078 +- 0.017 | **0.047 +- 0.012** | -0.030 +- 0.013 |
+| bandit, 4 contexts: first block / 3 750-4 000 | 0.140 / 0.005 | **0.089 / 0.006** | -0.051 +- 0.011 / +0.001 +- 0.005 |
+| bandit, 64 contexts: 3 750-4 000 | 0.230 +- 0.011 | **0.171 +- 0.011** | -0.058 +- 0.013 |
+
+The four-context tasks' first blocks fall by about a third (0.138-0.140 to 0.089, the recall's stronger drive), and
+every difference but the reversal's, the transfer's and the four-context bandit's end is beyond its interval.
+
+**Cost** (one thread, interleaved runs of 10 lives at loads of 2-7): a moment on the ring 0.082-0.085 ms as it was and
+0.077-0.083 as it is, a night 53-55 ms against 45-47 (over 413 and 435 cues kept); the return task's 10 lives 18.0-18.9
+s against 19.1-19.6 s - familiarity's gather at every recall and scatter at every day's write, about 4%.
+
+**Checks** (`make test`): the weigher's share by hand at rate 1, toward the forecast nearer the outcomes, toward the
+memories when noisy outcomes favour them, and at its prior where the forecasts agree; the guesser's weight by hand
+through an unfamiliar and a familiar outcome, to 0 and 1 under wrong and right guesses, fixed at rate 0; completion of a
+point of a learned plane from 3 of its 6 numbers within 0.01, the known numbers kept, nothing learned or every number
+known leaving the observation as it was; the store's familiarity halfway to 1 a write at rate 1/2, only for the outputs
+written, unchanged by a fade, a fold and a clear, and 0 at a reading sharing no cell; an agent with all three on driving
+its readout exactly as stated, and a checkpoint restoring its life - partial observations and a night among the next
+100 moments - into an agent of another seed, which agents lacking any of the three refuse.
+
 ## 6. Decisions and open questions
 
 **Decided**
@@ -2130,7 +2333,60 @@ a transient agent with a reservoir, saved with a fade pending, restores into an 
 76. **The associative memory stays in a consolidating agent** (gain 1): measured, it costs most where answers are not
     linear in the observation (the ring: 0.126 against 0.037) or where conflicting surroundings share most of an
     observation (back in A 0.069 against 0.021), and helps where one observation's answer changes (a reversal's first
-    block 0.179 against 0.223). Neither memory alone is best everywhere: open question 15.
+    block 0.179 against 0.223). Neither memory alone is best everywhere: open question 15. *Superseded by decision 77.*
+
+**Taken in phase 10 (2026-10-10)** - open questions 15-17, measured (2.16, 5.13):
+
+77. **A consolidating agent's readout is driven by its recall alone, at `RecallGain` 2** (`Settings.RecallAlone`, on;
+    open question 15): the two reads' former gains summed on the recall. Measured against both reads at 1, it lowers the
+    regret on every task - the ring's new points 0.126 to 0.031, B's start in the return 0.159 to 0.108, back in A 0.069
+    to 0.023, the reversal's block after the swap 0.179 to 0.161, the 64 contexts' end 0.228 to 0.164 - and it matches
+    the weighing of decision 78 within the intervals everywhere but the 64 contexts, where it is better
+    (-0.032 +- 0.017). The associative memory is still written (a weighing agent reads it); `RecallAlone` off with
+    `RecallGain` 1 is the agent as it was (2.14). Decision 76 is superseded: what the memory added beside a consolidator was drive,
+    which the recall supplies better.
+78. **Weighing the reads by their forecasts is built and not taken** (`Settings.Weigh`, off; `WeighRate` 0.1): the
+    readout's drive `RecallGain ((1 - Mix) m + Mix c)`, `Mix` the least-squares weight of the recall's forecast in the
+    outcome (Bates and Granger 1969) over running means at the moments that learn. It beats both reads at gain 1
+    everywhere and ends at a share of 0.94-0.97 for the recall (0.82 in the block after a reversal), so it buys little
+    over the recall alone, and with 64 contexts, where the linear memory knows nothing, its noise costs.
+79. **Observations with numbers missing are completed** (`Settings.Completion`, on; open question 16): `Step`, `Begin`
+    and `Imagine` take `known`, and the agent completes what it lacks before anything reads the observation - from a
+    correlation-matrix memory of its whole observations, by the conditional mean `x_u = M_uo (M_oo + nu I)^-1 x_o`. With
+    half the moments missing half their numbers it brings every task back to its regret with whole observations within
+    the intervals (the ring lived 0.087 to 0.036 against 0.031 whole; the four-context bandit without a consolidator
+    0.061 to 0.041 against 0.042), and a partial cue of a seen point is answered as the point itself (the ring's test
+    0.144 to 0.030, the whole points' 0.030). On by default because a life of whole observations is the same with it or
+    without (its matrix is learned and never read); it costs `n^2` multiply-adds at each moment that learns (`n` the
+    observation's numbers).
+80. **Completion needs the mask** - which numbers are missing is the caller's to say (`known`). Without one a completer
+    cannot tell a partial observation from a new one: computed for these tasks' geometry, half the ring's numbers zeroed
+    leave 0.67 of a cue outside the span of the observations learned, and a return task's new surroundings 0.73. A
+    blind completion would merge new surroundings into old ones, which is pattern completion's risk without pattern
+    separation's.
+81. **The completer learns as the other memories do**: at the moments that learn, from the observation acted on, only
+    when it was whole (a completed one would teach the completer its own estimates), at `1 / count` until that falls to
+    arousal's slow rate (`Settings.Slow`, 0.003), and with a ridge `nu = 0.01 tr(M) / n` that keeps the solve well posed
+    where the observations span fewer directions than the numbers known. Numbers nothing learned relates to the known
+    ones are completed as 0, what an unmarked missing number reads as anyway.
+82. **The slow part's guess at unfamiliar observations is weighed, and the weight learned** (`Settings.Familiarity`,
+    on, `Guess` 1, `GuessRate` 0.03; open question 17): the store keeps per output how much its days taught it
+    (`Store.ReadFamiliar`), the recall is `store + (f + (1 - f) Guess) slow`, and `Guess` is the least-squares weight of
+    the unfamiliar part in the outcomes over sums forgetting by `1 - GuessRate` a moment that learns, from a prior of 1
+    worth one unfamiliar outcome of a guess of 1/2. Measured on the recall-alone readout, in a life meeting both kinds
+    of new surroundings (80 lives): the first 250 moments of conflicting ones 0.167 to 0.111 (-0.056 +- 0.013), of
+    sharing ones unchanged (-0.004 +- 0.011); the return with nights' B start 0.161 to 0.121; the transfer's B start
+    0.015 to 0.021 (+0.006 +- 0.005), the one cost; the ring, the bandits and the reversal unchanged within +-0.007. A
+    weight fixed at 0 removes the same conflict cost but loses the transfer's generalization (+0.039 +- 0.012) and costs
+    the ring's partial cues; a weight fixed at 1 is the agent as it was.
+83. **`GuessRate` 0.03**: measured at 0.01, 0.03, 0.1 and 0.3 - the conflicting surroundings' first block -0.054,
+    -0.056, -0.044 and -0.026, the transfer's B start +0.008, +0.006, +0.004 and +0.002 - so a slower forgetting keeps
+    more of what earlier surroundings showed, at a small cost where the guess was right; 0.03 is the knee.
+84. **Familiarity is the days', not the nights'**: never faded with a transient store, never cleared or rewritten at
+    dawn. A night consolidates what the days saw into the slow part, so an observation seen remains familiar after its
+    trace in the store fades - the slow part's answer there is consolidated memory, not generalization.
+85. **5.11's and 5.12's tables describe the agent as it was** (both reads at gain 1, no familiarity), which
+    `recallalone=0 recallgain=1 familiarity=0` restores in the examples; 5.13 measures the agent as it is against them.
 
 **Open questions**
 
@@ -2195,23 +2451,38 @@ a transient agent with a reservoir, saved with a fade pending, restores into an 
     only approximately - a new surroundings sharing old answers, noisy cues, new points of a smooth rule - and for a
     store that forgets; they cost where new surroundings conflict; a permanent pattern-separating store needs them for
     nothing else.*
-15. **Which memory drives the readout** (from 5.12). The associative memory's linear read and the consolidator's recall
-    both drive the readout at gain 1; the first is wrong wherever answers are not linear in the observation or
-    conflicting surroundings share most of it (a consolidating agent's regret coming back to A 0.069 with it, 0.021
-    without), the second slow where one observation's answer changes (a reversal's first block 0.179 with the memory,
-    0.223 without). Recommended: weigh each read by how well it has predicted lately - each memory's recent error at
-    the moments that learn, a per-memory associability (Pearce & Hall 1980, arousal's own principle) - and measure on
-    the ring, the return and the reversal together. Default: both at gain 1.
-16. **Partial cues** (from 5.12). With half of an observation's numbers missing neither the store nor the nights help
-    (regret 0.14-0.15 against 0.31 by chance, 0.035 when whole): a sparse code of a partial reading is another code,
-    and the slow part reads a smaller input. Pattern completion - the cue completed before it is keyed, by the
-    attractors of an auto-associative network (Hopfield 1984) or the nearest cue kept - is the mechanism the theory
-    gives the hippocampus for this. Recommended: when a task presents partial observations. Default: none.
-17. **Generalization as a bet** (from 5.12). The slow part's recall at an unfamiliar observation is right when new
-    surroundings share old answers and wrong when they conflict, and the agent cannot know which before it acts. A
-    familiarity signal - how many of the observation's code cells the days have written - could weigh the slow part's
-    recall down where the store knows nothing and arousal is about to learn anyway. Recommended: measure on a life that
-    meets both kinds of new surroundings. Default: the recall at full gain everywhere.
+15. *(Answered: the recall alone, at the two gains' sum - decisions 77-78.)* **Which memory drives the readout** (from
+    5.12). The associative memory's linear read and the consolidator's recall both drive the readout at gain 1; the
+    first is wrong wherever answers are not linear in the observation or conflicting surroundings share most of it (a
+    consolidating agent's regret coming back to A 0.069 with it, 0.021 without), the second slow where one observation's
+    answer changes (a reversal's first block 0.179 with the memory, 0.223 without). Recommended: weigh each read by how
+    well it has predicted lately - each memory's recent error at the moments that learn, a per-memory associability
+    (Pearce & Hall 1980, arousal's own principle) - and measure on the ring, the return and the reversal together.
+    Default: both at gain 1. *Measured in phase 10 (5.13): weighing by forecast pays, but the recall alone at the same
+    total gain pays as much - what the memory added was drive.*
+16. *(Answered: completed from the observations learned, when the caller says which numbers are missing - decisions
+    79-81.)* **Partial cues** (from 5.12). With half of an observation's numbers missing neither the store nor the
+    nights help (regret 0.14-0.15 against 0.31 by chance, 0.035 when whole): a sparse code of a partial reading is
+    another code, and the slow part reads a smaller input. Pattern completion - the cue completed before it is keyed, by
+    the attractors of an auto-associative network (Hopfield 1984) or the nearest cue kept - is the mechanism the theory
+    gives the hippocampus for this. Recommended: when a task presents partial observations. Default: none. *Built in
+    phase 10 (2.16) as a correlation-matrix memory read by conditional mean: partial observations answered as whole
+    ones.*
+17. *(Answered: weighed by familiarity, the weight learned from the outcomes - decisions 82-84.)* **Generalization as a
+    bet** (from 5.12). The slow part's recall at an unfamiliar observation is right when new surroundings share old
+    answers and wrong when they conflict, and the agent cannot know which before it acts. A familiarity signal - how
+    many of the observation's code cells the days have written - could weigh the slow part's recall down where the store
+    knows nothing and arousal is about to learn anyway. Recommended: measure on a life that meets both kinds of new
+    surroundings. Default: the recall at full gain everywhere. *Measured in phase 10 (5.13): a fixed weight trades one
+    kind for the other; a weight learned from the first outcomes at unfamiliar observations keeps the generalization
+    where it holds and drops it where it does not.*
+18. **The readout's drive gain** (from 5.13). The recall's gain on the readout is an inverse temperature on the
+    recalled values: 3 and 4 measured lower regret still than 2 on the return and the reversal, the 64 contexts level
+    from 1.5 and the ring from 2 (a little worse at 4), and a doubled memory gain helps an agent without a consolidator
+    after a reversal (0.229 to 0.181).
+    On these stationary four-armed tasks greed pays; where actions must be tried again it may not, and the arousal gate
+    already ties exploration to surprise (open question 8). Recommended: measure with a task whose payoffs drift slowly,
+    together with question 8. Default: `RecallGain` 2, `MemoryGain` 1.
 
 
 ---
@@ -2270,6 +2541,7 @@ Memory, arousal, consolidation
   McNaughton, B. L. (1994). Reactivation of hippocampal ensemble memories during sleep. *Science* 265. Hinton, G. E.,
   Plaut, D. C. (1987). Using fast weights to deblur old memories. *Proc. Cognitive Science Society*.
 - Vitter, J. S. (1985). Random sampling with a reservoir. *ACM Trans. Mathematical Software* 11.
+- Bates, J. M., Granger, C. W. J. (1969). The combination of forecasts. *Operational Research Quarterly* 20.
 - Cho, K. et al. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation.
   *EMNLP*. Bradbury, J. et al. (2017). Quasi-recurrent neural networks. *ICLR*. Werbos, P. J. (1990). Backpropagation
   through time: what it does and how to do it. *Proc. IEEE* 78.

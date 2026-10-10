@@ -709,9 +709,12 @@ conv.olang              convolution (forward: one product of the patches packed 
 vision.olang            the convolution layer; the gradient checks of convolution and pooling
 circuit.olang           settling networks: Circuit (regions, projections dense or sparse, readout groups), settles,
                         the certificate, Teach, Eligibility; the neuron models, spiking included
-agent.olang             Agent: a circuit living moments, with a critic, memories, a context trace and arousal
+agent.olang             Agent: a circuit living moments, with a critic, memories, a context trace and arousal; its
+                        consolidator's recall driving the readout, weighed by familiarity (Guesser); the Weigher;
+                        completion of observations with numbers missing (Completer)
 board.olang             the PYNQ-Z2 engine simulated in integers (docs/settling.md 4.2), golden vectors
-store.olang             the sparse-code store
+store.olang             the sparse-code store, with an optional familiarity table
+consolidator.olang      sleep: the slow learner on a Graph beside the store, days, nights and dawn
 sparse.olang            CSR matrices and their products, top-k, the sparse-code products
 datasets/idx.olang      the IDX format
 datasets/loader.olang   Labeled sets and the Loader
@@ -741,6 +744,7 @@ bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against
 bench/sparse.olang      sparse projections against dense ones, kernels and whole circuits
 bench/int8.olang        the INT8 product against std/linalg's F32 one, on the networks' shapes
 bench/each.olang        oann's element-wise loops against std/linalg's Map (kept for the record of section 22)
+bench/paired.py         two runs of the settling examples' lives (perlife=1) compared life by life, with intervals
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
@@ -1064,6 +1068,11 @@ rule - and retention for a store that forgets; a cost where new surroundings con
 (`Settings.RecallHalfLife`, off) and a reservoir of the cues a night replays (`Settings.SleepCues`, 1 024 for an
 agent). `make nights` runs `examples/nights.olang`. Results and decisions: docs/settling.md sections 2.15, 5.12 and 6
 (decisions 72-76).
+
+Phase 10 answers how a consolidating agent should read what it remembers (docs/settling.md open questions 15-17;
+section 24 below): its recall drives the readout alone, at gain 2; observations with numbers missing are completed from
+the whole ones learned; and the slow part's guess at observations the store has never seen is weighed by a bet learned
+from the outcomes there. Results and decisions: docs/settling.md sections 2.16, 5.13 and 6 (decisions 77-85).
 
 ## 18. Phase 5: attention on products, mixed precision, a Dataset trait
 
@@ -1788,3 +1797,87 @@ the slow part's generalization at unfamiliar observations are docs/settling.md's
 3. **An agent's nights replay at most 1 024 cues**, a reservoir; a lone consolidator keeps every cue (74).
 4. **Nights are measured in pairs, generalization on the ring** (75).
 5. **The associative memory stays in a consolidating agent** until a reliability-weighted readout is measured (76).
+
+## 24. Phase 10: olang ada716d; how a consolidating agent reads what it remembers
+
+docs/settling.md's open questions 15-17, measured (its 2.16, 5.13, decisions 77-85), on olang ada716d's compiler, the
+shared four-core machine, 2026-10-10.
+
+### Catching up
+
+The makefile's `OLANG` is `/home/user/wt/oannc5/build/out` (olang ada716d). Two things changed what oann had to write:
+
+- **A field of a call's value result passed straight to a call is refused** (O10d, "this value lives in this
+  function's own scope") when the call's receiver is a reference parameter - `o.stepIn(g.Masters().Data, ...)` in
+  optim's `AdamW` and `Sgd`, the consolidator's night and the agent's checkpoints, all of which olang efdb82c took. Each
+  result is named first (`masters := g.Masters()`). `repro/fieldofresult`.
+- **A view-giving function left a local in the scope its result lands in, at every call.** `nn.Graph.Value` copied its
+  node (`nd := g.nodes[v]`, 160 bytes) and passed it to `g.rows(nd)`, whose number sized the returned view; the compiled
+  `Value` allocated the copy in its result scope, which lands where the graph's storage lives, so every `Value`, `Grad`
+  and saved-matrix view added 160 bytes to the graph's scope until the graph died. A transformer's training step grew by
+  about 100 KB (`bench/lm`: 113.3 MB after 5 steps, 114.8 MB after 20), and a consolidating agent - whose slow part runs
+  `Forward` at every moment - by about 9 KB a moment (69 MB over 6 000 moments, where efdb82c's build stays at 3.3 MB).
+  Regrets were unaffected (they are deterministic); memory and time were not. Worked around in nn: the three views read
+  their node's numbers through one helper (`place`) and hold no node; both stay flat now. `repro/resultgrowth` (a struct
+  copied from a `List` element, passed to a method of the structure whose result sizes the view: it grows 16 bytes a
+  call; a field copy, a plain function or a result not reading the call do not).
+- Every example and bench program builds; `repro/lambdalend` still reproduces (O17, now worded as the references
+  living where the value's storage does not), and `fieldname`, `joinparen`, `nestedtry` and `tryindex` are reported as
+  before. Under the scope sanitizer (`-s`) the tests of nn, quant, sparse, store, circuit, board, agent and the
+  consolidator - 88 of them - pass with nothing reported, and again those of nn, store, agent and the consolidator (44)
+  with this phase's code, beside a mixed life with missing numbers and weighed reads that gives the same regrets as
+  the plain build. `make test`: 138 passed.
+
+### Which memory drives the readout, partial observations, the slow part's bet
+
+**Which memory (question 15).** A Weigher shares the readout's drive between the associative memory's read and the
+consolidator's recall by their recent forecast errors (Bates and Granger's combination of forecasts): it pays on every
+task, but the recall alone at the two gains' sum (2) pays as much, and more where the linear memory knows nothing - so
+a consolidating agent's readout is now its recall alone at gain 2, and the weighing an option. 5.12's finding that the
+memory helped after a reversal was drive: the recall at gain 2 recovers as fast. Gains 3-4 measured lower still on the
+return and the reversal - an exploration question (settling open question 18).
+
+**Partial cues (question 16).** `Step`, `Begin` and `Imagine` take `known`, which numbers were observed; the agent
+completes the others from a correlation-matrix memory of its whole observations by the conditional mean
+`x_u = M_uo (M_oo + nu I)^-1 x_o`. With half the moments' observations missing half their numbers, every task's regret
+comes back to its value with whole observations within the intervals. On by default: a life of whole observations is
+the same with it.
+
+**The slow part's bet (question 17).** The consolidator's store keeps how much its days taught it (a familiarity table
+beside its values), and the recall is `store + (f + (1 - f) Guess) slow`, `Guess` learned from the outcomes at
+unfamiliar observations (recursive least squares with forgetting). In a life meeting new surroundings that share old
+answers and ones that conflict with them, the conflicting ones' first 250 moments cost 0.111 against 0.167 and the
+sharing ones nothing more.
+
+**The agent as it was against as it is** (paired over 40 lives, 80 for the mixed task; regret):
+
+| | as it was | as it is |
+|---|---|---|
+| ring: new points / lived anywhere | 0.113 / 0.113 | 0.029 / 0.030 |
+| ring, half the moments half missing: lived / partial cues | 0.163 / 0.243 | 0.040 / 0.042 |
+| return: B begins / A again | 0.178 / 0.079 | 0.121 / 0.023 |
+| reversal: after the swap | 0.179 | 0.156 |
+| transfer: B begins | 0.030 | 0.021 |
+| mixed: conflicting / sharing surroundings' first 250 moments | 0.187 / 0.078 | 0.111 / 0.047 |
+| bandit, 64 contexts: 3 750-4 000 | 0.230 | 0.171 |
+
+Cost: familiarity's gather and scatter, about 4% on the return task; a moment on the ring no dearer.
+
+### Decisions
+
+1. **A consolidating agent's readout is its recall alone, at gain 2** (settling decision 77); the forecast-weighted
+   mix is built and not taken (78).
+2. **Completion of observations with numbers missing, told which** (79-81), on by default.
+3. **The slow part's guess weighed by familiarity, its weight learned at `GuessRate` 0.03** (82-84), on by default.
+4. **5.11's and 5.12's tables are the agent as it was** (85); `recallalone=0 recallgain=1 familiarity=0` restores it.
+5. **Paired comparisons through `bench/paired.py`**, the examples' `perlife=1` lines matched life by life.
+
+### olang issues (repro/)
+
+- `fieldofresult` (new): O10d refuses a field of a call's value result passed on, with a reference-parameter
+  receiver; naming the result first compiles.
+- `resultgrowth` (new): a local copied from a `List` element and passed to a method of the structure is kept in the
+  result scope of a function returning a view into that structure - unbounded growth in a loop.
+- `membercascade` (new): reading a constructor parameter that is not a field gives a second error at the same place
+  ("a condition is a Bool, found I32").
+- `lambdalend`: still refused (O17). `fieldname`, `joinparen`, `nestedtry`, `tryindex`: deliberate rules, as before.

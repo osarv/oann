@@ -17,14 +17,19 @@
 # the code of the moved mean. Fade(f) makes the store transient: every value it holds is multiplied by f (a
 # hippocampus whose traces decay unless consolidated, McClelland, McNaughton and O'Reilly 1995) - kept pending as one
 # number, Pending, folded into the table only when it falls below 1/2, so a fade costs nothing per read or write.
-# Nothing is allocated after the store is made.
+# With Familiarity the store also keeps how much of each output the writes have taught it at every cell: a second
+# table of the same shape, written by every write at the same cells and rate toward 1 for the outputs it knows, never
+# faded and left as it is by WriteCode and Clear - so ReadFamiliar gives, per output, how much of a reading's read is
+# what writes put there (0 where no write reached its cells, toward 1 after writes at them; docs/settling.md 6,
+# question 17). Nothing is allocated after the store is made.
 
 import "std/linalg"
 import "std/math"
 import "std/rand"
 import "sparse"
 
-type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I64 = 0, Rate F64 = 1, MeanRate F64 = 0.01) {
+type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I64 = 0, Rate F64 = 1,
+        MeanRate F64 = 0.01, Familiarity Bool = false) {
     Inputs I64 = inputs
     Outputs I64 = outputs
     Seed U64 = seed
@@ -32,6 +37,7 @@ type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I6
     K I64 = Active if Active > 0 else I64(math.Ceil(0.05 * F64(N)))    # the active cells of a code
     Rate
     MeanRate
+    Familiarity
     assert N >= 1 and K >= 1 and K <= N and Outputs >= 1
     R mut Array<T>& = Array<T>(N * inputs)                     # N x Inputs, row by row
     fillProjection(R, N, inputs, seed)
@@ -46,6 +52,7 @@ type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I6
     Code mut Array<T>& = Array<T>(K)                           # and their values (a selected cell may be 0)
     y mut Array<T>& = Array<T>(outputs)
     err mut Array<T>& = Array<T>(outputs)
+    Familiar mut Array<T>& = Array<T>(N * outputs if Familiarity else 0)  # N x Outputs, with Familiarity
 }
 
 # row i of the projection, into out (Inputs of them): N(0, 1 / Inputs) from the generator of seed and i - what an
@@ -143,8 +150,23 @@ fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&, known Array<Bool>& =
         }
     }
     sparse.ScatterRank1(s.Table, s.Idx, s.Code, s.K, s.err, s.scaled(s.Rate))
+    if s.Familiarity {
+        sparse.GatherRowsWeighted(s.y, s.Familiar, s.Idx, s.Code, s.K)
+        one := linalg.Cast(1.0, like)
+        for t in range s.Outputs { s.err[t] = like if known != null and not known[t] else one - s.y[t] }
+        sparse.ScatterRank1(s.Familiar, s.Idx, s.Code, s.K, s.err, linalg.Cast(s.Rate, like))
+    }
     s.Writes++
     return active
+}
+
+# how familiar the last code read or written is (Familiarity): per output, the second table's read at it, clamped to
+# [0, 1] - what share of the read the writes taught, 0 where none reached the code's cells
+fn (s Store<<T>>&) ReadFamiliar(out mut Array<T>&) {
+    sparse.GatherRowsWeighted(out, s.Familiar, s.Idx, s.Code, s.K)
+    like T
+    one := linalg.Cast(1.0, like)
+    for t in range s.Outputs { out[t] = like if out[t] < like else (one if out[t] > one else out[t]) }
 }
 
 # the code of reading x at the mean as it is, its K cells (increasing) into idx and their values into code; gives the
@@ -391,4 +413,54 @@ test "a fading store: every value it holds shrinks by the factor, a write still 
     c := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
     c.Fade(1.0)
     assert c.Pending == 1.0
+}
+
+test "familiarity: writes teach it toward 1 at their cells for the outputs they know, and nothing fades or clears it" {
+    s := Store<F64>(8, 3, 11, 0, 0, 0.5, 0.0, true)
+    r := rand.Rand(4)
+    x := reading(r, 8)
+    out := Array<F64>(3)
+    f := Array<F64>(3)
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert f[0] == 0.0 and f[1] == 0.0 and f[2] == 0.0
+    known := Bool[true, false, true]
+    target := F64[0.4, -0.7, 0.9]
+    # a unit code at rate 0.5: each write moves the read halfway to 1, for the outputs it knows only
+    s.Write(x, target, known)
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert math.Abs(f[0] - 0.5) < 1e-14 and f[1] == 0.0 and math.Abs(f[2] - 0.5) < 1e-14
+    s.Write(x, target, known)
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert math.Abs(f[0] - 0.75) < 1e-14 and f[1] == 0.0 and math.Abs(f[2] - 0.75) < 1e-14
+    # the values fade and clear; what the writes taught does not
+    s.Fade(0.3)
+    s.Fold()
+    s.Clear()
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert out[0] == 0.0 and math.Abs(f[0] - 0.75) < 1e-14 and f[1] == 0.0
+    # a reading sharing no cell with x is not familiar at all
+    sx := Store<F64>(8, 3, 11)                      # the same projection: x's cells
+    sx.code(x)
+    apart I64 = 0
+    for trial in range 100 {
+        y := reading(r, 8)
+        s.code(y)
+        shared I64 = 0
+        for i in range s.K {
+            for j in range s.K {
+                if s.Idx[i] == sx.Idx[j] { shared++ }
+            }
+        }
+        if shared == 0 {
+            s.Read(y, out)
+            s.ReadFamiliar(f)
+            assert f[0] == 0.0 and f[2] == 0.0
+            apart++
+        }
+    }
+    assert apart > 10
 }

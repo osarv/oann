@@ -613,17 +613,32 @@ fn (g Graph<<T>>&) rows(nd Node&) I64 {
     return g.N if nd.Batched else nd.Rows
 }
 
-# v's value, as a view of the arena: writing it writes the graph
+# v's value, as a view of the arena: writing it writes the graph. Its place is read through place, so that no node is a
+# local of a function giving a view: such a local passed to a method of the graph was kept in the graph's scope at
+# every call (olang ada716d, repro/resultgrowth)
 fn (g Graph<<T>>&) Value(v Var) linalg.Matrix<T> {
-    nd := g.nodes[v]
-    return linalg.View(g.mem, nd.Offset, g.rows(nd), nd.Cols)
+    at, rows, cols := g.place(v, 0)
+    return linalg.View(g.mem, at, rows, cols)
 }
 
 # v's gradient, as a view of the arena - for a node that has one (a parameter, or anything depending on one)
 fn (g Graph<<T>>&) Grad(v Var) linalg.Matrix<T> {
+    at, rows, cols := g.place(v, 1)
+    return linalg.View(g.mem, at, rows, cols)
+}
+
+# where node v's value (what 0), gradient (1) or saved matrix (2) is in the arena, and its rows and columns in use
+fn (g Graph<<T>>&) place(v Var, what I64) (I64, I64, I64) {
     nd := g.nodes[v]
-    assert nd.GradOffset >= 0
-    return linalg.View(g.mem, nd.GradOffset, g.rows(nd), nd.Cols)
+    if what == 1 {
+        assert nd.GradOffset >= 0
+        return nd.GradOffset, g.rows(nd), nd.Cols
+    }
+    if what == 2 {
+        sr, sc := g.savedShape(nd, true)
+        return nd.SavedOffset, sr, sc
+    }
+    return nd.Offset, g.rows(nd), nd.Cols
 }
 
 # where the caller puts an input's batch: Batch rows of its columns, one after another
@@ -933,9 +948,8 @@ fn (g Graph<<T>>&) classData(v Var) Array<I32>&g {
 # the matrix an operation keeps for its backward, for the rows in use: a loss's softmax, a normalization's row
 # statistics, attention's probabilities, dropout's mask
 fn (g Graph<<T>>&) saved(v Var) linalg.Matrix<T> {
-    nd := g.nodes[v]
-    sr, sc := g.savedShape(nd, true)
-    return linalg.View(g.mem, nd.SavedOffset, sr, sc)
+    at, sr, sc := g.place(v, 2)
+    return linalg.View(g.mem, at, sr, sc)
 }
 
 # v's gradient to write into for a contribution, or an empty matrix where v needs none; whether to add to it is

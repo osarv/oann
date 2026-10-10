@@ -21,8 +21,12 @@
 # Arguments, all optional: lives (20), train (2000), after (1000), points (8), hidden (64), block (250); then the
 # agent's settings as name=value (as examples/bandit_settle.olang's: sleep, recallgain, recallrate, recallhalflife,
 # sleephidden, passes, sleepcells, sleepactive, cues, memorygain, ...) and night (500; 0: none), noise (0.15),
-# partial (0.5), perlife (1: each life's block regrets, then its test's answers and recalls, a line of its own - for
-# paired comparisons).
+# partial (0.5), missing (0: the fraction of the life's moments whose observations lack `partial` of their numbers,
+# the agent told which - Step's known), completion (1, the default: the agent completes missing numbers,
+# docs/settling.md question 16; the test's partial observations are then completed too), weigh (1: the readout's drive
+# shared between the memories by how well each has forecast, question 15), recallalone, familiarity, guess, guessrate
+# (questions 15 and 17), perlife (1: each life's block regrets, then its test's answers and recalls, a line of its own
+# - for paired comparisons).
 
 import "std/io"
 import "std/json"
@@ -37,6 +41,7 @@ Night mut I64 = 500
 PerLife mut Bool = false
 Noise mut F64 = 0.15
 Partial mut F64 = 0.5
+Missing mut F64 = 0.0
 
 type Ring struct(size I64, seed U64) {
     Size I64 = size
@@ -44,6 +49,7 @@ type Ring struct(size I64, seed U64) {
     E mut Array<F64>& = Array<F64>(2 * size)              # e1, then e2
     Turn F64 = 0.0
     seen mut Array<F32>& = Array<F32>(size)
+    Known mut Array<Bool>& = Array<Bool>(size)            # which numbers of the last observation were not dropped
     a F64 = 0.0
     norm F64 = 0.0
     for j in range size { E[j] = rng.Normal() }
@@ -58,12 +64,17 @@ type Ring struct(size I64, seed U64) {
     Turn = rng.Uniform(0.0, math.Pi)
 }
 
-# the observation at theta, with noise times N(0, 1) added to each number and a fraction drop of them zeroed
+# the observation at theta, with noise times N(0, 1) added to each number and a fraction drop of them zeroed - missing,
+# as Known says
 fn (w mut Ring&) Observe(theta F64, noise F64 = 0.0, drop F64 = 0.0) Array<F32>&w {
     for j in range w.Size {
         x F64 = math.Cos(theta) * w.E[j] + math.Sin(theta) * w.E[w.Size + j]
         if noise > 0.0 { x += noise * w.rng.Normal() }
-        if drop > 0.0 and w.rng.Float() < drop { x = 0.0 }
+        w.Known[j] = true
+        if drop > 0.0 and w.rng.Float() < drop {
+            x = 0.0
+            w.Known[j] = false
+        }
         w.seen[j] = F32(x)
     }
     return w.seen
@@ -101,6 +112,8 @@ type Life struct(blocks I64) {
     TrainMs F64 = 0.0                    # per moment, nights excluded
     NightMs F64 = 0.0                    # per night
     Cues F64 = 0.0
+    Mix F64 = 0.0                        # the recall's share of the readout's drive at the end (weigh=1)
+    Guess F64 = 0.0                      # the slow part's weight at unfamiliar observations at the end (familiarity=1)
 }
 
 fn argmax(x Array<F32>&) I64 {
@@ -111,16 +124,17 @@ fn argmax(x Array<F32>&) I64 {
     return best
 }
 
-# the agent's greedy answer to obs, the agent unchanged (Imagine), and its consolidator's most valued arm (-1 without)
-fn answer(a mut agent.Agent<F32>&, obs Array<F32>&, recall mut Array<F32>&) (I64, I64) {
-    try a.Imagine(obs) catch circuit.NotSettled { return 0, 0 }
+# the agent's greedy answer to obs, the agent unchanged (Imagine), and its consolidator's most valued arm (-1 without) -
+# known, when given, marking the numbers observed (Imagine completes the others with completion=1)
+fn answer(a mut agent.Agent<F32>&, obs Array<F32>&, recall mut Array<F32>&, known Array<Bool>& = null) (I64, I64) {
+    try a.Imagine(obs, known) catch circuit.NotSettled { return 0, 0 }
     s := a.Net.Activity(circuit.Phase.Scratch, a.Choice)
     best I64 = 0
     for j in range 1, 4 {
         if s.Get(0, j) > s.Get(0, best) { best = j }
     }
     if a.Sleeper == null { return best, -1 }
-    a.Sleeper.Predict(obs, 0, 1, recall)
+    a.Sleeper.Predict(a.Seen, 0, 1, recall)
     return best, argmax(recall)
 }
 
@@ -137,7 +151,7 @@ fn examine(a mut agent.Agent<F32>&, w mut Ring&, points I64) Test {
             if set == 1 { theta = w.Turn + 2.0 * math.Pi * (F64(i) + 0.5) / 64.0 }
             if set >= 2 { theta = w.Point(i % points, points) }
             obs := w.Observe(theta, Noise if set == 2 else 0.0, Partial if set == 3 else 0.0)
-            act, rec := answer(a, obs, recall)
+            act, rec := answer(a, obs, recall, w.Known if set == 3 else null)
             sumA += w.Best(theta) - w.Pay(theta, act)
             if rec >= 0 { sumR += w.Best(theta) - w.Pay(theta, rec) }
         }
@@ -154,7 +168,8 @@ fn live(seed U64, train I64, after I64, points I64, block I64, hidden I64, s age
     pick := rand.Rand(seed + 104729)
     sleeps Bool = s.Consolidate and Night > 0
     theta F64 = w.Point(pick.Below(points), points)
-    action := try a.Begin(w.Observe(theta)) catch circuit.NotSettled { } default 0
+    gaps := rand.Rand(seed + 15485863)                  # which moments' observations come in part (missing=), and which
+    action := try a.Begin(w.Observe(theta)) catch circuit.NotSettled { } default 0      # numbers they lack
     nightNs I64 = 0
     nights I64 = 0
     t0 := time.Now()
@@ -172,11 +187,23 @@ fn live(seed U64, train I64, after I64, points I64, block I64, hidden I64, s age
         life.Regret[t / block] += (w.Best(theta) - w.Pay(theta, action)) / F64(block)
         reward := w.Pull(theta, action)
         theta = w.Point(pick.Below(points), points) if t + 1 < train else pick.Uniform(0.0, 2.0 * math.Pi)
-        next := try a.Step(w.Observe(theta), reward, true) catch circuit.NotSettled { } default action
+        obs := w.Observe(theta)
+        lacking Bool = Missing > 0.0 and gaps.Float() < Missing
+        if lacking {
+            for j in range w.Size {
+                if gaps.Float() < Partial {
+                    w.seen[j] = 0.0
+                    w.Known[j] = false
+                }
+            }
+        }
+        next := try a.Step(obs, reward, true, w.Known if lacking else null) catch circuit.NotSettled { } default action
         action = next
     }
     if nights > 0 { life.NightMs = F64(nightNs) * 1e-6 / F64(nights) }
     if a.Sleeper != null { life.Cues = F64(a.Sleeper.Cues()) }
+    life.Mix = a.Reads.Mix
+    life.Guess = a.Bet.Guess
     return life
 }
 
@@ -205,9 +232,17 @@ fn settings(args Array<String&>&, from I64) agent.Settings ? json.JsonError {
         if name == "sleepcells" { s.SleepCells = I64(v) }
         if name == "sleepactive" { s.SleepActive = I64(v) }
         if name == "cues" { s.SleepCues = I64(v) }
+        if name == "weigh" { s.Weigh = v != 0.0 }
+        if name == "recallalone" { s.RecallAlone = v != 0.0 }
+        if name == "weighrate" { s.WeighRate = v }
+        if name == "familiarity" { s.Familiarity = v != 0.0 }
+        if name == "guess" { s.Guess = v }
+        if name == "guessrate" { s.GuessRate = v }
         if name == "night" { Night = I64(v) }
         if name == "noise" { Noise = v }
         if name == "partial" { Partial = v }
+        if name == "missing" { Missing = v }
+        if name == "completion" { s.Completion = v != 0.0 }
         if name == "perlife" { PerLife = v != 0.0 }
     }
     return s
@@ -247,6 +282,8 @@ fn main() ? io.IoError + json.JsonError {
     trainMs := Array<F64>(lives)
     nightMs := Array<F64>(lives)
     cues := Array<F64>(lives)
+    mix := Array<F64>(lives)
+    guess := Array<F64>(lives)
     t0 := time.Now()
     for k in range lives {
         life := live(U64(k + 1), train, after, points, block, hidden, s)
@@ -267,6 +304,8 @@ fn main() ? io.IoError + json.JsonError {
         trainMs[k] = life.TrainMs
         nightMs[k] = life.NightMs
         cues[k] = life.Cues
+        mix[k] = life.Mix
+        guess[k] = life.Guess
     }
     kind := ", no consolidator"
     if s.Consolidate {
@@ -285,5 +324,9 @@ fn main() ? io.IoError + json.JsonError {
     for b in range blocks {
         try io.Print($((b + 1) * block) "  " $show(regret[b * lives:(b + 1) * lives]) "\n")
     }
-    try io.Print("ms a moment (nights excluded) " $show(trainMs) "; ms a night " $show(nightMs) "; cues kept " $show(cues) "\n\n")
+    try io.Print("ms a moment (nights excluded) " $show(trainMs) "; ms a night " $show(nightMs) "; cues kept "
+        $show(cues) "\n")
+    if s.Weigh { try io.Print("the recall's share of the readout's drive at the end " $show(mix) "\n") }
+    if s.Familiarity { try io.Print("the slow part's weight at unfamiliar observations at the end " $show(guess) "\n") }
+    try io.Print("\n")
 }

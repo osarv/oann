@@ -16,14 +16,20 @@
 # context's 16 numbers and the surroundings' code (8 random signs over sqrt(8), drawn once a life), and B's arms are
 # A's with each context's best and worst swapped - the same contexts, conflicting answers, told apart by the code.
 # transfer - generalization across surroundings (docs/settling.md 5.12): the life in halves, A then B, B's arms A's -
-# the same contexts and the same answers under a new code, observations half like the ones seen.
+# the same contexts and the same answers under a new code, observations half like the ones seen. mixed - a life that
+# meets both kinds of new surroundings (docs/settling.md question 17): in thirds, A, then B, then C, each with a code of
+# its own, one of B and C with A's answers and the other with each context's best and worst arms swapped - the sharing
+# one first in odd lives, the conflicting one first in even ones.
 # Further arguments, all optional: moments (2000), seeds (20), contexts (4), hidden neurons (64), block (100); then any
 # of the agent's settings as name=value (threshold, critical, rate, memoryrate, fast, slow, beta, criticrate,
 # tracegain, memorygain, temperature, calmsamples - 1 to sample in calm moments too - entropygain; sleep - 1 for a
 # consolidator, recallgain, recallrate, recallhalflife - its store's half-life in moments, cues - the most a night
 # replays, sleephidden, passes, sleepcells, sleepactive), night - the moments between the nights of an agent with a
 # consolidator (500; 0: none) - noise - each moment's observation drawn around its context's numbers with this
-# standard deviation per number (0) - and perlife - 1 to print each life's block regrets, for paired comparisons.
+# standard deviation per number (0) - missing - the fraction of moments whose observations come with each number
+# missing with probability 1/2, the agent told which (Step's known; 0) - completion - 0 for an agent that reads them as
+# zeros rather than completing them (docs/settling.md question 16) - weigh, familiarity, guess, guessrate, recallalone
+# (questions 15 and 17) - and perlife - 1 to print each life's block regrets, for paired comparisons.
 
 import "std/io"
 import "std/json"
@@ -45,15 +51,19 @@ Night mut I64 = 500
 # the observations' noise (noise=): each number of a context's observation gets this times N(0, 1), drawn each moment
 NoiseLevel mut F64 = 0.0
 
+# the fraction of moments whose observations come with half their numbers missing (missing=), the agent told which
+Missing mut F64 = 0.0
+
 # each life's block regrets printed as a line of its own (perlife=1), for paired comparisons of two runs of the same lives
 PerLife mut Bool = false
 
 # the numbers of a surroundings' code in the return task's observations
 codeSize I64 = 8
 
-# K contexts of observations, arms arms each with a probability of paying; with codes, two surroundings, each with a
-# code of that many random signs over sqrt(codes) drawn once, which an observation carries after its context's numbers
-type Bandit struct(contexts I64, size I64, arms I64, seed U64, codes I64 = 0) {
+# K contexts of observations, arms arms each with a probability of paying; with codes, places surroundings (2), each
+# with a code of that many random signs over sqrt(codes) drawn once, which an observation carries after its context's
+# numbers
+type Bandit struct(contexts I64, size I64, arms I64, seed U64, codes I64 = 0, places I64 = 2) {
     Contexts I64 = contexts
     Size I64 = size
     Arms I64 = arms
@@ -63,8 +73,9 @@ type Bandit struct(contexts I64, size I64, arms I64, seed U64, codes I64 = 0) {
     rng rand.Rand = rand.Rand(seed)
     Keys mut Array<F32>& = Array<F32>(contexts * size)
     Pay mut Array<F64>& = Array<F64>(contexts * arms)
-    Code mut Array<F32>& = Array<F32>(2 * codes)
+    Code mut Array<F32>& = Array<F32>(places * codes)
     seen mut Array<F32>& = Array<F32>(size + codes)
+    Known mut Array<Bool>& = Array<Bool>(size + codes)     # which numbers of a moment's observation are not missing
     for c in range contexts {
         norm F64 = 0.0
         for j in range size {
@@ -76,7 +87,7 @@ type Bandit struct(contexts I64, size I64, arms I64, seed U64, codes I64 = 0) {
         best := rng.Below(arms)
         for a in range arms { Pay[c * arms + a] = 0.8 if a == best else rng.Uniform(0.1, 0.5) }
     }
-    for i in range 2 * codes { Code[i] = F32((1.0 if rng.Below(2) == 0 else -1.0) / math.Sqrt(F64(codes))) }
+    for i in range places * codes { Code[i] = F32((1.0 if rng.Below(2) == 0 else -1.0) / math.Sqrt(F64(codes))) }
 }
 
 # context c's observation: its numbers - with Noise, each moment's own draw around them - and the surroundings' code
@@ -123,9 +134,12 @@ type Life struct(blocks I64) {
     Regret mut Array<F64>& = Array<F64>(blocks)
     Calm mut Array<F64>& = Array<F64>(blocks)
     Level mut Array<F64>& = Array<F64>(blocks)
+    Share mut Array<F64>& = Array<F64>(blocks)           # the recall's share of the readout's drive (weigh=1)
     Repeats F64 = 0.0
     Sweeps F64 = 0.0
     Refused I64 = 0
+    Mix F64 = 0.0                                       # the recall's share of the readout's drive at the end (weigh=1)
+    Guess F64 = 0.0                                     # the slow part's weight at unfamiliar observations at the end
 }
 
 # the settings with every name=value argument from position 7 on applied
@@ -157,8 +171,16 @@ fn settings(args Array<String&>&) agent.Settings ? json.JsonError {
         if name == "sleepactive" { s.SleepActive = I64(v) }
         if name == "recallhalflife" { s.RecallHalfLife = v }
         if name == "cues" { s.SleepCues = I64(v) }
+        if name == "weigh" { s.Weigh = v != 0.0 }
+        if name == "recallalone" { s.RecallAlone = v != 0.0 }
+        if name == "weighrate" { s.WeighRate = v }
+        if name == "familiarity" { s.Familiarity = v != 0.0 }
+        if name == "guess" { s.Guess = v }
+        if name == "guessrate" { s.GuessRate = v }
         if name == "night" { Night = I64(v) }
         if name == "noise" { NoiseLevel = v }
+        if name == "missing" { Missing = v }
+        if name == "completion" { s.Completion = v != 0.0 }
         if name == "perlife" { PerLife = v != 0.0 }
     }
     return s
@@ -167,15 +189,16 @@ fn settings(args Array<String&>&) agent.Settings ? json.JsonError {
 # a life of moments moments in a world of seed, reversed halfway when reversal; in the return task the surroundings
 # change to B for its second third and back to A for its last. An agent with a consolidator sleeps every Night moments
 fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Bool, s agent.Settings, watch Bool = false,
-        back Bool = false, transfer Bool = false) Life {
+        back Bool = false, transfer Bool = false, mixed Bool = false) Life {
     life mut Life&return = Life(moments / block)
-    codes I64 = codeSize if back or transfer else 0
-    w := Bandit(contexts, 16, 4, seed, codes)
+    codes I64 = codeSize if back or transfer or mixed else 0
+    w := Bandit(contexts, 16, 4, seed, codes, 3 if mixed else 2)
     w.Noise = NoiseLevel
     a := agent.Agent<F32>(16 + codes, 4, I64[hidden], seed + 7919, s)
     pick := rand.Rand(seed + 104729)
     c := pick.Below(contexts)
     action := try a.Begin(w.Observe(c)) catch circuit.NotSettled { life.Refused++ } default 0
+    gaps := rand.Rand(seed + 15485863)                  # which moments' observations come in part (missing=)
     changes I64 = 0
     repeats I64 = 0
     lastBest I64 = -1
@@ -188,6 +211,12 @@ fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Boo
             # the observation the agent is acting on was A's; it sees B's from the next moment on
         }
         if transfer and t == moments / 2 { w.Place = 1 }     # B: a new code, the same answers
+        if mixed and (t == moments / 3 or t == 2 * moments / 3) {
+            # B, then C: one sharing A's answers and the other A's with each context's best and worst arms swapped -
+            # sharing first in odd lives, conflicting first in even ones
+            if t == 2 * moments / 3 or seed % 2 == 0 { w.Reverse() }
+            w.Place = 1 if t == moments / 3 else 2
+        }
         if s.Consolidate and Night > 0 and t > 0 and t % Night == 0 { a.Sleep() }
         best, top := w.Best(c)
         life.Regret[t / block] += (top - w.Pay[c * w.Arms + action]) / F64(block)
@@ -199,7 +228,16 @@ fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Boo
         lastAction = action
         reward := w.Pull(c, action)
         c = pick.Below(contexts)
-        next := try a.Step(w.Observe(c), reward, true) catch circuit.NotSettled { life.Refused++ } default action
+        obs := w.Observe(c)
+        lacking Bool = Missing > 0.0 and gaps.Float() < Missing
+        if lacking {
+            for j in range obs.Len() {
+                w.Known[j] = gaps.Float() >= 0.5
+                w.seen[j] = obs[j] if w.Known[j] else 0.0
+            }
+        }
+        next := try a.Step(w.seen if lacking else obs, reward, true, w.Known if lacking else null)
+            catch circuit.NotSettled { life.Refused++ } default action
         if watch and t >= moments / 2 - 5 and t < moments / 2 + 60 {
             try io.Print($t ": context " $c " arm " $action " best " $best " reward " $reward " delta " $(a.LastDelta).Fixed(2)
                 " surprise " $(a.Mood.Surprise).Fixed(2) " want " $(a.Mood.Want).Fixed(2) " level " $(a.Mood.Level).Fixed(2)
@@ -207,10 +245,13 @@ fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Boo
         }
         life.Calm[t / block] += (0.0 if a.Mood.Aroused else 1.0) / F64(block)
         life.Level[t / block] += a.Mood.Level / F64(block)
+        life.Share[t / block] += a.Reads.Mix / F64(block)
         action = next
     }
     life.Repeats = F64(repeats) / F64(changes if changes > 0 else 1)
     life.Sweeps = F64(a.Sweeps) / F64(moments)
+    life.Mix = a.Reads.Mix
+    life.Guess = a.Bet.Guess
     return life
 }
 
@@ -244,8 +285,8 @@ fn main() ? io.IoError + json.JsonError {
         live(1, moments, block, contexts, hidden, true, base, true)
         return
     }
-    if task == "return" and (moments % 3 != 0 or (moments / 3) % block != 0) {
-        try io.Print("return: the moments must be three times a whole number of blocks\n")
+    if (task == "return" or task == "mixed") and (moments % 3 != 0 or (moments / 3) % block != 0) {
+        try io.Print($task ": the moments must be three times a whole number of blocks\n")
         return
     }
     gains := F64[0.0, base.TraceGain, 8.0 * base.TraceGain] if task == "pinning" else F64[base.TraceGain]
@@ -256,12 +297,15 @@ fn main() ? io.IoError + json.JsonError {
         regret := Array<F64>(seeds * blocks)
         calm := Array<F64>(seeds * blocks)
         level := Array<F64>(seeds * blocks)
+        mixes := Array<F64>(seeds * blocks)
         repeats := Array<F64>(seeds)
         sweeps := Array<F64>(seeds)
+        mix := Array<F64>(seeds)
+        guess := Array<F64>(seeds)
         refused I64 = 0
         for k in range seeds {
             life := live(U64(k + 1), moments, block, contexts, hidden, task == "reversal", s, false, task == "return",
-                task == "transfer")
+                task == "transfer", task == "mixed")
             if PerLife {
                 line := StringBuilder()
                 line.Push("life " $(k + 1))
@@ -273,9 +317,12 @@ fn main() ? io.IoError + json.JsonError {
                 regret[b * seeds + k] = life.Regret[b]
                 calm[b * seeds + k] = life.Calm[b]
                 level[b * seeds + k] = life.Level[b]
+                mixes[b * seeds + k] = life.Share[b]
             }
             repeats[k] = life.Repeats
             sweeps[k] = life.Sweeps
+            mix[k] = life.Mix
+            guess[k] = life.Guess
             refused += life.Refused
         }
         sleeping := ", no consolidator"
@@ -284,11 +331,19 @@ fn main() ? io.IoError + json.JsonError {
         }
         try io.Print($task " - " $seeds " lives of " $moments " moments, " $contexts " contexts, 4 arms, hidden " $hidden
             ", trace gain " $gain $sleeping " (" $(F64(time.Since(t0)) * 1e-9).Fixed(1) " s, " $refused " refused settles)\n")
-        try io.Print("block      regret            calm              arousal level\n")
+        share := "     the recall's share" if s.Weigh else ""
+        try io.Print("block      regret            calm              arousal level" $share "\n")
         for b in range blocks {
             try io.Print($((b + 1) * block) "  " $show(regret[b * seeds:(b + 1) * seeds]) "  " $show(calm[b * seeds:(b + 1) * seeds])
-                "  " $show(level[b * seeds:(b + 1) * seeds]) "\n")
+                "  " $show(level[b * seeds:(b + 1) * seeds])
+                $(("  " $show(mixes[b * seeds:(b + 1) * seeds])) if s.Weigh else "") "\n")
         }
-        try io.Print("repeats of the last action when the best arm changed: " $show(repeats) "; sweeps a moment " $show(sweeps) "\n\n")
+        try io.Print("repeats of the last action when the best arm changed: " $show(repeats) "; sweeps a moment "
+            $show(sweeps) "\n")
+        if s.Weigh { try io.Print("the recall's share of the readout's drive at the end " $show(mix) "\n") }
+        if s.Familiarity {
+            try io.Print("the slow part's weight at unfamiliar observations at the end " $show(guess) "\n")
+        }
+        try io.Print("\n")
     }
 }
