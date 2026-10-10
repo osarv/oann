@@ -14,12 +14,13 @@
 #
 # Unsigned activations times signed weights is the shape the hardware's integer dot products take (VNNI's vpdpbusd,
 # NEON's usdot), and it is also the one form LLVM 18 turns into a single multiply-add instruction from plain code: the
-# accumulating step acc + I32(a) I32(q), with a zero-extended from 8 bits, becomes vpdpwssd on AVX-512 VNNI (DESIGN.md
-# section 22 has what it does and does not reach). The tile is std/linalg's for 32-bit elements on the target - 12 x 32
-# on AVX-512, 6 x 16 on AVX, 4 x 12 on SSE, a thin tile one vector wide for an output of a vector or fewer - and both
-# operands are packed by their quantization: the weights once, column panels of the tile's width, step by step; the
-# activations as they are quantized, row panels of the tile's height. So the kernel reads two contiguous panels and
-# nothing is packed per product.
+# accumulating step acc + I32(a) I32(q), a zero-extended from 8 bits, becomes vpdpwssd on AVX-512 VNNI - one product
+# per 32-bit lane, eight to a 256-bit instruction (DESIGN.md section 22: what that reaches, and what std/linalg would
+# need to reach the four-way dot product). The tile follows std/linalg's for 32-bit elements, sized for the registers
+# that instruction uses - 6 x 32 on AVX-512 and 6 x 16 on AVX, twice the rows for a thin output one vector wide, 4 x 12
+# on SSE. The weights are packed once, by their quantization: column panels of the tile's width, step by step. The
+# activations are quantized row by row - one pass in order, a convolution's patches runs of pixels - and a tile's rows
+# are packed step by step as each product begins them, a byte moved per value for all of the output's columns.
 
 import "std/linalg"
 import "std/math"
@@ -328,7 +329,13 @@ fn (a mut Activations&) Patches(x linalg.Matrix<F32>&, s conv.Shape&, r Range&) 
 # The tile's rows are the weights' Mr - one, a matrix-vector product per row, for fewer rows than four - and runs of
 # them are split over "threads" tasks
 fn Linear(y mut linalg.Matrix<F32>&, a Activations&, w Weights&, bias Array<F32>&, relu Bool, threads I64 = 1) {
-    assert a.Cols == w.In and y.Rows == a.Rows and y.Cols == w.Out and bias.Len() == w.Out
+    assert y.Rows == a.Rows and y.Cols == w.Out
+    LinearInto(y.Data, y.Stride, a, w, bias, relu, threads)
+}
+
+# Linear into a.Rows x w.Out elements of yd, a row every ys - the form for a caller holding y by value
+fn LinearInto(yd mut Array<F32>&, ys I64, a Activations&, w Weights&, bias Array<F32>&, relu Bool, threads I64 = 1) {
+    assert a.Cols == w.In and bias.Len() == w.Out and ys >= w.Out and yd.Len() >= (a.Rows - 1) * ys + w.Out
     # each output's multiplier and the integer the zero point adds to its accumulator
     mul := Array<F32>(w.Out)
     corr := Array<I32>(w.Out)
@@ -347,25 +354,26 @@ fn Linear(y mut linalg.Matrix<F32>&, a Activations&, w Weights&, bias Array<F32>
             ao I64 = r * mr * a.Cols
             if mr > 1 {
                 packRows(pa, a.Data, ao, a.Cols, mr)
-                rowPanel(mr, rows, r * mr, pa, 0, a.Cols, w, y, mul, corr, bias, floor)
+                rowPanel(mr, rows, r * mr, pa, 0, a.Cols, w, yd, ys, mul, corr, bias, floor)
             } else {
-                rowPanel(mr, rows, r * mr, a.Data, ao, a.Cols, w, y, mul, corr, bias, floor)
+                rowPanel(mr, rows, r * mr, a.Data, ao, a.Cols, w, yd, ys, mul, corr, bias, floor)
             }
         }
     })
 }
 
 # rows i0 .. i0 + rows of y, their activations' tile at src[so ..], by every column panel of w
-fn rowPanel(mr I64, rows I64, i0 I64, src Array<U8>&, so I64, K I64, w Weights&, y mut linalg.Matrix<F32>&, mul Array<F32>&, corr Array<I32>&, bias Array<F32>&, floor F32) {
+fn rowPanel(mr I64, rows I64, i0 I64, src Array<U8>&, so I64, K I64, w Weights&, yd mut Array<F32>&, ys I64, mul Array<F32>&,
+        corr Array<I32>&, bias Array<F32>&, floor F32) {
     for p in range w.Panels {
         cols := lesser(w.Cols, w.Out - p * w.Cols)
         bo I64 = p * w.In * w.Cols
-        yo I64 = i0 * y.Stride + p * w.Cols
+        yo I64 = i0 * ys + p * w.Cols
         n0 I64 = p * w.Cols
         if w.Cols > lanes() {
-            product(mr, K, src, so, w.Q, bo, wideTile(), rows, cols, y.Data, yo, y.Stride, mul, corr, bias, n0, floor)
+            product(mr, K, src, so, w.Q, bo, wideTile(), rows, cols, yd, yo, ys, mul, corr, bias, n0, floor)
         } else {
-            product(mr, K, src, so, w.Q, bo, thinTile(), rows, cols, y.Data, yo, y.Stride, mul, corr, bias, n0, floor)
+            product(mr, K, src, so, w.Q, bo, thinTile(), rows, cols, yd, yo, ys, mul, corr, bias, n0, floor)
         }
     }
 }

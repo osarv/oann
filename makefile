@@ -6,9 +6,9 @@ OLANG ?= /home/user/wt/oannc4/build/out
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang datasets/loader.olang \
 	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
-	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang
+	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep int8 int8lm int8bench clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -88,6 +88,26 @@ sparse:
 sleep:
 	$(OLANG) -b examples/sleep_retention.olang
 	./build/examples_sleep_retention $(ARGS)
+
+# the perceptron (or the CNN) trained in F32, quantized to INT8 (quant.olang) and measured both ways: test accuracy,
+# the parameters' size, throughput at batch 1, 64 and 128, where the INT8 model's time goes - ARGS: mlp or cnn, epochs,
+# seed, threads, timing rounds
+int8:
+	$(OLANG) -b examples/mnist_int8.olang
+	./build/examples_mnist_int8 $(ARGS)
+
+# the character transformer (data/shakespeare/charlm.ckpt, from make charlm) with its linear layers in INT8
+# (Graph.QuantizeLinear): validation loss, a forward's time, greedy text and cached decoding against F32 - ARGS:
+# characters, timing rounds, threads
+int8lm:
+	$(OLANG) -b examples/charlm_int8.olang
+	./build/examples_charlm_int8 $(ARGS)
+
+# the INT8 product against std/linalg's F32 product with its bias and ReLU, on oann's networks' shapes (bench/int8.olang)
+# - ARGS: rounds, threads
+int8bench:
+	$(OLANG) -b bench/int8.olang
+	./build/bench_int8 $(ARGS)
 
 # an epoch's time against C over OpenBLAS (bench/epoch.sh)
 epoch:

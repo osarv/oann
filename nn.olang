@@ -33,6 +33,7 @@ import "std/time"
 import "ops"
 import "conv"
 import "kernels"
+import "quant"
 
 # a node's handle: an index into the graph's nodes
 type Var I64
@@ -163,6 +164,10 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     masters mut Array<F32>& = Array<F32>(0)   # a BF16 graph's parameters in F32, laid out as Params() is
     losses mut Array<F64>& = Array<F64>(0)    # each loss node's last value, in F64
     planned Bool = false
+    Int8 Bool = false               # once QuantizeLinear has run: every Linear's product in 8-bit integers (quant.olang)
+    int8Weights mut List<quant.Weights>& = List<quant.Weights>()  # each Linear node's weights quantized
+    int8At mut List<I64>& = List<I64>()                           # by node: its weights' index there, or -1
+    int8Acts mut quant.Activations& = quant.Activations(0)       # a Linear's input quantized
 }
 
 # ---- recording ----
@@ -703,6 +708,46 @@ fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<T> {
     return linalg.View(g.mem, g.ParamCount, 1, g.ParamCount)
 }
 
+# ---- INT8 inference ----
+#
+# QuantizeLinear quantizes every Linear node's weights as they are now (quant.QuantizeWeights: symmetric per output
+# channel), and with Int8 set Forward runs those nodes' products as quant.Linear - each input quantized over its own
+# range (dynamically), the bias added in the product's store. Inference only, an F32 graph only: the weights quantized
+# are a copy, so training on and quantizing again is the way to quantize new weights.
+
+fn (g mut Graph<<T>>&) QuantizeLinear() {
+    match T {
+        case F32 { }
+        nomatch { mismatch("INT8 inference is for an F32 graph") }
+    }
+    g.int8Weights = List<quant.Weights>()
+    g.int8At = List<I64>()
+    widest I64 = 0
+    for i in range g.nodes.Len() {
+        match g.nodes[i].Kind {
+            case Op.Linear(x, w, b) {
+                g.int8At.Push(g.int8Weights.Len())
+                g.int8Weights.Push(quant.QuantizeWeights(g.Value(w)))
+                widest = widest if widest > g.nodes[x].Cols else g.nodes[x].Cols
+            }
+            nomatch { g.int8At.Push(-1) }
+        }
+    }
+    g.int8Acts = quant.Activations(quant.ElementsFor(g.Batch, widest))
+}
+
+# a Linear node's product in INT8: its input quantized over its own range into acts, the bias added in the store
+fn linearInt8(acts mut quant.Activations&, w quant.Weights&, yd mut Array<<T>>&, ys I64, x linalg.Matrix<T>&,
+        b linalg.Matrix<T>&, th I64) {
+    match T {
+        case F32 {
+            acts.QuantizeDynamic(x)
+            quant.LinearInto(yd, ys, acts, w, b.Row(0), false, th)
+        }
+        nomatch { mismatch("INT8 inference is for an F32 graph") }
+    }
+}
+
 # ---- checkpoints ----
 # The parameters as one file: "oann" and the element width (4 or 8) as eight bytes, the parameter count as eight bytes,
 # then the parameters' bits, little-endian, in the order they were registered - the arena's first region as it is, or
@@ -822,7 +867,12 @@ fn (g mut Graph<<T>>&) forwardIn(node Var, nd Node&, th I64, z <A>) {
     match nd.Kind {
         case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
         case Op.MatMul(a, b, ta, tb) { ops.MatMul(y, g.Value(a), ta, g.Value(b), tb, th, g.ws) }
-        case Op.Linear(x, w, b) { ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th, g.ws, z) }
+        case Op.Linear(x, w, b) {
+            if g.Int8 {
+                linearInt8(g.int8Acts, g.int8Weights[g.int8At[I64(node)]], y.Data, y.Stride, g.Value(x), g.Value(b), th)
+            } else {
+                ops.Linear(y, g.Value(x), g.Value(w), g.Value(b), th, g.ws, z) }
+        }
         case Op.AddRow(x, b) { ops.AddRow(y, g.Value(x), g.Value(b), z) }
         case Op.Add(a, b) { ops.Add(y, g.Value(a), g.Value(b), z) }
         case Op.Sub(a, b) { ops.Sub(y, g.Value(a), g.Value(b), z) }
@@ -1492,4 +1542,34 @@ test "a BF16 graph's checkpoint is its F32 masters, and loads into an F32 graph 
     d.Plan(rand.Rand(1))
     try d.Load("build/nn_mixed_checkpoint") catch { fail }
     assert d.Masters().MaxAbsDifference(b.Masters()) == 0.0 and d.Params().MaxAbsDifference(b.Params()) == 0.0
+}
+
+test "QuantizeLinear runs a graph's linear layers in INT8: within 2% of the F32 outputs' range, and F32 again when Int8 is off" {
+    g := Graph<F32>(16)
+    x := g.Input(40)
+    w1 := g.Param(24, 40, Init.Normal(0.0, 0.2), true)
+    b1 := g.Param(1, 24, Init.Normal(0.0, 0.1), false)
+    w2 := g.Param(8, 24, Init.Normal(0.0, 0.2), true)
+    b2 := g.Param(1, 8, Init.Normal(0.0, 0.1), false)
+    out := g.Linear(g.Relu(g.Linear(x, w1, b1)), w2, b2)
+    r := rand.Rand(5)
+    g.Plan(r)
+    xd := g.InputData(x)
+    for i in range 16 * 40 { xd[i] = F32(r.Normal()) }
+    g.Forward(16)
+    exact := g.Value(out).Clone()
+    g.QuantizeLinear()
+    g.Int8 = true
+    g.Forward(16)
+    got := g.Value(out).Clone()
+    scale F32 = 0.0
+    worst F32 = 0.0
+    for i in range 16 * 8 {
+        scale = math.Max(scale, math.Abs(exact.Data[i]))
+        worst = math.Max(worst, math.Abs(got.Data[i] - exact.Data[i]))
+    }
+    assert worst > 0.0 and worst < 0.02 * scale
+    g.Int8 = false
+    g.Forward(16)
+    for i in range 16 * 8 { assert g.Value(out).Data[i] == exact.Data[i] }
 }

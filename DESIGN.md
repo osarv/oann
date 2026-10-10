@@ -35,6 +35,13 @@ adopted. **Phase 7** (section 20, olang db2af5d): mixed precision as fast as F32
 against 119 in F32, 215 before), attention's softmax by std/linalg's `FastExp` (its forward 1.3-1.9x faster), and an
 agent may live its days into a consolidator (docs/settling.md 2.14). **olang 999ae6c** (section 21): a copy of what
 is reached read-only is read-only, and std/linalg's destination forms take `mut` - 38 `mut`s added, nothing else.
+**Phase 8** (section 22, olang efdb82c): INT8 post-training quantization for inference (`quant.olang`) - weights per
+output channel, activations per tensor (dynamic or calibrated), a U8 x I8 -> I32 product with its dequantization fused:
+the perceptron and the CNN lose nothing on MNIST's test set (97.10 -> 97.08%, 97.78 -> 97.79%), take 3.9x and 2.7x less
+memory, and run 3.1x faster at batch 1 (the perceptron) and 1.1-1.3x faster at every batch (the CNN); the character
+transformer's linear layers in INT8 (`Graph.QuantizeLinear`) keep its validation loss (1.8063 -> 1.8060) and decode 2.1x
+faster; a compute-bound product is held to 0.6-0.8x F32 by the instruction LLVM 18 picks. The element-wise kernels are
+std/linalg's `Map` again.
 
 ## 1. The operand: Matrix
 
@@ -664,6 +671,9 @@ the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted 
    the first convolution's products (a depth of 9) run at 6-7 GFLOPS against 26-50 for the second's.
 4. ~~BF16 results without a call per element~~ - done by olang db2af5d, which narrows inline: std/linalg's BF16
    products are as fast as F32's (section 20).
+5. **The INT8 product** (`quant.olang`, section 22): its kernel, blocked as `Gemm` is, and - from the compiler - a way to
+   reach the four-way integer dot product (`vpdpbusd`, `usdot`), without which INT8 runs at half F32's rate when
+   compute-bound.
 
 ## 14. Open questions
 
@@ -680,7 +690,7 @@ the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted 
 
 ```
 makefile                OLANG ?= the compiler; make test, data, mnist, cnn, epoch, charlm, lmbench, lmref, bpe,
-                        bpelm, safetensors, board, sparse, clean
+                        bpelm, safetensors, board, sparse, sleep, int8, int8lm, int8bench, clean
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
@@ -691,6 +701,9 @@ train.olang             Classifier, Epoch, Evaluate; LanguageModel, Gpt, LmStep,
 generate.olang          sampling; generation running the context again, and with a key-value cache
 tokenizer.olang         byte-level BPE: GPT-2's pre-tokenization, training, encoding, decoding, JSON
 checkpoint.olang        safetensors: Names (PyTorch's for the layers), Save and Load in F64, F32, F16 or BF16
+quant.olang             INT8 inference: weights per channel, activations per tensor (dynamic or calibrated), the
+                        U8 x I8 -> I32 product with its dequantizing store, and Model (dense, conv, pool) built from a
+                        trained graph
 conv.olang              convolution (forward: one product of the patches packed from the images; backward: im2col,
                         two products, col2im) and max pooling on images held as rows
 vision.olang            the convolution layer; the gradient checks of convolution and pooling
@@ -711,6 +724,8 @@ examples/charlm_sample.olang  sampling from its checkpoint, with and without the
 examples/bpelm.olang    the same transformer on 512 BPE tokens, per character against the character model
 examples/xor_settle.olang, xor_spiking.olang, mnist_settle.olang, bandit_settle.olang  settling networks end to end
 examples/mnist_board.olang  MNIST taught and answered through the board engine, against F32
+examples/mnist_int8.olang   the perceptron or the CNN trained, quantized to INT8, and measured against F32
+examples/charlm_int8.olang  the character transformer's checkpoint with its linear layers in INT8, against F32
 bench/data.olang        the data pipeline, checked and timed
 bench/train.olang       where an epoch's time goes
 bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
@@ -723,6 +738,8 @@ bench/conv.olang        a convolution's passes timed: the forward by GemmPatches
                         backward's im2col, two products and col2im
 bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against numpy
 bench/sparse.olang      sparse projections against dense ones, kernels and whole circuits
+bench/int8.olang        the INT8 product against std/linalg's F32 one, on the networks' shapes
+bench/each.olang        oann's element-wise loops against std/linalg's Map (kept for the record of section 22)
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
@@ -1516,3 +1533,193 @@ norms' `y` need no `mut` (permission stays shallow through views, olang's record
   `ActivationBackward` compile for F32).
 - Still open: `narrowtbaa` (on 999ae6c BF16 through the struct 2.2-3.1 ns an element, local 0.29-0.41; F32 0.53-0.83
   either way). Kept as records, reported as before: `fieldname`, `joinparen`, `nestedtry`, `tryindex`.
+
+## 22. Phase 8: olang efdb82c, and INT8 inference
+
+Built with olang efdb82c (the scope sanitizer run with a compiler built from olang master 2e83597, below), measured
+2026-10-10 between 03:30 and 04:20 CEST on the shared 4-core machine at load averages of 2-10: every figure an
+interleaved median or a range of them. `make test`: 130 tests, all passing (quant.olang's seven and the graph's INT8 test new).
+
+### Catching up
+
+`make test` passed on efdb82c unchanged (121 tests). `repro/narrowtbaa` is fixed - every numeric type has its own alias
+tags now - and deleted: BF16 through the struct 0.29-0.33 ns an element, as with locals (F32 0.53-0.86 either way). So
+section 20's decision 4 is reversed: the element-wise kernels go through std/linalg's `Map`, `Map2` and `Map3` again,
+and `ops.each1/2/3` are gone (olang's `tools/perm_mut.py` gave the 15 destinations they write their `mut`). Measured
+(`bench/each.olang`, ns an element, F32 / BF16, two runs of 9 rounds):
+
+| | `each` | `Map` |
+|---|---|---|
+| GELU forward | 1.60-1.73 / 1.54-1.68 | 1.56-1.72 / 1.55-1.63 |
+| GELU backward, added | 1.92-2.05 / 2.29-2.43 | 1.90 / 2.06-2.23 |
+| add | 0.54-0.58 / 0.25-0.35 | 0.52-0.58 / 0.26-0.32 |
+
+and a transformer step level (`bench/lm`, five runs alternating with the build before: F32 122 -> 117 ms, BF16 99 ->
+102). `ops.GeluTanh` is std/linalg's `Activate(Activation.Gelu)`, the same formula computed the same way (in F32 for
+BF16, rounded once) - bit for bit, a test in F32, F64 and BF16. Its backward stays oann's: std/linalg's
+`ActivationBackward` computes a BF16 matrix's gradient in BF16 arithmetic, rounding the slope, the product and the sum,
+where oann's rounds once from F32; `ActivationSlope` alone saves nothing over oann's expression.
+
+**The scope sanitizer.** efdb82c has no `-s`: the sanitizer (olang's B2f) was merged into master at 9e5558a, after it.
+A compiler built from master 2e83597 in a scratch directory ran the whole suite under it - `-t -d -s` on every file with
+tests, quant.olang included: every test passes and nothing reports a use after a scope closed (nn.olang and quant.olang again after the graph's INT8 path landed: the same). `examples/mnist_int8`
+built with `-b -s` trains, quantizes and runs both networks without a report. No compiler bug found.
+
+### INT8 post-training quantization (`quant.olang`)
+
+A trained network's dense layers and convolutions run as products of 8-bit integers accumulated in 32 bits:
+
+- **Weights** symmetric per output channel: row n of W gets `sw[n] = max|W[n, :]| / 127` and `q = round(W / sw)` in
+  -127 .. 127 (ties to even), packed once into the kernel's column panels, with each row's scale and the sum of its q.
+  A convolution's columns are permuted from PyTorch's [C][K][K] to [K][K][C] (`QuantizeConvWeights`) - the images'
+  own order, so a patch's rows are runs of pixels.
+- **Activations** per tensor, over a `Range`: dynamically (each batch's own range) or statically (a range calibrated
+  over a calibration set, values outside it clamped). A range with no negatives - an image's pixels, ReLU's outputs,
+  max pooling's - takes all 256 levels of a U8, `s = hi / 255` and zero point 0; one with negatives is symmetric,
+  `s = max(|lo|, |hi|) / 127` and zero point 128.
+- **The product** `acc[i, n] = sum_k a[i, k] q[n, k]`, U8 times I8 in I32, then `y = s sw[n] (acc - zp sum_k q[n, k]) +
+  b[n]`, ReLU or not, as each tile leaves the registers (FBGEMM's and oneDNN's zero-point compensation); no
+  intermediate I32 matrix is written.
+- **API**: `quant.QuantizeWeights(w)`, `Activations(elements)` with `Quantize(x, range)`, `QuantizeDynamic(x)` and
+  `Patches(x, shape, range)`, `quant.Linear(y, a, w, bias, relu, threads)`; and a `quant.Model(batch, inputs)` built
+  from a trained graph's values - `m.Dense(w, b, relu)`, `m.Conv(w, b, shape, relu)`, `m.Pool(pool)` - run by
+  `m.Forward(y, x)` into the caller's matrix through two buffers of its own (nothing allocated after the first call),
+  `m.Calibrate(y, x)` over calibration batches then `m.Static = true`, `m.Bytes()`, and per-layer `Profiling`. And in
+  a graph, `g.QuantizeLinear()` then `g.Int8 = true`: every `Linear` node's product in INT8 (`quant.LinearInto`, the
+  form taking y's elements and stride), the input quantized dynamically - an F32 graph's inference only.
+
+**The kernel, and what LLVM 18 makes of it.** The micro-kernel is std/linalg's shape - a tile of accumulators at
+constant indices, one row of a step a line, `acc[i, j] += I32(a) * I32(q[j])` with `a` zero-extended from U8 and `q`
+sign-extended from I8. That is the one form LLVM 18 lowers to a single multiply-add instruction: on this AVX-512 VNNI
+machine `vpdpwssd` (checked in the binary: 156 of them, no `vpmulld` in the kernel) - but as one product per 32-bit
+lane (the zero-extended activation's upper half is zero, so the pair's second product vanishes), and on 256-bit
+registers even with `prefer-vector-width=512`: **8 multiply-adds an instruction against F32's 16 per 512-bit FMA**. The
+genuine instructions are out of reach from plain code: `vpdpwssd` on true 16-bit pairs (16 a 256-bit instruction, 32 at
+512) and `vpdpbusd`, four U8 x I8 products a lane (64 at 512), are formed by neither the loop nor the SLP vectorizer -
+probed in C with clang 18 on the same patterns: outer products, pairwise sums written out, dot-product reductions with
+several accumulators (`vpmulld` or the same one-product trick), and a single reduction (`vpmaddwd` on 256 bits only).
+So the tile is sized for 256-bit registers holding I32: 6 x 32 (24 accumulators, four vectors a row) for a wide output
+and 12 x 16 for a thin one (an output of 16 or fewer) on AVX-512 - measured against 12 x 16 for everything (6 x 32 5-10%
+faster on wide shapes, 12 x 16 25% faster at 16 outputs) and against the 12 x 32 of std/linalg's F32 (spilled: half
+the speed) - 6 x 16 and 12 x 8 on AVX, 4 x 12 and 4 x 4 on SSE. A matrix of fewer than four rows is a matrix-vector
+product per row, four partial sums over alternate steps. Activations are quantized row by row and a tile's rows packed
+step by step as its product begins them (read in place by rows, as std/linalg reads a left operand, the product was
+half as fast).
+
+**Accuracy** (`examples/mnist_int8.olang`, AdamW, seed 1): nothing lost that the test set can see.
+
+| | F32 | INT8 dynamic | INT8 static | same class as F32 | parameters F32 / INT8 |
+|---|---|---|---|---|---|
+| 784-128-10 perceptron, 5 epochs | 97.10% | 97.08% | 97.08% | 99.93% / 99.94% | 407 080 / 104 056 B (3.9x) |
+| CNN (16 and 32 channels), 2 epochs | 97.78% | 97.79% | 97.79% | 99.97% / 99.99% | 81 960 / 30 536 B (2.7x) |
+
+(Static: ranges calibrated over ten training batches, 1280 samples. The CNN's size counts its dense head's ten outputs
+padded to the thin tile's sixteen - 62% of its parameters - and the biases in F32.)
+
+**Throughput** - the graph's F32 forward (what oann ran inference with: std/linalg's GEMM, its F32 batch-1 path) against
+the INT8 model, nine interleaved rounds, samples a second:
+
+| | batch 1 | batch 64 | batch 128 |
+|---|---|---|---|
+| perceptron F32 | 38 260 | 282 688 | 332 969 |
+| perceptron INT8 dynamic / static | 118 841 / 122 504 (3.1x / 3.2x) | 272 196 / 282 163 (0.96x / 1.00x) | 271 153 / 283 975 (0.81x / 0.85x) |
+| CNN F32 | 8 871 | 8 178 | 7 627 |
+| CNN INT8 dynamic / static | 10 193 / 10 009 (1.15x / 1.13x) | 9 960 / 10 308 (1.22x / 1.26x) | 9 522 / 9 836 (1.25x / 1.29x) |
+
+The products alone (`bench/int8.olang`, the INT8 product with dynamic quantization against std/linalg's `GemmAct` with
+bias and ReLU, seven rounds; F32 GFLOPS against INT8 GOPS):
+
+| m x k x n | F32 | INT8 (quantization included) | ratio |
+|---|---|---|---|
+| 1 x 784 x 128 (perceptron, one sample) | 24.9 us, 8.1 | 7.9 us, 25.4 | 3.16x |
+| 64 x 784 x 128 | 243 us, 52.8 | 224 us, 57.3 | 1.08x |
+| 128 x 784 x 128 | 349 us, 73.6 | 442 us, 58.1 | 0.79x |
+| 100352 x 9 x 16 (first convolution, batch 128) | 1.88 ms, 15.4 | 3.11 ms, 9.3 | 0.60x |
+| 25088 x 144 x 32 (second convolution) | 4.18 ms, 55.4 | 9.49 ms, 24.4 | 0.44x |
+| 1024 x 128 x 512 (transformer perceptron, 16 x 64 tokens) | 1.33 ms, 100.6 | 2.36 ms, 56.9 | 0.57x |
+| 1024 x 512 x 128 | 1.74 ms, 77.1 | 2.39 ms, 56.3 | 0.73x |
+| 1 x 128 x 512 (its decoding step) | 16.8 us, 7.8 | 5.5 us, 23.7 | 3.02x |
+| 1 x 512 x 128 | 16.0 us, 8.2 | 5.1 us, 25.7 | 3.13x |
+| 512 x 512 x 512 | 3.25 ms, 82.5 | 4.49 ms, 59.8 | 0.73x |
+| 1 x 1024 x 1024 | 364 us, 5.8 | 87 us, 24.1 | 4.20x |
+
+So INT8 wins where a product reads its weights for few rows - one sample, a decoding step: 3-4.4x, the bytes it reads
+(a quarter) - and loses where it is compute-bound, by the instruction above: the kernel reaches 55-62 GOPS where F32
+reaches 70-100 GFLOPS. The CNN gains anyway, at every batch size, because its INT8 path quantizes each image once and
+copies its patches as bytes, where the F32 graph packs F32 patches; its time per batch of 128 (`profile` in the
+example): the convolutions' patches 2.1 and 1.6 ms, their products 2.4 and 5.1 ms, pooling 1.1 and 0.4, the dense head
+0.3. Dynamic and static quantization cost the same to within noise: a range is one vectorized pass over the input
+(16 lanes of minima and maxima), quantization another.
+
+**The transformer** (`examples/charlm_int8.olang`, `make int8lm`: data/shakespeare/charlm.ckpt, 4 layers of 128, its
+attention projections and perceptrons in INT8 - the embeddings, attention's own products, the norms and the tied head
+stay F32), two runs of 5 and 7 rounds:
+
+| | F32 | INT8 | |
+|---|---|---|---|
+| validation loss, 10 batches of 16 x 64 | 1.8063 | 1.8060 | -0.0003 |
+| a forward over 1024 characters | 38.8-39.9 ms | 47.2-47.8 ms | 0.82-0.84x |
+| decoding through the key-value cache, characters a second | 2 796-2 804 | 5 945-6 125 | 2.13-2.18x |
+
+Greedy text from "ROMEO:" is the same for 38 of its 64 characters, then the two take different near-ties and go their
+own ways (both are this small model's text). Decoding is the case INT8 is for - every linear layer a one-row product,
+reading its weights - and it gains 2.1x end to end where its products gain 3x; a whole sequence's forward is
+compute-bound and slower, as the table above says it would be.
+
+### What std/linalg would need to host the INT8 product
+
+1. **The dot-product instruction, from olang.** The INT8 product is held to half of F32's rate by the instruction LLVM
+   picks (above). Reaching `vpdpbusd` (AVX-512 VNNI and AVX-VNNI), `vpdpwssd` on 16-bit pairs, or AArch64's
+   `sdot`/`usdot` needs either a compiler-supplied operation - say a method on an I32 place,
+   `acc.DotAdd4(a, b)` over four U8 and four I8, lowered to the target's instruction and to four multiply-adds
+   elsewhere, the evaluator computing the same integers (olang's K1) - or LLVM's `partial.reduce.add` intrinsic (LLVM
+   19 and later), which olang 18's toolchain does not have. With either, the same kernel's tile becomes 12 x 64 U8 x I8
+   on AVX-512 (four times F32's rate) and the products above should all turn into gains.
+2. **The kernel in std/linalg**: `Weights` (packed panels, per-channel scales, sums), `Activations` with `Range`,
+   `Linear` with its dequantizing store - and Goto's blocking around it, which quant.olang does not have yet: it
+   packs a tile's rows per product and keeps the whole depth (fine to a few thousand), where std/linalg blocks K into
+   panels for the cache and splits large products over tasks.
+3. **Patches of U8 images** in the images' [K][K][C] order - `GemmPatches`' counterpart - and a convolution's weights
+   permuted to match.
+4. **U8 and I8 matrices** with the quantization passes (a range observed, values quantized) as destination forms, and
+   `Matrix<T>` methods for them (`ArgMaxRows` on the logits works today).
+
+### Decisions
+
+1. **The element-wise kernels are std/linalg's `Map`, `Map2`, `Map3`** again (reversing section 20's decision 4), and
+   GELU's forward is `Activate(Gelu)`; its backward stays oann's (one rounding of a BF16 gradient).
+2. **Weights symmetric per output channel, activations per tensor**, the industry's default for post-training INT8
+   (PyTorch's fbgemm/x86 configuration, TensorRT): per-channel weights cost nothing at run time (a scale per output in
+   the store), per-channel activations would.
+3. **Activations unsigned where their range has no negatives** (zero point 0, 255 steps), symmetric about zero
+   otherwise (zero point 128, 127 steps a side) - the max-abs scheme asked for, with the half it wastes on a
+   nonnegative tensor given back; every input of the perceptron and the CNN is nonnegative.
+4. **U8 activations times I8 weights**: the hardware's integer dot products take that shape, and it is the one LLVM 18
+   turns into a multiply-add instruction (`vpdpwssd`); I8 x I8 and I16 x I16 tiles gave `vpmulld` (probed in C with
+   clang 18, the same LLVM).
+5. **Dynamic and static both**, static by `Calibrate` on the quantized network's own activations (each layer's input as
+   the layers before it produce it) and a flag; the two measure the same, so dynamic is the default (nothing to
+   calibrate, no clamping).
+6. **The tile by its width**: 6 x 32 wide, 12 x 16 thin on AVX-512 (measured); an output's columns padded to the tile
+   (sixteen for ten classes) - padding is memory the model really holds, and `Bytes` counts it.
+7. **No intermediate I32 matrix**: dequantization, bias and ReLU in the tile's store.
+8. **Max pooling in F32** between quantized layers; a layer's output is F32 and the next layer quantizes it - one pass,
+   and what lets dynamic quantization see each layer's real range. (Fusing requantization into the store needs the
+   next range before the product: static only, not built.)
+9. **The graph quantizes its `Linear` nodes in place** (`QuantizeLinear`, a flag to switch): a quantized copy of each
+   weight, the input quantized dynamically, no new op kind - so the transformer, its decoding and the evaluation helpers
+   run unchanged. Only `Linear` (the attention's projections, the perceptrons): the tied head is a `MatMul` against
+   the embedding table, and attention's own products multiply two activations, which per-tensor scales computed per
+   call would make slow and the cache's rows would make awkward. Inference only, F32 only.
+
+### olang issues
+
+- Fixed in efdb82c and deleted: `narrowtbaa`. Kept as records, as before: `fieldname`, `joinparen`, `nestedtry`,
+  `tryindex`.
+- New, `repro/lambdalend.olang`: O17 refuses to lend a value whose references live elsewhere (a `Matrix` view such as
+  `Graph.Value` gives) to a function that writes it from a lambda run by `linalg.ParallelRows`, though the lambda keeps
+  nothing and the same writes without tasks are accepted. Worked around by passing the elements and stride
+  (`quant.LinearInto`). Reproduces on efdb82c and master 2e83597.
+- Not a bug, a limit (above): LLVM 18 forms no four-way or true two-way integer dot product from plain olang, and its
+  SLP vectorizer keeps the I32 accumulation on 256-bit registers under `prefer-vector-width=512`.
+- The coordinator's compiler for this phase (efdb82c) lacks `-s`; the sanitizer run used master 2e83597.
