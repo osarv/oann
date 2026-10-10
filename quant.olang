@@ -23,6 +23,7 @@
 
 import "std/linalg"
 import "std/math"
+import "std/time"
 import "conv"
 
 # ---- the tile ----
@@ -30,18 +31,20 @@ import "conv"
 # the I32 elements of one vector register of the target
 fn lanes() I64 { return TargetVectorBits / 32 }
 
-# the tile's rows: std/linalg's for 32-bit elements
-fn tileRows() I64 {
-    if TargetVectorBits >= 512 { return 6 }
-    if TargetVectorBits >= 256 { return 6 }
-    return 4
-}
-
 # the tile's columns: two vectors (three on SSE), or one for a thin output
 fn wideCols() I64 {
     if TargetVectorBits >= 512 { return 32 }
     if TargetVectorBits >= 256 { return 16 }
     return 12
+}
+
+# the tile's rows for a panel of cols columns: the accumulators, a step's columns of weights and a broadcast activation
+# fill the vector registers - and a thin tile, half as wide, has twice the rows (12 x 16 and 6 x 32 on AVX-512, 12 x 8
+# and 6 x 16 on AVX, 4 x 4 and 4 x 12 on SSE). Measured on AVX-512 (bench/int8): 6 x 32 the faster wide tile by 5-10%
+# over 12 x 16, which is 25% faster for an output of sixteen
+fn tileRows(cols I64) I64 {
+    if TargetVectorBits < 256 { return 4 }
+    return 12 if cols <= lanes() else 6
 }
 
 type wideTile struct() { }
@@ -68,6 +71,7 @@ type Weights struct(Out I64, In I64) {
     Out
     In
     Cols I64 = wideCols() if Out > lanes() else lanes()
+    Mr I64 = tileRows(Cols)
     Panels I64 = (Out + Cols - 1) / Cols
     Q mut Array<I8>& = Array<I8>(Panels * In * Cols)
     Scale mut Array<F32>& = Array<F32>(Out)
@@ -95,6 +99,20 @@ fn QuantizeWeights(w linalg.Matrix<<T>>&) Weights {
         q.Sum[n] = sum
     }
     return q
+}
+
+# a convolution's weights (OutC x C K K, PyTorch's [C][K][K] columns) quantized with their columns in the patches'
+# order, [K][K][C] (Activations.Patches)
+fn QuantizeConvWeights(w linalg.Matrix<<T>>&, s conv.Shape&) Weights {
+    assert w.Rows == s.OutC and w.Cols == s.Patch()
+    KK I64 = s.K * s.K
+    p := linalg.Matrix<T>(w.Rows, w.Cols)
+    for n in range w.Rows {
+        for c in range s.C {
+            for j in range KK { p.Set(n, j * s.C + c, w.Get(n, c * KK + j)) }
+        }
+    }
+    return QuantizeWeights(p)
 }
 
 # the quantized value of W[n, k]
@@ -140,8 +158,11 @@ fn (r mut Range&) Observe(x linalg.Matrix<F32>&) {
         b.lo[j] = first
         b.hi[j] = r.Hi if r.Seen else first
     }
-    for i in range x.Rows {
-        row := x.Row(i)
+    # a matrix whose rows are contiguous is one run
+    runs I64 = 1 if x.Contiguous() else x.Rows
+    n I64 = x.Rows * x.Cols if x.Contiguous() else x.Cols
+    for i in range runs {
+        row := x.Data[i * x.Stride:i * x.Stride + n]
         whole I64 = row.Len() - row.Len() % 16
         for k in range 0, whole, 16 {
             for j in range 16 {
@@ -174,78 +195,61 @@ fn (r Range&) Scale() (F32, I32) {
     return m / 127.0, 128
 }
 
-# activations quantized to U8 as the kernel reads them - a Rows x Cols matrix in row panels of Mr rows (Mr the tile's
-# height, or 1 for a matrix of fewer rows than four), panel r's step k holding rows r Mr .. at (r Cols + k) Mr, rows
-# past Rows filled with the zero point; x ~ Step (a - Zero). Room for Elements values (the rows rounded up to a whole
-# panel), and Pixels, U8 images a convolution's patches are made from
+# activations quantized to U8: a Rows x Cols matrix, row by row, x ~ Step (a - Zero) - read by the micro-kernel where
+# they are, a tile's rows at once (std/linalg's in-place left operand), so quantizing is one pass in order and a
+# convolution's patches are runs of pixels copied. Room for Elements values: the rows and twelve more, which hold the
+# zero point so that a tile reaching past the last row reads values that are never stored. Pixels holds the U8 images
+# a convolution's patches are copied from
 type Activations struct(Elements I64) {
     Elements
     Rows I64 = 0
     Cols I64 = 0
-    Mr I64 = 1
     Step F32 = 1.0
     Zero I32 = 0
     Data mut Array<U8>& = Array<U8>(Elements)
     Pixels mut Array<U8>& = Array<U8>(0)
 }
 
-# the room a rows x cols matrix takes, its last panel whole
+# the room a rows x cols matrix takes, a tile's rows past it included
 fn ElementsFor(rows I64, cols I64) I64 {
-    return (rows + tileRows()) * cols
+    return (rows + 12) * cols
 }
 
 # the shape, and the step and zero point taken from r
 fn (a mut Activations&) begin(rows I64, cols I64, r Range&) {
+    assert (rows + 12) * cols <= a.Elements, "more values than the activations have room for"
     a.Rows = rows
     a.Cols = cols
-    a.Mr = 1 if rows < 4 else tileRows()
-    assert (rows + a.Mr - 1) / a.Mr * a.Mr * cols <= a.Elements, "more values than the activations have room for"
     s, zp := r.Scale()
     a.Step = s
     a.Zero = zp
 }
 
+# the twelve rows past the last filled with the zero point
+fn (a mut Activations&) pad() {
+    z := U8(a.Zero)
+    d := a.Data
+    for i in range a.Rows * a.Cols, (a.Rows + 12) * a.Cols { d[i] = z }
+}
+
 # x quantized over the range r: a = clamp(round(x / Step) + Zero, 0, 255), ties to even
 fn (a mut Activations&) Quantize(x linalg.Matrix<F32>&, r Range&) {
     a.begin(x.Rows, x.Cols, r)
-    mr := a.Mr
     K := a.Cols
     inv F32 = 1.0 / a.Step
     zp F32 = F32(a.Zero)
     d := a.Data
-    if mr == 1 {
+    if x.Contiguous() {
+        xs := x.Data
+        for k in range a.Rows * K { d[k] = quantizeOne(xs[k], inv, zp) }
+    } else {
         for i in range a.Rows {
             row := x.Row(i)
             o I64 = i * K
             for k in range K { d[o + k] = quantizeOne(row[k], inv, zp) }
         }
-        return
     }
-    full I64 = a.Rows / mr * mr
-    for p in range 0, full, mr { quantizePanel(d, p * K, x, p, K, inv, zp) }
-    if full == a.Rows { return }
-    # the last panel, part rows and part zero points
-    for i in range mr {
-        o I64 = full * K + i
-        if full + i < a.Rows {
-            row := x.Row(full + i)
-            for k in range K { d[o + k * mr] = quantizeOne(row[k], inv, zp) }
-        } else {
-            z := U8(a.Zero)
-            for k in range K { d[o + k * mr] = z }
-        }
-    }
-}
-
-# a whole panel: rows p .. p + Mr of x, the tile's height a constant here so that the panel's rows are one loop
-fn quantizePanel(d mut Array<U8>&, base I64, x linalg.Matrix<F32>&, p I64, K I64, inv F32, zp F32) {
-    mr := tileRows()
-    xs := x.Data
-    ld := x.Stride
-    o I64 = p * ld
-    for k in range K {
-        for i in range mr { d[base + k * mr + i] = quantizeOne(xs[o + i * ld + k], inv, zp) }
-    }
+    a.pad()
 }
 
 # x dynamically quantized: over its own range
@@ -261,9 +265,9 @@ fn quantizeOne(v F32, inv F32, zp F32) U8 {
 }
 
 # the patches of a convolution (conv.Shape s) of the images x (n x H W C), quantized over r: row (b OutH + oy) OutW +
-# ox is the patch of output pixel (oy, ox) of image b in PyTorch's [C][K][K] order (conv.Im2col's), a pixel off the
-# image the zero point - the left operand of the convolution's product. The images are quantized once, into Pixels,
-# and the patches copied from there
+# ox is the patch of output pixel (oy, ox) of image b, its columns [ky][kx][c] - the order the image holds them in
+# (channels last), so that a window's row of K pixels is one run of K C values - and a pixel off the image the zero
+# point. The weights' columns are in this order too (QuantizeConvWeights). The images are quantized once, into Pixels
 fn (a mut Activations&) Patches(x linalg.Matrix<F32>&, s conv.Shape&, r Range&) {
     assert x.Cols == s.H * s.W * s.C
     a.begin(x.Rows * s.Positions(), s.Patch(), r)
@@ -276,45 +280,53 @@ fn (a mut Activations&) Patches(x linalg.Matrix<F32>&, s conv.Shape&, r Range&) 
         o I64 = b * x.Cols
         for k in range x.Cols { px[o + k] = quantizeOne(img[k], inv, zp) }
     }
-    mr := a.Mr
-    K := a.Cols
     z := U8(a.Zero)
     d := a.Data
     C := s.C
-    KK I64 = s.K * s.K
-    rows := a.Rows
-    padded I64 = (rows + mr - 1) / mr * mr
-    for row in range padded {
-        base I64 = (row / mr) * K * mr + row % mr
-        if row >= rows {
-            for k in range K { d[base + k * mr] = z }
-            continue
-        }
-        b I64 = row / s.Positions()
-        pos I64 = row % s.Positions()
-        oy I64 = pos / s.OutW
-        ox I64 = pos % s.OutW
+    K := s.K
+    W := s.W
+    KC I64 = K * C
+    row I64 = 0
+    for b in range x.Rows {
         img I64 = b * x.Cols
-        for ky in range s.K {
-            iy I64 = oy * s.Stride - s.Pad + ky
-            for kx in range s.K {
-                ix I64 = ox * s.Stride - s.Pad + kx
-                w0 I64 = ky * s.K + kx
-                if iy < 0 or iy >= s.H or ix < 0 or ix >= s.W {
-                    for c in range C { d[base + (c * KK + w0) * mr] = z }
-                } else {
-                    at I64 = img + (iy * s.W + ix) * C
-                    for c in range C { d[base + (c * KK + w0) * mr] = px[at + c] }
+        for oy in range s.OutH {
+            y0 I64 = oy * s.Stride - s.Pad
+            for ox in range s.OutW {
+                x0 I64 = ox * s.Stride - s.Pad
+                o I64 = row * a.Cols
+                inside Bool = x0 >= 0 and x0 + K <= W
+                for ky in range K {
+                    iy I64 = y0 + ky
+                    t I64 = o + ky * KC
+                    if iy < 0 or iy >= s.H {
+                        for j in range KC { d[t + j] = z }
+                    } else if inside {
+                        at I64 = img + (iy * W + x0) * C
+                        for j in range KC { d[t + j] = px[at + j] }
+                    } else {
+                        for kx in range K {
+                            ix I64 = x0 + kx
+                            if ix < 0 or ix >= W {
+                                for c in range C { d[t + kx * C + c] = z }
+                            } else {
+                                at I64 = img + (iy * W + ix) * C
+                                for c in range C { d[t + kx * C + c] = px[at + c] }
+                            }
+                        }
+                    }
                 }
+                row++
             }
         }
     }
+    a.pad()
 }
 
 # ---- the product ----
 
 # y = act(dequantize(a w^T) + bias): y is a.Rows x w.Out, bias one value per output (b's row), act ReLU or none.
-# Row panels are split over "threads" tasks
+# The tile's rows are the weights' Mr - one, a matrix-vector product per row, for fewer rows than four - and runs of
+# them are split over "threads" tasks
 fn Linear(y mut linalg.Matrix<F32>&, a Activations&, w Weights&, bias Array<F32>&, relu Bool, threads I64 = 1) {
     assert a.Cols == w.In and y.Rows == a.Rows and y.Cols == w.Out and bias.Len() == w.Out
     # each output's multiplier and the integer the zero point adds to its accumulator
@@ -325,35 +337,70 @@ fn Linear(y mut linalg.Matrix<F32>&, a Activations&, w Weights&, bias Array<F32>
         corr[n] = a.Zero * w.Sum[n]
     }
     floor F32 = 0.0 if relu else F32(-math.Inf)
-    mr := a.Mr
+    mr I64 = 1 if a.Rows < 4 else w.Mr
     panels I64 = (a.Rows + mr - 1) / mr
     linalg.ParallelRows(panels, 1, threads, fn(lo, hi) {
-        for p in range w.Panels {
-            for r in range lo, hi {
-                rows := lesser(mr, a.Rows - r * mr)
-                cols := lesser(w.Cols, w.Out - p * w.Cols)
-                ao I64 = r * a.Cols * mr
-                bo I64 = p * w.In * w.Cols
-                yo I64 = r * mr * y.Stride + p * w.Cols
-                n0 I64 = p * w.Cols
-                if w.Cols > lanes() {
-                    product(mr, a.Cols, a.Data, ao, w.Q, bo, wideTile(), rows, cols, y.Data, yo, y.Stride, mul, corr, bias, n0, floor)
-                } else {
-                    product(mr, a.Cols, a.Data, ao, w.Q, bo, thinTile(), rows, cols, y.Data, yo, y.Stride, mul, corr, bias, n0, floor)
-                }
+        # a tile's rows of the activations packed step by step (k mr + i), the order the micro-kernel reads them in
+        pa := Array<U8>(mr * a.Cols)
+        for r in range lo, hi {
+            rows := lesser(mr, a.Rows - r * mr)
+            ao I64 = r * mr * a.Cols
+            if mr > 1 {
+                packRows(pa, a.Data, ao, a.Cols, mr)
+                rowPanel(mr, rows, r * mr, pa, 0, a.Cols, w, y, mul, corr, bias, floor)
+            } else {
+                rowPanel(mr, rows, r * mr, a.Data, ao, a.Cols, w, y, mul, corr, bias, floor)
             }
         }
     })
 }
+
+# rows i0 .. i0 + rows of y, their activations' tile at src[so ..], by every column panel of w
+fn rowPanel(mr I64, rows I64, i0 I64, src Array<U8>&, so I64, K I64, w Weights&, y mut linalg.Matrix<F32>&, mul Array<F32>&, corr Array<I32>&, bias Array<F32>&, floor F32) {
+    for p in range w.Panels {
+        cols := lesser(w.Cols, w.Out - p * w.Cols)
+        bo I64 = p * w.In * w.Cols
+        yo I64 = i0 * y.Stride + p * w.Cols
+        n0 I64 = p * w.Cols
+        if w.Cols > lanes() {
+            product(mr, K, src, so, w.Q, bo, wideTile(), rows, cols, y.Data, yo, y.Stride, mul, corr, bias, n0, floor)
+        } else {
+            product(mr, K, src, so, w.Q, bo, thinTile(), rows, cols, y.Data, yo, y.Stride, mul, corr, bias, n0, floor)
+        }
+    }
+}
+
+# rows o / K .. + mr of a (K wide, row by row) into dst step by step: dst[k mr + i] = a[o + i K + k] - for each of
+# the tile's heights a constant, so that a step's rows are written out in one go. Rows past the activations' last are
+# their padding, the zero point
+type rows12 struct() { }
+type rows6 struct() { }
+type rows4 struct() { }
+
+fn packRows(dst mut Array<U8>&, a Array<U8>&, o I64, K I64, mr I64) {
+    if mr == 12 { packRowsOf(dst, a, o, K, rows12()) } else if mr == 6 { packRowsOf(dst, a, o, K, rows6()) } else { packRowsOf(dst, a, o, K, rows4()) }
+}
+
+fn packRowsOf(dst mut Array<U8>&, a Array<U8>&, o I64, K I64, h <H>) {
+    mr I64 = match H {
+        case rows12 => 12
+        case rows6 => 6
+        case rows4 => 4
+    }
+    for k in range K {
+        for i in range mr { dst[k * mr + i] = a[o + i * K + k] }
+    }
+}
+
 
 fn lesser(a I64, b I64) I64 { return a if a < b else b }
 
 fn product(mr I64, depth I64, ap Array<U8>&, ao I64, bp Array<I8>&, bo I64, sh <S>, rows I64, cols I64, y mut Array<F32>&, yo I64, ldy I64, mul Array<F32>&, corr Array<I32>&, bias Array<F32>&, n0 I64, floor F32) {
     if mr == 1 {
         micro1(depth, ap, ao, bp, bo, sh, cols, y, yo, mul, corr, bias, n0, floor)
-    } else if TargetVectorBits >= 1024 {
+    } else if mr == 12 {
         micro12(depth, ap, ao, bp, bo, sh, rows, cols, y, yo, ldy, mul, corr, bias, n0, floor)
-    } else if TargetVectorBits >= 256 {
+    } else if mr == 6 {
         micro6(depth, ap, ao, bp, bo, sh, rows, cols, y, yo, ldy, mul, corr, bias, n0, floor)
     } else {
         micro4(depth, ap, ao, bp, bo, sh, rows, cols, y, yo, ldy, mul, corr, bias, n0, floor)
@@ -485,6 +532,8 @@ type Model struct(Batch I64, Inputs I64) {
     Inputs
     Threads I64 = 1
     Static Bool = false
+    Profiling Bool = false
+    Times mut List<I64>& = List<I64>()
     Layers mut List<Layer>& = List<Layer>()
     Ranges mut List<Range>& = List<Range>()
     widths mut List<I64>& = List<I64>()
@@ -503,6 +552,8 @@ fn (m Model&) Outputs() I64 {
 fn (m mut Model&) push(l Layer, width I64, elements I64) {
     m.Layers.Push(l)
     m.Ranges.Push(Range())
+    m.Times.Push(0)
+    m.Times.Push(0)
     m.widths.Push(width)
     if elements > m.elements { m.elements = elements }
 }
@@ -521,7 +572,7 @@ fn (m mut Model&) Conv(w linalg.Matrix<<T>>&, b linalg.Matrix<T>&, s conv.Shape,
     bias mut Array<F32>&m = Array<F32>(w.Rows)
     for n in range w.Rows { bias[n] = F32(b.Get(0, n)) }
     if m.Outputs() * m.Batch > m.pixels { m.pixels = m.Outputs() * m.Batch }
-    m.push(Layer.Conv(QuantizeWeights(w), bias, s, relu), s.Positions() * s.OutC,
+    m.push(Layer.Conv(QuantizeConvWeights(w, s), bias, s, relu), s.Positions() * s.OutC,
         ElementsFor(m.Batch * s.Positions(), s.Patch()))
 }
 
@@ -599,21 +650,30 @@ fn (m Model&) buffer(i I64, n I64) mut linalg.Matrix<F32>&m {
     return linalg.View(data, 0, n, m.widths[i])
 }
 
-# layer i applied to x into y; observe: widen its input range by x and quantize over that (calibration)
+# layer i applied to x into y; observe: widen its input range by x and quantize over that (calibration). Profiling
+# adds the time its input's quantization took to Times[2 i], the rest's (its product, or its pooling) to Times[2 i + 1]
 fn (m mut Model&) run(i I64, y mut linalg.Matrix<F32>&, x linalg.Matrix<F32>&, observe Bool) {
+    t0 := time.Now() if m.Profiling else 0
+    t1 I64 = t0
     match m.Layers[i] {
         case Layer.Dense(w, b, relu) {
             r := m.inputRange(i, x, observe)
             m.acts.Quantize(x, r)
+            if m.Profiling { t1 = time.Now() }
             Linear(y, m.acts, w, b, relu, m.Threads)
         }
         case Layer.Conv(w, b, s, relu) {
             r := m.inputRange(i, x, observe)
             m.acts.Patches(x, s, r)
+            if m.Profiling { t1 = time.Now() }
             out mut linalg.Matrix<F32>&y = y.Reshape(y.Rows * s.Positions(), s.OutC)
             Linear(out, m.acts, w, b, relu, m.Threads)
         }
         case Layer.Pool(p) { maxPool(y, x, p) }
+    }
+    if m.Profiling {
+        m.Times[2 * i] = m.Times[2 * i] + (t1 - t0)
+        m.Times[2 * i + 1] = m.Times[2 * i + 1] + (time.Now() - t1)
     }
 }
 
@@ -694,17 +754,15 @@ test "activations round-trip: unsigned for a tensor with no negatives, symmetric
     x := randomMatrix(5, 33, r, 0.0, 3.0)
     a := Activations(ElementsFor(8, 33))
     a.QuantizeDynamic(x)
-    assert a.Zero == 0 and a.Mr == 4 or a.Mr == tileRows()
+    assert a.Zero == 0
     y := randomMatrix(5, 33, r, -1.0, 2.0)
     b := Activations(ElementsFor(8, 33))
     b.QuantizeDynamic(y)
     assert b.Zero == 128
     for i in range 5 {
         for k in range 33 {
-            pa I64 = (i / a.Mr) * 33 * a.Mr + k * a.Mr + i % a.Mr
-            assert math.Abs(a.Step * F32(I32(a.Data[pa]) - a.Zero) - x.Get(i, k)) <= 0.5 * a.Step * 1.0001
-            pb I64 = (i / b.Mr) * 33 * b.Mr + k * b.Mr + i % b.Mr
-            assert math.Abs(b.Step * F32(I32(b.Data[pb]) - b.Zero) - y.Get(i, k)) <= 0.5 * b.Step * 1.0001
+            assert math.Abs(a.Step * F32(I32(a.Data[i * 33 + k]) - a.Zero) - x.Get(i, k)) <= 0.5 * a.Step * 1.0001
+            assert math.Abs(b.Step * F32(I32(b.Data[i * 33 + k]) - b.Zero) - y.Get(i, k)) <= 0.5 * b.Step * 1.0001
         }
     }
 }
@@ -732,8 +790,7 @@ test "the INT8 product equals the F32 product of the dequantized operands" {
                     for j in range n {
                         s F64 = F64(bias.Get(0, j))
                         for p in range k {
-                            pa I64 = (i / a.Mr) * k * a.Mr + p * a.Mr + i % a.Mr
-                            s += F64(a.Step) * F64(I32(a.Data[pa]) - a.Zero) * F64(q.At(j, p)) * F64(q.Scale[j])
+                            s += F64(a.Step) * F64(I32(a.Data[i * k + p]) - a.Zero) * F64(q.At(j, p)) * F64(q.Scale[j])
                         }
                         if relu and s < 0.0 { s = 0.0 }
                         assert math.Abs(F64(y.Get(i, j)) - s) <= 1e-5 * (1.0 + math.Abs(s))
@@ -771,9 +828,9 @@ test "the INT8 product is within the quantization's bound of the F32 product" {
     }
 }
 
-test "a convolution's quantized patches are conv.Im2col's patches quantized" {
+test "a convolution's quantized patches are conv.Im2col's patches quantized, columns in the images' order" {
     r := rand.Rand(9)
-    for s in conv.Shape[conv.Shape(1, 6, 5, 3, 3, 1, 1), conv.Shape(3, 7, 6, 4, 3, 2, 1)] {
+    for s in conv.Shape[conv.Shape(1, 6, 5, 3, 3, 1, 1), conv.Shape(3, 7, 6, 4, 3, 2, 1), conv.Shape(2, 5, 5, 2, 2, 1, 0)] {
         x := randomMatrix(2, s.H * s.W * s.C, r, 0.0, 1.0)
         rng := Range()
         rng.Observe(x)
@@ -783,8 +840,29 @@ test "a convolution's quantized patches are conv.Im2col's patches quantized" {
         conv.Im2col(x, s, cols, 1)
         b := Activations(ElementsFor(2 * s.Positions(), s.Patch()))
         b.Quantize(cols, rng)
-        assert a.Rows == b.Rows and a.Mr == b.Mr and a.Step == b.Step and a.Zero == b.Zero
-        for i in range (a.Rows + a.Mr - 1) / a.Mr * a.Mr * a.Cols { assert a.Data[i] == b.Data[i] }
+        assert a.Rows == b.Rows and a.Cols == b.Cols and a.Step == b.Step and a.Zero == b.Zero
+        KK I64 = s.K * s.K
+        for i in range a.Rows {
+            for c in range s.C {
+                for j in range KK { assert a.Data[i * a.Cols + j * s.C + c] == b.Data[i * b.Cols + c * KK + j] }
+            }
+        }
+        # the rows past the last are the zero point
+        for i in range a.Rows * a.Cols, (a.Rows + 12) * a.Cols { assert I32(a.Data[i]) == a.Zero }
+    }
+}
+
+test "a convolution's quantized weights hold the patches' column order" {
+    r := rand.Rand(11)
+    s := conv.Shape(3, 5, 5, 4, 3, 1, 1)
+    w := randomMatrix(4, s.Patch(), r, -1.0, 1.0)
+    q := QuantizeConvWeights(w, s)
+    p := QuantizeWeights(w)
+    for n in range 4 {
+        assert q.Scale[n] == p.Scale[n] and q.Sum[n] == p.Sum[n]
+        for c in range 3 {
+            for j in range 9 { assert q.At(n, j * 3 + c) == p.At(n, c * 9 + j) }
+        }
     }
 }
 
