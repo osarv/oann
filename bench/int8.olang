@@ -1,0 +1,75 @@
+# the INT8 product (quant.Linear) against std/linalg's F32 product with its bias and ReLU (GemmAct), on the shapes of
+# oann's networks and a square one - interleaved, the median of each over rounds. Arguments: rounds (7), threads (1)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "std/linalg"
+import "../quant"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len() { return fallback }
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b) { return a < b })
+    return xs[xs.Len() / 2]
+}
+
+fn main() ? io.IoError + ParseError {
+    args := os.Args()
+    rounds := try number(args, 1, 7)
+    threads := try number(args, 2, 1)
+    r := rand.Rand(1)
+    ws := linalg.GemmWorkspace<F32>()
+    for shape in Array<I64>&[I64[1, 784, 128], I64[64, 784, 128], I64[128, 784, 128], I64[128, 128, 10],
+            I64[100352, 9, 16], I64[25088, 144, 32], I64[1024, 128, 512], I64[1024, 512, 128], I64[512, 512, 512],
+            I64[1024, 1024, 1024]] {
+        m := shape[0]
+        k := shape[1]
+        n := shape[2]
+        x := linalg.Matrix<F32>(m, k)
+        x.FillUniform(r, 0.0, 1.0)
+        w := linalg.Matrix<F32>(n, k)
+        w.FillUniform(r, -0.2, 0.2)
+        b := linalg.Matrix<F32>(1, n)
+        b.FillUniform(r, -0.1, 0.1)
+        q := quant.QuantizeWeights(w)
+        a := quant.Activations(quant.ElementsFor(m, k))
+        y := linalg.Matrix<F32>(m, n)
+        ops F64 = 2.0 * F64(m) * F64(n) * F64(k)
+        # repeat each timing until it takes about 20 ms
+        reps I64 = 1
+        for {
+            t0 := time.Now()
+            for i in range reps { ws.GemmAct(y, x, false, w, true, b, linalg.Activation.Relu, 1, 0, threads) }
+            if time.Since(t0) > 20000000 or reps > 1000000 { break }
+            reps = reps * 2
+        }
+        f32s := Array<F64>(rounds)
+        i8s := Array<F64>(rounds)
+        qs := Array<F64>(rounds)
+        for t in range rounds {
+            t0 := time.Now()
+            for i in range reps { ws.GemmAct(y, x, false, w, true, b, linalg.Activation.Relu, 1, 0, threads) }
+            f32s[t] = F64(time.Since(t0)) / F64(reps)
+            t1 := time.Now()
+            for i in range reps {
+                a.QuantizeDynamic(x)
+                quant.Linear(y, a, q, b.Row(0), true, threads)
+            }
+            i8s[t] = F64(time.Since(t1)) / F64(reps)
+            t2 := time.Now()
+            for i in range reps { quant.Linear(y, a, q, b.Row(0), true, threads) }
+            qs[t] = F64(time.Since(t2)) / F64(reps)
+        }
+        f := median(f32s)
+        g := median(i8s)
+        p := median(qs)
+        try io.Print($m " x " $k " x " $n ": F32 " $(f * 1e-3).Fixed(2) " us (" $(ops / f).Fixed(1) " GFLOPS), INT8 with dynamic quantization "
+            $(g * 1e-3).Fixed(2) " us (" $(ops / g).Fixed(1) " GOPS, " $(f / g).Fixed(2) "x), the product alone "
+            $(p * 1e-3).Fixed(2) " us (" $(ops / p).Fixed(1) " GOPS, " $(f / p).Fixed(2) "x)\n")
+    }
+}
