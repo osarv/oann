@@ -1,0 +1,83 @@
+# ops' element-wise passes (ops.each1/2/3: each row's storage taken into a local) against std/linalg's Map, Map2 and
+# Map3 (the storage read through the matrices), GELU forward and backward and an add, in F32 and BF16 - interleaved,
+# medians, ns an element. Arguments: rounds (9)
+
+import "std/io"
+import "std/os"
+import "std/time"
+import "std/linalg"
+import "../ops"
+import "../kernels"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len() { return fallback }
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b) { return a < b })
+    return xs[xs.Len() / 2]
+}
+
+fn slope(v <A>) A {
+    t A = linalg.FastTanh(0.7978845608028654 * (v + 0.044715 * v * v * v))
+    return 0.5 * (1.0 + t) + 0.5 * v * (1.0 - t * t) * 0.7978845608028654 * (1.0 + 0.134145 * v * v)
+}
+
+fn geluMap(y mut linalg.Matrix<<T>>&, x linalg.Matrix<T>&, z <A>) {
+    like T
+    y.Map(x, fn(s) {
+        v := kernels.Up(s, z)
+        return kernels.Down(0.5 * v * (1.0 + linalg.FastTanh(0.7978845608028654 * (v + 0.044715 * v * v * v))), like)
+    })
+}
+
+fn geluBackMap(dx mut linalg.Matrix<<T>>&, dy linalg.Matrix<T>&, x linalg.Matrix<T>&, z <A>) {
+    like T
+    dx.Map3(dx, dy, x, fn(d, g, v) {
+        return kernels.Down(kernels.Up(d, z) + kernels.Up(g, z) * slope(kernels.Up(v, z)), like)
+    })
+}
+
+fn addMap(y mut linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
+    like T
+    y.Map2(a, b, fn(p, q) { return kernels.Down(kernels.Up(p, z) + kernels.Up(q, z), like) })
+}
+
+fn run(like <T>, name String&, rounds I64) ? io.IoError {
+    z F32 = 0.0
+    x := linalg.Matrix<T>(1024, 512)
+    dy := linalg.Matrix<T>(1024, 512)
+    y := linalg.Matrix<T>(1024, 512)
+    for i in range x.Data.Len() {
+        x.Data[i] = linalg.Cast(F64(i % 97) * 0.02 - 1.0, like)
+        dy.Data[i] = linalg.Cast(F64(i % 89) * 0.01 - 0.4, like)
+    }
+    e F64 = F64(x.Data.Len() * 10)
+    names := String&["GELU forward", "GELU backward (acc)", "add"]
+    for kind in range 3 {
+        each := Array<F64>(rounds)
+        mapped := Array<F64>(rounds)
+        for t in range rounds {
+            t0 := time.Now()
+            for i in range 10 {
+                if kind == 0 { ops.GeluTanh(y, x, z) } else if kind == 1 { ops.GeluTanhBackward(dy, x, y, true, z) } else { ops.Add(y, x, dy, z) }
+            }
+            each[t] = F64(time.Since(t0)) / e
+            t1 := time.Now()
+            for i in range 10 {
+                if kind == 0 { geluMap(y, x, z) } else if kind == 1 { geluBackMap(y, dy, x, z) } else { addMap(y, x, dy, z) }
+            }
+            mapped[t] = F64(time.Since(t1)) / e
+        }
+        try io.Print($name " " $names[kind] ": each " $median(each).Fixed(3) " ns an element, Map " $median(mapped).Fixed(3) "\n")
+    }
+}
+
+fn main() ? io.IoError + ParseError {
+    rounds := try number(os.Args(), 1, 9)
+    f F32 = 0.0
+    h BF16 = 0.0
+    try run(f, "F32", rounds)
+    try run(h, "BF16", rounds)
+}
