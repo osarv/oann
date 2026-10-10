@@ -1,7 +1,7 @@
 # oann - neural networks in olang. Each .olang file is one module (olang M22); the compiler writes everything it
 # builds under build/, and MNIST is cached under data/ (both ignored by git).
 
-OLANG ?= /home/user/wt/oannc3/build/out
+OLANG ?= /home/user/wt/oannc4/build/out
 
 # every module with test blocks
 TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang datasets/loader.olang \
