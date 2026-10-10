@@ -1058,6 +1058,13 @@ the store lowers every task's regret - back in A, 0.07 in the first 250 moments 
 nights add nothing, changing the recall only at observations never seen. Results and decisions: docs/settling.md
 sections 2.14, 5.11 and 6 (decisions 62-71).
 
+Phase 9 answers what an agent's nights are for (docs/settling.md open question 14; section 23 below): generalization
+where observations recur only approximately - a new surroundings sharing old answers, noisy cues, new points of a smooth
+rule - and retention for a store that forgets; a cost where new surroundings conflict. It adds a transient store
+(`Settings.RecallHalfLife`, off) and a reservoir of the cues a night replays (`Settings.SleepCues`, 1 024 for an
+agent). `make nights` runs `examples/nights.olang`. Results and decisions: docs/settling.md sections 2.15, 5.12 and 6
+(decisions 72-76).
+
 ## 18. Phase 5: attention on products, mixed precision, a Dataset trait
 
 ### Attention through std/linalg's Gemm
@@ -1724,3 +1731,60 @@ compute-bound and slower, as the table above says it would be.
 - Not a bug, a limit (above): LLVM 18 forms no four-way or true two-way integer dot product from plain olang, and its
   SLP vectorizer keeps the I32 accumulation on 256-bit registers under `prefer-vector-width=512`.
 - The coordinator's compiler for this phase (efdb82c) lacks `-s`; the sanitizer run used master 2e83597.
+
+## 23. Phase 9: what an agent's nights are for
+
+docs/settling.md's open question 14, measured (its 2.15, 5.12, decisions 72-76; olang efdb82c's compiler, the shared
+four-core machine, 2026-10-10). Phase 7 had found that an agent's nights change nothing measured: keyed by the
+observation, a night leaves the recall at every observation seen as it was, and only moves it where the agent has never
+been. Complementary learning systems name four places consolidation should pay - generalization, interference,
+capacity, noisy or partial cues - so phase 9 built a task for each and measured them over 40 lives a configuration,
+comparing agents with and without nights life by life (two agents of one seed live the same moments until a night
+makes a difference, so the intervals are a third to a half as wide as unpaired ones).
+
+**The tasks.** `examples/nights.olang` puts the observations on a ring - a great circle of the 16-number unit sphere -
+with each arm's payoff a smooth function of the angle that no linear read of the observation holds (it is quadratic in
+it: opposite points have opposite observations and the same answers); a life trains on 8 points, is tested with
+`Imagine` (nothing changes) on seen, new, noisy and partial observations, then lives anywhere on the ring.
+`examples/bandit_settle.olang` gained `transfer` - a second surroundings under a new code with the first's answers -
+beside `return` (a conflicting second surroundings), and both examples `perlife=1` for paired comparisons.
+
+**What was found** (regret; docs/settling.md 5.12 has the tables and intervals):
+
+| | without nights | with nights |
+|---|---|---|
+| the ring, lived anywhere after training (memory off) | 0.044-0.045 | 0.035 (paired -0.009 to -0.010) |
+| the ring, noisy observations (memory off) | 0.087 | 0.057 (paired -0.030 +- 0.005) |
+| the ring, partial observations | 0.149 | 0.153 (no change) |
+| transfer, the new surroundings' first 250 moments | 0.050 | 0.030 (paired -0.020 +- 0.011) |
+| return, the conflicting surroundings' first 250 | 0.159 | 0.178 (paired +0.019 +- 0.013) |
+| return, back in A - permanent store | 0.069 | 0.079 |
+| return, back in A - store with a half-life of 500 moments | 0.145 | 0.088 (paired -0.057 +- 0.022) |
+| 64 random contexts, any block | | within +-0.003 |
+
+So nights pay where observations recur only approximately and where the fast store forgets, and cost where new
+surroundings conflict. The consolidator's own store does more than expected without them: its sparse codes of a
+one-dimensional ring's nearby points share cells, so it answers new points between seen ones nearly as well as seen
+ones, and its pattern separation keeps two surroundings apart better than nights keep a forgetting store's.
+
+**Built**: `Store.Fade` (a pending factor folded below 1/2, so a fade costs nothing per read or write) and
+`agent.Settings.RecallHalfLife` (off) - a transient store, which only nights keep; `SleepSettings.Cues` and
+`agent.Settings.SleepCues` - a night replays a uniform sample of the cues (reservoir sampling), at most 1 024 for an
+agent, since a night costs about 0.12 ms a cue and every cue kept grows it without end (128 of 450 measured level with
+all of them). Checkpoints keep both. Cost on the ring: 0.086-0.094 ms a moment with a consolidator, a night 50-57 ms over
+about 450 cues (19 ms over 128).
+
+**Found on the way**: the associative memory's linear read drives a consolidating agent's readout against its own
+recall wherever answers are not linear in the observation or conflicting surroundings share most of an observation -
+on the ring the agent's answers cost 0.126 against its recall's 0.038, and with the memory off a consolidating agent
+comes back to A at 0.021 against 0.069 - while it helps where one observation's answer changes (a reversal's first block
+0.179 with it, 0.223 without). Which memory should drive the readout, how to complete partial cues, and how to weigh
+the slow part's generalization at unfamiliar observations are docs/settling.md's open questions 15-17.
+
+### Decisions
+
+1. **Nights are for approximate recurrence and a forgetting store** (settling decision 72); sleep stays the caller's.
+2. **The store stays permanent**; a transient one is an option, off (73).
+3. **An agent's nights replay at most 1 024 cues**, a reservoir; a lone consolidator keeps every cue (74).
+4. **Nights are measured in pairs, generalization on the ring** (75).
+5. **The associative memory stays in a consolidating agent** until a reliability-weighted readout is measured (76).

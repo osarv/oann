@@ -384,6 +384,18 @@ readout beside the memories'. Its store is keyed by the observation alone, since
 On the tasks of 5.11 the store kept the agent's answers across a change of surroundings and back; the nights added
 nothing, changing the recall only at observations never seen.
 
+*What an agent's nights are for (phase 9, 2.15, 5.12):* the slow part's generalization, where an observation is new but
+like old ones in the way a smooth learner captures and the store's sparse codes do not - a second surroundings sharing
+the first's answers (its first 250 moments cost 0.030 of regret with nights, 0.050 without), observations seen through
+noise (a third less regret), and, a little, points between seen ones of a smooth rule; and retention, but only for a
+store whose traces fade, which without nights forgets surroundings left for others (0.145 coming back, 0.088 with
+nights) - the permanent, pattern-separating store keeps them better with no nights at all (0.069). Where new
+surroundings conflict with old ones the generalization is a cost (0.178 against 0.159), and nights add nothing at an
+observation seen exactly, at one half missing, or to a store too small for its contexts. Complementary learning
+systems' account holds wherever its premises do - a fast store that forgets, a structure for the slow learner to find
+in what is new - and the agent's own store, which forgets nothing and separates patterns, already does much of the
+rest.
+
 ### 1.10 Sizes, budgets and cost
 
 **Planning classes** (oann's; the model fixes none):
@@ -942,6 +954,42 @@ line). Results in 5.11; decisions 62-71.
 - **What it bought** (5.11): the consolidator's store, by day, much of what an agent keeps across a change of
   surroundings and back - the first 250 moments back in a surroundings left for a conflicting one cost 0.07 of regret
   against 0.19 without it - and lower regret everywhere else; its nights, nothing more on these tasks.
+
+### 2.15 As built: phase 9 - what an agent's nights are for (open question 14)
+
+Open question 14 asked where an agent's nights should pay, since on the tasks of 5.11 they changed nothing. Complementary
+learning systems name four places: generalization to observations like seen ones, protection against a second task
+overwriting the first, capacity beyond what the fast store holds apart, and cues seen through noise or in part. Phase 9
+builds a task for each, measures them with and without nights over 40 lives, and adds the two mechanisms the
+measurements asked for. Results in 5.12; decisions 72-76.
+
+- **The ring** (`examples/nights.olang`, `make nights`): an observation is a point of a great circle of the 16-number
+  unit sphere, `x(theta) = cos(theta) e1 + sin(theta) e2`, and arm `a` pays 1 with probability
+  `0.45 + 0.35 cos(2 (theta - phi_a))`, `phi_a = a pi / 4` plus a turn drawn once a life: each arm best in two opposite
+  sectors of 45 degrees. The answers are a smooth function of `theta` - what a slow learner can capture - and quadratic
+  in the observation, so no linear read holds them: the associative memory's keys of opposite points are each other's
+  negatives while their answers are the same. A life trains on 8 points (the sectors' centres) for 2 000 moments,
+  is tested, then lives 1 000 moments anywhere on the ring, every observation new. The test changes nothing - each
+  answer is the agent's readout settled by `Imagine`, beside its consolidator's recall alone (the arm it values most) -
+  on four sets: the training points (seen), 64 points spread between them (new), the training points with N(0, 0.15^2)
+  added to each number (noisy), and with half of their numbers zeroed (partial). The night just before the test is
+  the last of the training.
+- **Transfer** (`examples/bandit_settle.olang transfer`): 5.11's surroundings, A then B, but B's answers A's - the same
+  contexts under a new code, each observation about half like one seen (cosine 0.5): where the slow part's
+  generalization should pay and the store's sparse codes, which hold nearly identical observations together and little
+  else, cannot. The return task (A, a conflicting B, A again) is where it should cost.
+- **A transient store** (`agent.Settings.RecallHalfLife`, off): the consolidator's store fades by `0.5^(1/H)` every
+  moment (`Consolidator.Fade`, `Store.Fade`) - a hippocampus whose traces decay unless consolidated, which is what
+  complementary learning systems assume of it. The fade is kept pending as one number, folded into the table only when
+  it falls below 1/2 (and at a checkpoint), so it costs nothing per read or write; dusk dreams the traces as they have
+  faded, and dawn writes back at full strength only what the slow part did not absorb.
+- **A reservoir of cues** (`SleepSettings.Cues`, `agent.Settings.SleepCues`, off): a night replays at most that many
+  cues, a uniform sample of every sequence the days saw - reservoir sampling (Vitter's algorithm R), drawn from the
+  consolidator's generator - so a night's cost stops growing with the life (open question 12). The sequences seen go
+  into the checkpoint (a fourteenth scalar; a checkpoint of thirteen is read as having kept every cue).
+- **Paired lives** (`perlife=1` in both examples): two agents of one seed differing only in their nights live the same
+  moments until the first night, so differences are taken life by life - intervals a third to a half as wide as the
+  unpaired ones.
 
 ---
 
@@ -1720,6 +1768,119 @@ a night keeps the agent's recall at every cue but for what dawn's store could no
 consolidating agent into one of another seed exactly - its next 100 moments, a night among them, the same - and agents
 with and without a consolidator refuse each other's checkpoints.
 
+### 5.12 Results of phase 9 (2026-10-10)
+
+`examples/nights.olang` (the ring) and `examples/bandit_settle.olang` (transfer, return, reversal, a bandit of 64
+contexts), F32, with olang efdb82c's compiler (oannc4) on the shared four-core machine at loads of 2-5. 40 lives a
+configuration, intervals 95%; every agent has 64 hidden neurons, a consolidator 2.14's defaults, nights every 500
+moments. Regrets are deterministic; times are not. A **paired** difference is taken life by life between two agents of
+one seed that differ in the one setting named: they live the same moments until the first difference matters, so
+before the first night a night's difference is exactly 0. A random arm's regret is about 0.31 on the ring and 0.375 in
+the bandits.
+
+**What complementary learning systems predicts**, the expectation the tasks were built to test: nights pay at new
+observations like seen ones (the slow part generalizes, a pattern-separating store does not), at noisy and partial
+cues (a smooth learner tolerates what moves a sparse code), when a second task would overwrite the first in the fast
+store, and when there are more associations than the fast store holds apart; and they cost nothing at an observation
+seen exactly (5.11).
+
+**The ring** (2 000 moments on the 8 sector centres, then 1 000 anywhere on the ring). The test's regret - the agent's
+answer / its consolidator's recall alone - and the regret lived anywhere afterwards:
+
+| the associative memory at gain 1 (the default) | seen | new | noisy | partial | lived anywhere |
+|---|---|---|---|---|---|
+| no consolidator | 0.301 +- 0.021 | 0.258 +- 0.020 | 0.297 +- 0.019 | 0.307 +- 0.017 | 0.254-0.260 +- 0.021 |
+| a consolidator, no nights | 0.139 / 0.039 | 0.126 / 0.038 | 0.200 / 0.081 | 0.239 / 0.143 | 0.123-0.130 +- 0.013 |
+| a consolidator and nights | 0.139 / 0.039 | 0.113 / 0.035 | 0.154 / 0.063 | 0.219 / 0.148 | 0.109-0.117 +- 0.013 |
+| **the memory at gain 0** | | | | | |
+| no consolidator | 0.333 +- 0.016 | 0.290 +- 0.016 | 0.333 +- 0.014 | 0.341 +- 0.012 | 0.284-0.294 +- 0.012 |
+| a consolidator, no nights | 0.035 / 0.033 | 0.037 / 0.034 | 0.087 / 0.079 | 0.149 / 0.139 | 0.044-0.045 +- 0.008 |
+| a consolidator and nights | 0.035 / 0.033 | 0.032 / 0.030 | 0.057 / 0.054 | 0.153 / 0.150 | 0.035 +- 0.007 |
+| nights less no nights, paired | 0 / 0 | -0.005 +- 0.002 / -0.004 +- 0.003 | **-0.030 +- 0.005** / -0.025 +- 0.006 | +0.004 +- 0.013 / +0.011 +- 0.011 | **-0.009 to -0.010** (+- 0.003-0.006) |
+
+(intervals of the consolidating agents' test entries 0.005-0.015.) Three things show. The agent alone learns nothing of
+the ring in 3 000 moments - the actor is slow, and the associative memory's linear read contradicts itself, opposite
+points' keys being each other's negatives with the same answers. The consolidator's store alone holds the seen points
+and even the new ones (0.038): its sparse codes of points of a one-dimensional ring 22 degrees apart share cells, which
+is generalization of its own, local kind. And the nights add what the slow part's smoothness gives beyond it: a third
+less regret on noisy cues, a fifth less living anywhere, a little at the new points - nothing at the seen ones, and
+nothing at the partial ones. With the memory at its default gain the agent's answer is three to four times its own
+recall's regret: the memory's read drives the readout against what the consolidator knows (below).
+
+**Transfer** (A, then B under a new code with A's answers; regret by block of 250 moments):
+
+| moments | 1 750-2 000 (A) | 2 000-2 250 (B begins) | 2 250-2 500 | 2 500-2 750 | 3 750-4 000 |
+|---|---|---|---|---|---|
+| no consolidator | 0.043 +- 0.016 | 0.052 +- 0.019 | 0.046 +- 0.020 | 0.045 +- 0.020 | 0.053 +- 0.018 |
+| a consolidator, no nights | 0.022 +- 0.011 | 0.050 +- 0.013 | 0.022 +- 0.010 | 0.027 +- 0.011 | 0.022 +- 0.014 |
+| a consolidator and nights | 0.022 +- 0.011 | **0.030 +- 0.009** | 0.013 +- 0.008 | 0.017 +- 0.010 | 0.014 +- 0.008 |
+| nights less no nights, paired | 0 | **-0.020 +- 0.011** | -0.009 +- 0.012 | -0.009 +- 0.014 | -0.008 +- 0.016 |
+
+The store does not know B's observations - half like A's, its codes share few cells - so without nights the agent with
+a consolidator starts B as badly as an agent without one (0.050 against 0.052); the slow part, taught A at night,
+answers B as A, which is right here. Where B conflicts with A (5.11's return task) the same generalization costs:
+0.178 +- 0.017 against 0.159 +- 0.019 at B's start (paired +0.019 +- 0.013, measured again in this phase).
+
+**Interference, and a transient store** (the return task: A, a conflicting B, A again; a store with a half-life of 500
+moments, `recallhalflife=500`):
+
+| moments | 2 000-2 250 (B begins) | 3 750-4 000 (B) | 4 000-4 250 (A again) | 4 250-4 500 | 5 750-6 000 |
+|---|---|---|---|---|---|
+| a permanent store, no nights (2.14) | 0.159 +- 0.019 | 0.038 +- 0.016 | **0.069 +- 0.014** | 0.028 +- 0.015 | 0.024 +- 0.011 |
+| a permanent store and nights | 0.178 +- 0.017 | 0.030 +- 0.013 | 0.079 +- 0.014 | 0.027 +- 0.014 | 0.014 +- 0.008 |
+| a transient store, no nights | 0.172 +- 0.015 | 0.042 +- 0.015 | **0.145 +- 0.018** | 0.070 +- 0.021 | 0.045 +- 0.016 |
+| a transient store and nights | 0.189 +- 0.018 | 0.044 +- 0.019 | **0.088 +- 0.019** | 0.037 +- 0.019 | 0.027 +- 0.015 |
+
+Paired, back in A: nights against none with the transient store -0.057 +- 0.022 (and -0.032 to -0.018 in the blocks
+after); the transient store with nights against the permanent one without, +0.019 +- 0.019. So complementary learning
+systems' account holds as stated - a fast store whose traces fade forgets the surroundings left for another, and nights
+save most of it into the slow part - but the permanent sparse store, separating the surroundings' patterns, keeps it
+better with no nights at all. Interference in the store is what pattern separation already prevents (5.11); the nights
+are needed only by a store that forgets.
+
+**Capacity.** Sixty-four random contexts (no structure for a slow part to find), 4 000 moments: nights change nothing
+(every block within +-0.003, paired), with the default store (2 400 cells for the 16 numbers, 16 active) or a
+small one (300 cells: +0.010 to +0.018 of regret, which the nights do not recover). The ring with 64 training points
+(structure to find): nights lower the noisy cues' regret (-0.017 +- 0.011) and nothing else measurably, and a store of
+240 cells costs about +0.01 everywhere, nights or not. The agent learns from few moments (the calm gate, open question
+8): with many contexts each is written a few times at rate 0.2, and the night consolidates those weak values, mistakes
+included, as they are - a slow part fitting the dreams does not extract more than the dreams hold.
+
+**Which memory drives the readout** (from the ring's gap between answer and recall, then checked on the bandit tasks,
+a consolidator without nights; paired):
+
+| | memory gain 1 | memory gain 0 | paired |
+|---|---|---|---|
+| ring, the test's new points | 0.126 | 0.037 | - |
+| return, A again: 4 000-4 250 | 0.069 | 0.021 | **-0.048 +- 0.017** |
+| return, the end: 5 750-6 000 | 0.024 | 0.004 | -0.020 +- 0.012 |
+| reversal, after the swap: 2 000-2 250 | 0.179 | 0.223 | **+0.044 +- 0.024** |
+| reversal, the end: 3 750-4 000 | 0.026 | 0.059 | +0.033 +- 0.038 |
+| return with nights, B begins | 0.178 | 0.194 | +0.015 +- 0.020 |
+| return with nights, A again | 0.079 | 0.026 | **-0.053 +- 0.015** |
+
+The associative memory's linear read hurts wherever answers are not linear in the observation - the ring - or where
+two surroundings with conflicting answers share most of their observations (its keys overlap by half, so B's writes
+overwrite A's); it helps where one observation's answer changes, its fast store taking a new value in one write where
+the consolidator's store moves at 0.2 a write. Without the memory, nights cost more at a conflicting B's start (0.194
+against 0.138 without nights, paired +0.055 +- 0.016): the slow part's generalization then drives the readout alone.
+
+**The reservoir** (the ring, memory at 0, nights; paired against every cue kept, 450 +- 19 of them): 128 cues - a night
+19 ms instead of 53, regret within +-0.003 everywhere but the partial cues (+0.009 to +0.011 +- 0.010); 32 cues - 4.8
+ms, the noisy cues +0.007 to +0.009 +- 0.007, the partial +0.024 to +0.028 +- 0.012. A night costs about 0.12 ms a cue
+kept (60 passes, 16 slow neurons). A cap of 1024 changes no decision in the return task's lives (8 lives compared
+line for line): they keep fewer.
+
+**Cost** (one thread, loads 2-5): on the ring a moment costs 0.016-0.025 ms without a consolidator and 0.086-0.094 ms
+with one (a store read at every settle, a day at every moment that learns), a night 50-57 ms over 410-450 cues - 0.1 ms
+a moment at a night every 500 moments. A transient store's fade is one multiplication a moment and a fold of the table
+(3 600 x 4 numbers) every 500 moments at a half-life of 500: the return task took 45.1 s with it and 44.7 s without.
+
+**Checks** (`make test`): a fading store reads as the table multiplied by hand, its fade folded exactly; a reservoir of
+16 cues of 200 keeps each quarter of the days about equally often (163, 157, 161, 159 of 160, over 40 consolidators);
+a transient agent with a reservoir, saved with a fade pending, restores into an agent of another seed and lives its next
+100 moments, a night among them, exactly as the saved one.
+
 ## 6. Decisions and open questions
 
 **Decided**
@@ -1943,6 +2104,34 @@ with and without a consolidator refuse each other's checkpoints.
     from it (`Store.Reseed`) when the restoring agent's own differs, as the agent's generator state goes into any agent
     of its shape.
 
+**Taken in phase 9 (2026-10-10)** - open question 14, measured (2.15, 5.12):
+
+72. **What an agent's nights are for** (open question 14, answered by measurement): generalization where observations
+    recur only approximately - a new surroundings sharing old answers (B's first block 0.050 to 0.030), noisy cues (a
+    third less regret), new points of a smooth rule (a fifth less, living anywhere on the ring) - and retention for a
+    transient store. Not: an observation seen exactly, a partial cue, a store too small for its contexts, or
+    surroundings conflicting with old ones, where they cost (+0.019 at their start; +0.055 without the associative
+    memory). Sleep stays the caller's (decision 70), worth calling for a life whose observations come back only
+    approximately and whose new surroundings tend to share old answers.
+73. **The consolidator's store stays permanent; a transient one is an option** (`Settings.RecallHalfLife`, 0): with a
+    half-life of 500 moments nights recover most of what it forgets (back in A 0.145 to 0.088) but never beat a
+    permanent store without nights (0.069), whose pattern separation already protects it from interference. The fade is
+    kept pending as one number (`Store.Fade`), so it costs nothing per read or write, and folded at a checkpoint.
+74. **An agent's nights replay at most 1 024 cues** (`Settings.SleepCues`, a reservoir: a uniform sample of every moment
+    that learned, from the consolidator's generator): a night costs about 0.12 ms a cue, and every cue kept grows it
+    with the life without end. 128 of 450 cues measured within +-0.003 of every cue kept but for the partial cues
+    (+0.01), 32 a little worse; 1 024 binds in no task measured, so every result of 5.11 and 5.12 stands. The
+    consolidator alone keeps every cue by default (`SleepSettings.Cues` 0, decision 60), as `examples/sleep_retention`
+    measures it.
+75. **Nights are measured in pairs** (`perlife=1`): two agents of one seed live the same moments until the first night
+    makes a difference, so a night's effect is taken life by life; and **generalization on a ring whose answers no
+    linear read holds** (`examples/nights.olang`), tested with `Imagine` so the test changes nothing, on seen, new, noisy
+    and partial observations.
+76. **The associative memory stays in a consolidating agent** (gain 1): measured, it costs most where answers are not
+    linear in the observation (the ring: 0.126 against 0.037) or where conflicting surroundings share most of an
+    observation (back in A 0.069 against 0.021), and helps where one observation's answer changes (a reversal's first
+    block 0.179 against 0.223). Neither memory alone is best everywhere: open question 15.
+
 **Open questions**
 
 1. **Scope and order within settling networks.** Recommended: the circuit and the agent (phases 1-2) first; the
@@ -1990,7 +2179,9 @@ with and without a consolidator refuse each other's checkpoints.
 12. **The capacity of dawn's store.** A store that cannot hold every residual apart leaves its residue in the recall
     after a night (decision 56); the cues kept also grow without bound (decision 60). Recommended: measure on the first
     task that consolidates more than a few thousand steps - grow the store with its cues, or replay a sample. Default:
-    a fixed store, every cue kept.
+    a fixed store, every cue kept. *Narrowed in phase 9 (decision 74): a night can replay a sample of the cues (a reservoir),
+    and an agent's do, at most 1 024; and nights do not make up for a store too small for its contexts (5.12) - what
+    remains is how large a store a life needs.*
 13. **Spiking on the board's lanes.** The simulation counts events (about 290 a step a row on MNIST against 2 560
     multiply-adds of the rate engine's dense recurrent transport) but a lane design for them - which lane adds a spike's
     column, how a reciprocal block's rows are read - is not made, nor whether Lif currents need a wider format than
@@ -2000,7 +2191,27 @@ with and without a consolidator refuse each other's checkpoints.
     the old and bought nothing measurable with noisy observations. A task where generalization pays - new contexts drawn
     near old ones with the old ones' answers, or a store too small for every observation (open question 12) - is where
     they should. Recommended: measure on such a task before using nights in an agent. Default: a consolidator, if
-    any, sleeping as the caller chooses.
+    any, sleeping as the caller chooses. *Answered in phase 9 (decision 72, 5.12): nights pay where observations recur
+    only approximately - a new surroundings sharing old answers, noisy cues, new points of a smooth rule - and for a
+    store that forgets; they cost where new surroundings conflict; a permanent pattern-separating store needs them for
+    nothing else.*
+15. **Which memory drives the readout** (from 5.12). The associative memory's linear read and the consolidator's recall
+    both drive the readout at gain 1; the first is wrong wherever answers are not linear in the observation or
+    conflicting surroundings share most of it (a consolidating agent's regret coming back to A 0.069 with it, 0.021
+    without), the second slow where one observation's answer changes (a reversal's first block 0.179 with the memory,
+    0.223 without). Recommended: weigh each read by how well it has predicted lately - each memory's recent error at
+    the moments that learn, a per-memory associability (Pearce & Hall 1980, arousal's own principle) - and measure on
+    the ring, the return and the reversal together. Default: both at gain 1.
+16. **Partial cues** (from 5.12). With half of an observation's numbers missing neither the store nor the nights help
+    (regret 0.14-0.15 against 0.31 by chance, 0.035 when whole): a sparse code of a partial reading is another code,
+    and the slow part reads a smaller input. Pattern completion - the cue completed before it is keyed, by the
+    attractors of an auto-associative network (Hopfield 1984) or the nearest cue kept - is the mechanism the theory
+    gives the hippocampus for this. Recommended: when a task presents partial observations. Default: none.
+17. **Generalization as a bet** (from 5.12). The slow part's recall at an unfamiliar observation is right when new
+    surroundings share old answers and wrong when they conflict, and the agent cannot know which before it acts. A
+    familiarity signal - how many of the observation's code cells the days have written - could weigh the slow part's
+    recall down where the store knows nothing and arousal is about to learn anyway. Recommended: measure on a life that
+    meets both kinds of new surroundings. Default: the recall at full gain everywhere.
 
 
 ---
@@ -2058,6 +2269,7 @@ Memory, arousal, consolidation
 - Robins, A. (1995). Catastrophic forgetting, rehearsal and pseudorehearsal. *Connection Science* 7. Wilson, M. A.,
   McNaughton, B. L. (1994). Reactivation of hippocampal ensemble memories during sleep. *Science* 265. Hinton, G. E.,
   Plaut, D. C. (1987). Using fast weights to deblur old memories. *Proc. Cognitive Science Society*.
+- Vitter, J. S. (1985). Random sampling with a reservoir. *ACM Trans. Mathematical Software* 11.
 - Cho, K. et al. (2014). Learning phrase representations using RNN encoder-decoder for statistical machine translation.
   *EMNLP*. Bradbury, J. et al. (2017). Quasi-recurrent neural networks. *ICLR*. Werbos, P. J. (1990). Backpropagation
   through time: what it does and how to do it. *Proc. IEEE* 78.
