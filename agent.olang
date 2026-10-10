@@ -250,6 +250,10 @@ type Settings struct() {
     SleepPasses I64 = 60                # passes over the dreams a night
     SleepCells I64 = 0                  # its store's cells, and of them active in a code (0: the consolidator's defaults,
     SleepActive I64 = 0                 # 150 cells per number of its key and 0.5% of them active)
+    RecallHalfLife F64 = 0.0            # its store's half-life in moments: every moment it fades by 0.5^(1 / this), a
+                                        # transient store that only nights keep (docs/settling.md 5.12); 0: it never fades
+    SleepCues I64 = 0                   # the cues its nights replay, at most - a uniform sample of the moments that
+                                        # learned (docs/settling.md 5.12); 0: every one
 }
 
 # a life of observations observations and actions actions (in each of Config.Groups groups), with hidden regions of the
@@ -282,6 +286,7 @@ type Agent<T> struct(observations I64, actions I64, hidden Array<I64>&, seed U64
     recall mut Array<T>& = Array<T>(actions * Config.Groups)     # the consolidator's recall of this moment
     dayY mut Array<T>& = Array<T>(actions * Config.Groups)       # a moment's outcome as its day sees it
     dayKnown mut Array<Bool>& = Array<Bool>(actions * Config.Groups)
+    fading F64 = math.Pow(0.5, 1.0 / Config.RecallHalfLife) if Config.RecallHalfLife > 0.0 else 1.0
     Elig mut circuit.Eligibility<T>& = circuit.Eligibility<T>(Net)
     Opt mut optim.FlatAdamW<T>& = optim.FlatAdamW<T>(Net.ParamCount, Config.Rate)
     Mem mut Memory<T>& = Memory<T>(observations, actions * Groups, Config.MemoryDecay, Config.MemoryRate, Config.MemoryGain)
@@ -351,6 +356,7 @@ fn sleeperFor(like Array<<T>>&, observations I64, outputs I64, s Settings, seed 
     q.StateInKey = false
     q.Cells = s.SleepCells
     q.Active = s.SleepActive
+    q.Cues = s.SleepCues
     k mut consolidator.Consolidator<T>&return = consolidator.Consolidator<T>(observations, outputs, s.SleepHidden, 1, 16,
         seed ^ U64(0x5EEB5EEB), q)
     return k
@@ -569,6 +575,7 @@ fn (a mut Agent<<T>>&) act(obs Array<T>&, aroused Bool) I64 {
     for i in range a.Width { a.lastPhi[i] = a.phi[i] }
     a.LastAction = action
     a.Mem.Fade()
+    if a.Sleeper != null and a.fading < 1.0 { a.Sleeper.Fade(a.fading) }
     a.Moments++
     return action
 }
@@ -702,6 +709,7 @@ fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
     g.add("\"scalars\"", a.scalars())
     if a.Sleeper != null {
         k := a.Sleeper
+        k.Fast.Fold()                                   # the store's pending fade into its table: the values it holds
         g.add("\"sleep.slow\"", k.Slow.Params().Data)
         g.add("\"sleep.table\"", k.Fast.Table, k.Fast.N)
         g.add("\"sleep.mean\"", k.Fast.Mean)
@@ -712,11 +720,12 @@ fn (a mut Agent<<T>>&) Save(path String&) ? os.OsError {
 }
 
 # the consolidator's scalars a checkpoint keeps: its days, nights and store writes, its generator's state as eight
-# 32-bit halves, and the seed of its store's projection (the projection is made again from it, not kept)
+# 32-bit halves, the seed of its store's projection (the projection is made again from it, not kept), and the sequences
+# its days saw (of which the cues kept are a sample)
 fn sleepScalars(k consolidator.Consolidator<<T>>&) Array<F64>& {
     st := k.Generator()
     out mut Array<F64>&return = F64[F64(k.Days), F64(k.Nights), F64(k.Fast.Writes), high(st[0]), low(st[0]), high(st[1]),
-        low(st[1]), high(st[2]), low(st[2]), high(st[3]), low(st[3]), high(k.Fast.Seed), low(k.Fast.Seed)]
+        low(st[1]), high(st[2]), low(st[2]), high(st[3]), low(st[3]), high(k.Fast.Seed), low(k.Fast.Seed), F64(k.Seen)]
     return out
 }
 
@@ -824,9 +833,15 @@ fn restoreSleeper(k mut consolidator.Consolidator<<T>>&, doc json.Json&, text St
     try fetch(doc, text, base, "sleep.cues", cues)
     held := Array<T>(values)
     put(cues, held)
-    k.Keep(held, values / per)
-    v := Array<F64>(13)
-    try fetch(doc, text, base, "sleep.scalars", v)
+    # the scalars: 13 before cues were sampled (every cue kept: the sequences seen are the cues), 14 since
+    v := Array<F64>(14)
+    if (try sizeOf(doc, "sleep.scalars")) == 13 {
+        try fetch(doc, text, base, "sleep.scalars", v[:13])
+        v[13] = F64(values / per)
+    } else {
+        try fetch(doc, text, base, "sleep.scalars", v)
+    }
+    k.Keep(held, values / per, I64(v[13]))
     seed := word(v[11], v[12])
     if seed != k.Fast.Seed { k.Fast.Reseed(seed) }
     k.Days = I64(v[0])
@@ -1134,6 +1149,42 @@ test "a consolidating agent: its days write only the actions taken, a night keep
     refused = false
     try b.Restore(path) catch CheckpointError.MISMATCH { refused = true } catch { fail }
     assert refused
+    try os.Remove(path) catch { }
+}
+
+test "a transient store and a reservoir of cues: a checkpoint still restores a consolidating life exactly" {
+    s := Settings()
+    s.Consolidate = true
+    s.SleepHidden = 4
+    s.Critical = 60
+    s.Threshold = 3.0
+    s.RecallHalfLife = 40.0                         # the store fades, its pending fade folded at the save
+    s.SleepCues = 12                                # and the nights replay a sample of 12 of the moments that learned
+    a := little(s, 17)
+    obs := Array<F64>(4)
+    scene(0, obs)
+    try a.Begin(obs) catch { fail }
+    acts := Array<I64>(200)
+    livedFrom(a, 1, 150, acts)
+    assert a.Sleeper.Cues() == 12 and a.Sleeper.Seen > 12
+    a.Sleep()
+    livedFrom(a, 151, 25, acts)                     # the store fading since dawn: a fade pending at the save
+    path := "build/agent_transient_checkpoint_test.safetensors"
+    try a.Save(path) catch { fail }
+    assert a.Sleeper.Fast.Pending == 1.0
+    late := Array<I64>(100)
+    livedFrom(a, 176, 50, late)
+    a.Sleep()
+    livedFrom(a, 226, 50, late[50:])
+    b := little(s, 29)
+    try b.Restore(path) catch { fail }
+    again := Array<I64>(100)
+    livedFrom(b, 176, 50, again)
+    b.Sleep()
+    livedFrom(b, 226, 50, again[50:])
+    for i in range 100 { assert late[i] == again[i] }
+    assert a.Sleeper.Seen == b.Sleeper.Seen and a.Sleeper.Cues() == b.Sleeper.Cues()
+    for i in range a.Sleeper.Fast.Table.Len() { assert a.Sleeper.Fast.Table[i] == b.Sleeper.Fast.Table[i] }
     try os.Remove(path) catch { }
 }
 

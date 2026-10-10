@@ -724,6 +724,7 @@ examples/charlm_sample.olang  sampling from its checkpoint, with and without the
 examples/bpelm.olang    the same transformer on 512 BPE tokens, per character against the character model
 examples/xor_settle.olang, xor_spiking.olang, mnist_settle.olang, bandit_settle.olang  settling networks end to end
 examples/mnist_board.olang  MNIST taught and answered through the board engine, against F32
+examples/sleep_retention.olang, nights.olang  sleep: retention against interference, and what an agent's nights are for
 examples/mnist_int8.olang   the perceptron or the CNN trained, quantized to INT8, and measured against F32
 examples/charlm_int8.olang  the character transformer's checkpoint with its linear layers in INT8, against F32
 bench/data.olang        the data pipeline, checked and timed

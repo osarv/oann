@@ -14,7 +14,10 @@
 # following each write with weight MeanRate = 0.01 (about the last 100 writes). R's row i is drawn from a generator
 # of its own, seeded by the store's seed and i, so any row can be made again from the seed alone - on an FPGA, R need
 # not be stored (docs/settling.md 4.1). A read changes nothing; a write moves the mean first, then reads and writes at
-# the code of the moved mean. Nothing is allocated after the store is made.
+# the code of the moved mean. Fade(f) makes the store transient: every value it holds is multiplied by f (a
+# hippocampus whose traces decay unless consolidated, McClelland, McNaughton and O'Reilly 1995) - kept pending as one
+# number, Pending, folded into the table only when it falls below 1/2, so a fade costs nothing per read or write.
+# Nothing is allocated after the store is made.
 
 import "std/linalg"
 import "std/math"
@@ -35,6 +38,7 @@ type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I6
     Table mut Array<T>& = Array<T>(N * outputs)                # N x Outputs
     Mean mut Array<T>& = Array<T>(inputs)
     Writes I64 = 0
+    Pending F64 = 1.0                                           # the table holds Pending Table: fades not yet folded
     centered mut Array<T>& = Array<T>(inputs)
     z mut Array<T>& = Array<T>(N)
     work mut Array<T>& = Array<T>(N)
@@ -87,6 +91,36 @@ fn (s mut Store<<T>>&) code(x Array<T>&) I64 {
 fn (s mut Store<<T>>&) Read(x Array<T>&, out mut Array<T>&) {
     s.code(x)
     sparse.GatherRowsWeighted(out, s.Table, s.Idx, s.Code, s.K)
+    s.pend(out)
+}
+
+# out times the pending fade, when there is one
+fn (s Store<<T>>&) pend(out mut Array<T>&) {
+    if s.Pending == 1.0 { return }
+    like T
+    p := linalg.Cast(s.Pending, like)
+    for t in range out.Len() { out[t] = p * out[t] }
+}
+
+# the table's rate for a write of rate: rate over the pending fade, so the values held move by rate times the error
+fn (s Store<<T>>&) scaled(rate F64) T {
+    like T
+    return linalg.Cast(rate if s.Pending == 1.0 else rate / s.Pending, like)
+}
+
+# every value the store holds multiplied by factor (in (0, 1]): kept pending, folded into the table when below 1/2
+fn (s mut Store<<T>>&) Fade(factor F64) {
+    s.Pending = s.Pending * factor
+    if s.Pending < 0.5 { s.Fold() }
+}
+
+# the pending fade folded into the table (Pending 1 again) - what a checkpoint keeps
+fn (s mut Store<<T>>&) Fold() {
+    if s.Pending == 1.0 { return }
+    like T
+    p := linalg.Cast(s.Pending, like)
+    for i in range s.Table.Len() { s.Table[i] = p * s.Table[i] }
+    s.Pending = 1.0
 }
 
 # one write of target for reading x: the running mean moves toward x, then the table's active rows by the delta rule
@@ -101,13 +135,14 @@ fn (s mut Store<<T>>&) Write(x Array<T>&, target Array<T>&, known Array<Bool>& =
     }
     active := s.code(x)
     sparse.GatherRowsWeighted(s.y, s.Table, s.Idx, s.Code, s.K)
+    s.pend(s.y)
     for t in range s.Outputs { s.err[t] = target[t] - s.y[t] }
     if known != null {
         for t in range s.Outputs {
             if not known[t] { s.err[t] = like }
         }
     }
-    sparse.ScatterRank1(s.Table, s.Idx, s.Code, s.K, s.err, linalg.Cast(s.Rate, like))
+    sparse.ScatterRank1(s.Table, s.Idx, s.Code, s.K, s.err, s.scaled(s.Rate))
     s.Writes++
     return active
 }
@@ -126,15 +161,16 @@ fn (s mut Store<<T>>&) Encode(x Array<T>&, idx mut Array<I32>&, code mut Array<T
 # Read at a code Encode gave: code T at its cells, into out
 fn (s mut Store<<T>>&) ReadCode(idx Array<I32>&, code Array<T>&, out mut Array<T>&) {
     sparse.GatherRowsWeighted(out, s.Table, idx, code, s.K)
+    s.pend(out)
 }
 
 # Write at a code Encode gave: the delta rule toward target at its cells, at rate (Rate when rate is 0) - the mean does
 # not move (the code is already made)
 fn (s mut Store<<T>>&) WriteCode(idx Array<I32>&, code Array<T>&, target Array<T>&, rate F64 = 0.0) {
-    like T
     sparse.GatherRowsWeighted(s.y, s.Table, idx, code, s.K)
+    s.pend(s.y)
     for t in range s.Outputs { s.err[t] = target[t] - s.y[t] }
-    sparse.ScatterRank1(s.Table, idx, code, s.K, s.err, linalg.Cast(rate if rate != 0.0 else s.Rate, like))
+    sparse.ScatterRank1(s.Table, idx, code, s.K, s.err, s.scaled(rate if rate != 0.0 else s.Rate))
     s.Writes++
 }
 
@@ -148,6 +184,7 @@ fn (s mut Store<<T>>&) Reseed(seed U64) {
 fn (s mut Store<<T>>&) Clear() {
     zero T
     for i in range s.Table.Len() { s.Table[i] = zero }
+    s.Pending = 1.0
 }
 
 # ---- tests (docs/settling.md 5.3.2), in F64 ----
@@ -321,4 +358,37 @@ test "capacity: one exposure each, readings stored one after another and read ba
         }
         println("inputs " $n " (" $(s.N) " cells, " $(s.K) " active)" $line.ToString() " (targets uniform in [-1, 1): rms 0.577 knows nothing)")
     }
+}
+
+test "a fading store: every value it holds shrinks by the factor, a write still stores its target, the fade folds exactly" {
+    a := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
+    b := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
+    r := rand.Rand(8)
+    xs := Array<F64>(20 * 8)
+    for i in range xs.Len() { xs[i] = r.Uniform(-1.0, 1.0) }
+    target := Array<F64>(2)
+    out := Array<F64>(2)
+    want := Array<F64>(2)
+    for k in range 20 {
+        target[0] = r.Uniform(-1.0, 1.0)
+        target[1] = r.Uniform(-1.0, 1.0)
+        a.Write(xs[8 * k:8 * k + 8], target)
+        b.Write(xs[8 * k:8 * k + 8], target)
+        # a fades by 0.9 after each write; b's table is multiplied by hand
+        a.Fade(0.9)
+        for i in range b.Table.Len() { b.Table[i] = 0.9 * b.Table[i] }
+        for q in range k + 1 {
+            a.Read(xs[8 * q:8 * q + 8], out)
+            b.Read(xs[8 * q:8 * q + 8], want)
+            for t in range 2 { assert math.Abs(out[t] - want[t]) < 1e-12 }
+        }
+    }
+    assert a.Pending < 1.0 and a.Pending >= 0.5              # folded at least once, a fade still pending
+    a.Fold()
+    assert a.Pending == 1.0
+    for i in range a.Table.Len() { assert math.Abs(a.Table[i] - b.Table[i]) < 1e-12 }
+    # a store that never fades is bit for bit as before: Pending stays 1
+    c := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
+    c.Fade(1.0)
+    assert c.Pending == 1.0
 }

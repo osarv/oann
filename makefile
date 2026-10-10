@@ -8,7 +8,7 @@ TESTS = kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang da
 	datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep int8 int8lm int8bench clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench clean
 
 test:
 	$(OLANG) -t $(TESTS)
@@ -88,6 +88,15 @@ sparse:
 sleep:
 	$(OLANG) -b examples/sleep_retention.olang
 	./build/examples_sleep_retention $(ARGS)
+
+# what an agent's nights are for (examples/nights.olang, docs/settling.md 5.12): settling agents on a ring of observations
+# whose answers follow a smooth rule no linear read holds, trained on a few points, tested on seen, new, noisy and partial
+# observations and then living anywhere on the ring - ARGS: lives, train, after, points, hidden, block, then the agent's
+# settings as name=value (sleep=1, night=, memorygain=, recallhalflife=, cues=, perlife=1, ...). The transfer and
+# return tasks of examples/bandit_settle.olang measure the rest of 5.12
+nights:
+	$(OLANG) -b examples/nights.olang
+	./build/examples_nights $(ARGS)
 
 # the perceptron (or the CNN) trained in F32, quantized to INT8 (quant.olang) and measured both ways: test accuracy,
 # the parameters' size, throughput at batch 1, 64 and 128, where the INT8 model's time goes - ARGS: mlp or cnn, epochs,

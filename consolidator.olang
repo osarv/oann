@@ -67,6 +67,8 @@ type SleepSettings struct() {
                                         # for days observing only some outputs, whose others would read its noise
     StateInKey Bool = true              # the store's key holds the slow part's state, rho h, beside alpha u (1.9); off,
                                         # alpha u alone: a key no night moves (an agent's, docs/settling.md 2.14)
+    Cues I64 = 0                        # the cues a night replays, at most: a uniform sample of every sequence seen by
+                                        # day, kept by reservoir sampling (Vitter's algorithm R); 0: every one (decision 60)
 }
 
 type Consolidator<T> struct(inputs I64, outputs I64, hidden I64, window I64, batch I64, seed U64,
@@ -100,6 +102,7 @@ type Consolidator<T> struct(inputs I64, outputs I64, hidden I64, window I64, bat
     read mut Array<T>& = Array<T>(outputs)
     target mut Array<T>& = Array<T>(outputs)
     Days I64 = 0
+    Seen I64 = 0                        # sequences seen by day: the cues kept are a uniform sample of them
     Nights I64 = 0
     Steps I64 = 0                       # day steps taken by the line search
     Declined I64 = 0                    # day steps it gave up
@@ -171,10 +174,36 @@ fn (k mut Consolidator<<T>>&) SetGenerator(s Array<U64, 4>&) {
     k.rng.SetState(s)
 }
 
-# the cues kept replaced by count sequences of u (Window steps of Inputs each) - a checkpoint's, restored
-fn (k mut Consolidator<<T>>&) Keep(u Array<T>&, count I64) {
+# the cues kept replaced by count sequences of u (Window steps of Inputs each), out of seen sequences seen by day (count
+# when 0) - a checkpoint's, restored
+fn (k mut Consolidator<<T>>&) Keep(u Array<T>&, count I64, seen I64 = 0) {
     k.cues.Clear()
     for i in range count * k.Window * k.Inputs { k.cues.Push(u[i]) }
+    k.Seen = seen if seen > 0 else count
+}
+
+# sequence s of u, seen by day, kept as a cue: always, when every cue is kept or fewer than Cues are; otherwise in place
+# of a kept one with probability Cues / (sequences seen) - so the cues kept are a uniform sample of every sequence seen
+# (reservoir sampling), drawn from the consolidator's generator
+fn (k mut Consolidator<<T>>&) keepCue(u Array<T>&, s I64) {
+    per I64 = k.Window * k.Inputs
+    most := k.Config.Cues
+    if most <= 0 or k.Cues() < most {
+        for i in range per { k.cues.Push(u[s * per + i]) }
+    } else {
+        j := k.rng.Below(k.Seen + 1)
+        if j < most {
+            for i in range per { k.cues[j * per + i] = u[s * per + i] }
+        }
+    }
+    k.Seen++
+}
+
+# every value the store holds multiplied by factor - a transient store, whose traces decay unless a night consolidates
+# them into the slow part (docs/settling.md 5.12): dusk dreams them as they have faded, and dawn writes back at full
+# strength only what the slow part did not absorb
+fn (k mut Consolidator<<T>>&) Fade(factor F64) {
+    k.Fast.Fade(factor)
 }
 
 # the sequences seen by day and kept for the nights
@@ -282,7 +311,7 @@ fn (k mut Consolidator<<T>>&) Day(u Array<T>&, y Array<T>&, n I64, known Array<B
             }
         }
     }
-    for i in range n * k.Window * k.Inputs { k.cues.Push(u[i]) }
+    for q in range n { k.keepCue(u, q) }
     k.Days++
 }
 
@@ -618,4 +647,30 @@ test "nights: the slow part alone generalizes better night after night, beyond w
     byStore := agreement(out, hy)
     println("new sequences, " $line.ToString() "; a store alone after the same days " $(100.0 * byStore).Fixed(1) "%")
     assert last > first and last >= 0.95 and last > byStore
+}
+
+test "a reservoir of cues: at most Cues kept, a uniform sample of every sequence the days saw" {
+    s := SleepSettings()
+    s.Cues = 16
+    hits := Array<I64>(4)                             # how often each quarter of the days' sequences is kept
+    for seed in range 1, 41 {
+        k := Consolidator<F64>(2, 1, 4, 1, 4, U64(seed), s)
+        u := Array<F64>(2)
+        y := F64[0.0]
+        for i in range 200 {
+            u[0] = F64(i)                               # each sequence's first number names it
+            u[1] = 1.0
+            k.Day(u, y, 1)
+        }
+        assert k.Cues() == 16 and k.Seen == 200 and k.Days == 200
+        cues := k.CueInputs()
+        for c in range 16 { hits[I64(cues[2 * c]) / 50] += 1 }
+    }
+    println("a reservoir of 16 cues of 200, over 40 consolidators: kept from each quarter of the days " $(hits[0]) ", "
+        $(hits[1]) ", " $(hits[2]) ", " $(hits[3]) " (160 each if uniform)")
+    for q in range 4 { assert hits[q] > 110 and hits[q] < 210 }
+    # every cue kept when Cues is 0, as before
+    k := Consolidator<F64>(2, 1, 4, 1, 4, 1)
+    for i in range 50 { k.Day(F64[F64(i), 1.0], F64[0.0], 1) }
+    assert k.Cues() == 50 and k.Seen == 50
 }

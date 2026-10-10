@@ -15,10 +15,13 @@
 # (docs/settling.md 2.14, 5.11): the life in thirds, surroundings A, then B, then A again; each observation is the
 # context's 16 numbers and the surroundings' code (8 random signs over sqrt(8), drawn once a life), and B's arms are
 # A's with each context's best and worst swapped - the same contexts, conflicting answers, told apart by the code.
+# transfer - generalization across surroundings (docs/settling.md 5.12): the life in halves, A then B, B's arms A's -
+# the same contexts and the same answers under a new code, observations half like the ones seen.
 # Further arguments, all optional: moments (2000), seeds (20), contexts (4), hidden neurons (64), block (100); then any
 # of the agent's settings as name=value (threshold, critical, rate, memoryrate, fast, slow, beta, criticrate,
 # tracegain, memorygain, temperature, calmsamples - 1 to sample in calm moments too - entropygain; sleep - 1 for a
-# consolidator, recallgain, recallrate, sleephidden, passes, sleepcells, sleepactive), night - the moments between
+# consolidator, recallgain, recallrate, recallhalflife - its store's half-life in moments, cues - the most a night
+# replays, sleephidden, passes, sleepcells, sleepactive), night - the moments between
 # the nights of an agent with a consolidator (500; 0: none) - and noise - each moment's observation drawn around its
 # context's numbers with this standard deviation per number (0).
 
@@ -41,6 +44,9 @@ Night mut I64 = 500
 
 # the observations' noise (noise=): each number of a context's observation gets this times N(0, 1), drawn each moment
 NoiseLevel mut F64 = 0.0
+
+# each life's block regrets printed as a line of its own (perlife=1), for paired comparisons of two runs of the same lives
+PerLife mut Bool = false
 
 # the numbers of a surroundings' code in the return task's observations
 codeSize I64 = 8
@@ -149,8 +155,11 @@ fn settings(args Array<String&>&) agent.Settings ? json.JsonError {
         if name == "passes" { s.SleepPasses = I64(v) }
         if name == "sleepcells" { s.SleepCells = I64(v) }
         if name == "sleepactive" { s.SleepActive = I64(v) }
+        if name == "recallhalflife" { s.RecallHalfLife = v }
+        if name == "cues" { s.SleepCues = I64(v) }
         if name == "night" { Night = I64(v) }
         if name == "noise" { NoiseLevel = v }
+        if name == "perlife" { PerLife = v != 0.0 }
     }
     return s
 }
@@ -158,9 +167,9 @@ fn settings(args Array<String&>&) agent.Settings ? json.JsonError {
 # a life of moments moments in a world of seed, reversed halfway when reversal; in the return task the surroundings
 # change to B for its second third and back to A for its last. An agent with a consolidator sleeps every Night moments
 fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Bool, s agent.Settings, watch Bool = false,
-        back Bool = false) Life {
+        back Bool = false, transfer Bool = false) Life {
     life mut Life&return = Life(moments / block)
-    codes I64 = codeSize if back else 0
+    codes I64 = codeSize if back or transfer else 0
     w := Bandit(contexts, 16, 4, seed, codes)
     w.Noise = NoiseLevel
     a := agent.Agent<F32>(16 + codes, 4, I64[hidden], seed + 7919, s)
@@ -178,6 +187,7 @@ fn live(seed U64, moments I64, block I64, contexts I64, hidden I64, reversal Boo
             w.Place = 1 - w.Place
             # the observation the agent is acting on was A's; it sees B's from the next moment on
         }
+        if transfer and t == moments / 2 { w.Place = 1 }     # B: a new code, the same answers
         if s.Consolidate and Night > 0 and t > 0 and t % Night == 0 { a.Sleep() }
         best, top := w.Best(c)
         life.Regret[t / block] += (top - w.Pay[c * w.Arms + action]) / F64(block)
@@ -250,7 +260,15 @@ fn main() ? io.IoError + json.JsonError {
         sweeps := Array<F64>(seeds)
         refused I64 = 0
         for k in range seeds {
-            life := live(U64(k + 1), moments, block, contexts, hidden, task == "reversal", s, false, task == "return")
+            life := live(U64(k + 1), moments, block, contexts, hidden, task == "reversal", s, false, task == "return",
+                task == "transfer")
+            if PerLife {
+                line := StringBuilder()
+                line.Push("life " $(k + 1))
+                for b in range blocks { line.Push(" " $(life.Regret[b])) }
+                line.Push("\n")
+                try io.Print(line.ToString())
+            }
             for b in range blocks {
                 regret[b * seeds + k] = life.Regret[b]
                 calm[b * seeds + k] = life.Calm[b]
