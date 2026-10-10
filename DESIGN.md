@@ -33,7 +33,8 @@ one std/linalg `GemmBatch` over the heads, causal ones confined to their triangl
 images (`GemmPatches`: its forward 1.2x faster in the CNN, the same results bit for bit); `GemmAct` measured and not
 adopted. **Phase 7** (section 20, olang db2af5d): mixed precision as fast as F32 (a transformer step 115 ms in BF16
 against 119 in F32, 215 before), attention's softmax by std/linalg's `FastExp` (its forward 1.3-1.9x faster), and an
-agent may live its days into a consolidator (docs/settling.md 2.14).
+agent may live its days into a consolidator (docs/settling.md 2.14). **olang 999ae6c** (section 21): a copy of what
+is reached read-only is read-only, and std/linalg's destination forms take `mut` - 38 `mut`s added, nothing else.
 
 ## 1. The operand: Matrix
 
@@ -655,9 +656,8 @@ the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted 
    stands for it, and with its sum a pass of its own it vectorizes: attention's forward 1.3-1.9x faster (section 20).
    (`math.Exp`, a library call per element, had been about half of attention's forward once the products were
    batched; `FastExp` beside a running sum had been no faster, section 18.)
-2. **`ActivationSlope`, and the matrix `ActivationBackward` on it, for F32 and narrower types**: they do not compile
-   (repro/condliteral - a compiler issue: the slope is a match whose ReLU value is a conditional of literals, taken for
-   an F64 beside the F32 ones), so only F64 can use them; oann's own backward kernels serve meanwhile.
+2. ~~`ActivationSlope`, and the matrix `ActivationBackward` on it, for F32 and narrower types~~ - they compile since
+   olang 999ae6c (repro/condliteral, fixed and deleted, section 21); oann's own backward kernels still serve.
 3. **A convolution's weight gradient from the images.** The backward still makes the patches for `dW = dY^T cols`
    (im2col: 3.7-4.4 ms of each of the CNN's convolutions a step); `GemmPatches` takes the patches as the left operand
    only, and std/linalg measured a right-operand form slower than im2col and a product. And a path for thin depths:
@@ -1496,3 +1496,23 @@ cells. A consolidator costs 0.27 ms a moment, 0.67 with a night every 500 moment
   add 2.2-3.0 ns an element against 0.3 with the array in a local (F32 0.6 either way).
 - Fixed in db2af5d and deleted: `genericctor`, `operatornames`, `spawncall`, `bf16narrow`, `capturedvalue`.
 - Still open: `condliteral` (being fixed in olang). Kept as records: `fieldname`, `joinparen`, `nestedtry`, `tryindex`.
+
+## 21. olang 999ae6c: read-only copies
+
+olang 999ae6c makes a copy of a value holding `mut` references, taken from a place reached read-only, read-only itself
+(its decision QC), and std/linalg's destination forms (`Gemm`'s `c`, `Set`, `Fill`, `Map`, `Activate`'s `y`, ...) take
+`mut` so that a signature shows what a call writes. olang's `tools/perm_mut.py` migrated oann (2026-10-10): 38 `mut`s
+added, nothing else - the destination matrices of ops' products, gradients, norms and attention (`MatMul`'s `y`,
+`LinearBackward`'s `dx`, `dw`, `db`, ...), `nn.initialize`'s `p`, conv's gradients and its patch matrix, `ops.part`, and
+six locals built in a function's result scope and filled before being returned (`m mut Mlp&return = Mlp(act)`, ...).
+Nothing needed migrating by hand. Views are untouched: std/linalg's `Row`, `RowRange`, `Block` and `Reshape` keep
+read-only receivers and hand out writable views, so `ops.each1`/`each2`/`each3` - writing through `y.Row(r)` - and the
+norms' `y` need no `mut` (permission stays shallow through views, olang's recorded limit). `make test` passed on
+999ae6c unchanged, and every example and benchmark builds.
+
+### olang issues (repro/)
+
+- Fixed in 999ae6c and deleted: `condliteral` (`slope` prints `1 1 5`; std/linalg's `ActivationSlope` and
+  `ActivationBackward` compile for F32).
+- Still open: `narrowtbaa` (on 999ae6c BF16 through the struct 2.2-3.1 ns an element, local 0.29-0.41; F32 0.53-0.83
+  either way). Kept as records, reported as before: `fieldname`, `joinparen`, `nestedtry`, `tryindex`.

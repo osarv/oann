@@ -92,7 +92,7 @@ fn backward2(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<T>&, s linalg.Ma
 }
 
 # dx = dy, or dx += dy
-fn pass(dx linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<T>&, z <A>) {
+fn pass(dx mut linalg.Matrix<<T>>&, acc Bool, dy linalg.Matrix<T>&, z <A>) {
     if acc {
         like T
         each2(dx, dx, dy, fn(d, g) {
@@ -119,7 +119,7 @@ fn addRow(y linalg.Matrix<<T>>&, b linalg.Matrix<T>&, z <A>) {
 # has grown to the largest product.
 
 # y = op(a) op(b), op(m) being m or, where its flag is set, m's transpose
-fn MatMul(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg.Matrix<T>&, tb Bool, threads I64,
+fn MatMul(y mut linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg.Matrix<T>&, tb Bool, threads I64,
         ws mut linalg.GemmWorkspace<T>&) {
     ws.Gemm(y, a, ta, b, tb, 1, 0, threads)
 }
@@ -127,7 +127,7 @@ fn MatMul(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg.Matrix<T
 # the gradients of y = op(a) op(b): for y = a b, da = dy b^T and db = a^T dy, and the transposes follow - every case
 # one product, transposes as Gemm's parameters
 fn MatMulBackward(dy linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg.Matrix<T>&, tb Bool,
-        da linalg.Matrix<T>&, accA Bool, db linalg.Matrix<T>&, accB Bool, threads I64,
+        da mut linalg.Matrix<T>&, accA Bool, db mut linalg.Matrix<T>&, accB Bool, threads I64,
         ws mut linalg.GemmWorkspace<T>&) {
     if da.Rows > 0 {
         if not ta {
@@ -146,15 +146,15 @@ fn MatMulBackward(dy linalg.Matrix<<T>>&, a linalg.Matrix<T>&, ta Bool, b linalg
 }
 
 # y = x w^T + b: a dense layer, w being out x in (PyTorch's layout) and b one row of out
-fn Linear(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, threads I64,
+fn Linear(y mut linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, threads I64,
         ws mut linalg.GemmWorkspace<T>&, z <A>) {
     ws.Gemm(y, x, false, w, true, 1, 0, threads)
     addRow(y, b, z)
 }
 
 # the gradients of y = x w^T + b: dx = dy w, dw = dy^T x, db = the column sums of dy
-fn LinearBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, dx linalg.Matrix<T>&,
-        accX Bool, dw linalg.Matrix<T>&, accW Bool, db linalg.Matrix<T>&, accB Bool, threads I64,
+fn LinearBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, dx mut linalg.Matrix<T>&,
+        accX Bool, dw mut linalg.Matrix<T>&, accW Bool, db mut linalg.Matrix<T>&, accB Bool, threads I64,
         ws mut linalg.GemmWorkspace<T>&) {
     if dx.Rows > 0 { ws.Gemm(dx, dy, false, w, false, 1, beta(accX), threads) }
     if dw.Rows > 0 { ws.Gemm(dw, dy, true, x, false, 1, beta(accW), threads) }
@@ -164,12 +164,13 @@ fn LinearBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, w linalg.Matrix<T
 # ---- element-wise ----
 
 # y = x + b, b one row added to every row of x
-fn AddRow(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
+fn AddRow(y mut linalg.Matrix<<T>>&, x linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
     y.Copy(x)
     addRow(y, b, z)
 }
 
-fn AddRowBackward(dy linalg.Matrix<<T>>&, dx linalg.Matrix<T>&, accX Bool, db linalg.Matrix<T>&, accB Bool, z <A>) {
+fn AddRowBackward(dy linalg.Matrix<<T>>&, dx mut linalg.Matrix<T>&, accX Bool, db mut linalg.Matrix<T>&, accB Bool,
+        z <A>) {
     if dx.Rows > 0 { pass(dx, accX, dy, z) }
     if db.Rows > 0 { dy.ColumnSums(db, beta(accB)) }
 }
@@ -182,7 +183,8 @@ fn Add(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
     })
 }
 
-fn AddBackward(dy linalg.Matrix<<T>>&, da linalg.Matrix<T>&, accA Bool, db linalg.Matrix<T>&, accB Bool, z <A>) {
+fn AddBackward(dy linalg.Matrix<<T>>&, da mut linalg.Matrix<T>&, accA Bool, db mut linalg.Matrix<T>&, accB Bool,
+        z <A>) {
     if da.Rows > 0 { pass(da, accA, dy, z) }
     if db.Rows > 0 { pass(db, accB, dy, z) }
 }
@@ -195,7 +197,7 @@ fn Sub(y linalg.Matrix<<T>>&, a linalg.Matrix<T>&, b linalg.Matrix<T>&, z <A>) {
     })
 }
 
-fn SubBackward(dy linalg.Matrix<<T>>&, da linalg.Matrix<T>&, accA Bool, db linalg.Matrix<T>&, accB Bool, z <A>) {
+fn SubBackward(dy linalg.Matrix<<T>>&, da mut linalg.Matrix<T>&, accA Bool, db linalg.Matrix<T>&, accB Bool, z <A>) {
     if da.Rows > 0 { pass(da, accA, dy, z) }
     if db.Rows > 0 {
         if accB {
@@ -398,7 +400,7 @@ fn Embedding(y linalg.Matrix<<T>>&, tokens Array<I32>&, table linalg.Matrix<T>&)
 }
 
 # the table's gradient: dy's row r added into row tokens[r] - a scatter-add, rows for repeated tokens summing
-fn EmbeddingBackward(dy linalg.Matrix<<T>>&, tokens Array<I32>&, dtable linalg.Matrix<T>&, acc Bool, z <A>) {
+fn EmbeddingBackward(dy linalg.Matrix<<T>>&, tokens Array<I32>&, dtable mut linalg.Matrix<T>&, acc Bool, z <A>) {
     like T
     if not acc { dtable.Fill(like) }
     for r in range dy.Rows {
@@ -420,8 +422,8 @@ fn Positions(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, table linalg.Matrix<T>&
     }
 }
 
-fn PositionsBackward(dy linalg.Matrix<<T>>&, T I64, first I64, dx linalg.Matrix<T>&, accX Bool,
-        dtable linalg.Matrix<T>&, accT Bool, z <A>) {
+fn PositionsBackward(dy linalg.Matrix<<T>>&, T I64, first I64, dx mut linalg.Matrix<T>&, accX Bool,
+        dtable mut linalg.Matrix<T>&, accT Bool, z <A>) {
     if dx.Rows > 0 { pass(dx, accX, dy, z) }
     if dtable.Rows > 0 {
         like T
@@ -437,7 +439,7 @@ fn PositionsBackward(dy linalg.Matrix<<T>>&, T I64, first I64, dx linalg.Matrix<
 # row r of y = (x_r - mean_r) / sqrt(var_r + eps) * gain + bias, mean and variance over the row's columns (the biased
 # variance, as PyTorch's LayerNorm takes it); stats keeps each row's mean and 1 / sqrt(var + eps) for the backward
 fn LayerNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&, bias linalg.Matrix<T>&,
-        eps <A>, stats linalg.Matrix<T>&) {
+        eps <A>, stats mut linalg.Matrix<T>&) {
     like T
     n := linalg.Cast(x.Cols, eps)
     g := gain.Row(0)
@@ -458,8 +460,8 @@ fn LayerNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&,
 # with xhat = (x - mean) rstd and g = dy * gain: dx = rstd (g - mean(g) - xhat mean(g xhat)), row by row; dgain = the
 # column sums of dy * xhat, dbias those of dy
 fn LayerNormBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&,
-        stats linalg.Matrix<T>&, dx linalg.Matrix<T>&, accX Bool, dgain linalg.Matrix<T>&, accG Bool,
-        dbias linalg.Matrix<T>&, accB Bool, z <A>) {
+        stats linalg.Matrix<T>&, dx linalg.Matrix<T>&, accX Bool, dgain mut linalg.Matrix<T>&, accG Bool,
+        dbias mut linalg.Matrix<T>&, accB Bool, z <A>) {
     like T
     n := linalg.Cast(x.Cols, z)
     gn := gain.Row(0)
@@ -500,7 +502,7 @@ fn LayerNormBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Ma
 
 # row r of y = x_r / sqrt(mean(x_r^2) + eps) * gain - root-mean-square normalization (Zhang and Sennrich), no mean
 # taken out and no bias; stats keeps each row's 1 / sqrt(mean + eps)
-fn RmsNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&, eps <A>, stats linalg.Matrix<T>&) {
+fn RmsNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&, eps <A>, stats mut linalg.Matrix<T>&) {
     like T
     n := linalg.Cast(x.Cols, eps)
     g := gain.Row(0)
@@ -515,7 +517,7 @@ fn RmsNorm(y linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&, e
 
 # with xn = x rinv and g = dy * gain: dx = rinv (g - xn mean(g xn)); dgain = the column sums of dy * xn
 fn RmsNormBackward(dy linalg.Matrix<<T>>&, x linalg.Matrix<T>&, gain linalg.Matrix<T>&, stats linalg.Matrix<T>&,
-        dx linalg.Matrix<T>&, accX Bool, dgain linalg.Matrix<T>&, accG Bool, z <A>) {
+        dx linalg.Matrix<T>&, accX Bool, dgain mut linalg.Matrix<T>&, accG Bool, z <A>) {
     like T
     n := linalg.Cast(x.Cols, z)
     gn := gain.Row(0)
@@ -759,8 +761,8 @@ fn AttentionCached(y linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T
 # "threads" tasks, and so are dS's rows between them; dS is kept in scratch, at most AttentionScratch(n, heads, T)
 # elements
 fn AttentionBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matrix<T>&, v linalg.Matrix<T>&,
-        heads I64, T I64, causal Bool, probs linalg.Matrix<T>&, dq linalg.Matrix<T>&, accQ Bool,
-        dk linalg.Matrix<T>&, accK Bool, dv linalg.Matrix<T>&, accV Bool, scratch mut Array<T>&, threads I64,
+        heads I64, T I64, causal Bool, probs linalg.Matrix<T>&, dq mut linalg.Matrix<T>&, accQ Bool,
+        dk mut linalg.Matrix<T>&, accK Bool, dv mut linalg.Matrix<T>&, accV Bool, scratch mut Array<T>&, threads I64,
         ws mut linalg.GemmWorkspace<T>&, z <A>) {
     like T
     scale F64 = 1.0 / math.Sqrt(F64(q.Cols / heads))
@@ -781,7 +783,7 @@ fn AttentionBackward(dy linalg.Matrix<<T>>&, q linalg.Matrix<T>&, k linalg.Matri
 
 # m's block of rows r0 ... r0 + rows - 1 and columns c0 ... c0 + cols - 1, or m itself when it is empty (a gradient
 # not wanted)
-fn part(m linalg.Matrix<<T>>&, r0 I64, c0 I64, rows I64, cols I64) linalg.Matrix<T> {
+fn part(m mut linalg.Matrix<<T>>&, r0 I64, c0 I64, rows I64, cols I64) linalg.Matrix<T> {
     return m.Block(r0, c0, rows, cols) if m.Rows > 0 else m
 }
 
@@ -949,7 +951,7 @@ fn MseBackward(dloss <A>, a linalg.Matrix<<T>>&, b linalg.Matrix<T>&, da linalg.
 # ---- tests ----
 
 fn m64(rows I64, cols I64, values Array<F64>&) linalg.Matrix<F64> {
-    out linalg.Matrix<F64>&return = linalg.Matrix<F64>(rows, cols)
+    out mut linalg.Matrix<F64>&return = linalg.Matrix<F64>(rows, cols)
     for i in range values.Len() { out.Data[i] = values[i] }
     return out
 }
