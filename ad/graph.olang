@@ -476,7 +476,7 @@ fn (g mut Graph<T>&) Linear(x Var, w Var, b Var = None) Var {
     }
     if not g.vector("Linear's bias", b, wd[0], true): return x
     d := g.dense(x)
-    return g.add(Op.Linear(d, w, b), lastTo(xd, wd[0]), g.batched(x))
+    return g.add(Op.Linear(d, g.lastContiguous(w), b), lastTo(xd, wd[0]), g.batched(x))
 }
 
 # op(a) op(b), op(m) being m or its last two axes' transpose: rank 2 operands, or batched over the leading axes (one or
@@ -786,7 +786,7 @@ fn (g mut Graph<T>&) Permute(x Var, axes ...I64) Var {
         d[k] = nd.Dims[a]
         st[k] = nd.Strides[a]
     }
-    return g.view(Op.Permute(x), tensor.Shape.Of(...d[0:r]), tensor.Shape.Of(...st[0:r]), 0)
+    return g.view(Op.Permute(x), x, tensor.Shape.Of(...d[0:r]), tensor.Shape.Of(...st[0:r]), 0)
 }
 
 # indices lo ... hi - 1 of axis `axis` (not a batch's)
@@ -797,7 +797,7 @@ fn (g mut Graph<T>&) Slice(x Var, axis I64, lo I64, hi I64) Var {
         g.fail("Slice of " $nd.Dims ": axis " $axis " from " $lo " to " $hi)
         return x
     }
-    return g.view(Op.Slice(x, axis, lo), withAxis(nd.Dims, axis, hi - lo), nd.Strides, lo * nd.Strides[axis])
+    return g.view(Op.Slice(x, axis, lo), x, withAxis(nd.Dims, axis, hi - lo), nd.Strides, lo * nd.Strides[axis])
 }
 
 # x read as these dims after the batch axis (all of them where x is not batched): a size-1 axis, or a new leading one,
@@ -818,7 +818,7 @@ fn (g mut Graph<T>&) Expand(x Var, dims ...I64) Var {
         g.fail("Expand of " $nd.Dims " to " $s)
         return x
     }
-    return g.view(Op.Expand(x), s, tensor.Shape.Of(...st[0:s.Rank]), 0)
+    return g.view(Op.Expand(x), x, s, tensor.Shape.Of(...st[0:s.Rank]), 0)
 }
 
 # ---- what each node needs ----
@@ -1769,7 +1769,8 @@ fn (g mut Graph<T>&) combineBack<A>(dy tensor.Tensor<T>&, a Var, b Var, k A) {
     ops.CombineBackward<T, A>(dy, k, da, aa, db, ab)
 }
 
-# a view's backward: dy added into x's gradient through the view's strides (relative to x's own layout, dense)
+# a view's backward: dy added into x's gradient through the view's strides (relative to x's own layout, dense) - zeroed
+# first where this is the first contribution, since a slice or a broadcast reaches only part of it, or parts many times
 fn (g mut Graph<T>&) viewBack<A>(i I64, dy tensor.Tensor<T>&, x Var) {
     dx, ax := g.gradOf(x), g.acc(x)
     if not ops.Wanted(dx): return
@@ -1783,7 +1784,8 @@ fn (g mut Graph<T>&) viewBack<A>(i I64, dy tensor.Tensor<T>&, x Var) {
         case Op.Slice(_, axis, _): tensor.Tensor<T>.Strided(dx.Flat()!, off / xn.Strides[axis] * st[axis], dy.Dims, st)!
         case _: expanded(dx, nd, xn, dy.Dims, st)
     }
-    ops.AddInto<T, A>(dx.Flat()!, target, dy, ax)
+    if not ax: dx.Fill(T(0.0))
+    ops.AddInto<T, A>(dx.Flat()!, target, dy, true)
 }
 
 # x's gradient seen through a permutation: the view's axis k reads x's axis axes[k], found by matching strides
