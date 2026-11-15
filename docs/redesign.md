@@ -532,14 +532,16 @@ build departs from the sketch, and why:
    `LinearBytes(g)` counts. The old module's tile and its profile hooks are gone: the product is `GemmI8`, and `Model`'s
    per-layer profile is not carried over.
 4. **`GemmI8` takes the weights' row sums.** It subtracted `zero * rowSum(b, j)` by summing every weight row on each call -
-   a second read of all the weights, which at batch 1 was a third of the product - so it now reads none when the zero point
-   is 0 (an image's pixels, ReLU's outputs) and takes `sums` where the caller has them (`Weights.Sum`): one more optional
-   argument, a test holds the result bit for bit.
+   a second read of all the weights, which is the whole cost of a batch-1 product - so it now reads none when the zero point
+   is 0 (an image's pixels, ReLU's outputs) and takes `sums` where the caller has them: `Weights.Sum` in `nn/quant`, and
+   the graph's INT8 hook (`q8Weights.sum`). One more optional argument; a test holds the result bit for bit. Measured
+   (`bench/int8`, load 10): the 1 x 784 x 128 product from 21.5 us to 11.3 (dynamic quantization) and 16.0 to 8.5 (static).
 5. **A bug in the graph, found by the SSM at 64 tokens and over.** `selectiveKeep` counted the states a selective scan keeps
    as `B * (T + 63) / 64`, not `B * ((T + 63) / 64)`: a context of 64 or more and a batch of 16 put the scan's gradient
    accumulator past the end of what `Plan` laid out, and `Backward` wrote over its neighbours (a segmentation fault or "slice
    bounds out of range", different on every run; the tests' contexts of 6 to 40 never reached it). Fixed in `ad/graph`; a test in
-   `models/ssm` trains 16 sequences of 64, 100 and 130 tokens and fails without the fix.
+   `models/ssm` trains 16 sequences of 64, 100 and 130 tokens and fails without the fix. (The same fix would have been needed by
+   any model with a scan block at those sizes: the first 10-million-parameter run of M13 is what found it.)
 6. **Examples.** `bench/charlm_nn` is `examples/charlm` (the old example, on the old modules, is replaced), through
    `models/gpt`; `charlm_sample`, `charlm_int8`, `bpelm`, `mnist_mlp` (AdamW, the input projection, SGD; F32 and BF16),
    `mnist_cnn` and `mnist_int8` are on `models/`, `nn/` and `ad/`; `mnist_learn`, `xor_settle` and `xor_spiking` on `dyn`
@@ -585,6 +587,37 @@ characters F32 147 ms, INT8 141 ms (1.04x; round 2: 0.82x), 500 characters throu
 INT8 3330 (1.12x; round 2: 2.1x, F32 2800 a second) - an F32 decode about as fast as round 2's, an INT8 one slower, not looked into
 (a decoding step's linear layers are one row each; the cache, norms and head are F32). A product alone (`bench/int8`, 1 x 784 x 128, load 10): F32
 12.3 us, INT8 dynamic 11.3, static 8.5; at 1 x 1024 x 1024 INT8 is 2.9x (round 2: 4.2x); the 128-row products are 1.1-1.5x.
+
+**M13, the first yardstick run** (`examples/tinystories.olang`; TinyStories from the Hugging Face hub - the validation file and
+the first 300 MB of the training file, of which the first 60 MB are tokenized - by a byte-level BPE of 4096 tokens learned from
+8 MB of it, 3.95 bytes a token: 15.2 million training tokens, 1.26 million validation tokens). A GPT (5 layers of 384 in 6
+heads, rotary positions, RMS norms, SwiGLU, 10 432 128 parameters, arena 900 MB) and an SSM (9 Mamba blocks of 384, 16 states,
+expansion 2, 10 216 704 parameters, arena 1239 MB), batches of 16 sequences of 256 tokens, 360 steps = 1 474 560 tokens each (a
+tenth of an epoch of the 15 million), AdamW (beta2 0.95, decay 0.1) at 1e-3 warmed up over 18 steps and down a cosine to 1e-4,
+clip 1, seed 1, F32; the validation loss is nats a token on the same 8 batches of 16 x 256 of the held-out file, ln 4096 = 8.318:
+
+| tokens | 0 | 147k | 295k | 442k | 590k | 737k | 885k | 1032k | 1180k | 1327k | 1475k |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| GPT | 8.369 | 4.791 | 3.976 | 3.590 | 3.381 | 3.242 | 3.107 | 3.025 | 2.960 | 2.919 | **2.880** |
+| SSM (Mamba) | 8.512 | 4.189 | 3.752 | 3.462 | 3.267 | 3.120 | 2.977 | 2.903 | 2.845 | 2.806 | **2.760** |
+
+(A sample from the GPT after the run begins "Once upon a time there was a young boy named Timmy. One day he went across a whole
+day. The cat was very happy because he had made a useful lesson." - words and the shape of a story, not yet sense.)
+
+Speed, tokens a second of training (the validation passes are not counted):
+
+| | one thread, the whole run (load 7-15) | one thread, 6 steps (load 3) | four threads, 6 steps (load 2-3) |
+|---|---|---|---|
+| GPT | 199 | 221 | 532 |
+| SSM | 153 (two threads) | 130 | 291 |
+
+At 221 tokens a second the GPT does about 14 GFLOPS on one thread (6 N flops a token, the attention not counted); where a step
+goes by operation is not measured here (`bench/lm.olang` and the graph's `Profiling` do it).
+The SSM is slower a token than the GPT at 10 million
+(a scan's forward and backward over 768 channels of 16 states, nine times) and ahead in loss at every point of the run;
+the results are the same for every thread count to the last digit (the 6-step loss 6.7385 and 6.1795 are equal at one and
+four threads). The same recipe on tiny Shakespeare at 0.8-0.9 million parameters orders them the same way (the SSM's 1.57
+against the GPT's 1.80 nats a character).
 
 ### 1.6 Data: `data/*.olang`
 
