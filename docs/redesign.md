@@ -82,7 +82,7 @@ partitioning its output, so results are identical for every thread count. Code c
 type Mat<S> struct(Data mut Array<S>&, Off I64, Rows I64, Cols I64, Ld I64) { ... }
 
 # kernels/gemm.olang - Goto GEMM with per-target tiles (from linalg), mixed storage
-type Workspace<A> struct(threads I64) { ... }                # packing buffers; grows on first use, then never
+type Workspace<A> struct(threads I64) { ... }                # packing buffers; reserved at Plan, never grown (as built)
 fn Gemm<S, A>(ws mut Workspace<A>&, c mut Mat<S>&, a Mat<S>&, ta Bool, b Mat<S>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None)
 fn GemmBatch<S, A>(ws mut Workspace<A>&, c mut Batch<S>&, a Batch<S>&, ta Bool, b Batch<S>&, tb Bool, alpha A = 1, beta A = 0, tri Triangle = Triangle.Full)
 fn Gemv<S, A>(y mut Array<A>&, a Mat<S>&, trans Bool, x Array<A>&, alpha A = 1, beta A = 0)   # rows <= 4: no packing, no tasks
@@ -190,10 +190,10 @@ made, an input filled before what reads it is recorded; an eager graph's paramet
 apart, for M9). `DeltaRule` takes its heads from `beta`'s last axis; `Conv2d` and `MaxPool2d` take images `[n, H, W, C]`.
 An operation whose kernel needs rows gets a `Contiguous` copy of a view that is not, recorded for it. The scans run their
 sequential forms (the chunked ones agree to rounding only). Not built: `Ahead` (an input's next batch filled on a task
-during the step). A step allocates nothing (resident memory flat, tested); it is
-not pinned with `assert not ....Allocates`, as function facts read too coarsely today (repro/allocfacts.olang,
-repro/methodfacts.olang). A `Custom` operation's tensors, given to an `any`, are built where the graph lives at each call,
-so a step through one allocates.
+during the step). A step allocates nothing (resident memory flat, tested); it was
+not pinned with `assert not ....Allocates`, as function facts read too coarsely then (repro/allocfacts.olang,
+repro/methodfacts.olang, both fixed since). A `Custom` operation's tensors, given to an `any`, were built where the graph
+lives at each call. Since the kernel follow-ups (section 4.1, the end) both are pinned: see there.
 
 **As built (C4, 2026-11-15).** What `Plan` decides is plain data, `Layout` (per node a `Placed` of its six offsets, `needs`,
 `ParamCount`, `ActivationSize`, and the sizes of the arena, the I32 region and the accumulator): `g.Lay()` computes it with
@@ -360,7 +360,9 @@ are constant and the evaluator can decide the bound.
     gemm's `Gemm`, which grows its workspace's panels on its first products (a fact holds for every call; pinning it
     wants a workspace reserved at Plan and a product that never grows - a kernels change), a sparse product holds the
     kernel's join, a sweep in tasks holds a join, and a custom model is a call through `any Dynamics&`, which no fact
-    sees through. For those, resident memory is measured (M9).
+    sees through. For those, resident memory is measured (M9). (Since the kernel follow-ups, section 4.1's end, the
+    sweep and the settle are pinned too: the workspaces are reserved at `Ready`, the joins allocate nothing, and
+    `Dynamics`' methods promise `noalloc`.)
 
 Measured (tests in `dyn/system.olang`, `bench/settle.olang`): a certified system at kappa 0.9 whose bound is tight
 settles cold in exactly 64 sweeps at the lesson tolerance (1.25e-3), 66 at 1e-3 and 71 at the life tolerance
@@ -416,7 +418,8 @@ Where the build departs from the sketch and B2a's notes, and why:
    over E's fields unrolled, every built-in term). Not pinnable, as in B2a: every product (gemm's workspace grows on its
    first products), a sparse form's sampled product (the kernel's join), a lesson's settles, a custom rule (`any
    Update&`). Resident memory is flat over 300 moments of a lesson, Adam, a tick (three factors, homeostasis) and an
-   exact implicit gradient (test).
+   exact implicit gradient (test). (Since the kernel follow-ups, section 4.1's end, the products and an implicit
+   gradient are pinned; a lesson, through `any Update&`, still not.)
 7. **Fixed in B2a's files on the way**: every event-driven connection used collector 0 (`Link.Index` was never set) -
    two of them in one system shared one; a retired unit's residual compared its total with its zeroed state, so a
    system with one never converged (found by B4) - its total is now held at its potential.
@@ -557,7 +560,8 @@ field overrides a name.
    decaying or not (`optim.Spans(g)`: a graph's parameters, decaying where it says; none given: the whole region
    decays). `Save`/`Load` write and read the moments and the step count through io/checkpoint. `ClipNorm(grads, max)`,
    `WarmupCosine`, `WarmupLinear`. A step of either optimizer, in either precision, is pinned allocation-free while
-   compiling (`assert not f.Allocates`, S17a; the graph's `Forward`/`Backward` cannot be, repro/allocfacts.olang).
+   compiling (`assert not f.Allocates`, S17a; the graph's `Forward`/`Backward` could not be then, repro/allocfacts.olang -
+   since the kernel follow-ups, section 4.1's end, they are, and so is a whole training step).
 2. **The projection regularizer is a `Projector<T>`** of its own, not an option of the optimizer: it is graph-specific.
    Made on a graph before `Plan` (it keeps every dense layer's output and input to the step's end, since activation
    storage is reused), `Project(g)` after `Backward` and before the optimizer's `Step`. Not for a graph with masters.
@@ -685,7 +689,8 @@ product is `Gemv`: 7.4 us for a forward against round 2's 26), the INT8 side did
 old `quant.olang`'s forward ran 3.9 us against this one's 5.3 (load 14, one run each). At batch 64 and 128 INT8 is now ahead of
 F32 (round 2: 0.8-1.0x). The CNN is the loss: round 2's 1.13-1.29x is 0.92-1.02x here, because the F32 convolution no
 longer builds a patch matrix (kernels/conv's `GemmLeft`) while the INT8 one still copies its patches as bytes and packs them -
-an implicit-patch `GemmI8` is the open item. The transformer (`charlm_int8`, 10 batches of 16 x 64): a forward over 1024
+an implicit-patch `GemmI8` is the open item (built since: `GemmI8Left`, section 4.1's end - it saves the patch matrix
+and 1-9% of the INT8 forward, but the INT8 micro-kernel, not the patches, holds the CNN near parity). The transformer (`charlm_int8`, 10 batches of 16 x 64): a forward over 1024
 characters F32 147 ms, INT8 141 ms (1.04x; round 2: 0.82x), 500 characters through the key-value cache F32 2963 a second,
 INT8 3330 (1.12x; round 2: 2.1x, F32 2800 a second) - an F32 decode about as fast as round 2's, an INT8 one slower, not looked into
 (a decoding step's linear layers are one row each; the cache, norms and head are F32). A product alone (`bench/int8`, 1 x 784 x 128, load 10): F32
@@ -940,6 +945,73 @@ not flags. Sizes: S < 600 lines, M 600-1500, L 1500-3000.
 Order: A1-A6 together (at most two agents in a full test run at a time); B1 and B2a as soon as A1-A3 merge, B2b
 after B2a's first commit, B3 after B1, B4 after B2a; C1-C2 after B; C3 last; C4 whenever B1 is merged. Critical
 path: A2 -> B1 -> B3 -> C1 -> C3.
+
+**As built (kernel follow-ups, 2026-11-15).** `kernels/gemm`, `kernels/scan`, `kernels/attention`, `kernels/conv`,
+`kernels/sparse`, `ad/graph`, `ad/ops`, `nn/quant`, `nn/optim`, `dyn/settle`, `dyn/learn`, `dyn/neuron`; benches
+`bench/storage`, `bench/int8cnn`, `bench/int8decode`. olang master of 2026-11-15 (G42 counting running ways only).
+
+1. **Workspaces are reserved, never grown.** A product took its panels from its `Workspace`, growing them on its first
+   call, so every function with a product read `Allocates` true. Now `Workspace<A>(threads, dim, wide)` /
+   `Reserve(dim, wide)` give room for every product whose m, n and k are at most dim (`ReserveLayer(x, y, z, like)` for a
+   layer's three products, `ReserveI8(n, k)` for GemmI8, `attention.ReserveAttention`, `conv.ReserveConv`), and
+   `scan.Work` likewise (`ReserveGated`, `ReserveSelective`, `ReserveDelta`); a product with too little ends the program
+   naming the Reserve. `Graph.Plan` reserves from the nodes' shapes (`reserve`: the whole batch, every product of the
+   node's forward and backward; an eager graph per node as recorded), dyn's `Ready` from the populations, rows and ranks,
+   the learner when it is made, `nn/quant`'s model per layer.
+2. **Pinned while compiling** (`assert not ... .Allocates`): every gemm product (`Gemm` in F32, BF16 and with INT8
+   weights, `GemmBatch`, `Gemv`, `GemmI8`), `Attention`/`AttentionGrad`/`AttentionStep`, `Conv2d` and its backward, the
+   sequential scans and their backward; `Graph<F32>`, `Graph<BF16>` and `Graph<F64>`'s `Forward` and `Backward`; a whole
+   training step (`nn/optim`: forward, backward, `ClipNorm`, AdamW; in F32 and in BF16 with masters); a whole dyn settle
+   (`Engine.Settle`, `System.Settle` and `Nudged`, F32 and F64) and an implicit gradient (`Learner.ImplicitGrad`: EP,
+   exact, JFB). B1, B2a and B3's "not pinnable" items are all pinned but a lesson as a whole (a custom rule is an
+   `any Update&`). What it took besides the reservation: the custom operation's `Function` and dyn's `Dynamics` promise
+   `noalloc` on their methods (T21c; `dyn/bridge`'s `Backward` needed EP's loop over an array literal rewritten); a custom
+   node's tensors are laid out once (`customRoom`); `Tiles.MulAdd`'s and `GemmI8`'s defaults are constants, not fresh
+   empty arrays; `conv.Patches.Pack`'s three per-panel arrays are fixed (32); the chunked delta rule's forms are types
+   (`stepwise`, `chunkwise`), so the sequential one's instance holds none of the chunked one's per-task workspace. And two
+   over-counts of olang's facts, worked around by binding call results to locals: a call's value lent to a `&`
+   parameter or receiver reads as allocating (repro/tempfacts.olang - `rows(x)` straight into `Gemm`, `g.nodes[x]`
+   into `inUse`), and so does a local reassigned from a view of itself (repro/reassignfacts.olang - `ops.storageOf`).
+   Joins allocate nothing (a sparse product's and a sweep's tasks are no reason to leave a function unpinned).
+3. **A bug, found by the reservation**: the chunked delta rule's backward multiplied by the whole decay matrix `gm`
+   while `deltaLoad` wrote only its lower triangle - the upper one was whatever the scratch held, zero only in a freshly
+   grown buffer. With a reused `Work` (any training loop's second step) `DeltaRuleGradChunked` gave wrong gradients
+   (11.7 off against 17.1 in the test at chunk 7, four threads). `deltaLoad` now zeroes it. The graph runs the
+   sequential form, so no model trained here was affected.
+4. **A storage type per operand.** `Gemm<SC, SA, SB, A>`, `GemmLeft<L, SC, SB, A>`, `GemmBatch<SC, SA, SB, A>`: each
+   operand widened to A as it is packed or read. The unpacked paths depend on C's type alone (its sums stored once), so
+   a product of narrower operands takes the very path its widened operands would, and the result is theirs bit for bit
+   (tests: BF16, F16, F8E4M3 and INT8 weights under F32, every transpose, the unpacked, packed and exchanged paths, one
+   and four threads; a causal GemmBatch of BF16 keys). INT8 weights carry their scale in alpha.
+5. **`GemmI8Left`**, GemmI8 whose activations are packed by their own type (the packing source is a parameter of the
+   blocked path, not a type parameter of its operands: making the operands' struct generic slowed batch-1 GemmI8 3.5x,
+   1 x 784 x 128 from 4.2 to 15.9 us - not reduced to a repro). `nn/quant`'s convolution quantizes the images once and
+   reads its windows from them (`windows`: [ky][kx][c] runs, the zero point off the image) - no patch matrix (3.6 MB at
+   batch 128 for the CNN's second convolution). `conv.Patches` takes a padding value, so `Patches<U8>` with the zero
+   point is the same product (a test against the patch matrix made, bit for bit, zero points 0 and 128).
+6. **INT8 decoding** (`bench/int8decode`, the character GPT as drawn, 500 characters through the cache). Profile
+   (`olang profile`, INT8 only): the linear layers are 73% - a decoding step's one-row products (`dot4I8`, 23%) and the
+   32-row re-prefill every 32 characters once the cache is full (`microI8Wide`, 30%) - then GELU (18%, F32 in both).
+   Why 1.12x where round 2 had 2.1x: the F32 side's one-row product is `Gemv` now (3.5x round 2's), and INT8's one-row
+   dot products run at about its speed (`bench/int8`: 1 x 128 x 512 and 1 x 512 x 128 at 0.98-1.14x), so only the
+   quantization is left to differ - and that cost 9% in `F32.Min`/`Max` calls per element for the activations' range.
+   The range is now taken in 16 lanes of selects (`graph.rangeOf`). Faster one-row INT8 products need VNNI's pairs
+   (`vpdpwssd`) at batch 1: summing adjacent pairs into the lanes by hand made it 2.2x slower, so that is left open.
+7. **Not looked into**: a BF16 matrix-vector product is 0.21x F32's (`bench/storage` 1 x 784 x 128, 19.5 against 4.1
+   us; INT8 weights 0.84x) - a bit-shift widening (`F32.FromBits(bits << 16)`) made it slower still; and `bench/int8`'s
+   F32 products at 64 to 1024 rows run at 12-17 GFLOPS where `bench/storage`'s same products run at 73-150 (the old
+   binary too), so its INT8 ratios at those sizes are against a slow F32 baseline.
+
+Measured (a 4-core machine shared with another compiler agent and this agent's `make test`, load 1-5; speeds are ratios
+within one run, before = branch point b4b5d68 built the same way, alternated run by run):
+
+| | before | after |
+|---|---|---|
+| allocation pins (S17a) | products, attention, convolution, scans, `Forward`/`Backward`, the training step, the settle: none (workspaces grew) | all of them, F32, BF16, F64 |
+| INT8 CNN, a static forward (`bench/int8cnn`, medians of 3 runs of 7 rounds) | batch 1 175.8 us, 64 10.62 ms, 128 23.56 ms | 168.4 us, 10.46 ms, 21.52 ms (4%, 1%, 9% faster) |
+| INT8 CNN against the F32 graph (static) | 1.01-1.17x | 0.98-1.13x (within the noise: the INT8 micro-kernel, not the patches, sets it - 30% of the INT8 profile against 8% for the windows) |
+| INT8 cached decoding against F32 (`bench/int8decode`, 3 runs) | 1.20, 1.32, 1.23x | 1.32, 1.34, 1.30x |
+| BF16 / INT8 weights against F32 (`bench/storage`) | - (one storage type) | batch 1: 0.21x / 0.84x; 1 x 1024 x 1024: 0.63x / 2.54x; 64-1024 rows: 0.92-1.23x / 0.91-1.03x |
 
 ### 4.2 Parity before deleting
 
