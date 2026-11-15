@@ -412,6 +412,49 @@ every product - 8.1 MB a step for the transformer of section 11. oann carried a 
 arena until the runtime's pool was fixed (olang O8b, size classes) and std/linalg gained `GemmWorkspace`, both asked
 for here.) The transformer's resident memory grows by 68-76 kB over its first 20 steps and by nothing after.
 
+### Measured on olang 374c1e3c, 2026-11-15
+
+The machine was shared with other agents the whole time: **load average 27 to 44** on the 4 cores (`uptime` is given
+beside each figure), so every wall-clock time below is inflated by an unknown factor and the figures are not the quiet-
+machine numbers; a repeat on a quiet machine is open. OpenBLAS was installed for the reference (`libopenblas-dev`).
+
+**Accuracy** (`make mnist`, 784-128-10, AdamW, seed 1, 10 epochs): 93.49, 95.49, 96.39, 96.80, 97.10, 97.41, 97.69,
+97.56, 97.83, **97.79%** - the same as 9621af3's seed 1 (97.79%); train loss 0.4169 -> 0.0378, test loss 0.2275 ->
+0.0721 (a bit-for-bit repeat of the first epoch: 0.4169 / 0.2275 / 93.49% in every run).
+
+**An epoch** (`make epoch`, medians of 3 rounds of 3 epochs, at a load average of 42), seconds:
+
+| | 9621af3 (load 10-12) | 374c1e3c (load 42) |
+|---|---|---|
+| oann, built for this machine, 1 thread | 0.69 | **3.80** |
+| oann, built for this machine, 4 threads | 1.57 | 3.41 |
+| oann, built for baseline x86-64, 1 thread | 2.24 | 7.43 |
+| C over OpenBLAS, 1 thread | 0.93 | 1.01 |
+| C over OpenBLAS, 4 threads | 4.53 | 1.13 |
+
+**This is slower than the load explains.** The C reference, run in the same minutes, took 1.01 s, within 10% of its
+old figure at a load of 42. CPU time says the same: three epochs of `examples/mnist_mlp` took 5.8 s of user time against
+2.0 s for one (1.9 s of CPU an epoch, the 3.8 s wall including the wait for a core), where the C reference's three took
+1.5 s (0.5 s an epoch). So oann is ~3.8x OpenBLAS's CPU time here, where it was 0.74x of its wall time on 9621af3.
+`bench/data.olang`, which does not multiply, is unchanged (below). `olang profile examples/mnist_mlp.olang 1`: **72%
+self in `linalg.rowStep<F32>`** (line 902), 8% `micro12`, 6.6% `F32.Fma`. The binary's `linalg_2erowStep_3cF32_3e` is an
+out-of-line function with its accumulators loaded, fused-multiply-added and stored through memory at every step
+(`vmovss`/`vfmadd213ss`, scalar and unrolled by 8 - `objdump -d build/examples_mnist_mlp
+--disassemble=linalg_2erowStep_3cF32_3e`), called 100% from `micro12`. `linalg.olang`'s micro-kernels (copied unchanged
+from std/linalg b6e4a103^) rely on `rowStep` being inlined into the kernel with a constant `nr`, so that the tile's 12 x 32
+accumulators live in zmm registers (their comment says so, above `micro4`); that does not happen with olang 374c1e3c.
+The same shape in a 25-line program (a `tile` of an inline `Array<F32>(384)`, a `rowStep` called four times a step) *is*
+inlined and folded away, so the break is specific to the real kernel's size or its generic instance
+(`micro12<F32, packedA, wideTile, F32>`); no minimal repro was found, so none is in repro/. The whole binary does
+contain AVX-512 FMAs (1,206 `vfmadd`, 15,660 `zmm` operands) - the vector kernels exist, `rowStep` is not one of them.
+The transformer step of section 11 is slower in the products (6.4x) and GELU (10x) in the same way. Not an oann change: the
+module's kernels are byte for byte std/linalg's last version.
+
+**The data pipeline** (`make data`, at a load of 27; `bench/data.olang`): MNIST already in data/ - the files are fetched
+on the first run, 1.85 s here - parsed in 0.139 s (396 MB/s), pixel mean 0.13066 and sd 0.30811 (MNIST's: 0.1307,
+0.3081); an epoch of shuffled batches of 128 checked in 0.127 s, filling alone 0.0325 s: 5,787 MB/s of F32,
+1,845,503 samples a second (section 7: 520-830 MB/s, ~3.5-4 GB/s, ~1.2M samples/s before - faster, and the same pipeline).
+
 ## 9. Testing
 
 - `make test`: each module's `test` blocks - the kernels against direct computations, every op's backward against
@@ -640,6 +683,35 @@ region in it); resident memory grows by 68-76 kB over the first 20 steps and by 
   tokenizer is built: section 16.)
 - Reusing activation storage by liveness: the arena holds every activation and gradient - 87 MB for the model above.
 - Element-wise ops over threads: at four threads they are 40 of the 344 ms.
+
+### Measured on olang 374c1e3c, 2026-11-15
+
+**Agreement with numpy** (`make lmref ARGS=10`): the ten steps' losses are **equal to six decimals** (4.211253 ...
+3.751469), the gradient norms equal to six decimals except in the last digit at steps 5, 7, 8 and 9 (5.406032 / 5.406031,
+3.293284 / 3.293283, ...), F32 precision.
+
+**Where a step goes** (`make lmbench ARGS="20 1"`, one thread, a load average of 42): **963 ms a step, 1,063 tokens a
+second** (a second run, 828 ms, 1,237), against ~200 ms and 4,900-5,200 tokens with 9621af3 above; resident memory grew
+68 kB over the 20 steps, as before. ms a step, forward / backward:
+
+| | forward, 9621af3 | backward, 9621af3 | forward, 374c1e3c | backward, 374c1e3c |
+|---|---|---|---|---|
+| `Linear` | 37.9 | 81.7 | 241.3 | 502.5 |
+| `MatMul` (the tied head) | 0.7 | 0.8 | 0.5 | 5.1 |
+| `Attention` | 28.2 | 27.3 | 26.2 | 40.4 |
+| `GeluTanh` | 5.3 | 6.9 | 52.5 | 73.6 |
+| `LayerNorm` | 4.1 | 5.0 | 4.3 | 4.0 |
+| `Add` | 1.5 | 2.2 | 5.1 | 1.7 |
+| clipping, AdamW | 3.7 | | 3.6 | |
+
+Products 749 ms of the step (6.4x), GELU 126 ms (10x), attention and the layer norms about as before. See section 8
+(the same measurement's note on the load and on `linalg.rowStep`): this is not the machine's load alone.
+
+**A character model** (`make charlm ARGS=300`, the schedule compressed to 300 steps - warmup 100, cosine to 1e-4 at
+step 300 - so not comparable to the 2,000-step table above): train loss 3.4240 (step 50), 2.6811, 2.5432, 2.4606,
+2.3924, 2.3592 (step 300); validation 2.3720 (step 250), **2.3583** (step 300); 806-838 ms a step, 1,271 tokens a
+second at a load of 40; a 500-character sample at temperature 0.8, 1,204 characters a second with the key-value cache
+(2,138 before). The loss at step 250 of the 2,000-step run was 2.4134 / 2.3825; the curve falls as it did.
 
 ## 12. Shapes as type parameters (when olang has const generics)
 
@@ -992,6 +1064,18 @@ and no Unicode character classes in std, so `\p{L}` and `\p{N}` became byte clas
 again: `:=` from a comparison needed its type written (D15 - relaxed in olang 9621af3).
 
 
+### Measured on olang 374c1e3c, 2026-11-15
+
+At a load average of 35-44 on the 4 cores (other agents compiling). **CNN** (`make cnn ARGS=3`, seed 1, one thread):
+test accuracy 96.97 / 97.78 / **98.44**%, test loss 0.0994 / 0.0650 / 0.0471 - the same, to the digit, as the 9621af3 row
+above; 37.3, 34.6, 42.5 s an epoch (mean 38.1 s) against 37-53 s with 9621af3 at a load of 10-21, resident 171,588 kB
+after epoch 1 and 172,496 after epoch 3 (the arena 60.8 MB; the old run's resident total was 116,7xx kB and flat after
+every epoch - here it is higher and **grows ~450 kB an epoch** (171,060 after step 10, 171,148 after step 100), cause not
+looked into; 3 epochs only). **BPE** (`make bpe`, vocabulary 512): training 135.1 ms (50-95 ms before), the training part encoded in 65.3 ms
+(15.4 MB/s; 35-60 ms, 17-28 MB/s before) and the validation part in 7.9 ms, decoded back exactly, saved and loaded back
+to the same tokens; **256 of 256 merges equal to `bench/ref/bpe.py`'s and the same 59,401 validation tokens**. The
+timing was taken at a load of 42, the old at 3-6.
+
 ## 17. Settling networks (`circuit.olang`)
 
 Beside the graph, `circuit.Circuit<T>` is the second recorded structure: a network of regions whose neurons settle to
@@ -1075,6 +1159,15 @@ Phase 10 answers how a consolidating agent should read what it remembers (docs/s
 section 24 below): its recall drives the readout alone, at gain 2; observations with numbers missing are completed from
 the whole ones learned; and the slow part's guess at observations the store has never seen is weighed by a bet learned
 from the outcomes there. Results and decisions: docs/settling.md sections 2.16, 5.13 and 6 (decisions 77-85).
+
+### Measured on olang 374c1e3c, 2026-11-15
+
+At a load average of 34-44 on the 4 cores (`uptime`). `make board ARGS=1` (784-128-10, lessons settled on the board,
+batches of 32, beta 0.5, T 0.05, defaults): epoch 1 train loss 0.0178, 24.9 sweeps a lesson, 6.9 s, test accuracy
+**91.71% in F32 and 91.71% on the board, the answers agreeing on 100.00%** (1.0 s to answer the test set both ways);
+0 refused, gain 0.90, constants clipped 0.11%. `make sleep` (retention, 10 lives): days only, recall of A after B
+82.8 +- 4.9; store alone 87.6 +- 3.9; days and nights **95.2 +- 5.5** (B 100.0); nights only 99.1 +- 1.2 - the 85-87%
+against 96% of docs/settling.md 5.10, unchanged; 114 s (user 70 s). `make nights` not run.
 
 ## 18. Phase 5: attention on products, mixed precision, a Dataset trait
 
