@@ -190,10 +190,24 @@ made, an input filled before what reads it is recorded; an eager graph's paramet
 apart, for M9). `DeltaRule` takes its heads from `beta`'s last axis; `Conv2d` and `MaxPool2d` take images `[n, H, W, C]`.
 An operation whose kernel needs rows gets a `Contiguous` copy of a view that is not, recorded for it. The scans run their
 sequential forms (the chunked ones agree to rounding only). Not built: `Ahead` (an input's next batch filled on a task
-during the step) and the plan baked while compiling (C4). A step allocates nothing (resident memory flat, tested); it is
+during the step). A step allocates nothing (resident memory flat, tested); it is
 not pinned with `assert not ....Allocates`, as function facts read too coarsely today (repro/allocfacts.olang,
 repro/methodfacts.olang). A `Custom` operation's tensors, given to an `any`, are built where the graph lives at each call,
 so a step through one allocates.
+
+**As built (C4, 2026-11-15).** What `Plan` decides is plain data, `Layout` (per node a `Placed` of its six offsets, `needs`,
+`ParamCount`, `ActivationSize`, and the sizes of the arena, the I32 region and the accumulator): `g.Lay()` computes it with
+nothing allocated or drawn, `g.Layout()` reads a planned graph's, and `g.PlanBaked(r, layout)` plans from one given, so only
+the storage is made and the parameters drawn. `Plan` is `Lay` then the same storage step. The MLP's is baked with
+`mlpBaked Layout = comptime Layout.Mlp()` and tested equal to the one a run-time `Plan` captures, and a graph planned
+from it computes the same loss (`Graph.Lay`, `Graph.PlanBaked`). The evaluator took the graph's recording and layout
+(lists, enums, `Shape`s, the liveness placement) without a refusal. Compile time: a program recording the 784-128-10
+perceptron and baking its layout builds in 1.5 s warm against 1.5 s with the layout computed at run time (the difference
+is below the noise, ~0.1 s; cold builds 6.5 s each once the module is compiled); the layout itself is microseconds at
+run time, so baking saves nothing measurable there either - its worth is a fixed plan a later step (a freestanding or FPGA
+target) can rely on without running the planner. A layout of another graph is the program's error (`PlanBaked`
+checks the node count only). Seen once or twice in targeted test runs: a stray line `sum unread: ...` on the standard
+error from the compiler (not reproduced by a small program; intermittent).
 
 ### 1.4 The dynamical-system core: `dyn/*.olang`
 
@@ -693,7 +707,7 @@ not flags. Sizes: S < 600 lines, M 600-1500, L 1500-3000.
 | C1 | models | `models/*.olang`, `nn/quant.olang`, `examples/` | B1, B2b, B3 | each reference model trains to its round 2 number; INT8 accuracy and speed kept (M12); a GPT and an SSM block at 10M on TinyStories as the first yardstick run (loss curve, tokens per second, M13) | L |
 | C2 | bridge | `dyn/bridge.olang` (the settle as a `Custom` op), `models/hybrid.olang` | B1, B2b | the op's backward against central differences for each `Implicit`; a transformer with a settle block and an amortizer trains; sweeps used with and without the amortizer (M14) | M |
 | C3 | cut-over | delete the old modules; README.md, DESIGN.md, makefile, PROGRESS.md | all | every old test ported or recorded as moved to oagent; `make test` green; build time of the test suite measured (M15) | M |
-| C4 | baked plans | `ad/graph.olang` (a `comptime` plan) | B1 | the MLP's plan baked as constant data equals the captured one; compile time stated | S |
+| C4 (built, 2026-11-15) | baked plans | `ad/graph.olang` (a `comptime` plan) | B1 | the MLP's plan baked as constant data equals the captured one; compile time stated | S |
 
 Order: A1-A6 together (at most two agents in a full test run at a time); B1 and B2a as soon as A1-A3 merge, B2b
 after B2a's first commit, B3 after B1, B4 after B2a; C1-C2 after B; C3 last; C4 whenever B1 is merged. Critical
