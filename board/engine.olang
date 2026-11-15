@@ -1661,6 +1661,7 @@ test "the board refuses as dyn's settle does not: a refused settle leaves the co
 
 # ---- parity with board.olang (removed with it, when circuit goes: the golden digests below carry what these check) ----
 
+import "std/json"
 import "../board"
 import "../circuit"
 import "../optim"
@@ -2085,4 +2086,308 @@ test "retired units are dropped: the engine of a system with units retired is th
     lowered Bool = true
     try Engine.Lower(a2) catch LowerError { lowered = false }
     assert not lowered
+}
+
+# ---- spiking (docs/settling.md 4.6) ----
+
+# a Lif neuron's leak and threshold
+fn lifOf(model neuron.Neuron) F64, F64 {
+    match model {
+        case neuron.Neuron.Lif(leak, threshold, _, _) { return leak, threshold }
+        case _ { unreachable }
+    }
+}
+
+test "a Lif neuron on the board fires at the analytic rate of its quantized drive, leak and threshold" {
+    window I64 = 4000
+    r := rand.Rand(14)
+    s := system.System<F64>(6)
+    h := s.Population(s.Root(), "h", 1, neuron.Neuron.Lif(0.05, 1.0, 1.0, window))
+    s.Plan(r)!
+    drives := Array<F64>[0.5, 0.98, 1.05, 1.5, 2.5, 6.0]
+    for b in range 6: s.Pop(h).Drive[b] = drives[b]
+    e := Engine.Lower(s)!
+    e.Inputs(s)
+    st := try e.Settle(settle.Phase.Free, 40 * window, 2.0 / F64(window))
+    assert st.Converged and st.Sweeps >= 2 * window
+    leak, threshold := lifOf(e.LifOf(0))
+    # one rounding of u a step, at most 2^-15, is the step of a drive off by 2^-15 / leak: the rate lies between those
+    # of the drives that far either side, each within f^2 / (1 - f) + 1 / window of the continuous formula (dyn's own
+    # test), and the rate's rounding to Q1.15 adds 2^-15
+    off F64 = 1.0 / 32768.0 / leak
+    unit F64 = 1.0 / 32768.0
+    for b in range 6 {
+        drive F64 = F64(e.Drives[b]) / F64(PotOne)
+        rate := e.Activity(settle.Phase.Free, b, 0)
+        lo := neuron.LifRateOf(drive - off, leak, threshold)
+        hi := neuron.LifRateOf(drive + off, leak, threshold)
+        try io.PutLine("drive " $drive ": " $rate " spikes a step on the board, analytic " $(neuron.LifRateOf(drive, leak, threshold)))
+        if hi == 0.0 {
+            assert rate == 0.0
+        } else {
+            assert rate >= lo - lo * lo / (1.0 - lo) - 1.0 / F64(window) - unit
+            assert rate <= hi + hi * hi / (1.0 - hi) + 1.0 / F64(window) + unit
+        }
+    }
+    assert e.Saturations == 0
+}
+
+test "a spiking system on the board settles where dyn's floating-point one does, and where the rate model it approximates does" {
+    window I64 = 8000
+    a := lifFixture(2, neuron.Neuron.Spiking(0.1, 1.0, 0.1, window), rand.Rand(21))
+    e := Engine.Lower(a)!
+    e.Inputs(a)
+    # the same system in floating point with the board's leak, threshold and synapse rate, weights, biases and inputs
+    lif := e.LifOf(1)
+    b := lifFixture(2, lif, rand.Rand(21))
+    e.StoreParams(b)!
+    e.StoreInputs(b)
+    # and its rate model: rate neurons with the Lif rate curve, the mean field both are near
+    leak, threshold := lifOf(lif)
+    m := lifFixture(2, neuron.Neuron.Rate(neuron.Rho.LifRate(leak, threshold)), rand.Rand(21))
+    e.StoreParams(m)!
+    e.StoreInputs(m)
+    try e.Settle(settle.Phase.Free, 40 * window, 2.0 / F64(window))
+    assert b.Settle(settle.Phase.Free, settle.Budget(40 * window, 2.0 / F64(window))).Converged
+    exact(m)
+    floatGap F64 = 0.0
+    boardGap F64 = 0.0
+    between F64 = 0.0
+    for row in range 2 {
+        for p in range 1, 3 {
+            size := b.Pop(system.Pop(p)).Size
+            for u in range size {
+                rate := e.Activity(settle.Phase.Free, row, e.RegionDesc[p * RegionWords + 1] + u)
+                twin := b.State<neuron.LifCell<F64>>(system.Pop(p)).S[row * size + u]
+                model := activity(m, settle.Phase.Free, p, row, u)
+                floatGap = floatGap.Max((twin - model).Abs())
+                boardGap = boardGap.Max((rate - model).Abs())
+                between = between.Max((rate - twin).Abs())
+            }
+        }
+    }
+    try io.PutLine(("spiking on the board: rates within " $boardGap " of the rate model (dyn's floating point: " $floatGap ") and " $between
+        " of dyn's floating-point system"))
+    assert boardGap < 0.015 and floatGap < 0.015 and between < 0.005
+    assert e.Saturations == 0
+}
+
+test "board.olang's parity, spiking: the same image, settles, lessons and golden vectors; an engine deterministic, refusing as the circuit does" {
+    window I64 = 64
+    r := rand.Rand(31)
+    s := lifFixture(2, neuron.Neuron.Spiking(0.1, 1.0, 0.25, window), r)
+    c := circuitOf(s)
+    a := board.Engine.Board(c)
+    e := Engine.Lower(s)!
+    same(a, e)
+    a.Inputs(c)
+    e.Inputs(s)
+    try a.Settle(circuit.Phase.Free, 40 * window, 2.0 / F64(window))
+    try e.Settle(settle.Phase.Free, 40 * window, 2.0 / F64(window))
+    same(a, e)
+    sameBytes(a, e, "spiking")
+    assert e.Spikes > 0 and e.Events > 0
+    # a lesson, three phases of windows
+    try a.Teach(c, 2, circuit.Lesson(1.0, 2.0 / F64(window), 40 * window))
+    try e.Lesson(s, 1.0, true, 0, 2.0 / F64(window), 40 * window)
+    same(a, e)
+    sameBytes(a, e, "spiking")
+    # a second engine of the same system settles bit for bit alike
+    f := Engine.Lower(s)!
+    f.Inputs(s)
+    try f.Settle(settle.Phase.Free, 40 * window, 2.0 / F64(window))
+    try f.Lesson(s, 1.0, true, 0, 2.0 / F64(window), 40 * window)
+    g := Engine.Lower(s)!
+    g.Inputs(s)
+    try g.Settle(settle.Phase.Free, 40 * window, 2.0 / F64(window))
+    try g.Lesson(s, 1.0, true, 0, 2.0 / F64(window), 40 * window)
+    alike(f, g)
+    # a settle with no window to spare and a tolerance of none refuses, and leaves the committed state as it was
+    at := e.slot(0, e.current[0])
+    v := Array<I32>(e.Rows * e.Neurons)
+    syn := Array<I32>(e.Rows * e.Neurons)
+    tr := Array<I32>(e.Rows * e.Neurons)
+    for i in range v.Len() {
+        v[i] = e.V[at + i]
+        syn[i] = e.Syn[at + i]
+        tr[i] = e.Tr[at + i]
+    }
+    refused Bool = false
+    try e.relax(settle.Phase.Free, window, 0, true) catch NotSettled { refused = true }
+    assert refused
+    at = e.slot(0, e.current[0])
+    for i in range v.Len(): assert e.V[at + i] == v[i] and e.Syn[at + i] == syn[i] and e.Tr[at + i] == tr[i]
+    try io.PutLine("a spiking settle and lesson: " $(e.Spikes) " spikes over " $(e.Steps) " row-steps, " $(e.Events) " synaptic events")
+}
+
+test "board.olang's parity, spiking: XOR learned with its settles on both engines - identical after every lesson" {
+    lif := neuron.Neuron.Spiking(0.1, 1.0, 0.25, 256)
+    s := system.System<F64>(4)
+    root := s.Root()
+    x := s.Population(root, "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 8, lif)
+    o := s.Population(root, "o", 2, lif, neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, o, conn.Wiring.Dense, reciprocal = true)
+    r := rand.Rand(1)
+    s.Plan(r)!
+    for j in range 8: s.E.Params[s.Pop(h).Bias + j] = 1.2
+    for j in range 2: s.E.Params[s.Pop(o).Bias + j] = 1.0
+    for b in range 4 {
+        s.Pop(x).Drive[2 * b] = 1.0 if b / 2 == 1 else -1.0
+        s.Pop(x).Drive[2 * b + 1] = 1.0 if b % 2 == 1 else -1.0
+        s.Pop(o).Target[2 * b + ((b / 2) ^ (b % 2))] = 0.2
+    }
+    c := circuitOf(s)
+    a := board.Engine.Board(c)
+    e := Engine.Lower(s)!
+    opt := optim.FlatAdamW<F64>(c.ParamCount, 0.02)
+    steps I64 = 0
+    for _ in range 40 {
+        taught := try a.Teach(c, 4, circuit.Lesson(1.0, c.LessonTolerance(1.0), c.Budget(c.LessonTolerance(1.0), 1.0)))
+        assert taught == (try e.Lesson(s, 1.0, true, 0, c.LessonTolerance(1.0), c.Budget(c.LessonTolerance(1.0), 1.0)))
+        steps += taught
+        same(a, e)
+        opt.Step(c.ParamData(), c.GradData())
+        a.Load(c)
+        push(s, c)
+        e.Load(s)!
+        same(a, e)
+    }
+    try io.PutLine("spiking XOR, 40 lessons on both engines, identical after every one: " $(steps / 40) " steps a lesson")
+}
+
+# ---- golden digests: what board.olang's golden vectors were, kept when it is gone ----
+
+import "std/sha256"
+
+# the scenarios' systems: 0 a cross-entropy one with tanh inputs, 1 a squared-error one with linear inputs, 2 a spiking one
+fn scenario(kind I64) system.System<F64> {
+    if kind == 2: return lifFixture(2, neuron.Neuron.Spiking(0.1, 1.0, 0.25, 64), rand.Rand(31))
+    r := rand.Rand(U64(11 + kind))
+    return fixture(4, r, 0.9 - 0.1 * F64(kind), kind == 0, kind == 1)
+}
+
+# a scenario's engine after its settles: the free phase, then both nudged ones (a spiking scenario: a settle and a lesson)
+fn Engine.golden(kind I64) mut Engine& {
+    s := scenario(kind)
+    e mut Engine& = Engine.Lower(s)!
+    e.Inputs(s)
+    if kind == 2 {
+        e.Settle(settle.Phase.Free, 40 * 64, 2.0 / 64.0)!
+        e.Lesson(s, 1.0, true, 0, 2.0 / 64.0, 40 * 64)!
+        return e
+    }
+    e.Settle(settle.Phase.Free, 1000, 1e-4)!
+    for beta in Array<F64>[0.5, -0.5] {
+        phase := settle.Phase.Plus if beta > 0.0 else settle.Phase.Minus
+        e.Warm(phase, settle.Phase.Free)
+        e.Nudge(phase, beta)
+        e.Settle(phase, 1000, 2.0 / F64(PotOne))!
+    }
+    return e
+}
+
+# the same scenario on board.olang: the digest of the golden vectors it dumps
+fn boardDigest(kind I64) String {
+    s := scenario(kind)
+    c := circuitOf(s)
+    a := board.Engine.Board(c)
+    a.Inputs(c)
+    if kind == 2 {
+        a.Settle(circuit.Phase.Free, 40 * 64, 2.0 / 64.0)!
+        a.Teach(c, 2, circuit.Lesson(1.0, 2.0 / 64.0, 40 * 64))!
+    } else {
+        a.Settle(circuit.Phase.Free, 1000, 1e-4)!
+        for beta in Array<F64>[0.5, -0.5] {
+            phase := circuit.Phase.Plus if beta > 0.0 else circuit.Phase.Minus
+            a.Warm(phase, circuit.Phase.Free)
+            a.Nudge(phase, beta)
+            a.Settle(phase, 1000, 2.0 / F64(PotOne))!
+        }
+    }
+    path := "build/engine_golden.safetensors"
+    a.Dump(path)!
+    text := os.ReadFile(path)!
+    bytes := Array<U8>(text.Len())
+    for i in range text.Len(): bytes[i] = U8(text[i])
+    try os.Remove(path) catch { }
+    return sha256.Hex(bytes)
+}
+
+# the digests (sha256) of those scenarios' images, as board.olang's golden vectors dump them
+fn digest(kind I64) String {
+    return Array<String&>["dc02a1c88742b07e3381a3fbec4ad4e233b95c111d6d4c5be0b1ebd7b9d7e999"
+        "08b0d6b603c43f14e82a8a476a1e74152f033115c6d57e6272ca7bec11934d4b"
+        "f5bc2042ca8cc1f80703f4df564d9a2376c58d3f578ef4706c30dfac28b26135"][kind]
+}
+
+test "the golden vectors: each scenario's image has the digest board.olang's golden vectors had" {
+    got := Array<String>(3)
+    for kind in range 3 {
+        got[kind] = sha256.Hex(Engine.golden(kind).Image())
+        try io.PutLine("scenario " $kind ": " $(got[kind]))
+    }
+    for kind in range 3: assert got[kind] == digest(kind)
+}
+
+test "board.olang's parity: its golden vectors of each scenario have those digests" {
+    for kind in range 3: assert boardDigest(kind) == digest(kind)
+}
+
+test "the golden vectors read back as they were written; the engine is deterministic" {
+    ea := Engine.golden(0)
+    eb := Engine.golden(0)
+    assert ea.V == eb.V and ea.S == eb.S and ea.Image() == eb.Image()
+    path := "build/engine_vectors_test.safetensors"
+    ea.Dump(path)!
+    text := try os.ReadFile(path)
+    n I64 = 0
+    for k in range 8: n = n | (I64(U8(text[k])) << (8 * k))
+    doc := try json.Json.Parse(text[8:8 + n])
+    entry := try doc["v"]
+    offsets := try (try entry["data_offsets"]).AsArr()
+    from := try offsets[0].AsInt()
+    at := ea.slot(0, ea.current[0])
+    for i in range ea.Rows * ea.Neurons {
+        x I64 = 0
+        for k in range 4: x = x | (I64(U8(text[8 + n + from + 4 * i + k])) << (8 * k))
+        x = (x << 32) >> 32
+        assert x == I64(ea.V[at + i])
+    }
+    try os.Remove(path) catch { }
+    try io.PutLine("a sweep of this system takes " $(ea.SweepCycles()) " cycles on the board, its constant " $(ea.ConstantCycles()))
+}
+
+test "what the board cannot run is refused when lowering, saying why" {
+    r := rand.Rand(3)
+    # a rectifier has no table
+    s := system.System<F64>(1)
+    s.Population(s.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Relu))
+    s.Plan(r)!
+    refused Bool = false
+    try Engine.Lower(s) catch LowerError { refused = true }
+    assert refused
+    # a linear neuron that is not an input
+    t := system.System<F64>(1)
+    t.Population(t.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Linear))
+    t.Plan(r)!
+    refused = false
+    try Engine.Lower(t) catch LowerError { refused = true }
+    assert refused
+    # a system not yet planned
+    u := system.System<F64>(1)
+    u.Population(u.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    refused = false
+    try Engine.Lower(u) catch LowerError { refused = true }
+    assert refused
+    # a neuron with more than 2^16 synapses reaching it: its sum would overflow the accumulator
+    v := system.System<F64>(1)
+    h := v.Population(v.Root(), "h", 70000, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    g := v.Population(v.Root(), "g", 1, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    v.Connect(h, g, conn.Wiring.Dense, reciprocal = true)
+    v.Plan(r)!
+    refused = false
+    try Engine.Lower(v) catch LowerError { refused = true }
+    assert refused
 }
