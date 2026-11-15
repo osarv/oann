@@ -96,36 +96,48 @@ fn cast<X, D>(x X, like D) D {
 # the tasks a product of work multiply-adds is cut into: one below what pays for a task, else threads
 fn tasksFor(work I64, threads I64) I64 { return 1 if work < 400000 or threads <= 1 else threads }
 
-# the pairwise sum of eight lanes - what lets a sum of floats run in vector registers (a float sum keeps the order it is
-# written in, so one accumulator would not vectorize)
-fn pairwise<A>(v Array<A>&) A {
-    return ((v[0] + v[4]) + (v[2] + v[6])) + ((v[1] + v[5]) + (v[3] + v[7]))
-}
-
-# the dot product of w[wo .. wo + n) (stored in S) and x[xo .. xo + n), in eight lanes of acc
-fn dotRun<S, A>(w Array<S>&, wo I64, x Array<A>&, xo I64, n I64, acc mut Array<A>&) A {
+# the dot product of w[wo .. wo + n) (stored in S) and x[xo .. xo + n), in eight lanes - eight locals, not an array, so
+# that they live in vector registers (a float sum keeps the order it is written in, so one accumulator would not
+# vectorize); combined pairwise at the end
+fn dotRun<S, A>(w Array<S>&, wo I64, x Array<A>&, xo I64, n I64) A {
     z A
-    for u in range 8: acc[u] = z
+    a0, a1, a2, a3, a4, a5, a6, a7 A = z, z, z, z, z, z, z, z
     whole I64 = n - n % 8
     for t in range 0, whole, 8 {
-        for u in range 8: acc[u] += cast(w[wo + t + u], z) * x[xo + t + u]
+        a0 += cast(w[wo + t], z) * x[xo + t]
+        a1 += cast(w[wo + t + 1], z) * x[xo + t + 1]
+        a2 += cast(w[wo + t + 2], z) * x[xo + t + 2]
+        a3 += cast(w[wo + t + 3], z) * x[xo + t + 3]
+        a4 += cast(w[wo + t + 4], z) * x[xo + t + 4]
+        a5 += cast(w[wo + t + 5], z) * x[xo + t + 5]
+        a6 += cast(w[wo + t + 6], z) * x[xo + t + 6]
+        a7 += cast(w[wo + t + 7], z) * x[xo + t + 7]
     }
     rest A = z
     for t in range whole, n: rest += cast(w[wo + t], z) * x[xo + t]
-    return pairwise(acc) + rest
+    return (((a0 + a4) + (a2 + a6)) + ((a1 + a5) + (a3 + a7))) + rest
 }
 
-# the dot product of a[ao .. ao + n) and b[bo .. bo + n) in A, in eight lanes of acc
-fn dotAs<A>(a Array<A>&, ao I64, b Array<A>&, bo I64, n I64, acc mut Array<A>&) A {
+# the dot product of a[ao .. ao + n) and b[bo .. bo + n) in A, in eight lanes - eight locals, not an array, so that they
+# live in vector registers (a float sum keeps the order it is written in, so one accumulator would not vectorize);
+# combined pairwise at the end
+fn dotAs<A>(a Array<A>&, ao I64, b Array<A>&, bo I64, n I64) A {
     z A
-    for u in range 8: acc[u] = z
+    a0, a1, a2, a3, a4, a5, a6, a7 A = z, z, z, z, z, z, z, z
     whole I64 = n - n % 8
     for t in range 0, whole, 8 {
-        for u in range 8: acc[u] += a[ao + t + u] * b[bo + t + u]
+        a0 += a[ao + t] * b[bo + t]
+        a1 += a[ao + t + 1] * b[bo + t + 1]
+        a2 += a[ao + t + 2] * b[bo + t + 2]
+        a3 += a[ao + t + 3] * b[bo + t + 3]
+        a4 += a[ao + t + 4] * b[bo + t + 4]
+        a5 += a[ao + t + 5] * b[bo + t + 5]
+        a6 += a[ao + t + 6] * b[bo + t + 6]
+        a7 += a[ao + t + 7] * b[bo + t + 7]
     }
     rest A = z
     for t in range whole, n: rest += a[ao + t] * b[bo + t]
-    return pairwise(acc) + rest
+    return (((a0 + a4) + (a2 + a6)) + ((a1 + a5) + (a3 + a7))) + rest
 }
 
 # y[yo .. yo + n) += a * w[wo .. wo + n) (w stored in S)
@@ -314,36 +326,57 @@ fn (w Csr<S>&) rowAt(target I64) I64 {
     return lo
 }
 
-# row i's entries times the entries of x they name (x[j] at xo + j xs), in eight lanes of acc - the gathers and
-# multiply-adds in vector registers
-fn (w Csr<S>&) rowDot<A>(i I64, x Array<A>&, xo I64, xs I64, acc mut Array<A>&) A {
+# row i's entries times the entries of x they name (x[j] at xo + j xs), in eight lanes - the gathers and multiply-adds in
+# vector registers. The lanes are eight locals, not an array: nothing a loop stores through can alias them
+fn (w Csr<S>&) rowDot<A>(i I64, x Array<A>&, xo I64, xs I64) A {
     z A
-    for u in range 8: acc[u] = z
+    a0, a1, a2, a3, a4, a5, a6, a7 A = z, z, z, z, z, z, z, z
     lo := w.Ptr[i]
     hi := w.Ptr[i + 1]
     whole I64 = hi - (hi - lo) % 8
     for e in range lo, whole, 8 {
-        for u in range 8: acc[u] += cast(w.Values[e + u], z) * x[xo + I64(w.Idx[e + u]) * xs]
+        a0 += cast(w.Values[e], z) * x[xo + I64(w.Idx[e]) * xs]
+        a1 += cast(w.Values[e + 1], z) * x[xo + I64(w.Idx[e + 1]) * xs]
+        a2 += cast(w.Values[e + 2], z) * x[xo + I64(w.Idx[e + 2]) * xs]
+        a3 += cast(w.Values[e + 3], z) * x[xo + I64(w.Idx[e + 3]) * xs]
+        a4 += cast(w.Values[e + 4], z) * x[xo + I64(w.Idx[e + 4]) * xs]
+        a5 += cast(w.Values[e + 5], z) * x[xo + I64(w.Idx[e + 5]) * xs]
+        a6 += cast(w.Values[e + 6], z) * x[xo + I64(w.Idx[e + 6]) * xs]
+        a7 += cast(w.Values[e + 7], z) * x[xo + I64(w.Idx[e + 7]) * xs]
     }
     rest A = z
     for e in range whole, hi: rest += cast(w.Values[e], z) * x[xo + I64(w.Idx[e]) * xs]
-    return pairwise(acc) + rest
+    return (((a0 + a4) + (a2 + a6)) + ((a1 + a5) + (a3 + a7))) + rest
 }
 
-# rows lo .. hi of Y += alpha W X: row i of Y gathers the rows of X its entries name (x[j, t] at xo + j xs + t)
+# rows lo .. hi of Y += alpha W X: row i of Y gathers the rows of X its entries name (x[j, t] at xo + j xs + t). A batch is
+# taken sixteen columns at a time with the sixteen sums in registers across the whole row - y is read and written once a
+# chunk, not once an entry - and the columns left over one entry at a time
 fn (w Csr<S>&) rowsInto<A>(y mut Array<A>&, yo I64, ys I64, x Array<A>&, xo I64, xs I64, width I64, alpha A, lo I64, hi I64) {
     z A
-    acc := Array<A>(8)
+    idx := w.Idx
+    vals := w.Values
+    whole I64 = width - width % 16
     for i in range lo, hi {
         yi I64 = yo + i * ys
         if width == 1 {
-            y[yi] = y[yi] + alpha * w.rowDot(i, x, xo, xs, acc)
+            y[yi] = y[yi] + alpha * w.rowDot(i, x, xo, xs)
             continue
         }
+        for t0 in range 0, whole, 16 {
+            acc := Array<A>(16)
+            for e in range w.Ptr[i], w.Ptr[i + 1] {
+                a A = alpha * cast(vals[e], z)
+                xj I64 = xo + I64(idx[e]) * xs + t0
+                for u in range 16: acc[u] += a * x[xj + u]
+            }
+            for u in range 16: y[yi + t0 + u] += acc[u]
+        }
+        if whole == width: continue
         for e in range w.Ptr[i], w.Ptr[i + 1] {
-            a A = alpha * cast(w.Values[e], z)
-            xj I64 = xo + I64(w.Idx[e]) * xs
-            for t in range width: y[yi + t] += a * x[xj + t]
+            a A = alpha * cast(vals[e], z)
+            xj I64 = xo + I64(idx[e]) * xs
+            for t in range whole, width: y[yi + t] += a * x[xj + t]
         }
     }
 }
@@ -410,11 +443,10 @@ fn (w Csr<S>&) mulAddT<A>(y mut mat.Mat<A>&, x mat.Mat<A>&, alpha A, threads I64
 # rows lo .. hi's entries of g (g[e] = alpha (A B^T)[i, j] at each entry e = (i, j), plus g[e] when accumulate)
 fn (w Csr<S>&) sampledRows<A>(g mut Array<A>&, a Array<A>&, ao I64, sa I64, b Array<A>&, bo I64, sb I64, width I64, alpha A, accumulate Bool, lo I64, hi I64) {
     z A
-    acc := Array<A>(8)
     for i in range lo, hi {
         ai I64 = ao + i * sa
         for e in range w.Ptr[i], w.Ptr[i + 1] {
-            d := alpha * dotAs(a, ai, b, bo + I64(w.Idx[e]) * sb, width, acc)
+            d := alpha * dotAs(a, ai, b, bo + I64(w.Idx[e]) * sb, width)
             g[e] = (g[e] if accumulate else z) + d
         }
     }
@@ -630,31 +662,57 @@ fn (w Tiles<S>&) rowAt(target I64) I64 {
     return lo
 }
 
-# tile rows r0 .. r1 of Y += alpha W X, skipping dead tiles and the blocks of x that active calls quiet
+# tile rows r0 .. r1 of Y += alpha W X, skipping dead tiles and the blocks of x that active calls quiet. A batch of one
+# (x and y contiguous) dots each row of every live tile with its block of x in eight lanes. A wider batch is taken
+# sixteen columns at a time, each row of Y's sixteen sums held across the whole tile row
 fn (w Tiles<S>&) rowsInto<A>(y mut Array<A>&, yo I64, ys I64, x Array<A>&, xo I64, xs I64, width I64, alpha A, active Array<Bool>&, r0 I64, r1 I64) {
-    z A
-    acc := Array<A>(8)
-    tt := w.Tile * w.Tile
-    flat := width == 1 and xs == 1 and ys == 1
+    whole I64 = width - width % 16
     for r in range r0, r1 {
-        h := w.height(r)
-        for e in range w.Ptr[r], w.Ptr[r + 1] {
-            c := I64(w.Col[e])
-            if not w.Live[e] or (active.Len() > 0 and not active[c]): continue
-            wd := w.width(c)
-            if flat {
-                for i in range h: y[yo + r * w.Tile + i] += alpha * dotRun(w.Data, e * tt + i * w.Tile, x, xo + c * w.Tile, wd, acc)
-                continue
+        if width == 1 and xs == 1 and ys == 1 {
+            w.dotRows(y, yo, x, xo, alpha, active, r)
+            continue
+        }
+        for i in range w.height(r) {
+            yi I64 = yo + (r * w.Tile + i) * ys
+            for t0 in range 0, whole, 16 {
+                acc := Array<A>(16)
+                w.addRow(acc, x, xo, xs, t0, 16, alpha, active, r, i)
+                for u in range 16: y[yi + t0 + u] += acc[u]
             }
-            for i in range h {
-                yi I64 = yo + (r * w.Tile + i) * ys
-                for k in range wd {
-                    a A = alpha * cast(w.Data[e * tt + i * w.Tile + k], z)
-                    xj I64 = xo + (c * w.Tile + k) * xs
-                    for t in range width: y[yi + t] += a * x[xj + t]
-                }
+            if whole < width {
+                rest := Array<A>(16)
+                w.addRow(rest, x, xo, xs, whole, width - whole, alpha, active, r, i)
+                for u in range width - whole: y[yi + whole + u] += rest[u]
             }
         }
+    }
+}
+
+# acc[u] += alpha W[row i of tile row r, .] X[., t0 + u] for u < n (at most sixteen columns), over the live tiles the
+# active blocks leave
+fn (w Tiles<S>&) addRow<A>(acc mut Array<A>&, x Array<A>&, xo I64, xs I64, t0 I64, n I64, alpha A, active Array<Bool>&, r I64, i I64) {
+    z A
+    tt := w.Tile * w.Tile
+    for e in range w.Ptr[r], w.Ptr[r + 1] {
+        c := I64(w.Col[e])
+        if not w.Live[e] or (active.Len() > 0 and not active[c]): continue
+        for k in range w.width(c) {
+            a A = alpha * cast(w.Data[e * tt + i * w.Tile + k], z)
+            xj I64 = xo + (c * w.Tile + k) * xs + t0
+            for u in range n: acc[u] += a * x[xj + u]
+        }
+    }
+}
+
+# tile row r's rows of Y += alpha W x for one contiguous vector x: each live tile's rows dotted with its block of x
+fn (w Tiles<S>&) dotRows<A>(y mut Array<A>&, yo I64, x Array<A>&, xo I64, alpha A, active Array<Bool>&, r I64) {
+    tt := w.Tile * w.Tile
+    h := w.height(r)
+    for e in range w.Ptr[r], w.Ptr[r + 1] {
+        c := I64(w.Col[e])
+        if not w.Live[e] or (active.Len() > 0 and not active[c]): continue
+        wd := w.width(c)
+        for i in range h: y[yo + r * w.Tile + i] += alpha * dotRun(w.Data, e * tt + i * w.Tile, x, xo + c * w.Tile, wd)
     }
 }
 
