@@ -10,10 +10,14 @@ rules on clocks. It is recorded through handles, laid out once by `Plan` and the
 | `neuron.olang` | the cells (`RateCell`, `LifCell`, `@Keep` for state kept across settles), `Rho`, `Neuron` (rate, spiking, `Custom` through the `Dynamics` trait), `Role`, `Cost`, and the per-element work of a sweep: the residual and step, a spiking time step and window, a readout's force and cost |
 | `conn.olang` | `Wiring` (Dense, Symmetric, Csr, Tiles, Events, LowRank) and `Link<T>`: its weights as a view of the parameter region, carrying activities forward and back, its share of the units' incoming mass, pruning (`Prune`, `MaskGrads`) and compaction in place |
 | `settle.olang` | `Phase`, `Budget`, `Settlement` and the `Engine`: population state double-buffered as `Columns` of cells, every phase side by side on one axis, Jacobi sweeps cut into units (a population's rows of a phase, 128 at most) run on the system's tasks - the same bit for bit for any thread count |
+| `learn.olang` | `Learner<T>`: a planned system's learning - the rules attached to its modules run on their clock (`Tick`): EP lessons (`Lesson`, `Contrast`: free and nudged phases, the contrast for every wiring into `ParamGrads`), three-factor rules (an eligibility trace per rule times a signal; the local term EP's contrast of the last nudge, or Hebbian), homeostasis (thresholds or biases toward a target rate), delta writes, custom rules; and gradients at a fixed point (`ImplicitGrad`: exact adjoint, JFB, EP through the drive) |
+| `energy.olang` | `Energy<E>`: an energy written as a struct of terms whose value, state gradient and parameter gradient are assembled while compiling by walking E's fields; the terms (`Potential`, `Bilinear`, `Linear`, `Squared`, `LogSumExp`), made from a system's populations and connections; `StateOf` (a row's activities) and `Of` (a system's energy) |
 
-Programs import the four modules (`import "dyn/system"` and so on) and write `system.System<F32>(batch, threads)`,
-`neuron.Neuron.Rate(neuron.Rho.Tanh)`, `conn.Wiring.Symmetric`, `settle.Budget()`. Learning rules, energies and
-implicit gradients are `dyn/learn.olang` and `dyn/energy.olang` (B2b).
+Programs import the modules (`import "dyn/system"` and so on) and write `system.System<F32>(batch, threads)`,
+`neuron.Neuron.Rate(neuron.Rho.Tanh)`, `conn.Wiring.Symmetric`, `settle.Budget()`; after `Plan` (and after attaching
+the rules) `learn.Learner<F32>(s)!` teaches it: `l.Lesson(s.Root(), beta)!`, an optimizer's step over `s.E.Params` and
+`s.E.Grads`, `l.Tick(system.Clock.Step)!`.
 
 Tests: `olang test dyn/FILE.olang` (`make test` runs them). Speed against `circuit.olang`, the same network and
-weights side by side: `make settlebench ARGS="ROUNDS THREADS"` (bench/settle.olang).
+weights side by side: `make settlebench ARGS="ROUNDS THREADS"` (bench/settle.olang). MNIST taught by EP on dyn:
+`make mnistlearn ARGS="EPOCHS"` (examples/mnist_learn.olang; `make data` first).

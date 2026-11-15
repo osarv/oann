@@ -69,9 +69,10 @@ acceptance:
   error with linear inputs, a spiking settle and lesson); the parity test shows board.olang's own dumps have the same
   digests, so after C3 the digests carry the golden vectors.
 - **MNIST through the board** (M11, only when `make data` has fetched it): a certified 784-128-10 at T = 0.25 taught for
-  three epochs (equilibrium propagation in circuit F32 until dyn's learning rules land), its weights in a `System<F32>`,
-  lowered, the test set answered by the engine: 90.05 / 91.02 / 91.09% after epochs 1 / 2 / 3, the same as dyn's F32
-  settles (answers agreeing on 99.99-100%), 3.9-4.0 sweeps a settle.
+  three epochs by dyn's equilibrium propagation (`learn.Learner`, F32, Adam 1e-3, beta 0.5, restrained to the certified
+  set after every step), lowered, the test set answered by the engine: 90.05 / 91.07 / 91.06% after epochs 1 / 2 / 3,
+  the same as dyn's F32 settles (answers agreeing on 99.99-100%), 3.9-4.0 sweeps a settle (taught in circuit before
+  dyn's rules landed: 90.05 / 91.02 / 91.09%).
 
 Allocation-free, pinned while compiling (S17a, G42; `assert not f.Allocates`): a sweep's totals (plain and nudged), its
 residual and step, a settle's constants, a settle (`relax`), a run of sweeps, a spiking time step and a window's end,
