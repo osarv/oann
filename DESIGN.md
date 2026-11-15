@@ -732,11 +732,11 @@ examples/mnist_int8.olang   the perceptron or the CNN trained, quantized to INT8
 examples/charlm_int8.olang  the character transformer's checkpoint with its linear layers in INT8, against F32
 bench/data.olang        the data pipeline, checked and timed
 bench/train.olang       where an epoch's time goes
-bench/epoch.sh, ref/    an epoch against the C reference over OpenBLAS
+bench/epoch.olang, ref/ an epoch against the C reference over OpenBLAS
 bench/lm.olang          where a transformer's step goes, by kind of operation
 bench/lmref.olang, ref/charlm.py  the first steps of the character model against numpy
 bench/attention.olang   attention's batched products against a Gemm per sequence and head, causal or not
-bench/abstep.py         two builds of bench/lm.olang run in alternation: the medians of their steps
+bench/abstep.olang       two builds of bench/lm.olang run in alternation: the medians of their steps
 bench/bpe.olang, ref/bpe.py  BPE timed, and checked against an independent Python implementation
 bench/conv.olang        a convolution's passes timed: the forward by GemmPatches and as im2col and a product, the
                         backward's im2col, two products and col2im
@@ -744,7 +744,7 @@ bench/safetensors.olang, ref/safetensors_check.py  safetensors both ways against
 bench/sparse.olang      sparse projections against dense ones, kernels and whole circuits
 bench/int8.olang        the INT8 product against std/linalg's F32 one, on the networks' shapes
 bench/each.olang        oann's element-wise loops against std/linalg's Map (kept for the record of section 22)
-bench/paired.py         two runs of the settling examples' lives (perlife=1) compared life by life, with intervals
+bench/paired.olang       two runs of the settling examples' lives (perlife=1) compared life by life, with intervals
 docs/settling.md        settling networks - the model after transformers
 repro/                  minimal programs for olang issues found here
 data/, build/           downloads and build output, not in git
@@ -767,7 +767,7 @@ themselves and there is no unknown token.
   letter or any byte from 0x80 up (so a UTF-8 word stays one chunk), a digit is 0-9, whitespace the six ASCII spaces.
   On ASCII text - tiny Shakespeare is ASCII - this is GPT-2's rule exactly; elsewhere it keeps a non-ASCII symbol or
   punctuation mark with the letters around it, where GPT-2 would split it off.
-- **Training** (`tokenizer.Train(text, vocab)`) counts each distinct chunk once with its number of occurrences, then
+- **Training** (`Tokenizer.Train(text, vocab)`) counts each distinct chunk once with its number of occurrences, then
   merges the most frequent adjacent pair again and again, ties to the smaller pair (Hugging Face's rule). Pair counts
   are kept up to date as chunks change, a heap with lazy deletion gives the most frequent, and every pair keeps a list
   of the chunks it occurs in (a linked list in flat arrays), so a merge costs the chunks it touches, not the corpus.
@@ -776,8 +776,8 @@ themselves and there is no unknown token.
   pairs of a later rank), in O(n log n) of the chunk's length - a megabyte of one letter is no harder than prose, where
   the usual quadratic loop would not finish. Each distinct chunk's tokens are remembered for the rest of the text, as
   GPT-2's encoder does. The ranks are an open-addressed table of pairs. `t.Decode(ids)` fails on an id the vocabulary
-  does not have (`TokenizerError.UNKNOWN`).
-- **Saving** is JSON, `t.Save(path)` and `tokenizer.Load(path)`: `{"format": "oann-bpe", "version": 1, "pretokenize":
+  does not have (`TokenizerError.Unknown`).
+- **Saving** is JSON, `t.Save(path)` and `Tokenizer.Load(path)`: `{"format": "oann-bpe", "version": 1, "pretokenize":
   "gpt2-ascii", "merges": [[32, 116], ...], "vocab": [...]}`. The merges, as pairs of ids, are what Load reads (each
   checked to name only tokens made before it); the vocabulary is every token in GPT-2's printable form ("Ġthe" for
   " the"), for a person to read.
@@ -1100,7 +1100,7 @@ against numpy (`make lmref ARGS=40`): losses within 1e-6 and gradient norms with
 2.5-3.1 by `Gemm`s, the backward 4.5-5.2 against 3.1-3.7; at T 256 (16 sequences), 70-81 ms against 32-42 forward
 and 71-83 against 36-37 backward. Without the transposes the products below 64^3 ran unpacked and the backward at T 64
 was *slower* than the loops (6.0-7.5 ms against 4.5-5.1). The transformer step (`bench/lm.olang`, 10 steps after 3,
-medians of 8 runs alternating the build before and after, `bench/abstep.py`):
+medians of 8 runs alternating the build before and after, `bench/abstep.olang`):
 
 | context | attention before | attention after | step before | step after |
 |---|---|---|---|---|
@@ -1173,7 +1173,7 @@ within 0.006 of F32's all the way and end 0.0014 above them. Its sample, generat
 BF16 run's masters, reads as section 11's does.
 
 **Speed: slower on this compiler, and why.** Interleaved on the shared machine (load 5): an MNIST epoch (`bench/train`,
-the best of three epochs, medians of 5 runs) **0.63 s in F32, 2.11 in BF16**; a transformer step (`bench/abstep.py`,
+the best of three epochs, medians of 5 runs) **0.63 s in F32, 2.11 in BF16**; a transformer step (`bench/abstep.olang`,
 medians of 4 runs) **157 ms in F32, 650 in BF16** - products 102 against 366 ms, attention 29 against 119, the rest
 of the graph 23 against 160. Neither the format nor this design costs that - narrowing does:
 
@@ -1309,7 +1309,7 @@ ARGS=40`): the same numbers as before, losses within 1e-6 and gradient norms wit
 The backward gains most - three of its four products are causal, and the transposes are gone. The forward barely
 moves because it is mostly not products any more: at `T` 64 (16 sequences, 4 heads) the scores' product takes 0.35-0.6
 ms, `P V` 0.33-0.6, and the softmax between them 1.0-2.0 - `math.Exp`, a library call per element (section 13's first
-item). The transformer's step (`bench/abstep.py`, the build before and after alternating, the graph's own profiling):
+item). The transformer's step (`bench/abstep.olang`, the build before and after alternating, the graph's own profiling):
 
 | context | attention before | attention after | step before | step after |
 |---|---|---|---|---|
@@ -1870,7 +1870,7 @@ Cost: familiarity's gather and scatter, about 4% on the return task; a moment on
 2. **Completion of observations with numbers missing, told which** (79-81), on by default.
 3. **The slow part's guess weighed by familiarity, its weight learned at `GuessRate` 0.03** (82-84), on by default.
 4. **5.11's and 5.12's tables are the agent as it was** (85); `recallalone=0 recallgain=1 familiarity=0` restores it.
-5. **Paired comparisons through `bench/paired.py`**, the examples' `perlife=1` lines matched life by life.
+5. **Paired comparisons through `bench/paired.olang`**, the examples' `perlife=1` lines matched life by life.
 
 ### olang issues (repro/)
 
