@@ -24,7 +24,7 @@ e.Load(s)!                            # after a learning step: the weights and b
 `Settle(phase, sweeps, tolerance)` takes the tolerance in the system's units and runs to the board's integer tolerance
 for it, `max(tau, 5 steps of Q4.14)` (a spiking system's: the largest change of a rate between windows, in steps of
 Q1.15). The formats, the arithmetic of a sweep and of a spiking time step, and the cycle model are the header of
-`engine.olang`; they are board.olang's, unchanged.
+`engine.olang`; they are those of `board.olang`, the module this one replaced (removed at C3, tag `pre-c3`), unchanged.
 
 ## What lowering does
 
@@ -61,13 +61,14 @@ both costs, tolerances of 0, 1 and 5 steps).
 bisected root, equilibria, nudged phases, a lesson, refusals, spiking rates against the analytic rate), these decide
 acceptance:
 
-- **board.olang bit for bit** (the parity tests import `board` and `circuit`, so they go with them in C3): a system and
-  the circuit made from it give the same image, the same settles of the free and both nudged phases, the same lesson,
-  the same golden vectors - rate and spiking, two readout groups, XOR taught for 400 lessons with the weights pushed to
-  both engines after every step (the images are identical after every lesson), spiking XOR for 40.
+- **board.olang bit for bit** (until C3 the parity tests ran a system and the circuit made from it side by side on both
+  engines and found the same image, the same settles of the free and both nudged phases, the same lesson, the same golden
+  vectors - rate and spiking, two readout groups, XOR taught for 400 lessons with the weights pushed to both engines after
+  every step, spiking XOR for 40; they went with `board.olang` and `circuit.olang`, and the digests below carry what they
+  checked).
 - **Golden digests** (`digest`): the sha256 of the image of three scenarios (cross-entropy with tanh inputs, squared
-  error with linear inputs, a spiking settle and lesson); the parity test shows board.olang's own dumps have the same
-  digests, so after C3 the digests carry the golden vectors.
+  error with linear inputs, a spiking settle and lesson); board.olang's own dumps had the same
+  digests (checked before C3), so the digests are the golden vectors.
 - **MNIST through the board** (M11, only when `make data` has fetched it): a certified 784-128-10 at T = 0.25 taught for
   three epochs by dyn's equilibrium propagation (`learn.Learner`, F32, Adam 1e-3, beta 0.5, restrained to the certified
   set after every step), lowered, the test set answered by the engine: 90.05 / 91.07 / 91.06% after epochs 1 / 2 / 3,
@@ -82,9 +83,9 @@ allocate (the processing system's side, once per learning step).
 ## Not built
 
 - Learning rules: the contrast, the optimizer and `Restrain` are dyn's (`dyn/learn`, B2b); `Lesson` settles the three
-  phases on the engine and stores them back for it. board.olang's `Teach` took circuit's contrast.
+  phases on the engine and stores them back for it. board.olang's `Teach` took circuit's contrast (both gone with C3).
 - `StoreParams` into a tiled or low-rank block (no stored form to write the board's weights into).
 - dyn's `Budget.Damping`: the engine damps as the board does, by halving the step over `Attempts` parts of the budget.
 - A hardware engine; the PYNQ-Z2 overlay waits for an FPGA toolchain.
 
-board.olang stays until C3 (every test above that imports it is then replaced by the digests).
+board.olang is gone (C3); `git show pre-c3:board.olang` has it.

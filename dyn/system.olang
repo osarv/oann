@@ -668,6 +668,29 @@ test System.Settle "a refusal: a budget too small ends unconverged, with the swe
     assert s.Settle(settle.Phase.Free, settle.Budget(20, 1e-3)).Diverged()
 }
 
+test System.Settle "damping changes the path, not the equilibrium, and removes a period-2 cycle" {
+    # a linear neuron feeding itself with weight -1: v <- 1 - v swings between 0 and 1 with a residual that never
+    # shrinks; a step shortened by half lands on 1 / 2 at once
+    s := System<F64>(1)
+    h := s.Population(s.Root(), "h", 1, neuron.Neuron.Rate(neuron.Rho.Linear))
+    s.Connect(h, h, conn.Wiring.Dense)
+    s.Plan(rand.Rand(7))!
+    s.Weights(Conn(0)).Fill(-1.0)
+    s.Bias(h).Fill(1.0)
+    out := s.Settle(settle.Phase.Free, settle.Budget(100, 1e-10))
+    assert not out.Converged and out.Sweeps == 100
+    s.Reset(settle.Phase.Free)
+    damped := s.Settle(settle.Phase.Free, settle.Budget(100, 1e-10, 0.5))
+    assert damped.Converged and (s.Activity(settle.Phase.Free, h).Get(0, 0) - 0.5).Abs() < 1e-12
+    # a damped settle of a certified system ends where an undamped one does
+    t := System<F64>.tight(8, 0.9)
+    t.Settle(settle.Phase.Free, settle.Budget(400, 1e-13))
+    star := Array<F64>[t.Activity(settle.Phase.Free, Pop(1)).Get(0, i) for i in range 8]
+    t.Reset(settle.Phase.Free)
+    assert t.Settle(settle.Phase.Free, settle.Budget(2000, 1e-13, 0.5)).Converged
+    for i in range 8: assert (t.Activity(settle.Phase.Free, Pop(1)).Get(0, i) - star[i]).Abs() < 2e-12
+}
+
 # x (20 inputs) -> a (24 tanh) <-> b (16 tanh) <-> y (6, cross-entropy in two groups) with every wiring: a dense input,
 # a reciprocal sparse block, a low-rank one, a lateral tiled block, an event-driven feedback, a symmetric readout; F32,
 # batch rows (130: three chunks a phase, the last short) and threads as given

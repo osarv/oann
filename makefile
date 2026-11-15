@@ -5,13 +5,13 @@
 OLANG ?= ../olang/build/olang
 
 # every module with test blocks
-TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
-	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
+TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang \
+	ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang \
+	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
-	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
-	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
+	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
 
-.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench hybridbench mnistlearn sample clean
+.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench xor spiking hybridbench mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -83,32 +83,12 @@ bpe:
 	./build/bench_bpe $(or $(ARGS),512) build/bpe_olang.txt
 	python3 -I bench/ref/bpe.py data/shakespeare/input.txt $(or $(ARGS),512) build/bpe_olang.txt
 
-# safetensors checked against a reader and writer of numpy's (bench/ref/safetensors_check.py): oann's files in every
-# dtype bit by bit, and numpy's file loaded back exactly
-safetensors:
-	$(OLANG) build -output build/bench_safetensors bench/safetensors.olang
-	./build/bench_safetensors write build/safetensors
-	python3 -I bench/ref/safetensors_check.py build/safetensors
-	./build/bench_safetensors read build/safetensors
-
-# MNIST by a settling circuit the board can run, its lessons settled on the simulated board engine (board.olang) or in
+# MNIST by a settling system the board can run, its lessons settled on the simulated board engine (board/engine) or in
 # F32, the test set answered both ways after every epoch - ARGS: epochs, board or float, samples, hidden, batch, seed,
-# rate, beta, temperature, restrain, and a window to make it spiking
+# rate, beta, temperature
 board:
 	$(OLANG) build -output build/examples_mnist_board examples/mnist_board.olang
 	./build/examples_mnist_board $(ARGS)
-
-# a sparse projection's transport and contrast against a dense block's, by density (bench/sparse.olang) - ARGS: rounds,
-# threads
-sparse:
-	$(OLANG) build -output build/bench_sparse bench/sparse.olang
-	./build/bench_sparse $(ARGS)
-
-# dyn's settle against circuit.olang's on the 784-128-10 network, the same weights side by side, batch 1 and 128
-# (docs/redesign.md 4.3, M7) - ARGS: rounds, threads for dyn's tasked run, beta x 100
-settlebench:
-	$(OLANG) build -output build/bench_settle bench/settle.olang
-	./build/bench_settle $(ARGS)
 
 # M14 (docs/redesign.md 4.3): models/hybrid's transformer with a settle block on tiny Shakespeare, trained twice - every
 # settle from rest, then from the amortizer's guess - and the sweeps a settle takes in each (bench/hybrid.olang) - ARGS:
@@ -117,23 +97,15 @@ hybridbench:
 	$(OLANG) build -output build/bench_hybrid bench/hybrid.olang
 	./build/bench_hybrid $(ARGS)
 
-# sleep against interference (consolidator.olang): days of a flip-flop with and without nights - ARGS: nights or
-# retention, seeds, days, sequences a day, repeats, hidden, window, passes, the day's step, the night's rate
+# XOR by rate neurons on dyn, taught by equilibrium propagation (examples/xor_settle.olang)
 xor:
 	$(OLANG) build -output build/examples_xor_settle examples/xor_settle.olang
 	./build/examples_xor_settle $(ARGS)
 
+# XOR by spiking neurons on dyn (examples/xor_spiking.olang)
 spiking:
 	$(OLANG) build -output build/examples_xor_spiking examples/xor_spiking.olang
 	./build/examples_xor_spiking $(ARGS)
-
-bandit:
-	$(OLANG) build -output build/examples_bandit_settle examples/bandit_settle.olang
-	./build/examples_bandit_settle $(ARGS)
-
-mnistsettle:
-	$(OLANG) build -output build/examples_mnist_settle examples/mnist_settle.olang
-	./build/examples_mnist_settle $(ARGS)
 
 # the same network on dyn (dyn/learn's EP lessons; docs/redesign.md 4.3, M8) - ARGS: epochs, samples, hidden, batch,
 # seed, Adam's rate, beta, threads
@@ -141,22 +113,10 @@ mnistlearn:
 	$(OLANG) build -output build/examples_mnist_learn examples/mnist_learn.olang
 	./build/examples_mnist_learn $(ARGS)
 
+# text from the checkpoint make charlm wrote (examples/charlm_sample.olang)
 sample:
 	$(OLANG) build -output build/examples_charlm_sample examples/charlm_sample.olang
 	./build/examples_charlm_sample $(ARGS)
-
-sleep:
-	$(OLANG) build -output build/examples_sleep_retention examples/sleep_retention.olang
-	./build/examples_sleep_retention $(ARGS)
-
-# what an agent's nights are for (examples/nights.olang, docs/settling.md 5.12): settling agents on a ring of observations
-# whose answers follow a smooth rule no linear read holds, trained on a few points, tested on seen, new, noisy and partial
-# observations and then living anywhere on the ring - ARGS: lives, train, after, points, hidden, block, then the agent's
-# settings as name=value (sleep=1, night=, memorygain=, recallhalflife=, cues=, perlife=1, ...). The transfer and
-# return tasks of examples/bandit_settle.olang measure the rest of 5.12
-nights:
-	$(OLANG) build -output build/examples_nights examples/nights.olang
-	./build/examples_nights $(ARGS)
 
 # the perceptron (or the CNN) trained in F32, quantized to INT8 (nn/quant.olang, M12) and measured both ways: test accuracy,
 # the parameters' size, throughput at batch 1, 64 and 128 - ARGS: mlp or cnn, epochs,
@@ -172,7 +132,7 @@ int8lm:
 	$(OLANG) build -output build/examples_charlm_int8 examples/charlm_int8.olang
 	./build/examples_charlm_int8 $(ARGS)
 
-# the INT8 product against linalg's F32 product with its bias and ReLU, on oann's networks' shapes (bench/int8.olang)
+# the INT8 product against kernels/gemm's F32 product with its bias and ReLU, on oann's networks' shapes (bench/int8.olang)
 # - ARGS: rounds, threads
 int8bench:
 	$(OLANG) build -output build/bench_int8 bench/int8.olang
