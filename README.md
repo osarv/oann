@@ -38,6 +38,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `examples/` | the programs the makefile runs: MNIST, transformers, settling networks, INT8 |
 | `bench/` | benchmarks and the checks against reference implementations (`bench/ref/`) |
 | `docs/settling.md` | settling networks: the model, the papers it rests on, the open questions |
+| `docs/redesign.md` | the redesign plan: tensors, kernels, autodiff, the dynamical-system core; round 3 work packages |
 | `repro/` | minimal programs for olang issues found here (`repro/README.md`) |
 
 `PROGRESS.md` is the hand-off note of the work in progress.
