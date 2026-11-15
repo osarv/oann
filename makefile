@@ -7,6 +7,7 @@ OLANG ?= ../olang/build/olang
 # every module with test blocks
 TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
+	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
 .PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle sample clean
