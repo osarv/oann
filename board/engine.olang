@@ -1653,3 +1653,166 @@ test "the board refuses as dyn's settle does not: a refused settle leaves the co
     }
     assert refused > 0 and accepted > 0
 }
+
+# ---- parity with board.olang (removed with it, when circuit goes: the golden digests below carry what these check) ----
+
+import "../board"
+import "../circuit"
+
+fn rhoOf(f neuron.Rho) circuit.Rho {
+    return match f {
+        case neuron.Rho.Tanh: circuit.Rho.Tanh
+        case neuron.Rho.HardSigmoid: circuit.Rho.HardSigmoid
+        case neuron.Rho.Linear: circuit.Rho.Linear
+        case _: unreachable
+    }
+}
+
+# a circuit with the populations, connections and values of s (plain blocks, rate or spiking neurons), for board.olang
+# to run: what Engine.Lower(s) must agree with bit for bit
+fn circuitOf(s system.System<F64>&) circuit.Circuit<F64> {
+    c := circuit.Circuit<F64>(s.Batch)
+    for p in s.E.Pops {
+        model := match p.Model {
+            case neuron.Neuron.Rate(f): circuit.Neuron.Rate(rhoOf(f))
+            case neuron.Neuron.Lif(leak, threshold, synapse, window): circuit.Neuron.Lif(leak, threshold, synapse, window)
+            case _: unreachable
+        }
+        role := p.Role
+        if role == neuron.Role.Readout {
+            match role.cost {
+                case neuron.Cost.CrossEntropy(temperature, groups) { c.Readout(p.Size, circuit.Cost.CrossEntropy(temperature), model, groups) }
+                case neuron.Cost.Squared { c.Readout(p.Size, circuit.Cost.Squared, model) }
+            }
+        } else if role == neuron.Role.Hidden {
+            c.Hidden(p.Size, model)
+        } else {
+            c.Input(p.Size, model)
+        }
+    }
+    for l in s.E.Links: c.Project(circuit.Region(l.Pre), circuit.Region(l.Post), circuit.Wiring.Reciprocal if l.Both else circuit.Wiring.OneWay)
+    r := rand.Rand(1)
+    c.Plan(r)
+    c.Dt = s.E.Dt
+    pull(c, s)
+    for k in range s.E.Pops.Len() {
+        pop := s.Pop(system.Pop(k))
+        reg := circuit.Region(k)
+        for j in range pop.Drive.Len(): c.DriveData(reg)[j] = pop.Drive[j]
+        if pop.Role == neuron.Role.Readout and settle.GroupsOf(pop.Role) > 0 {
+            for j in range pop.Labels.Len(): c.LabelData(reg)[j] = pop.Labels[j]
+        } else if pop.Role == neuron.Role.Readout {
+            for j in range pop.Target.Len(): c.TargetData(reg)[j] = pop.Target[j]
+        }
+    }
+    return c
+}
+
+# s's weights and biases into c (the same structure): a learning step's result pushed to the other side
+fn pull(c mut circuit.Circuit<F64>&, s system.System<F64>&) {
+    for k in range s.E.Links.Len() {
+        l := s.E.Links[k]
+        w := c.Weights(circuit.Projection(k))
+        for i in range l.PostSize {
+            for j in range l.PreSize: w.Set(i, j, s.E.Params[l.Off + i * l.PreSize + j])
+        }
+    }
+    for k in range s.E.Pops.Len() {
+        pop := s.Pop(system.Pop(k))
+        if pop.Role == neuron.Role.Input: continue
+        for j in range pop.Size: c.Bias(circuit.Region(k))[j] = s.E.Params[pop.Bias + j]
+    }
+}
+
+# the other way: c's weights and biases into s
+fn push(s system.System<F64>&, c circuit.Circuit<F64>&) {
+    for k in range s.E.Links.Len() {
+        l := s.E.Links[k]
+        w := c.Weights(circuit.Projection(k))
+        for i in range l.PostSize {
+            for j in range l.PreSize: s.E.Params[l.Off + i * l.PreSize + j] = w.Get(i, j)
+        }
+    }
+    for k in range s.E.Pops.Len() {
+        pop := s.Pop(system.Pop(k))
+        if pop.Role == neuron.Role.Input: continue
+        for j in range pop.Size: s.E.Params[pop.Bias + j] = c.Bias(circuit.Region(k))[j]
+    }
+}
+
+# a's image and last settle are b's, every integer
+fn same(a board.Engine&, b Engine&) {
+    assert a.Rows == b.Rows and a.Neurons == b.Neurons and a.N == b.N and a.Spiking == b.Spiking
+    assert a.RegionDesc == b.RegionDesc and a.BlockDesc == b.BlockDesc and a.Weights == b.Weights and a.Biases == b.Biases
+    assert a.Tables == b.Tables and a.Drives == b.Drives and a.Labels == b.Labels and a.Targets == b.Targets
+    assert a.V == b.V and a.S == b.S and a.Constant == b.Constant and a.Total == b.Total and a.Residuals == b.Residuals
+    assert a.Syn == b.Syn and a.Spk == b.Spk and a.Tr == b.Tr and a.Counts == b.Counts
+    assert a.DtQ == b.DtQ and a.Attempts == b.Attempts and a.Window == b.Window and a.FollowQ == b.FollowQ
+    assert a.Sweeps == b.Sweeps and a.Saturations == b.Saturations and a.Clipped == b.Clipped and a.Constants == b.Constants
+    assert a.Steps == b.Steps and a.Spikes == b.Spikes and a.Events == b.Events and a.Lambda == b.Lambda
+    assert a.ActError == b.ActError and a.ExpError == b.ExpError
+    assert a.Last.Sweeps == b.Last.Sweeps and a.Last.Qualified == b.Last.Converged and a.Last.Residual == b.Last.Residual
+}
+
+# the golden vectors of a and b written and read back: the same bytes
+fn sameBytes(a board.Engine&, b Engine&, name String&) {
+    pa := "build/engine_parity_a_" $name ".safetensors"
+    pb := "build/engine_parity_b_" $name ".safetensors"
+    a.Dump(pa)!
+    b.Dump(pb)!
+    ta := os.ReadFile(pa)!
+    tb := os.ReadFile(pb)!
+    assert ta == tb and ta.Len() > 0
+    try os.Remove(pa) catch { }
+    try os.Remove(pb) catch { }
+}
+
+# a system of x (2 inputs) -> h (the model, 5) <-> y (2, squared error toward the targets), the Lif fixture of
+# board.olang's spiking tests: every relaxing neuron biased above its threshold
+fn lifFixture(batch I64, model neuron.Neuron, r mut rand.Rand&) system.System<F64> {
+    s := system.System<F64>(batch)
+    root := s.Root()
+    x := s.Population(root, "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 5, model)
+    y := s.Population(root, "y", 2, model, neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    l := s.Connect(h, y, conn.Wiring.Dense, reciprocal = true)
+    s.Plan(r)!
+    for i in range s.Link(l).Count: s.E.Params[s.Link(l).Off + i] *= 2.0
+    for j in range 5: s.E.Params[s.Pop(h).Bias + j] = 1.3 + 0.1 * F64(j)
+    for j in range 2: s.E.Params[s.Pop(y).Bias + j] = 1.5
+    for j in range s.Pop(x).Drive.Len(): s.Pop(x).Drive[j] = r.Uniform(0.0, 1.0)
+    for b in range batch {
+        for j in range 2: s.Pop(y).Target[b * 2 + j] = 0.15 if (j == b % 2) else 0.02
+    }
+    return s
+}
+
+test "board.olang's parity: the same image, the same settles and the same golden vectors, rate systems" {
+    r := rand.Rand(6)
+    for trial in range 6 {
+        s := fixture(3, r, Array<F64>[0.5, 0.9][trial % 2], trial % 2 == 1, trial % 4 < 2)
+        c := circuitOf(s)
+        a := board.Engine.Board(c)
+        e := Engine.Lower(s)!
+        same(a, e)
+        a.Inputs(c)
+        e.Inputs(s)
+        same(a, e)
+        try a.Settle(circuit.Phase.Free, 1000, 1e-4)
+        try e.Settle(settle.Phase.Free, 1000, 1e-4)
+        same(a, e)
+        sameBytes(a, e, "rate")
+        for beta in Array<F64>[0.5, -0.5] {
+            a.Warm(circuit.Phase.Plus, circuit.Phase.Free)
+            e.Warm(settle.Phase.Plus, settle.Phase.Free)
+            a.Nudge(circuit.Phase.Plus, beta)
+            e.Nudge(settle.Phase.Plus, beta)
+            try a.Settle(circuit.Phase.Plus, 1000, 2.0 / F64(PotOne))
+            try e.Settle(settle.Phase.Plus, 1000, 2.0 / F64(PotOne))
+            same(a, e)
+        }
+        sameBytes(a, e, "rate")
+        for j in range e.Neurons: assert a.Potential(circuit.Phase.Plus, 0, j) == e.Potential(settle.Phase.Plus, 0, j)
+    }
+}
