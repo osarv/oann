@@ -587,3 +587,111 @@ test System.Settle "linear neurons settle to the solution of (I - W_eff) v = c, 
         for k in range 2: assert (y.Get(b, k) - c[5 + k]).Abs() < 1e-10
     }
 }
+
+# x (one input, drive 1) -> h (n linear units, a uniform positive lateral block) certified at kappa: the bound of the
+# certificate is tight here - the residual of a cold settle shrinks by exactly kappa a sweep
+fn System<T>.tight(n I64, kappa F64) System<T> {
+    r := rand.Rand(3)
+    s := System<T>(1, 1, 1)
+    root := s.Root()
+    x := s.Population(root, "x", 1, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", n, neuron.Neuron.Rate(neuron.Rho.Linear))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    s.Weights(Conn(0)).Fill(1.0)
+    s.Weights(Conn(1)).Fill(1.0)
+    s.Pop(x).Drive[0] = 1.0
+    s.Certify(kappa)
+    return s
+}
+
+test System.Settle "the certificate's sweep counts at kappa 0.9: a cold settle needs ln(tol) / ln(0.9) sweeps - 64 at the lesson tolerance, 66 at 1e-3, 71 at the life tolerance" {
+    s := System<F64>.tight(16, 0.9)
+    assert (s.Gain() - 0.9).Abs() < 1e-12
+    wants := Array<I64>[64, 66, 71]
+    for i, tol in Array<F64>[1.25e-3, 1e-3, 6.25e-4] {
+        want := wants[i]
+        s.Reset(settle.Phase.Free)
+        out := s.Settle(settle.Phase.Free, settle.Budget(128, tol))
+        assert out.Converged and out.Sweeps == want, "tol " $tol ": " $out.Sweeps " sweeps"
+        assert out.Sweeps <= I64((tol.Log() / 0.9.Log()).Ceil())
+    }
+    # the equilibrium: v = 1 + 0.9 v, every unit
+    assert (s.Activity(settle.Phase.Free, Pop(1)).Get(0, 3) - 10.0).Abs() < 1e-3 / (1.0 - 0.9)
+    # a warm start from it needs none
+    assert s.Settle(settle.Phase.Free, settle.Budget(128, 6.25e-4)).Sweeps == 0
+}
+
+test System.Settle "a refusal: a budget too small ends unconverged, with the sweeps it took" {
+    s := System<F64>.tight(4, 0.9)
+    out := s.Settle(settle.Phase.Free, settle.Budget(10, 1e-3))
+    assert not out.Converged and out.Sweeps == 10 and not out.Diverged()
+    s.Weights(Conn(1)).Fill(1e300)
+    s.Reset(settle.Phase.Free)
+    assert s.Settle(settle.Phase.Free, settle.Budget(20, 1e-3)).Diverged()
+}
+
+# x (20 inputs) -> a (24 tanh) <-> b (16 tanh) <-> y (6, cross-entropy in two groups) with every wiring: a dense input,
+# a reciprocal sparse block, a low-rank one, a lateral tiled block, an event-driven feedback, a symmetric readout; F32,
+# batch rows (130: three chunks a phase, the last short) and threads as given
+fn System<T>.mixed(batch I64, threads I64) System<T> {
+    r := rand.Rand(5)
+    s := System<T>(batch, threads)
+    root := s.Root()
+    x := s.Population(root, "x", 20, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    a := s.Population(root, "a", 24, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    b := s.Population(root, "b", 16, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 6, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.CrossEntropy(0.25, 2)))
+    s.Connect(x, a, conn.Wiring.Dense)
+    s.Connect(a, b, conn.Wiring.Csr(0.4), reciprocal = true)
+    s.Connect(a, b, conn.Wiring.LowRank(3))
+    s.Connect(a, a, conn.Wiring.Tiles(8, 0.6), reciprocal = true)
+    s.Connect(b, a, conn.Wiring.Events(1e-5))
+    s.Connect(b, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for i in range batch * 20: s.Pop(x).Drive[i] = T(r.Uniform(-1.0, 1.0))
+    for i in range batch * 2: s.Pop(y).Labels[i] = I32(r.Below(3))
+    for i in range 46: s.E.Params[s.Pop(a).Bias + i] = T(r.Uniform(-0.1, 0.1))
+    s.Certify(0.9)
+    return s
+}
+
+# a and b's state, every phase, against another's: the same bit for bit
+fn sameState<T>(p System<T>&, q System<T>&) Bool {
+    for i in range 1, 4 {
+        u := p.State<neuron.RateCell<T>>(Pop(i))
+        v := q.State<neuron.RateCell<T>>(Pop(i))
+        if u.U != v.U or u.S != v.S: return false
+    }
+    return true
+}
+
+test System.Settle "Jacobi sweeps in tasks equal one thread bit for bit, free and nudged, every wiring" {
+    one := System<F32>.mixed(130, 1)
+    free := one.Settle(settle.Phase.Free, settle.Budget())
+    nudged := one.Nudged(settle.Budget())
+    assert free.Converged and nudged.Converged, "free " $free " nudged " $nudged
+    for threads in range 2, 5 {
+        s := System<F32>.mixed(130, threads)
+        assert s.Settle(settle.Phase.Free, settle.Budget()).Sweeps == free.Sweeps
+        assert s.Nudged(settle.Budget()).Sweeps == nudged.Sweeps
+        assert sameState(one, s), $threads " threads"
+    }
+}
+
+test System.Nudged "the nudged phases start from the free fixed point: +beta lowers the cost, -beta raises it" {
+    s := System<F64>.mixed(4, 2)
+    s.Settle(settle.Phase.Free, settle.Budget(256, 1e-9))
+    free := s.Loss(settle.Phase.Free)
+    out := s.Nudged(settle.Budget(256, 1e-9), 0.5)
+    assert out.Converged and s.NudgeOf(settle.Phase.Plus) == 0.5 and s.NudgeOf(settle.Phase.Minus) == -0.5
+    assert s.Loss(settle.Phase.Plus) < free and s.Loss(settle.Phase.Minus) > free
+    # a small nudge moves the state by O(beta): the plus and minus phases straddle the free one
+    s.Nudged(settle.Budget(256, 1e-12), 1e-3)
+    p, f, m := s.Activity(settle.Phase.Plus, Pop(3)), s.Activity(settle.Phase.Free, Pop(3)), s.Activity(settle.Phase.Minus, Pop(3))
+    for j in range 6 {
+        d := (p.Get(1, j) - f.Get(1, j)) + (m.Get(1, j) - f.Get(1, j))
+        assert d.Abs() < 1e-5 and (p.Get(1, j) - f.Get(1, j)).Abs() < 1e-2
+    }
+}

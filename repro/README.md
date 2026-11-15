@@ -16,6 +16,8 @@ where the library changed) so each builds or fails as its header says.
 | `nestedtry.olang` | no longer a limitation | a `try` takes the whole expression after it (E24): `try entry["shape"].AsArr() catch { ... }` covers the lookup and the conversion with one clause. The old nested form still gets R9, as the spec says |
 | `resultgrowth.olang` | fixed | resident memory stays flat over 4 000 000 calls (1720 kB before, 1792 kB after); O26a no longer moves the unrelated local into the result scope |
 | `variadicat.olang` | reproduces (new) | E31: a variadic `At(idx ...I64)` is the operator for one index only; `x[i, j]` is an error. An N-d tensor (rank known at run time) cannot declare `t[i, j]` for every rank |
+| `traittype.olang` | reproduces (new) | a trait method's signature naming a type not in scope (its module not imported) is not reported; a generic calling it through `any` then fails in lowering ("an unknown type ... a local"). Expected M22 at the trait |
+| `colfields.olang` | reproduces (new) | `Columns<C>.Fields` is empty when C's fields are lower case, even in C's own module, so a generic cannot reach a column by reflection; capitalized fields work (dyn's cells are capitalized for it) |
 | `tryindex.olang` | fixed | builds and runs: `try` no longer makes an array index inside its operand a checked one (indexing is unchecked, `try a.Get(i)` the checked form) |
 
 The `Status` line in each file's header repeats the row.
