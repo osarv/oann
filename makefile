@@ -5,7 +5,7 @@
 OLANG ?= ../olang/build/olang
 
 # every module with test blocks
-TESTS = linalg.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
+TESTS = linalg.olang tensor.olang kernels/mat.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
