@@ -505,6 +505,48 @@ within the machine's noise and none of it is in `nn/` - the fill, clip and optim
 (old: 1.8). A quiet-machine repeat is open. 2,000 steps took 1,102 s (F32) and 824 s (BF16) at that load, resident memory
 flat. A sample after the run reads as round 2's did, 2,254 characters a second through the key-value cache (BF16 run).
 
+**As built (C1, 2026-11-15).** `models/`, `nn/quant.olang`, `examples/` (`models/README.md`, `examples/README.md`). Where the
+build departs from the sketch, and why:
+
+1. **A model is a config, its layers, and the handles the loops take.** `MlpConfig`/`Mlp`, `CnnConfig`/`Cnn`,
+   `GptConfig`/`Gpt`, `SsmConfig`/`Ssm`: `New(g, config)` registers the layers before `Plan`; `Logits`, and `Task` (a
+   classifier's input, classes, logits and loss) or `Lm` (a language model's tokens, targets, logits and loss) record the
+   forward pass and give `nn/train`'s `Classifier` or `LanguageModel`. `GptConfig.Params()` and `SsmConfig.Params()` count a
+   model's parameters from the config (a test holds them to the graph's `ParamCount`), which is how the 10 million of M13
+   were sized. `Gpt` has the sketch's `Rope` (default false here, GPT-2's learned positions - round 2's number needs them)
+   and adds `Rms`, `Gated`, `Dropout`; it registers its parameters in `train.LanguageModel.Gpt`'s order, so one seed gives
+   the same parameters and a checkpoint loads into either (a test). The sketch's `Head` field is the tied embedding or one
+   of its own. There is no `settle` or `hybrid` model file: the settling models are `dyn` systems (examples/xor_*,
+   mnist_learn), the hybrid is C2's.
+2. **`Ssm` takes either scan block.** `SsmConfig.Kind` is `Mixer.Mamba` (`layers.SsmBlock`) or `Mixer.Delta`
+   (`layers.DeltaBlock`); a block is half a transformer block's parameters (6 D^2 against 12 D^2), so M13's SSM has 9 blocks
+   of 384 (10.2 million) where the GPT has 5 layers of 384 (10.4 million). Generation is `generate.Rerun` (a scan keeps no state
+   between forwards).
+3. **`nn/quant.olang` on the graph and on tensors.** `Weights` (per output row, in GemmI8's layout, with each row's sum),
+   `Range` and the U8 mapping (a tensor with no negatives takes all 256 levels, else symmetric about 128), and `Model`: dense
+   layers, convolutions (the images quantized once, patches copied as bytes in [ky][kx][c] order, the zero point at the
+   edges) and max pooling read from a trained graph's values by `Dense(g, layer, relu)`, `Conv`, `Pool`, `Model.Mlp`
+   (each model has an `Int8(g, batch)`), run on plain arrays by `Forward(n, x, y)` through buffers of its own - nothing
+   allocated after the first call; `Calibrate` and `Static` for ranges calibrated once; `Bytes`. `Quantize(g)` is the graph's
+   own hook (every `Linear` node in INT8, a transformer's key-value decoding unchanged), `Dequantize(g)` undoes it,
+   `LinearBytes(g)` counts. The old module's tile and its profile hooks are gone: the product is `GemmI8`, and `Model`'s
+   per-layer profile is not carried over.
+4. **`GemmI8` takes the weights' row sums.** It subtracted `zero * rowSum(b, j)` by summing every weight row on each call -
+   a second read of all the weights, which at batch 1 was a third of the product - so it now reads none when the zero point
+   is 0 (an image's pixels, ReLU's outputs) and takes `sums` where the caller has them (`Weights.Sum`): one more optional
+   argument, a test holds the result bit for bit.
+5. **A bug in the graph, found by the SSM at 64 tokens and over.** `selectiveKeep` counted the states a selective scan keeps
+   as `B * (T + 63) / 64`, not `B * ((T + 63) / 64)`: a context of 64 or more and a batch of 16 put the scan's gradient
+   accumulator past the end of what `Plan` laid out, and `Backward` wrote over its neighbours (a segmentation fault or "slice
+   bounds out of range", different on every run; the tests' contexts of 6 to 40 never reached it). Fixed in `ad/graph`; a test in
+   `models/ssm` trains 16 sequences of 64, 100 and 130 tokens and fails without the fix.
+6. **Examples.** `bench/charlm_nn` is `examples/charlm` (the old example, on the old modules, is replaced), through
+   `models/gpt`; `charlm_sample`, `charlm_int8`, `bpelm`, `mnist_mlp` (AdamW, the input projection, SGD; F32 and BF16),
+   `mnist_cnn` and `mnist_int8` are on `models/`, `nn/` and `ad/`; `mnist_learn`, `xor_settle` and `xor_spiking` on `dyn`
+   and `nn/optim`; new: `charlm_ssm` (the SSM on tiny Shakespeare) and `tinystories` (M13). `bench/int8` measures `nn/quant`
+   against `kernels/gemm`. Still on `circuit`, `board`, `agent` and `consolidator`, for C3: `mnist_settle` (superseded by
+   `mnist_learn`), `mnist_board`, `bandit_settle`, `sleep_retention`, `nights`.
+
 ### 1.6 Data: `data/*.olang`
 
 `datasets/` and `tokenizer.olang` moved as they are (`Dataset` trait, `Loader<D>`, IDX, MNIST, characters, byte-level
