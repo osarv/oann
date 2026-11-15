@@ -30,6 +30,7 @@ import "../ad/graph"
 import "../kernels/mat"
 import "../kernels/elem"
 import "../kernels/gemm"
+import "../io/checkpoint"
 
 # what a training loop asks of an optimizer: a step from the gradients the last Backward left, and the learning rate to
 # take the next one with - a schedule's
@@ -147,6 +148,27 @@ fn (o mut AdamW<A, G>&) Step() {
     }
 }
 
+# the moments and the step count added to a checkpoint as "adam.m", "adam.v" and the metadata "adam.steps" - what a run
+# needs to resume where it stopped
+fn (o AdamW<A, G>&) Save(w mut checkpoint.Writer&) ? checkpoint.SafetensorsError {
+    try w.Add("adam.m", tensor.Tensor<A>.Over(o.M, 0, o.M.Len())!)
+    try w.Add("adam.v", tensor.Tensor<A>.Over(o.V, 0, o.V.Len())!)
+    w.Meta("adam.steps", $o.Steps)
+}
+
+# the state Save wrote, read back from a file (the same region, so the same sizes)
+fn (o mut AdamW<A, G>&) Load(f checkpoint.File&) ? checkpoint.SafetensorsError, tensor.ShapeError {
+    try f.Read("adam.m", tensor.Tensor<A>.Over(o.M, 0, o.M.Len())!)
+    try f.Read("adam.v", tensor.Tensor<A>.Over(o.V, 0, o.V.Len())!)
+    o.Steps = try steps(f, "adam.steps")
+}
+
+# the integer metadata "key" of a checkpoint
+fn steps(f checkpoint.File&, key String&) I64 ? checkpoint.SafetensorsError {
+    text := try f.Meta.Get(key) catch { error checkpoint.SafetensorsError.Missing($key) }
+    return try text.ParseInt() catch { error checkpoint.SafetensorsError.Malformed }
+}
+
 # the AdamW update of p[lo:hi] from the gradients gr, the moments m and v laid out as p: keep is 1 - rate decay, step
 # the rate over the first moment's correction, root one over the square root of the second's. Computed in p's type,
 # the gradients widened into it
@@ -187,6 +209,15 @@ fn (o mut Sgd<A, G>&) Step() {
         l2 A = A(o.Decay) if r.Decay else A(0.0)
         sgdRun(o.p, o.gr, o.U, r.Lo, r.Hi, rate, mu, l2, o.Momentum != 0.0, o.Nesterov)
     }
+}
+
+# the momentum added to a checkpoint as "sgd.u" (nothing without momentum)
+fn (o Sgd<A, G>&) Save(w mut checkpoint.Writer&) ? checkpoint.SafetensorsError {
+    if o.U.Len() > 0: try w.Add("sgd.u", tensor.Tensor<A>.Over(o.U, 0, o.U.Len())!)
+}
+
+fn (o mut Sgd<A, G>&) Load(f checkpoint.File&) ? checkpoint.SafetensorsError, tensor.ShapeError {
+    if o.U.Len() > 0: try f.Read("sgd.u", tensor.Tensor<A>.Over(o.U, 0, o.U.Len())!)
 }
 
 # the SGD update of p[lo:hi] from the gradients gr (plus l2 p), with momentum mu in u laid out as p when momentum
