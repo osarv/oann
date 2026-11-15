@@ -547,6 +547,45 @@ build departs from the sketch, and why:
    against `kernels/gemm`. Still on `circuit`, `board`, `agent` and `consolidator`, for C3: `mnist_settle` (superseded by
    `mnist_learn`), `mnist_board`, `bandit_settle`, `sleep_retention`, `nights`.
 
+**Measured (C1; a 4-core machine shared with other agents, load average 7 to 15 throughout, one thread unless said - wall
+times are inflated by an unknown factor, so every speed is a ratio taken in one run, and every number is seed 1).**
+
+Round 2's numbers, reached (the models' accuracy and loss do not depend on the load):
+
+| model | number | round 2 | here |
+|---|---|---|---|
+| MLP 784-128-10, 10 epochs, AdamW (M1) | test accuracy | 97.73% (DESIGN 8) | **97.73%** F32, **97.74%** BF16 (`examples/mnist_mlp`) |
+| CNN 16/32 channels, epochs 1, 2, 3 | test accuracy | 96.97, 97.78, 98.44% (DESIGN 16) | **97.29, 97.93, 98.48%**; resident memory flat at 110 432 kB over all three (round 2's grew 450 kB an epoch) |
+| character GPT, 2000 steps (M3) | validation loss, nats a character | 1.8063 (DESIGN 11) | **1.7961**, every report of the curve (2.3946, 2.2136, 2.0800, 2.0027, 1.9550, 1.8708, 1.8156) the same to four digits as B3's `nn/` run: `models/gpt` is `train.LanguageModel.Gpt`'s model |
+| character SSM, 2000 steps, 8 Mamba blocks of 128 (0.93 M parameters against the GPT's 0.81 M; no round 2) | validation loss | - | **1.5725** against the GPT's 1.7961 (1.6300 against 1.8708 at step 1500); 1.48 s a step against the GPT's 0.52 |
+
+INT8 (M12; `examples/mnist_int8`, `charlm_int8`, `bench/int8`; accuracy and memory are what the old `quant.olang` had, speed is
+reported against the F32 graph run in the same process):
+
+| | F32 | INT8 dynamic | INT8 static | same class as F32 | parameters F32 / INT8 |
+|---|---|---|---|---|---|
+| 784-128-10, 5 epochs | 96.99% | 97.01% | 97.00% | 99.98% / 99.97% | 407 080 / 103 288 B (3.94x) |
+| CNN, 2 epochs | 97.93% | 97.93% | 97.94% | 99.96% / 99.97% | 81 960 / 21 128 B (3.88x) |
+| character GPT, validation loss | 1.7961 | 1.7964 | - | - | linear weights 3 145 728 / 804 864 B (3.91x) |
+
+| samples a second | batch 1 | batch 64 | batch 128 |
+|---|---|---|---|
+| perceptron F32 | 134 411 | 53 911 | 57 518 |
+| perceptron INT8 dynamic / static | 188 407 / 185 357 (1.40x / 1.38x) | 74 852 / 73 340 (1.39x / 1.36x) | 64 687 / 69 947 (1.12x / 1.22x) |
+| CNN F32 | 4 973 | 4 972 | 5 109 |
+| CNN INT8 dynamic / static | 4 820 / 5 079 (0.97x / 1.02x) | 4 697 / 4 717 (0.94x / 0.95x) | 4 710 / 4 891 (0.92x / 0.96x) |
+
+The perceptron's INT8 speedup at batch 1 is 1.4x where round 2 had 3.1x: the F32 side got faster (the graph's batch-1
+product is `Gemv`: 7.4 us for a forward against round 2's 26), the INT8 side did not slow down - at the same minutes the
+old `quant.olang`'s forward ran 3.9 us against this one's 5.3 (load 14, one run each). At batch 64 and 128 INT8 is now ahead of
+F32 (round 2: 0.8-1.0x). The CNN is the loss: round 2's 1.13-1.29x is 0.92-1.02x here, because the F32 convolution no
+longer builds a patch matrix (kernels/conv's `GemmLeft`) while the INT8 one still copies its patches as bytes and packs them -
+an implicit-patch `GemmI8` is the open item. The transformer (`charlm_int8`, 10 batches of 16 x 64): a forward over 1024
+characters F32 147 ms, INT8 141 ms (1.04x; round 2: 0.82x), 500 characters through the key-value cache F32 2963 a second,
+INT8 3330 (1.12x; round 2: 2.1x, F32 2800 a second) - an F32 decode about as fast as round 2's, an INT8 one slower, not looked into
+(a decoding step's linear layers are one row each; the cache, norms and head are F32). A product alone (`bench/int8`, 1 x 784 x 128, load 10): F32
+12.3 us, INT8 dynamic 11.3, static 8.5; at 1 x 1024 x 1024 INT8 is 2.9x (round 2: 4.2x); the 128-row products are 1.1-1.5x.
+
 ### 1.6 Data: `data/*.olang`
 
 `datasets/` and `tokenizer.olang` moved as they are (`Dataset` trait, `Loader<D>`, IDX, MNIST, characters, byte-level
