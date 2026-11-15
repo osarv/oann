@@ -1242,4 +1242,75 @@ if TestBuild {
         bi.Fill(2)
         assert (try ai @ bi).Get(0, 0) == I32.Max * 2 + I32.Max * 2
     }
+
+    test Tensor.Str "rendering like numpy's, equality by shape and elements, a hash that agrees" {
+        m := Tensor<F64>.counting(2, 2)
+        assert $(try m + 0.5) == "[[0.5, 1.5],\n [2.5, 3.5]]"
+        long := Tensor<F64>.counting(12, 1)
+        assert $long == "[[0],\n [1],\n [2],\n ...,\n [9],\n [10],\n [11]]"
+        assert $Tensor<F64>.counting(12) == "[0, 1, 2, ..., 9, 10, 11]" and $Tensor<I32>.Zeros() == "0" and $Tensor<I32>.Zeros(0) == "[]"
+        assert $Tensor<F64>.counting(2, 2, 2) == "[[[0, 1],\n  [2, 3]],\n\n [[4, 5],\n  [6, 7]]]"
+        t := Tensor<F64>.counting(2, 3)
+        tt := try t.Permute(1, 0)
+        assert $tt == "[[0, 3],\n [1, 4],\n [2, 5]]"
+        assert t == t.Clone() and t != (try t * 2.0) and t != Tensor<F64>.counting(3, 2) and t != Tensor<F64>.counting(6)
+        assert tt == (try t.Permute(1, 0)) and tt == tt.Clone() and tt != t.Clone().Reshape(3, 2)!
+        assert t.Hash() == t.Clone().Hash() and tt.Hash() == tt.Clone().Hash() and t.Hash() != tt.Hash()
+        z := Tensor<F32>.Zeros(1)
+        nz := Tensor<F32>.Zeros(1)
+        nz.Fill(F32(-0.0))
+        assert z == nz and z.Hash() == nz.Hash()
+        nan := Tensor<F32>.Zeros(1)
+        nan.Fill(F32(NaN))
+        assert nan != nan
+        assert Tensor<F8E4M3>.Zeros(2) == Tensor<F8E4M3>.Zeros(2) and Tensor<F8E5M2>.Zeros(2).Hash() == Tensor<F8E5M2>.Zeros(2).Hash()
+    }
+
+    test Tensor.FillNormal "random fills are reproducible from the seed, drawn in row-major order of the view" {
+        r := rand.Rand(42)
+        a := Tensor<F32>.Zeros(100, 100)
+        a.FillNormal(r, 1.0, 2.0)
+        mean := a.Sum() / 10000.0
+        dev := (try a - mean).Mapped(fn(x) { return x * x }).Sum() / 10000.0
+        assert mean > 0.9 and mean < 1.1 and dev > 3.8 and dev < 4.2
+        again := rand.Rand(42)
+        b := Tensor<F32>.Zeros(100, 100)
+        b.FillNormal(again, 1.0, 2.0)
+        assert a == b
+        u := Tensor<F64>.Zeros(50, 50)
+        u.FillUniform(r, -1.0, 3.0)
+        assert u.Min()! >= -1.0 and u.Max()! < 3.0 and u.Sum() / 2500.0 > 0.9 and u.Sum() / 2500.0 < 1.1
+        # filling a transposed view draws in the view's order: its rows are the columns of the storage
+        s1 := rand.Rand(3)
+        s2 := rand.Rand(3)
+        plain := Tensor<F64>.Zeros(3, 4)
+        plain.FillUniform(s1, 0.0, 1.0)
+        stored := Tensor<F64>.Zeros(4, 3)
+        view := try stored.Permute(1, 0)
+        view.FillUniform(s2, 0.0, 1.0)
+        assert view == plain and stored != plain
+        h := Tensor<BF16>.Zeros(8)
+        h.FillNormal(rand.Rand(1), 0.0, 1.0)
+        assert h.To<F64>().Max()! != 0.0
+    }
+
+    test Tensor.Zeros "empty tensors, rank 0 and rank 6: the walks, the reductions and the views hold" {
+        e := Tensor<F32>.Zeros(0, 3)
+        e.Fill(1.0)
+        assert e.Count() == 0 and e.Sum() == 0.0 and (try e + e).Count() == 0 and e == e.Clone() and $e == "[]"
+        failed := false
+        try e.Max() catch ShapeError.Mismatch { failed = true }
+        assert failed
+        s := Tensor<I32>.Zeros()
+        s.Set(5)
+        assert s.Get() == 5 and s.Sum() == 5 and (try s + s).Get() == 10 and s.Count() == 1
+        six := Tensor<I32>.Zeros(1, 2, 1, 3, 1, 2)
+        assert six.Dims.Rank == 6 and six.Count() == 12 and six.Strides == Shape.Of(12, 6, 6, 2, 2, 1)
+        six.Fill(2)
+        p := try six.Permute(5, 4, 3, 2, 1, 0)
+        assert p.Dims == Shape.Of(2, 1, 3, 1, 2, 1) and (try p + six.Permute(5, 4, 3, 2, 1, 0)).Sum() == 48
+        folds := true
+        try p.Rows() catch ShapeError.Mismatch { folds = false }
+        assert not folds and (try p.Clone().Rows()).Dims == Shape.Of(12, 1)
+    }
 }
