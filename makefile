@@ -119,9 +119,10 @@ int8bench:
 	$(OLANG) build -output build/bench_int8 bench/int8.olang
 	./build/bench_int8 $(ARGS)
 
-# an epoch's time against C over OpenBLAS (bench/epoch.sh)
+# an epoch's time against C over OpenBLAS (bench/epoch.olang)
 epoch:
-	OLANG=$(OLANG) bench/epoch.sh
+	$(OLANG) build -output build/bench_epoch bench/epoch.olang
+	OLANG=$(OLANG) ./build/bench_epoch
 
 clean:
 	rm -rf build
