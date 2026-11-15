@@ -6,8 +6,8 @@
 # rules step the parameters. docs/redesign.md section 1.4 is the design, docs/settling.md the model.
 #
 # A child module reads its own signals first, then its parent's (Read): the global "how it went" flows down, each rule's
-# "what happened" stays local. The rules' code is dyn/learn's: Attach records a rule on a clock, Rules lists a clock's,
-# and learn.Tick runs them.
+# "what happened" stays local. The rules' code is dyn/learn's: Attach records a rule on a clock, AttachedAt reads them
+# back, and a learn.Learner's Tick runs a clock's.
 #
 # Structure may change while running (docs/redesign.md section 3, decision 3): a connection's weights are masked in
 # place (Prune), a sparse one's masked entries dropped in place (Compact), a population's units retired (Retire) - the
@@ -34,7 +34,7 @@ type Sig I64
 # the clocks rules run on: inside a settle, per sample or moment, per episode, in sleep
 type Clock enum { Sweep, Step, Episode, Sleep }
 
-# learning and adaptation as rules on a module (run by dyn/learn)
+# learning and adaptation as rules on a module (run by dyn/learn's Learner)
 type Rule enum {
     Ep(beta F64, centered Bool)                     # contrast of nudged phases into ParamGrads
     ThreeFactor(signal Sig, decay F64, rate F64)    # eligibility trace x the module's signal
@@ -104,27 +104,30 @@ fn (s mut System<T>&) Connect(pre Pop, post Pop, w conn.Wiring, frozen Bool = fa
     return Conn(s.E.Links.Len() - 1)
 }
 
-# a signal of width values in module m, zero until Set
+# a signal of width values in module m, zero until Set (declared after Plan, the signals' room grows to hold it)
 fn (s mut System<T>&) Signal(m Mod, name String&, width I64 = 1) Sig {
     at I64 = 0
     for g in s.sigs: at += g.Width
     s.sigs.Push(sigRec(I64(m), name, width, at))
+    if s.Planned: s.signals = Array<T>[s.signals[i] if i < at else T(0) for i in range at + width]
     return Sig(s.sigs.Len() - 1)
 }
 
-# a rule on module m, run on clock c (by learn.Tick)
+# a rule on module m, run on clock c (by learn.Learner's Tick)
 fn (s mut System<T>&) Attach(m Mod, r Rule, c Clock) {
     s.rules.Push(ruleRec(I64(m), r, c))
 }
 
-# a rule as attached: where and what
-type Attached struct(Where Mod, What Rule) { Where, What }
+# a rule as attached: where, what, and the clock it runs on
+type Attached struct(Where Mod, What Rule, When Clock) { Where, What, When }
 
-# the rules on clock c, in the order attached, with their modules
-fn (s System<T>&) Rules(c Clock) Iterator<Attached> {
-    for g in s.rules {
-        if g.When == c: yield Attached(Mod(g.In), g.What)
-    }
+# how many rules are attached
+fn (s System<T>&) Attachments() I64 { return s.rules.Len() }
+
+# the rule attached i-th (learn.Learner.Tick walks them, running a clock's in the order attached)
+fn (s System<T>&) AttachedAt(i I64) Attached {
+    g := s.rules[i]
+    return Attached(Mod(g.In), g.What, g.When)
 }
 
 # ---- the plan ----
@@ -268,6 +271,22 @@ fn (s System<T>&) Read(m Mod, name String&) tensor.Tensor<T> ? SignalError {
         at = s.mods[at].Parent
     }
     error SignalError.Missing(name)
+}
+
+# signal sig's values, a view (what a rule given the signal's handle reads)
+fn (s System<T>&) Value(sig Sig) tensor.Tensor<T> {
+    g := s.sigs[I64(sig)]
+    return tensor.Tensor<T>.Over(s.signals, g.At, g.Width)!
+}
+
+# whether population p is in module m or in a module under it (the populations a rule attached to m reaches)
+fn (s System<T>&) Within(p Pop, m Mod) Bool {
+    at := s.pops[I64(p)].In
+    for at >= 0 {
+        if at == I64(m): return true
+        at = s.mods[at].Parent
+    }
+    return false
 }
 
 # ---- settling ----
@@ -839,6 +858,10 @@ test System.Read "a module reads its own signal first, then its parent's" {
     assert s.Read(child, "reward")!.Get(0) == 1.0 and s.Read(s.Root(), "reward")!.Get(0) == 2.0
     assert s.Read(child, "arousal")!.Get(1) == 4.0
     assert not has(s, child, "nothing") and has(s, child, "arousal")
+    # a signal declared after the plan: room is made, the others keep their values
+    late := s.Signal(child, "late")
+    s.Set(late, tensor.Tensor<F32>.Of(Array<F32>[5.0], 1)!)!
+    assert s.Value(late).Get(0) == 5.0 and s.Read(child, "arousal")!.Get(1) == 4.0 and s.Value(mine).Get(0) == 1.0
 }
 
 # the resident set, in pages, from /proc
@@ -917,4 +940,21 @@ test System.Settle "a spiking system settles to its rate model's equilibrium, fr
     plus := a.Activity(settle.Phase.Plus, Pop(2))
     free := a.Activity(settle.Phase.Free, Pop(2))
     assert (plus.Get(0, 0) - 0.15).Abs() <= (free.Get(0, 0) - 0.15).Abs() + 2.0 / F64(window)
+}
+
+test System.Retire "a system with a retired unit converges, free and nudged, the unit at rest" {
+    a := System<F64>.mixed(3, 1)
+    a.Retire(Pop(1), 2)
+    a.Retire(Pop(3), 0)
+    out := a.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    assert out.Converged, $out
+    nudged := a.Nudged(settle.Budget(256, 1e-10))
+    assert nudged.Converged, $nudged
+    for row in range 3: assert a.Activity(settle.Phase.Free, Pop(1)).Get(row, 2) == 0.0 and a.Activity(settle.Phase.Plus, Pop(3)).Get(row, 0) == 0.0
+    # before the fix a retired unit's residual was its total against its zeroed state: never within the tolerance
+    assert out.Sweeps < 64 and nudged.Sweeps < 64
+    # a retired spiking unit does not keep its system from converging either
+    s := System<F64>.lifty(neuron.Neuron.Lif(0.1, 1.0, 0.1, 400))
+    s.Retire(Pop(1), 1)
+    assert s.Settle(settle.Phase.Free, settle.Budget(40 * 400, 2.0 / 400.0)).Converged
 }

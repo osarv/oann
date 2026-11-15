@@ -363,6 +363,65 @@ settle): 6.7 against 10.5 us a sweep at batch 1, 328 against 234 us at batch 128
 time on these shapes), and dyn's settles in four tasks are slower than one thread on this loaded machine (two units
 a sweep, one of them tiny; a join's wake-up costs more than its share).
 
+**As built (B2b, 2026-11-15).** `dyn/learn.olang`, `dyn/energy.olang`, `examples/mnist_learn.olang` (`make mnistlearn`).
+Where the build departs from the sketch and B2a's notes, and why:
+
+1. **A `learn.Learner<T>(s)` runs the rules**, made after `Plan` and after the rules are attached (`? LearnError`
+   before a plan): `l.Tick(clock)`, not `learn.Tick(s, clock)` - rules keep state (an eligibility trace per three-factor
+   rule) and every rule, lesson and gradient works in room laid out once for the planned system, which the learner
+   holds. `l.Lesson(m, beta, centered = true)` and `l.Contrast(m, beta, centered)` are callable without attaching.
+2. **`System.Rules(c)` is gone**: the generator was refused once instantiated (D18c/T22a: it yields an enum one case of
+   which holds `any Update&`; `repro/genref.olang`), so `Attachments()` and `AttachedAt(i)` read the rules back and
+   `Attached` gained its `When`. `System.Value(sig)` (a signal by handle) and `Within(p, m)` (a population in a module's
+   subtree) were added for the rules; a signal declared after `Plan` now gets room (it indexed past the signals).
+3. **Rules.** `Ep(beta, centered)` on a clock is a whole lesson (free settle, nudged phases side by side, the contrast
+   into `ParamGrads` for the connections into the module's populations and their biases); the optimizer steps after
+   the tick. A refused phase raises `NotSettled` and leaves the gradients as they were. `ThreeFactor(signal, decay,
+   rate)`: e <- decay e + the local term - EP's contrast of the last nudge (centered where the minus phase was nudged
+   by -beta), else the free phase's Hebbian coincidences - then rate m e into the parameters, or G = -m e for an
+   optimizer when rate is 0 (m the signal's first value; traces masked with the pruned weights, `Clear()` after a
+   compaction). `Homeostasis(target, rate)`: a spiking population's `Theta` per unit (every row, both buffers), a rate
+   population's biases. `DeltaWrite(c, gate)`: dense and symmetric connections only (`Unsupported` otherwise). The
+   settle runs no rule itself: a `Sweep`-clock rule is ticked by the program between settles of one sweep.
+4. **`ImplicitGrad(out, dz, how, inp, dx) Settlement`**: dz is dL/ds of one population's activities, dx the gradient
+   in another population's drive (an input's through rho' and the connections out of it); `ParamGrads` is written, not
+   added to. Exact solves the adjoint by a fixed-point iteration at the system's step (`l.Adjoint` says how it went);
+   JFB takes lambda = rho'(u) dz; EP nudges through out's drive by -+beta dz (the readouts' forces off meanwhile; three
+   phases needed) and settles the free phase again afterwards so its constant is folded back. Rate systems only: a
+   spiking or custom one is refused (`Dynamics.RelaxVjp` is not used).
+5. **`Energy<E>`**: the state z is one batch row's activities (`StateOf`: every unit at its `Unit`), an `Array<T>`, not
+   a `Tensor<F32>`; terms are generic over T and supply `Value`, `AddGrad`, `AddParamGrad` (needs, not a trait);
+   `Descend` is a step of gradient flow. E's fields must be capitalized (a struct's private fields are not in
+   `T.Fields` outside its module). Built-in terms: `Potential.Of(s, p)` (G' = rho^-1), `Bilinear.Of(s, c)` (dense and
+   symmetric connections), `Linear.Bias(s, p)`, `Linear.Constant(s, p, row)`, `Squared`, `LogSumExp` (a Hopfield
+   log-sum-exp). `energy.Of(s, phase, row)` evaluates a rate system's energy in the potentials (circuit's form) - a
+   diagnostic that makes its own room; `Settlement` stays without an energy.
+6. **Allocation-free, pinned while compiling**: a contrast's differences and bias sums, the feature-major
+   transposition, a trace's decay and step, the homeostatic moves, a delta write's error and mask, the slopes, an
+   adjoint's step, a nudge through the drive; an energy's value, gradient, parameters' gradient and descent (the walk
+   over E's fields unrolled, every built-in term). Not pinnable, as in B2a: every product (gemm's workspace grows on its
+   first products), a sparse form's sampled product (the kernel's join), a lesson's settles, a custom rule (`any
+   Update&`). Resident memory is flat over 300 moments of a lesson, Adam, a tick (three factors, homeostasis) and an
+   exact implicit gradient (test).
+7. **Fixed in B2a's files on the way**: every event-driven connection used collector 0 (`Link.Index` was never set) -
+   two of them in one system shared one; a retired unit's residual compared its total with its zeroed state, so a
+   system with one never converged (found by B4) - its total is now held at its potential.
+
+Measured (tests in `dyn/learn.olang`, `dyn/energy.olang`): the centered contrast against central differences of the
+cost, relative error 1.6e-2, 1.6e-4, 1.6e-6 at beta 0.1, 0.01, 0.001 (beta^2), uncentered 0.12, 0.013, 0.0014 (beta);
+the exact implicit gradient against central differences 1.2e-10, EP at 1e-3 against it 6.8e-8, JFB's cosine with it
+0.996 (every reciprocal wiring); the contrast written is its definition for every wiring to 1e-13; XOR with rate
+neurons 4/4 right, cost 1.4e-4 after 300 lessons at 9.2 sweeps a lesson (circuit: 9.6e-5 after 400, 9 sweeps); with
+spiking neurons (window 256) 4/4, cost 1.4e-6, 643 steps a lesson (circuit's three settles: about 1 080); a contextual
+bandit by three factors 100 of the last 100 moments rewarded; an energy of three terms against central differences
+below 1e-8, a settled symmetric system its stationary point. **M8** (`make mnistlearn ARGS=10`, 784-128-10, F32,
+batch 32, Adam 1e-3, beta 0.5, seed 1, one thread): 95.72, 96.50, 96.71, 96.71, 97.15, 97.49, 97.36, 97.42, 97.74,
+**97.77%** after ten epochs (circuit's run: 97.48%), 30-34 sweeps a lesson (free, then both nudged side by side; no
+lesson refused but one), 12-18 an answer; an epoch 2.5 s against circuit's 5.4 s (examples/mnist_settle.olang, the
+same machine, three interleaved rounds of one epoch, medians, load 4.2-4.5), both at train loss 0.0696 after the first
+epoch (test 95.72% against 95.69%). Through the board (B4's M11 test, now taught by the Learner): 91.06% after three
+epochs, restrained to the certified set.
+
 ### 1.5 Models: `nn/*.olang`, `models/*.olang`
 
 `nn/` holds what models are built from: `layers.olang` (Dense, Mlp, Norm, AttentionBlock, SsmBlock, DeltaBlock,

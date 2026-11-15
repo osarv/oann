@@ -180,7 +180,9 @@ fn (e mut Engine<T>&) Ready() {
     }
     e.wideSc = conn.Scratch<T>(widest, e.Batch.Max(Chunk), rank)
     for l in e.Links {
-        if l.Kind == conn.Wiring.Events: e.wideSc.Ev.Push(sparse.Events(l.PreSize))
+        if l.Kind != conn.Wiring.Events: continue
+        l.Index = e.wideSc.Ev.Len()                 # its collector in every scratch
+        e.wideSc.Ev.Push(sparse.Events(l.PreSize))
     }
     most := e.Pops.Len() * e.Phases * ((e.Batch + Chunk - 1) / Chunk)
     e.units = Array<I64>(3 * most)
@@ -398,6 +400,7 @@ fn (e mut Engine<T>&) rateStep(p mut Population<T>&, r0 I64, r1 I64) T {
     model := p.Model
     if model != neuron.Neuron.Custom: return e.builtStep(p, r0, r1)
     b := p.rate(1 - e.cur)
+    if p.Retired > 0: rest(p, p.Total, r0, r1, false)
     worst := custom(model.d, p, b, r0, r1, e.step(r0 / e.Batch, e.damping))
     if p.Retired > 0: retire(p, b, r0, r1)
     return worst
@@ -410,6 +413,7 @@ fn (e mut Engine<T>&) builtStep(p mut Population<T>&, r0 I64, r1 I64) T {
     a := p.rate(e.cur)
     b := p.rate(1 - e.cur)
     n := p.Size
+    if p.Retired > 0: rest(p, a.U, r0, r1, true)
     worst := neuron.RateStep(model.rho, a.U, p.Total, b.U, b.S, r0 * n, r1 * n, T(e.step(r0 / e.Batch, e.damping)))
     if p.Retired > 0: retire(p, b, r0, r1)
     return worst
@@ -426,6 +430,18 @@ fn custom<T>(d mut any neuron.Dynamics&, p mut Population<T>&, b mut Columns<neu
             return T(worst)
         }
         case _ { unreachable "a custom model runs in a System<F32>" }
+    }
+}
+
+# the retired units of rows r0 .. r1 left out of the residual: their totals set to their potentials (held, built-in
+# models), or to zero (a custom model's drive) - a retired unit is at rest, so it never keeps a settle from converging
+fn rest<T>(p mut Population<T>&, u Array<T>&, r0 I64, r1 I64, held Bool) {
+    for r in range r0, r1 {
+        for j in range p.Size {
+            if p.Alive[j]: continue
+            i := r * p.Size + j
+            p.Total[i] = u[i] if held else T(0)
+        }
     }
 }
 
@@ -524,6 +540,7 @@ fn (e mut Engine<T>&) spikes(b Budget) Settlement {
 # `any Dynamics&`, which no fact sees through. Resident memory over many settles is measured instead (system.olang).
 
 fn builtStepOf(e mut Engine<F32>&, p mut Population<F32>&) F32 { return e.builtStep(p, 0, 1) }
+fn restOf(p mut Population<F32>&) { rest(p, p.Total, 0, 1, true) }
 fn lifStepOf(e mut Engine<F32>&, p mut Population<F32>&) F32 { return e.lifStep(p, 0, 1) }
 fn resetOf(e mut Engine<F32>&) { e.Reset(0) }
 fn warmOf(e mut Engine<F32>&) { e.Warm(1, 0) }
@@ -535,6 +552,7 @@ fn closedFormOf(e mut Engine<F32>&, p mut Population<F32>&) {
 }
 
 assert not builtStepOf.Allocates, "a rate population's step allocates"
+assert not restOf.Allocates, "holding retired units out of the residual allocates"
 assert not lifStepOf.Allocates, "a spiking population's step allocates"
 assert not resetOf.Allocates, "a cold start allocates"
 assert not warmOf.Allocates, "a warm start allocates"

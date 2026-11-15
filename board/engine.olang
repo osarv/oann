@@ -2397,6 +2397,7 @@ test "what the board cannot run is refused when lowering, saying why" {
 import "std/time"
 import "../data/loader"
 import "../data/mnist"
+import "../dyn/learn"
 
 # the test set answered on the board and by dyn in F32, by free settles: the board's accuracy, dyn's, the fraction of
 # samples both answer alike, and the sweeps a settle took on the board (a refused settle counts as wrong)
@@ -2440,31 +2441,19 @@ test "MNIST through the board (M11): a certified 784-128-10 taught at T = 0.25, 
     }
     data := try mnist.Mnist.Load("data/mnist", mnist.Source)
     batch I64 = 32
-    # the circuit that teaches (equilibrium propagation, as docs/settling.md 5.9 ran it: Adam 1e-3, beta 0.5, held in the
-    # certified set after every step) - dyn's learning rules replace it when they land
-    c := circuit.Circuit<F32>(batch)
-    cx := c.Input(784)
-    ch := c.Hidden(128)
-    cy := c.Readout(10, circuit.Cost.CrossEntropy(0.25))
-    c.Project(cx, ch, circuit.Wiring.OneWay)
-    c.Project(ch, cy)
-    cr := rand.Rand(1)
-    c.Plan(cr)
-    c.Certify(0.9)
-    # the system the board runs, and the engine lowered from it
+    # the system the board runs, taught by dyn's equilibrium propagation (learn.Learner: Adam 1e-3, beta 0.5, held in the
+    # certified set after every step, as docs/settling.md 5.9 ran it), and the engine lowered from it
     s := system.System<F32>(batch)
     x := s.Population(s.Root(), "pixels", 784, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
     h := s.Population(s.Root(), "hidden", 128, neuron.Neuron.Rate(neuron.Rho.Tanh))
     y := s.Population(s.Root(), "digits", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes(0.25)))
     s.Connect(x, h, conn.Wiring.Dense)
     s.Connect(h, y, conn.Wiring.Dense, reciprocal = true)
-    sr := rand.Rand(1)
-    s.Plan(sr)!
-    push(s, c)
+    s.Plan(rand.Rand(1))!
+    s.Certify(0.9)
+    l := learn.Learner<F32>(s)!
     e := Engine.Lower(s)!
-    opt := optim.FlatAdamW<F32>(c.ParamCount, 0.001)
-    lesson := circuit.Lesson(0.5)
-    classes := Array<I32>(batch)
+    opt := optim.FlatAdamW<F32>(s.E.Params.Len(), 0.001)
     trainSet := loader.Loader(data.Train, batch, 1)
     testSet := loader.Loader(data.Test, batch, 1, false)
     last F64 = 0.0
@@ -2472,15 +2461,14 @@ test "MNIST through the board (M11): a certified 784-128-10 taught at T = 0.25, 
         t0 := time.Now()
         trainSet.Epoch()
         for b in range trainSet.Batches() {
-            n := trainSet.Fill(b, c.DriveData(cx), classes)
-            for i in range n: c.LabelData(cy)[i] = classes[i]
-            taught := try c.Teach(n, lesson) catch circuit.NotSettled { } default -1
-            if taught < 0: continue
-            opt.Step(c.ParamData(), c.GradData())
-            c.Restrain(0.9)
+            if trainSet.Fill(b, s.Pop(x).Drive, s.Pop(y).Labels) < batch: continue
+            taught := true
+            try l.Lesson(s.Root(), 0.5) catch { taught = false }
+            if not taught: continue
+            opt.Step(s.E.Params, s.E.Grads)
+            s.Restrain(0.9)
         }
         trained := F64(time.Since(t0)) * 1e-9
-        push(s, c)
         e.Load(s)!
         t1 := time.Now()
         boardAccuracy, floatAccuracy, agree, sweeps := answer(s, e, testSet, x, y)
