@@ -82,11 +82,12 @@ type Init enum {
 
 # an operation defined outside oann (the settle of dyn/bridge.olang): its output's shape from its inputs' (batch axis
 # included), its forward, and its backward - the gradients of its inputs (written, each of its input's shape) from its
-# output's. F32 only
+# output's. F32 only. Forward and Backward allocate nothing (a promise held of every implementation, T21c), so a step
+# through one can be pinned allocation-free
 type Function trait {
     Shape(inputs Array<tensor.Shape>&) tensor.Shape
-    mut Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&)
-    mut Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&)
+    mut Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) noalloc
+    mut Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) noalloc
 }
 
 # what a node computes
@@ -329,6 +330,8 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     Decode Bool = decode
     nodes mut list.List<Node>& = list.List<Node>()
     customIn mut list.List<Var>& = list.List<Var>()
+    customVals mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]    # each custom input's value, set per call
+    customGrads mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]   # and the gradient its backward writes
     vals mut list.List<slot<T>>& = list.List<slot<T>>()
     ints mut list.List<slot<I32>>& = list.List<slot<I32>>()
     accs32 mut list.List<slot<F32>>& = list.List<slot<F32>>()
@@ -730,8 +733,19 @@ fn (g mut Graph<T>&) Custom(f mut any Function&, inputs ...Var) Var {
     shapes := Array<tensor.Shape>[g.dims(x) for x in inputs]
     first := g.customIn.Len()
     for x in inputs: g.customIn.Push(g.dense(x))
+    if g.Eager: g.customRoom()
     out := f.Shape(shapes)
     return g.add(Op.Custom(f, first, inputs.Len()), out, inputs.Len() > 0 and g.batched(inputs[0]))
+}
+
+# room for every custom input's value and gradient as the operations are handed them: an element per input, made once
+# (each a tensor, overwritten by every call), so that a step through a custom operation allocates nothing
+fn (g mut Graph<T>&) customRoom() {
+    if g.customVals.Len() == g.customIn.Len(): return
+    vals := Vec<tensor.Tensor<T>>()
+    for v in g.customIn: vals.Push(g.Value(v))
+    g.customVals = vals.ToArray()
+    g.customGrads = vals.ToArray()
 }
 
 # ---- views ----
@@ -1057,7 +1071,40 @@ fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
         g.accs64.Push(slot<F64>(g.acc64))
     }
     for i in range count: g.initParam(i, r)
+    for i in range count: g.reserve(i)
+    g.customRoom()
     g.SyncParams()
+}
+
+# room in the workspaces for node i's products and scans, forward and backward, at the whole batch: reserved at Plan
+# (an eager graph's as each node is recorded), so that no step grows a workspace - a step allocates nothing
+fn (g mut Graph<T>&) reserve(i I64) {
+    match T {
+        case F64: g.reserveIn<F64>(i, g.ws64, g.sw64)
+        case _: g.reserveIn<F32>(i, g.ws32, g.sw32)
+    }
+}
+
+fn (g Graph<T>&) reserveIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.Work<A>&) {
+    nd := g.nodes[i]
+    d := nd.Dims
+    last := d[d.Rank - 1]
+    like T
+    match nd.Kind {
+        case Op.Linear(_, w, _): ws.ReserveLayer(d.Count() / last, g.nodes[w].Dims[1], last, like)
+        case Op.MatMul(a, b, ta, _) {
+            ad := g.nodes[a].Dims
+            k I64 = ad[ad.Rank - 2] if ta else ad[ad.Rank - 1]
+            folded := g.nodes[b].Dims.Rank == 2 and (ad.Rank == 2 or not ta)
+            if folded: ws.ReserveLayer(d.Count() / last, last, k, like)
+            else: ws.ReserveLayer(d[d.Rank - 2], last, k, like, true)
+        }
+        case Op.Attention(_, _, _, heads, _): ws.ReserveLayer(d[1], d[1], last / heads, like, true)
+        case Op.Conv2d(_, _, _, s): ws.ReserveLayer(d[0] * s.Positions(), s.Patch(), s.OutC, like)
+        case Op.SelectiveScan(_, _, a, _, _, _): sw.ReserveSelective(d[0] * d[1], last, g.nodes[a].Dims[0], scan.Seq(d[1]))
+        case Op.DeltaRule(q, _, _, beta, _): sw.ReserveDelta(d[0] * d[1], g.nodes[q].Dims[2], last, scan.Seq(d[1], 64, g.nodes[beta].Dims[2]))
+        case _ { }
+    }
 }
 
 # each parameter's place, in the order made, and its gradient's ParamCount after: the parameters' count
@@ -1325,6 +1372,7 @@ fn (g mut Graph<T>&) eagerNode(v Var) {
     }
     g.grow(i)
     if nd.Kind == Op.Param: g.initParam(i, g.draw)
+    if g.problem == "": g.reserve(i)
     if g.problem == "" and not isLeaf(nd.Kind): g.forwardNode(i)
 }
 
@@ -1455,7 +1503,8 @@ fn (g Graph<T>&) Ints(v Var) tensor.Tensor<I32> {
 
 fn (g Graph<T>&) intsOf(v I64) mut Array<I32>& {
     nd := g.nodes[v]
-    n := nd.Dims.Count() if not nd.Batched else withAxis(nd.Dims, 1 if g.Decode and nd.Dims.Rank >= 2 else 0, g.N).Count()
+    axis I64 = 1 if g.Decode and nd.Dims.Rank >= 2 else 0
+    n := nd.Dims.Count() if not nd.Batched else nd.Dims.Count() / nd.Dims[axis] * g.N
     return g.ints[v].mem[nd.IntOffset:nd.IntOffset + n]
 }
 
@@ -1581,6 +1630,7 @@ fn (g mut Graph<T>&) QuantizeLinear() {
                 rows = rows.Max(d.Count() / d[d.Rank - 1])
                 wide = wide.Max(d[d.Rank - 1])
                 outs = outs.Max(g.nodes[w].Dims[0])
+                g.wsI8.ReserveI8(g.nodes[w].Dims[0], d[d.Rank - 1])
             }
             case _: g.q8At.Push(-1)
         }
@@ -1611,21 +1661,42 @@ fn q8Weights.quantize<T>(w tensor.Tensor<T>) q8Weights {
 }
 
 # node i, a Linear of x (bias b), in INT8: x quantized over its range, the product, the dequantization and the bias
+# the least and the greatest of m's elements, 0 among them: in 16 lanes, each a select (which vectorizes, where a call
+# of Min and Max per element did not - a tenth of an INT8 decoding step)
+fn rangeOf<T>(m mat.Mat<T>&) F32, F32 {
+    lo, hi := Array<F32>(16), Array<F32>(16)
+    whole := m.Cols - m.Cols % 16
+    for r in range m.Rows {
+        o := m.Off + r * m.Ld
+        for c in range 0, whole, 16 {
+            for j in range 16 {
+                v := F32(m.Data[o + c + j])
+                lo[j] = v if v < lo[j] else lo[j]
+                hi[j] = v if v > hi[j] else hi[j]
+            }
+        }
+        for c in range whole, m.Cols {
+            v := F32(m.Data[o + c])
+            lo[0] = v if v < lo[0] else lo[0]
+            hi[0] = v if v > hi[0] else hi[0]
+        }
+    }
+    least, most := lo[0], hi[0]
+    for j in range 1, 16 {
+        least = lo[j] if lo[j] < least else least
+        most = hi[j] if hi[j] > most else most
+    }
+    return least, most
+}
+
 fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
     match T {
         case F32 {
             w := g.q8[g.q8At[i]]
-            xm := g.Value(x).Mat()!
+            xv := g.Value(x)
+            xm := xv.Mat()!
             n := xm.Rows
-            lo F32 = 0.0
-            hi F32 = 0.0
-            for r in range n {
-                for c in range xm.Cols {
-                    v := F32(xm[r, c])
-                    lo = lo.Min(v)
-                    hi = hi.Max(v)
-                }
-            }
+            lo, hi := rangeOf(xm)
             sa := (hi - lo) / 255.0 if hi > lo else F32(1.0)
             zero := I32((-lo / sa).Round())
             acts := g.q8Acts
@@ -1642,7 +1713,8 @@ fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
             om := mat.Mat<F32>(ym.Data, ym.Off, ym.Rows, ym.Cols, ym.Ld)
             gemm.GemmI8(g.wsI8, cm, am, bm, scale[0:w.out], om, zero, w.sum)
             if b < 0: return
-            bd := g.Value(b).Flat()!
+            bv := g.Value(b)
+            bd := bv.Flat()!
             for r in range n {
                 for o in range w.out: om.Data[om.Off + r * om.Ld + o] = om.Data[om.Off + r * om.Ld + o] + F32(bd[o])
             }
@@ -1709,10 +1781,14 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         }
         case Op.Dropout(x, p) {
             if g.Training: ops.Dropout<T, A>(y, g.Value(x), g.saved(i), p, g.Rng)
-            else: try y.Convert(g.Value(x)) catch { unreachable }
+            else {
+                xv := g.Value(x)
+                try y.Convert(xv) catch { unreachable }
+            }
         }
         case Op.CrossEntropy(z, c) {
-            probs := g.savedLike(i, g.inUse(g.nodes[z]))
+            zn := g.nodes[z]
+            probs := g.savedLike(i, g.inUse(zn))
             g.losses[i] = ops.CrossEntropy<T, A>(g.Value(z), g.intsOf(c), probs)
             y.Set(T(g.losses[i]), 0)
         }
@@ -1740,7 +1816,10 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
             keep := g.accOf<A>(i)[0:kk]
             ops.DeltaRule<T, A>(sw, y, state, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), nd.Dims[1], heads, keep)
         }
-        case Op.Contiguous(x): try y.Convert(g.Value(x)) catch { unreachable }
+        case Op.Contiguous(x) {
+            xv := g.Value(x)
+            try y.Convert(xv) catch { unreachable }
+        }
         case Op.Sum(x, mean): ops.SumLast<T, A>(y, g.Value(x), mean)
         case Op.Custom(f, first, count): g.customForward(i, f, first, count)
         case _ { }
@@ -1782,18 +1861,13 @@ fn (g Graph<T>&) deltaKeep(i I64) I64 {
 fn (g mut Graph<T>&) customForward(i I64, f mut any Function&, first I64, count I64) {
     match T {
         case F32 {
-            ins := g.customIns(first, count)
+            for j in range count: g.customVals[first + j] = g.Value(g.customIn[first + j])
             out := g.Value(Var(i))
-            f.Forward(out, ins.View())
+            ins := g.customVals[first:first + count]
+            f.Forward(out, ins)
         }
         case _ { }
     }
-}
-
-fn (g Graph<T>&) customIns(first I64, count I64) Vec<tensor.Tensor<T>> {
-    ins := Vec<tensor.Tensor<T>>()
-    for j in range count: ins.Push(g.Value(g.customIn[first + j]))
-    return ins
 }
 
 # the gradients of loss - a one-element node - with respect to every node it depends on, parameters included, after a
@@ -1938,7 +2012,8 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
         case Op.CrossEntropy(z, c) {
             dz := g.gradOf(z)
             az := g.acc(z)
-            probs := g.savedLike(i, g.inUse(g.nodes[z]))
+            zn := g.nodes[z]
+            probs := g.savedLike(i, g.inUse(zn))
             if ops.Wanted(dz): ops.CrossEntropyBackward<T, A>(A(dy.Get(0)), g.intsOf(c), probs, dz, az)
         }
         case Op.Mse(a, b) {
@@ -2041,7 +2116,8 @@ type cursor struct(at I64) {
 # a gradient to give a kernel that writes every gradient: the real one, or (not wanted) scratch of x's shape from c
 fn (g Graph<T>&) gradOrScratch(i I64, x Var, c mut cursor&) tensor.Tensor<T> {
     if x >= 0 and g.nodes[x].GradOffset >= 0: return g.Grad(x)
-    d := g.inUse(g.nodes[x])
+    xn := g.nodes[x]
+    d := g.inUse(xn)
     t := g.scratchTensor(i, c.at, d)
     c.at += d.Count()
     return t
@@ -2118,25 +2194,42 @@ fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count 
     match T {
         case F32 {
             dy := g.Grad(Var(i))
-            ins := g.customIns(first, count)
-            dins := Vec<tensor.Tensor<T>>()
             at I64 = 0
             for j in range count {
-                d := g.inUse(g.nodes[g.customIn[first + j]])
-                dins.Push(g.scratchTensor(i, at, d))
+                x := g.customIn[first + j]
+                g.customVals[first + j] = g.Value(x)
+                xn := g.nodes[x]
+                d := g.inUse(xn)
+                g.customGrads[first + j] = g.scratchTensor(i, at, d)
                 at += d.Count()
             }
-            f.Backward(dy, ins.View(), dins.ViewMut())
+            ins := g.customVals[first:first + count]
+            dins := g.customGrads[first:first + count]
+            f.Backward(dy, ins, dins)
             for j in range count {
                 x := g.customIn[first + j]
                 dx := g.gradOf(x)
                 ax := g.acc(x)
-                if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dins[j].Flat()!, A(1.0), ax)
+                if not ops.Wanted(dx): continue
+                to, from := dx.Flat()!, dins[j].Flat()!
+                ops.Put<T, A>(to, from, A(1.0), ax)
             }
         }
         case _ { }
     }
 }
+
+# ---- what must not allocate, decided while compiling (S17a, G42) ----
+# A captured graph's Forward and Backward, every operation's kernels included: the products' and scans' workspaces are
+# reserved at Plan (reserve), the scratch and saved values are the arena's, a custom operation's tensors are laid out once
+# (customRoom) and its methods promise `noalloc`. With the optimizer's step (nn/optim) this is a whole training step
+
+assert not Graph<F32>.Forward.Allocates, "a forward pass allocates"
+assert not Graph<F32>.Backward.Allocates, "a backward pass allocates"
+assert not Graph<BF16>.Forward.Allocates, "a BF16 forward pass allocates"
+assert not Graph<BF16>.Backward.Allocates, "a BF16 backward pass allocates"
+assert not Graph<F64>.Forward.Allocates, "an F64 forward pass allocates"
+assert not Graph<F64>.Backward.Allocates, "an F64 backward pass allocates"
 
 # ---- tests ----
 
