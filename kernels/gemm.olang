@@ -1015,9 +1015,7 @@ fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat
     for j in range n: corr[j] = zero * rowSum(b, j)
     q := quant(operand<U8>.of(a), operand<I8>.of(b), m, n, k, scale, corr, c.Data[c.Off:], c.Ld, out.Data[out.Off:], out.Ld)
     if m < 4 {
-        for i in range m {
-            for j in range n: q.store1(i, j, dotI8(q.a.d, i * q.a.ld, q.b.d, j * q.b.ld, k))
-        }
+        for i in range m: q.rowI8(i)
         return
     }
     if n > i8Lanes: q.blocked(ws, wideI8())
@@ -1155,7 +1153,35 @@ fn stepI8(acc mut tile<I32>&, base I64, a U8, qb Array<I8>&, b I64, nr I64) {
     for j in range nr: acc.v[base + j] = acc.v[base + j] + x * I32(qb[b + j])
 }
 
-# the sum of a[ao ..] b[bo ..] over k: 16 lanes of partial sums, added pairwise
+# row i of the result, dot products of a's row i with four of b's rows at a time against one read of it
+fn (q quant&) rowI8(i I64) {
+    four I64 = q.n - q.n % 4
+    for j in range 0, four, 4: q.dot4I8(i, j)
+    for j in range four, q.n: q.store1(i, j, dotI8(q.a.d, i * q.a.ld, q.b.d, j * q.b.ld, q.k))
+}
+
+fn (q quant&) dot4I8(i I64, j I64) {
+    a0, b0, ld := i * q.a.ld, j * q.b.ld, q.b.ld
+    s0, s1, s2, s3 := lanes<I32>(), lanes<I32>(), lanes<I32>(), lanes<I32>()
+    whole I64 = q.k - q.k % 16
+    for p in range 0, whole, 16 {
+        stepDotI8(s0, q.a.d, a0 + p, q.b.d, b0 + p)
+        stepDotI8(s1, q.a.d, a0 + p, q.b.d, b0 + ld + p)
+        stepDotI8(s2, q.a.d, a0 + p, q.b.d, b0 + 2 * ld + p)
+        stepDotI8(s3, q.a.d, a0 + p, q.b.d, b0 + 3 * ld + p)
+    }
+    comptime for r in range 4 {
+        t I32 = laneSum(s0 if r == 0 else (s1 if r == 1 else (s2 if r == 2 else s3)), 16)
+        for p in range whole, q.k: t = t + I32(q.a.d[a0 + p]) * I32(q.b.d[b0 + r * ld + p])
+        q.store1(i, j + r, t)
+    }
+}
+
+fn stepDotI8(acc mut lanes<I32>&, a Array<U8>&, ao I64, b Array<I8>&, bo I64) {
+    for j in range 16: acc.v[j] = acc.v[j] + I32(a[ao + j]) * I32(b[bo + j])
+}
+
+# the sum of a[ao ..] b[bo ..] over k: 16 lanes of partial sums, added in order
 fn dotI8(a Array<U8>&, ao I64, b Array<I8>&, bo I64, k I64) I32 {
     acc := lanes<I32>()
     whole I64 = k - k % 16
@@ -1764,5 +1790,16 @@ test Gemm "BF16 storage's one to four rows and one column are dot products summe
         for i in range m {
             for j in range n: assert (F64(c[i, j]) - want[i, j]).Abs() <= want[i, j].Abs() / 256.0 + 300.0 * 1.2e-7 * mag[i, j]
         }
+    }
+}
+
+test Gemm "thin products and exchanged ones: a convolution's sixteen channels, its weights' gradient, ten classes" {
+    z F32 = 0
+    assert tiling.choose(500, 16, microRows, tileCols(z), vectorLanes(z), true).thin or TargetVectorBits < 512
+    assert tiling.choose(16, 9, microRows, tileCols(z), vectorLanes(z), true).exchanged or TargetVectorBits < 512
+    r := rand.Rand(9)
+    sizes := Array<I64>[500, 16, 9, 16, 9, 3000, 64, 10, 128, 7, 300, 70, 300, 3, 20]
+    for s in range sizes.Len() / 3 {
+        for form in range 4: productCase(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], form, r)
     }
 }
