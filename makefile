@@ -9,7 +9,7 @@ TESTS = linalg.olang kernels.olang ops.olang nn.olang layers.olang optim.olang t
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -86,6 +86,26 @@ sparse:
 
 # sleep against interference (consolidator.olang): days of a flip-flop with and without nights - ARGS: nights or
 # retention, seeds, days, sequences a day, repeats, hidden, window, passes, the day's step, the night's rate
+xor:
+	$(OLANG) build -output build/examples_xor_settle examples/xor_settle.olang
+	./build/examples_xor_settle $(ARGS)
+
+spiking:
+	$(OLANG) build -output build/examples_xor_spiking examples/xor_spiking.olang
+	./build/examples_xor_spiking $(ARGS)
+
+bandit:
+	$(OLANG) build -output build/examples_bandit_settle examples/bandit_settle.olang
+	./build/examples_bandit_settle $(ARGS)
+
+mnistsettle:
+	$(OLANG) build -output build/examples_mnist_settle examples/mnist_settle.olang
+	./build/examples_mnist_settle $(ARGS)
+
+sample:
+	$(OLANG) build -output build/examples_charlm_sample examples/charlm_sample.olang
+	./build/examples_charlm_sample $(ARGS)
+
 sleep:
 	$(OLANG) build -output build/examples_sleep_retention examples/sleep_retention.olang
 	./build/examples_sleep_retention $(ARGS)
