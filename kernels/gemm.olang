@@ -1018,17 +1018,21 @@ fn actOf<A, K>(x A, kind K) A {
 
 # ---- INT8 ----
 
-# out = scale[j] (c - zero colsum(b)[j]) where c = a b^T, in I32: unsigned activations a (m x k, quantized with zero
-# point zero) times signed weights b (n x k, a row per output, as PyTorch keeps a Linear's), the accumulators c (m x n)
+# out = scale[j] (c - zero colsum(b)[j]) where c = a b^T, in I32 (the sums of b's rows come from `sums` where the caller
+# has them - quantized weights keep theirs - and are not needed when zero is 0): unsigned activations a (m x k, quantized
+# with zero point zero) times signed weights b (n x k, a row per output, as PyTorch keeps a Linear's), the accumulators c (m x n)
 # kept and dequantized per output column into out. The step acc + I32(a) I32(q) is the one form LLVM makes the target's
 # integer multiply-add of (vpdpwssd on AVX-512 VNNI). The weights are packed into ws in column panels of the tile's
 # width; a tile's rows of activations are packed step by step as its products begin them. Fewer than four rows take
 # dot products along the rows with nothing packed - the decoding step, a single sample
-fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat<I8>&, scale Array<F32>&, out mut mat.Mat<F32>&, zero I32 = 0) {
+fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat<I8>&, scale Array<F32>&, out mut mat.Mat<F32>&, zero I32 = 0
+        sums Array<I32>& = Array<I32>(0)) {
     m, n, k := a.Rows, b.Rows, a.Cols
     if m == 0 or n == 0: return
     corr := ws.corrections(n)
-    for j in range n: corr[j] = zero * rowSum(b, j)
+    if zero == 0 { for j in range n: corr[j] = 0 }
+    else if sums.Len() >= n { for j in range n: corr[j] = zero * sums[j] }
+    else { for j in range n: corr[j] = zero * rowSum(b, j) }
     q := quant(operand<U8>.of(a), operand<I8>.of(b), m, n, k, scale, corr, c.Data[c.Off:], c.Ld, out.Data[out.Off:], out.Ld)
     if m < 4 {
         for i in range m: q.rowI8(i)
@@ -1757,6 +1761,11 @@ fn i8Case(m I64, n I64, k I64, zero I32, r mut rand.Rand&) {
     out4 := gappy(m, n, F32(0))
     GemmI8(four, gappy(m, n, I32(0)), a, b, scale, out4, zero)
     assert sameBits(out, out4)
+    # the rows' sums given, as quantized weights keep them: the same result
+    sums := Array<I32>[rowSum(b, j) for j in range n]
+    given := gappy(m, n, F32(0))
+    GemmI8(ws, gappy(m, n, I32(0)), a, b, scale, given, zero, sums)
+    assert sameBits(out, given)
 }
 
 test GemmI8 "INT8 products are the integer sums, dequantized per output, wide and thin tiles, any thread count" {

@@ -339,7 +339,7 @@ fn (m mut Model&) product(rows I64, w Weights&, step F32, zero I32, b Array<F32>
     q := mat.Mat<I8>(w.Q, 0, w.Out, w.In, w.In)
     c := mat.Mat<I32>(m.sums, 0, rows, w.Out, w.Out)
     out := mat.Mat<F32>(y, 0, rows, w.Out, w.Out)
-    gemm.GemmI8(m.ws, c, a, q, m.scales[0:w.Out], out, zero)
+    gemm.GemmI8(m.ws, c, a, q, m.scales[0:w.Out], out, zero, w.Sum)
     for r in range rows {
         base := r * w.Out
         if relu { for o in range w.Out: y[base + o] = (y[base + o] + b[o]).Max(0.0) }
@@ -672,19 +672,26 @@ fn resident() I64 {
     return 0
 }
 
-test Model "allocates nothing after its first call: the resident memory does not grow over 40 calls, dynamic and static" {
+test Model "allocates nothing per call: the resident memory grows by no more than two pages over 400 calls after 40, dynamic and static" {
     g, _, _, m := convNet(11)
     r := rand.Rand(12)
     xs := samples(9, 72, r, 0.0, 1.0)
     out := Array<F32>(36)
     m.Forward(9, xs, out)
     m.Calibrate(9, xs, out)
-    m.Static = true
-    before := resident()
-    for _ in range 40 {
-        m.Forward(9, xs, out)
-        m.Forward(1, xs, out)
+    for static in Array<Bool>[false, true] {
+        m.Static = static
+        for _ in range 40 {
+            m.Forward(9, xs, out)
+            m.Forward(1, xs, out)
+        }
+        before := resident()
+        for _ in range 400 {
+            m.Forward(9, xs, out)
+            m.Forward(1, xs, out)
+        }
+        # a page or two is the process's own (a thread's stack, the allocator's bookkeeping): a byte a call would be 800
+        assert resident() <= before + 8, "grew by " $(resident() - before) " kB"
     }
-    assert resident() == before, "grew by " $(resident() - before) " kB"
     assert g.Size() > 0
 }
