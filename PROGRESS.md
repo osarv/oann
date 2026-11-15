@@ -1,7 +1,7 @@
 # oann - hand-off note
 
 State at the cut-over (C3, 2026-11-15): the redesign of docs/redesign.md is built and the old modules are gone.
-Tag `pre-c3` is the last commit with them (`git show pre-c3:linalg.olang`).
+Branch `pre-c3` is the last commit with them (`git show pre-c3:linalg.olang`).
 
 ## Where things are
 

@@ -24,7 +24,7 @@ e.Load(s)!                            # after a learning step: the weights and b
 `Settle(phase, sweeps, tolerance)` takes the tolerance in the system's units and runs to the board's integer tolerance
 for it, `max(tau, 5 steps of Q4.14)` (a spiking system's: the largest change of a rate between windows, in steps of
 Q1.15). The formats, the arithmetic of a sweep and of a spiking time step, and the cycle model are the header of
-`engine.olang`; they are those of `board.olang`, the module this one replaced (removed at C3, tag `pre-c3`), unchanged.
+`engine.olang`; they are those of `board.olang`, the module this one replaced (removed at C3, branch `pre-c3`), unchanged.
 
 ## What lowering does
 

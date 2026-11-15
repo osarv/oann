@@ -24,6 +24,6 @@ where the library changed) so each builds or fails as its header says.
 | `learnerarg.olang` | reproduces (new) | C2d: a struct of another module holding a reference parameter (dyn/learn's `Learner`, dyn/bridge's `Bridge`), made inside a function from that function's reference parameter, "would outlive" the argument, though it is a local dropped there; the same struct copied into the root module builds. dyn/bridge's tests build the system inside the helper instead |
 | `factcascade.olang` | reproduces (new) | any other error in a program (an unused import here) makes every `assert not f.Allocates` (S17a, G42) read false: 36 spurious S17a errors from dyn/ and nn/optim behind one unneeded `try` while writing models/hybrid |
 
-`lambdalend` and `resultgrowth` (both fixed, regression cases on the old `linalg`) were removed with `linalg` at C3 (tag `pre-c3`).
+`lambdalend` and `resultgrowth` (both fixed, regression cases on the old `linalg`) were removed with `linalg` at C3 (branch `pre-c3`).
 
 The `Status` line in each file's header repeats the row.
