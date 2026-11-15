@@ -5,13 +5,13 @@
 OLANG ?= ../olang/build/olang
 
 # every module with test blocks
-TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
+TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang board/engine.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test mlpad arenaad data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
+.PHONY: test mlpad arenaad charlmnn data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -26,6 +26,12 @@ mlpad:
 arenaad:
 	$(OLANG) build -output build/bench_arena_ad bench/arena_ad.olang
 	./build/bench_arena_ad $(ARGS)
+
+# M2 and M3 on nn/*: the character transformer on tiny Shakespeare through the new layers, optimizer, loop and generator
+# - ARGS: steps, seed, threads, dropout, characters to generate, and bf16 last
+charlmnn:
+	$(OLANG) build -output build/bench_charlm_nn bench/charlm_nn.olang
+	./build/bench_charlm_nn $(ARGS)
 
 # fetches MNIST into data/mnist (once), checks the pipeline against what is known about the dataset, and times it
 data bench:

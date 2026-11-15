@@ -442,6 +442,69 @@ fn (m Gpt&) Logits<T>(g mut ad.Graph<T>&, tokens ad.Var) ad.Var
 Checkpoint names come from the model's fields by reflection (`blocks.3.attn.q.weight`); `@io.Name("c_attn")` on a
 field overrides a name.
 
+**As built (B3, 2026-11-15).** `nn/layers.olang`, `nn/optim.olang`, `nn/train.olang`, `nn/generate.olang`
+(`nn/README.md`); `nn/quant.olang` and `models/` are C1's. Where the build departs from the sketch, and why:
+
+1. **An optimizer steps one flat region, not a graph.** `optim.AdamW(params, grads, rate, beta1, beta2, eps, decay,
+   spans)` and `optim.Sgd(params, grads, rate, momentum, nesterov, decay, spans)` take two tensors laid out alike and are
+   generic over the parameters' type `A` and the gradients' `G`; one `Step()`, one `SetRate`, the moments in `A`, readable.
+   A graph's region is `g.Params()`/`g.ParamGrads()`, a system's the same; **a BF16 or F16 graph's is its masters** -
+   `optim.AdamW(g.Masters(), g.ParamGrads(), ...)` - and `g.SyncParams()` rounds the result into the graph (the loops
+   in `nn/train` do). `FlatAdamW`/`FlatSgd` merged into these. Which elements decay is `spans`: runs of the region, each
+   decaying or not (`optim.Spans(g)`: a graph's parameters, decaying where it says; none given: the whole region
+   decays). `Save`/`Load` write and read the moments and the step count through io/checkpoint. `ClipNorm(grads, max)`,
+   `WarmupCosine`, `WarmupLinear`. A step of either optimizer, in either precision, is pinned allocation-free while
+   compiling (`assert not f.Allocates`, S17a; the graph's `Forward`/`Backward` cannot be, repro/allocfacts.olang).
+2. **The projection regularizer is a `Projector<T>`** of its own, not an option of the optimizer: it is graph-specific.
+   Made on a graph before `Plan` (it keeps every dense layer's output and input to the step's end, since activation
+   storage is reused), `Project(g)` after `Backward` and before the optimizer's `Step`. Not for a graph with masters.
+3. **Layers** (`nn/layers.olang`): `Dense` (`New`, `With` starting values, no bias), `Embedding` (also the tied head,
+   `Logits`), `Norm`, `Mlp` (a `mat.Act` between layers), `Conv` (from a `conv.Shape`), `SelfAttention` (rotary positions
+   optional), `AttentionBlock` (GELU `Feed` or gated SwiGLU `Feed`, RMS or layer norm, dropout), `Transformer` (GPT-2's
+   decoder: it stays here, and C1's `models/gpt` builds on it), `SsmBlock`, `DeltaBlock`. Biases and gains are vectors.
+   A block takes no context length (attention reads it from its input). `SsmBlock` is Mamba's block without its short
+   convolution (the graph has no 1-D convolution): `A = -softplus(Alog)` keeps the state decaying, delta is a low-rank
+   softplus with Mamba's log-uniform start. `DeltaBlock` normalizes q and k per head (RMS norm with a gain starting at
+   1 / sqrt(dk), so the rule starts stable) and gates with a sigmoid starting at 0.98. The scan blocks keep no state
+   between `Forward` calls, so a model with one generates by `Rerun`, not the cache. Every layer is checked against
+   central differences in F64 (`SsmBlock` and `DeltaBlock` through the graph's scans).
+4. **Loops** (`nn/train.olang`): `Epoch`/`Evaluate` over a `loader.Loader` without `Ahead` (the graph has none);
+   `Classifier.On` records the loss and keeps the logits. `LmStep`/`LmEvaluate`/`Fit` are generic over the batch source
+   and the optimizer by what they call (`Random(tokens, targets, B)`, `At(first, tokens, targets, B)`, `Step()`,
+   `SetRate`), which `text.Windows` and `tokens.Tokens` both have - a trait cannot say "may fail" for one and not the
+   other. `Fit(g, m, train, valid, o, cfg, on)` is a whole run: reports to `on`, a line per report through io/runlog,
+   validation, checkpoints. `Save`/`Resume` write the parameters (as `g.Save` names them), the optimizer's state and the
+   step; a run resumed in a fresh graph continues bit for bit (tested for AdamW and Sgd, F32 and BF16 masters).
+   `LanguageModel.Gpt(..., loss = false)` builds a decoding model.
+5. **Generation** (`nn/generate.olang`): on token ids (`CachedTokens`, `RerunTokens`) and on text (`Cached`, `Rerun`),
+   generic over the graph's element type; the cache equals the full forward to 1e-12 in F64.
+6. **Allocation.** A training step, an optimizer step and a classifier epoch have a test each that runs 20 steps after
+   the first and asserts the resident memory did not grow (the same measure as B1's: a scope's storage is reclaimed at its
+   close, so this finds what is kept, not what is made and freed).
+
+**Measured (B3; a 4-core machine shared with other agents, load average 7 to 19 throughout, one thread - wall
+times are inflated by an unknown factor and every number is a comparison made in the same minutes).**
+M3, `make charlmnn ARGS="2000 1 1 0 300"` (bench/charlm_nn.olang, seed 1, round 2's recipe: 4 x 128, 4 heads, context 64,
+16 sequences, AdamW beta2 0.99, decay 0.1, rate 1e-3 warmed over 100 steps, cosine to 1e-4, clip 1), validation loss in
+nats per character on the same 10 batches of 16 windows - round 2's table (DESIGN 11, 22) beside it. The parameters are
+drawn in another order than round 2's (`Plan` draws the dropout generator first), so the same seed is not the same start:
+
+| step | 250 | 500 | 750 | 1000 | 1250 | 1500 | 1750 | 2000 |
+|---|---|---|---|---|---|---|---|---|
+| round 2, F32 | 2.3825 | 2.2186 | 2.0828 | 2.0032 | 1.9575 | 1.8779 | 1.8220 | 1.8063 |
+| nn/, F32 | 2.3946 | 2.2136 | 2.0800 | 2.0027 | 1.9550 | 1.8708 | 1.8156 | **1.7961** |
+| round 2, BF16 | 2.3817 | 2.2181 | 2.0882 | 2.0029 | 1.9622 | 1.8790 | 1.8221 | 1.8077 |
+| nn/, BF16 | 2.4059 | 2.2110 | 2.0771 | 2.0022 | 1.9527 | 1.8658 | 1.8182 | **1.7936** |
+
+The curves agree within 0.012 everywhere and end 0.010 and 0.014 below round 2's. M2, step time, one thread, 50 steps
+alternated old/new in three rounds (load 6-19), ms a step: F32 old 392 / 434 / 442, new 402 / 451 / 467 (the new graph
+3 to 5% slower in wall time here); BF16 old 441 / 488 / 494, new 303 / 305 / 318 (37% faster; the cause is not looked into - DESIGN 22's note on BF16 narrowing an element at a time is
+the likely one). One profile of each at load 18, the new graph's forward + backward 434 ms
+(Linear 331, Act 44, attention 27.5) against the old step's 477 (Linear 366, GeluTanh 65, attention 33): the F32 gap is
+within the machine's noise and none of it is in `nn/` - the fill, clip and optimizer together take 1.8 ms a step in both
+(old: 1.8). A quiet-machine repeat is open. 2,000 steps took 1,102 s (F32) and 824 s (BF16) at that load, resident memory
+flat. A sample after the run reads as round 2's did, 2,254 characters a second through the key-value cache (BF16 run).
+
 ### 1.6 Data: `data/*.olang`
 
 `datasets/` and `tokenizer.olang` moved as they are (`Dataset` trait, `Loader<D>`, IDX, MNIST, characters, byte-level
