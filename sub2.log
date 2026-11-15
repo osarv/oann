@@ -1,0 +1,65 @@
+== ad/graph.olang ==
+ok - Graph.QuantizeLinear: a graph's linear layers in INT8: within 2% of the F32 outputs' range, and F32 again when Int8 is off
+ok - Graph: records, plans and runs a small network
+ok - Graph: the kernels compute what they say: ReLU, a product, a linear layer, softmax cross-entropy
+ok - Graph: eager equals captured bit for bit: the loss and every parameter's gradient, with dropout and without
+ok - Graph: liveness reuse: a smaller arena, and every number the same as with each buffer apart
+ok - Graph: Backward with accumulate adds to the gradients already there
+ok - Graph: causal attention: a position's output depends on no later position
+ok - Graph: GELU through tanh is within 1e-3 of the exact GELU
+ok - Graph: a checkpoint saves the parameters and loads them back into a graph built the same way, whatever its batch
+ok - Graph: a step split over tasks gives exactly what one task gives, forward and backward
+ok - Graph: a BF16 graph keeps F32 masters drawn as an F32 graph's, and computes as the F64 graph does to BF16's precision
+ok - Graph: a BF16 graph's checkpoint is its F32 masters, and loads into an F32 graph or a BF16 one exactly
+ok - Graph.Plan: a shape that does not fit is reported by Plan, naming it, and nothing after it runs
+ok - Graph.Custom: an operation defined outside runs forward and backward as the graph's own: x^2 as Mul(x, x)
+ok - Graph: decoding with a cache of keys and values equals the full forward, a position at a time or several
+ok - Graph: a step allocates nothing: the resident memory does not grow over 20 steps after the first, F32 and BF16
+ok - Graph.Lay: the perceptron's plan baked while compiling equals the plan captured at run time
+ok - Graph.PlanBaked: a graph planned from the baked layout runs as the one that laid itself out
+18 passed, 0 failed
+== nn/optim.olang ==
+ok - WarmupCosine: warms up linearly, follows half a cosine down to its floor and stays there
+ok - WarmupLinear: warms up linearly, falls on a straight line to its floor and stays there
+ok - AdamW: takes PyTorch's steps, decaying only the runs that decay
+ok - AdamW: a run that does not decay is stepped without decay, one that does with it; no runs given, all decay
+ok - Sgd: with momentum takes PyTorch's steps
+ok - Sgd: Nesterov's step and an L2 decay, as PyTorch computes them
+ok - Projector: takes W <- W - (alpha / n) (W X^T) X, in place of weight decay, then a plain gradient step follows
+ok - Projector: normalized, each row's term divides by |x|^2: a unit-norm input is projected exactly as the unnormalized form
+ok - AdamW: any two tensors are a region: stepped as a graph's parameters are, Sgd too
+ok - AdamW: on a BF16 graph steps the F32 masters: steps too small for BF16 add up there, then show in the graph
+ok - ClipNorm: scales the gradients to the norm asked for, and leaves smaller ones alone
+ok - ClipNorm: of BF16 gradients is computed in F32 and rounded once
+ok - AdamW: a step allocates nothing: the resident memory does not grow over 20 steps after the first, AdamW and Sgd, F32 and BF16
+13 passed, 0 failed
+== nn/quant.olang ==
+ok - Weights: are quantized per row to within half a step, and dequantize to what they represent; a convolution's columns are in the patches' order
+ok - Range: takes all 256 levels for a tensor with no negatives, and is symmetric with zero point 128 otherwise
+ok - Model: a dense layer is the F32 product of the dequantized operands, with negatives (zero point 128) and without, any batch
+ok - Model: a quantized convolution network runs what the F32 graph runs, dynamically and over calibrated ranges, any batch
+ok - Model: a perceptron of a graph, threads or not, gives the same logits and the same classes as the graph
+ok - Quantize: a graph's Linear layers in INT8 and back: close to F32, F32 again after Dequantize, a quarter of the weights' bytes
+ok - Model: allocates nothing per call: the resident memory grows by no more than two pages over 400 calls after 40, dynamic and static
+7 passed, 0 failed
+dyn/bridge.olang:265:45: error[T30c, T22b]: Bridge<F32>'s 'Backward' may allocate, and Function's 'Backward' promises 'noalloc'
+  265 |     if guess == graph.None: return g.Custom(b, x), graph.None
+      |                                             ^
+dyn/bridge.olang:265:45: note: every call through an 'any Function&' relies on it
+dyn/bridge.olang:210:13: note: its call of 'Grad' may allocate
+  210 |             b.Grad(dout, dinputs[0])
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+dyn/bridge.olang:265:45: help: give Bridge<F32> a method that does not, or take 'noalloc' off the trait's method
+dyn/bridge.olang: semantic errors, skipping
+== dyn/settle.olang ==
+0 passed, 0 failed
+dyn/bridge.olang:265:45: error[T30c, T22b]: Bridge<F32>'s 'Backward' may allocate, and Function's 'Backward' promises 'noalloc'
+  265 |     if guess == graph.None: return g.Custom(b, x), graph.None
+      |                                             ^
+dyn/bridge.olang:265:45: note: every call through an 'any Function&' relies on it
+dyn/bridge.olang:210:13: note: its call of 'Grad' may allocate
+  210 |             b.Grad(dout, dinputs[0])
+      |             ^~~~~~~~~~~~~~~~~~~~~~~~
+dyn/bridge.olang:265:45: help: give Bridge<F32> a method that does not, or take 'noalloc' off the trait's method
+models/hybrid.olang: semantic errors, skipping
+DONE

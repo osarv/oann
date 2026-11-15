@@ -11,7 +11,7 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
 
-.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench xor spiking hybridbench sleepreplay mnistlearn sample clean
+.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking hybridbench sleepreplay mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -143,6 +143,23 @@ int8lm:
 int8bench:
 	$(OLANG) build -output build/bench_int8 bench/int8.olang
 	./build/bench_int8 $(ARGS)
+
+# F32 activations times weights stored in F32, BF16 or INT8 through one Gemm (bench/storage.olang) - ARGS: rounds, threads
+storagebench:
+	$(OLANG) build -output build/bench_storage bench/storage.olang
+	./build/bench_storage $(ARGS)
+
+# the INT8 CNN of nn/quant against the graph's F32 forward, as drawn, at batch 1, 64, 128 (bench/int8cnn.olang) - ARGS:
+# rounds, threads
+int8cnnbench:
+	$(OLANG) build -output build/bench_int8cnn bench/int8cnn.olang
+	./build/bench_int8cnn $(ARGS)
+
+# the character GPT decoding through the key-value cache, F32 against INT8 (bench/int8decode.olang) - ARGS: characters,
+# rounds, threads, and int8 to time INT8 alone (for olang profile)
+int8decodebench:
+	$(OLANG) build -output build/bench_int8decode bench/int8decode.olang
+	./build/bench_int8decode $(ARGS)
 
 # an epoch's time against C over OpenBLAS (bench/epoch.olang)
 epoch:

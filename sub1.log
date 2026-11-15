@@ -1,0 +1,229 @@
+== kernels/gemm.olang ==
+ok - Gemv: matrix-vector products both ways round, of strided views, F64 and BF16 x F32
+ok - Ger2: a decayed rank-2 update
+ok - Gemm: against the plain sum: every transpose, alpha and beta, across block boundaries, any thread count
+ok - Gemm: products either side of the unpacked paths' bounds are exact, in F32 and in I32
+ok - Gemm: low-precision storage accumulated in F32 is the exact sum rounded once: BF16, F16, F8E4M3, F8E5M2
+ok - Gemm: a product's multiply-adds are fused exactly where the target has fused multiply-add
+ok - Gemm: a product computed while compiling is the run time's
+ok - Workspace: room reserved once serves every product up to its size, and no product replaces a panel
+ok - GemmBatch: a Gemm per matrix: every transpose, alpha and beta, strided storage, threads
+ok - GemmBatch: a triangular result is computed below its diagonal only, and nothing above it is touched
+ok - GemmBatch: a triangular left operand is read in its lower triangle only, transposed or not
+ok - Gemm: one to four rows and one column take the vector paths, every transpose
+ok - Epilogue: a bias and an activation on the summed result: every activation, unpacked, packed and exchanged
+ok - GemmLeft: a left operand packed by its own type is the matrix it reads
+ok - GemmI8: INT8 products are the integer sums, dequantized per output, wide and thin tiles, any thread count
+ok - GemmBatch: BF16 storage over a depth of several blocks is summed in F32 and rounded once, triangles kept
+ok - Gemm: BF16 storage's one to four rows and one column are dot products summed in F32
+ok - Gemm: thin products and exchanged ones: a convolution's sixteen channels, its weights' gradient, ten classes
+18 passed, 0 failed
+== kernels/scan.olang ==
+ok - GatedScan: the sequential scan is the recurrence: F64 to 1e-13, F32 to 1e-5, BF16 stored and F32 carried to 2e-2
+ok - GatedScanChunked: equals the sequential scan: F32 to 1e-5, one and four threads, chunks that do not divide the length, blocks of channels
+ok - GatedScanGrad: dx, da, db and the initial state's gradient equal the central differences in F64: sequential, chunked, one and three threads, adding
+ok - GatedScanGradChunked: equals the sequential backward scan: F32 to 1e-5 for chunks of any size, and the same for every thread count
+ok - GatedScan: the consolidator's recurrence h = l h_prev + (1 - l) z is a scan with a = l, b = 1 - l, x = z
+ok - DeltaRule: the sequential form is the formula S = alpha S (I - beta k k^T) + beta v k^T, o = S q: F64 to 1e-12, F32 to 1e-5, BF16 stored to 3e-2; gated and not, any thread count
+ok - DeltaRuleChunked: equals the formula (F64 to 1e-11) and the sequential form (F32 to 1e-5): chunks of every size, the last short, gated and not, any thread count
+ok - DeltaRuleGrad: dq, dk, dv, dbeta, dgate and the initial state's gradient equal the central differences in F64: sequential and chunked, gated or not, chunks of every size, adding
+ok - DeltaRuleGrad: the chunked backward equals the sequential one: F32 to 1e-4 of the largest gradient, chunks of any size, one or four threads, and the sequential one is the same for every thread count
+ok - SelectiveScan: the sequential scan is the equations: F64 to 1e-12, F32 to 1e-5 (the library's exponential is within 3e-7), BF16 stored to 3e-2, with and without the skip
+ok - SelectiveScanChunked: equals the equations (F64 to 1e-12) and the sequential scan (F32 to 1e-5): chunks of every size, blocks of channels, any thread count
+ok - SelectiveScanGrad: dx, ddelta, dA, dB, dC, dskip and the initial state's gradient equal the central differences in F64: chunks of every size, one and three threads, adding, with and without the skip
+12 passed, 0 failed
+== kernels/attention.olang ==
+ok - attentionPart: the parts cover every (sequence, head) matrix exactly once, whole sequences or runs of one sequence's heads
+ok - Rope: rotates pairs by position x base^(-2c / Dh): the formula, lengths kept, relative positions only, and RopeBack undoes it
+ok - Attention: equals the naive F64 attention, causal and not, one and three threads: F64 1e-13, F32 2e-6, BF16 3e-2
+ok - Attention: on strided views of wider storage, the result is the contiguous one
+ok - AttentionGrad: dq, dk and dv equal the central differences of sum(w y) in F64, causal and not; add flags add; threads agree
+ok - AttentionStep: decoding position by position, and in one go, gives the rows of causal attention over the whole sequence
+ok - Attention: a context of 256, parts smaller than a sequence's heads: F32 forward and backward within 2e-4 of F64's
+7 passed, 0 failed
+== kernels/conv.olang ==
+ok - Shape: a shape no convolution can have fails where it is made, saying why
+ok - Conv2d: a convolution as one product of its patches equals its definition: padding, strides, channels, threads
+ok - Conv2d: the forward through GemmLeft gives exactly what im2col, a product and the bias give, in F32, F64 and BF16
+ok - Conv2d: BF16 storage: the forward is the F64 convolution of the same values, to the rounding of its result
+ok - Im2col: col2im is im2col's transpose: <im2col(x), c> = <x, col2im(c)>, and threads change nothing
+ok - Conv2dBackward: the gradients against central differences of the definition: dx, dw and db, with and without accumulation
+ok - Pool: max pooling keeps each window's maximum per channel, and its backward adds the gradient there
+ok - Pool: pooling in tasks and in BF16: the same maxima and places, the first of equal values, at every thread count
+8 passed, 0 failed
+== kernels/sparse.olang ==
+ok - a drawn pattern: columns increase along a row, every row's entries are counted, and the density is as asked
+ok - a pattern from pairs: sorted into rows, any order in, the same pattern out
+ok - Csr: a pattern given wrongly fails once, where the matrix is made, saying what
+ok - Events: more changes than the capacity - the largest are reported, the rest wait and are not lost
+ok - the sparse-code products: a weighted gather of k rows, and a rank-1 write to them
+ok - Tiles: the sampled product at the tiles is the dense contrast read at them, and counts the live tiles' area
+ok - Csr: the products: W X, W^T X and the sampled product agree with the dense matrix's, at width 1 and in a batch
+ok - Csr: storage in low precision, a batch in the accumulator: BF16, F16 and F8 weights widened as they are read
+ok - Csr: tasks: a product is the same, bit for bit, at every thread count
+ok - Csr: pruning in place: Mask zeroes entries, Drop removes them (companions squeezed first) in arrays that keep their length
+ok - Tiles: the products equal the dense ones, with ragged edges, every width, strided and not, and quiet blocks skipped
+ok - Tiles: tasks: a tile product is the same, bit for bit, at every thread count
+ok - Tiles: retiring tiles in place: Drop skips them at once, Compact moves the live ones together, the product is the dense one's
+ok - Macs: counters: every product adds what a dense one would have done and what it did
+ok - Events: only the units that moved are reported and transported, and the total stays W^T of what the consumers hold
+ok - TopK: the k largest positions, ties to the earlier, in increasing order, per row and in tasks
+16 passed, 0 failed
+== tensor.olang ==
+ok - Shape: a shape: rank, dimensions, count, rendering, equality
+ok - Tensor.Zeros: a view: Zeros, Get and Set, copies sharing the elements, Clone not
+ok - Tensor.Of: Of copies values into a tensor; Over views storage, checked once
+ok - Tensor.Slice: Slice and Select: the offset and the dimensions move, the strides stay
+ok - Tensor.Permute: Permute moves strides: the transpose and a rank 3 rotation against hand-built strides
+ok - Tensor.Expand: Expand: stride 0 on new and size-1 axes, one element read many times, nothing copied
+ok - Tensor.Reshape: Reshape: contiguous only, never copies, the elements keep their order
+ok - Tensor.Rows: Rows folds the leading axes, Mat and Flat give the kernels what they read
+ok - Cast: conversions to F16, BF16 and both F8s round to nearest, ties to even, against a reference worked out in F64
+ok - Cast: the edges: ties, saturation, NaN, infinities, signed zero
+ok - Tensor.Convert: Convert and To: every storage type among the others, strided views included, shapes checked
+ok - Tensor.Plus: the operators and destination forms against loops, on contiguous, transposed and expanded operands
+ok - Tensor.Plus: operators on shapes that differ fail with ShapeError; nothing is broadcast
+ok - Tensor.MatMul: @ is batched over the leading axes: against triple loops, with transposed and sliced operands
+ok - Tensor.MatMul: products in every element type: F16, BF16 and F8 accumulate in F32, integers wrap
+ok - Tensor.Str: rendering like numpy's, equality by shape and elements, a hash that agrees
+ok - Tensor.FillNormal: random fills are reproducible from the seed, drawn in row-major order of the view
+ok - Tensor.Zeros: empty tensors, rank 0 and rank 6: the walks, the reductions and the views hold
+ok - Tensor.MatMul: the evaluator's tensors are the run time's: a baked product, strides and rounding agree
+19 passed, 0 failed
+ad/graph.olang:745:43: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  745 |     g.customVals = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                           ^
+ad/graph.olang:736:19: note: instantiated here, with T = F32
+  736 |     if g.Eager: g.customRoom()
+      |                   ^~~~~~~~~~
+ad/graph.olang:2564:23: note: instantiated here, with T = F32
+ 2564 |         la := a.Mse(a.Custom(f, a.Act(wa, mat.Act.Tanh)), a.Param(Init.Normal(0.0, 1.0), true, 4, 4))
+      |                       ^~~~~~
+ad/graph.olang:746:44: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  746 |     g.customGrads = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                            ^
+ad/graph.olang:736:19: note: instantiated here, with T = F32
+  736 |     if g.Eager: g.customRoom()
+      |                   ^~~~~~~~~~
+ad/graph.olang:2564:23: note: instantiated here, with T = F32
+ 2564 |         la := a.Mse(a.Custom(f, a.Act(wa, mat.Act.Tanh)), a.Param(Init.Normal(0.0, 1.0), true, 4, 4))
+      |                       ^~~~~~
+ad/graph.olang: semantic errors, skipping
+ad/graph.olang:745:43: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  745 |     g.customVals = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                           ^
+ad/graph.olang:1073:7: note: instantiated here, with T = F64
+ 1073 |     g.customRoom()
+      |       ^~~~~~~~~~
+ad/graph.olang:1014:7: note: instantiated here, with T = F64
+ 1014 |     g.arrange(l, r)
+      |       ^~~~~~~
+nn/optim.olang:379:7: note: instantiated here, with T = F64
+  379 |     g.Plan(rand.Rand(1))!
+      |       ^~~~
+ad/graph.olang:746:44: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  746 |     g.customGrads = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                            ^
+ad/graph.olang:1073:7: note: instantiated here, with T = F64
+ 1073 |     g.customRoom()
+      |       ^~~~~~~~~~
+ad/graph.olang:1014:7: note: instantiated here, with T = F64
+ 1014 |     g.arrange(l, r)
+      |       ^~~~~~~
+nn/optim.olang:379:7: note: instantiated here, with T = F64
+  379 |     g.Plan(rand.Rand(1))!
+      |       ^~~~
+nn/optim.olang: semantic errors, skipping
+ad/graph.olang:745:43: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  745 |     g.customVals = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                           ^
+ad/graph.olang:1073:7: note: instantiated here, with T = F32
+ 1073 |     g.customRoom()
+      |       ^~~~~~~~~~
+ad/graph.olang:1014:7: note: instantiated here, with T = F32
+ 1014 |     g.arrange(l, r)
+      |       ^~~~~~~
+nn/quant.olang:553:15: note: instantiated here, with T = F32
+  553 |         try g.Plan(r)
+      |               ^~~~
+ad/graph.olang:746:44: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  746 |     g.customGrads = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                            ^
+ad/graph.olang:1073:7: note: instantiated here, with T = F32
+ 1073 |     g.customRoom()
+      |       ^~~~~~~~~~
+ad/graph.olang:1014:7: note: instantiated here, with T = F32
+ 1014 |     g.arrange(l, r)
+      |       ^~~~~~~
+nn/quant.olang:553:15: note: instantiated here, with T = F32
+  553 |         try g.Plan(r)
+      |               ^~~~
+nn/quant.olang: semantic errors, skipping
+== dyn/conn.olang ==
+ok - Link.AddMass: a unit's incoming mass is its row's absolute sum, and a reciprocal connection adds its columns to the other side
+ok - Link.Prune: pruning masks in place, and compacting a sparse form drops the entries without changing its product
+ok - Link.Forward: every wiring carries what its dense matrix does, forward and back
+ok - Link.Forward: an event-driven connection carries only changes above its threshold, and catches up when they add up
+4 passed, 0 failed
+== dyn/settle.olang ==
+0 passed, 0 failed
+== dyn/system.olang ==
+ok - System.Reset: a cold start clears the state but the fields kept across settles (@Keep)
+ok - System.Read: a module reads its own signal first, then its parent's
+ok - System.Settle: linear neurons settle to the solution of (I - W_eff) v = c, c the bias and the folded input
+ok - System.Settle: the certificate's sweep counts at kappa 0.9: a cold settle needs ln(tol) / ln(0.9) sweeps - 64 at the lesson tolerance, 66 at 1e-3, 71 at the life tolerance
+ok - System.Settle: a refusal: a budget too small ends unconverged, with the sweeps it took
+ok - System.Settle: damping changes the path, not the equilibrium, and removes a period-2 cycle
+ok - System.Settle: Jacobi sweeps in tasks equal one thread bit for bit, free and nudged, every wiring
+ok - System.Nudged: the nudged phases start from the free fixed point: +beta lowers the cost, -beta raises it
+ok - System.Settle: a spiking population under a constant drive fires at the rate the analytic formula gives
+ok - System.Settle: a custom model settles where the built-in model it restates does
+ok - System.Prune: a pruned weight is a zero weight, a retired unit rests, and compacting changes no equilibrium
+ok - System.Settle: a lesson allocates nothing: resident memory does not grow over hundreds of free and nudged settles
+ok - System.Settle: a spiking system settles to its rate model's equilibrium, free and nudged
+ok - System.Retire: a system with a retired unit converges, free and nudged, the unit at rest
+14 passed, 0 failed
+ad/graph.olang:745:43: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  745 |     g.customVals = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                           ^
+ad/graph.olang:736:19: note: instantiated here, with T = F32
+  736 |     if g.Eager: g.customRoom()
+      |                   ^~~~~~~~~~
+dyn/bridge.olang:265:38: note: instantiated here, with T = F32
+  265 |     if guess == graph.None: return g.Custom(b, x), graph.None
+      |                                      ^~~~~~
+ad/graph.olang:746:44: error[E27]: a comprehension's elements may not be or hold references yet - build the array with a loop
+  746 |     g.customGrads = Array<tensor.Tensor<T>>[g.Value(v) for v in g.customIn]
+      |                                            ^
+ad/graph.olang:736:19: note: instantiated here, with T = F32
+  736 |     if g.Eager: g.customRoom()
+      |                   ^~~~~~~~~~
+dyn/bridge.olang:265:38: note: instantiated here, with T = F32
+  265 |     if guess == graph.None: return g.Custom(b, x), graph.None
+      |                                      ^~~~~~
+dyn/bridge.olang: semantic errors, skipping
+== dyn/learn.olang ==
+ok - Learner.Contrast: the contrast written is its definition for every wiring - k sum over the rows of the coupling's derivative at plus less at minus - frozen and pruned weights zero
+relative errors at beta 0.1, 0.01, 0.001: centered Array<F64>[0.015596476237620312, 0.00016242440744650532, 1.6247199525530003e-06], uncentered Array<F64>[0.12424559814337423, 0.013488434058850748, 0.0013589136562379457]
+ok - Learner.Lesson: the centered contrast is the gradient of the cost at the free equilibrium to O(beta^2), the uncentered to O(beta)
+exact against differences 1.248916646148202e-10, EP(1e-3) against exact 6.834544222235521e-08, JFB's cosine with exact 0.9963495917620292
+ok - Learner.ImplicitGrad: exact, JFB and EP gradients at a fixed point against each other and against central differences, every reciprocal wiring
+ok - Learner.ImplicitGrad: the exact gradient through one-way connections (dense, event-driven) against central differences
+rate XOR: loss 0.00014263558797674195, 4/4 right, 9.186666666666667 sweeps a lesson
+ok - Learner.Lesson: XOR by rate neurons: two inputs, eight tanh units, two readouts (cross-entropy), EP lessons and Adam
+spiking XOR: loss 1.4495843788653318e-06, 4/4 right, 642.56 steps a lesson
+ok - Learner.Lesson: XOR by spiking neurons: Lif hidden and readout units, their spike counts nudged toward 0.2 spikes a step for the class
+ok - Learner.Tick: a tick runs its clock's rules in the order attached: an EP lesson writes what Lesson writes, a custom rule is called
+ok - Learner.Tick: three factors: the trace is decay e + the contrast of the last nudge, the parameters step by rate m e; a pruned weight stays zero; without a nudge the term is Hebbian
+bandit: 100 of the last 100 moments rewarded
+ok - Learner.Tick: three factors learn a contextual bandit: the nudge toward the action taken, the reward less its running mean as the signal
+ok - Learner.Homeostasis: a spiking population's thresholds and a rate population's biases move each unit's mean activity to the target
+ok - Learner.DeltaWrite: a delta write stores a value at a unit key at once, orthogonal keys do not interfere, and the settle reads it back
+ok - Learner.Lesson: lessons, ticks and implicit gradients allocate nothing: resident memory does not grow over hundreds of them
+12 passed, 0 failed
+== dyn/energy.olang ==
+ok - Energy.AddGrad: an energy of three terms: its gradient in the state and in its parameters against central differences
+ok - Energy.AddGrad: a settled symmetric system is a stationary point of the energy its populations and connections supply, which Of evaluates alike
+ok - Of: small steps of the settle descend the energy, and a step at the equilibrium leaves it
+3 passed, 0 failed
+DONE

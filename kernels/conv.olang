@@ -100,9 +100,10 @@ fn cast<X, D>(x X, like D) D {
 # the most positions a panel of Patches has: gemm's tile rows (12 on AVX-512) with room to spare
 panelMost I64 = 32
 
-type Patches<S> struct(images mat.Mat<S>&, geometry Shape&) {
+type Patches<S> struct(images mat.Mat<S>&, geometry Shape&, fill S = 0) {
     Images mat.Mat<S>& = images
     Geometry Shape& = geometry
+    Fill S = fill                               # what the padding reads: 0, or quantized images' zero point
 }
 
 # the rows of the patch matrix: every output position of every image
@@ -116,6 +117,7 @@ fn (x Patches<S>&) Rows() I64 { return x.Images.Rows * x.Geometry.Positions() }
 # geometry is held in locals, read through x it would be read again at every store
 fn (x Patches<S>&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut Array<A>&) {
     z A
+    pad A = cast(x.Fill, z)
     s := x.Geometry
     data := x.Images.Data
     C, H, W, K, St, P := s.C, s.H, s.W, s.K, s.Stride, s.Pad
@@ -168,7 +170,7 @@ fn (x Patches<S>&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut
                 for w in range wr: dst[d + w] = cast(data[at[w] + step], z)
             } else {
                 for w in range wr {
-                    v A = z
+                    v A = pad
                     if U64(wy[w] + ky) < hu and U64(wx[w] + kx) < wu: v = cast(data[at[w] + step], z)
                     dst[d + w] = v
                 }
@@ -346,7 +348,8 @@ fn ReserveConv<S, A>(ws mut gemm.Workspace<A>&, n I64, s Shape&, like S) {
 # and the epilogue give (a test)
 fn Conv2d<S, A>(ws mut gemm.Workspace<A>&, y mut mat.Mat<S>&, x mat.Mat<S>&, w mat.Mat<S>&, s Shape&, epi gemm.Epilogue = gemm.Epilogue.None) {
     out := s.Rows(y)
-    gemm.GemmLeft(ws, out, Patches<S>(x, s), s.Patch(), w, true, 1, 0, epi)
+    patches := Patches<S>(x, s)
+    gemm.GemmLeft(ws, out, patches, s.Patch(), w, true, 1, 0, epi)
 }
 
 # the gradients of y = conv(x, w) + b: db the column sums of dy (OutC of them), dw = dy^T cols with the patches made
@@ -788,6 +791,53 @@ test Pool "pooling in tasks and in BF16: the same maxima and places, the first o
             for k in range 9 {
                 v := x[b, ((oy * 2 + k / 3) * 9 + ox * 2 + k % 3) * 3 + oc]
                 assert v <= one[b, o]
+            }
+        }
+    }
+}
+
+# the patch matrix of n images of quantized pixels, made: row (b OutH + oy) OutW + ox the window of output pixel (oy, ox)
+# of image b in Patches' [C][K][K] order, fill where the window is off the image
+fn bytePatches(x mat.Mat<U8>&, s Shape&, fill U8) mat.Mat<U8> {
+    out := plain(x.Rows * s.Positions(), s.Patch(), U8(0))
+    for b in range x.Rows {
+        for p in range s.Positions() {
+            oy, ox := p / s.OutW, p % s.OutW
+            for c in range s.C {
+                for ky in range s.K {
+                    for kx in range s.K: out[b * s.Positions() + p, (c * s.K + ky) * s.K + kx] = pixel(x, b, s, oy * s.Stride - s.Pad + ky, ox * s.Stride - s.Pad + kx, c, fill)
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn pixel(x mat.Mat<U8>&, b I64, s Shape&, iy I64, ix I64, c I64, fill U8) U8 {
+    if iy < 0 or iy >= s.H or ix < 0 or ix >= s.W: return fill
+    return x[b, (iy * s.W + ix) * s.C + c]
+}
+
+test Patches "an INT8 convolution read from its images as patches is the product of the patch matrix made, bit for bit, padding at the zero point" {
+    r := rand.Rand(71)
+    for shape in shapes() {
+        n I64 = 3
+        x := plain(n, shape.H * shape.W * shape.C, U8(0))
+        for i in range x.Data.Len(): x.Data[i] = U8(r.Below(256))
+        w := plain(shape.OutC, shape.Patch(), I8(0))
+        for i in range w.Data.Len(): w.Data[i] = I8(r.Below(255) - 127)
+        scale := Array<F32>[F32(r.Uniform(0.001, 0.01)) for _ in range shape.OutC]
+        rows := n * shape.Positions()
+        for zero in Array<I32>[0, 128] {
+            made := bytePatches(x, shape, U8(zero))
+            for threads in Array<I64>[1, 3] {
+                ws := gemm.Workspace<I32>(threads)
+                ws.ReserveI8(shape.OutC, shape.Patch())
+                want, wantOut := plain(rows, shape.OutC, I32(0)), plain(rows, shape.OutC, F32(0))
+                gemm.GemmI8(ws, want, made, w, scale, wantOut, zero)
+                got, gotOut := plain(rows, shape.OutC, I32(0)), plain(rows, shape.OutC, F32(0))
+                gemm.GemmI8Left(ws, got, Patches<U8>(x, shape, U8(zero)), rows, shape.Patch(), w, scale, gotOut, zero)
+                assert got.Data == want.Data and gotOut.Data == wantOut.Data, $shape.C + " channels, zero " + $zero
             }
         }
     }
