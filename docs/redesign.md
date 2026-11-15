@@ -428,19 +428,21 @@ fn main() ? {
 
 ### Questions for the user
 
-1. **The GPU route.** The 10M-300M baselines need the RTX 4060; a 300M model does not train on the CPU. olang has
-   no GPU target. Options: (a) olang gains an NVPTX target for a kernel subset (the same "compiler-checked subset"
-   idea as the FPGA path), oann's GPU kernels written in olang, NVIDIA's libraries (cuBLAS) through a C import where
-   they win; (b) cuBLAS/cuDNN through C imports only, no kernels of our own yet. Recommendation: (a), as the olang
-   batch after oann's round 3, with cuBLAS first so baselines can start. Default meanwhile: CPU only, baselines up to
-   about 20M parameters.
+1. **The GPU route - decided (the user, 2026-11-15: "we will depend on CUDA and CUblas either way, writing our own stuff
+   only when we gain something from it is the way").** NVIDIA's libraries (cuBLAS, cuDNN) through C imports are the
+   base; a kernel of our own is written only where it measurably gains (fused element work, the settle's small blocks,
+   attention variants cuDNN lacks). How our own GPU kernels are compiled (an NVPTX target in olang, or CUDA C through a
+   C import) is decided when the first one is needed, by what that kernel needs. Meanwhile CPU only.
 2. **Where research models live.** Recommendation: oann is the library and its reference models (MLP, CNN, GPT,
    SSM, the settling circuit, the hybrid); the agent, its store and sleep (agent, store, consolidator and their
    examples) and the energy-based reasoners move to oagent, which links oann. Default: they move in C3.
-3. **Structure changes between plans.** Recommendation: growth, pruning and evolutionary search rebuild and re-plan a
-   system (milliseconds, weights carried over by name); a planned system never changes shape, so its loops stay
-   allocation-free and the FPGA form stays static. The alternative, structure changing inside a running system, costs
-   allocation or fixed headroom in every loop. Default: between plans.
+3. **Structure changes - decided (the user, 2026-11-15: "we want the networks to be prunable at runtime eventually at
+   least. its not the most important first step, but dont depend it never being the case").** The first build may
+   re-plan between runs, but nothing may assume a planned system's structure is fixed: connections carry an active mask
+   (a pruned weight or unit is masked in place, no reallocation), sparse forms can drop entries in place, populations
+   can retire units, and the plan records what it laid out so a compaction step can rebuild it while running. The loops
+   stay allocation-free; pruning at run time costs a masked product until a compaction. The FPGA form is made from a
+   compacted system.
 
 ## 4. Round 3: work packages
 
