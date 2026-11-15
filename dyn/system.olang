@@ -6,8 +6,8 @@
 # rules step the parameters. docs/redesign.md section 1.4 is the design, docs/settling.md the model.
 #
 # A child module reads its own signals first, then its parent's (Read): the global "how it went" flows down, each rule's
-# "what happened" stays local. The rules' code is dyn/learn's: Attach records a rule on a clock, Rules lists a clock's,
-# and learn.Tick runs them.
+# "what happened" stays local. The rules' code is dyn/learn's: Attach records a rule on a clock, AttachedAt reads them
+# back, and a learn.Learner's Tick runs a clock's.
 #
 # Structure may change while running (docs/redesign.md section 3, decision 3): a connection's weights are masked in
 # place (Prune), a sparse one's masked entries dropped in place (Compact), a population's units retired (Retire) - the
@@ -34,7 +34,7 @@ type Sig I64
 # the clocks rules run on: inside a settle, per sample or moment, per episode, in sleep
 type Clock enum { Sweep, Step, Episode, Sleep }
 
-# learning and adaptation as rules on a module (run by dyn/learn)
+# learning and adaptation as rules on a module (run by dyn/learn's Learner)
 type Rule enum {
     Ep(beta F64, centered Bool)                     # contrast of nudged phases into ParamGrads
     ThreeFactor(signal Sig, decay F64, rate F64)    # eligibility trace x the module's signal
@@ -112,19 +112,21 @@ fn (s mut System<T>&) Signal(m Mod, name String&, width I64 = 1) Sig {
     return Sig(s.sigs.Len() - 1)
 }
 
-# a rule on module m, run on clock c (by learn.Tick)
+# a rule on module m, run on clock c (by learn.Learner's Tick)
 fn (s mut System<T>&) Attach(m Mod, r Rule, c Clock) {
     s.rules.Push(ruleRec(I64(m), r, c))
 }
 
-# a rule as attached: where and what
-type Attached struct(Where Mod, What Rule) { Where, What }
+# a rule as attached: where, what, and the clock it runs on
+type Attached struct(Where Mod, What Rule, When Clock) { Where, What, When }
 
-# the rules on clock c, in the order attached, with their modules
-fn (s System<T>&) Rules(c Clock) Iterator<Attached> {
-    for g in s.rules {
-        if g.When == c: yield Attached(Mod(g.In), g.What)
-    }
+# how many rules are attached
+fn (s System<T>&) Attachments() I64 { return s.rules.Len() }
+
+# the rule attached i-th (learn.Learner.Tick walks them, running a clock's in the order attached)
+fn (s System<T>&) AttachedAt(i I64) Attached {
+    g := s.rules[i]
+    return Attached(Mod(g.In), g.What, g.When)
 }
 
 # ---- the plan ----
