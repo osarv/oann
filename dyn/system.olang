@@ -1,0 +1,589 @@
+# dyn/system - a dynamical system: a tree of modules holding populations of neurons with named state (dyn/neuron),
+# connections between them (dyn/conn), signals the module's rules read, and rules on clocks. It is recorded through
+# handles (Pop, Conn, Mod, Sig), laid out once by Plan - one flat parameter region (every connection's weights, then
+# every population's biases), its gradient region in the same layout, every population's state, every workspace - and
+# then run with nothing allocated: Clamp and Target give a batch, Settle and Nudged relax it (dyn/settle), learning
+# rules step the parameters. docs/redesign.md section 1.4 is the design, docs/settling.md the model.
+#
+# A child module reads its own signals first, then its parent's (Read): the global "how it went" flows down, each rule's
+# "what happened" stays local. The rules' code is dyn/learn's: Attach records a rule on a clock, Rules lists a clock's,
+# and learn.Tick runs them.
+#
+# Structure may change while running (docs/redesign.md section 3, decision 3): a connection's weights are masked in
+# place (Prune), a sparse one's masked entries dropped in place (Compact), a population's units retired (Retire) - the
+# loops stay allocation-free; re-planning with the weights kept is the full compaction.
+#
+# The stability tools: Gain (kappa, the largest incoming absolute weight sum of a relaxing unit times its activation's
+# largest slope), Certify (every recurrent connection scaled so that kappa is a target, 0.9 by default), Restrain (each
+# scaled back into the certified set where it left it), Rate (the certified contraction q = 1 - dt (1 - kappa)) and the
+# budgets that follow (settling.md 1.2, 1.4, 1.10).
+
+import "std/rand"
+import "../tensor"
+import "neuron"
+import "conn"
+import "settle"
+
+# handles: a population, a connection, a module, a signal - numbered in the order they were made
+type Pop I64
+type Conn I64
+type Mod I64
+type Sig I64
+
+# the clocks rules run on: inside a settle, per sample or moment, per episode, in sleep
+type Clock enum { Sweep, Step, Episode, Sleep }
+
+# learning and adaptation as rules on a module (run by dyn/learn)
+type Rule enum {
+    Ep(beta F64, centered Bool)                     # contrast of nudged phases into ParamGrads
+    ThreeFactor(signal Sig, decay F64, rate F64)    # eligibility trace x the module's signal
+    Homeostasis(target F64, rate F64)               # thresholds or gains toward a target rate
+    DeltaWrite(c Conn, gate Sig)                    # fast weights written while settling
+    Custom(r mut any Update&)
+}
+
+# a rule beyond the built-in ones, given its system's parameters and gradients (flat) on its clock
+type Update trait {
+    mut Apply(params mut Array<F32>&, grads mut Array<F32>&)
+}
+
+# the gradient at a fixed point (dyn/learn)
+type Implicit enum { Exact(tol F64, sweeps I64), Jfb, Ep(beta F64) }
+
+# a signal looked up by a name no module on the way to the root has
+type SignalError error {
+    Missing(name String)
+}
+
+type modRec struct(Parent I64, Name String) { Parent, Name }
+
+type popRec struct(In I64, Name String) { In, Name }
+
+type sigRec struct(In I64, Name String, Width I64, At I64) { In, Name, Width, At }
+
+type ruleRec struct(In I64, What Rule, When Clock) { In, What, When }
+
+# a system of T elements (state and weights; F32 to run, F64 to check), batch rows a phase, phases phases side by side
+# (free, plus, minus), its sweeps split over threads tasks
+type System<T> struct(batch I64, threads I64 = 1, phases I64 = 3) {
+    Batch I64 = batch
+    Phases I64 = phases
+    E mut settle.Engine<T>& = settle.Engine<T>(batch, phases, threads)
+    Planned Bool = false
+    mods mut Vec<modRec>& = Vec<modRec>[modRec(-1, "root")]
+    pops mut Vec<popRec>& = Vec<popRec>()
+    sigs mut Vec<sigRec>& = Vec<sigRec>()
+    rules mut Vec<ruleRec>& = Vec<ruleRec>()
+    signals mut Array<T>& = Array<T>(0)
+}
+
+# ---- recording ----
+
+fn (s System<T>&) Root() Mod { return Mod(0) }
+
+# a module under parent
+fn (s mut System<T>&) Module(parent Mod, name String&) Mod {
+    s.mods.Push(modRec(I64(parent), name))
+    return Mod(s.mods.Len() - 1)
+}
+
+# a population of size units of model n in module m
+fn (s mut System<T>&) Population(m Mod, name String&, size I64, n neuron.Neuron, role neuron.Role = neuron.Role.Hidden) Pop {
+    s.E.Pops.Push(settle.Population<T>(size, n, role, s.Batch * s.Phases, s.Batch))
+    s.pops.Push(popRec(I64(m), name))
+    return Pop(s.pops.Len() - 1)
+}
+
+# a connection from pre into post, wired so; reciprocal also carries post's activities back into pre (Symmetric always
+# does); frozen: learning leaves its weights
+fn (s mut System<T>&) Connect(pre Pop, post Pop, w conn.Wiring, frozen Bool = false, reciprocal Bool = false) Conn {
+    a := s.E.Pops[I64(pre)]
+    b := s.E.Pops[I64(post)]
+    s.E.Links.Push(conn.Link<T>(I64(pre), I64(post), a.Size, b.Size, w, reciprocal, frozen))
+    return Conn(s.E.Links.Len() - 1)
+}
+
+# a signal of width values in module m, zero until Set
+fn (s mut System<T>&) Signal(m Mod, name String&, width I64 = 1) Sig {
+    at I64 = 0
+    for g in s.sigs: at += g.Width
+    s.sigs.Push(sigRec(I64(m), name, width, at))
+    return Sig(s.sigs.Len() - 1)
+}
+
+# a rule on module m, run on clock c (by learn.Tick)
+fn (s mut System<T>&) Attach(m Mod, r Rule, c Clock) {
+    s.rules.Push(ruleRec(I64(m), r, c))
+}
+
+# a rule as attached: where and what
+type Attached struct(Where Mod, What Rule) { Where, What }
+
+# the rules on clock c, in the order attached, with their modules
+fn (s System<T>&) Rules(c Clock) Iterator<Attached> {
+    for g in s.rules {
+        if g.When == c: yield Attached(Mod(g.In), g.What)
+    }
+}
+
+# ---- the plan ----
+
+# lays everything out and draws the weights from r (Glorot-uniform; biases zero). Refuses a structure the settle cannot
+# run: a connection into an input, an event-driven one that is reciprocal, spiking populations beside rate ones or as
+# inputs, spiking populations of different windows, a custom model outside a System<F32>
+fn (s mut System<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError, conn.WiringError {
+    if s.Planned: error tensor.ShapeError.Mismatch("Plan twice")
+    try s.check()
+    e := s.E
+    count I64 = 0
+    for l in e.Links {
+        try l.Check()
+        l.Draw(r)
+        count += l.Count
+    }
+    for p in e.Pops: count += p.Size
+    e.Params = Array<T>(count)
+    e.Grads = Array<T>(count)
+    at I64 = 0
+    for i in range e.Links.Len() {
+        l := e.Links[i]
+        l.Folded = e.Pops[l.Pre].Role == neuron.Role.Input
+        l.Lay(e.Params, at, s.Batch * s.Phases, r)
+        at += l.Count
+        s.route(l, i)
+    }
+    unit I64 = 0
+    for p in e.Pops {
+        p.Bias = at
+        at += p.Size
+        p.Unit = unit
+        unit += p.Size
+    }
+    width I64 = 0
+    for g in s.sigs: width += g.Width
+    s.signals = Array<T>(width)
+    e.Ready()
+    s.Planned = true
+}
+
+# connection i into the lists of the populations it feeds: folded into its post's constant (its pre an input), else
+# carried forward into post and, reciprocal, back into pre
+fn (s mut System<T>&) route(l conn.Link<T>&, i I64) {
+    post := s.E.Pops[l.Post]
+    if l.Folded {
+        post.Folds.Push(i)
+        return
+    }
+    post.In.Push(i)
+    if l.Both: s.E.Pops[l.Pre].Back.Push(i)
+}
+
+fn (s System<T>&) check() ? tensor.ShapeError {
+    lifs, rates := 0, 0
+    window I64 = 0
+    for p in s.E.Pops {
+        model := p.Model
+        if p.Role == neuron.Role.Input {
+            if model != neuron.Neuron.Rate: error tensor.ShapeError.Mismatch("an input population is of rate neurons")
+            continue
+        }
+        if model == neuron.Neuron.Lif {
+            if window != 0 and model.window != window: error tensor.ShapeError.Mismatch("every spiking population of a system counts over one window")
+            if model.window < 1: error tensor.ShapeError.Mismatch("a spiking window is at least one step")
+            window = model.window
+            lifs++
+        } else {
+            rates++
+        }
+        if model == neuron.Neuron.Custom and not isF32<T>(): error tensor.ShapeError.Mismatch("a custom model runs in a System<F32>")
+    }
+    if lifs > 0 and rates > 0: error tensor.ShapeError.Mismatch("a system's relaxing populations are all spiking or all rate (or custom) ones")
+    for l in s.E.Links {
+        if s.E.Pops[l.Post].Role == neuron.Role.Input: error tensor.ShapeError.Mismatch("a connection into an input population")
+        if l.Both and s.E.Pops[l.Pre].Role == neuron.Role.Input: error tensor.ShapeError.Mismatch("a reciprocal connection from an input population")
+    }
+}
+
+fn isF32<T>() Bool {
+    return match T {
+        case F32: true
+        case _: false
+    }
+}
+
+# ---- data in ----
+
+# the system's checks of a batch given for p: a [batch, size] tensor
+fn (s System<T>&) batchOf<Y>(p Pop, x tensor.Tensor<Y>&, width I64) mut Array<Y>& ? tensor.ShapeError {
+    if not s.Planned: error tensor.ShapeError.Mismatch("a batch given before Plan")
+    if x.Rank() != 2 or x.Dim(0) != s.Batch or x.Dim(1) != width {
+        error tensor.ShapeError.Mismatch("population " $I64(p) " takes [" $s.Batch ", " $width "], not " $x.Dims)
+    }
+    return try x.Flat()
+}
+
+# p's drive for the next settles, [batch, size]: an input's state is its drive (held fixed); any other population's is
+# added to its total (a memory's read, a stimulus)
+fn (s mut System<T>&) Clamp(p Pop, x tensor.Tensor<T>&) ? tensor.ShapeError {
+    pop := s.E.Pops[I64(p)]
+    from := try s.batchOf(p, x, pop.Size)
+    for i in range from.Len(): pop.Drive[i] = from[i]
+}
+
+# a cross-entropy readout's classes, [batch, groups]
+fn (s mut System<T>&) Target(p Pop, y tensor.Tensor<I32>&) ? tensor.ShapeError {
+    pop := s.E.Pops[I64(p)]
+    groups := settle.GroupsOf(pop.Role)
+    if groups == 0: error tensor.ShapeError.Mismatch("population " $I64(p) " is no cross-entropy readout")
+    from := try s.batchOf(p, y, groups)
+    for i in range from.Len(): pop.Labels[i] = from[i]
+}
+
+# a squared-error readout's targets, [batch, size]
+fn (s mut System<T>&) TargetValues(p Pop, y tensor.Tensor<T>&) ? tensor.ShapeError {
+    pop := s.E.Pops[I64(p)]
+    if pop.Target.Len() == 0: error tensor.ShapeError.Mismatch("population " $I64(p) " is no readout")
+    from := try s.batchOf(p, y, pop.Size)
+    for i in range from.Len(): pop.Target[i] = from[i]
+}
+
+# ---- signals ----
+
+# a signal's values, set
+fn (s mut System<T>&) Set(sig Sig, v tensor.Tensor<T>&) ? tensor.ShapeError {
+    g := s.sigs[I64(sig)]
+    if v.Count() != g.Width: error tensor.ShapeError.Mismatch("signal " $g.Name " holds " $g.Width " values, not " $v.Count())
+    from := try v.Flat()
+    for i in range g.Width: s.signals[g.At + i] = from[i]
+}
+
+# the signal called name as module m sees it: its own, else its parent's, up to the root - a view of its values
+fn (s System<T>&) Read(m Mod, name String&) tensor.Tensor<T> ? SignalError {
+    at := I64(m)
+    for at >= 0 {
+        for g in s.sigs {
+            if g.In == at and g.Name == name: return tensor.Tensor<T>.Over(s.signals, g.At, g.Width)!
+        }
+        at = s.mods[at].Parent
+    }
+    error SignalError.Missing(name)
+}
+
+# ---- settling ----
+
+# phase settled from its committed state (Reset it for a cold start) within the budget, with its inputs' drives and
+# targets as given: allocation-free. Its state is committed either way; the Settlement says how it went
+fn (s mut System<T>&) Settle(phase settle.Phase, b settle.Budget) settle.Settlement {
+    ph := phase.Index()
+    if ph >= s.Phases: unreachable "a system of " $s.Phases " phases has no " $phase
+    s.E.Beta[ph] = 0.0 if phase == settle.Phase.Free else s.E.Beta[ph]
+    return s.E.Settle(ph, ph + 1, b, true)
+}
+
+# every nudged phase settled from the free phase's state, side by side: +beta toward the readouts' targets and,
+# centered, -beta away (Minus) - one product per connection per sweep for both
+fn (s mut System<T>&) Nudged(b settle.Budget, beta F64 = 0.5, centered Bool = true) settle.Settlement {
+    hi := 3 if centered else 2
+    if s.Phases < hi: unreachable "a system of " $s.Phases " phases cannot hold these nudged phases"
+    s.E.Beta[1] = beta
+    if centered: s.E.Beta[2] = -beta
+    for ph in range 1, hi: s.E.Warm(ph, 0)
+    return s.E.Settle(1, hi, b, false)
+}
+
+# phase's state at rest: every field but the kept ones (@Keep) zero
+fn (s mut System<T>&) Reset(phase settle.Phase) { s.E.Reset(phase.Index()) }
+
+# phase's state set to from's
+fn (s mut System<T>&) Warm(phase settle.Phase, from settle.Phase) { s.E.Warm(phase.Index(), from.Index()) }
+
+# the nudge phase was last settled with (0 for the free phase)
+fn (s System<T>&) NudgeOf(phase settle.Phase) F64 { return s.E.Beta[phase.Index()] }
+
+# the step of a sweep, in (0, 1]: 1 is plain fixed-point iteration
+fn (s mut System<T>&) Step(dt F64) { s.E.Dt = dt }
+
+# ---- state and parameters out ----
+
+# p's named state, every phase's rows (phases x batch x size, a phase's batch rows after another's): its cells' Columns
+# - RateCell<T> for rate and custom populations, LifCell<T> for spiking ones. Writing it writes the state
+fn (s System<T>&) State<C>(p Pop) mut Columns<C>& {
+    pop := s.E.Pops[I64(p)]
+    match C {
+        case neuron.RateCell<T> { return pop.R0 }
+        case neuron.LifCell<T> { return pop.L0 }
+    }
+}
+
+# p's activities in phase, [batch, size], a view
+fn (s System<T>&) Activity(phase settle.Phase, p Pop) tensor.Tensor<T> {
+    pop := s.E.Pops[I64(p)]
+    n := s.Batch * pop.Size
+    return tensor.Tensor<T>.Over(pop.Activity(0), phase.Index() * n, s.Batch, pop.Size)!
+}
+
+# the class each row answers on a readout in phase: its most active unit (of each group, numbered within it), [batch,
+# groups] into out
+fn (s System<T>&) Predict(phase settle.Phase, p Pop, out mut Array<I32>&) {
+    pop := s.E.Pops[I64(p)]
+    groups := settle.GroupsOf(pop.Role).Max(1)
+    a := pop.Activity(0)
+    w := pop.Size / groups
+    base := phase.Index() * s.Batch * pop.Size
+    for b in range s.Batch {
+        for g in range groups {
+            at := base + b * pop.Size + g * w
+            best I64 = 0
+            for j in range 1, w: best = j if a[at + j] > a[at + best] else best
+            out[b * groups + g] = I32(best)
+        }
+    }
+}
+
+# the readouts' cost in phase, averaged over the batch rows
+fn (s System<T>&) Loss(phase settle.Phase) F64 {
+    total F64 = 0.0
+    for pop in s.E.Pops {
+        role := pop.Role
+        if role != neuron.Role.Readout: continue
+        a := pop.Activity(0)
+        for b in range s.Batch {
+            at := (phase.Index() * s.Batch + b) * pop.Size
+            total += neuron.CostOf(role.cost, a, at, pop.Size, pop.Labels, b * settle.GroupsOf(role), pop.Target, b * pop.Size)
+        }
+    }
+    return total / F64(s.Batch)
+}
+
+# connection c's weights, a view of the parameter region: [post, pre] for the dense forms, [pre, post] for an
+# event-driven one, A ([post, rank]) for a low-rank one (B follows it), the stored values for a sparse one ([Count])
+fn (s System<T>&) Weights(c Conn) tensor.Tensor<T> {
+    l := s.E.Links[I64(c)]
+    return match l.Kind {
+        case conn.Wiring.Dense, conn.Wiring.Symmetric: tensor.Tensor<T>.Over(s.E.Params, l.Off, l.PostSize, l.PreSize)!
+        case conn.Wiring.Events: tensor.Tensor<T>.Over(s.E.Params, l.Off, l.PreSize, l.PostSize)!
+        case conn.Wiring.LowRank(rank): tensor.Tensor<T>.Over(s.E.Params, l.Off, l.PostSize, rank)!
+        case _: tensor.Tensor<T>.Over(s.E.Params, l.Off, l.Count)!
+    }
+}
+
+# connection c as the settle runs it: its kind, sides, offset, sparse form and mask
+fn (s System<T>&) Link(c Conn) mut conn.Link<T>& { return s.E.Links[I64(c)] }
+
+# population p as the settle runs it
+fn (s System<T>&) Pop(p Pop) mut settle.Population<T>& { return s.E.Pops[I64(p)] }
+
+# p's biases, a view of the parameter region
+fn (s System<T>&) Bias(p Pop) tensor.Tensor<T> {
+    pop := s.E.Pops[I64(p)]
+    return tensor.Tensor<T>.Over(s.E.Params, pop.Bias, pop.Size)!
+}
+
+# every parameter, flat, as the graph's: what optimizers, clipping and checkpoints step in one pass
+fn (s System<T>&) Params() tensor.Tensor<T> { return tensor.Tensor<T>.Over(s.E.Params, 0, s.E.Params.Len())! }
+
+# their gradients, in the same layout
+fn (s System<T>&) ParamGrads() tensor.Tensor<T> { return tensor.Tensor<T>.Over(s.E.Grads, 0, s.E.Grads.Len())! }
+
+# the counts so far: sweeps (time steps) of every settle, and the last settle's
+fn (s System<T>&) Sweeps() I64 { return s.E.Sweeps }
+
+fn (s System<T>&) Last() settle.Settlement { return s.E.Last }
+
+# ---- structure while running ----
+
+# connection c's parameters (a Tiles' stored tiles) whose keep is false masked in place: zeroed, their gradient too
+fn (s mut System<T>&) Prune(c Conn, keep Array<Bool>&) {
+    s.E.Links[I64(c)].Prune(keep, s.E.Params, s.E.Grads)
+}
+
+# unit j of p retired: held at rest from the next sweep on (its rows zero), so nothing it is connected to hears it
+fn (s mut System<T>&) Retire(p Pop, j I64) {
+    pop := s.E.Pops[I64(p)]
+    if not pop.Alive[j]: return
+    pop.Alive[j] = false
+    pop.Retired++
+}
+
+# every sparse connection's masked entries dropped in place: products cheaper from now on. Gives the entries removed
+fn (s mut System<T>&) Compact() I64 {
+    removed I64 = 0
+    for l in s.E.Links: removed += l.Compact(s.E.Params, s.E.Grads)
+    return removed
+}
+
+# ---- stability ----
+
+# every unit's incoming mass over the recurrent connections (a folded one's source is constant and does not count)
+fn (s mut System<T>&) masses() {
+    e := s.E
+    for i in range e.Mass.Len(): e.Mass[i] = 0.0
+    for l in e.Links {
+        if not l.Folded: l.AddMass(e.Params, e.Mass, e.Pops[l.Post].Unit, e.Pops[l.Pre].Unit)
+    }
+}
+
+# the largest slope of the relaxing populations' activations (infinite for spiking and custom ones)
+fn (s System<T>&) slope() F64 {
+    worst F64 = 0.0
+    for p in s.E.Pops {
+        if p.Role != neuron.Role.Input: worst = worst.Max(neuron.Slope(p.Model))
+    }
+    return worst
+}
+
+# the feedback gain kappa: the largest incoming mass of a relaxing unit times the activations' largest slope. Below 1 a
+# sweep at dt = 1 is a contraction in the sup norm by this factor: one equilibrium, and the certificate's bounds
+fn (s mut System<T>&) Gain() F64 {
+    s.masses()
+    most F64 = 0.0
+    for p in s.E.Pops {
+        if p.Role == neuron.Role.Input: continue
+        for j in range p.Size: most = most.Max(s.E.Mass[p.Unit + j])
+    }
+    return 0.0 if most == 0.0 else most * s.slope()
+}
+
+# every recurrent connection scaled by one factor so that the gain is target (which keeps a reciprocal block
+# symmetric); nothing for a system with no recurrent weights or no bounded slope
+fn (s mut System<T>&) Certify(target F64 = 0.9) {
+    k := s.Gain()
+    if k == 0.0 or not (k <= F64.Max): return
+    for l in s.E.Links {
+        if not l.Folded: l.Scale(s.E.Params, target / k)
+    }
+}
+
+# the weights projected back into the certified set: each recurrent connection whose units' gain exceeds target scaled
+# by the factor the worst of them needs (all factors found before any is applied)
+fn (s mut System<T>&) Restrain(target F64 = 0.9) {
+    s.masses()
+    l := s.slope()
+    if not (l <= F64.Max): return
+    e := s.E
+    factors := Array<F64>(e.Links.Len(), 1.0)
+    for i in range e.Links.Len() {
+        c := e.Links[i]
+        if c.Folded: continue
+        factors[i] = s.worstFactor(e.Pops[c.Post], l, target)
+        if c.Both: factors[i] = factors[i].Min(s.worstFactor(e.Pops[c.Pre], l, target))
+    }
+    for i in range e.Links.Len() {
+        if factors[i] < 1.0: e.Links[i].Scale(e.Params, factors[i])
+    }
+}
+
+fn (s System<T>&) worstFactor(p settle.Population<T>&, slope F64, target F64) F64 {
+    f F64 = 1.0
+    for j in range p.Size {
+        g := slope * s.E.Mass[p.Unit + j]
+        if g > target: f = f.Min(target / g)
+    }
+    return f
+}
+
+# the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual - of a free phase, or one nudged
+# with beta at its step - or 1 where nothing is certified
+fn (s mut System<T>&) Rate(beta F64 = 0) F64 {
+    k := s.Gain()
+    dt := s.E.Dt if beta <= 0.0 else s.E.Dt / (1.0 + beta * s.E.ForceSlope())
+    return 1.0 if k >= 1.0 else 1.0 - dt * (1.0 - k)
+}
+
+# the training tolerance (settling.md 1.4): phases solved to it add an error no larger than the contrast's O(beta^2)
+# bias - max(beta^3 (1 - kappa) / 10, 100 u), kappa held at most 0.9. A spiking system's: two spikes a window
+fn (s mut System<T>&) LessonTolerance(beta F64) F64 {
+    if s.E.Spiking: return 2.0 / F64(s.E.Window)
+    kappa := s.Gain().Min(0.9)
+    return (beta * beta * beta * (1.0 - kappa) / 10.0).Max(100.0 * roundoff<T>())
+}
+
+# a budget for a settle to tol, free or nudged with beta: twice the sweeps the certificate says a cold start needs
+# (ln tol / ln q, q held at most 0.95), at least 128; a spiking system's 32 windows
+fn (s mut System<T>&) BudgetFor(tol F64, beta F64 = 0) settle.Budget {
+    if s.E.Spiking: return settle.Budget(32 * s.E.Window, tol)
+    q := s.Rate(beta).Min(0.95)
+    return settle.Budget(I64((2.0 * tol.Log() / q.Log()).Ceil().Max(128.0)), tol)
+}
+
+# the unit roundoff of T
+fn roundoff<T>() F64 {
+    return match T {
+        case F32: 5.960464477539063e-8
+        case F64: 1.1102230246251565e-16
+    }
+}
+
+# ---- tests ----
+
+# x (3 linear inputs) -> h (5) <-> y (2), h with a lateral block: every wiring of the rate path, F64
+fn small(s mut System<F64>&, rho neuron.Rho, lateral conn.Wiring, r mut rand.Rand&) {
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 5, neuron.Neuron.Rate(rho))
+    y := s.Population(root, "y", 2, neuron.Neuron.Rate(rho), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Connect(h, h, lateral, reciprocal = true)
+    s.Plan(r)!
+    for b in range s.Batch {
+        for j in range 3: s.Pop(x).Drive[b * 3 + j] = r.Uniform(-1.0, 1.0)
+    }
+    for j in range 7: s.E.Params[s.Pop(h).Bias + j] = r.Uniform(-0.2, 0.2)
+}
+
+# Gaussian elimination of a x = b, n unknowns
+fn solve(a mut Array<F64>&, b mut Array<F64>&, n I64) {
+    for c in range n {
+        p := c
+        for i in range c + 1, n: p = i if a[i * n + c].Abs() > a[p * n + c].Abs() else p
+        for k in range n { t := a[c * n + k]
+            a[c * n + k] = a[p * n + k]
+            a[p * n + k] = t }
+        t := b[c]
+        b[c] = b[p]
+        b[p] = t
+        for i in range c + 1, n {
+            f := a[i * n + c] / a[c * n + c]
+            for k in range c, n: a[i * n + k] -= f * a[c * n + k]
+            b[i] -= f * b[c]
+        }
+    }
+    for c := n - 1, c >= 0, c-- {
+        for k in range c + 1, n: b[c] -= a[c * n + k] * b[k]
+        b[c] /= a[c * n + c]
+    }
+}
+
+test System.Settle "linear neurons settle to the solution of (I - W_eff) v = c, c the bias and the folded input" {
+    r := rand.Rand(2)
+    s := System<F64>(2, 1, 1)
+    small(s, neuron.Rho.Linear, conn.Wiring.Dense, r)
+    s.Certify(0.8)
+    out := s.Settle(settle.Phase.Free, settle.Budget(400, 1e-12))
+    assert out.Converged
+    for b in range 2 {
+        # the relaxing units h (0 .. 5) and y (5 .. 7): v = c + W_eff v
+        a := Array<F64>(49)
+        c := Array<F64>(7)
+        wx := s.Weights(Conn(0))
+        wy := s.Weights(Conn(1))
+        wl := s.Weights(Conn(2))
+        for i in range 7: a[i * 7 + i] = 1.0
+        for i in range 5 {
+            c[i] = s.E.Params[s.Pop(Pop(1)).Bias + i]
+            for j in range 3: c[i] += wx.Get(i, j) * s.Pop(Pop(0)).Drive[b * 3 + j]
+            for j in range 5: a[i * 7 + j] -= wl.Get(i, j) + wl.Get(j, i)
+            for k in range 2: a[i * 7 + 5 + k] -= wy.Get(k, i)
+        }
+        for k in range 2 {
+            c[5 + k] = s.E.Params[s.Pop(Pop(2)).Bias + k]
+            for i in range 5: a[(5 + k) * 7 + i] -= wy.Get(k, i)
+        }
+        solve(a, c, 7)
+        h := s.Activity(settle.Phase.Free, Pop(1))
+        y := s.Activity(settle.Phase.Free, Pop(2))
+        for i in range 5: assert (h.Get(b, i) - c[i]).Abs() < 1e-10
+        for k in range 2: assert (y.Get(b, k) - c[5 + k]).Abs() < 1e-10
+    }
+}
