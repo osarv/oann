@@ -157,7 +157,7 @@ fn Gemm<S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a mat.Mat<S>&, ta Bool, b
     oa := operand<S>.of(a)
     ob := operand<S>.of(b)
     cd := c.Data[c.Off:]
-    if k > 0 and unpacked(m, n, k, tb, cd, alpha) {
+    if k > 0 and unpacked(m, n, k, ta, tb, cd, alpha) {
         unpackedProduct(m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
         finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
         return
@@ -773,18 +773,19 @@ fn sameType<S, A>(c Array<S>&, z A) Bool {
 # whether a product is computed without packing: storage that is its own accumulator, and up to four rows (a
 # vector-matrix product each), one column (a matrix-vector product), or so small that packing would cost more than it
 # saves - at most smallProduct multiply-adds, or fewer than twelve rows each at least four vectors long against an
-# op(B) that stays in the cache (measured against the packed path on AVX-512, AVX2 and SSE: linalg's bench)
+# op(B) that stays in the cache (measured against the packed path on AVX-512, AVX2 and SSE: linalg's bench). Narrower
+# storage takes only the paths summing each element in A and storing it once: rows of op(b) dotted, a column of a
 smallProduct I64 = 1024
 
-fn unpacked<S, A>(m I64, n I64, k I64, tb Bool, c Array<S>&, z A) Bool {
+fn unpacked<S, A>(m I64, n I64, k I64, ta Bool, tb Bool, c Array<S>&, z A) Bool {
     return match S {
         case A: m <= 4 or n == 1 or (not tb and (m * n * k <= smallProduct or (m < 12 and n >= 4 * vectorLanes(z) and k * n <= 65536)))
-        case _: false
+        case _: (m <= 4 and tb) or (n == 1 and not ta)          # dot products, each summed in A and stored once
     }
 }
 
-# the unpacked product, S being A: a vector-matrix product per row of up to four, a matrix-vector product for one
-# column, and the i-k-j loop otherwise
+# the unpacked product: a vector-matrix product per row of up to four, a matrix-vector product for one column, and the
+# i-k-j loop otherwise (S being A; narrower storage only takes the dot products, gemvRows)
 fn unpackedProduct<S, A>(m I64, n I64, k I64, a operand<S>&, ta Bool, b operand<S>&, tb Bool, alpha A, beta A, c mut Array<S>&, ldc I64) {
     if m <= 4 {
         # c's row i = alpha (a's row i, or column where ta) op(b) + beta c's row i
@@ -823,13 +824,19 @@ fn gemmDirect<S, A>(ta Bool, m I64, n I64, k I64, alpha A, a Array<S>&, lda I64,
 # + p]: a's rows dotted with v, four rows at a time against one read of v, each in two vectors of partial sums
 fn gemvRows<M, V, O, A>(rows I64, len I64, alpha A, mx Array<M>&, mo I64, ld I64, vec Array<V>&, vs I64, beta A, out mut Array<O>&, os I64) {
     like O
-    sums := tile<A>()
-    four I64 = rows - rows % 4
-    for i in range 0, four, 4 {
-        dot4(mx, mo + i * ld, ld, vec, vs, len, sums)
-        comptime for r in range 4 { out[(i + r) * os] = gemvOut(sums.v[r], alpha, beta, out[(i + r) * os], like) }
+    z A
+    if vs != 1 or os != 1 {
+        # strided vectors (a column of a matrix): one row at a time
+        for i in range rows {
+            s A = z
+            for p in range len: s = mulAdd(cast(mx[mo + i * ld + p], z), cast(vec[p * vs], z), s)
+            out[i * os] = gemvOut(s, alpha, beta, out[i * os], like)
+        }
+        return
     }
-    for i in range four, rows: out[i * os] = gemvOut(dot1(mx, mo + i * ld, vec, vs, len, alpha), alpha, beta, out[i * os], like)
+    two I64 = rows - rows % 2
+    for i in range 0, two, 2: dot2(mx, mo + i * ld, ld, vec, len, alpha, beta, out, i)
+    if two < rows: out[two] = gemvOut(dot1(mx, mo + two * ld, vec, len, z), alpha, beta, out[two], like)
 }
 
 # alpha s + beta o, beta 0 never reading o
@@ -837,68 +844,90 @@ fn gemvOut<A, O>(s A, alpha A, beta A, o O, like O) O {
     return cast(alpha * s, like) if beta == 0 else cast(alpha * s + beta * cast(o, s), like)
 }
 
-# the dot products of rows o, o + ld, o + 2 ld, o + 3 ld of mat with vec, into sums.v[0 .. 4]: each row's in two
-# vectors of partial sums (w lanes each), added pairwise at the end, the rest of len one at a time
-fn dot4<M, V, A>(mx Array<M>&, o I64, ld I64, vec Array<V>&, vs I64, len I64, sums mut tile<A>&) {
-    z A
-    w I64 = 2 * vectorLanes(z)
-    acc := tile<A>()
-    whole I64 = len - len % w
-    for p in range 0, whole, w {
-        comptime for r in range 4 { dotStep(acc, r * w, mx, o + r * ld + p, vec, p, vs, w) }
-    }
-    comptime for r in range 4 {
-        s A = laneSum(acc, r * w, w)
-        for p in range whole, len: s = mulAdd(cast(mx[o + r * ld + p], z), cast(vec[p * vs], z), s)
-        sums.v[r] = s
-    }
+# the partial sums of a dot product, a vector of them (measured: one vector per row, two rows against one read of the
+# vector, is what LLVM keeps in registers - more rows or wider lanes it splits into 128-bit pieces and spills)
+type lanes<A> struct() {
+    v := Array<A>(16)
 }
 
-fn dot1<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, vs I64, len I64, z A) A {
-    w I64 = 2 * vectorLanes(z)
-    acc := tile<A>()
+# out[i] and out[i + 1] from the dot products of rows o and o + ld of mx with vec (contiguous), each in a vector of
+# partial sums added pairwise at the end, the rest of len one at a time
+fn dot2<M, V, A, O>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A, beta A, out mut Array<O>&, i I64) {
+    z A
+    like O
+    w I64 = vectorLanes(z)
+    acc := lanes<A>()
+    acc2 := lanes<A>()
     whole I64 = len - len % w
-    for p in range 0, whole, w: dotStep(acc, 0, mx, o + p, vec, p, vs, w)
-    s A = laneSum(acc, 0, w)
-    for p in range whole, len: s = mulAdd(cast(mx[o + p], z), cast(vec[p * vs], z), s)
+    for p in range 0, whole, w {
+        dotStep(acc, mx, o + p, vec, p, w)
+        dotStep(acc2, mx, o + ld + p, vec, p, w)
+    }
+    s A = laneSum(acc, w)
+    t A = laneSum(acc2, w)
+    for p in range whole, len {
+        s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
+        t = mulAdd(cast(mx[o + ld + p], z), cast(vec[p], z), t)
+    }
+    out[i] = gemvOut(s, alpha, beta, out[i], like)
+    out[i + 1] = gemvOut(t, alpha, beta, out[i + 1], like)
+}
+
+fn dot1<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
+    w I64 = vectorLanes(z)
+    acc := lanes<A>()
+    whole I64 = len - len % w
+    for p in range 0, whole, w: dotStep(acc, mx, o + p, vec, p, w)
+    s A = laneSum(acc, w)
+    for p in range whole, len: s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
     return s
 }
 
-fn dotStep<M, V, A>(acc mut tile<A>&, base I64, mx Array<M>&, mo I64, vec Array<V>&, p I64, vs I64, w I64) {
+fn dotStep<M, V, A>(acc mut lanes<A>&, mx Array<M>&, mo I64, vec Array<V>&, p I64, w I64) {
     z A
-    for j in range w: acc.v[base + j] = mulAdd(cast(mx[mo + j], z), cast(vec[(p + j) * vs], z), acc.v[base + j])
+    for j in range w: acc.v[j] = mulAdd(cast(mx[mo + j], z), cast(vec[p + j], z), acc.v[j])
 }
 
-# acc.v[base .. base + w] added pairwise, in a fixed order
-fn laneSum<A>(acc mut tile<A>&, base I64, w I64) A {
-    h I64 = w / 2
-    for h >= 1 {
-        for i in range h: acc.v[base + i] = acc.v[base + i] + acc.v[base + i + h]
-        h = h / 2
-    }
-    return acc.v[base]
+# acc.v[0 .. w] added in order - every index a constant once w is, which keeps the partial sums in a register (added
+# pairwise in place, they are kept in memory and the dot product's loop is not vectorized)
+fn laneSum<A>(acc lanes<A>&, w I64) A {
+    s A = acc.v[0]
+    for j in range 1, w: s = s + acc.v[j]
+    return s
 }
 
 # out[i os] = alpha (the sum over p < len of M(p, i) v[p vs]) + beta out[i os] for i < rows, M(p, i) at mat[mo + p ld
-# + i]: a's columns, added in scaled, four rows of a at a time per pass over out
+# + i]: a's columns, added in scaled, four of them per pass over out
 fn gemvColumns<M, V, O, A>(rows I64, len I64, alpha A, mx Array<M>&, mo I64, ld I64, vec Array<V>&, vs I64, beta A, out mut Array<O>&, os I64) {
     like O
     z A
     for i in range rows: out[i * os] = cast(beta * cast(out[i * os], z), like) if beta != 0 else cast(z, like)
-    four I64 = len - len % 4
-    for p in range 0, four, 4 {
-        v0, v1, v2, v3 := alpha * cast(vec[p * vs], z), alpha * cast(vec[(p + 1) * vs], z), alpha * cast(vec[(p + 2) * vs], z), alpha * cast(vec[(p + 3) * vs], z)
-        r I64 = mo + p * ld
-        for i in range rows {
-            s A = mulAdd(v0, cast(mx[r + i], z), cast(out[i * os], z))
-            s = mulAdd(v1, cast(mx[r + ld + i], z), s)
-            s = mulAdd(v2, cast(mx[r + 2 * ld + i], z), s)
-            out[i * os] = cast(mulAdd(v3, cast(mx[r + 3 * ld + i], z), s), like)
+    if os != 1 {
+        # a strided result (a column of a matrix): one column of a at a time
+        for p in range len {
+            vp A = alpha * cast(vec[p * vs], z)
+            for i in range rows: out[i * os] = cast(mulAdd(vp, cast(mx[mo + p * ld + i], z), cast(out[i * os], z)), like)
         }
+        return
     }
+    four I64 = len - len % 4
+    for p in range 0, four, 4: columns4(rows, alpha, mx, mo + p * ld, ld, vec, p, vs, out)
     for p in range four, len {
         vp A = alpha * cast(vec[p * vs], z)
-        for i in range rows: out[i * os] = cast(mulAdd(vp, cast(mx[mo + p * ld + i], z), cast(out[i * os], z)), like)
+        for i in range rows: out[i] = cast(mulAdd(vp, cast(mx[mo + p * ld + i], z), cast(out[i], z)), like)
+    }
+}
+
+# out += alpha (v[p] a's row r + .. + v[p + 3] row r + 3 ld), out contiguous
+fn columns4<M, V, O, A>(rows I64, alpha A, mx Array<M>&, r I64, ld I64, vec Array<V>&, p I64, vs I64, out mut Array<O>&) {
+    like O
+    v0, v1 := alpha * cast(vec[p * vs], alpha), alpha * cast(vec[(p + 1) * vs], alpha)
+    v2, v3 := alpha * cast(vec[(p + 2) * vs], alpha), alpha * cast(vec[(p + 3) * vs], alpha)
+    for i in range rows {
+        s A = mulAdd(v0, cast(mx[r + i], alpha), cast(out[i], alpha))
+        s = mulAdd(v1, cast(mx[r + ld + i], alpha), s)
+        s = mulAdd(v2, cast(mx[r + 2 * ld + i], alpha), s)
+        out[i] = cast(mulAdd(v3, cast(mx[r + 3 * ld + i], alpha), s), like)
     }
 }
 
@@ -984,10 +1013,10 @@ fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat
     if m == 0 or n == 0: return
     corr := ws.corrections(n)
     for j in range n: corr[j] = zero * rowSum(b, j)
-    q := quant(a, b, scale, corr, c, out)
+    q := quant(operand<U8>.of(a), operand<I8>.of(b), m, n, k, scale, corr, c.Data[c.Off:], c.Ld, out.Data[out.Off:], out.Ld)
     if m < 4 {
         for i in range m {
-            for j in range n: q.store1(i, j, dotI8(a.Data, a.Off + i * a.Ld, b.Data, b.Off + j * b.Ld, k))
+            for j in range n: q.store1(i, j, dotI8(q.a.d, i * q.a.ld, q.b.d, j * q.b.ld, k))
         }
         return
     }
@@ -996,13 +1025,18 @@ fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat
 }
 
 # a GemmI8's operands and results, as its tasks read them
-type quant struct(a mat.Mat<U8>&, b mat.Mat<I8>&, scale Array<F32>&, corr Array<I32>&, c mut mat.Mat<I32>&, out mut mat.Mat<F32>&) {
+type quant struct(a operand<U8>, b operand<I8>, m I64, n I64, k I64, scale Array<F32>&, corr Array<I32>&, c mut Array<I32>&, ldc I64, out mut Array<F32>&, ldo I64) {
     a
     b
+    m
+    n
+    k
     scale
     corr
     c
+    ldc
     out
+    ldo
 }
 
 # the INT8 tiles: the I32 lanes of a vector; a wide tile two vectors (three on SSE) by 6 rows, a thin one a vector by 12
@@ -1026,10 +1060,10 @@ fn i8Shape<H>(sh H) I64, I64 {
 # the packed product: b in column panels of nr (zeros past n) into ws, then runs of the row tiles over ws.Threads tasks
 fn (q quant&) blocked<H>(ws mut Workspace<I32>&, sh H) {
     mr, nr := i8Shape(sh)
-    m, n, k := q.a.Rows, q.b.Rows, q.a.Cols
+    m, n, k := q.m, q.n, q.k
     panels I64 = (n + nr - 1) / nr
     qb := ws.bytesB(panels * k * nr)
-    for p in range panels: packI8(q.b, p * nr, lesser(nr, n - p * nr), nr, qb, p * k * nr)
+    for p in range panels: packI8(q.b, k, p * nr, lesser(nr, n - p * nr), nr, qb, p * k * nr)
     tiles I64 = (m + mr - 1) / mr
     tasks I64 = 1 if m * n * k < 2000000 else lesser(ws.Threads, tiles)
     share I64 = (tiles + tasks - 1) / tasks
@@ -1048,11 +1082,10 @@ fn (q quant&) blocked<H>(ws mut Workspace<I32>&, sh H) {
 }
 
 # outputs j0 .. j0 + cols of b into a panel nr wide: dst[o + p nr + j] = b[j0 + j, p], zeros past cols
-fn packI8(b mat.Mat<I8>&, j0 I64, cols I64, nr I64, dst mut Array<I8>&, o I64) {
-    k I64 = b.Cols
+fn packI8(b operand<I8>&, k I64, j0 I64, cols I64, nr I64, dst mut Array<I8>&, o I64) {
     for j in range cols {
-        s I64 = b.Off + (j0 + j) * b.Ld
-        for p in range k: dst[o + p * nr + j] = b.Data[s + p]
+        s I64 = (j0 + j) * b.ld
+        for p in range k: dst[o + p * nr + j] = b.d[s + p]
     }
     for j in range cols, nr {
         for p in range k: dst[o + p * nr + j] = 0
@@ -1063,12 +1096,12 @@ fn packI8(b mat.Mat<I8>&, j0 I64, cols I64, nr I64, dst mut Array<I8>&, o I64) {
 # with every panel
 fn (q quant&) tilesI8<H>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, sh H) {
     mr, nr := i8Shape(sh)
-    m, n, k := q.a.Rows, q.b.Rows, q.a.Cols
+    m, n, k := q.m, q.n, q.k
     for r in range lo, hi {
         rows I64 = lesser(mr, m - r * mr)
         for i in range rows {
-            s I64 = q.a.Off + (r * mr + i) * q.a.Ld
-            for p in range k: pa[p * mr + i] = q.a.Data[s + p]
+            s I64 = (r * mr + i) * q.a.ld
+            for p in range k: pa[p * mr + i] = q.a.d[s + p]
         }
         for i in range rows, mr {
             for p in range k: pa[p * mr + i] = 0
@@ -1080,7 +1113,7 @@ fn (q quant&) tilesI8<H>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, sh H)
 # the tile of rows i0 .. i0 + rows and outputs j0 .. j0 + cols, summed over the depth then stored
 fn (q quant&) tileI8<H>(i0 I64, rows I64, j0 I64, cols I64, pa Array<U8>&, qb Array<I8>&, sh H) {
     _, nr := i8Shape(sh)
-    k I64 = q.a.Cols
+    k I64 = q.k
     t := tile<I32>()
     match H {
         case wideI8 { microI8Wide(k, pa, qb, j0 * k, t) }
@@ -1093,8 +1126,8 @@ fn (q quant&) tileI8<H>(i0 I64, rows I64, j0 I64, cols I64, pa Array<U8>&, qb Ar
 
 # c[i, j] = s and out[i, j] = scale[j] (s - corr[j])
 fn (q quant&) store1(i I64, j I64, s I32) {
-    q.c.Data[q.c.Off + i * q.c.Ld + j] = s
-    q.out.Data[q.out.Off + i * q.out.Ld + j] = F32(s - q.corr[j]) * q.scale[j]
+    q.c[i * q.ldc + j] = s
+    q.out[i * q.ldo + j] = F32(s - q.corr[j]) * q.scale[j]
 }
 
 # the micro-kernels: rows of a step written out by comptime for, every accumulator at a constant index
@@ -1122,14 +1155,14 @@ fn stepI8(acc mut tile<I32>&, base I64, a U8, qb Array<I8>&, b I64, nr I64) {
     for j in range nr: acc.v[base + j] = acc.v[base + j] + x * I32(qb[b + j])
 }
 
-# the sum of a[ao ..] b[bo ..] over k: 32 lanes of partial sums, added pairwise
+# the sum of a[ao ..] b[bo ..] over k: 16 lanes of partial sums, added pairwise
 fn dotI8(a Array<U8>&, ao I64, b Array<I8>&, bo I64, k I64) I32 {
-    acc := tile<I32>()
-    whole I64 = k - k % 32
-    for p in range 0, whole, 32 {
-        for j in range 32: acc.v[j] = acc.v[j] + I32(a[ao + p + j]) * I32(b[bo + p + j])
+    acc := lanes<I32>()
+    whole I64 = k - k % 16
+    for p in range 0, whole, 16 {
+        for j in range 16: acc.v[j] = acc.v[j] + I32(a[ao + p + j]) * I32(b[bo + p + j])
     }
-    s I32 = laneSum(acc, 0, 32)
+    s I32 = laneSum(acc, 16)
     for p in range whole, k: s = s + I32(a[ao + p]) * I32(b[bo + p])
     return s
 }
@@ -1716,4 +1749,20 @@ test GemmBatch "BF16 storage over a depth of several blocks is summed in F32 and
         }
     }
     assert c[1, 1][0, 5] == before
+}
+
+test Gemm "BF16 storage's one to four rows and one column are dot products summed in F32" {
+    r := rand.Rand(16)
+    for m in Array<I64>[1, 4, 300] {
+        n I64 = 1 if m == 300 else 70
+        a := uniform(m, 300, BF16(0), r)
+        b := uniform(n, 300, BF16(0), r)
+        want, mag := reference(a, false, b, true)
+        c := gappy(m, n, BF16(0))
+        ws := Workspace<F32>(1)
+        Gemm(ws, c, a, false, b, true)
+        for i in range m {
+            for j in range n: assert (F64(c[i, j]) - want[i, j]).Abs() <= want[i, j].Abs() / 256.0 + 300.0 * 1.2e-7 * mag[i, j]
+        }
+    }
 }
