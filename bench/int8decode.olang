@@ -1,0 +1,59 @@
+# the character transformer (models/gpt's GptConfig.Char: 4 layers of 128 in 4 heads, context 64, 65 characters)
+# decoding one character at a time through the key-value cache, its linear layers in F32 and in INT8 (nn/quant's
+# Quantize) - interleaved, medians, characters a second. Its weights as drawn: the speed does not depend on training.
+# Arguments: the characters (500), rounds (5), threads (1), and "int8" to time only INT8 (for olang profile). From the
+# repository's root: olang build -output build/bench_int8decode bench/int8decode.olang && build/bench_int8decode
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../models/gpt"
+import "../nn/generate"
+import "../nn/quant"
+import "../tensor"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn main() ? io.Error, ParseError, tensor.ShapeError {
+    args := os.Args()
+    count := try number(args, 1, 500)
+    rounds := try number(args, 2, 5)
+    threads := try number(args, 3, 1)
+    only Bool = args.Len() > 4 and args[4] == "int8"
+    cfg := gpt.GptConfig.Char(65)
+    dec := graph.Graph<F32>(1, threads, graph.Mode.Captured, true)
+    dm := gpt.Gpt.New(dec, cfg).Lm(dec, false)
+    try dec.Plan(rand.Rand(1))
+    quant.Quantize(dec)
+    prompt := Array<I32>[10]
+    f32s, int8s := Array<F64>(rounds), Array<F64>(rounds)
+    for t in range rounds {
+        if not only {
+            dec.Int8 = false
+            ra := rand.Rand(U64(t + 1))
+            t0 := time.Now()
+            a := generate.CachedTokens(dec, dm, prompt, count, 0.8, ra)
+            f32s[t] = F64(time.Since(t0))
+            assert a.Len() == count + 1
+        }
+        dec.Int8 = true
+        rb := rand.Rand(U64(t + 1))
+        t1 := time.Now()
+        b := generate.CachedTokens(dec, dm, prompt, count, 0.8, rb)
+        int8s[t] = F64(time.Since(t1))
+        assert b.Len() == count + 1
+    }
+    f, q := median(f32s), median(int8s)
+    try io.Put($count + " characters with the cache: F32 " + $(F64(count) / (f * 1e-9)).Fixed(0) + " a second, INT8 " +
+        $(F64(count) / (q * 1e-9)).Fixed(0) + " (" + $(f / q).Fixed(2) + "x)\n")
+}
