@@ -18,6 +18,7 @@
 # scaled back into the certified set where it left it), Rate (the certified contraction q = 1 - dt (1 - kappa)) and the
 # budgets that follow (settling.md 1.2, 1.4, 1.10).
 
+import "std/os"
 import "std/rand"
 import "../tensor"
 import "neuron"
@@ -674,6 +675,7 @@ test System.Settle "Jacobi sweeps in tasks equal one thread bit for bit, free an
     assert free.Converged and nudged.Converged, "free " $free " nudged " $nudged
     for threads in range 2, 5 {
         s := System<F32>.mixed(130, threads)
+        s.E.TaskWork = 0                            # every sweep in tasks, however small
         assert s.Settle(settle.Phase.Free, settle.Budget()).Sweeps == free.Sweeps
         assert s.Nudged(settle.Budget()).Sweeps == nudged.Sweeps
         assert sameState(one, s), $threads " threads"
@@ -821,4 +823,38 @@ test System.Read "a module reads its own signal first, then its parent's" {
     assert s.Read(child, "reward")!.Get(0) == 1.0 and s.Read(s.Root(), "reward")!.Get(0) == 2.0
     assert s.Read(child, "arousal")!.Get(1) == 4.0
     assert not has(s, child, "nothing") and has(s, child, "arousal")
+}
+
+# the resident set, in pages, from /proc
+fn resident() I64 {
+    stat := try os.ReadFile("/proc/self/statm") catch { unreachable }
+    return try stat.Split(" ")[1].ParseInt(10) catch { unreachable }
+}
+
+test System.Settle "a lesson allocates nothing: resident memory does not grow over hundreds of free and nudged settles" {
+    r := rand.Rand(17)
+    s := System<F32>(32, 2)
+    x := s.Population(s.Root(), "x", 100, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 64, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Connect(h, h, conn.Wiring.Csr(0.2), reciprocal = true)
+    s.Plan(r)!
+    s.Certify(0.9)
+    for i in range 32 * 100: s.Pop(x).Drive[i] = F32(r.Uniform(0.0, 1.0))
+    for i in range 32: s.Pop(y).Labels[i] = I32(i % 10)
+    b := settle.Budget()
+    for _ in range 20 {
+        s.Settle(settle.Phase.Free, b)
+        s.Nudged(b)
+    }
+    before := resident()
+    for _ in range 400 {
+        s.Reset(settle.Phase.Free)
+        s.Settle(settle.Phase.Free, b)
+        s.Nudged(b)
+    }
+    grown := resident() - before
+    assert grown <= 16, "resident memory grew by " $grown " pages"
 }

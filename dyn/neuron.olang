@@ -133,15 +133,20 @@ fn ActivateRun<T Float>(f Rho, u Array<T>&, s mut Array<T>&, lo I64, hi I64) {
 # one sweep of rate units lo .. hi (elements of the columns): the residual r = total - u, its sup norm (given back,
 # NaN when one is), and the step into the other buffer - u2 = u + dt r, s2 = rho(u2)
 fn RateStep<T Float>(f Rho, u Array<T>&, total Array<T>&, u2 mut Array<T>&, s2 mut Array<T>&, lo I64, hi I64, dt T) T {
-    worst T = T(0)
+    m := T(0).Bits()
     for i in range lo, hi {
         r := total[i] - u[i]
-        worst = Worse(worst, r.Abs())
+        b := r.Bits() << 1 >> 1             # the sup norm kept as bits (below)
+        m = b if b > m else m
         u2[i] = u[i] + dt * r
     }
     ActivateRun(f, u2, s2, lo, hi)
-    return worst
+    return T.FromBits(m)
 }
+
+# (the sup norm as bits: |r|'s pattern, the sign cleared, orders as an unsigned integer as |r| does, and every NaN
+# above the infinities - so the largest pattern is the largest |r|, a NaN where one is, and the loop's maximum is an
+# integer one, which vectorizes)
 
 # one time step of spiking units lo .. hi, from cell buffer a into b: the synaptic current moves by synapse toward its
 # input (in syn: the transport of the spikes, a's), the potential leaks toward the constant plus the current (the

@@ -30,7 +30,7 @@ import "neuron"
 import "conn"
 
 # the rows of a unit of work, at most
-Chunk I64 = 64
+Chunk I64 = 128
 
 # the phases a system holds side by side: free, nudged toward the targets, nudged away (centered EP)
 type Phase enum { Free, Plus, Minus }
@@ -135,14 +135,18 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     Spiking Bool = false
     Window I64 = 1
     Units I64 = 0                                   # every population's units
+    TaskWork I64 = 2000000                          # the multiply-adds a sweep needs to be split over tasks
     Sweeps I64 = 0                                  # every sweep of every settle
     Last Settlement = Settlement()
     cur I64 = 0                                     # the buffer a sweep reads
     sweep I64 = 0                                   # the sweep (time step) running
     damping F64 = 0.0                               # the running settle's
     ws mut Vec<mut gemm.Workspace<T>&>& = Vec<mut gemm.Workspace<T>&>()
+    wide mut gemm.Workspace<T>& = gemm.Workspace<T>(threads)   # the constants' products, whole batches, split by gemm
+    wideSc mut conn.Scratch<T>& = conn.Scratch<T>(0, 0, 0)
     sc mut Vec<mut conn.Scratch<T>&>& = Vec<mut conn.Scratch<T>&>()
-    work mut Array<I64>& = Array<I64>(0)            # a settle's units: population, first row, end row
+    units mut Array<I64>& = Array<I64>(0)           # a settle's units: population, first row, end row
+    work I64 = 0                                    # a sweep's multiply-adds, about
     count I64 = 0
     worst mut Array<T>& = Array<T>(0)               # each unit's residual
     Mass mut Array<F64>& = Array<F64>(0)             # each unit's incoming mass (the gain)
@@ -174,8 +178,12 @@ fn (e mut Engine<T>&) Ready() {
         }
         e.sc.Push(sc)
     }
+    e.wideSc = conn.Scratch<T>(widest, e.Batch.Max(Chunk), rank)
+    for l in e.Links {
+        if l.Kind == conn.Wiring.Events: e.wideSc.Ev.Push(sparse.Events(l.PreSize))
+    }
     most := e.Pops.Len() * e.Phases * ((e.Batch + Chunk - 1) / Chunk)
-    e.work = Array<I64>(3 * most)
+    e.units = Array<I64>(3 * most)
     e.worst = Array<T>(most)
     e.Mass = Array<F64>(units)
     e.Spiking = false
@@ -205,19 +213,23 @@ fn copyRows<C>(a Columns<C>&, b mut Columns<C>&, from I64, to I64, n I64) {
     }
 }
 
-# phase ph's state set to rest (every field but the kept ones zero): a cold start
+# phase ph's state set to rest (every field but the kept ones zero): a cold start. Inputs are left: a settle sets
+# theirs from their drive
 fn (e mut Engine<T>&) Reset(ph I64) {
     for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
         lo := ph * e.Batch * p.Size
         hi := lo + e.Batch * p.Size
         if p.Spiking { clearRows(p.L0, lo, hi) } else { clearRows(p.R0, lo, hi) }
     }
 }
 
-# phase to's state set to phase from's (a nudged phase starts from the free fixed point)
+# phase to's state set to phase from's (a nudged phase starts from the free fixed point). Inputs are left: a settle
+# sets theirs from their drive
 fn (e mut Engine<T>&) Warm(to I64, from I64) {
     if to == from: return
     for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
         n := e.Batch * p.Size
         if p.Spiking { copyRows(p.L0, p.L0, from * n, to * n, n) } else { copyRows(p.R0, p.R0, from * n, to * n, n) }
     }
@@ -226,6 +238,7 @@ fn (e mut Engine<T>&) Warm(to I64, from I64) {
 # rows lo .. hi of buffer 1 copied into buffer 0, every population: where a settle ending on buffer 1 commits
 fn (e mut Engine<T>&) commit(r0 I64, r1 I64) {
     for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
         n := (r1 - r0) * p.Size
         if p.Spiking { copyRows(p.L1, p.L0, r0 * p.Size, r0 * p.Size, n) } else { copyRows(p.R1, p.R0, r0 * p.Size, r0 * p.Size, n) }
     }
@@ -233,7 +246,8 @@ fn (e mut Engine<T>&) commit(r0 I64, r1 I64) {
 
 # ---- the start of a settle ----
 
-# phases lo .. hi made ready: every input's state set from its drive in closed form, in both buffers; every relaxing
+# phases lo .. hi made ready: every input's state set from its drive in closed form (in buffer 0: only folded
+# connections, run from there, read an input); every relaxing
 # population's constant made (with fold: its drive, its bias and the folded carries of its inputs); the counts of a
 # spiking population's window cleared; event-driven connections forget what they carried
 fn (e mut Engine<T>&) prepare(lo I64, hi I64, fold Bool) {
@@ -244,24 +258,19 @@ fn (e mut Engine<T>&) prepare(lo I64, hi I64, fold Bool) {
     }
     for l in e.Links: l.Forget(r0, r1)
     if not fold: return
-    e.plan(0, 1, true)
-    e.run(true)
+    for p in e.Pops {
+        if p.Role != neuron.Role.Input: e.constant(e.wide, e.wideSc, p, 0, e.Batch)
+    }
 }
 
-# an input's rows r0 .. r1, in both buffers: U = drive, S = rho(drive)
+# an input's rows r0 .. r1 (whole phases), in buffer 0: U = drive, S = rho(drive)
 fn (e mut Engine<T>&) closedForm(p mut Population<T>&, r0 I64, r1 I64) {
     model := p.Model
     rho := model.rho if model == neuron.Neuron.Rate else neuron.Rho.Linear
-    n := p.Size
-    for r in range r0, r1 {
-        b := r % e.Batch
-        for j in range n {
-            x := p.Drive[b * n + j]
-            p.R0.U[r * n + j] = x
-            p.R1.U[r * n + j] = x
-            p.R0.S[r * n + j] = neuron.Activate(rho, x)
-            p.R1.S[r * n + j] = p.R0.S[r * n + j]
-        }
+    n := e.Batch * p.Size
+    for at := r0 * p.Size, at < r1 * p.Size, at += n {
+        for i in range n: p.R0.U[at + i] = p.Drive[i]
+        neuron.ActivateRun(rho, p.R0.U, p.R0.S, at, at + n)
     }
 }
 
@@ -274,32 +283,39 @@ fn (e mut Engine<T>&) clearCounts(p mut Population<T>&, r0 I64, r1 I64) {
 
 # ---- units of work ----
 
-# the units of phases lo .. hi (with constants: of the batch's rows, once): every relaxing population's rows in chunks
-fn (e mut Engine<T>&) plan(lo I64, hi I64, constants Bool) {
+# the units of phases lo .. hi: every relaxing population's rows of each, in chunks
+fn (e mut Engine<T>&) plan(lo I64, hi I64) {
     e.count = 0
+    e.work = 0
     for i in range e.Pops.Len() {
-        if e.Pops[i].Role == neuron.Role.Input: continue
+        p := e.Pops[i]
+        if p.Role == neuron.Role.Input: continue
+        carried := p.Size
+        for l in p.In: carried += e.Links[l].Count
+        for l in p.Back: carried += e.Links[l].Count
+        e.work += (hi - lo) * e.Batch * carried
         for ph in range lo, hi {
             for c0 := 0, c0 < e.Batch, c0 += Chunk {
-                base := 0 if constants else ph * e.Batch
-                e.work[3 * e.count] = i
-                e.work[3 * e.count + 1] = base + c0
-                e.work[3 * e.count + 2] = base + (c0 + Chunk).Min(e.Batch)
+                base := ph * e.Batch
+                e.units[3 * e.count] = i
+                e.units[3 * e.count + 1] = base + c0
+                e.units[3 * e.count + 2] = base + (c0 + Chunk).Min(e.Batch)
                 e.count++
             }
         }
     }
 }
 
-# every unit run, on the system's tasks - each task the units t, t + threads, ... - with constants the constants' pass
-# instead of a sweep. Gives the largest residual (NaN when one is)
-fn (e mut Engine<T>&) run(constants Bool) T {
+# every unit run, on the system's tasks - each task the units t, t + tasks, ... - and their largest residual (NaN
+# when one is). A sweep too small to pay for tasks runs on the calling thread; the units are the same either way
+fn (e mut Engine<T>&) run() T {
     tasks := e.Threads.Min(e.count)
+    if e.work < e.TaskWork: tasks = 1
     if tasks <= 1 {
-        e.task(0, 1, constants)
+        e.task(0, 1)
     } else {
         join {
-            for t in range tasks: spawn e.task(t, tasks, constants)
+            for t in range tasks: spawn e.task(t, tasks)
         }
     }
     worst T = T(0)
@@ -307,16 +323,12 @@ fn (e mut Engine<T>&) run(constants Bool) T {
     return worst
 }
 
-fn (e mut Engine<T>&) task(t I64, every I64, constants Bool) {
+fn (e mut Engine<T>&) task(t I64, every I64) {
     ws := e.ws[t]
     sc := e.sc[t]
     for u in range t, e.count, every {
-        p := e.Pops[e.work[3 * u]]
-        r0, r1 := e.work[3 * u + 1], e.work[3 * u + 2]
-        if constants {
-            e.constant(ws, sc, p, r0, r1)
-            continue
-        }
+        p := e.Pops[e.units[3 * u]]
+        r0, r1 := e.units[3 * u + 1], e.units[3 * u + 2]
         e.totals(ws, sc, p, r0, r1)
         e.worst[u] = e.lifStep(p, r0, r1) if p.Spiking else e.rateStep(p, r0, r1)
     }
@@ -459,7 +471,7 @@ fn retireLif<T>(p mut Population<T>&, b mut Columns<neuron.LifCell<T>>&, r I64) 
 # made afresh (a nudged phase keeps the free phase's)
 fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
     e.prepare(lo, hi, fold)
-    e.plan(lo, hi, false)
+    e.plan(lo, hi)
     e.damping = b.Damping
     e.cur = 0
     out := e.spikes(b) if e.Spiking else e.relax(b)
@@ -475,7 +487,7 @@ fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
 fn (e mut Engine<T>&) relax(b Budget) Settlement {
     for k in range b.Sweeps + 1 {
         e.sweep = k
-        worst := F64(e.run(false))
+        worst := F64(e.run())
         out := Settlement(k, worst, worst <= b.Tol)
         if out.Converged or out.Diverged() or k == b.Sweeps: return out
         e.cur = 1 - e.cur
@@ -489,7 +501,7 @@ fn (e mut Engine<T>&) spikes(b Budget) Settlement {
     steps := b.Sweeps.Max(e.Window)
     for k in range steps {
         e.sweep = k
-        worst := F64(e.run(false))
+        worst := F64(e.run())
         e.cur = 1 - e.cur
         if (k + 1) % e.Window != 0: continue
         out = Settlement(k + 1, worst, worst <= b.Tol)
