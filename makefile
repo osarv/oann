@@ -9,7 +9,7 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
-	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
+	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
 
 .PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench xor spiking hybridbench mnistlearn sample clean
 
