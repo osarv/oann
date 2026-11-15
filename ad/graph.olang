@@ -1559,6 +1559,7 @@ type q8Weights struct(out I64, width I64) {
     width
     q mut Array<I8>& = Array<I8>(out * width)
     scale mut Array<F32>& = Array<F32>(out)
+    sum mut Array<I32>& = Array<I32>(out)       # each row's sum of q: the zero point's correction
 }
 
 fn (g mut Graph<T>&) QuantizeLinear() {
@@ -1598,7 +1599,13 @@ fn q8Weights.quantize<T>(w tensor.Tensor<T>) q8Weights {
         for c in range m.Cols: top = top.Max(F64(m[o, c]).Abs())
         s := top / 127.0 if top > 0.0 else 1.0
         q.scale[o] = F32(s)
-        for c in range m.Cols: q.q[o * m.Cols + c] = I8((F64(m[o, c]) / s).Round())
+        sum I32 = 0
+        for c in range m.Cols {
+            v := I8((F64(m[o, c]) / s).Round())
+            q.q[o * m.Cols + c] = v
+            sum += I32(v)
+        }
+        q.sum[o] = sum
     }
     return q
 }
@@ -1633,7 +1640,7 @@ fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
             y := g.Value(Var(i))
             ym := y.Mat()!
             om := mat.Mat<F32>(ym.Data, ym.Off, ym.Rows, ym.Cols, ym.Ld)
-            gemm.GemmI8(g.wsI8, cm, am, bm, scale[0:w.out], om, zero)
+            gemm.GemmI8(g.wsI8, cm, am, bm, scale[0:w.out], om, zero, w.sum)
             if b < 0: return
             bd := g.Value(b).Flat()!
             for r in range n {
@@ -1757,7 +1764,7 @@ fn (g Graph<T>&) selectiveKeep(i I64) I64 {
         case Op.SelectiveScan(_, _, a, _, _, _): g.nodes[a].Dims[0]
         case _: 0
     }
-    return nd.Dims[0] * (nd.Dims[1] + 63) / 64 * states * nd.Dims[2]
+    return nd.Dims[0] * ((nd.Dims[1] + 63) / 64) * states * nd.Dims[2]
 }
 
 fn (g Graph<T>&) deltaKeep(i I64) I64 {

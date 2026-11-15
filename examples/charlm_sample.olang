@@ -8,17 +8,14 @@ import "std/json"
 import "std/os"
 import "std/rand"
 import "std/time"
-import "../nn"
-import "../train"
-import "../generate"
-import "../datasets/text"
+import "../ad/graph"
+import "../data/text"
+import "../io/checkpoint"
+import "../models/gpt"
+import "../nn/generate"
+import "../tensor"
 
-depth I64 = 4
-width I64 = 128
-heads I64 = 4
-context I64 = 64
-
-fn main() ? io.Error, os.Error, text.CorpusError, ParseError, json.Error, nn.CheckpointError {
+fn main() ? io.Error, os.Error, text.CorpusError, ParseError, json.Error, checkpoint.SafetensorsError, tensor.ShapeError {
     args := os.Args()
     count I64 = 500
     if args.Len() > 1: count = try args[1].ParseInt()
@@ -27,20 +24,21 @@ fn main() ? io.Error, os.Error, text.CorpusError, ParseError, json.Error, nn.Che
     seed U64 = 1
     if args.Len() > 3: seed = U64(try args[3].ParseInt())
     c := try text.Corpus.Load("data/shakespeare/input.txt")
+    cfg := gpt.GptConfig.Char(c.Size())
     r := rand.Rand(seed)
-    dec := nn.Graph<F32>(context, 1, true)
-    dm := train.LanguageModel.Gpt(dec, c.Size(), context, width, heads, depth)
-    dec.Plan(r)
+    dec := graph.Graph<F32>(1, 1, graph.Mode.Captured, true)
+    dm := gpt.Gpt.New(dec, cfg).Lm(dec, false)
+    try dec.Plan(r)
     try dec.Load("data/shakespeare/charlm.ckpt")
-    full := nn.Graph<F32>(context, 1)
-    fm := train.LanguageModel.Gpt(full, c.Size(), context, width, heads, depth)
-    full.Plan(r)
+    full := graph.Graph<F32>(1)
+    fm := gpt.Gpt.New(full, cfg).Lm(full, false)
+    try full.Plan(r)
     try full.Load("data/shakespeare/charlm.ckpt")
 
-    greedyCached := try generate.Cached(dec, dm, c, "ROMEO:", context - 6, 0.0, r)
-    greedyRerun := try generate.Rerun(full, fm, c, "ROMEO:", context - 6, 0.0, r)
+    greedyCached := try generate.Cached(dec, dm, c, "ROMEO:", cfg.Ctx - 6, 0.0, r)
+    greedyRerun := try generate.Rerun(full, fm, c, "ROMEO:", cfg.Ctx - 6, 0.0, r)
     verdict := "agree" if greedyCached == greedyRerun else "DIFFER"
-    try io.Put("greedy, " $context " characters: the cache and the rerun " $verdict "\n")
+    try io.Put("greedy, " $cfg.Ctx " characters: the cache and the rerun " $verdict "\n")
 
     ra := rand.Rand(seed)
     t0 := time.Now()
