@@ -673,6 +673,7 @@ assert not nudgeOf.Allocates, "a nudge through the drive allocates"
 # ---- tests ----
 
 import "std/io"
+import "std/os"
 import "std/rand"
 import "../kernels/sparse"
 
@@ -785,9 +786,11 @@ test Learner.Contrast "the contrast written is its definition for every wiring -
 
 # three tanh inputs, four hidden units with a lateral block, three readouts (cross-entropy at T = 0.25), hidden and
 # readout reciprocal: feedback worth having (the recurrent weights tripled, then certified at 0.9); two rows
-fn gradientSystem(r mut rand.Rand&) system.System<F64> {
+# (with a signal "reward", the root's first, declared before the plan)
+fn gradientSystem(r mut rand.Rand&, reward Bool = false) system.System<F64> {
     s := system.System<F64>(2)
     root := s.Root()
+    if reward: s.Signal(root, "reward")
     x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Input)
     h := s.Population(root, "h", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
     y := s.Population(root, "y", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
@@ -1053,4 +1056,210 @@ test Learner.Lesson "XOR by spiking neurons: Lif hidden and readout units, their
     s.Settle(settle.Phase.Free, s.BudgetFor(s.LessonTolerance(1.0)))
     try io.PutLine("spiking XOR: loss " $s.Loss(settle.Phase.Free) ", " $xorRight(s, y) "/4 right, " $(F64(steps) / 300.0) " steps a lesson")
     assert xorRight(s, y) == 4 and s.Loss(settle.Phase.Free) < 0.01, "loss " $s.Loss(settle.Phase.Free) ", " $(F64(steps) / 300.0) " steps a lesson"
+}
+
+# a rule of one's own: counts its calls, adds one to the first gradient
+type counter struct() {
+    Calls I64 = 0
+}
+
+fn (c mut counter&) Apply(params mut Array<F32>&, grads mut Array<F32>&) {
+    c.Calls++
+    grads[0] += 1.0
+}
+
+test Learner.Tick "a tick runs its clock's rules in the order attached: an EP lesson writes what Lesson writes, a custom rule is called" {
+    a := gradientSystem(rand.Rand(12))
+    b := gradientSystem(rand.Rand(12))
+    a.Attach(a.Root(), system.Rule.Ep(0.5, true), system.Clock.Step)
+    la := Learner<F64>(a)!
+    lb := Learner<F64>(b)!
+    la.Tick(system.Clock.Sweep)!
+    assert la.Lessons == 0
+    la.Tick(system.Clock.Step)!
+    lb.Lesson(b.Root(), 0.5)!
+    assert la.Lessons == 1 and a.E.Grads == b.E.Grads
+    s := system.System<F32>(1)
+    s.Population(s.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    c := counter()
+    s.Attach(s.Root(), system.Rule.Custom(c), system.Clock.Episode)
+    s.Plan(rand.Rand(1))!
+    l := Learner<F32>(s)!
+    l.Tick(system.Clock.Episode)!
+    l.Tick(system.Clock.Episode)!
+    assert c.Calls == 2 and s.E.Grads[0] == 2.0
+}
+
+test Learner.Tick "three factors: the trace is decay e + the contrast of the last nudge, the parameters step by rate m e; a pruned weight stays zero; without a nudge the term is Hebbian" {
+    s := gradientSystem(rand.Rand(13), true)
+    reward := system.Sig(0)
+    s.Attach(s.Root(), system.Rule.ThreeFactor(reward, 0.5, 0.1), system.Clock.Step)
+    keep := Array<Bool>(s.Link(system.Conn(2)).Count, true)
+    keep[3] = false
+    s.Prune(system.Conn(2), keep)
+    s.Set(reward, tensor.Tensor<F64>.Of(Array<F64>[2.0], 1)!)!
+    l := Learner<F64>(s)!
+    l.Tol = 1e-12
+    l.Sweeps = 20000
+    l.Lesson(s.Root(), 0.5)!
+    g := s.E.Grads.Copy()
+    before := s.E.Params.Copy()
+    l.Tick(system.Clock.Step)!
+    e := l.Trace(s.Root(), reward, system.Clock.Step)
+    worst F64 = 0.0
+    for i in range g.Len() {
+        worst = worst.Max((e[i] + g[i]).Abs())
+        worst = worst.Max((s.E.Params[i] - before[i] - 0.1 * 2.0 * e[i]).Abs())
+    }
+    assert worst < 1e-15 and s.E.Params[s.Link(system.Conn(2)).Off + 3] == 0.0
+    # the same state again: the trace decays by a half and gains the same contrast
+    mid := s.E.Params.Copy()
+    l.Tick(system.Clock.Step)!
+    for i in range g.Len(): worst = worst.Max((e[i] + 1.5 * g[i]).Abs()).Max((s.E.Params[i] - mid[i] - 0.2 * e[i]).Abs())
+    assert worst < 1e-15
+    # rate 0: G = -m e for an optimizer, the parameters left
+    t := gradientSystem(rand.Rand(13), true)
+    sig := system.Sig(0)
+    t.Attach(t.Root(), system.Rule.ThreeFactor(sig, 0.0, 0.0), system.Clock.Episode)
+    t.Set(sig, tensor.Tensor<F64>.Of(Array<F64>[-1.0], 1)!)!
+    lt := Learner<F64>(t)!
+    t.Settle(settle.Phase.Free, settle.Budget(20000, 1e-12))
+    held := t.E.Params.Copy()
+    lt.Tick(system.Clock.Episode)!
+    h := t.Pop(system.Pop(1)).Activity(0)
+    y := t.Pop(system.Pop(2)).Activity(0)
+    # without a nudge: the coincidence of y_0 and h_1 over the two rows, its bias the mean activity
+    want := (y[0] * h[1] + y[3] * h[5]) / 2.0
+    assert t.E.Params == held and (t.E.Grads[t.Link(system.Conn(2)).Off + 1] - want).Abs() < 1e-15
+    assert (t.E.Grads[t.Pop(system.Pop(2)).Bias] - (y[0] + y[3]) / 2.0).Abs() < 1e-15
+}
+
+test Learner.Tick "three factors learn a contextual bandit: the nudge toward the action taken, the reward less its running mean as the signal" {
+    r := rand.Rand(7)
+    s := system.System<F64>(1)
+    x := s.Population(s.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 6, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    surprise := s.Signal(s.Root(), "surprise")
+    s.Attach(s.Root(), system.Rule.ThreeFactor(surprise, 0.0, 0.5), system.Clock.Step)
+    s.Plan(r)!
+    s.Certify(0.9)
+    l := Learner<F64>(s)!
+    b := settle.Budget(2000, 1e-6)
+    baseline F64 = 0.0
+    right I64 = 0
+    for t in range 600 {
+        context := r.Below(2)
+        s.Pop(x).Drive[0] = 1.0 if context == 0 else -1.0
+        s.Pop(x).Drive[1] = -s.Pop(x).Drive[0]
+        s.Settle(settle.Phase.Free, b)
+        a := s.Activity(settle.Phase.Free, y)
+        p0 := 1.0 / (1.0 + ((a.Get(0, 1) - a.Get(0, 0)) / 0.25).Exp())
+        action := 0 if r.Float() < p0 else 1
+        s.Pop(y).Labels[0] = I32(action)
+        s.Nudged(b, 0.1)
+        reward := 1.0 if action == context else 0.0
+        s.Set(surprise, tensor.Tensor<F64>.Of(Array<F64>[reward - baseline], 1)!)!
+        baseline += 0.05 * (reward - baseline)
+        l.Tick(system.Clock.Step)!
+        if t >= 500 and reward == 1.0: right++
+    }
+    try io.PutLine("bandit: " $right " of the last 100 moments rewarded")
+    assert right >= 90
+}
+
+# a population of three units of model under drives 1.5, 2 and 2.5 (both rows), homeostasis toward 0.1 on the Episode clock,
+# settled cold and ticked 60 times; gives its mean activity per unit in the end
+fn homeostatic(model neuron.Neuron, b settle.Budget) Array<F64> {
+    s := system.System<F64>(2, 1, 1)
+    h := s.Population(s.Root(), "h", 3, model)
+    s.Attach(s.Root(), system.Rule.Homeostasis(0.1, 0.5), system.Clock.Episode)
+    s.Plan(rand.Rand(1))!
+    for i in range 6: s.Pop(h).Drive[i] = 1.5 + 0.5 * F64(i % 3)
+    l := Learner<F64>(s)!
+    for _ in range 61 {
+        s.Reset(settle.Phase.Free)
+        s.Settle(settle.Phase.Free, b)
+        l.Tick(system.Clock.Episode)!
+    }
+    a := s.Activity(settle.Phase.Free, h)
+    return Array<F64>[(a.Get(0, j) + a.Get(1, j)) / 2.0 for j in range 3]
+}
+
+test Learner.Homeostasis "a spiking population's thresholds and a rate population's biases move each unit's mean activity to the target" {
+    spikes := homeostatic(neuron.Neuron.Spiking(window = 64), settle.Budget(64 * 64, 1.0 / 32.0))
+    rates := homeostatic(neuron.Neuron.Rate(neuron.Rho.Tanh), settle.Budget(200, 1e-12))
+    for j in range 3: assert (spikes[j] - 0.1).Abs() < 0.03 and (rates[j] - 0.1).Abs() < 1e-3, "unit " $j ": " $spikes[j] " spikes a step, activity " $rates[j]
+}
+
+test Learner.DeltaWrite "a delta write stores a value at a unit key at once, orthogonal keys do not interfere, and the settle reads it back" {
+    s := system.System<F64>(1, 1, 1)
+    k := s.Population(s.Root(), "key", 4, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    v := s.Population(s.Root(), "value", 3, neuron.Neuron.Rate(neuron.Rho.Linear))
+    w := s.Connect(k, v, conn.Wiring.Dense)
+    gate := s.Signal(s.Root(), "write")
+    s.Attach(s.Root(), system.Rule.DeltaWrite(w, gate), system.Clock.Sweep)
+    s.Plan(rand.Rand(2))!
+    s.Weights(w).Fill(0.0)
+    s.Set(gate, tensor.Tensor<F64>.Of(Array<F64>[1.0], 1)!)!
+    l := Learner<F64>(s)!
+    keys := Array<F64>[0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    values := Array<F64>[1.0, -2.0, 0.5, 3.0, 0.25, -1.0]
+    for i in range 2 {
+        for j in range 4: s.Pop(k).R0.S[j] = keys[4 * i + j]
+        for j in range 3: s.Pop(v).R0.S[j] = values[3 * i + j]
+        l.Tick(system.Clock.Sweep)!
+    }
+    for i in range 2 {
+        for j in range 4: s.Pop(k).Drive[j] = keys[4 * i + j]
+        s.Reset(settle.Phase.Free)
+        s.Settle(settle.Phase.Free, settle.Budget(10, 1e-14))
+        for j in range 3: assert (s.Activity(settle.Phase.Free, v).Get(0, j) - values[3 * i + j]).Abs() < 1e-14
+    }
+}
+
+# the resident set, in pages, from /proc
+fn resident() I64 {
+    stat := try os.ReadFile("/proc/self/statm") catch { unreachable }
+    return try stat.Split(" ")[1].ParseInt(10) catch { unreachable }
+}
+
+# a lesson, the optimizer's step, the Step clock's rules and an exact implicit gradient from y into x's drive
+fn moment(l mut Learner<F32>&, opt mut adam<F32>&, dz tensor.Tensor<F32>&, dx mut tensor.Tensor<F32>&) {
+    s := l.S
+    l.Lesson(s.Root(), 0.5)!
+    opt.Step(s.E.Params, s.E.Grads)
+    l.Tick(system.Clock.Step)!
+    l.ImplicitGrad(system.Pop(2), dz, system.Implicit.Exact(1e-4, 500), system.Pop(0), dx)!
+}
+
+test Learner.Lesson "lessons, ticks and implicit gradients allocate nothing: resident memory does not grow over hundreds of them" {
+    r := rand.Rand(17)
+    s := system.System<F32>(32)
+    x := s.Population(s.Root(), "x", 100, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 64, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Connect(h, h, conn.Wiring.Csr(0.2), reciprocal = true)
+    s.Connect(h, h, conn.Wiring.LowRank(4), reciprocal = true)
+    reward := s.Signal(s.Root(), "reward")
+    s.Attach(s.Root(), system.Rule.ThreeFactor(reward, 0.9, 0.0), system.Clock.Step)
+    s.Attach(s.Root(), system.Rule.Homeostasis(0.2, 1e-3), system.Clock.Step)
+    s.Plan(r)!
+    s.Certify(0.9)
+    for i in range 32 * 100: s.Pop(x).Drive[i] = F32(r.Uniform(0.0, 1.0))
+    for i in range 32: s.Pop(y).Labels[i] = I32(i % 10)
+    l := Learner<F32>(s)!
+    opt := adam<F32>(s.E.Params.Len(), 1e-3)
+    dz := tensor.Tensor<F32>.Zeros(32, 10)
+    dz.Fill(0.01)
+    dx := tensor.Tensor<F32>.Zeros(32, 100)
+    for _ in range 20: moment(l, opt, dz, dx)
+    before := resident()
+    for _ in range 300: moment(l, opt, dz, dx)
+    grown := resident() - before
+    assert grown <= 16, "resident memory grew by " $grown " pages"
 }
