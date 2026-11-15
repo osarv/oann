@@ -19,8 +19,10 @@ What models are built from and trained with, on the autodiff graph (`ad/`). docs
 - `generate.olang` - `Sample` and the generators: `CachedTokens`/`Cached` through a decoding graph's key-value cache,
   `RerunTokens`/`Rerun` running the context again, on token ids and on text.
 
+- `quant.olang` - INT8 post-training quantization for inference over kernels/gemm's `GemmI8`: `Weights` (symmetric per output channel), `Range` (dynamic or calibrated activation ranges, U8 with a zero point), `Model` (dense layers, convolutions and max pooling read from a trained graph's values, run on plain arrays by `Forward`; `Calibrate` and `Static`; `Bytes`), and `Quantize(g)` / `Dequantize(g)` / `LinearBytes(g)` for the graph's own hook (every `Linear` node in INT8 - a transformer's projections and perceptrons, its key-value decoding unchanged).
+
 A step, an optimizer step and a training step allocate nothing: each has a test that runs 20 steps after the first and
 asserts the process's resident memory did not grow.
 
-Test with `olang test nn/FILE.olang`; `make test` runs them all. `make charlmnn` trains the character transformer
-through them (M2, M3 of docs/redesign.md 4.3; `bench/charlm_nn.olang`).
+Test with `olang test nn/FILE.olang`; `make test` runs them all. `make charlm` trains the character transformer
+through them (M2, M3 of docs/redesign.md 4.3; `examples/charlm.olang`, the model is `models/gpt`).

@@ -178,8 +178,8 @@ type Model struct(Batch I64, Inputs I64, Threads I64 = 1) {
     Layers mut list.List<Layer>& = list.List<Layer>()
     Ranges mut list.List<Range>& = list.List<Range>()
     widths mut list.List<I64>& = list.List<I64>()
-    rows I64 = 0                                # the most rows of activations a layer quantizes, and their columns
-    cols I64 = 0
+    cells I64 = 0                               # the most values of activations a layer quantizes
+    sumCells I64 = 0                            # the most integer products a layer makes
     outs I64 = 0                                # the widest output of a quantized layer
     pixels I64 = 0                              # the most image values a convolution quantizes
     ws mut gemm.Workspace<I32>& = gemm.Workspace<I32>(Threads)
@@ -200,8 +200,8 @@ fn (m mut Model&) push(l Layer, width I64, rows I64, cols I64, outs I64) {
     m.Layers.Push(l)
     m.Ranges.Push(Range())
     m.widths.Push(width)
-    m.rows = m.rows.Max(rows)
-    m.cols = m.cols.Max(cols)
+    m.cells = m.cells.Max(rows * cols)
+    m.sumCells = m.sumCells.Max(rows * outs)
     m.outs = m.outs.Max(outs)
     m.acts = Array<U8>(0)                       # re-made by the next call, sized for the layers now
 }
@@ -217,8 +217,13 @@ fn vector<T>(g graph.Graph<T>&, v graph.Var, n I64) Array<F32> {
 
 # a dense layer of a trained graph, read from its values: y = x w^T + b, ReLU after it or not
 fn (m mut Model&) Dense<T>(g graph.Graph<T>&, d layers.Dense&, relu Bool) {
-    assert d.In == m.Outputs(), "a dense layer reads " $d.In " features, the layer before gives " $m.Outputs()
-    m.push(Layer.Dense(Weights.Quantize(g.Value(d.W)), vector(g, d.B, d.Out), relu), d.Out, m.Batch, d.In, d.Out)
+    m.DenseOf(g.Value(d.W), vector(g, d.B, d.Out), relu)
+}
+
+# a dense layer of weights w (Out x In) and biases b (Out values, or none), ReLU after it or not
+fn (m mut Model&) DenseOf<T>(w tensor.Tensor<T>&, b Array<F32>&, relu Bool) {
+    assert w.Dim(1) == m.Outputs(), "a dense layer reads " $w.Dim(1) " features, the layer before gives " $m.Outputs()
+    m.push(Layer.Dense(Weights.Quantize(w), b, relu), w.Dim(0), m.Batch, w.Dim(1), w.Dim(0))
 }
 
 # a convolution of a trained graph, ReLU after it or not
@@ -285,14 +290,14 @@ fn (m mut Model&) go(n I64, x Array<F32>&, y mut Array<F32>&, observe Bool) {
 
 # the buffers sized for the layers added (once, unless layers were added since)
 fn (m mut Model&) prepare() {
-    if m.acts.Len() >= m.rows * m.cols and m.acts.Len() > 0: return
+    if m.acts.Len() >= m.cells and m.acts.Len() > 0: return
     widest I64 = 0
     for w in m.widths: widest = widest.Max(w)
     m.front = Array<F32>(widest * m.Batch)
     m.back = Array<F32>(widest * m.Batch)
-    m.acts = Array<U8>(m.rows * m.cols)
+    m.acts = Array<U8>(m.cells)
     m.image = Array<U8>(m.pixels)
-    m.sums = Array<I32>(m.rows * m.outs)
+    m.sums = Array<I32>(m.sumCells)
     m.scales = Array<F32>(m.outs)
 }
 

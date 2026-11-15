@@ -198,6 +198,18 @@ test Ssm "generates the cycle it was trained on by running the context again" {
     assert out == Array<I32>[I32(i % 4) for i in range 12]
 }
 
+test Ssm "trains past one chunk of the scan: batches of 16 sequences of 64, 100 and 130 tokens, a forward after the step too" {
+    for ctx in Array<I64>[64, 100, 130] {
+        c := SsmConfig(30, 16, 2, ctx, Mixer.Mamba, 4, 2, 2)
+        g, lm := made<F32>(c, 16, 3)
+        src := text.Windows(Array<I32>[I32(i % 30) for i in range 2000], ctx, 1)
+        o := optim.AdamW(g.Params(), g.ParamGrads(), spans = optim.Spans(g))
+        for _ in range 2: train.LmStep(g, lm, src, o, 1e-3, 1.0)
+        valid := text.Windows(Array<I32>[I32(i % 30) for i in range 2000], ctx, 2)
+        assert train.LmEvaluate(g, lm, valid, 2) < 30.0.Log() + 0.5
+    }
+}
+
 # this process's resident memory in kB (VmRSS, Linux)
 fn resident() I64 {
     status := try os.ReadFile("/proc/self/status") catch { return 0 }

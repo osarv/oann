@@ -11,7 +11,7 @@ TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/e
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang board/engine.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test mlpad arenaad charlmnn data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
+.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -26,12 +26,6 @@ mlpad:
 arenaad:
 	$(OLANG) build -output build/bench_arena_ad bench/arena_ad.olang
 	./build/bench_arena_ad $(ARGS)
-
-# M2 and M3 on nn/*: the character transformer on tiny Shakespeare through the new layers, optimizer, loop and generator
-# - ARGS: steps, seed, threads, dropout, characters to generate, and bf16 last
-charlmnn:
-	$(OLANG) build -output build/bench_charlm_nn bench/charlm_nn.olang
-	./build/bench_charlm_nn $(ARGS)
 
 # fetches MNIST into data/mnist (once), checks the pipeline against what is known about the dataset, and times it
 data bench:
@@ -50,11 +44,18 @@ cnn:
 	$(OLANG) build -output build/examples_mnist_cnn examples/mnist_cnn.olang
 	./build/examples_mnist_cnn $(ARGS)
 
-# trains the character-level transformer on tiny Shakespeare (fetched into data/shakespeare once) and generates a
-# sample - ARGS: steps, seed, threads, dropout, characters to generate
+# M2 and M3: the character-level transformer (models/gpt) on tiny Shakespeare (fetched into data/shakespeare once)
+# through nn/train's Fit, its checkpoint in data/shakespeare, and a sample through the key-value cache - ARGS: steps,
+# seed, threads, dropout, characters to generate, and bf16 last for mixed precision
 charlm:
 	$(OLANG) build -output build/examples_charlm examples/charlm.olang
 	./build/examples_charlm $(ARGS)
+
+# M13: a GPT and an SSM of 10 million parameters on TinyStories (examples/tinystories.olang) - first ARGS="prep", then
+# ARGS="gpt TOKENS" or "mamba TOKENS" (context, sequences, seed, threads, bf16 after)
+tinystories:
+	$(OLANG) build -output build/examples_tinystories examples/tinystories.olang
+	./build/examples_tinystories $(ARGS)
 
 # the same transformer on byte-level BPE tokens (512, learned from the training part), its loss per character against
 # the character model's checkpoint - ARGS: steps, seed, threads, vocabulary, tokens to generate
@@ -150,15 +151,15 @@ nights:
 	$(OLANG) build -output build/examples_nights examples/nights.olang
 	./build/examples_nights $(ARGS)
 
-# the perceptron (or the CNN) trained in F32, quantized to INT8 (quant.olang) and measured both ways: test accuracy,
-# the parameters' size, throughput at batch 1, 64 and 128, where the INT8 model's time goes - ARGS: mlp or cnn, epochs,
+# the perceptron (or the CNN) trained in F32, quantized to INT8 (nn/quant.olang, M12) and measured both ways: test accuracy,
+# the parameters' size, throughput at batch 1, 64 and 128 - ARGS: mlp or cnn, epochs,
 # seed, threads, timing rounds
 int8:
 	$(OLANG) build -output build/examples_mnist_int8 examples/mnist_int8.olang
 	./build/examples_mnist_int8 $(ARGS)
 
 # the character transformer (data/shakespeare/charlm.ckpt, from make charlm) with its linear layers in INT8
-# (Graph.QuantizeLinear): validation loss, a forward's time, greedy text and cached decoding against F32 - ARGS:
+# (nn/quant's Quantize): validation loss, a forward's time, greedy text and cached decoding against F32 - ARGS:
 # characters, timing rounds, threads
 int8lm:
 	$(OLANG) build -output build/examples_charlm_int8 examples/charlm_int8.olang

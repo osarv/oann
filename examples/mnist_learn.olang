@@ -2,7 +2,7 @@
 # folded into a constant once a settle), a population of tanh units, ten readouts (cross-entropy at T = 0.25), the
 # hidden and readout units connected symmetrically - taught by equilibrium propagation (learn.Learner.Lesson: a free
 # settle, the nudged phases at +beta and -beta side by side, their contrast) and Adam, then measured on the test set,
-# where an answer is a free settle. examples/mnist_settle.olang is the same network on circuit.olang. Arguments, all
+# where an answer is a free settle. The optimizer is nn/optim's AdamW over the system's flat parameter region. Arguments, all
 # optional: the epochs (1), the training samples used (60000), the hidden units (128), the batch (32), the seed (1),
 # Adam's rate (0.001), beta (0.5), the threads a sweep may be split over (1).
 
@@ -16,7 +16,7 @@ import "../dyn/neuron"
 import "../dyn/conn"
 import "../dyn/settle"
 import "../dyn/learn"
-import "../optim"
+import "../nn/optim"
 import "../data/idx"
 import "../data/loader"
 import "../data/mnist"
@@ -48,9 +48,9 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error {
     s.Plan(rand.Rand(seed))!
     s.Certify(0.9)
     l := learn.Learner<F32>(s)!
-    opt := optim.FlatAdamW<F32>(s.E.Params.Len(), rate)
+    opt := optim.AdamW(s.Params(), s.ParamGrads(), rate = rate)
     tol := s.LessonTolerance(beta)
-    try io.Put(("784-" $hidden "-10 settling system (dyn), " $s.E.Params.Len() " parameters, " $samples " training samples, batches of "
+    try io.Put(("784-" $hidden "-10 settling system (dyn), " $s.Params().Count() " parameters, " $samples " training samples, batches of "
         $batch ", beta " $beta ", lesson tolerance " $tol ", budget " $s.BudgetFor(tol, beta).Sweeps " sweeps, " $threads " threads\n"))
 
     trainSet := loader.Loader(part, batch, seed)
@@ -72,7 +72,7 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error {
             sweeps += lesson.Sweeps
             taught++
             loss += s.Loss(settle.Phase.Free)
-            opt.Step(s.E.Params, s.E.Grads)
+            opt.Step()
         }
         spent := F64(time.Since(t0)) * 1e-9
         accuracy, answer := evaluate(s, testSet, pixels, digits, tol, labels)
