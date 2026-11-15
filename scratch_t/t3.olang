@@ -1,0 +1,144 @@
+import "std/time"
+
+fn dotLane(a Array<F32>&, o I64, x Array<F32>&, n I64) F32 {
+    return (a[o:o + n] * x[0:n]).Sum()
+}
+
+type lanes struct() {
+    v := Array<F32>(64)
+}
+
+fn dot16(a Array<F32>&, o I64, x Array<F32>&, n I64) F32 {
+    acc := lanes()
+    whole I64 = n - n % 16
+    for p in range 0, whole, 16 {
+        for j in range 16: acc.v[j] = a[o + p + j].Fma(x[p + j], acc.v[j])
+    }
+    s F32 = 0
+    for j in range 16: s = s + acc.v[j]
+    for p in range whole, n: s = a[o + p].Fma(x[p], s)
+    return s
+}
+
+fn dot32(a Array<F32>&, o I64, x Array<F32>&, n I64) F32 {
+    acc := lanes()
+    whole I64 = n - n % 32
+    for p in range 0, whole, 32 {
+        for j in range 32: acc.v[j] = a[o + p + j].Fma(x[p + j], acc.v[j])
+    }
+    s F32 = 0
+    for j in range 32: s = s + acc.v[j]
+    for p in range whole, n: s = a[o + p].Fma(x[p], s)
+    return s
+}
+
+fn dot16x2(a Array<F32>&, o I64, ld I64, x Array<F32>&, n I64, y mut Array<F32>&, i I64) {
+    acc := lanes()
+    acc2 := lanes()
+    whole I64 = n - n % 16
+    for p in range 0, whole, 16 {
+        for j in range 16: acc.v[j] = a[o + p + j].Fma(x[p + j], acc.v[j])
+        for j in range 16: acc2.v[j] = a[o + ld + p + j].Fma(x[p + j], acc2.v[j])
+    }
+    s F32 = 0
+    t F32 = 0
+    for j in range 16: s = s + acc.v[j]
+    for j in range 16: t = t + acc2.v[j]
+    y[i] = s
+    y[i + 1] = t
+}
+
+fn vl<A>(z A) I64 {
+    return match A {
+        case F64, I64, U64: TargetVectorBits / 64
+        case _: TargetVectorBits / 32
+    }
+}
+
+fn ma<A>(a A, b A, c A) A {
+    match A {
+        case F32, F64 {
+            if TargetHasFma: return a.Fma(b, c)
+        }
+        case _ { }
+    }
+    return a * b + c
+}
+
+type lanesG<A> struct() {
+    v := Array<A>(16)
+}
+
+fn stepG<M, V, A>(acc mut lanesG<A>&, mx Array<M>&, mo I64, vec Array<V>&, p I64, w I64) {
+    z A
+    for j in range w: acc.v[j] = ma(cast(mx[mo + j], z), cast(vec[p + j], z), acc.v[j])
+}
+
+fn dotG<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
+    w I64 = vl(z)
+    acc := lanesG<A>()
+    whole I64 = len - len % w
+    for p in range 0, whole, w: stepG(acc, mx, o + p, vec, p, w)
+    s A = acc.v[0]
+    for j in range 1, w: s = s + acc.v[j]
+    return s
+}
+
+fn main() {
+    rows, cols := 256, 512
+    a := Array<F32>(rows * cols)
+    x := Array<F32>(cols)
+    y := Array<F32>(rows)
+    for i in range a.Len(): a[i] = F32(i % 7) * 0.25
+    for i in range cols: x[i] = F32(i % 5) * 0.5
+    for _ in range 3 {
+        t0 := time.Now()
+        for _ in range 1000 {
+            for i in range rows: y[i] = dotLane(a, i * cols, x, cols)
+        }
+        t1 := time.Now()
+        for _ in range 1000 {
+            for i in range rows: y[i] = dot16(a, i * cols, x, cols)
+        }
+        t2 := time.Now()
+        t3 := time.Now()
+        for _ in range 1000 {
+            for i in range rows: y[i] = dot32(a, i * cols, x, cols)
+        }
+        t4 := time.Now()
+        for _ in range 1000 {
+            for i in range 0, rows, 2: dot16x2(a, i * cols, cols, x, cols, y, i)
+        }
+        t5 := time.Now()
+        t6 := time.Now()
+        for _ in range 1000 {
+            for i in range rows: y[i] = dotG(a, i * cols, x, cols, F32(0))
+        }
+        Println("generic " $(F64(time.Since(t6)) / 1000.0))
+        Println("dot32 " $(F64(t4 - t3) / 1000.0) " dot16x2 " $(F64(t5 - t4) / 1000.0))
+        Println("lane " $(F64(t1 - t0) / 1000.0) " ns, dot16 " $(F64(t2 - t1) / 1000.0) " ns " $y[3])
+    }
+}
+
+fn cast<X, D>(x X, like D) D {
+    match X {
+        case F8E4M3, F8E5M2 { return cast(x.F64(), like) }
+        case _ { }
+    }
+    return match D {
+        case F8E4M3: F8E4M3(F64(x))
+        case F8E5M2: F8E5M2(F64(x))
+        case F16: F16(x)
+        case BF16: BF16(x)
+        case F32: F32(x)
+        case F64: F64(x)
+        case I8: I8(x)
+        case I16: I16(x)
+        case I32: I32(x)
+        case I64: I64(x)
+        case U8: U8(x)
+        case U16: U16(x)
+        case U32: U32(x)
+        case U64: U64(x)
+    }
+}

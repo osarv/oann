@@ -1,0 +1,274 @@
+
+# a batch of groups x members matrices, rows x cols each, in one gappy storage - members' matrices side by side,
+# filled uniformly
+fn batchOf<S>(rows I64, cols I64, groups I64, members I64, like S, r mut rand.Rand&) Batch<S> {
+    m := uniform(groups * rows, members * (cols + 1), like, r)
+    return Batch<S>(m.Data, m.Off, rows, cols, m.Ld, groups, rows * m.Ld, members, cols + 1)
+}
+
+fn batchCase(m I64, n I64, k I64, form I64, r mut rand.Rand&) {
+    ta, tb := form % 2 == 1, form >= 2
+    z F64 = 0.0
+    a := batchOf(k, m, 3, 2, z, r) if ta else batchOf(m, k, 3, 2, z, r)
+    b := batchOf(n, k, 3, 2, z, r) if tb else batchOf(k, n, 3, 2, z, r)
+    c := batchOf(m, n, 3, 2, z, r)
+    c0 := Array<F64>(c.Data.Len())
+    for e in range c0.Len(): c0[e] = c.Data[e]
+    ws := Workspace<F64>(1)
+    GemmBatch(ws, c, a, ta, b, tb, 2.0, 0.5)
+    old := Batch<F64>(c0, c.Off, c.Rows, c.Cols, c.Ld, c.Groups, c.GroupStride, c.Members, c.MemberStride)
+    for e in range 6 {
+        g, h := e / 2, e % 2
+        want, _ := reference(a[g, h], ta, b[g, h], tb)
+        for i in range m {
+            for j in range n: assert (c[g, h][i, j] - (2.0 * want[i, j] + 0.5 * old[g, h][i, j])).Abs() < 1e-12 * F64(k)
+        }
+    }
+    # the gaps between the matrices are untouched, and threads change nothing
+    d := Array<F64>(c0.Len())
+    for e in range d.Len(): d[e] = c0[e]
+    dc := Batch<F64>(d, c.Off, c.Rows, c.Cols, c.Ld, c.Groups, c.GroupStride, c.Members, c.MemberStride)
+    four := Workspace<F64>(4)
+    GemmBatch(four, dc, a, ta, b, tb, 2.0, 0.5)
+    for e in range d.Len(): assert d[e] == c.Data[e] or (c0[e] == c.Data[e] and d[e] == c0[e])
+}
+
+test GemmBatch "a Gemm per matrix: every transpose, alpha and beta, strided storage, threads" {
+    r := rand.Rand(21)
+    sizes := Array<I64>[37, 29, 41, 130, 45, 300]
+    for s in range 2 {
+        for form in range 4: batchCase(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], form, r)
+    }
+}
+
+# m's element (i, j) above the diagonal (j > i + d) set to v
+fn aboveDiagonal<S>(m mut mat.Mat<S>&, d I64, v S) {
+    for i in range m.Rows {
+        for j in range i + d + 1, m.Cols: m[i, j] = v
+    }
+}
+
+fn resultCase(T I64, first I64, d I64, r mut rand.Rand&) {
+    z F64 = 0.0
+    q := uniform(2 * T, 26, z, r)
+    k := uniform(2 * (T + first), 26, z, r)
+    s := gappy(4 * T, T + first, z)
+    fill(s, NaN)
+    S, Q, K := Batch.Stacked(s, T, 2), Batch.Heads(q, T, 2), Batch.Heads(k, T + first, 2)
+    ws := Workspace<F64>(2)
+    GemmBatch(ws, S, Q, false, K, true, 0.5, 0.0, Triangle.Result(d))
+    GemmBatch(ws, S, Q, false, K, true, 0.5, 1.0, Triangle.Result(d))
+    for e in range 4 {
+        want, _ := reference(Q[e / 2, e % 2], false, K[e / 2, e % 2], true)
+        got := S[e / 2, e % 2]
+        for i in range T {
+            for j in range T + first: assert (got[i, j] - want[i, j]).Abs() < 1e-12 * F64(T) if j <= i + d else got[i, j].IsNan()
+        }
+    }
+}
+
+test GemmBatch "a triangular result is computed below its diagonal only, and nothing above it is touched" {
+    r := rand.Rand(5)
+    for size in range 3 {
+        T, first := Array<I64>[37, 300, 9][size], Array<I64>[0, 0, 40][size]
+        for diag in range -2, 4, 3: resultCase(T, first, diag + first, r)
+    }
+}
+
+fn leftCase(T I64, d I64, ta Bool, r mut rand.Rand&) {
+    z F64 = 0.0
+    p := uniform(3 * T, T, z, r, 0.0, 1.0)
+    clean := gappy(3 * T, T, z)
+    for i in range 3 * T {
+        for j in range T: clean[i, j] = p[i, j]
+    }
+    P, C := Batch.Stacked(p, T), Batch.Stacked(clean, T)
+    for g in range 3 {
+        aboveDiagonal(C[g, 0], d, 0.0)
+        aboveDiagonal(P[g, 0], d, NaN)          # never read
+    }
+    v := uniform(3 * T, 19, z, r)
+    y := gappy(3 * T, 19, z)
+    fill(y, 1.0)
+    ws := Workspace<F64>(1)
+    GemmBatch(ws, Batch.Stacked(y, T), P, ta, Batch.Stacked(v, T), false, 1.0, 2.0, Triangle.Left(d))
+    for g in range 3 {
+        want, _ := reference(C[g, 0], ta, Batch.Stacked(v, T)[g, 0], false)
+        assert maxDiff(Batch.Stacked(y, T)[g, 0], want, 1.0, 2.0) < 1e-12 * F64(T)
+    }
+}
+
+test GemmBatch "a triangular left operand is read in its lower triangle only, transposed or not" {
+    r := rand.Rand(6)
+    for T in Array<I64>[37, 300] {
+        for diag in range -2, 4, 3 {
+            leftCase(T, diag, false, r)
+            leftCase(T, diag, true, r)
+        }
+    }
+}
+
+fn gemvCase(rows I64, cols I64, r mut rand.Rand&) {
+    a := uniform(rows, cols, F64(0), r)
+    x := uniform(1, cols, F64(0), r)
+    u := uniform(1, rows, F64(0), r)
+    want, _ := reference(a, false, x, true)
+    y := Array<F64>(rows, NaN)
+    Gemv(y, a, false, x.Data[x.Off:x.Off + cols])
+    for i in range rows: assert (y[i] - want[i, 0]).Abs() < 1e-13 * F64(cols)
+    # a's columns: y = 2 a^T u + y
+    wantT, _ := reference(a, true, u, true)
+    yt := Array<F64>(cols, 1.0)
+    Gemv(yt, a, true, u.Data[u.Off:u.Off + rows], 2.0, 1.0)
+    for j in range cols: assert (yt[j] - (2.0 * wantT[j, 0] + 1.0)).Abs() < 1e-13 * F64(rows)
+    # mixed: BF16 storage, F32 vectors
+    ab := uniform(rows, cols, BF16(0), r)
+    xf := Array<F32>(cols)
+    for j in range cols: xf[j] = F32(x[0, j])
+    yf := Array<F32>(rows)
+    Gemv(yf, ab, false, xf)
+    for i in range rows {
+        s F64 = 0.0
+        for j in range cols: s = s + F64(ab[i, j]) * F64(xf[j])
+        assert (F64(yf[i]) - s).Abs() < 1e-6 * F64(cols)
+    }
+}
+
+test Gemv "matrix-vector products both ways round, of strided views, F64 and BF16 x F32" {
+    r := rand.Rand(7)
+    for s in range 5: gemvCase(Array<I64>[64, 256, 3, 7, 128][s], Array<I64>[64, 512, 5, 130, 128][s], r)
+}
+
+test Gemm "one to four rows and one column take the vector paths, every transpose" {
+    r := rand.Rand(8)
+    for m in Array<I64>[1, 2, 3, 4, 300] {
+        for form in range 4 {
+            ta, tb := form % 2 == 1, form >= 2
+            n I64 = 1 if m == 300 else 29
+            a := uniform(37, m, F32(0), r) if ta else uniform(m, 37, F32(0), r)
+            b := uniform(n, 37, F32(0), r) if tb else uniform(37, n, F32(0), r)
+            c := gappy(m, n, F32(0))
+            fill(c, 1.0)
+            ws := Workspace<F32>(1)
+            Gemm(ws, c, a, ta, b, tb, 1.0, 1.0)
+            want, _ := reference(a, ta, b, tb)
+            assert maxDiff(c, want, 1.0, 1.0) < 1e-5
+        }
+    }
+}
+
+fn epilogueCase(m I64, n I64, k I64, act mat.Act, r mut rand.Rand&) {
+    a := uniform(m, k, F32(0), r)
+    b := uniform(k, n, F32(0), r)
+    bias := Array<F32>(n)
+    for j in range n: bias[j] = F32(r.Uniform(-1.0, 1.0))
+    want, _ := reference(a, false, b, false)
+    c := gappy(m, n, F32(0))
+    ws := Workspace<F32>(4)
+    Gemm(ws, c, a, false, b, false, 1.0, 0.0, Epilogue.BiasAct(bias, act))
+    kind := actKind(act)
+    for i in range m {
+        for j in range n: assert (F64(c[i, j]) - kind(want[i, j] + F64(bias[j]))).Abs() < 1e-5, $act " " $m "x" $n "x" $k
+    }
+    plain := gappy(m, n, F32(0))
+    Gemm(ws, plain, a, false, b, false, 1.0, 0.0, Epilogue.Bias(bias))
+    for i in range m {
+        for j in range n: assert (F64(plain[i, j]) - (want[i, j] + F64(bias[j]))).Abs() < 1e-5
+    }
+}
+
+# act in F64, as the epilogue computes it
+fn actKind(act mat.Act) fn&(x F64) F64 {
+    return match act {
+        case mat.Act.Relu: fn(x F64) F64 { return actOf(x, reluAct()) }
+        case mat.Act.Gelu: fn(x F64) F64 { return actOf(x, geluAct()) }
+        case mat.Act.GeluTanh: fn(x F64) F64 { return actOf(x, geluTanhAct()) }
+        case mat.Act.Silu: fn(x F64) F64 { return actOf(x, siluAct()) }
+        case mat.Act.Sigmoid: fn(x F64) F64 { return actOf(x, sigmoidAct()) }
+        case mat.Act.Tanh: fn(x F64) F64 { return actOf(x, tanhAct()) }
+        case mat.Act.Softplus: fn(x F64) F64 { return actOf(x, softplusAct()) }
+    }
+}
+
+test Epilogue "a bias and an activation on the summed result: every activation, unpacked, packed and exchanged" {
+    r := rand.Rand(12)
+    acts := Array<mat.Act>[mat.Act.Relu, mat.Act.Gelu, mat.Act.GeluTanh, mat.Act.Silu, mat.Act.Sigmoid, mat.Act.Tanh, mat.Act.Softplus]
+    for act in acts {
+        epilogueCase(3, 40, 17, act, r)
+        epilogueCase(130, 70, 300, act, r)
+        epilogueCase(10, 300, 64, act, r)
+    }
+    assert actOf(-2.0, softplusAct()) - (1.0 + (-2.0).Exp()).Log() < 1e-15 and actOf(NaN, reluAct()).IsNan()
+}
+
+# a left operand of its own type, for GemmLeft: a matrix read through Pack
+type rowsOf struct(m mat.Mat<F64>&) {
+    m
+}
+
+fn (x rowsOf&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut Array<A>&) {
+    for q in range 0, width, wr {
+        for p in range depth {
+            for w in range wr: dst[q * depth + p * wr + w] = x.m[w0 + q + w, p0 + p] if q + w < width else 0.0
+        }
+    }
+}
+
+test GemmLeft "a left operand packed by its own type is the matrix it reads" {
+    r := rand.Rand(13)
+    a := uniform(300, 517, F64(0), r)
+    b := uniform(270, 517, F64(0), r)
+    want, _ := reference(a, false, b, true)
+    c := gappy(300, 270, F64(0))
+    ws := Workspace<F64>(4)
+    GemmLeft(ws, c, rowsOf(a), 517, b, true, 1.0, 0.0, Epilogue.Bias(Array<F32>(270)))
+    assert maxDiff(c, want) < 1e-12 * 517.0
+}
+
+fn i8Case(m I64, n I64, k I64, zero I32, r mut rand.Rand&) {
+    a := gappy(m, k, U8(0))
+    b := gappy(n, k, I8(0))
+    for i in range m {
+        for p in range k: a[i, p] = U8(r.Below(256))
+    }
+    for j in range n {
+        for p in range k: b[j, p] = I8(r.Below(255) - 127)
+    }
+    scale := Array<F32>(n)
+    for j in range n: scale[j] = F32(r.Uniform(0.001, 0.01))
+    c := gappy(m, n, I32(0))
+    out := gappy(m, n, F32(0))
+    ws := Workspace<I32>(1)
+    GemmI8(ws, c, a, b, scale, out, zero)
+    for i in range m {
+        for j in range n {
+            s I32 = 0
+            sb I32 = 0
+            for p in range k {
+                s = s + I32(a[i, p]) * I32(b[j, p])
+                sb = sb + I32(b[j, p])
+            }
+            assert c[i, j] == s and out[i, j] == F32(s - zero * sb) * scale[j], $m "x" $n "x" $k
+        }
+    }
+    four := Workspace<I32>(4)
+    out4 := gappy(m, n, F32(0))
+    GemmI8(four, gappy(m, n, I32(0)), a, b, scale, out4, zero)
+    assert sameBits(out, out4)
+}
+
+test GemmI8 "INT8 products are the integer sums, dequantized per output, wide and thin tiles, any thread count" {
+    r := rand.Rand(14)
+    sizes := Array<I64>[1, 10, 300, 3, 70, 5, 7, 16, 41, 64, 128, 784, 300, 70, 300, 13, 40, 9]
+    for s in range sizes.Len() / 3 {
+        i8Case(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], 0, r)
+        i8Case(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], 128, r)
+    }
+}
+
+test Ger2 "a decayed rank-2 update" {
+    a := gappy(2, 3, F32(0))
+    fill(a, 2.0)
+    Ger2(a, Array<F32>[1.0, 2.0], Array<F32>[3.0, 4.0, 5.0], Array<F32>[1.0, 0.0], Array<F32>[1.0, 1.0, 1.0], F32(0.5), F32(0.25))
+    assert a[0, 0] == 0.5 + 0.5 * (3.0 + 1.0) and a[1, 2] == 0.5 + 0.5 * 10.0
+}

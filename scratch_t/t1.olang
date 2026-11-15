@@ -1,0 +1,30 @@
+mr I64 = 12 if TargetVectorBits >= 512 else (6 if TargetVectorBits >= 256 else 4)
+
+type tile<A> struct() {
+    v := Array<A>(384)
+}
+
+fn step<A>(acc mut tile<A>&, base I64, x A, bp Array<A>&, b I64, nr I64) {
+    for j in range nr { acc.v[base + j] = x.Fma(bp[b + j], acc.v[base + j]) }
+}
+
+fn micro<A>(d I64, ap Array<A>&, bp Array<A>&, nr I64, out mut Array<A>&) {
+    acc := tile<A>()
+    for k in range d {
+        comptime for i in range mr { step(acc, i * nr, ap[k * mr + i], bp, k * nr, nr) }
+    }
+    for i in range mr * nr { out[i] = acc.v[i] }
+}
+
+test "comptime for" {
+    ap := Array<F32>(mr * 3)
+    bp := Array<F32>(32 * 3)
+    for i in range ap.Len() { ap[i] = 1.0 }
+    for i in range bp.Len() { bp[i] = 2.0 }
+    out := Array<F32>(mr * 32)
+    micro(3, ap, bp, 32, out)
+    assert out[0] == 6.0
+    x F32 = 0.5
+    assert x.Erf() > 0.5
+    Println("mr " $mr " bits " $TargetVectorBits)
+}
