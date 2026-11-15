@@ -1,0 +1,68 @@
+# the INT8 convolutional network of nn/quant (M12 of docs/redesign.md 4.3) against the graph's F32 forward: models/cnn
+# (two 3x3 convolutions of 16 and 32 channels with ReLU and 2x2 pooling, then a dense layer), its weights as drawn - the
+# speed does not depend on training - on random images, at batch 1, 64 and 128: interleaved, the median of each over
+# rounds, F32 then INT8 dynamic then static (calibrated on one batch). Arguments: rounds (7), threads (1). From the
+# repository's root: olang build -output build/bench_int8cnn bench/int8cnn.olang && build/bench_int8cnn
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../kernels/conv"
+import "../models/cnn"
+import "../tensor"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn main() ? io.Error, ParseError, conv.GeometryError, tensor.ShapeError {
+    args := os.Args()
+    rounds := try number(args, 1, 7)
+    threads := try number(args, 2, 1)
+    batch I64 = 128
+    g := graph.Graph<F32>(batch, threads)
+    m := try cnn.Cnn.New(g, cnn.CnnConfig.Mnist())
+    c := m.Task(g)
+    try g.Plan(rand.Rand(1))
+    r := rand.Rand(2)
+    xs := g.Data(c.X).Flat()!
+    for i in range xs.Len(): xs[i] = F32(r.Float())
+    q := m.Int8(g, batch, threads)
+    out := Array<F32>(batch * 10)
+    q.Calibrate(batch, xs, out)
+    for size in Array<I64>[1, 64, batch] {
+        reps I64 = 1
+        for {
+            t0 := time.Now()
+            for _ in range reps: g.Forward(size)
+            if time.Since(t0) > 20000000 or reps > 1000000: break
+            reps = reps * 2
+        }
+        f32s, dyns, stats := Array<F64>(rounds), Array<F64>(rounds), Array<F64>(rounds)
+        for t in range rounds {
+            t0 := time.Now()
+            for _ in range reps: g.Forward(size)
+            f32s[t] = F64(time.Since(t0)) / F64(reps)
+            q.Static = false
+            t1 := time.Now()
+            for _ in range reps: q.Forward(size, xs, out)
+            dyns[t] = F64(time.Since(t1)) / F64(reps)
+            q.Static = true
+            t2 := time.Now()
+            for _ in range reps: q.Forward(size, xs, out)
+            stats[t] = F64(time.Since(t2)) / F64(reps)
+        }
+        f, d, s := median(f32s), median(dyns), median(stats)
+        try io.Put("batch " + $size + ": F32 " + $(f * 1e-3).Fixed(1) + " us (" + $(F64(size) * 1e9 / f).Fixed(0) +
+            " samples/s), INT8 dynamic " + $(d * 1e-3).Fixed(1) + " us (" + $(f / d).Fixed(2) + "x), static " +
+            $(s * 1e-3).Fixed(1) + " us (" + $(f / s).Fixed(2) + "x)\n")
+    }
+}

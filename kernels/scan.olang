@@ -27,9 +27,10 @@
 #
 # Work is split over tasks by sequence, channel block or head - never across a sum - so a result is the same for every
 # thread count (the sums over channel blocks and sequences of the selective scan's backward are added in a fixed order).
-# The work object holds the thread count and the scratch; it grows on the first call and then allocates nothing, but for
-# the chunked delta rule, whose products each task makes a gemm.Workspace for (grown on its first product, in the task's
-# own scope, and gone with it: the Workspace's panels cannot be kept in a collection yet).
+# The work object holds the thread count and the scratch, reserved once (ReserveGated, ReserveSelective, ReserveDelta)
+# and never grown, so a scan allocates nothing - but for the chunked delta rule, whose products each task makes a
+# gemm.Workspace for (sized for the chunk, in the task's own scope, and gone with it: the Workspace's panels cannot be
+# kept in a collection yet).
 #
 # A backward needs the forward's states: the forward writes the state at the start of every chunk (`keep`, the chunk size
 # being at.Chunk of the Seq both are given) and the backward recomputes the rest of a chunk from it - one state per chunk
@@ -47,16 +48,57 @@ type Seq struct(Len I64, Chunk I64 = 64, Heads I64 = 1) {
     Heads
 }
 
-# the thread count and the scratch the kernels need, grown on the first call
-type Work<A> struct(threads I64) {
+# the thread count and the scratch the kernels need: room elements of A, or what the Reserve methods give it where the
+# kernels are planned. A kernel never grows it, so a loop of scans allocates nothing (`assert not f.Allocates` can pin
+# it); one the Work has no room for ends the program, naming the Reserve it needed
+type Work<A> struct(threads I64, room I64 = 0) {
     Threads I64 = threads if threads > 0 else 1
-    buf mut Array<A>& = Array<A>(0)
+    buf mut Array<A>& = Array<A>(room)
 }
 
 fn (w mut Work<A>&) scratch(n I64) mut Array<A>& {
-    if w.buf.Len() < n: w.buf = Array<A>(n if n > w.buf.Len() * 2 else w.buf.Len() * 2)
+    if w.buf.Len() < n: unreserved(n, w.buf.Len())
     return w.buf
 }
+
+fn unreserved(need I64, have I64) noreturn {
+    unreachable "scan: a kernel needs " + $need + " elements of scratch and its Work has " + $have + " - Reserve it (ReserveGated, ReserveSelective, ReserveDelta) where the scans are planned"
+}
+
+# room for n elements of scratch; never shrinks
+fn (w mut Work<A>&) Reserve(n I64) {
+    if w.buf.Len() < n: w.buf = Array<A>(n)
+}
+
+# room for GatedScanChunked and GatedScanGradChunked over rows x cols cut as at (the sequential forms need none)
+fn (w mut Work<A>&) ReserveGated(rows I64, cols I64, at Seq) {
+    w.Reserve(2 * (rows / at.Len) * chunksOf(at) * cols)
+}
+
+# room for SelectiveScan, SelectiveScanChunked and SelectiveScanGrad over rows x cols with n states, cut as at
+fn (w mut Work<A>&) ReserveSelective(rows I64, cols I64, n I64, at Seq) {
+    seqs := rows / at.Len
+    units := seqs * blocksOf(cols)
+    tasks := lesser(w.Threads, units)
+    chunkUnits := units * chunksOf(at)
+    chunked := lesser(w.Threads, chunkUnits) * 3 * scanWidth + 2 * seqs * n * chunksOf(at) * cols
+    grad := tasks * selGradScratch(at, n) + 2 * units * at.Len * n + seqs * n * cols + seqs * cols
+    w.Reserve(tasks * 3 * scanWidth)
+    w.Reserve(chunked)
+    w.Reserve(grad)
+}
+
+# room for DeltaRule, DeltaRuleChunked, DeltaRuleGrad and DeltaRuleGradChunked over rows of q (kcols columns) and v
+# (vcols), cut as at
+fn (w mut Work<A>&) ReserveDelta(rows I64, kcols I64, vcols I64, at Seq) {
+    tasks := lesser(w.Threads, rows / at.Len * at.Heads)
+    dk, dv, c := kcols / at.Heads, vcols / at.Heads, at.Chunk
+    w.Reserve(tasks * deltaScratch(true, at, dk, dv))
+    w.Reserve(tasks * deltaScratch(false, at, dk, dv))
+    w.Reserve(tasks * deltaGradScratch(at, dk, dv))
+    w.Reserve(tasks * (deltaChunkSize(c, dk, dv) + deltaGradChunkSize(c, dk, dv)))
+}
+
 
 # ---- tasks ----
 
@@ -84,6 +126,9 @@ scanWidth I64 = 512
 fn blocksOf(cols I64) I64 { return (cols + scanWidth - 1) / scanWidth }
 
 fn lesser(a I64, b I64) I64 { return a if a < b else b }
+
+# a chunk's products' room: each of m, n and k is the chunk, a key's or a value's width, or the two widths side by side
+fn roomOf(c I64, dk I64, dv I64) I64 { return c if c >= dk + dv else dk + dv }
 
 fn chunksOf(at Seq) I64 { return (at.Len + at.Chunk - 1) / at.Chunk }
 
@@ -148,7 +193,8 @@ fn (j scanJob<S, A>&) run(lo I64, hi I64, task I64) {
 # over each sequence, the sequences and channel blocks in tasks. state holds the last position's state afterwards
 fn GatedScan<S, A>(ws mut Work<A>&, h mut mat.Mat<S>&, state mut mat.Mat<A>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, at Seq) {
     seqs := h.Rows / at.Len
-    spread(scanJob<S, A>(h, state, x, a, b, at), seqs * blocksOf(h.Cols), ws.Threads)
+    job := scanJob<S, A>(h, state, x, a, b, at)
+    spread(job, seqs * blocksOf(h.Cols), ws.Threads)
 }
 
 # the summaries (pass 1) of chunks: unit u = (sequence s, chunk k, channel block), at ps and es [(s chunks + k) D ...]
@@ -240,9 +286,12 @@ fn GatedScanChunked<S, A>(ws mut Work<A>&, h mut mat.Mat<S>&, state mut mat.Mat<
     buf := ws.scratch(2 * size)
     ps := buf[0:size]
     es := buf[size:2 * size]
-    spread(scanSummaryJob<S, A>(x, a, b, ps, es, at), seqs * chunks * blocksOf(cols), ws.Threads)
-    spread(scanCarryJob<A>(state, ps, es, cols, chunks, false), seqs * blocksOf(cols), ws.Threads)
-    spread(scanChunkJob<S, A>(h, x, a, b, es, at), seqs * chunks * blocksOf(cols), ws.Threads)
+    job1 := scanSummaryJob<S, A>(x, a, b, ps, es, at)
+    spread(job1, seqs * chunks * blocksOf(cols), ws.Threads)
+    job2 := scanCarryJob<A>(state, ps, es, cols, chunks, false)
+    spread(job2, seqs * blocksOf(cols), ws.Threads)
+    job3 := scanChunkJob<S, A>(h, x, a, b, es, at)
+    spread(job3, seqs * chunks * blocksOf(cols), ws.Threads)
 }
 
 # ---- GatedScan's gradients ----
@@ -363,7 +412,7 @@ fn (j scanGradSummaryJob<S, A>&) run(lo I64, hi I64, task I64) {
 # the last position (zeros when nothing reads it) and on return the gradient in the initial state. Sequential
 fn GatedScanGrad<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Mat<S>&, db mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dh mat.Mat<S>&, h mat.Mat<S>&, init mat.Mat<A>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, at Seq, add Bool = false) {
     seqs := h.Rows / at.Len
-    job := scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, Array<A>(0), at, false, add)
+    job := scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, ws.buf, at, false, add)   # no ends: es unread
     spread(job, seqs * blocksOf(h.Cols), ws.Threads)
 }
 
@@ -377,9 +426,12 @@ fn GatedScanGradChunked<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Ma
     ps := buf[0:size]
     es := buf[size:2 * size]
     units := seqs * chunks * blocksOf(cols)
-    spread(scanGradSummaryJob<S, A>(dh, a, ps, es, at), units, ws.Threads)
-    spread(scanCarryJob<A>(dstate, ps, es, cols, chunks, true), seqs * blocksOf(cols), ws.Threads)
-    spread(scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, es, at, true, add), units, ws.Threads)
+    job1 := scanGradSummaryJob<S, A>(dh, a, ps, es, at)
+    spread(job1, units, ws.Threads)
+    job2 := scanCarryJob<A>(dstate, ps, es, cols, chunks, true)
+    spread(job2, seqs * blocksOf(cols), ws.Threads)
+    job3 := scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, es, at, true, add)
+    spread(job3, units, ws.Threads)
 }
 
 # ---- the selective scan ----
@@ -557,7 +609,8 @@ fn SelectiveScan<S, A>(ws mut Work<A>&, y mut mat.Mat<S>&, state mut mat.Mat<A>&
     units := x.Rows / at.Len * blocksOf(x.Cols)
     tasks := ws.Threads if ws.Threads < units else units
     z := ws.scratch(tasks * 3 * scanWidth)
-    spread(selJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, state, keep, z, 3 * scanWidth), units, ws.Threads)
+    job := selJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, state, keep, z, 3 * scanWidth)
+    spread(job, units, ws.Threads)
 }
 
 # the chunked form: per (sequence, chunk, channel block) what the chunk leaves behind, the carry over the chunks, then
@@ -574,9 +627,12 @@ fn SelectiveScanChunked<S, A>(ws mut Work<A>&, y mut mat.Mat<S>&, state mut mat.
     vecs := z[0:tasks * 3 * scanWidth]
     ps := z[tasks * 3 * scanWidth:tasks * 3 * scanWidth + size]
     es := z[tasks * 3 * scanWidth + size:tasks * 3 * scanWidth + 2 * size]
-    spread(selSummaryJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), ps, es, vecs, 3 * scanWidth), units, ws.Threads)
-    spread(scanCarryJob<A>(state, ps, es, cols, chunks, false), seqs * n * blocksOf(cols), ws.Threads)
-    spread(selChunkJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, es, keep, vecs, 3 * scanWidth), units, ws.Threads)
+    job1 := selSummaryJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), ps, es, vecs, 3 * scanWidth)
+    spread(job1, units, ws.Threads)
+    job2 := scanCarryJob<A>(state, ps, es, cols, chunks, false)
+    spread(job2, seqs * n * blocksOf(cols), ws.Threads)
+    job3 := selChunkJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, es, keep, vecs, 3 * scanWidth)
+    spread(job3, units, ws.Threads)
 }
 
 # ---- the selective scan's backward ----
@@ -745,7 +801,8 @@ fn SelectiveScanGrad<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, ddelta mut mat.M
     pds := z[o + 2 * partial + seqs * n * cols:total]
     for i in range seqs * n * cols: pda[i] = 0.0
     for i in range seqs * cols: pds[i] = 0.0
-    spread(selGradJob<S, A>(selGradArgs<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), dx, ddelta, da, db, dc, dskip, dstate, dy, keep, add), z, per, pdb, pdc, pda, pds), units, ws.Threads)
+    job := selGradJob<S, A>(selGradArgs<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), dx, ddelta, da, db, dc, dskip, dstate, dy, keep, add), z, per, pdb, pdc, pda, pds)
+    spread(job, units, ws.Threads)
     # the sums over channel blocks (dB, dC), sequences (dA) and sequences again (dskip), in a fixed order
     for r in range seqs * at.Len {
         s := r / at.Len
@@ -949,6 +1006,7 @@ fn deltaLoad<S, A>(a deltaArgs<S>&, b deltaBuf<A>&, r0 I64, rows I64, h I64) {
         for c in range dk: b.x[i * wd + dv + c] = b.gam[i] * b.kc[i * dk + c]
         for j in range i: b.gm[i * b.c + j] = b.gm[(i - 1) * b.c + j] * b.alp[i]
         b.gm[i * b.c + i] = 1.0
+        for j in range i + 1, rows: b.gm[i * b.c + j] = 0.0        # zero above the diagonal: the backward's dgm gm^T reads it
     }
 }
 
@@ -1018,46 +1076,62 @@ fn deltaChunks<S, A>(a deltaArgs<S>&, out mat.Mat<S>&, st mat.Mat<A>&, keep mut 
     }
 }
 
-type deltaJob<S, A> struct(args deltaArgs<S>, out mat.Mat<S>, st mat.Mat<A>, keep mut Array<A>&, z mut Array<A>&, per I64, chunked Bool) {
+type deltaJob<S, A, K> struct(args deltaArgs<S>, out mat.Mat<S>, st mat.Mat<A>, keep mut Array<A>&, z mut Array<A>&, per I64, kind K) {
     args
     out
     st
     keep
     z
     per
-    chunked
 }
 
 # unit u: sequence u / Heads, head u % Heads; task t works in z's t-th share
-fn (j deltaJob<S, A>&) run(lo I64, hi I64, task I64) {
+fn (j deltaJob<S, A, K>&) run(lo I64, hi I64, task I64) {
     mine := j.z[task * j.per:(task + 1) * j.per]
-    if not j.chunked {
-        for u in range lo, hi: deltaSteps<S, A>(j.args, j.out, j.st, j.keep, mine, u / j.args.at.Heads, u % j.args.at.Heads)
-        return
+    heads := j.args.at.Heads
+    match K {
+        case chunkwise {
+            products := gemm.Workspace<A>(1, roomOf(j.args.at.Chunk, j.args.dk(), j.args.dv()))
+            b := deltaBuf<A>.Carve(mine, j.args.at.Chunk, j.args.dk(), j.args.dv())
+            for u in range lo, hi: deltaChunks<S, A>(j.args, j.out, j.st, j.keep, products, b, u / heads, u % heads)
+            return
+        }
+        case _ { }
     }
-    products := gemm.Workspace<A>(1)
-    b := deltaBuf<A>.Carve(mine, j.args.at.Chunk, j.args.dk(), j.args.dv())
-    for u in range lo, hi: deltaChunks<S, A>(j.args, j.out, j.st, j.keep, products, b, u / j.args.at.Heads, u % j.args.at.Heads)
+    for u in range lo, hi: deltaSteps<S, A>(j.args, j.out, j.st, j.keep, mine, u / heads, u % heads)
 }
 
-fn deltaRun<S, A>(ws mut Work<A>&, chunked Bool, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>&) {
+# the two forms of the delta rule, as a type, so that each form's code is compiled into its own instance alone: the
+# sequential one allocates nothing (its facts are its own), the chunked one makes a workspace per task
+type stepwise struct() { }
+type chunkwise struct() { }
+
+fn isChunked<K>(kind K) Bool {
+    return match K {
+        case chunkwise: true
+        case _: false
+    }
+}
+
+fn deltaRun<S, A, K>(ws mut Work<A>&, kind K, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>&) {
     units := q.Rows / at.Len * at.Heads
     tasks := ws.Threads if ws.Threads < units else units
-    per := deltaScratch(not chunked, at, q.Cols / at.Heads, v.Cols / at.Heads)
+    per := deltaScratch(not isChunked(kind), at, q.Cols / at.Heads, v.Cols / at.Heads)
     z := ws.scratch(tasks * per)
-    spread(deltaJob<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), out, state, keep, z, per, chunked), units, ws.Threads)
+    job := deltaJob<S, A, K>(deltaArgs<S>(q, k, v, beta, gate, at), out, state, keep, z, per, kind)
+    spread(job, units, ws.Threads)
 }
 
 # out = the delta rule over q, k, v, beta and gate from state, which holds the state after the last position on return.
 # The sequential form: one pass over the positions per head and sequence, heads and sequences in tasks
 fn DeltaRule<S, A>(ws mut Work<A>&, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
-    deltaRun(ws, false, out, state, q, k, v, beta, gate, at, keep)
+    deltaRun(ws, stepwise(), out, state, q, k, v, beta, gate, at, keep)
 }
 
 # the chunked form (the WY form): the same result, a chunk at a time through gemm's products. Chunks of 32 to 64 are
 # the useful sizes; scratch grows with Chunk squared
 fn DeltaRuleChunked<S, A>(ws mut Work<A>&, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
-    deltaRun(ws, true, out, state, q, k, v, beta, gate, at, keep)
+    deltaRun(ws, chunkwise(), out, state, q, k, v, beta, gate, at, keep)
 }
 
 # ---- the delta rule's backward ----
@@ -1423,48 +1497,58 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
     }
 }
 
-type deltaGradJob<S, A> struct(g deltaGradArgs<S, A>, z mut Array<A>&, per I64, chunked Bool) {
+type deltaGradJob<S, A, K> struct(g deltaGradArgs<S, A>, z mut Array<A>&, per I64, kind K) {
     g
     z
     per
-    chunked
 }
 
-fn (j deltaGradJob<S, A>&) run(lo I64, hi I64, task I64) {
+fn (j deltaGradJob<S, A, K>&) run(lo I64, hi I64, task I64) {
     mine := j.z[task * j.per:(task + 1) * j.per]
     heads := j.g.f.at.Heads
-    if not j.chunked {
-        for u in range lo, hi: deltaGradSteps<S, A>(j.g, mine, u / heads, u % heads)
-        return
+    match K {
+        case chunkwise {
+            products := gemm.Workspace<A>(1, roomOf(j.g.f.at.Chunk, j.g.f.dk(), j.g.f.dv()))
+            c, dk, dv := j.g.f.at.Chunk, j.g.f.dk(), j.g.f.dv()
+            b := deltaBuf<A>.Carve(mine, c, dk, dv)
+            gb := deltaGradBuf<A>.Carve(mine[deltaChunkSize(c, dk, dv):], c, dk, dv)
+            for u in range lo, hi: deltaGradChunks<S, A>(j.g, products, b, gb, u / heads, u % heads)
+            return
+        }
+        case _ { }
     }
-    products := gemm.Workspace<A>(1)
-    c := j.g.f.at.Chunk
-    dk := j.g.f.dk()
-    dv := j.g.f.dv()
-    b := deltaBuf<A>.Carve(mine, c, dk, dv)
-    gb := deltaGradBuf<A>.Carve(mine[deltaChunkSize(c, dk, dv):], c, dk, dv)
-    for u in range lo, hi: deltaGradChunks<S, A>(j.g, products, b, gb, u / heads, u % heads)
+    for u in range lo, hi: deltaGradSteps<S, A>(j.g, mine, u / heads, u % heads)
 }
 
-fn deltaGradRun<S, A>(ws mut Work<A>&, chunked Bool, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dbeta mut mat.Mat<S>&, dgate mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, keep Array<A>&, at Seq, add Bool) {
+fn deltaGradRun<S, A, K>(ws mut Work<A>&, kind K, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dbeta mut mat.Mat<S>&, dgate mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, keep Array<A>&, at Seq, add Bool) {
     units := q.Rows / at.Len * at.Heads
     tasks := ws.Threads if ws.Threads < units else units
     kd := q.Cols / at.Heads
     vd := v.Cols / at.Heads
-    per := deltaChunkSize(at.Chunk, kd, vd) + deltaGradChunkSize(at.Chunk, kd, vd) if chunked else deltaGradScratch(at, kd, vd)
+    per := deltaChunkSize(at.Chunk, kd, vd) + deltaGradChunkSize(at.Chunk, kd, vd) if isChunked(kind) else deltaGradScratch(at, kd, vd)
     z := ws.scratch(tasks * per)
-    spread(deltaGradJob<S, A>(deltaGradArgs<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), dq, dk, dv, dbeta, dgate, dout, dstate, keep, add), z, per, chunked), units, ws.Threads)
+    job := deltaGradJob<S, A, K>(deltaGradArgs<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), dq, dk, dv, dbeta, dgate, dout, dstate, keep, add), z, per, kind)
+    spread(job, units, ws.Threads)
 }
 
 # the delta rule's gradients, sequential: see deltaGradArgs. dstate is seqs Heads dk rows of dv, the state's layout
 fn DeltaRuleGrad<S, A>(ws mut Work<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dbeta mut mat.Mat<S>&, dgate mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, keep Array<A>&, at Seq, add Bool = false) {
-    deltaGradRun(ws, false, dq, dk, dv, dbeta, dgate, dstate, dout, q, k, v, beta, gate, keep, at, add)
+    deltaGradRun(ws, stepwise(), dq, dk, dv, dbeta, dgate, dstate, dout, q, k, v, beta, gate, keep, at, add)
 }
 
 # the same gradients through matrix products a chunk at a time (the adjoint of the chunked forward, step for step)
 fn DeltaRuleGradChunked<S, A>(ws mut Work<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dbeta mut mat.Mat<S>&, dgate mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, keep Array<A>&, at Seq, add Bool = false) {
-    deltaGradRun(ws, true, dq, dk, dv, dbeta, dgate, dstate, dout, q, k, v, beta, gate, keep, at, add)
+    deltaGradRun(ws, chunkwise(), dq, dk, dv, dbeta, dgate, dstate, dout, q, k, v, beta, gate, keep, at, add)
 }
+
+# a scan allocates nothing once its Work is reserved - the sequential forms and their backward (S17a, G42); the chunked
+# delta rule makes a gemm workspace per task
+assert not GatedScan<F32, F32>.Allocates, "a gated scan allocates"
+assert not GatedScanGrad<F32, F32>.Allocates, "a gated scan's backward allocates"
+assert not SelectiveScan<F32, F32>.Allocates, "a selective scan allocates"
+assert not SelectiveScanGrad<F32, F32>.Allocates, "a selective scan's backward allocates"
+assert not DeltaRule<F32, F32>.Allocates, "the delta rule allocates"
+assert not DeltaRuleGrad<F32, F32>.Allocates, "the delta rule's backward allocates"
 
 # ---- tests ----
 
@@ -1532,6 +1616,7 @@ fn gatedRun<S, A>(chunked Bool, threads I64, seqs I64, len I64, cols I64, chunk 
     h := Array<S>(n * cols)
     ws := Work<A>(threads)
     at := Seq(len, chunk)
+    ws.ReserveGated(n, cols, at)
     if chunked: GatedScanChunked(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
     else: GatedScan(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
     got := Array<F64>(n * cols)
@@ -1611,6 +1696,7 @@ fn gradCase(chunked Bool, threads I64, add Bool) {
     for i in range seqs * cols: state[i] = init[i]
     ws := Work<F64>(threads)
     at := Seq(len, 4)
+    ws.ReserveGated(n, cols, at)
     GatedScan(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
     dx := Array<F64>(n * cols)
     da := Array<F64>(n * cols)
@@ -1666,6 +1752,7 @@ fn gradRun<S, A>(chunked Bool, threads I64, seqs I64, len I64, cols I64, chunk I
     for i in range seqs * cols: state[i] = init[i]
     ws := Work<A>(threads)
     at := Seq(len, chunk)
+    ws.ReserveGated(n, cols, at)
     GatedScan(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
     dx := Array<S>(n * cols)
     da := Array<S>(n * cols)
@@ -1821,6 +1908,7 @@ fn deltaCase<S, A>(chunked Bool, threads I64, d deltaData<S, A>&, chunk I64) Arr
     for i in range state.Len(): state[i] = d.state[i]
     ws := Work<A>(threads)
     at := Seq(d.len, chunk, d.heads)
+    ws.ReserveDelta(n, d.heads * d.dk, d.heads * d.dv, at)
     qm := whole(d.q, n, d.heads * d.dk)
     km := whole(d.k, n, d.heads * d.dk)
     vm := whole(d.v, n, d.heads * d.dv)
@@ -1879,6 +1967,7 @@ fn deltaGrads<S, A>(chunked Bool, threads I64, d deltaData<S, A>&, w mut Array<S
     for i in range state.Len(): state[i] = d.state[i]
     ws := Work<A>(threads)
     at := Seq(d.len, chunk, heads)
+    ws.ReserveDelta(n, heads * d.dk, heads * d.dv, at)
     qm := whole(d.q, n, heads * d.dk)
     km := whole(d.k, n, heads * d.dk)
     vm := whole(d.v, n, heads * d.dv)
@@ -2066,6 +2155,7 @@ fn selCase<S, A>(chunked Bool, threads I64, d selData<S, A>&, chunk I64) Array<F
     for i in range state.Len(): state[i] = d.state[i]
     ws := Work<A>(threads)
     at := Seq(d.len, chunk)
+    ws.ReserveSelective(n, d.cols, d.n, at)
     xm := whole(d.x, n, d.cols)
     dm := whole(d.delta, n, d.cols)
     am := whole(d.a, d.n, d.cols)
@@ -2122,6 +2212,7 @@ fn selGrads<S, A>(threads I64, d selData<S, A>&, w mut Array<S>&, u Array<A>&, c
     for i in range state.Len(): state[i] = d.state[i]
     ws := Work<A>(threads)
     at := Seq(d.len, chunk)
+    ws.ReserveSelective(rows, cols, d.n, at)
     keep := Array<A>(d.seqs * chunksOf(at) * d.n * cols)
     xm := whole(d.x, rows, cols)
     dm := whole(d.delta, rows, cols)

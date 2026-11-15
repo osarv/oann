@@ -241,7 +241,8 @@ fn sgdRun<A, G>(p mut Array<A>&, gr Array<G>&, u mut Array<A>&, lo I64, hi I64, 
     }
 }
 
-# ---- what must not allocate, decided while compiling (S17a, G42): a step of either optimizer, in either precision ----
+# ---- what must not allocate, decided while compiling (S17a, G42): a step of either optimizer, in either precision, and
+# a whole training step - forward, backward, clipping and AdamW ----
 
 fn adamOf(o mut AdamW<F32, F32>&) { o.Step() }
 fn adamMixedOf(o mut AdamW<F32, BF16>&) { o.Step() }
@@ -249,11 +250,28 @@ fn sgdOf(o mut Sgd<F32, F32>&) { o.Step() }
 fn sgdMixedOf(o mut Sgd<F32, BF16>&) { o.Step() }
 fn scaleOf(d mut Array<BF16>&) { scaleBy(d, 0.5) }
 
+fn trainOf(g mut graph.Graph<F32>&, o mut AdamW<F32, F32>&, loss graph.Var, grads tensor.Tensor<F32>&) {
+    g.Forward(g.Batch)
+    g.Backward(loss)
+    ClipNorm(grads, 1.0)
+    o.Step()
+}
+
+fn trainMixedOf(g mut graph.Graph<BF16>&, o mut AdamW<F32, BF16>&, loss graph.Var, grads tensor.Tensor<BF16>&) {
+    g.Forward(g.Batch)
+    g.Backward(loss)
+    ClipNorm(grads, 1.0)
+    o.Step()
+    g.SyncParams()
+}
+
 assert not adamOf.Allocates, "a step of AdamW allocates"
 assert not adamMixedOf.Allocates, "a step of AdamW on masters allocates"
 assert not sgdOf.Allocates, "a step of Sgd allocates"
 assert not sgdMixedOf.Allocates, "a step of Sgd on masters allocates"
 assert not scaleOf.Allocates, "scaling the gradients allocates"
+assert not trainOf.Allocates, "a training step allocates"
+assert not trainMixedOf.Allocates, "a BF16 training step on masters allocates"
 
 # ---- the input projection ----
 
@@ -278,7 +296,7 @@ type Projector<T> struct(g mut graph.Graph<T>&, alpha F64 = 0.001, normalized Bo
     Normalized Bool = normalized
     layers Array<linked> = denseLayers(g)
     m mut Array<T>& = Array<T>(largest(g, layers))
-    ws gemm.Workspace<T> = gemm.Workspace<T>(g.Threads)
+    ws gemm.Workspace<T> = gemm.Workspace<T>(g.Threads, widest(g, layers))
 }
 
 # every dense layer of g, its output and its input kept
@@ -299,6 +317,16 @@ fn denseLayers<T>(g mut graph.Graph<T>&) Array<linked> {
 fn largest<T>(g graph.Graph<T>&, layers Array<linked>&) I64 {
     most I64 = 0
     for l in layers: most = most.Max(g.Info(l.y).Dims.Count())
+    return most
+}
+
+# the largest of every dense layer's rows, inputs and outputs: its product's room
+fn widest<T>(g graph.Graph<T>&, layers Array<linked>&) I64 {
+    most I64 = 0
+    for l in layers {
+        d := g.Info(l.x).Dims
+        most = most.Max(d.Count() / d[d.Rank - 1]).Max(d[d.Rank - 1]).Max(g.Info(l.w).Dims[0])
+    }
     return most
 }
 

@@ -1,0 +1,24 @@
+# repro/tempfacts - G42 counts a method called on a call's value (a temporary struct, read through the method's `&`
+# receiver) as allocating, while the same value held in a local first allocates nothing. Found pinning ad/graph's
+# Forward: `withAxis(...).Count()` in Graph.intsOf made the whole step "allocate" (rewritten there as arithmetic).
+# Expected: both asserts hold - a struct of one I64 lent to a method that reads it asks the runtime for nothing.
+# Status: reproduces (new). Today the second assert is a compile error (S17a).
+#   olang test repro/tempfacts.olang
+
+type Sh struct(rank I64) {
+    rank
+}
+
+fn (s Sh&) Count() I64 { return s.rank }
+
+fn Sh.Make(n I64) Sh { return Sh(n) }
+
+fn viaLocal(n I64) I64 {
+    s := Sh.Make(n)
+    return s.Count()
+}
+
+fn viaTemp(n I64) I64 { return Sh.Make(n).Count() }
+
+assert not viaLocal.Allocates, "a local lent to a method allocates nothing"
+assert not viaTemp.Allocates, "a call's value lent to a method allocates nothing"

@@ -178,7 +178,8 @@ type Model struct(Batch I64, Inputs I64, Threads I64 = 1) {
     Layers mut list.List<Layer>& = list.List<Layer>()
     Ranges mut list.List<Range>& = list.List<Range>()
     widths mut list.List<I64>& = list.List<I64>()
-    cells I64 = 0    # the most values of activations a layer quantizes
+    ready Bool = false   # the buffers below are sized for the layers added
+    cells I64 = 0    # the most values of activations a dense layer quantizes
     sumCells I64 = 0 # the most integer products a layer makes
     outs I64 = 0     # the widest output of a quantized layer
     pixels I64 = 0   # the most image values a convolution quantizes
@@ -203,7 +204,8 @@ fn (m mut Model&) push(l Layer, width I64, rows I64, cols I64, outs I64) {
     m.cells = m.cells.Max(rows * cols)
     m.sumCells = m.sumCells.Max(rows * outs)
     m.outs = m.outs.Max(outs)
-    m.acts = Array<U8>(0) # re-made by the next call, sized for the layers now
+    m.ws.ReserveI8(outs, cols)
+    m.ready = false     # the buffers re-made by the next call, sized for the layers now
 }
 
 # a vector of the graph's values as F32
@@ -232,7 +234,8 @@ fn (m mut Model&) Conv<T>(g graph.Graph<T>&, c layers.Conv&, relu Bool) {
     assert s.H * s.W * s.C == m.Outputs(), "a convolution reads " + $(s.H * s.W * s.C) + " features, the layer before gives " + $m.Outputs()
     m.pixels = m.pixels.Max(m.Batch * m.Outputs())
     m.push(Layer.Conv(Weights.QuantizeConv(g.Value(c.W), s), vector(g, c.B, s.OutC), s, relu), s.Positions() * s.OutC
-        m.Batch * s.Positions(), s.Patch(), s.OutC)
+        0, s.Patch(), s.OutC)
+    m.sumCells = m.sumCells.Max(m.Batch * s.Positions() * s.OutC)
 }
 
 # max pooling (conv.Pool p)
@@ -290,7 +293,8 @@ fn (m mut Model&) go(n I64, x Array<F32>&, y mut Array<F32>&, observe Bool) {
 
 # the buffers sized for the layers added (once, unless layers were added since)
 fn (m mut Model&) prepare() {
-    if m.acts.Len() >= m.cells and m.acts.Len() > 0: return
+    if m.ready: return
+    m.ready = true
     widest I64 = 0
     for w in m.widths: widest = widest.Max(w)
     m.front = Array<F32>(widest * m.Batch)
@@ -311,8 +315,7 @@ fn (m mut Model&) run(i I64, n I64, x Array<F32>&, y mut Array<F32>&, observe Bo
         }
         case Layer.Conv(w, b, s, relu) {
             step, zero := m.stepOf(i, x, n * s.H * s.W * s.C, observe)
-            m.patches(n, x, s, step, zero)
-            m.product(n * s.Positions(), w, step, zero, b, relu, y)
+            m.convolve(n, x, w, s, step, zero, b, relu, y)
         }
         case Layer.Pool(p): maxPool(n, y, x, p)
     }
@@ -340,61 +343,80 @@ fn (m mut Model&) product(rows I64, w Weights&, step F32, zero I32, b Array<F32>
     c := mat.Mat<I32>(m.sums, 0, rows, w.Out, w.Out)
     out := mat.Mat<F32>(y, 0, rows, w.Out, w.Out)
     gemm.GemmI8(m.ws, c, a, q, m.scales[0:w.Out], out, zero, w.Sum)
-    for r in range rows {
-        base := r * w.Out
-        if relu { for o in range w.Out: y[base + o] = (y[base + o] + b[o]).Max(0.0) }
-        else { for o in range w.Out: y[base + o] = y[base + o] + b[o] }
-    }
+    finish(rows, w.Out, b, relu, y)
 }
 
-# the patches of a convolution (conv.Shape s) of the n images x, quantized: the images are quantized once, then row
-# (b OutH + oy) OutW + ox of the patch matrix is the patch of output pixel (oy, ox) of image b, its columns [ky][kx][c]
-# - the order the image holds them in, so a window's row of K pixels is one run of K C values - and a pixel off the
-# image the zero point
-fn (m mut Model&) patches(n I64, x Array<F32>&, s conv.Shape&, step F32, zero I32) {
+# a convolution (conv.Shape s) of the n images x: the images quantized once, and the product read from them as its
+# patches (windows: the zero point where a window hangs over the edge) - no patch matrix is made
+fn (m mut Model&) convolve(n I64, x Array<F32>&, w Weights&, s conv.Shape&, step F32, zero I32, b Array<F32>&, relu Bool, y mut Array<F32>&) {
     per I64 = s.H * s.W * s.C
     quantize(m.image, x, n * per, step, zero)
-    for b in range n {
-        for p in range s.Positions(): m.patchRow(b * s.Positions() + p, b * per, p / s.OutW, p % s.OutW, s, U8(zero))
+    for o in range w.Out: m.scales[o] = step * w.Scale[o]
+    rows := n * s.Positions()
+    patches := windows(m.image, s, U8(zero))
+    q := mat.Mat<I8>(w.Q, 0, w.Out, w.In, w.In)
+    c := mat.Mat<I32>(m.sums, 0, rows, w.Out, w.Out)
+    out := mat.Mat<F32>(y, 0, rows, w.Out, w.Out)
+    gemm.GemmI8Left(m.ws, c, patches, rows, s.Patch(), q, m.scales[0:w.Out], out, zero, w.Sum)
+    finish(rows, w.Out, b, relu, y)
+}
+
+# the bias added to each of rows rows of outs outputs, and ReLU where relu
+fn finish(rows I64, outs I64, b Array<F32>&, relu Bool, y mut Array<F32>&) {
+    for r in range rows {
+        base := r * outs
+        if relu { for o in range outs: y[base + o] = (y[base + o] + b[o]).Max(0.0) }
+        else { for o in range outs: y[base + o] = y[base + o] + b[o] }
     }
 }
 
-# patch row "row": output pixel (oy, ox) of the image whose quantized pixels start at img, a kernel row at a time - one
-# run of K C values where the window's row is on the image, the zero point where it is above or below it
-fn (m mut Model&) patchRow(row I64, img I64, oy I64, ox I64, s conv.Shape&, z U8) {
-    d := m.acts
-    px := m.image
-    KC I64 = s.K * s.C
-    y0 I64 = oy * s.Stride - s.Pad
-    x0 I64 = ox * s.Stride - s.Pad
-    inside Bool = x0 >= 0 and x0 + s.K <= s.W
+# a convolution's patches of quantized pixels as GemmI8Left packs them: row (b OutH + oy) OutW + ox the window of output
+# pixel (oy, ox) of image b, its columns [ky][kx][c] - the order the images hold them in, so a window's row is one run
+# of K C bytes (QuantizeConv orders the weights so) - and the zero point off the image. A tile of rows is packed for
+# the whole depth at once (p0 0, depth the patch): one pass over the pixels, a run at a time, where a patch matrix made
+# and then packed took two
+type windows struct(image Array<U8>&, s conv.Shape, fill U8) {
+    image
+    s
+    fill
+}
+
+fn (x windows&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut Array<A>&) {
+    for w in range wr {
+        if w < width: x.window(w0 + w, w, wr, dst)
+        else { for p in range depth: dst[p * wr + w] = 0 }
+    }
+}
+
+# the window of row "row" into column w of a panel wr wide, a kernel row at a time
+fn (x windows&) window<A>(row I64, w I64, wr I64, dst mut Array<A>&) {
+    s := x.s
+    per, KC := s.Positions(), s.K * s.C
+    img, q := row / per, row % per
+    y0, x0 := q / s.OutW * s.Stride - s.Pad, q % s.OutW * s.Stride - s.Pad
+    base := img * s.H * s.W * s.C
+    inside := x0 >= 0 and x0 + s.K <= s.W
     for ky in range s.K {
         iy := y0 + ky
-        t := row * s.Patch() + ky * KC
+        t := ky * KC
         if iy < 0 or iy >= s.H {
-            for j in range KC: d[t + j] = z
+            for j in range KC: dst[(t + j) * wr + w] = x.fill
         } else if inside {
-            at := img + (iy * s.W + x0) * s.C
-            for j in range KC: d[t + j] = px[at + j]
+            at := base + (iy * s.W + x0) * s.C
+            for j in range KC: dst[(t + j) * wr + w] = x.image[at + j]
         } else {
-            m.patchPixels(t, img, iy, x0, s, z)
+            x.edge(base, iy, x0, t, w, wr, dst)
         }
     }
 }
 
-# a kernel row of a window hanging over the image's left or right edge, pixel by pixel into the patches at t
-fn (m mut Model&) patchPixels(t I64, img I64, iy I64, x0 I64, s conv.Shape&, z U8) {
-    d := m.acts
-    px := m.image
+# a kernel row of a window hanging over the image's left or right edge, pixel by pixel
+fn (x windows&) edge<A>(base I64, iy I64, x0 I64, t I64, w I64, wr I64, dst mut Array<A>&) {
+    s := x.s
     for kx in range s.K {
         ix := x0 + kx
         o := t + kx * s.C
-        if ix < 0 or ix >= s.W {
-            for c in range s.C: d[o + c] = z
-            continue
-        }
-        at := img + (iy * s.W + ix) * s.C
-        for c in range s.C: d[o + c] = px[at + c]
+        for c in range s.C: dst[(o + c) * wr + w] = x.fill if ix < 0 or ix >= s.W else x.image[base + (iy * s.W + ix) * s.C + c]
     }
 }
 

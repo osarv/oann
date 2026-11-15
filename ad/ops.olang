@@ -103,15 +103,18 @@ fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A) {
 # y = x w^T + b over the last axis: x [..., in], w [out, in], b [out] or empty. An F32 bias is added in the product's
 # epilogue, as each block is summed; another type's after it
 fn Linear<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>, w tensor.Tensor<S>, b tensor.Tensor<S>) {
-    ym := rows(y)
+    ym, xm, wm := rows(y), rows(x), rows(w)
     if b.Count() == 0 {
-        gemm.Gemm(ws, ym, rows(x), false, rows(w), true)
+        gemm.Gemm(ws, ym, xm, false, wm, true)
         return
     }
     match S {
-        case F32 { gemm.Gemm(ws, ym, rows(x), false, rows(w), true, 1.0, 0.0, gemm.Epilogue.Bias(flat(b))) }
+        case F32 {
+            bias := gemm.Epilogue.Bias(flat(b))
+            gemm.Gemm(ws, ym, xm, false, wm, true, 1.0, 0.0, bias)
+        }
         case _ {
-            gemm.Gemm(ws, ym, rows(x), false, rows(w), true)
+            gemm.Gemm(ws, ym, xm, false, wm, true)
             addBias<S, A>(ym, flat(b))
         }
     }
@@ -127,14 +130,14 @@ fn addBias<S, A>(y mut mat.Mat<S>&, b Array<S>&) {
 
 # dx (+)= dy w, dw (+)= dy^T x, db (+)= the column sums of dy
 fn LinearBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor.Tensor<S>, w tensor.Tensor<S>, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool) {
-    g := rows(dy)
+    g, xm, wm := rows(dy), rows(x), rows(w)
     if Wanted(dx) {
         d := rows(dx)
-        gemm.Gemm(ws, d, g, false, rows(w), false, A(1.0), betaOf<A>(addX))
+        gemm.Gemm(ws, d, g, false, wm, false, A(1.0), betaOf<A>(addX))
     }
     if Wanted(dw) {
         d := rows(dw)
-        gemm.Gemm(ws, d, g, true, rows(x), false, A(1.0), betaOf<A>(addW))
+        gemm.Gemm(ws, d, g, true, xm, false, A(1.0), betaOf<A>(addW))
     }
     if Wanted(db): elem.ColumnSums(flat(db), g, S(1.0) if addB else S(0.0))
 }
@@ -154,22 +157,33 @@ fn batchOf<S>(t tensor.Tensor<S>&, groups I64, members I64) gemm.Batch<S> {
 # the storage under a tensor whose last axis is contiguous (the whole array its Offset indexes): its first matrix's Mat
 # holds it - a view of any leading strides, a permuted batch's included
 fn storageOf<S>(t tensor.Tensor<S>&) mut Array<S>& {
-    u := t
-    for u.Rank() > 2: u = u.Select(0, 0)!
-    return u.Mat()!.Data
+    # unrolled for the two leading axes a batch has: a local reassigned from its own view reads as allocating
+    # (repro/reassignfacts)
+    if t.Rank() == 2 {
+        m := t.Mat()!
+        return m.Data
+    }
+    u := t.Select(0, 0)!
+    if u.Rank() == 2 {
+        m := u.Mat()!
+        return m.Data
+    }
+    v := u.Select(0, 0)!
+    m := v.Mat()!
+    return m.Data
 }
 
 # y = op(a) op(b): rank 2 operands, or batched over one or two leading axes (b may be rank 2, shared by the batch); a
 # product of rank 2 operands, or of a batched a and a shared b not transposed, is one Gemm over the folded rows
 fn MatMul<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, a tensor.Tensor<S>, ta Bool, b tensor.Tensor<S>, tb Bool) {
     if b.Rank() == 2 and (a.Rank() == 2 or not ta) {
-        ym := rows(y)
-        gemm.Gemm(ws, ym, rows(a), ta, rows(b), tb)
+        ym, am, bm := rows(y), rows(a), rows(b)
+        gemm.Gemm(ws, ym, am, ta, bm, tb)
         return
     }
     g, m := leading(y)
-    yb := batchOf(y, g, m)
-    gemm.GemmBatch(ws, yb, batchOf(a, g, m), ta, batchOf(b, g, m), tb)
+    yb, ab, bb := batchOf(y, g, m), batchOf(a, g, m), batchOf(b, g, m)
+    gemm.GemmBatch(ws, yb, ab, ta, bb, tb)
 }
 
 # the groups and members of a batched result: its leading axes
@@ -183,30 +197,30 @@ fn leading<S>(y tensor.Tensor<S>&) I64, I64 {
 fn MatMulBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, a tensor.Tensor<S>, ta Bool, b tensor.Tensor<S>, tb Bool, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
     one A = 1.0
     if b.Rank() == 2 and (a.Rank() == 2 or not ta) {
-        g := rows(dy)
+        g, am, bm := rows(dy), rows(a), rows(b)
         if Wanted(da) {
             d := rows(da)
-            if ta: gemm.Gemm(ws, d, rows(b), tb, g, true, one, betaOf<A>(addA))
-            else: gemm.Gemm(ws, d, g, false, rows(b), not tb, one, betaOf<A>(addA))
+            if ta: gemm.Gemm(ws, d, bm, tb, g, true, one, betaOf<A>(addA))
+            else: gemm.Gemm(ws, d, g, false, bm, not tb, one, betaOf<A>(addA))
         }
         if Wanted(db) {
             d := rows(db)
-            if tb: gemm.Gemm(ws, d, g, true, rows(a), ta, one, betaOf<A>(addB))
-            else: gemm.Gemm(ws, d, rows(a), not ta, g, false, one, betaOf<A>(addB))
+            if tb: gemm.Gemm(ws, d, g, true, am, ta, one, betaOf<A>(addB))
+            else: gemm.Gemm(ws, d, am, not ta, g, false, one, betaOf<A>(addB))
         }
         return
     }
     gs, ms := leading(dy)
-    g := batchOf(dy, gs, ms)
+    g, ab, bb := batchOf(dy, gs, ms), batchOf(a, gs, ms), batchOf(b, gs, ms)
     if Wanted(da) {
         d := batchOf(da, gs, ms)
-        if ta: gemm.GemmBatch(ws, d, batchOf(b, gs, ms), tb, g, true, one, betaOf<A>(addA))
-        else: gemm.GemmBatch(ws, d, g, false, batchOf(b, gs, ms), not tb, one, betaOf<A>(addA))
+        if ta: gemm.GemmBatch(ws, d, bb, tb, g, true, one, betaOf<A>(addA))
+        else: gemm.GemmBatch(ws, d, g, false, bb, not tb, one, betaOf<A>(addA))
     }
     if Wanted(db) {
         d := batchOf(db, gs, ms)
-        if tb: gemm.GemmBatch(ws, d, g, true, batchOf(a, gs, ms), ta, one, betaOf<A>(addB))
-        else: gemm.GemmBatch(ws, d, batchOf(a, gs, ms), not ta, g, false, one, betaOf<A>(addB))
+        if tb: gemm.GemmBatch(ws, d, g, true, ab, ta, one, betaOf<A>(addB))
+        else: gemm.GemmBatch(ws, d, ab, not ta, g, false, one, betaOf<A>(addB))
     }
 }
 
@@ -243,8 +257,8 @@ fn LeakyReluBackward<S, A>(dy tensor.Tensor<S>, x tensor.Tensor<S>, slope A, dx 
 
 # y = softmax over the last axis
 fn Softmax<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>) {
-    ym := rows(y)
-    elem.RowSoftmax(ym, rows(x), S(1.0))
+    ym, xm := rows(y), rows(x)
+    elem.RowSoftmax(ym, xm, S(1.0))
 }
 
 # dx = y (dy - <dy, y>) row by row
@@ -480,7 +494,8 @@ fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tenso
     om := rows(out)
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
-    attention.Attention(ws, om, qm, rows(k), rows(v), pm, attention.Heads(heads, ctx, causal))
+    km, vm := rows(k), rows(v)
+    attention.Attention(ws, om, qm, km, vm, pm, attention.Heads(heads, ctx, causal))
 }
 
 fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
@@ -489,7 +504,8 @@ fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q t
     dqm := gradRows(dq)
     dkm := gradRows(dk)
     dvm := gradRows(dv)
-    attention.AttentionGrad(ws, dqm, dkm, dvm, rows(dout), qm, rows(k), rows(v), pm, scratch, attention.Heads(heads, ctx, causal), addQ, addK, addV)
+    om, km, vm := rows(dout), rows(k), rows(v)
+    attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal), addQ, addK, addV)
 }
 
 # causal attention while decoding: rows are positions first ... of one sequence, keys and values kept in the cache
@@ -499,7 +515,8 @@ fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.T
     keys := mat.Mat<S>(cache, 0, ctx, d, d)
     values := mat.Mat<S>(cache, ctx * d, ctx, d, d)
     om := rows(out)
-    attention.AttentionStep(om, qm, rows(k), rows(v), keys, values, scores, first, heads)
+    km, vm := rows(k), rows(v)
+    attention.AttentionStep(om, qm, km, vm, keys, values, scores, first, heads)
 }
 
 # ---- dropout ----
@@ -554,13 +571,14 @@ fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor
     dxm := images(dx) if Wanted(dx) else none(dx)
     dwm := gradRows(dw)
     dbd := flat(db) if Wanted(db) else cols[0:0]
-    conv.Conv2dBackward<S, A>(ws, images(dy), images(x), rows(w), s, dxm, addX, dwm, addW, dbd, addB, patches, threads)
+    dym, xm, wm := images(dy), images(x), rows(w)
+    conv.Conv2dBackward<S, A>(ws, dym, xm, wm, s, dxm, addX, dwm, addW, dbd, addB, patches, threads)
 }
 
 fn MaxPool2d<S>(y mut tensor.Tensor<S>&, where mut Array<I32>&, x tensor.Tensor<S>, p conv.Pool&, threads I64) {
-    ym := images(y)
+    ym, xm := images(y), images(x)
     wm := mat.Mat<I32>(where, 0, ym.Rows, ym.Cols, ym.Cols)
-    conv.MaxPool2d(ym, wm, images(x), p, threads)
+    conv.MaxPool2d(ym, wm, xm, p, threads)
 }
 
 fn MaxPool2dBackward<S>(dy tensor.Tensor<S>, where mut Array<I32>&, p conv.Pool&, threads I64, dx mut tensor.Tensor<S>&, add Bool) {
@@ -576,8 +594,8 @@ fn MaxPool2dBackward<S>(dy tensor.Tensor<S>, where mut Array<I32>&, p conv.Pool&
 # A, left holding the last positions' states)
 fn Scan<S, A>(work mut scan.Work<A>&, h mut tensor.Tensor<S>&, state mut mat.Mat<A>&, x tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, ctx I64) {
     zero(state)
-    hm := rows(h)
-    scan.GatedScan(work, hm, state, rows(x), rows(a), rows(b), scan.Seq(ctx))
+    hm, xm, am, bm := rows(h), rows(x), rows(a), rows(b)
+    scan.GatedScan(work, hm, state, xm, am, bm, scan.Seq(ctx))
 }
 
 # every element of m zero
@@ -598,7 +616,8 @@ fn ScanBackward<S, A>(work mut scan.Work<A>&, dh tensor.Tensor<S>, h tensor.Tens
     dxm := rows(dx)
     dam := rows(da)
     dbm := rows(db)
-    scan.GatedScanGrad(work, dxm, dam, dbm, dstate, rows(dh), rows(h), init, rows(x), rows(a), rows(b), scan.Seq(ctx), true)
+    dhm, hm, xm, am, bm := rows(dh), rows(h), rows(x), rows(a), rows(b)
+    scan.GatedScanGrad(work, dxm, dam, dbm, dstate, dhm, hm, init, xm, am, bm, scan.Seq(ctx), true)
 }
 
 # a gradient about to be added to by a kernel with one add flag for several: zeroed first where it is written fresh
@@ -612,7 +631,8 @@ fn SelectiveScan<S, A>(work mut scan.Work<A>&, y mut tensor.Tensor<S>&, state mu
     zero(state)
     ym := rows(y)
     sk := flat(skip) if skip.Count() > 0 else flat(y)[0:0]
-    scan.SelectiveScan(work, ym, state, rows(x), rows(delta), rows(a), rows(b), rows(c), sk, scan.Seq(ctx), keep)
+    xm, dm, am, bm, cm := rows(x), rows(delta), rows(a), rows(b), rows(c)
+    scan.SelectiveScan(work, ym, state, xm, dm, am, bm, cm, sk, scan.Seq(ctx), keep)
 }
 
 # the gradients (each written or added to; one not wanted given scratch to write into), dstate scratch in A
@@ -632,14 +652,16 @@ fn SelectiveScanBackward<S, A>(work mut scan.Work<A>&, dy tensor.Tensor<S>, x te
     if skip.Count() > 0: freshZero(dskip, addS)
     dsk := flat(dskip) if skip.Count() > 0 else empty
     sk := flat(skip) if skip.Count() > 0 else empty
-    scan.SelectiveScanGrad(work, dxm, ddm, dam, dbm, dcm, dsk, dstate, rows(dy), rows(x), rows(delta), rows(a), rows(b), rows(c), sk, keep, scan.Seq(ctx), true)
+    dym, xm, dm, am, bm, cm := rows(dy), rows(x), rows(delta), rows(a), rows(b), rows(c)
+    scan.SelectiveScanGrad(work, dxm, ddm, dam, dbm, dcm, dsk, dstate, dym, xm, dm, am, bm, cm, sk, keep, scan.Seq(ctx), true)
 }
 
 # the delta rule (kernels/scan's DeltaRule): q, k [b, t, H dk], v [b, t, H dv], beta and gate [b, t, H]
 fn DeltaRule<S, A>(work mut scan.Work<A>&, out mut tensor.Tensor<S>&, state mut mat.Mat<A>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, ctx I64, heads I64, keep mut Array<A>&) {
     zero(state)
     om := rows(out)
-    scan.DeltaRule(work, om, state, rows(q), rows(k), rows(v), rows(beta), rows(gate), scan.Seq(ctx, 64, heads), keep)
+    qm, km, vm, bm, gm := rows(q), rows(k), rows(v), rows(beta), rows(gate)
+    scan.DeltaRule(work, om, state, qm, km, vm, bm, gm, scan.Seq(ctx, 64, heads), keep)
 }
 
 fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, ctx I64, heads I64, keep Array<A>&, dstate mut mat.Mat<A>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool, dbeta mut tensor.Tensor<S>&, addB Bool, dgate mut tensor.Tensor<S>&, addG Bool) {
@@ -654,7 +676,8 @@ fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tens
     dvm := rows(dv)
     dbm := rows(dbeta)
     dgm := rows(dgate)
-    scan.DeltaRuleGrad(work, dqm, dkm, dvm, dbm, dgm, dstate, rows(dout), rows(q), rows(k), rows(v), rows(beta), rows(gate), keep, scan.Seq(ctx, 64, heads), true)
+    om, qm, km, vm, bm, gm := rows(dout), rows(q), rows(k), rows(v), rows(beta), rows(gate)
+    scan.DeltaRuleGrad(work, dqm, dkm, dvm, dbm, dgm, dstate, om, qm, km, vm, bm, gm, keep, scan.Seq(ctx, 64, heads), true)
 }
 
 # ---- reductions ----

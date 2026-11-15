@@ -73,7 +73,7 @@ type Learner<T> struct(s mut system.System<T>&) ? LearnError {
     Adjoint settle.Settlement = settle.Settlement()   # the last exact adjoint's iteration
     n I64 = s.Batch
     count I64 = s.E.Params.Len()
-    ws mut gemm.Workspace<T>& = gemm.Workspace<T>(1)
+    ws mut gemm.Workspace<T>& = gemm.Workspace<T>(1, widest(s).Max(s.E.Rows).Max(rankOf(s)))
     sc mut conn.Scratch<T>& = conn.Scratch<T>(widest(s), s.Batch, rankOf(s))
     diff mut Array<T>& = Array<T>(s.E.Units * s.Batch)       # every unit's dS (a population at Unit x batch)
     lam mut Array<T>& = Array<T>(s.E.Units * s.Batch)        # the adjoint, and its next iterate
@@ -591,7 +591,8 @@ fn (l mut Learner<T>&) byEp(out system.Pop, dz Array<T>&, beta F64) settle.Settl
     e.Beta[1], e.Beta[2] = 0.0, 0.0
     for i in range count: l.save[i] = p.Drive[i]
     worse := settle.Settlement(0, 0, true)
-    for ph, sign in Array<F64>[-1.0, 1.0] {
+    for ph in range 2 {
+        sign F64 = -1.0 if ph == 0 else 1.0
         nudge(p.Drive, l.save, dz, T(sign * beta), count)
         e.Warm(ph + 1, 0)
         got := e.Settle(ph + 1, ph + 2, b, true)
@@ -633,11 +634,10 @@ fn (l mut Learner<T>&) driveGrad(inp system.Pop, dx mut Array<T>&) {
 
 # ---- what must not allocate, decided while compiling (S17a, G42): the per-element work of every rule and gradient ----
 # Pinned: a contrast's differences and bias sums, the feature-major transposition, a trace's decay and its step, the
-# homeostatic moves, a delta write's error and mask, the slopes, an adjoint's step, a nudge through the drive. Not
-# pinned, and why: everything that takes a product - a contrast's, the adjoint's carries, a delta write's read - goes
-# through gemm's Gemm, which grows its workspace's panels on its first products (the fact holds for every call: B2a's
-# note, dyn/settle); a sparse form's sampled product holds the kernel's join; a lesson's settles are B2a's (not
-# pinnable for the same reasons); and a custom rule is a call through `any Update&`, which no fact sees through.
+# homeostatic moves, a delta write's error and mask, the slopes, an adjoint's step, a nudge through the drive - and a
+# whole implicit gradient (EP's nudged settles, the exact adjoint, JFB), products and settles included: gemm's
+# workspace is reserved when the learner is made. Not pinned: a lesson as a whole, since a custom rule is a call through
+# `any Update&`, which no fact sees through.
 # Resident memory over many lessons is measured instead (the tests).
 
 fn differOf(a Array<F32>&, d mut Array<F32>&) { differ(a, 0, 1, d, 0, 1) }
@@ -669,6 +669,7 @@ assert not deltaOf.Allocates, "a delta write's error allocates"
 assert not slopeOf.Allocates, "the slopes allocate"
 assert not adjointOf.Allocates, "an adjoint's step allocates"
 assert not nudgeOf.Allocates, "a nudge through the drive allocates"
+assert not Learner<F32>.ImplicitGrad.Allocates, "an implicit gradient (EP, exact or JFB) allocates"
 
 # ---- tests ----
 
@@ -721,7 +722,7 @@ fn everyWiring(batch I64, r mut rand.Rand&) system.System<F64> {
 # s_post^T W s_pre in state row r: the coupling a connection's contrast differentiates, through its own product
 fn coupling(lk mut conn.Link<F64>&, s system.System<F64>&, r I64) F64 {
     post, pre := s.E.Pops[lk.Post], s.E.Pops[lk.Pre]
-    ws := gemm.Workspace<F64>(1)
+    ws := gemm.Workspace<F64>(1, s.E.Rows.Max(lk.PostSize).Max(lk.PreSize))
     sc := conn.Scratch<F64>(8, s.E.Rows, 2)
     sc.Ev.Push(sparse.Events(lk.PreSize))
     carry := Array<F64>(s.E.Rows * lk.PostSize)

@@ -170,8 +170,10 @@ fn (e mut Engine<T>&) Ready() {
     units I64 = 0
     for p in e.Pops: units += p.Size
     e.Units = units
+    room I64 = widest.Max(rank).Max(e.Rows).Max(e.Batch.Max(Chunk))   # every product's sizes: units, rows, rank
+    e.wide.Reserve(room)
     for _ in range e.Threads {
-        e.ws.Push(gemm.Workspace<T>(1))
+        e.ws.Push(gemm.Workspace<T>(1, room))
         sc := conn.Scratch<T>(widest, Chunk, rank)
         for l in e.Links {
             if l.Kind == conn.Wiring.Events: sc.Ev.Push(sparse.Events(l.PreSize))
@@ -344,7 +346,8 @@ fn (e mut Engine<T>&) constant(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>
     }
     for i in p.Folds {
         l := e.Links[i]
-        l.Forward(ws, sc, p.Const, e.Pops[l.Pre].R0.S, r0, r1)
+        pre := e.Pops[l.Pre].R0.S
+        l.Forward(ws, sc, p.Const, pre, r0, r1)
     }
 }
 
@@ -359,11 +362,13 @@ fn (e mut Engine<T>&) totals(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>&,
     }
     for i in p.In {
         l := e.Links[i]
-        l.Forward(ws, sc, p.Total, e.Pops[l.Pre].carried(k), r0, r1)
+        pre := e.Pops[l.Pre].carried(k)
+        l.Forward(ws, sc, p.Total, pre, r0, r1)
     }
     for i in p.Back {
         l := e.Links[i]
-        l.Backward(ws, sc, p.Total, e.Pops[l.Post].carried(k), r0, r1)
+        post := e.Pops[l.Post].carried(k)
+        l.Backward(ws, sc, p.Total, post, r0, r1)
     }
     beta := e.Beta[r0 / e.Batch]
     role := p.Role
@@ -425,7 +430,8 @@ fn custom<T>(d mut any neuron.Dynamics&, p mut Population<T>&, b mut Columns<neu
         case F32 {
             drive := tensor.Tensor<F32>.Over(p.Total, 0, p.Total.Len() / p.Size, p.Size)!
             worst := d.Relax(drive, dt, r0, r1)
-            act := d.Activity().Flat()!
+            activity := d.Activity()
+            act := activity.Flat()!
             for i in range r0 * p.Size, r1 * p.Size: b.S[i] = act[i]
             return T(worst)
         }
@@ -533,11 +539,9 @@ fn (e mut Engine<T>&) spikes(b Budget) Settlement {
 
 # ---- what must not allocate, decided while compiling (S17a, G42) ----
 # Pinned: every step of a population, the state's moves between settles and phases, the units' plan, an input's closed
-# form. Not pinned, and why: a sweep's products go through gemm's Gemm, which grows its workspace's panels on its
-# first products (the fact holds for every call, never "after the first": run -> task -> totals -> conn.Link.Forward
-# -> gemm.Gemm -> Workspace.panelsA); a sparse connection's product holds the kernel's join for its threads; a sweep in
-# tasks holds a join (which keeps ~110 bytes a join: repro/joinleak.olang); a custom model's step is a call through
-# `any Dynamics&`, which no fact sees through. Resident memory over many settles is measured instead (system.olang).
+# form - and a whole settle (rate or spiking, every connection's products, in tasks or not, a custom model through
+# `any Dynamics&`, whose methods promise `noalloc`): gemm's workspaces are reserved at Ready and never grown, a sparse
+# product's join and a sweep's join allocate nothing. Resident memory over many settles is measured too (system.olang).
 
 fn builtStepOf(e mut Engine<F32>&, p mut Population<F32>&) F32 { return e.builtStep(p, 0, 1) }
 fn restOf(p mut Population<F32>&) { rest(p, p.Total, 0, 1, true) }
@@ -546,6 +550,8 @@ fn resetOf(e mut Engine<F32>&) { e.Reset(0) }
 fn warmOf(e mut Engine<F32>&) { e.Warm(1, 0) }
 fn commitOf(e mut Engine<F32>&) { e.commit(0, 1) }
 fn planOf(e mut Engine<F32>&) { e.plan(0, 1) }
+fn settleOf(e mut Engine<F32>&, b Budget) F64 { return e.Settle(0, e.Batch, b, true).Residual }
+fn settle64Of(e mut Engine<F64>&, b Budget) F64 { return e.Settle(0, e.Batch, b, false).Residual }
 fn closedFormOf(e mut Engine<F32>&, p mut Population<F32>&) {
     e.closedForm(p, 0, 1)
     e.clearCounts(p, 0, 1)
@@ -559,3 +565,5 @@ assert not warmOf.Allocates, "a warm start allocates"
 assert not commitOf.Allocates, "committing a settle allocates"
 assert not planOf.Allocates, "a settle's units allocate"
 assert not closedFormOf.Allocates, "an input's closed form allocates"
+assert not settleOf.Allocates, "a settle allocates"
+assert not settle64Of.Allocates, "a settle in F64 allocates"

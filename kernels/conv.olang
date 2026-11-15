@@ -97,9 +97,13 @@ fn cast<X, D>(x X, like D) D {
 # the patch matrix of a convolution over images - a row for every output position of every image, (b OutH + oy) OutW +
 # ox, and a column for every input the kernel sees there, (c K + ky) K + kx - as Im2col would make it but never made:
 # gemm's GemmLeft reads it through Pack, panel by panel, as the product needs it
-type Patches<S> struct(images mat.Mat<S>&, geometry Shape&) {
+# the most positions a panel of Patches has: gemm's tile rows (12 on AVX-512) with room to spare
+panelMost I64 = 32
+
+type Patches<S> struct(images mat.Mat<S>&, geometry Shape&, fill S = 0) {
     Images mat.Mat<S>& = images
     Geometry Shape& = geometry
+    Fill S = fill                               # what the padding reads: 0, or quantized images' zero point
 }
 
 # the rows of the patch matrix: every output position of every image
@@ -113,6 +117,7 @@ fn (x Patches<S>&) Rows() I64 { return x.Images.Rows * x.Geometry.Positions() }
 # geometry is held in locals, read through x it would be read again at every store
 fn (x Patches<S>&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut Array<A>&) {
     z A
+    pad A = cast(x.Fill, z)
     s := x.Geometry
     data := x.Images.Data
     C, H, W, K, St, P := s.C, s.H, s.W, s.K, s.Stride, s.Pad
@@ -120,9 +125,10 @@ fn (x Patches<S>&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut
     kk I64 = K * K
     hu U64 = U64(H)
     wu U64 = U64(W)
-    at := Array<I64>(wr)
-    wy := Array<I64>(wr)
-    wx := Array<I64>(wr)
+    if wr > panelMost: unreachable "conv: a panel wider than " + $panelMost + " positions"
+    at := Array<I64>(panelMost)                 # laid out in place: a panel is the tile's rows, 12 at most today
+    wy := Array<I64>(panelMost)
+    wx := Array<I64>(panelMost)
     # the position w0, and its image, row and column of the output
     img I64 = w0 / per
     oy I64 = (w0 - img * per) / ow
@@ -164,7 +170,7 @@ fn (x Patches<S>&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut
                 for w in range wr: dst[d + w] = cast(data[at[w] + step], z)
             } else {
                 for w in range wr {
-                    v A = z
+                    v A = pad
                     if U64(wy[w] + ky) < hu and U64(wx[w] + kx) < wu: v = cast(data[at[w] + step], z)
                     dst[d + w] = v
                 }
@@ -329,6 +335,12 @@ fn scatterWindow<S, A>(dx mut mat.Mat<S>&, patch Array<S>&, row I64, s Shape&, b
 
 # ---- the convolution ----
 
+# room in ws for Conv2d and Conv2dBackward over up to n images, stored in S: the products are n OutH OutW rows by the
+# patch (C K K) by OutC, each way round, and where S is narrower than A a depth past 256 sums a result in the accumulator
+fn ReserveConv<S, A>(ws mut gemm.Workspace<A>&, n I64, s Shape&, like S) {
+    ws.ReserveLayer(n * s.Positions(), s.Patch(), s.OutC, like)
+}
+
 # y = act(the convolution of x by w plus a bias): x is n images (n x H W C), w OutC x C K K, y n x OutH OutW OutC (rows
 # contiguous), epi gemm's epilogue - the bias (OutC values) and an activation. One GemmLeft: the product of the patches
 # and w^T, the patches packed straight from the images as the product reads them - never made - so the forward writes no
@@ -336,7 +348,8 @@ fn scatterWindow<S, A>(dx mut mat.Mat<S>&, patch Array<S>&, row I64, s Shape&, b
 # and the epilogue give (a test)
 fn Conv2d<S, A>(ws mut gemm.Workspace<A>&, y mut mat.Mat<S>&, x mat.Mat<S>&, w mat.Mat<S>&, s Shape&, epi gemm.Epilogue = gemm.Epilogue.None) {
     out := s.Rows(y)
-    gemm.GemmLeft(ws, out, Patches<S>(x, s), s.Patch(), w, true, 1, 0, epi)
+    patches := Patches<S>(x, s)
+    gemm.GemmLeft(ws, out, patches, s.Patch(), w, true, 1, 0, epi)
 }
 
 # the gradients of y = conv(x, w) + b: db the column sums of dy (OutC of them), dw = dy^T cols with the patches made
@@ -356,6 +369,10 @@ fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy mat.Mat<S>&, x mat.Mat<S>&
         Col2im<S, A>(dx, cols, s, accX, threads)
     }
 }
+
+# a convolution and its backward allocate nothing once the workspace is reserved (ReserveConv; S17a, G42)
+assert not Conv2d<F32, F32>.Allocates, "a convolution allocates"
+assert not Conv2dBackward<F32, F32>.Allocates, "a convolution's backward allocates"
 
 # ---- max pooling ----
 
@@ -558,6 +575,7 @@ test Conv2d "a convolution as one product of its patches equals its definition: 
         for threads in Array<I64>[1, 3] {
             y := plain(n, shape.Positions() * shape.OutC, F64(0))
             ws := gemm.Workspace<F64>(threads)
+            ReserveConv(ws, n, shape, F64(0))
             Conv2d(ws, y, x, w, shape, gemm.Epilogue.Bias(b))
             # the bias is F32 (gemm's epilogue), added in F64 to the sum: its rounding is the bound
             assert gap(y, want) < 1e-6
@@ -583,6 +601,7 @@ fn forwardAgrees<S, A>(like S, acc A, r mut rand.Rand&) {
         b := Array<F32>[F32(r.Normal()) for _ in range shape.OutC]
         for threads in Array<I64>[1, 4] {
             ws := gemm.Workspace<A>(threads)
+            ReserveConv(ws, n, shape, like)
             want := plain(n, shape.Positions() * shape.OutC, like)
             byIm2col(ws, want, x, w, b, shape)
             y := plain(n, shape.Positions() * shape.OutC, like)
@@ -606,6 +625,7 @@ test Conv2d "BF16 storage: the forward is the F64 convolution of the same values
     w := normal(s.OutC, s.Patch(), BF16(0), r, 0.3)
     y := plain(4, s.Positions() * s.OutC, BF16(0))
     ws := gemm.Workspace<F32>(2)
+    ReserveConv(ws, 4, s, BF16(0))
     Conv2d(ws, y, x, w, s)
     want := direct(x, w, Array<F32>(0), s)
     # a BF16 result keeps 8 bits: its error is at most one part in 2^8 of the value, the sum in F32 adds far less
@@ -676,6 +696,7 @@ test Conv2dBackward "the gradients against central differences of the definition
     db := Array<F64>(s.OutC)
     cols := plain(n * s.Positions(), s.Patch(), F64(0))
     ws := gemm.Workspace<F64>(2)
+    ReserveConv(ws, n, s, F64(0))
     Conv2dBackward(ws, dyc, x, w, s, dx, false, dw, false, db, false, cols, 2)
     h F64 = 1e-6
     for k in Array<I64>[0, 7, 19, 33, 50, 58] {
@@ -770,6 +791,53 @@ test Pool "pooling in tasks and in BF16: the same maxima and places, the first o
             for k in range 9 {
                 v := x[b, ((oy * 2 + k / 3) * 9 + ox * 2 + k % 3) * 3 + oc]
                 assert v <= one[b, o]
+            }
+        }
+    }
+}
+
+# the patch matrix of n images of quantized pixels, made: row (b OutH + oy) OutW + ox the window of output pixel (oy, ox)
+# of image b in Patches' [C][K][K] order, fill where the window is off the image
+fn bytePatches(x mat.Mat<U8>&, s Shape&, fill U8) mat.Mat<U8> {
+    out := plain(x.Rows * s.Positions(), s.Patch(), U8(0))
+    for b in range x.Rows {
+        for p in range s.Positions() {
+            oy, ox := p / s.OutW, p % s.OutW
+            for c in range s.C {
+                for ky in range s.K {
+                    for kx in range s.K: out[b * s.Positions() + p, (c * s.K + ky) * s.K + kx] = pixel(x, b, s, oy * s.Stride - s.Pad + ky, ox * s.Stride - s.Pad + kx, c, fill)
+                }
+            }
+        }
+    }
+    return out
+}
+
+fn pixel(x mat.Mat<U8>&, b I64, s Shape&, iy I64, ix I64, c I64, fill U8) U8 {
+    if iy < 0 or iy >= s.H or ix < 0 or ix >= s.W: return fill
+    return x[b, (iy * s.W + ix) * s.C + c]
+}
+
+test Patches "an INT8 convolution read from its images as patches is the product of the patch matrix made, bit for bit, padding at the zero point" {
+    r := rand.Rand(71)
+    for shape in shapes() {
+        n I64 = 3
+        x := plain(n, shape.H * shape.W * shape.C, U8(0))
+        for i in range x.Data.Len(): x.Data[i] = U8(r.Below(256))
+        w := plain(shape.OutC, shape.Patch(), I8(0))
+        for i in range w.Data.Len(): w.Data[i] = I8(r.Below(255) - 127)
+        scale := Array<F32>[F32(r.Uniform(0.001, 0.01)) for _ in range shape.OutC]
+        rows := n * shape.Positions()
+        for zero in Array<I32>[0, 128] {
+            made := bytePatches(x, shape, U8(zero))
+            for threads in Array<I64>[1, 3] {
+                ws := gemm.Workspace<I32>(threads)
+                ws.ReserveI8(shape.OutC, shape.Patch())
+                want, wantOut := plain(rows, shape.OutC, I32(0)), plain(rows, shape.OutC, F32(0))
+                gemm.GemmI8(ws, want, made, w, scale, wantOut, zero)
+                got, gotOut := plain(rows, shape.OutC, I32(0)), plain(rows, shape.OutC, F32(0))
+                gemm.GemmI8Left(ws, got, Patches<U8>(x, shape, U8(zero)), rows, shape.Patch(), w, scale, gotOut, zero)
+                assert got.Data == want.Data and gotOut.Data == wantOut.Data, $shape.C + " channels, zero " + $zero
             }
         }
     }
