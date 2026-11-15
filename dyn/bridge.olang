@@ -28,7 +28,8 @@
 # and the amortizer's loss.
 #
 # Counts for M14 (docs/redesign.md 4.3): Settles, Sweeps (every forward settle's), Unsettled (forward settles that ended
-# outside the budget's tolerance), and the last forward settle and backward adjoint.
+# outside the budget's tolerance), Backs and AdjointSweeps (the backward passes and the sweeps of their adjoint
+# iterations or nudged phases; none for JFB), and the last forward settle and backward adjoint.
 #
 # T is the system's element: F32 inside a graph (the graph's Custom is F32), F64 for the checks below, which call
 # Run and Grad - what Forward and Backward call - directly.
@@ -53,6 +54,8 @@ type Bridge<T> struct(s mut system.System<T>&, inp system.Pop, out system.Pop, h
     Sweeps I64 = 0
     Unsettled I64 = 0
     Refused I64 = 0
+    Backs I64 = 0
+    AdjointSweeps I64 = 0
     Last settle.Settlement = settle.Settlement()
     Adjoint settle.Settlement = settle.Settlement()
     inSize I64 = s.Pop(inp).Size
@@ -164,6 +167,8 @@ fn (b mut Bridge<T>&) Grad(dout tensor.Tensor<T>&, dx mut tensor.Tensor<T>&) {
     } catch tensor.ShapeError {
         unreachable "the bridge's staging is laid out for its system"
     }
+    b.Backs++
+    b.AdjointSweeps += b.Adjoint.Sweeps
     back := T(largest)
     for i in range grads.Len(): grads[i] = grads[i] * back
     for i in range into.Len(): into[i] = b.dx[i] * back
