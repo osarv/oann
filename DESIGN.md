@@ -767,7 +767,7 @@ themselves and there is no unknown token.
   letter or any byte from 0x80 up (so a UTF-8 word stays one chunk), a digit is 0-9, whitespace the six ASCII spaces.
   On ASCII text - tiny Shakespeare is ASCII - this is GPT-2's rule exactly; elsewhere it keeps a non-ASCII symbol or
   punctuation mark with the letters around it, where GPT-2 would split it off.
-- **Training** (`tokenizer.Train(text, vocab)`) counts each distinct chunk once with its number of occurrences, then
+- **Training** (`Tokenizer.Train(text, vocab)`) counts each distinct chunk once with its number of occurrences, then
   merges the most frequent adjacent pair again and again, ties to the smaller pair (Hugging Face's rule). Pair counts
   are kept up to date as chunks change, a heap with lazy deletion gives the most frequent, and every pair keeps a list
   of the chunks it occurs in (a linked list in flat arrays), so a merge costs the chunks it touches, not the corpus.
@@ -776,8 +776,8 @@ themselves and there is no unknown token.
   pairs of a later rank), in O(n log n) of the chunk's length - a megabyte of one letter is no harder than prose, where
   the usual quadratic loop would not finish. Each distinct chunk's tokens are remembered for the rest of the text, as
   GPT-2's encoder does. The ranks are an open-addressed table of pairs. `t.Decode(ids)` fails on an id the vocabulary
-  does not have (`TokenizerError.UNKNOWN`).
-- **Saving** is JSON, `t.Save(path)` and `tokenizer.Load(path)`: `{"format": "oann-bpe", "version": 1, "pretokenize":
+  does not have (`TokenizerError.Unknown`).
+- **Saving** is JSON, `t.Save(path)` and `Tokenizer.Load(path)`: `{"format": "oann-bpe", "version": 1, "pretokenize":
   "gpt2-ascii", "merges": [[32, 116], ...], "vocab": [...]}`. The merges, as pairs of ids, are what Load reads (each
   checked to name only tokens made before it); the vocabulary is every token in GPT-2's printable form ("Ġthe" for
   " the"), for a person to read.
