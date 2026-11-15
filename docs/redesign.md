@@ -178,6 +178,23 @@ type Function trait {                                          # Custom's forwar
 `Graph<BF16>` keeps today's mixed precision (BF16 storage, F32 computation, F32 masters); `Graph<F16>` adds loss
 scaling; `Graph<F64>` is the gradient checks'.
 
+**As built (B1).** The sketch holds, with these differences, recorded for B3 on: `Plan` draws the dropout generator
+before the parameters, and an eager graph is planned (seeded) *before* anything is recorded, each parameter drawn as it is
+made, an input filled before what reads it is recorded; an eager graph's parameters have storage of their own, so
+`Params()`/`ParamGrads()` (one flat region) are a captured graph's. A shape mistake is the graph's problem, reported by
+`Plan` (or `Check()` in eager mode); nothing recorded after it runs. Added: `Constant`, `LeakyRelu`, `Softmax`,
+`LogSoftmax`, `Positions` (learned), `SelectiveScan`, `Expand`, `Sum`/`Mean` (last axis), `Watch` (an input's gradient),
+`Keep` (a value kept to the step's end: an intermediate's storage is otherwise reused within the step), `Data`/`Ints`
+(where the caller puts the next batch, the whole planned one), `Decays`, `Masters`/`Master`/`SyncParams`,
+`Save`/`Load` (safetensors), `QuantizeLinear`/`Int8`, `Scalar`, `Profiling`/`Times`, `Reuse = false` (every buffer
+apart, for M9). `DeltaRule` takes its heads from `beta`'s last axis; `Conv2d` and `MaxPool2d` take images `[n, H, W, C]`.
+An operation whose kernel needs rows gets a `Contiguous` copy of a view that is not, recorded for it. The scans run their
+sequential forms (the chunked ones agree to rounding only). Not built: `Ahead` (an input's next batch filled on a task
+during the step) and the plan baked while compiling (C4). A step allocates nothing (resident memory flat, tested); it is
+not pinned with `assert not ....Allocates`, as function facts read too coarsely today (repro/allocfacts.olang,
+repro/methodfacts.olang). A `Custom` operation's tensors, given to an `any`, are built where the graph lives at each call,
+so a step through one allocates.
+
 ### 1.4 The dynamical-system core: `dyn/*.olang`
 
 A `System<T>` is a tree of **modules**. A module holds **populations** (neurons with named state), **connections**

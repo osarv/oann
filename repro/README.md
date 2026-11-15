@@ -19,6 +19,9 @@ where the library changed) so each builds or fails as its header says.
 | `traittype.olang` | reproduces (new) | a trait method's signature naming a type not in scope (its module not imported) is not reported; a generic calling it through `any` then fails in lowering ("an unknown type ... a local"). Expected M22 at the trait |
 | `colfields.olang` | reproduces (new) | `Columns<C>.Fields` is empty when C's fields are lower case, even in C's own module, so a generic cannot reach a column by reflection; capitalized fields work (dyn's cells are capitalized for it) |
 | `genref.olang` | reproduces (new) | D18c/T22a: a method generator yielding an enum read from the receiver's Vec is refused once the enum has a case holding a reference (`any Update&`), whatever case is yielded; `.Copy()` does not help. dyn's `System.Rules` was one (now `AttachedAt`) |
+| `tempref.olang` | reproduces (new) | a temporary passed to a `&` parameter of a function whose result copies it into a struct also holding a reference, that result itself a temporary passed by reference, is built in the referent's scope at every call: resident memory grows without bound. ad/graph took tensors by value to avoid it |
+| `allocfacts.olang` | reproduces (new) | G42 too coarse to pin a hot path allocation-free while compiling: a local fixed array (`Array<F32>(8)`, kernels/elem's lanes) and an error carrying a literal text (`!` on any tensor view) read `Allocates` true |
+| `methodfacts.olang` | reproduces (new) | G42 through a method of a generic type's instance (`Box<I64>.Fill.Allocates`) is refused at build: "it does not check a generic name as a value yet" |
 | `tryindex.olang` | fixed | builds and runs: `try` no longer makes an array index inside its operand a checked one (indexing is unchecked, `try a.Get(i)` the checked form) |
 
 The `Status` line in each file's header repeats the row.

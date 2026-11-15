@@ -5,16 +5,27 @@
 OLANG ?= ../olang/build/olang
 
 # every module with test blocks
-TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
+TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
-	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang \
+	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang board/engine.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
+.PHONY: test mlpad arenaad data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
+
+# M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
+mlpad:
+	$(OLANG) build -output build/bench_mlp_ad bench/mlp_ad.olang
+	./build/bench_mlp_ad $(ARGS)
+
+# M9 on ad/graph: round 2's transformer's arena with activations reused and apart, and the resident memory per step -
+# ARGS: steps, threads, and bf16
+arenaad:
+	$(OLANG) build -output build/bench_arena_ad bench/arena_ad.olang
+	./build/bench_arena_ad $(ARGS)
 
 # fetches MNIST into data/mnist (once), checks the pipeline against what is known about the dataset, and times it
 data bench:
