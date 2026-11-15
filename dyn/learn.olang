@@ -672,6 +672,7 @@ assert not nudgeOf.Allocates, "a nudge through the drive allocates"
 
 # ---- tests ----
 
+import "std/io"
 import "std/rand"
 import "../kernels/sparse"
 
@@ -852,6 +853,7 @@ test Learner.Lesson "the centered contrast is the gradient of the cost at the fr
         l.Lesson(s.Root(), beta, false)!
         plain[i] = relative(s.E.Grads, reference)
     }
+    try io.PutLine("relative errors at beta 0.1, 0.01, 0.001: centered " $centered ", uncentered " $plain)
     assert centered[0] / centered[1] > 50.0 and centered[1] / centered[2] > 50.0, "centered " $centered
     assert plain[0] / plain[1] > 5.0 and plain[0] / plain[1] < 20.0 and plain[1] / plain[2] > 5.0, "uncentered " $plain
     assert centered[2] < 1e-5
@@ -957,6 +959,7 @@ test Learner.ImplicitGrad "exact, JFB and EP gradients at a fixed point against 
     # JFB's adjoint stays on the readout: a descent direction for the connections into it, nothing for the inputs
     # two connections away
     cosine := dot(j, g) / (dot(j, j) * dot(g, g)).Sqrt()
+    try io.PutLine("exact against differences " $relative(g, params) ", EP(1e-3) against exact " $relative(e, g) ", JFB's cosine with exact " $cosine)
     assert cosine > 0.5 and dot(jx, jx) == 0.0, "cosine " $cosine
     # the drives are as they were: the free state is the equilibrium of the given ones
     assert (readLoss(s, d) - dot(d, s.Pop(system.Pop(3)).Activity(0)[0:6])).Abs() < 1e-12
@@ -974,4 +977,80 @@ test Learner.ImplicitGrad "the exact gradient through one-way connections (dense
     l := Learner<F64>(s)!
     g, dx, _ := implicitOf(l, dz, system.Implicit.Exact(1e-14, 20000))
     assert relative(g, params) < 1e-7 and relative(dx, inputs) < 1e-7, $relative(g, params) " " $relative(dx, inputs)
+}
+
+# XOR's four rows: inputs -1 or 1, the class their exclusive or - as labels, or as targets of rate for the class and 0
+fn xorData<T>(s mut system.System<T>&, x system.Pop, y system.Pop, rate F64) {
+    for b in range 4 {
+        p, q := b / 2, b % 2
+        s.Pop(x).Drive[2 * b] = T(1) if p == 1 else T(-1)
+        s.Pop(x).Drive[2 * b + 1] = T(1) if q == 1 else T(-1)
+        class := p ^ q
+        if rate == 0.0 {
+            s.Pop(y).Labels[b] = I32(class)
+            continue
+        }
+        s.Pop(y).Target[2 * b + class] = T(rate)
+        s.Pop(y).Target[2 * b + 1 - class] = T(0)
+    }
+}
+
+# the XOR rows the readout answers right
+fn xorRight<T>(s system.System<T>&, y system.Pop) I64 {
+    predicted := Array<I32>(4)
+    s.Predict(settle.Phase.Free, y, predicted)
+    right I64 = 0
+    for b in range 4 {
+        if I64(predicted[b]) == (b / 2) ^ (b % 2): right++
+    }
+    return right
+}
+
+test Learner.Lesson "XOR by rate neurons: two inputs, eight tanh units, two readouts (cross-entropy), EP lessons and Adam" {
+    r := rand.Rand(1)
+    s := system.System<F32>(4)
+    x := s.Population(s.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 8, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    s.Certify(0.9)
+    xorData(s, x, y, 0.0)
+    l := Learner<F32>(s)!
+    opt := adam<F32>(s.E.Params.Len(), 0.05)
+    sweeps I64 = 0
+    for _ in range 300 {
+        sweeps += l.Lesson(s.Root(), 0.5)!.Sweeps
+        opt.Step(s.E.Params, s.E.Grads)
+    }
+    s.Settle(settle.Phase.Free, settle.Budget())
+    try io.PutLine("rate XOR: loss " $s.Loss(settle.Phase.Free) ", " $xorRight(s, y) "/4 right, " $(F64(sweeps) / 300.0) " sweeps a lesson")
+    assert xorRight(s, y) == 4 and s.Loss(settle.Phase.Free) < 0.02, "loss " $s.Loss(settle.Phase.Free) ", " $(F64(sweeps) / 300.0) " sweeps a lesson"
+}
+
+test Learner.Lesson "XOR by spiking neurons: Lif hidden and readout units, their spike counts nudged toward 0.2 spikes a step for the class" {
+    r := rand.Rand(1)
+    window I64 = 256
+    lif := neuron.Neuron.Spiking(0.1, 1.0, 0.25, window)
+    s := system.System<F32>(4)
+    x := s.Population(s.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 8, lif)
+    y := s.Population(s.Root(), "y", 2, lif, neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for j in range 8: s.Bias(h).Flat()![j] = 1.2
+    for j in range 2: s.Bias(y).Flat()![j] = 1.0
+    xorData(s, x, y, 0.2)
+    l := Learner<F32>(s)!
+    opt := adam<F32>(s.E.Params.Len(), 0.02)
+    steps I64 = 0
+    for _ in range 300 {
+        steps += l.Lesson(s.Root(), 1.0)!.Sweeps
+        opt.Step(s.E.Params, s.E.Grads)
+    }
+    s.Settle(settle.Phase.Free, s.BudgetFor(s.LessonTolerance(1.0)))
+    try io.PutLine("spiking XOR: loss " $s.Loss(settle.Phase.Free) ", " $xorRight(s, y) "/4 right, " $(F64(steps) / 300.0) " steps a lesson")
+    assert xorRight(s, y) == 4 and s.Loss(settle.Phase.Free) < 0.01, "loss " $s.Loss(settle.Phase.Free) ", " $(F64(steps) / 300.0) " steps a lesson"
 }
