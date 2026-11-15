@@ -8,10 +8,10 @@ import "std/os"
 import "idx"
 import "loader"
 
-error MnistError {
-    DOWNLOAD           # curl could not fetch a file
-    UNPACK             # gunzip could not unpack one
-    MALFORMED          # a file is not what the dataset's files are: wrong shapes, a label out of range
+type MnistError error {
+    Download  # curl could not fetch a file
+    Unpack    # gunzip could not unpack one
+    Malformed # a file is not what the dataset's files are: wrong shapes, a label out of range
 }
 
 # where MNIST is fetched from: the copy Google keeps for TensorFlow's datasets
@@ -30,48 +30,46 @@ type Mnist struct(Train loader.Labeled&, Test loader.Labeled&) {
 
 # downloads "name" from "source" into "dir" and unpacks it, unless it is there already. Each step writes a file of
 # its own and renames it into place once it is whole, so an interrupted fetch never leaves a file that looks done
-fn fetchOne(dir String&, source String&, name String&) ? MnistError + os.OsError {
+fn fetchOne(dir String&, source String&, name String&) ? MnistError, os.Error {
     raw := $dir "/" $name
     if os.Exists(raw) { return }
     gz := $raw ".gz"
     if not os.Exists(gz) {
         part := $gz ".part"
         if os.Run("curl -fsSL --retry 3 -o " $os.Quote(part) " " $os.Quote($source $name ".gz")) != 0 {
-            error MnistError.DOWNLOAD
+            error MnistError.Download
         }
         try os.Rename(part, gz)
     }
     part := $raw ".part"
-    if os.Run("gunzip -c " $os.Quote(gz) " > " $os.Quote(part)) != 0 { error MnistError.UNPACK }
+    if os.Run("gunzip -c " $os.Quote(gz) " > " $os.Quote(part)) != 0 { error MnistError.Unpack }
     try os.Rename(part, raw)
 }
 
 # makes sure the four files are in "dir", fetching from "source" whichever are not
-fn Fetch(dir String&, source String&) ? MnistError + os.OsError {
+fn Fetch(dir String&, source String&) ? MnistError, os.Error {
     try os.MkDirAll(dir)
-    try fetchOne(dir, source, TrainImages)
-    try fetchOne(dir, source, TrainLabels)
-    try fetchOne(dir, source, TestImages)
-    try fetchOne(dir, source, TestLabels)
+    for name in Array<String&>[TrainImages, TrainLabels, TestImages, TestLabels]: try fetchOne(dir, source, name)
 }
 
 # a set of images and their labels: images of rank 3 (count, rows, cols), labels of rank 1 and the same count, each
 # below "classes"
 fn labeled(images idx.Idx&, labels idx.Idx&, classes I64) loader.Labeled ? MnistError {
-    if images.Dims.Len() != 3 or labels.Dims.Len() != 1 or images.Dims[0] != labels.Dims[0] {
-        error MnistError.MALFORMED
-    }
-    for c in labels.Data {
-        if I64(c) >= classes { error MnistError.MALFORMED }
-    }
+    if images.Dims.Len() != 3 or labels.Dims.Len() != 1 or images.Dims[0] != labels.Dims[0]: error MnistError.Malformed
+    if labels.Data.Some(fn(c): return I64(c) >= classes): error MnistError.Malformed
     return loader.Labeled(images.Data, labels.Data, images.Dims[1] * images.Dims[2], classes)
 }
 
+# the set whose images and labels are the files of those names in "dir"
+fn loadSet(dir String&, images String&, labels String&) loader.Labeled ? MnistError, idx.IdxError, os.Error {
+    return try labeled(idx.Idx.Load($dir "/" $images), idx.Idx.Load($dir "/" $labels), 10)
+}
+
 # the dataset in "dir" - fetched from "source" first when it is not there
-fn Load(dir String&, source String&) Mnist ? MnistError + idx.IdxError + os.OsError {
+fn Mnist.Load(dir String&, source String&) Mnist ? MnistError, idx.IdxError, os.Error {
     try Fetch(dir, source)
-    train loader.Labeled&return = try labeled(try idx.Load($dir "/" $TrainImages), try idx.Load($dir "/" $TrainLabels), 10)
-    tests loader.Labeled&return = try labeled(try idx.Load($dir "/" $TestImages), try idx.Load($dir "/" $TestLabels), 10)
+    train loader.Labeled& = try loadSet(dir, TrainImages, TrainLabels)
+    tests loader.Labeled& = try loadSet(dir, TestImages, TestLabels)
     return Mnist(train, tests)
 }
 
@@ -87,24 +85,30 @@ fn churn() I64 {
 }
 
 # a dataset of the MNIST family laid out in "dir" as MNIST's files are, from images built by hand - for tests
-fn writeFake(dir String&, n I64) ? os.OsError {
+fn writeFake(dir String&, n I64) ? os.Error {
     try os.MkDirAll(dir)
     images := Array<U8>(n * 4)
     labels := Array<U8>(n)
     for i in range n {
-        for j in range 4 { images[i * 4 + j] = U8(i * 4 + j) }
+        for j in range 4: images[i * 4 + j] = U8(i * 4 + j)
         labels[i] = U8(i % 10)
     }
-    try os.WriteFile($dir "/" $TrainImages, idx.Encode(I64[n, 2, 2], images))
-    try os.WriteFile($dir "/" $TrainLabels, idx.Encode(I64[n], labels))
-    try os.WriteFile($dir "/" $TestImages, idx.Encode(I64[n, 2, 2], images))
-    try os.WriteFile($dir "/" $TestLabels, idx.Encode(I64[n], labels))
+    try os.WriteFile($dir "/" $TrainImages, idx.Encode(Array<I64>[n, 2, 2], images))
+    try os.WriteFile($dir "/" $TrainLabels, idx.Encode(Array<I64>[n], labels))
+    try os.WriteFile($dir "/" $TestImages, idx.Encode(Array<I64>[n, 2, 2], images))
+    try os.WriteFile($dir "/" $TestLabels, idx.Encode(Array<I64>[n], labels))
+}
+
+# whether Load of "dir" fails with the error word
+fn refuses(dir String&, word MnistError) Bool {
+    try Mnist.Load(dir, "file:///nowhere/") catch MnistError e { return e == word } catch { }
+    return false
 }
 
 test "Load reads a dataset laid out as MNIST's files, fetching nothing that is there" {
     assert os.Run("rm -rf build/mnist_test") == 0
-    try writeFake("build/mnist_test", 12) catch { fail }
-    m := try Load("build/mnist_test", "file:///nowhere/") catch { fail }
+    try writeFake("build/mnist_test", 12)
+    m := try Mnist.Load("build/mnist_test", "file:///nowhere/")
     assert churn() > 0
     assert m.Train.Count == 12 and m.Train.Width == 4 and m.Test.Count == 12
     assert m.Train.Row(2)[1] == 9 and m.Train.Labels[11] == 1
@@ -112,21 +116,17 @@ test "Load reads a dataset laid out as MNIST's files, fetching nothing that is t
 
 test "Load refuses a label out of range and images that do not match their labels" {
     assert os.Run("rm -rf build/mnist_bad") == 0
-    try writeFake("build/mnist_bad", 3) catch { fail }
-    try os.WriteFile("build/mnist_bad/" $TrainLabels, idx.Encode(I64[3], U8[1, 2, 10])) catch { fail }
-    bad := false
-    try Load("build/mnist_bad", "file:///nowhere/") catch MnistError.MALFORMED { bad = true } catch { }
-    assert bad
-    try os.WriteFile("build/mnist_bad/" $TrainLabels, idx.Encode(I64[2], U8[1, 2])) catch { fail }
-    short := false
-    try Load("build/mnist_bad", "file:///nowhere/") catch MnistError.MALFORMED { short = true } catch { }
-    assert short
+    try writeFake("build/mnist_bad", 3)
+    try os.WriteFile("build/mnist_bad/" $TrainLabels, idx.Encode(Array<I64>[3], Array<U8>[1, 2, 10]))
+    assert refuses("build/mnist_bad", MnistError.Malformed)
+    try os.WriteFile("build/mnist_bad/" $TrainLabels, idx.Encode(Array<I64>[2], Array<U8>[1, 2]))
+    assert refuses("build/mnist_bad", MnistError.Malformed)
 }
 
 test "Fetch fails when a file cannot be downloaded, and leaves nothing that looks fetched" {
     assert os.Run("rm -rf build/mnist_none") == 0
     failed := false
-    try Fetch("build/mnist_none", "file:///nowhere/") catch MnistError.DOWNLOAD { failed = true } catch { }
+    try Fetch("build/mnist_none", "file:///nowhere/") catch MnistError.Download { failed = true } catch { }
     assert failed
     assert not os.Exists("build/mnist_none/" $TrainImages) and not os.Exists("build/mnist_none/" $TrainImages ".gz")
 }
