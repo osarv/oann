@@ -941,3 +941,20 @@ test System.Settle "a spiking system settles to its rate model's equilibrium, fr
     free := a.Activity(settle.Phase.Free, Pop(2))
     assert (plus.Get(0, 0) - 0.15).Abs() <= (free.Get(0, 0) - 0.15).Abs() + 2.0 / F64(window)
 }
+
+test System.Retire "a system with a retired unit converges, free and nudged, the unit at rest" {
+    a := System<F64>.mixed(3, 1)
+    a.Retire(Pop(1), 2)
+    a.Retire(Pop(3), 0)
+    out := a.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    assert out.Converged, $out
+    nudged := a.Nudged(settle.Budget(256, 1e-10))
+    assert nudged.Converged, $nudged
+    for row in range 3: assert a.Activity(settle.Phase.Free, Pop(1)).Get(row, 2) == 0.0 and a.Activity(settle.Phase.Plus, Pop(3)).Get(row, 0) == 0.0
+    # before the fix a retired unit's residual was its total against its zeroed state: never within the tolerance
+    assert out.Sweeps < 64 and nudged.Sweeps < 64
+    # a retired spiking unit does not keep its system from converging either
+    s := System<F64>.lifty(neuron.Neuron.Lif(0.1, 1.0, 0.1, 400))
+    s.Retire(Pop(1), 1)
+    assert s.Settle(settle.Phase.Free, settle.Budget(40 * 400, 2.0 / 400.0)).Converged
+}
