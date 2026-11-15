@@ -171,10 +171,10 @@ fn scatterEdge<T>(row Array<T>&, s Shape&, y0 I64, x0 I64, img mut Array<T>&) {
 # no patch matrix and reads the images where im2col and the product's packing read them twice; exactly what Im2col,
 # Gemm and AddRow give (a test)
 fn Conv2d<T>(y linalg.Matrix<T>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&, threads I64
-        ws mut linalg.GemmWorkspace<T>&) ? {
-    out := try y.Reshape(y.Rows * s.Positions(), s.OutC)
-    patches := try linalg.Patches<T>(x, s.C, s.H, s.W, s.K, s.Stride, s.Pad)
-    try ws.GemmPatches(out, patches, w, true, b, linalg.Activation.Identity, 1, 0, threads)
+        ws mut linalg.GemmWorkspace<T>&) {
+    out := y.Reshape(y.Rows * s.Positions(), s.OutC)!
+    patches := linalg.Patches<T>(x, s.C, s.H, s.W, s.K, s.Stride, s.Pad)!
+    ws.GemmPatches(out, patches, w, true, b, linalg.Activation.Identity, 1, 0, threads)!
 }
 
 # the gradients of y = conv(x, w) + b: db the column sums of dy (as OutC-wide rows), dw = dy^T cols with the patches
@@ -182,15 +182,15 @@ fn Conv2d<T>(y linalg.Matrix<T>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b li
 # the patches. An empty gradient matrix is one not wanted; acc adds to one instead of writing it
 fn Conv2dBackward<T>(dy linalg.Matrix<T>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, s Shape&
         dx linalg.Matrix<T>&, accX Bool, dw mut linalg.Matrix<T>&, accW Bool, db mut linalg.Matrix<T>&, accB Bool
-        cols mut linalg.Matrix<T>&, threads I64, ws mut linalg.GemmWorkspace<T>&) ? {
-    g := try dy.Reshape(dy.Rows * s.Positions(), s.OutC)
-    if db.Rows > 0 { try g.ColumnSums(db, 1.0 if accB else 0.0) }
+        cols mut linalg.Matrix<T>&, threads I64, ws mut linalg.GemmWorkspace<T>&) {
+    g := dy.Reshape(dy.Rows * s.Positions(), s.OutC)!
+    if db.Rows > 0 { g.ColumnSums(db, 1.0 if accB else 0.0)! }
     if dw.Rows > 0 {
         Im2col(x, s, cols, threads)
-        try ws.Gemm(dw, g, true, cols, false, 1, 1.0 if accW else 0.0, threads)
+        ws.Gemm(dw, g, true, cols, false, 1, 1.0 if accW else 0.0, threads)!
     }
     if dx.Rows > 0 {
-        try ws.Gemm(cols, g, false, w, false, 1, 0, threads)
+        ws.Gemm(cols, g, false, w, false, 1, 0, threads)!
         Col2im(cols, s, dx, accX, threads)
     }
 }
@@ -331,21 +331,21 @@ test "a convolution as one product of its patches equals its definition: padding
         for threads in range 1, 4, 2 {
             y := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
             ws := linalg.GemmWorkspace<F64>()
-            try Conv2d(y, x, w, b, shape, threads, ws)
-            assert try y.MaxAbsDifference(want) < 1e-12
+            Conv2d(y, x, w, b, shape, threads, ws)
+            assert y.MaxAbsDifference(want)! < 1e-12
         }
     }
 }
 
 # the forward as it was made before GemmPatches: im2col, one product of the patches, the bias
 fn byIm2col<T>(y linalg.Matrix<T>&, x linalg.Matrix<T>&, w linalg.Matrix<T>&, b linalg.Matrix<T>&, s Shape&
-        threads I64) ? {
+        threads I64) {
     cols := linalg.Matrix<T>(x.Rows * s.Positions(), s.Patch())
     Im2col(x, s, cols, threads)
-    out := try y.Reshape(y.Rows * s.Positions(), s.OutC)
+    out := y.Reshape(y.Rows * s.Positions(), s.OutC)!
     ws := linalg.GemmWorkspace<T>()
-    try ws.Gemm(out, cols, false, w, true, 1, 0, threads)
-    try out.AddRow(b)
+    ws.Gemm(out, cols, false, w, true, 1, 0, threads)!
+    out.AddRow(b)!
 }
 
 test "the forward through GemmPatches gives exactly what im2col, a product and the bias give, in F32 and F64" {
@@ -363,21 +363,21 @@ test "the forward through GemmPatches gives exactly what im2col, a product and t
         x64 := linalg.Matrix<F64>(n, x.Cols)
         w64 := linalg.Matrix<F64>(w.Rows, w.Cols)
         b64 := linalg.Matrix<F64>(1, b.Cols)
-        try x64.Convert(x)
-        try w64.Convert(w)
-        try b64.Convert(b)
+        x64.Convert(x)!
+        w64.Convert(w)!
+        b64.Convert(b)!
         for threads in range 1, 4, 2 {
             want := linalg.Matrix<F32>(n, shape.Positions() * shape.OutC)
-            try byIm2col(want, x, w, b, shape, threads)
+            byIm2col(want, x, w, b, shape, threads)
             y := linalg.Matrix<F32>(n, shape.Positions() * shape.OutC)
             ws := linalg.GemmWorkspace<F32>()
-            try Conv2d(y, x, w, b, shape, threads, ws)
+            Conv2d(y, x, w, b, shape, threads, ws)
             assert y == want
             want64 := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
-            try byIm2col(want64, x64, w64, b64, shape, threads)
+            byIm2col(want64, x64, w64, b64, shape, threads)
             y64 := linalg.Matrix<F64>(n, shape.Positions() * shape.OutC)
             ws64 := linalg.GemmWorkspace<F64>()
-            try Conv2d(y64, x64, w64, b64, shape, threads, ws64)
+            Conv2d(y64, x64, w64, b64, shape, threads, ws64)
             assert y64 == want64
         }
     }
@@ -394,7 +394,7 @@ test "col2im is im2col's transpose: <im2col(x), c> = <x, col2im(c)>" {
     Im2col(x, s, cols, 1)
     back := linalg.Matrix<F64>(2, s.H * s.W * s.C)
     Col2im(c, s, back, false, 1)
-    d F64 = try cols.Dot(c) - try x.Dot(back)
+    d F64 = cols.Dot(c)! - x.Dot(back)!
     assert d * d < 1e-20
 }
 
