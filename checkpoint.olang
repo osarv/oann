@@ -69,7 +69,7 @@ fn widthOf(d Dtype) I64 {
 
 # Same made the graph's own type
 fn concrete<T>(d Dtype, like T) Dtype {
-    if not (d == Dtype.Same) { return d }
+    if not (d == Dtype.Same): return d
     return match T {
         case F32, BF16: Dtype.F32          # a BF16 graph's parameters are its F32 masters
         case F64: Dtype.F64
@@ -99,12 +99,12 @@ fn valueOf(bits U64, d Dtype) F64 {
 }
 
 fn putBits(out mut Array<U8>&, at I64, v U64, width I64) {
-    for b in range width { out[at + b] = U8((v >> U64(8 * b)) & 255) }
+    for b in range width: out[at + b] = U8((v >> U64(8 * b)) & 255)
 }
 
 fn getBits(data String&, at I64, width I64) U64 {
     v U64 = 0
-    for b in range width { v = v | (U64(U8(data[at + b])) << U64(8 * b)) }
+    for b in range width: v = v | (U64(U8(data[at + b])) << U64(8 * b))
     return v
 }
 
@@ -120,7 +120,7 @@ type Names struct() {
 # parameter v called "name" - a later name for the same parameter replaces an earlier one
 fn (n mut Names&) Add(v nn.Var, name String&) {
     n.vars.Push(I64(v))
-    for c in name { n.chars.Push(c) }
+    for c in name: n.chars.Push(c)
     n.ends.Push(n.chars.Len())
 }
 
@@ -131,7 +131,7 @@ fn (n Names&) Of(v nn.Var, K I64) String {
         if n.vars[i] == I64(v) {
             first I64 = n.ends[i - 1] if i > 0 else 0
             out := Array<Char>(n.ends[i] - first)
-            for j in range out.Len() { out[j] = n.chars[first + j] }
+            for j in range out.Len(): out[j] = n.chars[first + j]
             return String(out)
         }
         i--
@@ -140,7 +140,7 @@ fn (n Names&) Of(v nn.Var, K I64) String {
 }
 
 fn dotted(prefix String&, name String&) String {
-    if prefix.Len() == 0 { return $name }
+    if prefix.Len() == 0: return $name
     return $prefix "." $name
 }
 
@@ -153,12 +153,12 @@ fn (n mut Names&) AddDense(d layers.Dense&, prefix String&) {
 # a normalization's gain and bias: PREFIX.weight, PREFIX.bias (none for RMS normalization) - nn.LayerNorm's
 fn (n mut Names&) AddNorm(m layers.Norm&, prefix String&) {
     n.Add(m.Gain, dotted(prefix, "weight"))
-    if not m.Rms { n.Add(m.Bias, dotted(prefix, "bias")) }
+    if not m.Rms: n.Add(m.Bias, dotted(prefix, "bias"))
 }
 
 # a perceptron's layers as nn.Sequential numbers them, an activation between every two: PREFIX.0, PREFIX.2, ...
 fn (n mut Names&) AddMlp(m layers.Mlp&, prefix String&) {
-    for i in range m.Layers.Len() { n.AddDense(m.Layers[i], dotted(prefix, $(2 * i))) }
+    for i in range m.Layers.Len(): n.AddDense(m.Layers[i], dotted(prefix, $(2 * i)))
 }
 
 # a transformer's parameters, by GPT-2's names where it has them: wte and wpe the token and position embeddings,
@@ -180,7 +180,7 @@ fn (n mut Names&) AddTransformer(t layers.Transformer&, prefix String&) {
         n.AddDense(b.Down, dotted(h, "mlp.c_proj"))
     }
     n.AddNorm(t.Final, dotted(prefix, "ln_f"))
-    if t.Head != t.Embedding { n.Add(t.Head, dotted(prefix, "lm_head.weight")) }
+    if t.Head != t.Embedding: n.Add(t.Head, dotted(prefix, "lm_head.weight"))
 }
 
 # ---- writing and reading ----
@@ -214,24 +214,24 @@ fn Save<T>(g nn.Graph<T>&, path String&, names Names&, d Dtype = Dtype.Same) ? o
     for k in range vars.Len() {
         nd := g.Info(nn.Var(vars[k]))
         shape := $(nd.Cols)
-        if nd.Rows != 1 { shape = $(nd.Rows) "," $(nd.Cols) }
+        if nd.Rows != 1: shape = $(nd.Rows) "," $(nd.Cols)
         size I64 = nd.Rows * nd.Cols * width
         sb.Push(("," $json.Encode(json.Json.Str(called[k])) ":{\"dtype\":\"" $dtypeName(dt) "\",\"shape\":[" $shape
             "],\"data_offsets\":[" $at "," $(at + size) "]}"))
         at += size
     }
     sb.PushChar('}')
-    for sb.Len() % 8 != 0 { sb.PushChar(' ') }
+    for sb.Len() % 8 != 0: sb.PushChar(' ')
     header := sb.ToString()
     base I64 = 8 + header.Len()
     out := Array<U8>(base + at)
     putBits(out, 0, U64(header.Len()), 8)
-    for i in range header.Len() { out[8 + i] = U8(header[i]) }
+    for i in range header.Len(): out[8 + i] = U8(header[i])
     p I64 = base
     for v in vars {
         match T {
-            case BF16 { p = putMatrix(out, p, g.Master(nn.Var(v)), dt, width) }
-            case _ { p = putMatrix(out, p, g.Value(nn.Var(v)), dt, width) }
+            case BF16: p = putMatrix(out, p, g.Master(nn.Var(v)), dt, width)
+            case _: p = putMatrix(out, p, g.Value(nn.Var(v)), dt, width)
         }
     }
     try os.WriteFile(path, out)
@@ -285,14 +285,14 @@ fn Load<T>(g mut nn.Graph<T>&, path String&, names Names&) ? os.Error, Safetenso
         if first < 0 or last < first or base + last > data.Len() { error SafetensorsError.Malformed }
         if last - first != nd.Rows * nd.Cols * width { error SafetensorsError.Shape }
         match T {
-            case BF16 { getMatrix(g.Master(v), data, base + first, d, width) }
-            case _ { getMatrix(g.Value(v), data, base + first, d, width) }
+            case BF16: getMatrix(g.Master(v), data, base + first, d, width)
+            case _: getMatrix(g.Value(v), data, base + first, d, width)
         }
     }
     g.SyncParams()
     count I64 = 0
     for key in tensors.Keys {
-        if key != "__metadata__" { count++ }
+        if key != "__metadata__": count++
     }
     if count != vars.Len() { error SafetensorsError.Unexpected }
 }
@@ -338,8 +338,8 @@ test "a graph saved as safetensors loads back: exactly in its own type, rounded 
         b := h.Params()
         for i in range a.Cols {
             want F32 = a.Data[i]
-            if d == Dtype.F16 { want = F32(F16(a.Data[i])) }
-            if d == Dtype.BF16 { want = F32(BF16(a.Data[i])) }
+            if d == Dtype.F16: want = F32(F16(a.Data[i]))
+            if d == Dtype.BF16: want = F32(BF16(a.Data[i]))
             assert b.Data[i].Bits() == want.Bits(), "element " $i " of " $dtypeName(d)
         }
     }
