@@ -810,3 +810,174 @@ test RowLogSumExp "equals log of the sum of exponentials in F64: F64 1e-14, F32 
         assert (F64(o32[i]) - s.Log()).Abs() <= 2.0e-6 * s.Log().Abs().Max(1.0), "F32 row " $i
     }
 }
+
+# the normalized rows and the loss sum(w y) of a rows x cols matrix, all in T
+fn normLoss<T>(x Array<T>&, w Array<T>&, gain Array<T>&, bias Array<T>&, rows I64, cols I64, rms Bool) F64 {
+    mean := Array<T>(rows)
+    inv := Array<T>(rows)
+    y := Array<T>(rows * cols)
+    m := mat.Mat<T>(x.Copy(), 0, rows, cols, cols)
+    RowNormStats(mean, inv, m, T(1.0e-5), rms)
+    RowNormApply(mat.Mat<T>(y, 0, rows, cols, cols), m, mean, inv, gain, bias)
+    loss F64
+    for i in range y.Len(): loss += F64(w[i]) * F64(y[i])
+    return loss
+}
+
+fn normReference(x Array<F64>&, from I64, n I64, rms Bool) Array<F64> {
+    mean := 0.0 if rms else Array<F64>[x[from + j] for j in range n].Sum() / F64(n)
+    var := Array<F64>[(x[from + j] - mean) * (x[from + j] - mean) for j in range n].Sum() / F64(n)
+    return Array<F64>[(x[from + j] - mean) / (var + 1.0e-5).Sqrt() for j in range n]
+}
+
+fn normWithin<T>(bound F64, rms Bool, r mut rand.Rand&) {
+    rows := 5
+    cols := 29
+    data := Array<T>(3 + rows * (cols + 5))
+    fill(data, r, 2.0)
+    gain := Array<T>[T(1.0 + 0.1 * F64(j)) for j in range cols]
+    bias := Array<T>[T(0.05 * F64(j)) for j in range cols] if not rms else Array<T>(0)
+    mean := Array<T>(rows)
+    inv := Array<T>(rows)
+    x := strided(data, rows, cols)
+    RowNormStats(mean, inv, x, T(1.0e-5), rms)
+    out := Array<T>(3 + rows * (cols + 5))
+    RowNormApply(strided(out, rows, cols), x, mean, inv, gain, bias)
+    ref := Array<F64>[F64(v) for v in data]
+    for i in range rows {
+        want := normReference(ref, 3 + i * (cols + 5), cols, rms)
+        for j in range cols {
+            w := want[j] * F64(gain[j]) + (0.0 if rms else F64(bias[j]))
+            assert (F64(out[3 + i * (cols + 5) + j]) - w).Abs() <= bound * w.Abs().Max(1.0), "row " $i " col " $j " of " $T.Name
+        }
+    }
+}
+
+test RowNormStats "layer and RMS normalization equal the F64 formulas on strided rows: F64 1e-13, F32 2e-5, BF16 4e-2" {
+    r := rand.Rand(4)
+    for rms in Array<Bool>[false, true] {
+        normWithin<F64>(1.0e-13, rms, r)
+        normWithin<F32>(2.0e-5, rms, r)
+        normWithin<BF16>(4.0e-2, rms, r)
+    }
+}
+
+test RowNormGrad "dx, dgain and dbias equal the central differences of sum(w y), layer and RMS, F64" {
+    r := rand.Rand(5)
+    rows := 4
+    cols := 9
+    n := rows * cols
+    h := 1.0e-6
+    for rms in Array<Bool>[false, true] {
+        x := Array<F64>(n)
+        w := Array<F64>(n)
+        gain := Array<F64>(cols)
+        bias := Array<F64>(cols) if not rms else Array<F64>(0)
+        fill(x, r, 1.5)
+        fill(w, r, 1.0)
+        for j in range cols: gain[j] = 1.0 + 0.2 * F64(j % 3)
+        for j in range bias.Len(): bias[j] = 0.1 * F64(j)
+        mean := Array<F64>(rows)
+        inv := Array<F64>(rows)
+        xm := mat.Mat<F64>(x, 0, rows, cols, cols)
+        RowNormStats(mean, inv, xm, 1.0e-5, rms)
+        dx := Array<F64>(n)
+        RowNormGrad(mat.Mat<F64>(dx, 0, rows, cols, cols), mat.Mat<F64>(w, 0, rows, cols, cols), xm, mean, inv, gain, rms, false)
+        dgain := Array<F64>(cols)
+        dbias := Array<F64>(cols) if not rms else Array<F64>(0)
+        RowNormParamGrad(dgain, dbias, mat.Mat<F64>(w, 0, rows, cols, cols), xm, mean, inv, false)
+        for i in range n {
+            hi := x.Copy()
+            hi[i] += h
+            lo := x.Copy()
+            lo[i] -= h
+            want := (normLoss(hi, w, gain, bias, rows, cols, rms) - normLoss(lo, w, gain, bias, rows, cols, rms)) / (2.0 * h)
+            assert (dx[i] - want).Abs() <= 1.0e-7 * want.Abs().Max(1.0), "dx[" $i "] " $dx[i] " against " $want
+        }
+        for j in range cols {
+            hi := gain.Copy()
+            hi[j] += h
+            lo := gain.Copy()
+            lo[j] -= h
+            want := (normLoss(x, w, hi, bias, rows, cols, rms) - normLoss(x, w, lo, bias, rows, cols, rms)) / (2.0 * h)
+            assert (dgain[j] - want).Abs() <= 1.0e-7 * want.Abs().Max(1.0), "dgain[" $j "] " $dgain[j] " against " $want
+        }
+        for j in range bias.Len() {
+            col F64
+            for i in range rows: col += w[i * cols + j]
+            assert (dbias[j] - col).Abs() <= 1.0e-12
+        }
+        # added to what is there, and written over what is there
+        again := dx.Copy()
+        RowNormGrad(mat.Mat<F64>(again, 0, rows, cols, cols), mat.Mat<F64>(w, 0, rows, cols, cols), xm, mean, inv, gain, rms, true)
+        for i in range n: assert (again[i] - 2.0 * dx[i]).Abs() <= 1.0e-12 * dx[i].Abs().Max(1.0)
+    }
+}
+
+test RowMaxAbs "RowMaxAbs, RowSums and ColumnSums (beta 0 overwrites, beta adds) on a strided matrix" {
+    rows := 6
+    cols := 70
+    data := Array<F32>(3 + rows * (cols + 5))
+    r := rand.Rand(6)
+    fill(data, r, 3.0)
+    x := strided(data, rows, cols)
+    best := Array<F32>(rows)
+    sums := Array<F32>(rows)
+    RowMaxAbs(best, x)
+    RowSums(sums, x)
+    cs := Array<F32>(cols)
+    for j in range cols: cs[j] = F32(NaN)
+    ColumnSums(cs, x, 0.0)
+    again := cs.Copy()
+    ColumnSums(again, x, 1.0)
+    for i in range rows {
+        b F64
+        s F64
+        for j in range cols {
+            v := F64(data[3 + i * (cols + 5) + j])
+            b = b.Max(v.Abs())
+            s += v
+        }
+        assert F64(best[i]) == b and (F64(sums[i]) - s).Abs() <= 1.0e-5
+    }
+    for j in range cols {
+        c F64
+        for i in range rows: c += F64(data[3 + i * (cols + 5) + j])
+        assert (F64(cs[j]) - c).Abs() <= 1.0e-5 and (F64(again[j]) - 2.0 * c).Abs() <= 2.0e-5
+    }
+}
+
+test Dot "Dot, Sum, SquaresF64 and Axpy over runs at an offset, F32, BF16 in F32, F64" {
+    x := Array<F64>[F64(i % 7) - 3.0 for i in range 103]
+    y := Array<F64>[F64(i % 5) * 0.5 for i in range 103]
+    d F64
+    s F64
+    q F64
+    for i in range 100 {
+        d += x[2 + i] * y[1 + i]
+        s += x[2 + i]
+        q += x[i] * x[i]
+    }
+    assert Dot(x, 2, y, 1, 100) == d and Sum(x, 2, 100) == s
+    x32 := Array<F32>[F32(v) for v in x]
+    y32 := Array<F32>[F32(v) for v in y]
+    assert F64(Dot(x32, 2, y32, 1, 100)) == d and F64(Sum(x32, 2, 100)) == s
+    xb := Array<BF16>[BF16(v) for v in x]
+    assert F64(Sum(xb, 2, 100)) == s
+    assert (SquaresF64(x32[0:100]) - q).Abs() <= 1.0e-9
+    z := Array<F64>(103)
+    Axpy(z, 3, 2.0, x, 5, 90)
+    assert z[3] == 2.0 * x[5] and z[92] == 2.0 * x[94] and z[93] == 0.0 and z[2] == 0.0
+}
+
+test FastExp "the evaluator and the run time agree: comptime values equal the run's, bit for bit" {
+    a := Array<F64>[0.75, -3.5]
+    b := Array<F32>[0.75, -3.5]
+    assert (comptime FastExp<F32>(0.75)).Bits() == FastExp(b[0]).Bits()
+    assert (comptime FastExp<F64>(-3.5)).Bits() == FastExp(a[1]).Bits()
+    assert (comptime FastTanh<F64>(0.75)).Bits() == FastTanh(a[0]).Bits()
+    assert (comptime FastTanh<F32>(-3.5)).Bits() == FastTanh(b[1]).Bits()
+    assert (comptime FastSigmoid<F32>(-3.5)).Bits() == FastSigmoid(b[1]).Bits()
+    assert (comptime FastGeluTanh<F32>(-3.5)).Bits() == FastGeluTanh(b[1]).Bits()
+    assert (comptime FastGeluTanh<F64>(0.75)).Bits() == FastGeluTanh(a[0]).Bits()
+}
