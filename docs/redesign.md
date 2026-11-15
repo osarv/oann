@@ -439,7 +439,8 @@ fn main() ? {
    kernels, autodiff, the dynamical-system core with every settling mechanism (memory store, consolidation and sleep,
    the agent's machinery, energy-based reasoners as model kinds) and the reference models. oagent, private, holds the
    AGI model being bootstrapped: its configuration and architecture choices, trained weights and checkpoints, training
-   data and recipes, its experiments and their results. Nothing moves out of oann in C3.
+   data and recipes, its experiments and their results. Nothing moves out of oann in C3. Datasets we create (not ones
+   retrieved) are oagent's too - "basically any company secrets" (the user, 2026-11-15).
 3. **Structure changes - decided (the user, 2026-11-15: "we want the networks to be prunable at runtime eventually at
    least. its not the most important first step, but dont depend it never being the case").** The first build may
    re-plan between runs, but nothing may assume a planned system's structure is fixed: connections carry an active mask
