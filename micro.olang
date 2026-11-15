@@ -1,0 +1,41 @@
+import "std/rand"
+import "std/time"
+import "sparse"
+import "kernels/mat"
+import ks "kernels/sparse"
+
+fn best(f fn&(), reps I64) F64 {
+    b F64 = 1e18
+    for _ in range 15 {
+        t0 := time.Now()
+        for _ in range reps: f()
+        b = b.Min(F64(time.Since(t0)) / F64(reps))
+    }
+    return b
+}
+
+fn main() {
+    r := rand.Rand(1)
+    n I64 = 1024
+    for d in Array<F64>[0.05, 0.1, 0.2] {
+        csr := ks.Csr<F32>.Random(n, n, d, r)
+        ptr := Array<I64>[csr.Ptr[i] for i in range n + 1]
+        idx := Array<I32>[csr.Idx[e] for e in range csr.Nnz()]
+        vals := Array<F32>[csr.Values[e] for e in range csr.Nnz()]
+        tiles ks.Tiles<F32>& = ks.Tiles<F32>.Drawn(n, n, 16, d, r)
+        for e in range tiles.Data.Len(): tiles.Data[e] = F32(r.Uniform(-1.0, 1.0))
+        old sparse.Csr<F32>& = sparse.Csr<F32>(n, n, ptr, idx, vals)
+        for width in Array<I64>[1, 32] {
+            xd := Array<F32>[F32(r.Uniform(-1.0, 1.0)) for _ in range n * width]
+            x := mat.Mat<F32>(xd, 0, n, width, width)
+            y mut mat.Mat<F32>& = mat.Mat<F32>(Array<F32>(n * width), 0, n, width, width)
+            yo mut Array<F32>& = Array<F32>(n * width)
+            a := best(fn() { old.MulAdd(xd, 0, width, yo, 0, width, width, 1.0) }, 50)
+            b := best(fn() { csr.MulAdd(y, x) }, 50)
+            c := best(fn() { tiles.MulAdd(y, x) }, 50)
+            e := best(fn() { tiles.MulAdd(y, x, true) }, 50)
+            f := best(fn() { csr.MulAdd(y, x, true) }, 50)
+            Println($d " width " $width " old " $a.Round() " new " $b.Round() " tiles " $c.Round() " | trans csr " $f.Round() " tiles " $e.Round())
+        }
+    }
+}
