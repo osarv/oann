@@ -26,8 +26,15 @@
 # position. Both forms are exact reorderings, so they agree to rounding (the tests hold F32 to 1e-5).
 #
 # Work is split over tasks by sequence, channel block or head - never across a sum - so a result is the same for every
-# thread count. The work object holds the thread count and the scratch; it grows on the first call and then allocates
-# nothing.
+# thread count (the sums over channel blocks and sequences of the selective scan's backward are added in a fixed order).
+# The work object holds the thread count and the scratch; it grows on the first call and then allocates nothing, but for
+# the chunked delta rule, whose products each task makes a gemm.Workspace for (grown on its first product, in the task's
+# own scope, and gone with it: the Workspace's panels cannot be kept in a collection yet).
+#
+# A backward needs the forward's states: the forward writes the state at the start of every chunk (`keep`, the chunk size
+# being at.Chunk of the Seq both are given) and the backward recomputes the rest of a chunk from it - one state per chunk
+# of memory, one more forward of time. The gradient of a state travels the other way as `dstate`: in, the gradient in the
+# state after the last position; out, in the state before the first.
 
 import "mat"
 import "elem"
@@ -596,8 +603,8 @@ type selGradArgs<S, A> struct(f selArgs<S>, dx mat.Mat<S>, ddelta mat.Mat<S>, da
     add
 }
 
-# the A's of scratch a task needs: a chunk's states (Chunk + 1 of N x scanWidth) and five vectors
-fn selGradScratch(at Seq, n I64) I64 { return (at.Chunk + 1) * n * scanWidth + 5 * scanWidth }
+# the A's of scratch a task needs: a chunk's states (Chunk + 1 of N x scanWidth) and six vectors
+fn selGradScratch(at Seq, n I64) I64 { return (at.Chunk + 1) * n * scanWidth + 6 * scanWidth }
 
 type selGradJob<S, A> struct(g selGradArgs<S, A>, z mut Array<A>&, per I64, pdb mut Array<A>&, pdc mut Array<A>&, pda mut Array<A>&, pds mut Array<A>&) {
     g
@@ -630,7 +637,7 @@ fn (j selGradJob<S, A>&) sweep(s I64, u I64, d0 I64, d1 I64, n I64, w mut Array<
     cols := f.x.Cols
     chunks := chunksOf(f.at)
     hs := w[0:(f.at.Chunk + 1) * n * scanWidth]
-    vecs := w[(f.at.Chunk + 1) * n * scanWidth:(f.at.Chunk + 1) * n * scanWidth + 5 * scanWidth]
+    vecs := w[(f.at.Chunk + 1) * n * scanWidth:(f.at.Chunk + 1) * n * scanWidth + 6 * scanWidth]
     gbase := g.ds.Off + s * n * g.ds.Ld
     for i in range chunks {
         k := chunks - 1 - i
@@ -677,6 +684,8 @@ fn selGradStep<S, A>(g selGradArgs<S, A>&, r I64, t I64, s I64, u I64, d0 I64, d
     dyv := w[2 * scanWidth:3 * scanWidth]
     ddl := w[3 * scanWidth:4 * scanWidth]
     dxg := w[4 * scanWidth:5 * scanWidth]
+    gdl := w[5 * scanWidth:6 * scanWidth]
+    width := d1 - d0
     pt := (u * f.at.Len + r - s * f.at.Len) * n
     for d in range d0, d1 {
         dl[d - d0] = A(f.delta.Data[f.delta.Off + r * f.delta.Ld + d])
@@ -689,21 +698,19 @@ fn selGradStep<S, A>(g selGradArgs<S, A>&, r I64, t I64, s I64, u I64, d0 I64, d
     for k in range n {
         bn := A(f.b.Data[f.b.Off + r * f.b.Ld + k])
         cn := A(f.c.Data[f.c.Off + r * f.c.Ld + k])
-        dB A = 0.0
-        dC A = 0.0
         for d in range d0, d1 {
             av := A(f.a.Data[f.a.Off + k * f.a.Ld + d])
             ex := elem.FastExp(dl[d - d0] * av)
             hp := hs[(t * n + k) * scanWidth + d - d0]
-            hn := hs[((t + 1) * n + k) * scanWidth + d - d0]
             gv := gd[gbase + k * g.ds.Ld + d] + dyv[d - d0] * cn
-            dC += dyv[d - d0] * hn
-            dB += gv * dl[d - d0] * xv[d - d0]
-            dxg[d - d0] += gv * dl[d - d0] * bn
+            gdl[d - d0] = gv * dl[d - d0]
+            dxg[d - d0] += gdl[d - d0] * bn
             ddl[d - d0] += gv * (av * ex * hp + bn * xv[d - d0])
-            pda[(s * n + k) * cols + d] += gv * dl[d - d0] * ex * hp
+            pda[(s * n + k) * cols + d] += gdl[d - d0] * ex * hp
             gd[gbase + k * g.ds.Ld + d] = ex * gv
         }
+        dC := elem.DotIn<A, A>(dyv, 0, hs, ((t + 1) * n + k) * scanWidth, width)
+        dB := elem.DotIn<A, A>(gdl, 0, xv, 0, width)
         pdb[pt + k] = dB
         pdc[pt + k] = dC
     }
