@@ -1,0 +1,470 @@
+# dyn/sleep - sleep consolidation as a mechanism of a system (docs/settling.md 1.9, 2.7). Complementary learning systems
+# (McClelland, McNaughton and O'Reilly 1995): a fast store takes in experience at once, and the slow weights integrate
+# it by interleaved replay offline. Here the fast part is dyn/store's Memory (key population -> readout) and the slow
+# part is the system's own connections, taught through the rules attached to the Sleep clock (an EP lesson, a
+# three-factor rule) by a Learner's Tick - replay is a rule's data, not a rule of its own.
+#
+# A Sleeper keeps the cues of the days and runs a night:
+#
+# - Day: the key population is clamped (its drive) and the readout's targets given, as for a lesson. The slow part
+#   answers (a free settle, no store), and the store writes the residual target - answer at the key, once (the delta
+#   rule, one exposure): it holds what the slow weights do not. The key row joins the cues, a reservoir of at most Cues
+#   (Vitter's algorithm R: a uniform sample of every row the days showed).
+# - Night: every cue is dreamed once - the free path with the store's read joined to the readout's drive - and frozen
+#   as targets. Then the slow weights are taught the cue-to-dream pairs, the store excluded, for Passes passes over the
+#   cues in an order drawn each pass (replay, Wilson and McNaughton 1994; pseudorehearsal, Robins 1995): each batch is
+#   one Tick of the Sleep clock, then an AdamW step on the system's parameters (Optimize; off when a rule steps the
+#   parameters itself). At dawn the store is cleared and rewritten with each dream's residual from what the slow weights
+#   now produce at the cue, in passes until every residual reads back or DawnPasses are done: it holds only what the
+#   slow weights did not absorb, and slow plus store recall the dreams again as exactly as the store can.
+#
+# Sleep consolidates what the system produces, mistakes included - it does not correct the store. Batches of the
+# system's own size are replayed; the last one is padded by repeating its first row. Nothing is allocated after the
+# Sleeper is made.
+
+import "std/rand"
+import "../nn/optim"
+import "neuron"
+import "settle"
+import "system"
+import "learn"
+import "store"
+
+type Sleeper<T> struct(l mut learn.Learner<T>&, m mut store.Memory<T>&, Cues I64 = 64, Rate F64 = 0.01, Passes I64 = 20
+        DawnPasses I64 = 10, DawnTolerance F64 = 0.001, Optimize Bool = true, seed U64 = 1) {
+    L mut learn.Learner<T>& = l
+    M mut store.Memory<T>& = m
+    S mut system.System<T>& = l.S
+    assert S.Pop(m.Key).Role == neuron.Role.Input, "the sleeper's cues are the key population's drive: an input"
+    assert Cues >= 1 and Passes >= 0 and DawnPasses >= 0
+    In I64 = S.Pop(m.Key).Size
+    Out I64 = S.Pop(m.Value).Size
+    Cues
+    Passes
+    DawnPasses
+    DawnTolerance
+    Optimize
+    Budget settle.Budget = settle.Budget()          # a free settle's budget
+    rng rand.Rand = rand.Rand(seed)
+    opt mut optim.AdamW<T, T>& = optim.AdamW<T, T>(S.Params(), S.ParamGrads(), rate = Rate)
+    cues mut Array<T>& = Array<T>(Cues * In)
+    dreams mut Array<T>& = Array<T>(Cues * Out)
+    order mut Array<I64>& = Array<I64>(Cues)
+    resid mut Array<T>& = Array<T>(Cues * Out)
+    res mut Array<T>& = Array<T>(Out)
+    idx mut Array<I32>& = Array<I32>(M.Core.K)
+    code mut Array<T>& = Array<T>(M.Core.K)
+    Kept I64 = 0                                    # the cues held
+    Seen I64 = 0                                    # the rows the days showed, of which the cues are a sample
+    Nights I64 = 0
+    NightLoss F64 = 0.0                             # the last night's mean loss over its last pass
+    DawnError F64 = 0.0                             # the largest error of a read of a residual after the last dawn
+    DawnPassesTaken I64 = 0
+}
+
+# the slow part's settle: the readout's drive cleared (no store), free phase
+fn (k mut Sleeper<T>&) settleSlow() settle.Settlement {
+    out := k.S.Pop(k.M.Value)
+    for i in range out.Drive.Len(): out.Drive[i] = T(0)
+    return k.S.Settle(settle.Phase.Free, k.Budget)
+}
+
+# row r of the readout's free-phase answer
+fn (k Sleeper<T>&) answer(r I64) Array<T>& {
+    return k.S.Pop(k.M.Value).Activity(0)[r * k.Out:(r + 1) * k.Out]
+}
+
+# the system's batch answers for the key rows as clamped, into out ([batch, Out]): the slow part alone, or with the
+# store's read joined to the readout's drive
+fn (k mut Sleeper<T>&) Answer(withStore Bool, out mut Array<T>&) {
+    if withStore {
+        k.M.Recall()
+        k.S.Settle(settle.Phase.Free, k.Budget)
+    } else {
+        k.settleSlow()
+    }
+    for r in range k.S.Batch {
+        a := k.answer(r)
+        for j in range k.Out: out[r * k.Out + j] = a[j]
+    }
+}
+
+# a day: the batch clamped on the key population with the readout's targets given (known marks the targets observed,
+# default all): the store writes what the slow part's answer lacks, and the key rows join the cues
+fn (k mut Sleeper<T>&) Day(known Array<Bool>?& = null) {
+    k.settleSlow()
+    for r in range k.S.Batch {
+        a := k.answer(r)
+        t := k.M.ValueRow(r)
+        for j in range k.Out: k.res[j] = t[j] - a[j]
+        k.M.Core.Write(k.M.KeyRow(r), k.res, known)
+        k.keep(k.M.KeyRow(r))
+    }
+}
+
+# a key row into the reservoir of cues
+fn (k mut Sleeper<T>&) keep(row Array<T>&) {
+    k.Seen++
+    at I64 = -1
+    if k.Kept < k.Cues {
+        at = k.Kept
+        k.Kept++
+    } else {
+        j := k.rng.Below(k.Seen)
+        if j < k.Cues: at = j
+    }
+    if at < 0: return
+    for i in range k.In: k.cues[at * k.In + i] = row[i]
+}
+
+# the batch of cues first .. first + Batch of order (or of the cues themselves, as kept, with no order) clamped on the
+# key population, the last batch padded by its first row; gives each row's cue
+fn (k mut Sleeper<T>&) load(first I64, ordered Bool) {
+    key := k.S.Pop(k.M.Key)
+    for r in range k.S.Batch {
+        at := first + r
+        at = first if at >= k.Kept else at
+        c := k.order[at] if ordered else at
+        for i in range k.In: key.Drive[r * k.In + i] = k.cues[c * k.In + i]
+    }
+}
+
+# the cue of batch row r of the batch loaded at first
+fn (k Sleeper<T>&) cueAt(first I64, r I64, ordered Bool) I64 {
+    at := first + r
+    at = first if at >= k.Kept else at
+    return k.order[at] if ordered else at
+}
+
+# the night: dream every cue, teach the slow weights the dreams through the Sleep clock's rules, rewrite the store at
+# dawn. Gives the mean loss of the last pass; refuses what the rules refuse. Nothing kept: nothing done
+fn (k mut Sleeper<T>&) Night() F64 ? learn.LearnError {
+    if k.Kept == 0: return 0.0
+    k.dream()
+    loss := try k.teach()
+    k.dawn()
+    k.Nights++
+    k.NightLoss = loss
+    return loss
+}
+
+# every cue's dream: the free path, the store's read included, by batches
+fn (k mut Sleeper<T>&) dream() {
+    for first in range 0, k.Kept, k.S.Batch {
+        k.load(first, false)
+        k.M.Recall()
+        k.S.Settle(settle.Phase.Free, k.Budget)
+        for r in range k.S.Batch {
+            c := k.cueAt(first, r, false)
+            a := k.answer(r)
+            for j in range k.Out: k.dreams[c * k.Out + j] = a[j]
+        }
+    }
+}
+
+# the slow weights taught the dreams for Passes passes: a Tick of the Sleep clock and a step per batch
+fn (k mut Sleeper<T>&) teach() F64 ? learn.LearnError {
+    for i in range k.Kept: k.order[i] = i
+    out := k.S.Pop(k.M.Value)
+    loss F64 = 0.0
+    for _ in range k.Passes {
+        k.rng.Shuffle(k.order[0:k.Kept])
+        loss = 0.0
+        for first in range 0, k.Kept, k.S.Batch {
+            k.load(first, true)
+            for i in range out.Drive.Len(): out.Drive[i] = T(0)
+            for r in range k.S.Batch {
+                c := k.cueAt(first, r, true)
+                for j in range k.Out: out.Target[r * k.Out + j] = k.dreams[c * k.Out + j]
+            }
+            try k.L.Tick(system.Clock.Sleep)
+            if k.Optimize: k.opt.Step()
+            loss += k.S.Loss(settle.Phase.Free) * F64(k.S.Batch)
+        }
+        loss /= F64(k.Kept.Max(1))
+    }
+    return loss
+}
+
+# dawn: the store cleared, then each dream's residual from the slow part as it now is written at the cue's code, in
+# passes until every residual reads back within DawnTolerance
+fn (k mut Sleeper<T>&) dawn() {
+    k.M.Core.Clear()
+    for first in range 0, k.Kept, k.S.Batch {
+        k.load(first, false)
+        k.settleSlow()
+        for r in range k.S.Batch {
+            c := k.cueAt(first, r, false)
+            a := k.answer(r)
+            for j in range k.Out: k.resid[c * k.Out + j] = k.dreams[c * k.Out + j] - a[j]
+        }
+    }
+    k.DawnPassesTaken = 0
+    k.DawnError = 0.0
+    for _ in range k.DawnPasses {
+        k.DawnError = k.rewrite()
+        k.DawnPassesTaken++
+        if k.DawnError < k.DawnTolerance: break
+    }
+}
+
+# one pass of writes of the residuals at their cues' codes; gives the largest error of a read before its write
+fn (k mut Sleeper<T>&) rewrite() F64 {
+    worst F64 = 0.0
+    for c in range k.Kept {
+        k.M.Core.Encode(k.cues[c * k.In:(c + 1) * k.In], k.idx, k.code)
+        k.M.Core.ReadCode(k.idx, k.code, k.res)
+        for j in range k.Out: worst = worst.Max(F64((k.resid[c * k.Out + j] - k.res[j]).Abs()))
+        k.M.Core.WriteCode(k.idx, k.code, k.resid[c * k.Out:(c + 1) * k.Out])
+    }
+    return worst
+}
+
+# a rule that runs the night, for Attach(m, system.Rule.Custom(...), clock) on a clock the Sleep clock's own rules are
+# not on (the Episode clock, say, for a night after every episode): a refused night stops the program
+type Dream struct(k mut Sleeper<F32>&) {
+    K mut Sleeper<F32>& = k
+}
+
+fn (d mut Dream&) Apply(params mut Array<F32>&, grads mut Array<F32>&) { d.K.Night()! }
+
+# ---- what must not allocate, decided while compiling (S17a, G42): the day's write, a cue kept, the dawn's rewrite ----
+# Not pinned: whatever settles or takes a product (B2a's note, dyn/learn). Resident memory over many days and nights is
+# measured instead (the tests).
+
+fn keepOf(k mut Sleeper<F32>&, row Array<F32>&) { k.keep(row) }
+fn rewriteOf(k mut Sleeper<F32>&) F64 { return k.rewrite() }
+fn dreamRowOf(k mut Sleeper<F32>&) { k.load(0, true) }
+
+assert not keepOf.Allocates, "keeping a cue allocates"
+assert not rewriteOf.Allocates, "dawn's rewrite allocates"
+assert not dreamRowOf.Allocates, "loading a replayed batch allocates"
+
+# ---- tests ----
+
+import "std/os"
+import "conn"
+
+# a linear task, y = W x for a fixed W (Out x In): a system of the key input x and a linear readout y, an EP rule on
+# the Sleep clock, a memory from x to y, planned, the slow weights zero
+type Rig struct(batch I64, n I64, m I64, seed U64) {
+    Batch I64 = batch
+    N I64 = n
+    M I64 = m
+    S mut system.System<F64>& = system.System<F64>(batch, 1, 3)
+    X system.Pop = S.Population(S.Root(), "x", n, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    Y system.Pop = S.Population(S.Root(), "y", m, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    S.Connect(X, Y, conn.Wiring.Dense)
+    Memory mut store.Memory<F64>& = store.Memory<F64>(S, X, Y, 0, 0, 1.0, 0.0, false, seed)
+    S.Attach(S.Root(), system.Rule.Ep(0.5, true), system.Clock.Sleep)
+    S.Plan(rand.Rand(seed))!
+    S.Weights(system.Conn(0)).Fill(0.0)
+    Learner mut learn.Learner<F64>& = learn.Learner<F64>(S)!
+    Learner.Tol = 1e-12
+    Learner.Sweeps = 4000
+    Task mut Array<F64>& = Array<F64>(n * m)
+    r mut rand.Rand& = rand.Rand(seed + 100)
+    for i in range n * m: Task[i] = r.Uniform(-1.0, 1.0)
+}
+
+# a batch of rows of the task clamped on the rig: keys uniform in [-1, 1), targets W x; the keys also into keys[at ..]
+fn (g mut Rig&) clamp(keys mut Array<F64>&, at I64) {
+    x := g.S.Pop(g.X)
+    y := g.S.Pop(g.Y)
+    for b in range g.Batch {
+        for i in range g.N {
+            x.Drive[b * g.N + i] = g.r.Uniform(-1.0, 1.0)
+            keys[at + b * g.N + i] = x.Drive[b * g.N + i]
+        }
+        for j in range g.M {
+            sum F64 = 0.0
+            for i in range g.N: sum += g.Task[j * g.N + i] * x.Drive[b * g.N + i]
+            y.Target[b * g.M + j] = sum
+        }
+    }
+}
+
+# the rms error of a sleeper's answers (with the store or not) over the rows of keys (a whole number of batches)
+fn (g mut Rig&) error(k mut Sleeper<F64>&, keys Array<F64>&, withStore Bool) F64 {
+    x := g.S.Pop(g.X)
+    out := Array<F64>(g.Batch * g.M)
+    sq F64 = 0.0
+    rows := keys.Len() / g.N
+    for first in range 0, rows, g.Batch {
+        for i in range g.Batch * g.N: x.Drive[i] = keys[first * g.N + i]
+        k.Answer(withStore, out)
+        for b in range g.Batch {
+            for j in range g.M {
+                want F64 = 0.0
+                for i in range g.N: want += g.Task[j * g.N + i] * keys[(first + b) * g.N + i]
+                sq += (out[b * g.M + j] - want) * (out[b * g.M + j] - want)
+            }
+        }
+    }
+    return (sq / F64(rows * g.M)).Sqrt()
+}
+
+fn (g mut Rig&) Sleeper(cues I64, rate F64, passes I64) mut Sleeper<F64>& {
+    k mut Sleeper<F64>& = Sleeper<F64>(g.Learner, g.Memory, cues, rate, passes, 10, 1e-6, true, 5)
+    k.Budget = settle.Budget(4000, 1e-12)
+    return k
+}
+
+test Sleeper.Day "a day: the store holds what the slow part lacks, so slow and store answer the rows shown, the slow part alone nothing yet" {
+    g := Rig(4, 6, 2, 1)
+    k := g.Sleeper(16, 0.05, 20)
+    keys := Array<F64>(16 * 6)
+    for d in range 4 {
+        g.clamp(keys, d * 24)
+        k.Day()
+    }
+    assert k.Kept == 16 and k.Seen == 16
+    alone := g.error(k, keys, false)
+    whole := g.error(k, keys, true)
+    assert whole < 0.35 * alone, "slow and store " + $whole + ", the slow part alone " + $alone
+}
+
+test Sleeper.Night "a night: the slow part alone learns the dreams, and the dawn store keeps slow and store recalling them" {
+    g := Rig(4, 6, 2, 2)
+    k := g.Sleeper(16, 0.02, 300)
+    keys := Array<F64>(16 * 6)
+    for d in range 4 {
+        g.clamp(keys, d * 24)
+        k.Day()
+    }
+    before := g.error(k, keys, false)
+    dreamt := g.error(k, keys, true)
+    loss := k.Night()!
+    after := g.error(k, keys, false)
+    whole := g.error(k, keys, true)
+    assert after < 0.5 * before and after < 1.3 * dreamt, "the slow part alone: " + $before + " before the night, " + $after + " after; the dreams were " + $dreamt + " off"
+    assert whole < 1e-3 + dreamt, "slow and store recall the dreams as before: " + $dreamt + ", then " + $whole
+    assert k.DawnError < 0.01 and k.Nights == 1 and loss >= 0.0, "dawn: error " + $k.DawnError + " in " + $k.DawnPassesTaken + " passes"
+}
+
+test Sleeper.Night "nights: the slow part alone generalizes better night after night, beyond what a store alone does" {
+    g := Rig(4, 6, 2, 3)
+    k := g.Sleeper(32, 0.05, 40)
+    keys := Array<F64>(32 * 6)
+    fresh := Array<F64>(64 * 6)
+    for d in range 16: g.clamp(fresh, d * 24)
+    first := g.error(k, fresh, false)
+    last F64 = first
+    for night in range 4 {
+        for d in range 2 {
+            g.clamp(keys, ((night * 2 + d) * 24) % (32 * 6))
+            k.Day()
+        }
+        k.Night()!
+        now := g.error(k, fresh, false)
+        assert now < last + 5e-3, "night " + $night + ": the slow part's error on new rows rose from " + $last + " to " + $now
+        last = now
+    }
+    stored := g.error(k, fresh, true)
+    assert last < 0.7 * first, "the slow part alone on new rows: " + $first + " to " + $last
+    assert last < stored, "slow alone " + $last + " against slow and store " + $stored + " on new rows"
+}
+
+test Sleeper.Day "a reservoir of cues: at most Cues kept, a uniform sample of every row the days showed" {
+    g := Rig(5, 4, 1, 4)
+    k := g.Sleeper(10, 0.05, 1)
+    x := g.S.Pop(g.X)
+    taken := Array<I64>(100)
+    for d in range 20 {
+        for b in range 5 {
+            for i in range 4: x.Drive[b * 4 + i] = F64(d * 5 + b + 1)
+        }
+        k.Day()
+    }
+    assert k.Kept == 10 and k.Seen == 100
+    for c in range 10 {
+        tag := I64(k.cues[c * 4])
+        assert tag >= 1 and tag <= 100 and k.cues[c * 4 + 3] == k.cues[c * 4]
+        taken[tag - 1]++
+    }
+    for t in taken: assert t <= 1, "a row kept twice"
+}
+
+test Sleeper.Day "a day knowing only some targets: the others' reads stay as they were" {
+    g := Rig(2, 6, 2, 5)
+    k := g.Sleeper(8, 0.05, 1)
+    keys := Array<F64>(2 * 6)
+    known := Array<Bool>[true, false]
+    for _ in range 6 {
+        g.clamp(keys, 0)
+        k.Day(known)
+    }
+    out := Array<F64>(4)
+    for i in range 12: g.S.Pop(g.X).Drive[i] = 0.5
+    k.Answer(true, out)
+    assert out[1] == 0.0 and out[3] == 0.0, "the unknown output is " + $out[1]
+    assert out[0] != 0.0
+}
+
+test Sleeper.Night "nothing kept: a night does nothing; a night is a Tick of the Sleep clock per replayed batch" {
+    g := Rig(4, 6, 2, 6)
+    k := g.Sleeper(8, 0.05, 3)
+    assert k.Night()! == 0.0 and k.Nights == 0
+    keys := Array<F64>(8 * 6)
+    g.clamp(keys, 0)
+    k.Day()
+    g.clamp(keys, 24)
+    k.Day()
+    k.Night()!
+    assert g.Learner.Lessons == 3 * 2
+}
+
+test Dream.Apply "a Dream rule on a clock runs the night when its Tick does" {
+    s := system.System<F32>(2, 1, 3)
+    x := s.Population(s.Root(), "x", 4, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    y := s.Population(s.Root(), "y", 1, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, y, conn.Wiring.Dense)
+    s.Attach(s.Root(), system.Rule.Ep(0.5, true), system.Clock.Sleep)
+    s.Plan(rand.Rand(1))!
+    l := learn.Learner<F32>(s)!
+    m := store.Memory<F32>(s, x, y, 0, 0, 1.0, 0.0)
+    k := Sleeper<F32>(l, m, 4, 0.01, 2)
+    s.Attach(s.Root(), system.Rule.Custom(Dream(k)), system.Clock.Episode)
+    for i in range 8: s.Pop(x).Drive[i] = F32(i) * 0.1
+    s.Pop(y).Target[0] = 1.0
+    s.Pop(y).Target[1] = -1.0
+    k.Day()
+    l.Tick(system.Clock.Episode)!
+    assert k.Nights == 1 and l.Lessons > 0
+}
+
+fn resident() I64 {
+    stat := try os.ReadFile("/proc/self/statm") catch { unreachable }
+    return try stat.Split(" ")[1].ParseInt(10) catch { unreachable }
+}
+
+# a random day on the 4-row system: keys and targets, shown
+fn life(s mut system.System<F32>&, x system.Pop, y system.Pop, k mut Sleeper<F32>&, r mut rand.Rand&) {
+    for i in range 4 * 8: s.Pop(x).Drive[i] = F32(r.Uniform(-1.0, 1.0))
+    for i in range 4 * 2: s.Pop(y).Target[i] = F32(r.Uniform(-1.0, 1.0))
+    k.Day()
+}
+
+test Sleeper.Night "days and nights allocate nothing: resident memory does not grow over many of them" {
+    s := system.System<F32>(4, 1, 3)
+    x := s.Population(s.Root(), "x", 8, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, y, conn.Wiring.Dense)
+    s.Attach(s.Root(), system.Rule.Ep(0.5, true), system.Clock.Sleep)
+    s.Plan(rand.Rand(1))!
+    l := learn.Learner<F32>(s)!
+    m := store.Memory<F32>(s, x, y)
+    k := Sleeper<F32>(l, m, 16, 0.01, 3)
+    r := rand.Rand(9)
+    for _ in range 6 {
+        life(s, x, y, k, r)
+        k.Night()!
+    }
+    before := resident()
+    for _ in range 40 {
+        life(s, x, y, k, r)
+        k.Night()!
+    }
+    grown := resident() - before
+    assert grown <= 16, "resident memory grew by " + $grown + " pages"
+}

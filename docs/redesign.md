@@ -814,7 +814,7 @@ fn main() ? {
 | `sparse.olang` | reshaped | `kernels/sparse.olang` (Csr, TopK, gather/scatter) plus Tiles and Events. |
 | `circuit.olang` | replaced | `dyn/` (System, populations, connections, settle, EP). Deleted at parity (section 4.2, C3). |
 | `board.olang` | reshaped | `board/engine.olang`: a fixed-point backend of `dyn` (Q1.15 cells, `arith.Saturating`, the descriptor table a `packed struct`), golden vectors kept bit for bit. |
-| `store.olang`, `consolidator.olang`, `agent.olang` | moved | oagent (question 2); the parts the library needs become rules: `DeltaWrite`, `ThreeFactor`, the top-k store as a connection over `kernels/sparse`. |
+| `store.olang`, `consolidator.olang`, `agent.olang` | moved | oagent (question 2); the parts the library needs become rules: `DeltaWrite`, `ThreeFactor`, the top-k store as a connection over `kernels/sparse`. Built 2026-11-15: `dyn/store.olang` and `dyn/sleep.olang` (as built, section 3, decision 2). |
 | `tokenizer.olang`, `datasets/*` | kept | `data/` unchanged, plus `data/tokens.olang`. |
 | `examples/*` | rewritten | each on the new layers, or moved to oagent with the agent (bandit, sleep, nights). |
 | `bench/*` | rewritten | one driver per number of section 4.3; `bench/ref/mlp.c` kept. |
@@ -865,6 +865,31 @@ fn main() ? {
    AGI model being bootstrapped: its configuration and architecture choices, trained weights and checkpoints, training
    data and recipes, its experiments and their results. Nothing moves out of oann in C3. Datasets we create (not ones
    retrieved) are oagent's too - "basically any company secrets" (the user, 2026-11-15).
+   **As built (2026-11-15, wt-oannmem).** The agent's two remaining mechanisms are in `dyn`, on the library's own parts.
+   `dyn/store.olang`: `Store<T>` (the old store - sparse code by a seeded projection, `sparse.TopK`, read by
+   `GatherRowsWeighted`, written by the delta rule through `ScatterRank1`; capacity is `Cells`/`K`, eviction is `Fade`
+   (pending, folded below 1/2) and `Clear`; `Familiarity`, kept codes, masked writes), and `Memory<T>`, the store as a
+   connection of a system - from a key population's rows to a value population's: `Recall` carries its read into the
+   value's drive, `Write(gate)` stores the value's rows (a readout's targets) at the key's, the rule `Remember` writes on
+   a clock (`Rule.Custom`). `dyn/sleep.olang`: `Sleeper<T>` - `Day` (the store writes the residual of the slow part's
+   free answer, the key rows enter a reservoir of cues), `Night` (every cue dreamed with the store's read, the slow
+   weights taught the dreams by `Learner.Tick(Clock.Sleep)` - an attached `Rule.Ep` or `ThreeFactor` - and an AdamW step
+   per batch, the store cleared and rewritten at dawn with each dream's residual until it reads back), and `Dream`, a
+   rule that runs the night on a clock. Per-step paths are pinned allocation-free with top-level asserts (`Store`'s read,
+   write, code, fade, `Memory.Recall`; the sleeper's cue, dawn rewrite and replayed-batch load) and resident memory over
+   many days and nights is tested; `Memory.Write` reads its gate through `System.Value` (a tensor view) and is measured,
+   not pinned. Not ported: the consolidator's gated recurrence and its BPTT window (nn's graph, not a settle) with the
+   gradient check and line-search day steps that tested it - replay here goes through the system's own rules. The flip-flop
+   retention experiment does not port as it was (its target is a state carried over a window): `examples/sleep_replay.olang`
+   runs the same protocol on a stateless flip-flop (the held state an input). Measured (6 lives, 4 days of A then 4 of B,
+   16 patterns a day; accuracy %, mean +- 95% interval; **different tasks, not comparable beyond the protocol**): old
+   example (`oagent/agent/examples/sleep_retention`, 12-step windows, 16 slow neurons, 60 passes): store alone, A recalled
+   after B 19.6 +- 6.3, days and nights 0.0 +- 0.0; new example (stateless, 32 hidden units, 100 passes, a store of 48
+   cells): store alone 71.1 +- 12.5, days and nights 72.1 +- 14.4 - nights do not protect A against B in either (the dreams
+   of an A the store has lost are the store's mistakes: sleep consolidates what the system produces), and in the new one
+   they make the slow part alone as good as the whole (71.5 against 43.0). Tests: `dyn/store.olang` (11, the old store's
+   eight plus the connection's three), `dyn/sleep.olang` (8).
+
 3. **Structure changes - decided (the user, 2026-11-15: "we want the networks to be prunable at runtime eventually at
    least. its not the most important first step, but dont depend it never being the case").** The first build may
    re-plan between runs, but nothing may assume a planned system's structure is fixed: connections carry an active mask

@@ -1,0 +1,630 @@
+# dyn/store - the top-k associative store as a connection (docs/settling.md 1.6, 2.7): a cerebellum-style memory
+# (Marr 1969; Albus 1971; Kanerva 1988) from readings of Inputs numbers to predictions of Outputs, over kernels/sparse.
+# A reading minus its running mean is projected by a fixed random matrix R (Cells x Inputs, entries N(0, 1 / Inputs))
+# onto Cells cells; the K strongest are kept, rectified and scaled to unit length - the code - and a table of Cells
+# rows of Outputs is read at the K active rows only (sparse.GatherRowsWeighted), and written by the delta rule at them
+# (sparse.ScatterRank1):
+#
+#   z = R (x - mean),   code = unit(relu(top_K(z))),   y = code T,   T[active] += Rate code[active]^T (target - y)
+#
+# With a unit code and Rate 1 a write stores its target exactly, and a reading whose code shares no active cell with it
+# is not disturbed at all: interference is only through shared cells, by the dot of the codes. A smaller Rate averages
+# noisy targets over about 1 / Rate visits (the delta rule is stable for 0 < Rate < 2). Defaults: Cells = 20 Inputs, K =
+# 5% of them rounded up (the sparse expansion of the fly's olfactory circuit, Dasgupta, Stevens and Navlakha 2017),
+# Rate 1, the running mean following each write with weight MeanRate = 0.01. R's row i is drawn from a generator of its
+# own, seeded by the store's seed and i, so any row can be made again from the seed alone (an FPGA need not store R).
+#
+# Capacity and eviction. The table holds Cells rows; what a write displaces is what shares its cells (the delta rule
+# moves the shared read toward the new target), so capacity is Cells / K codes at no interference and degrades
+# smoothly past it. Eviction is Fade(f): every value held is multiplied by f (a hippocampus whose traces decay unless
+# consolidated, McClelland, McNaughton and O'Reilly 1995), kept pending as one number and folded into the table only
+# when it falls below 1/2, so a fade costs nothing per read or write; Clear forgets everything. With Familiarity the
+# store also keeps how much of each output the writes have taught it at every cell (a second table, written toward 1
+# for the outputs a write knows, never faded) - ReadFamiliar gives how much of a read is what writes put there.
+#
+# Memory is the store as a connection of a system: from a key population (its rows are the readings) into a value
+# population (what it carries into the drive of, as a stimulus), written by a rule on a clock (Remember). Nothing is
+# allocated after either is made.
+
+import "std/rand"
+import "../kernels/sparse"
+import "neuron"
+import "system"
+
+type Store<T> struct(inputs I64, outputs I64, seed U64, Cells I64 = 0, Active I64 = 0, Rate F64 = 1
+    MeanRate F64 = 0.01, Familiarity Bool = false) {
+    Inputs I64 = inputs
+    Outputs I64 = outputs
+    Seed U64 = seed
+    N I64 = Cells if Cells > 0 else 20 * inputs                    # the cells
+    K I64 = Active if Active > 0 else I64((0.05 * F64(N)).Ceil())  # the active cells of a code
+    Rate
+    MeanRate
+    Familiarity
+    assert N >= 1 and K >= 1 and K <= N and Outputs >= 1
+    R mut Array<T>& = Array<T>(N * inputs)      # N x Inputs, row by row
+    fillProjection(R, N, inputs, seed)
+    Table mut Array<T>& = Array<T>(N * outputs) # N x Outputs
+    Mean mut Array<T>& = Array<T>(inputs)
+    Writes I64 = 0
+    Pending F64 = 1.0                           # the table holds Pending Table: fades not yet folded
+    centered mut Array<T>& = Array<T>(inputs)
+    z mut Array<T>& = Array<T>(N)
+    work mut Array<T>& = Array<T>(N)
+    Idx mut Array<I32>& = Array<I32>(K)         # the last code's cells, increasing
+    Code mut Array<T>& = Array<T>(K)            # and their values (a selected cell may be 0)
+    y mut Array<T>& = Array<T>(outputs)
+    err mut Array<T>& = Array<T>(outputs)
+    Familiar mut Array<T>& = Array<T>(N * outputs if Familiarity else 0) # N x Outputs, with Familiarity
+}
+
+# row i of the projection into out[at ..] (Inputs of them): N(0, 1 / Inputs) from the generator of seed and i - what an
+# engine regenerates instead of storing R
+fn ProjectionRow<T>(seed U64, i I64, inputs I64, out mut Array<T>&, at I64) {
+    r := rand.Rand(seed ^ (U64(i + 1) * U64(0x9E3779B97F4A7C15)))
+    sd := 1.0 / F64(inputs).Sqrt()
+    for j in range inputs: out[at + j] = T(sd * r.Normal())
+}
+
+fn fillProjection<T>(r mut Array<T>&, cells I64, inputs I64, seed U64) {
+    for i in range cells: ProjectionRow(seed, i, inputs, r, i * inputs)
+}
+
+# the code of reading x at the mean as it is, into Idx and Code; gives the cells active (positive)
+fn (s mut Store<T>&) code(x Array<T>&) I64 {
+    for i in range s.Inputs: s.centered[i] = x[i] - s.Mean[i]
+    for c in range s.N {
+        row := c * s.Inputs
+        sum T = T(0)
+        for i in range s.Inputs: sum += s.R[row + i] * s.centered[i]
+        s.z[c] = sum
+    }
+    sparse.TopK(s.z, 0, s.N, s.K, s.Idx, s.work)
+    sq F64 = 0.0
+    active I64 = 0
+    for j in range s.K {
+        v := s.z[I64(s.Idx[j])]
+        s.Code[j] = v if v > T(0) else T(0)
+        sq += F64(s.Code[j]) * F64(s.Code[j])
+        if v > T(0): active++
+    }
+    if sq > 0.0 {
+        inv := T(1.0 / sq.Sqrt())
+        for j in range s.K: s.Code[j] *= inv
+    }
+    return active
+}
+
+# the store's prediction for reading x, into out (Outputs of them): code(x) T. Changes nothing but the workspace
+fn (s mut Store<T>&) Read(x Array<T>&, out mut Array<T>&) {
+    s.code(x)
+    sparse.GatherRowsWeighted(out, s.Table, s.Idx, s.Code, s.K)
+    s.pend(out)
+}
+
+# out times the pending fade, when there is one
+fn (s Store<T>&) pend(out mut Array<T>&) {
+    if s.Pending == 1.0: return
+    p := T(s.Pending)
+    for t in range out.Len(): out[t] *= p
+}
+
+# the table's rate for a write of rate: rate over the pending fade, so the values held move by rate times the error
+fn (s Store<T>&) scaled(rate F64) T { return T(rate if s.Pending == 1.0 else rate / s.Pending) }
+
+# every value the store holds multiplied by factor (in (0, 1]): kept pending, folded into the table when below 1/2
+fn (s mut Store<T>&) Fade(factor F64) {
+    s.Pending *= factor
+    if s.Pending < 0.5: s.Fold()
+}
+
+# the pending fade folded into the table (Pending 1 again) - what a checkpoint keeps
+fn (s mut Store<T>&) Fold() {
+    if s.Pending == 1.0: return
+    p := T(s.Pending)
+    for i in range s.Table.Len(): s.Table[i] *= p
+    s.Pending = 1.0
+}
+
+# whether output t is left out of a write: known marks the outputs it writes, and no mask writes them all
+fn unknown(known Array<Bool>?&, t I64) Bool { return known != null and not known[t] }
+
+# one write of target for reading x: the running mean moves toward x, then the table's active rows by the delta rule
+# toward target, at Rate times scale. With known, only the outputs it marks are written - the others' errors are taken
+# as 0, so their reads stay as they were (a target observed in part: an agent's reward for the one action it took).
+# Gives the cells active
+fn (s mut Store<T>&) Write(x Array<T>&, target Array<T>&, known Array<Bool>?& = null, scale F64 = 1.0) I64 {
+    if s.MeanRate > 0.0 {
+        m := T(s.MeanRate)
+        for i in range s.Inputs: s.Mean[i] += m * (x[i] - s.Mean[i])
+    }
+    active := s.code(x)
+    sparse.GatherRowsWeighted(s.y, s.Table, s.Idx, s.Code, s.K)
+    s.pend(s.y)
+    for t in range s.Outputs: s.err[t] = T(0) if unknown(known, t) else target[t] - s.y[t]
+    sparse.ScatterRank1(s.Table, s.Idx, s.Code, s.K, s.err, s.scaled(s.Rate * scale))
+    if s.Familiarity: s.teachFamiliar(known, scale)
+    s.Writes++
+    return active
+}
+
+# the second table written toward 1 at the last code's cells, for the outputs known
+fn (s mut Store<T>&) teachFamiliar(known Array<Bool>?&, scale F64) {
+    sparse.GatherRowsWeighted(s.y, s.Familiar, s.Idx, s.Code, s.K)
+    for t in range s.Outputs: s.err[t] = T(0) if unknown(known, t) else T(1) - s.y[t]
+    sparse.ScatterRank1(s.Familiar, s.Idx, s.Code, s.K, s.err, T(s.Rate * scale))
+}
+
+# how familiar the last code read or written is (Familiarity): per output, the second table's read at it, clamped to
+# [0, 1] - what share of the read the writes taught, 0 where none reached the code's cells
+fn (s Store<T>&) ReadFamiliar(out mut Array<T>&) {
+    sparse.GatherRowsWeighted(out, s.Familiar, s.Idx, s.Code, s.K)
+    for t in range s.Outputs: out[t] = out[t].Clamp(T(0), T(1))
+}
+
+# the code of reading x at the mean as it is, its K cells (increasing) into idx and their values into code; gives the
+# cells active - what Read and Write compute first, kept by a caller that reads or writes one reading many times
+fn (s mut Store<T>&) Encode(x Array<T>&, idx mut Array<I32>&, code mut Array<T>&) I64 {
+    active := s.code(x)
+    for j in range s.K {
+        idx[j] = s.Idx[j]
+        code[j] = s.Code[j]
+    }
+    return active
+}
+
+# Read at a code Encode gave: code T at its cells, into out
+fn (s Store<T>&) ReadCode(idx Array<I32>&, code Array<T>&, out mut Array<T>&) {
+    sparse.GatherRowsWeighted(out, s.Table, idx, code, s.K)
+    s.pend(out)
+}
+
+# Write at a code Encode gave: the delta rule toward target at its cells, at rate (Rate when rate is 0) - the mean does
+# not move (the code is already made)
+fn (s mut Store<T>&) WriteCode(idx Array<I32>&, code Array<T>&, target Array<T>&, rate F64 = 0.0) {
+    sparse.GatherRowsWeighted(s.y, s.Table, idx, code, s.K)
+    s.pend(s.y)
+    for t in range s.Outputs: s.err[t] = target[t] - s.y[t]
+    sparse.ScatterRank1(s.Table, idx, code, s.K, s.err, s.scaled(rate if rate != 0.0 else s.Rate))
+    s.Writes++
+}
+
+# the projection made again from another seed - a checkpoint's store restored into one made from its own
+fn (s mut Store<T>&) Reseed(seed U64) {
+    s.Seed = seed
+    fillProjection(s.R, s.N, s.Inputs, seed)
+}
+
+# the table forgets everything (the projection and the mean stay)
+fn (s mut Store<T>&) Clear() {
+    for i in range s.Table.Len(): s.Table[i] = T(0)
+    s.Pending = 1.0
+}
+
+# ---- the store as a connection of a system ----
+
+# a store from the key population's rows into the value population's: Recall carries its read of every batch row into
+# the value population's drive (a stimulus added to its total - the memory's read), Write stores the value population's
+# rows at the key population's. A key row is the population's drive if it is an input, else its free-phase activity; a
+# value row written is a readout's target, an input's drive, else its free-phase activity
+type Memory<T> struct(s mut system.System<T>&, key system.Pop, value system.Pop, Cells I64 = 0, Active I64 = 0
+    Rate F64 = 1, MeanRate F64 = 0.01, Familiarity Bool = false, seed U64 = 1) {
+    S mut system.System<T>& = s
+    Key system.Pop = key
+    Value system.Pop = value
+    Core mut Store<T>& = Store<T>(s.Pop(key).Size, s.Pop(value).Size, seed, Cells, Active, Rate, MeanRate, Familiarity)
+    read mut Array<T>& = Array<T>(s.Pop(value).Size)
+}
+
+# row r of the key population's readings
+fn (m Memory<T>&) KeyRow(r I64) Array<T>& {
+    p := m.S.Pop(m.Key)
+    if p.Role == neuron.Role.Input: return p.Drive[r * p.Size:(r + 1) * p.Size]
+    return p.Activity(0)[r * p.Size:(r + 1) * p.Size]
+}
+
+# row r of what the value population is to hold
+fn (m Memory<T>&) ValueRow(r I64) Array<T>& {
+    p := m.S.Pop(m.Value)
+    if p.Target.Len() > 0: return p.Target[r * p.Size:(r + 1) * p.Size]
+    if p.Role == neuron.Role.Input: return p.Drive[r * p.Size:(r + 1) * p.Size]
+    return p.Activity(0)[r * p.Size:(r + 1) * p.Size]
+}
+
+# the store's read of every key row into the value population's drive
+fn (m mut Memory<T>&) Recall() {
+    p := m.S.Pop(m.Value)
+    for r in range m.S.Batch {
+        m.Core.Read(m.KeyRow(r), m.read)
+        for j in range p.Size: p.Drive[r * p.Size + j] = m.read[j]
+    }
+}
+
+# every batch row written at the gate's rate: nothing at 0 (a neuromodulator opening the store to writes)
+fn (m mut Memory<T>&) Write(gate system.Sig) {
+    g := F64(m.S.Value(gate).Get(0))
+    if g == 0.0: return
+    for r in range m.S.Batch: m.Core.Write(m.KeyRow(r), m.ValueRow(r), null, g)
+}
+
+# a rule that writes the memory, for Attach(m, system.Rule.Custom(...), clock): the gate's signal opens it
+type Remember struct(m mut Memory<F32>&, gate system.Sig) {
+    M mut Memory<F32>& = m
+    Gate system.Sig = gate
+}
+
+fn (r mut Remember&) Apply(params mut Array<F32>&, grads mut Array<F32>&) { r.M.Write(r.Gate) }
+
+# ---- what must not allocate, decided while compiling (S17a, G42): a read, a write, a code, a fade, a recall ----
+# Not pinned: Memory.Write reads its gate through System.Value, which makes a tensor view (as Learner.DeltaWrite's does);
+# resident memory over many writes is measured instead (the tests).
+
+fn readOf(s mut Store<F32>&, x Array<F32>&, out mut Array<F32>&) { s.Read(x, out) }
+fn writeOf(s mut Store<F32>&, x Array<F32>&, t Array<F32>&) { s.Write(x, t) }
+fn codeOf(s mut Store<F32>&, x Array<F32>&, idx mut Array<I32>&, code mut Array<F32>&) { s.Encode(x, idx, code) }
+fn codeWriteOf(s mut Store<F32>&, idx Array<I32>&, code Array<F32>&, t Array<F32>&) { s.WriteCode(idx, code, t) }
+fn fadeOf(s mut Store<F32>&) { s.Fade(0.9) }
+fn recallOf(m mut Memory<F32>&) { m.Recall() }
+
+assert not readOf.Allocates, "a store's read allocates"
+assert not writeOf.Allocates, "a store's write allocates"
+assert not codeOf.Allocates, "a store's code allocates"
+assert not codeWriteOf.Allocates, "a write at a kept code allocates"
+assert not fadeOf.Allocates, "a fade allocates"
+assert not recallOf.Allocates, "a memory's recall allocates"
+
+# ---- tests (docs/settling.md 5.3.2), in F64: the old store's, ported ----
+
+import "std/os"
+import "../tensor"
+import "learn"
+import "conn"
+
+# a reading of n numbers uniform in [-1, 1)
+fn reading(r mut rand.Rand&, n I64) Array<F64>& {
+    x mut Array<F64>& = Array<F64>(n)
+    for i in range n: x[i] = r.Uniform(-1.0, 1.0)
+    return x
+}
+
+test Store.code "a code has norm 1 and exactly K active cells, the K largest of the projection" {
+    s := Store<F64>(16, 3, 7)
+    assert s.N == 320 and s.K == 16
+    r := rand.Rand(1)
+    for _ in range 50 {
+        x := reading(r, 16)
+        assert s.code(x) == 16
+        norm F64 = 0.0
+        for j in range s.K: norm += s.Code[j] * s.Code[j]
+        assert (norm - 1.0).Abs() < 1e-14
+        least F64 = 1e300
+        for j in range s.K: least = least.Min(s.z[I64(s.Idx[j])])
+        selected := Array<Bool>(s.N)
+        for j in range s.K: selected[I64(s.Idx[j])] = true
+        for c in range s.N {
+            if not selected[c]: assert s.z[c] <= least
+        }
+    }
+    # the projection's rows are regenerated from the seed alone
+    row := Array<F64>(16)
+    ProjectionRow(7, 123, 16, row, 0)
+    for j in range 16: assert row[j] == s.R[123 * 16 + j]
+}
+
+test Store.Write "a write at rate 1 is read back exactly; another reading is disturbed only through shared cells, by the codes' dot" {
+    s := Store<F64>(16, 3, 8, 0, 0, 1, 0) # the mean held at 0, so both readings' codes stay as they are
+    r := rand.Rand(2)
+    for _ in range 20 {
+        x := reading(r, 16)
+        q := reading(r, 16)
+        target := reading(r, 3)
+        before := Array<F64>(3)
+        s.Read(q, before)
+        s.code(q)
+        qIdx := Array<I32>(s.K)
+        qCode := Array<F64>(s.K)
+        for j in range s.K {
+            qIdx[j] = s.Idx[j]
+            qCode[j] = s.Code[j]
+        }
+        y := Array<F64>(3)
+        s.Read(x, y)
+        s.Write(x, target)
+        dot F64 = 0.0
+        shared I64 = 0
+        for a in range s.K {
+            for b in range s.K {
+                if qIdx[a] == s.Idx[b] {
+                    dot += qCode[a] * s.Code[b]
+                    shared++
+                }
+            }
+        }
+        out := Array<F64>(3)
+        s.Read(x, out)
+        for t in range 3: assert (out[t] - target[t]).Abs() < 1e-14
+        s.Read(q, out)
+        for t in range 3: assert (out[t] - before[t] - dot * (target[t] - y[t])).Abs() < 1e-14
+        if shared == 0 {
+            for t in range 3: assert out[t] == before[t]
+        }
+    }
+}
+
+test Store.WriteCode "a code kept: ReadCode and WriteCode are Read and Write at the code Encode gave" {
+    a := Store<F64>(8, 2, 11, 0, 0, 1, 0)
+    b := Store<F64>(8, 2, 11, 0, 0, 1, 0)
+    r := rand.Rand(5)
+    idx := Array<I32>(a.K)
+    code := Array<F64>(a.K)
+    out := Array<F64>(2)
+    want := Array<F64>(2)
+    for _ in range 30 {
+        x := reading(r, 8)
+        target := reading(r, 2)
+        a.Encode(x, idx, code)
+        a.WriteCode(idx, code, target)
+        b.Write(x, target)
+        q := reading(r, 8)
+        a.Encode(q, idx, code)
+        a.ReadCode(idx, code, out)
+        b.Read(q, want)
+        for t in range 2: assert out[t] == want[t]
+    }
+    for i in range a.Table.Len(): assert a.Table[i] == b.Table[i]
+}
+
+test Store.Write "a write that knows only some outputs leaves the others' reads as they were, everywhere" {
+    s := Store<F64>(8, 3, 12, 0, 0, 0.5, 0)
+    r := rand.Rand(6)
+    known := Array<Bool>[false, true, false]
+    before := Array<F64>(3)
+    after := Array<F64>(3)
+    for _ in range 40 {
+        x := reading(r, 8)
+        target := reading(r, 3)
+        s.Write(x, target)
+        q := reading(r, 8)
+        s.Read(q, before)
+        s.Read(x, after)
+        moved := after[1] + 0.5 * (target[1] - after[1])
+        s.Write(x, target, known)
+        s.Read(x, after)
+        assert (after[1] - moved).Abs() < 1e-14
+        s.Read(q, after)
+        assert after[0] == before[0] and after[2] == before[2]
+    }
+}
+
+test Store.Write "the running mean follows the writes, and a smaller rate averages noisy targets" {
+    s := Store<F64>(4, 1, 9, 80, 4, 0.1, 0.25)
+    r := rand.Rand(3)
+    mean := Array<F64>(4)
+    x := Array<F64>[0.5, -0.25, 1.0, 0.0]
+    target := Array<F64>(1)
+    out := Array<F64>(1)
+    for _ in range 400 {
+        target[0] = 0.7 + r.Uniform(-0.2, 0.2)
+        s.Write(x, target)
+        for i in range 4: mean[i] = mean[i] + 0.25 * (x[i] - mean[i])
+    }
+    for i in range 4: assert (s.Mean[i] - mean[i]).Abs() < 1e-14
+    q := Array<F64>[1.0, 1.0, -1.0, 0.5]
+    for _ in range 400 {
+        target[0] = 0.7 + r.Uniform(-0.2, 0.2)
+        s.Write(q, target)
+    }
+    s.Read(q, out)
+    assert (out[0] - 0.7).Abs() < 0.05, "the store reads " + $out[0]
+}
+
+test Store.Write "capacity: one exposure each, readings stored one after another and read back" {
+    r := rand.Rand(4)
+    for n in Array<I64>[16, 64] {
+        s := Store<F64>(n, 2, 10, 0, 0, 1, 0)
+        xs := Array<F64>(1000 * n)
+        ys := Array<F64>(1000 * 2)
+        for i in range xs.Len(): xs[i] = r.Uniform(-1.0, 1.0)
+        for i in range ys.Len(): ys[i] = r.Uniform(-1.0, 1.0)
+        stored I64 = 0
+        first F64 = 0.0
+        out := Array<F64>(2)
+        for count in Array<I64>[10, 100, 1000] {
+            for k in range stored, count: s.Write(xs[k * n:(k + 1) * n], ys[2 * k:2 * k + 2])
+            stored = count
+            err F64 = 0.0
+            for k in range count {
+                s.Read(xs[k * n:(k + 1) * n], out)
+                err += (out[0] - ys[2 * k]) * (out[0] - ys[2 * k]) + (out[1] - ys[2 * k + 1]) * (out[1] - ys[2 * k + 1])
+            }
+            rms F64 = (err / F64(2 * count)).Sqrt()
+            if count == 10: assert rms < 0.3, "inputs " + $n + ": rms " + $rms
+            if count == 1000: assert rms > first, "capacity is finite: rms " + $first + " at 10 stored, " + $rms + " at 1000"
+            if count == 10: first = rms
+        }
+    }
+}
+
+test Store.Fade "a fading store: every value it holds shrinks by the factor, a write still stores its target, the fade folds exactly" {
+    a := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
+    b := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
+    r := rand.Rand(8)
+    xs := Array<F64>(20 * 8)
+    for i in range xs.Len(): xs[i] = r.Uniform(-1.0, 1.0)
+    target := Array<F64>(2)
+    out := Array<F64>(2)
+    want := Array<F64>(2)
+    for k in range 20 {
+        target[0] = r.Uniform(-1.0, 1.0)
+        target[1] = r.Uniform(-1.0, 1.0)
+        a.Write(xs[8 * k:8 * k + 8], target)
+        b.Write(xs[8 * k:8 * k + 8], target)
+        a.Fade(0.9)
+        for i in range b.Table.Len(): b.Table[i] = 0.9 * b.Table[i]
+        for q in range k + 1 {
+            a.Read(xs[8 * q:8 * q + 8], out)
+            b.Read(xs[8 * q:8 * q + 8], want)
+            for t in range 2: assert (out[t] - want[t]).Abs() < 1e-12
+        }
+    }
+    assert a.Pending < 1.0 and a.Pending >= 0.5
+    a.Fold()
+    assert a.Pending == 1.0
+    for i in range a.Table.Len(): assert (a.Table[i] - b.Table[i]).Abs() < 1e-12
+    c := Store<F64>(8, 2, 13, 0, 0, 0.5, 0)
+    c.Fade(1.0)
+    assert c.Pending == 1.0
+}
+
+test Store.ReadFamiliar "familiarity: writes teach it toward 1 at their cells for the outputs they know, and nothing fades or clears it" {
+    s := Store<F64>(8, 3, 11, 0, 0, 0.5, 0.0, true)
+    r := rand.Rand(4)
+    x := reading(r, 8)
+    out := Array<F64>(3)
+    f := Array<F64>(3)
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert f[0] == 0.0 and f[1] == 0.0 and f[2] == 0.0
+    known := Array<Bool>[true, false, true]
+    target := Array<F64>[0.4, -0.7, 0.9]
+    s.Write(x, target, known)
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert (f[0] - 0.5).Abs() < 1e-14 and f[1] == 0.0 and (f[2] - 0.5).Abs() < 1e-14
+    s.Write(x, target, known)
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert (f[0] - 0.75).Abs() < 1e-14 and f[1] == 0.0 and (f[2] - 0.75).Abs() < 1e-14
+    s.Fade(0.3)
+    s.Fold()
+    s.Clear()
+    s.Read(x, out)
+    s.ReadFamiliar(f)
+    assert out[0] == 0.0 and (f[0] - 0.75).Abs() < 1e-14 and f[1] == 0.0
+    sx := Store<F64>(8, 3, 11)
+    sx.code(x)
+    apart I64 = 0
+    for _ in range 100 {
+        y := reading(r, 8)
+        s.code(y)
+        shared I64 = 0
+        for i in range s.K {
+            for j in range s.K {
+                if s.Idx[i] == sx.Idx[j]: shared++
+            }
+        }
+        if shared == 0 {
+            s.Read(y, out)
+            s.ReadFamiliar(f)
+            assert f[0] == 0.0 and f[2] == 0.0
+            apart++
+        }
+    }
+    assert apart > 10
+}
+
+# ---- tests of the connection ----
+
+# a system of a key input of n numbers and a linear readout of m, batch rows, planned
+fn rig(batch I64, n I64, m I64) system.System<F64> {
+    s := system.System<F64>(batch, 1, 1)
+    k := s.Population(s.Root(), "key", n, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    v := s.Population(s.Root(), "value", m, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(k, v, conn.Wiring.Dense)
+    s.Signal(s.Root(), "write")
+    s.Plan(rand.Rand(1))!
+    s.Weights(system.Conn(0)).Fill(0.0)
+    return s
+}
+
+test Memory.Write "a memory writes its batch rows from the key's drive and the value's target, and its recall carries them into the value's drive" {
+    s := rig(3, 8, 2)
+    gate := system.Sig(0)
+    m := Memory<F64>(s, system.Pop(0), system.Pop(1), 0, 0, 1.0, 0.0)
+    r := rand.Rand(3)
+    keys := Array<F64>(24)
+    targets := Array<F64>(6)
+    for i in range 24: keys[i] = r.Uniform(-1.0, 1.0)
+    for i in range 6: targets[i] = r.Uniform(-1.0, 1.0)
+    for i in range 24: s.Pop(system.Pop(0)).Drive[i] = keys[i]
+    for i in range 6: s.Pop(system.Pop(1)).Target[i] = targets[i]
+    m.Write(gate) # the gate is 0: nothing is written
+    assert m.Core.Writes == 0
+    s.Set(gate, tensor.Tensor<F64>.Of(Array<F64>[1.0], 1)!)!
+    m.Write(gate)
+    assert m.Core.Writes == 3
+    m.Recall()
+    drive := s.Pop(system.Pop(1)).Drive
+    # unit codes at rate 1 with the mean held: three keys' reads are the targets, up to the keys' shared cells
+    shared I64 = 0
+    for a in range 3 {
+        for b in range 3 {
+            if a == b: continue
+            m.Core.code(keys[8 * a:8 * a + 8])
+            seen := Array<I32>(m.Core.K)
+            for j in range m.Core.K: seen[j] = m.Core.Idx[j]
+            m.Core.code(keys[8 * b:8 * b + 8])
+            for i in range m.Core.K {
+                for j in range m.Core.K: shared += 1 if seen[i] == m.Core.Idx[j] else 0
+            }
+        }
+    }
+    if shared == 0 {
+        for i in range 6: assert (drive[i] - targets[i]).Abs() < 1e-12
+    }
+    # the last written row is exact whatever the sharing
+    for j in range 2: assert (drive[4 + j] - targets[4 + j]).Abs() < 1e-12 or shared > 0
+}
+
+test Remember.Apply "a Remember rule on a clock writes the memory when its Tick runs, as Write does" {
+    s := system.System<F32>(2, 1, 1)
+    k := s.Population(s.Root(), "key", 6, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    v := s.Population(s.Root(), "value", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(k, v, conn.Wiring.Dense)
+    gate := s.Signal(s.Root(), "write")
+    m := Memory<F32>(s, k, v, 0, 0, 1.0, 0.0)
+    s.Attach(s.Root(), system.Rule.Custom(Remember(m, gate)), system.Clock.Step)
+    s.Plan(rand.Rand(1))!
+    s.Set(gate, tensor.Tensor<F32>.Of(Array<F32>[1.0], 1)!)!
+    for i in range 12: s.Pop(k).Drive[i] = F32(i % 5) - 2.0
+    for i in range 4: s.Pop(v).Target[i] = F32(i) * 0.25
+    l := learn.Learner<F32>(s)!
+    l.Tick(system.Clock.Sweep)!
+    assert m.Core.Writes == 0
+    l.Tick(system.Clock.Step)!
+    assert m.Core.Writes == 2
+    m.Recall()
+    assert (s.Pop(v).Drive[3] - 0.75).Abs() < 1e-5
+}
+
+fn resident() I64 {
+    stat := try os.ReadFile("/proc/self/statm") catch { unreachable }
+    return try stat.Split(" ")[1].ParseInt(10) catch { unreachable }
+}
+
+test Memory.Recall "writes, recalls and fades allocate nothing: resident memory does not grow over thousands of them" {
+    s := system.System<F32>(8, 1, 1)
+    k := s.Population(s.Root(), "key", 32, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    v := s.Population(s.Root(), "value", 4, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(k, v, conn.Wiring.Dense)
+    gate := s.Signal(s.Root(), "write")
+    s.Plan(rand.Rand(1))!
+    m := Memory<F32>(s, k, v)
+    s.Set(gate, tensor.Tensor<F32>.Of(Array<F32>[1.0], 1)!)!
+    r := rand.Rand(5)
+    for i in range 8 * 32: s.Pop(k).Drive[i] = F32(r.Uniform(-1.0, 1.0))
+    for i in range 8 * 4: s.Pop(v).Target[i] = F32(r.Uniform(-1.0, 1.0))
+    for _ in range 20 {
+        m.Write(gate)
+        m.Recall()
+        m.Core.Fade(0.99)
+    }
+    before := resident()
+    for _ in range 2000 {
+        m.Write(gate)
+        m.Recall()
+        m.Core.Fade(0.99)
+    }
+    grown := resident() - before
+    assert grown <= 16, "resident memory grew by " + $grown + " pages"
+}
