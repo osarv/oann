@@ -808,7 +808,6 @@ type Events struct(units I64, capacity I64 = 0) {
 # made x[j] (what the consumers now hold). Others untouched. An overflow of Capacity: the largest changes (ties to the
 # earlier unit)
 fn (e mut Events&) Collect<A>(x Array<A>&, last mut Array<A>&, delta mut Array<A>&, threshold A) {
-    z A
     above I64 = 0
     for j in range e.Units: above += 1 if (x[j] - last[j]).Abs() > threshold else 0
     e.Over = above - lesser(above, e.Capacity)
@@ -1267,7 +1266,7 @@ fn blocky(rows I64, cols I64, tile I64, density F64, r mut rand.Rand&) mat.Mat<F
     return m
 }
 
-test Tiles "tiles: the products equal the dense ones, with ragged edges, every width, strided and not, and quiet blocks skipped" {
+test Tiles "the products equal the dense ones, with ragged edges, every width, strided and not, and quiet blocks skipped" {
     r := rand.Rand(6)
     for tile in Array<I64>[4, 16, 32] {
         m := blocky(50, 70, tile, 0.4, r)
@@ -1341,4 +1340,203 @@ test Tiles "tasks: a tile product is the same, bit for bit, at every thread coun
         }
         assert d == one and dt == oneT
     }
+}
+
+test Tiles "retiring tiles in place: Drop skips them at once, Compact moves the live ones together, the product is the dense one's" {
+    r := rand.Rand(8)
+    m := blocky(48, 64, 16, 0.7, r)
+    w := Tiles<F64>.Of(m, 16)
+    n := w.Stored()
+    keep := Array<Bool>[e % 3 != 1 for e in range n]
+    kept I64 = 0
+    for e in range n: kept += 1 if keep[e] else 0
+    assert kept > 0 and kept < n
+    # a tile is kept by its largest entry: scaled down, the first tile is the one a threshold drops
+    for u in range 256: w.Data[u] = w.Data[u] * 0.01
+    small := Array<Bool>(n)
+    w.KeepAtLeast(small, 0.5)
+    assert not small[0] and small[1]
+    # a gradient laid out like the tiles' data follows them
+    grad := Array<F64>(w.Data.Len())
+    for e in range grad.Len(): grad[e] = F64(e)
+    was := Array<F64>[w.Data[e] for e in range w.Data.Len()]
+    dense := Array<F64>(48 * 64)
+    w.Drop(keep)
+    assert w.Alive() == kept and w.Stored() == n
+    w.Dense(mat.Mat<F64>(dense, 0, 48, 64, 64))
+    x := gappy(64, 4, F64(0), r)
+    y := mat.Mat<F64>(Array<F64>(48 * 4), 0, 48, 4, 4)
+    macs := Macs()
+    w.MulAdd(y, x, false, 1.0, Array<Bool>(0), 1, macs)
+    want := denseProduct(dense, 48, 64, exact(x), 4, false, 1.0)
+    assert worst(y, want) < 1e-13
+    # the live tiles' area is what was done, out of the whole matrix
+    assert macs.Dense == 48 * 64 * 4 and macs.Effective == kept * 256 * 4
+    # compacted: fewer tiles stored, all live, the same product, the arrays as long as before, the gradient moved along
+    length := w.Data.Len()
+    assert Squeeze(grad, w.Live, 256) == kept
+    w.Compact()
+    assert w.Stored() == kept and w.Alive() == kept and w.Data.Len() == length
+    y2 := mat.Mat<F64>(Array<F64>(48 * 4), 0, 48, 4, 4)
+    w.MulAdd(y2, x)
+    assert worst(y2, want) < 1e-13
+    for e in range kept * 256: assert w.Data[e] == was[I64(grad[e])]
+    for rr in range w.TileRows {
+        for e in range w.Ptr[rr] + 1, w.Ptr[rr + 1]: assert w.Col[e] > w.Col[e - 1]
+    }
+}
+
+test Macs "counters: every product adds what a dense one would have done and what it did" {
+    r := rand.Rand(9)
+    w := Csr<F64>.Random(40, 50, 0.1, r)
+    x := gappy(50, 6, F64(0), r)
+    xt := gappy(40, 6, F64(0), r)
+    macs := Macs()
+    w.MulAdd(mat.Mat<F64>(Array<F64>(240), 0, 40, 6, 6), x, false, 1.0, 1, macs)
+    assert macs.Dense == 40 * 50 * 6 and macs.Effective == w.Nnz() * 6
+    w.MulAdd(mat.Mat<F64>(Array<F64>(300), 0, 50, 6, 6), xt, true, 1.0, 1, macs)
+    g := Array<F64>(w.Nnz())
+    w.Sampled(g, xt, x, 1.0, false, 1, macs)
+    assert macs.Dense == 3 * 40 * 50 * 6 and macs.Effective == 3 * w.Nnz() * 6
+    assert (macs.Ratio() - w.Density()).Abs() < 1e-12
+    macs.Clear()
+    assert macs.Dense == 0 and macs.Effective == 0 and macs.Ratio() == 1.0
+}
+
+test Events "only the units that moved are reported and transported, and the total stays W^T of what the consumers hold" {
+    r := rand.Rand(10)
+    m := blocky(64, 40, 8, 0.6, r)
+    csr := Csr<F64>.Of(m)
+    tiles := Tiles<F64>.Of(m, 8)
+    dense := exact(m)
+    e := Events(64)
+    x := Array<F64>(64)
+    last := Array<F64>(64)
+    delta := Array<F64>(64)
+    yd := Array<F64>(40)
+    ys := Array<F64>(40)
+    yt := Array<F64>(40)
+    macs := Macs()
+    for step in range 6 {
+        # about a fifth of the units move by a lot, the rest drift by less than the threshold
+        moved I64 = 0
+        for j in range 64 {
+            if r.Float() < 0.2 {
+                x[j] += r.Uniform(0.5, 1.0)
+                moved++
+            } else {
+                x[j] += r.Uniform(-0.01, 0.01)
+            }
+        }
+        e.Collect(x, last, delta, 0.1)
+        assert e.Count >= moved - 1 and e.Over == 0
+        for k in range e.Count: assert e.Idx[k] >= 0 and (k == 0 or e.Idx[k] > e.Idx[k - 1])
+        before := macs.Effective
+        Transport(m, yd, e, delta, 1, macs)
+        csr.Transport(ys, e, delta)
+        tiles.Transport(yt, e, delta)
+        assert macs.Effective - before == e.Count * 40 and macs.Dense == (step + 1) * 64 * 40
+        # y holds sum over j of W[j, .] last[j]
+        for c in range 40 {
+            want F64 = 0.0
+            for j in range 64: want += dense[j * 40 + c] * last[j]
+            assert (yd[c] - want).Abs() < 1e-12 and (ys[c] - want).Abs() < 1e-12 and (yt[c] - want).Abs() < 1e-12
+        }
+        # what was reported is what the consumers hold; the quiet units' drift is below the threshold
+        for j in range 64: assert (x[j] - last[j]).Abs() <= 0.1
+    }
+}
+
+test Events "more changes than the capacity - the largest are reported, the rest wait and are not lost" {
+    r := rand.Rand(11)
+    e := Events(50, 5)
+    x := Array<F64>[r.Uniform(1.0, 2.0) for _ in range 50]
+    last := Array<F64>(50)
+    delta := Array<F64>(50)
+    e.Collect(x, last, delta, 0.1)
+    assert e.Count == 5 and e.Over == 45
+    # the five largest, in increasing order of unit
+    for k in range 5 {
+        j := I64(e.Idx[k])
+        beaten I64 = 0
+        for q in range 50 {
+            if x[q] > x[j] or (x[q] == x[j] and q < j): beaten++
+        }
+        assert beaten < 5 and last[j] == x[j] and delta[j] == x[j]
+        assert k == 0 or e.Idx[k] > e.Idx[k - 1]
+    }
+    # the others still differ from what is held, and come in the next steps: ten steps in all caught up
+    held I64 = 0
+    for j in range 50: held += 1 if last[j] == x[j] else 0
+    assert held == 5
+    for _ in range 9: e.Collect(x, last, delta, 0.1)
+    for j in range 50: assert last[j] == x[j]
+    e.Collect(x, last, delta, 0.1)
+    assert e.Count == 0 and e.Over == 0
+}
+
+test TopK "the k largest positions, ties to the earlier, in increasing order, per row and in tasks" {
+    r := rand.Rand(3)
+    work := Array<F64>(500)
+    out := Array<I32>(500)
+    for trial in range 40 {
+        n I64 = 1 + r.Below(500)
+        k I64 = 1 + r.Below(n)
+        x := Array<F64>(n)
+        for i in range n: x[i] = F64(r.Below(30)) if trial % 2 == 0 else r.Uniform(-1.0, 1.0) # with many ties, then none
+        TopK(x, 0, n, k, out, work)
+        # the reference: a position is chosen when fewer than k elements beat it (larger, or equal and earlier)
+        m I64 = 0
+        for i in range n {
+            beaten I64 = 0
+            for j in range n {
+                if x[j] > x[i] or (x[j] == x[i] and j < i): beaten++
+            }
+            if beaten < k {
+                assert out[m] == I32(i)
+                m++
+            }
+        }
+        assert m == k
+    }
+    # a sorted and a reversed input, the quickselect's classic worst shapes
+    x := Array<F64>(300)
+    for i in range 300: x[i] = F64(i)
+    TopK(x, 0, 300, 10, out, work)
+    for j in range 10: assert out[j] == I32(290 + j)
+    for i in range 300: x[i] = F64(300 - i)
+    TopK(x, 0, 300, 10, out, work)
+    for j in range 10: assert out[j] == I32(j)
+    # rows of a matrix: the same selection per row, the values read back, the same for every task count
+    m := gappy(300, 200, F64(0), r)
+    one := Array<I32>(300 * 7)
+    for threads in Array<I64>[1, 4] {
+        idx := Array<I32>(300 * 7)
+        val := Array<F64>(300 * 7)
+        RowTopK(idx, val, m, 7, Array<F64>(200 * threads), threads)
+        for row in range 300 {
+            TopK(m.Data, m.Off + row * m.Ld, 200, 7, out, work)
+            for j in range 7 {
+                assert idx[row * 7 + j] == out[j] and val[row * 7 + j] == m[row, I64(out[j])]
+            }
+        }
+        if threads == 1 {
+            for e in range idx.Len(): one[e] = idx[e]
+        } else {
+            assert idx == one
+        }
+    }
+}
+
+test "the sparse-code products: a weighted gather of k rows, and a rank-1 write to them" {
+    table := Array<F64>(6 * 3)
+    for i in range table.Len(): table[i] = F64(i)
+    idx := Array<I32>[4, 1]
+    w := Array<F64>[0.5, -2.0]
+    out := Array<F64>(3)
+    GatherRowsWeighted(out, table, idx, w, 2)
+    for t in range 3: assert out[t] == 0.5 * F64(12 + t) - 2.0 * F64(3 + t)
+    err := Array<F64>[1.0, 0.0, -1.0]
+    ScatterRank1(table, idx, w, 2, err, 0.1)
+    assert table[12] == 12.0 + 0.05 and table[14] == 14.0 - 0.05 and table[3] == 3.0 - 0.2 and table[0] == 0.0
 }
