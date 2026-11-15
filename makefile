@@ -11,7 +11,7 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
 
-.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench xor spiking hybridbench mnistlearn sample clean
+.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench xor spiking hybridbench sleepreplay mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -106,6 +106,12 @@ xor:
 spiking:
 	$(OLANG) build -output build/examples_xor_spiking examples/xor_spiking.olang
 	./build/examples_xor_spiking $(ARGS)
+
+# sleep replay on dyn (examples/sleep_replay.olang) - ARGS: seeds, days, patterns a day, hidden, passes, rate, context,
+# store cells, active cells
+sleepreplay:
+	$(OLANG) build -output build/examples_sleep_replay examples/sleep_replay.olang
+	./build/examples_sleep_replay $(ARGS)
 
 # the same network on dyn (dyn/learn's EP lessons; docs/redesign.md 4.3, M8) - ARGS: epochs, samples, hidden, batch,
 # seed, Adam's rate, beta, threads

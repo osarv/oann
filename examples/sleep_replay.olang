@@ -1,0 +1,197 @@
+# Sleep against interference on dyn (dyn/sleep, dyn/store; docs/settling.md 1.9, 5.4, 5.10): a settling system lives days
+# of a flip-flop, then days of its opposite, and is measured with and without its nights.
+#
+# The task, stateless (the prior state is an input, so no window is unrolled): a pattern is a symbol - set, reset or hold
+# (probabilities 0.2, 0.2, 0.6) - the held state (a number in [-1, 1)) and a context; the target is the state after it: +1 after a set
+# and -1 after a reset in context 0 (task A), the other way round in context 1 (task B), the held state through a hold.
+# The two tasks share their symbols and conflict on them, so only the context tells them apart. A context is Context
+# numbers of +-1 / sqrt(Context), drawn once per life for each task. A day shows perDay new patterns of the day's task
+# once each; accuracy is the fraction of patterns whose output has the target's sign - recall over the patterns seen,
+# generalization over new ones.
+#
+# Two lives per seed (both made from the same seed): "store alone" - days only, the slow weights never move - and "days
+# and nights" - a night (dyn/sleep: the cues dreamed, replayed through an EP lesson on the Sleep clock, the store
+# rewritten at dawn) after every day. Arguments, all optional: seeds (6), days per phase (4), patterns a day (16),
+# hidden units (32), passes a night (100), Adam's rate at night (0.02), the context's numbers (8), the store's cells and
+# active cells (48 and 4, a small store so that interference shows; 0: its defaults, 20 and 5% of the key's numbers).
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../dyn/system"
+import "../dyn/neuron"
+import "../dyn/conn"
+import "../dyn/learn"
+import "../dyn/store"
+import "../dyn/sleep"
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
+    if i >= args.Len(): return fallback
+    return try json.Json.Parse(args[i]).AsNum()
+}
+
+# a task's context
+fn contextOf(r mut rand.Rand&, width I64) Array<F32>& {
+    c := Array<F32>(width)
+    for j in range width: c[j] = F32((1.0 if r.Below(2) == 0 else -1.0) / F64(width).Sqrt())
+    return c
+}
+
+# n patterns of the task (0: A, 1: B) in context cx, into x (3 + 1 + width numbers each) and y (one each)
+fn patterns(r mut rand.Rand&, n I64, task I64, cx Array<F32>&, x mut Array<F32>&, y mut Array<F32>&) {
+    width := 4 + cx.Len()
+    sign F32 = 1.0 if task == 0 else -1.0
+    for p in range n {
+        draw := r.Float()
+        sym := 0 if draw < 0.2 else (1 if draw < 0.4 else 2)
+        held := F32(r.Uniform(-1.0, 1.0))
+        for j in range width: x[p * width + j] = 0.0
+        x[p * width + sym] = 1.0
+        x[p * width + 3] = held
+        for j in range cx.Len(): x[p * width + 4 + j] = cx[j]
+        y[p] = sign if sym == 0 else (-sign if sym == 1 else held)
+    }
+}
+
+# the fraction of the patterns of xs (a whole number of batches) whose answer has the target's sign, the slow part alone
+# or with the store
+fn accuracy(k mut sleep.Sleeper<F32>&, s mut system.System<F32>&, xs Array<F32>&, ys Array<F32>&, withStore Bool) F64 {
+    key := s.Pop(k.M.Key)
+    width := key.Size
+    out := Array<F32>(s.Batch)
+    right I64 = 0
+    for first in range 0, ys.Len(), s.Batch {
+        for i in range s.Batch * width: key.Drive[i] = xs[first * width + i]
+        k.Answer(withStore, out)
+        for b in range s.Batch {
+            if (out[b] > 0.0) == (ys[first + b] > 0.0): right++
+        }
+    }
+    return F64(right) / F64(ys.Len())
+}
+
+# a life's measures: A's recall and generalization after phase A and after phase B, B's after B
+type Scores struct() {
+    RecallA F64 = 0.0
+    NewA F64 = 0.0
+    RecallAfter F64 = 0.0
+    NewAfter F64 = 0.0
+    SlowNewAfter F64 = 0.0
+    RecallB F64 = 0.0
+    NewB F64 = 0.0
+}
+
+fn Scores.life(seed U64, days I64, perDay I64, hidden I64, passes I64, rate F64, context I64, cells I64, active I64, sleeping Bool) Scores {
+    r := rand.Rand(seed)
+    ca := contextOf(r, context)
+    cb := contextOf(r, context)
+    width := 4 + context
+    held := 256
+    s := system.System<F32>(perDay)
+    x := s.Population(s.Root(), "x", width, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", hidden, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 1, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    m := store.Memory<F32>(s, x, y, cells, active, 1.0, 0.0, false, seed + 17)
+    s.Attach(s.Root(), system.Rule.Ep(0.5, true), system.Clock.Sleep)
+    s.Plan(rand.Rand(seed + 1))!
+    s.Certify(0.9)
+    l := learn.Learner<F32>(s)!
+    l.Sweeps = 4000
+    k := sleep.Sleeper<F32>(l, m, 2 * days * perDay, rate, passes, 10, 0.001, true, seed + 2)
+    seen := days * perDay
+    ua := Array<F32>(seen * width)
+    ya := Array<F32>(seen)
+    ub := Array<F32>(seen * width)
+    yb := Array<F32>(seen)
+    patterns(r, seen, 0, ca, ua, ya)
+    patterns(r, seen, 1, cb, ub, yb)
+    ha := Array<F32>(held * width)
+    hya := Array<F32>(held)
+    hb := Array<F32>(held * width)
+    hyb := Array<F32>(held)
+    patterns(r, held, 0, ca, ha, hya)
+    patterns(r, held, 1, cb, hb, hyb)
+    sc := Scores()
+    for phase in range 2 {
+        u := ua if phase == 0 else ub
+        t := ya if phase == 0 else yb
+        for d in range days {
+            for i in range perDay * width: s.Pop(x).Drive[i] = u[d * perDay * width + i]
+            for i in range perDay: s.Pop(y).Target[i] = t[d * perDay + i]
+            k.Day()
+            if sleeping: k.Night()!
+        }
+        if phase == 0 {
+            sc.RecallA = accuracy(k, s, ua, ya, true)
+            sc.NewA = accuracy(k, s, ha, hya, true)
+        } else {
+            sc.RecallAfter = accuracy(k, s, ua, ya, true)
+            sc.NewAfter = accuracy(k, s, ha, hya, true)
+            sc.SlowNewAfter = accuracy(k, s, ha, hya, false)
+            sc.RecallB = accuracy(k, s, ub, yb, true)
+            sc.NewB = accuracy(k, s, hb, hyb, true)
+        }
+    }
+    return sc
+}
+
+# the mean of x and the half-width of its 95% confidence interval (1.96 standard errors)
+fn interval(x Array<F64>&) F64, F64 {
+    n := F64(x.Len())
+    mean F64 = 0.0
+    for v in x: mean += v
+    mean /= n
+    sq F64 = 0.0
+    for v in x: sq += (v - mean) * (v - mean)
+    return mean, (0.0 if n < 2.0 else 1.96 * (sq / (n - 1.0) / n).Sqrt())
+}
+
+fn show(x Array<F64>&) String {
+    m, h := interval(x)
+    return $(100.0 * m).Fixed(1) + " +- " + $(100.0 * h).Fixed(1)
+}
+
+fn main() ? io.Error, json.Error {
+    args := os.Args()
+    seeds := I64(try number(args, 1, 6))
+    days := I64(try number(args, 2, 4))
+    perDay := I64(try number(args, 3, 16))
+    hidden := I64(try number(args, 4, 32))
+    passes := I64(try number(args, 5, 100))
+    rate := try number(args, 6, 0.02)
+    context := I64(try number(args, 7, 8))
+    cells := I64(try number(args, 8, 48))
+    active := I64(try number(args, 9, 4))
+    t0 := time.Now()
+    try io.Put("sleep replay: " + $seeds + " lives of " + $days + " days of task A, then " + $days + " of task B, " + $perDay +
+        " new patterns a day, " + $hidden + " hidden units, " + $passes + " passes a night; accuracy (%) - the A patterns seen " +
+        "(recall), new A patterns (slow and store; the slow part alone)" + "\n")
+    for sleeping in Array<Bool>[false, true] {
+        recallA := Array<F64>(seeds)
+        newA := Array<F64>(seeds)
+        recallAfter := Array<F64>(seeds)
+        newAfter := Array<F64>(seeds)
+        slowAfter := Array<F64>(seeds)
+        recallB := Array<F64>(seeds)
+        newB := Array<F64>(seeds)
+        for k in range seeds {
+            sc := Scores.life(U64(k + 1), days, perDay, hidden, passes, rate, context, cells, active, sleeping)
+            recallA[k] = sc.RecallA
+            newA[k] = sc.NewA
+            recallAfter[k] = sc.RecallAfter
+            newAfter[k] = sc.NewAfter
+            slowAfter[k] = sc.SlowNewAfter
+            recallB[k] = sc.RecallB
+            newB[k] = sc.NewB
+        }
+        try io.Put(("days and nights:" if sleeping else "store alone (no nights):") + "\n")
+        try io.Put("  after A: recall " + $show(recallA) + ", new A " + $show(newA) + "\n")
+        try io.Put(("  after B: recall of A " + $show(recallAfter) + ", new A " + $show(newAfter) + " (slow alone " +
+            $show(slowAfter) + "); B: recall " + $show(recallB) + ", new B " + $show(newB)) + "\n")
+    }
+    try io.Put($(F64(time.Since(t0)) * 1e-9).Fixed(1) + " s" + "\n")
+}

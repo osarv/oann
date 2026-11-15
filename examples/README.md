@@ -18,6 +18,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `tinystories.olang` | `prep`, then a GPT or an SSM of 10 million parameters on TinyStories: loss curve, tokens a second (M13) | `tinystories` |
 | `mnist_learn.olang` | MNIST by a settling system of `dyn`, taught by equilibrium propagation (M8) | `mnistlearn` |
 | `xor_settle.olang`, `xor_spiking.olang` | XOR by rate and by spiking `dyn` systems | `xor`, `spiking` |
+| `sleep_replay.olang` | days of a flip-flop task and then its opposite, with and without nights (`dyn/sleep`: replay through EP on the Sleep clock, the store of `dyn/store` rewritten at dawn): recall and generalization of the first task | `sleepreplay` |
 | `mnist_board.olang` | MNIST through the simulated board (`board/engine`): lessons settled in F32 or on the board, the test set answered both ways, their agreement (M11) | `board` |
 
-The programs of the settling agent (`bandit_settle`, `sleep_retention`, `nights`) moved to oagent with the agent at C3 (docs/redesign.md 4.2).
+The programs of the settling agent (`bandit_settle`, `sleep_retention`, `nights`) moved to oagent with the agent at C3 (docs/redesign.md 4.2); `sleep_replay` is the mechanism of `sleep_retention` on `dyn`, with no agent model.
