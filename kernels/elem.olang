@@ -23,17 +23,9 @@
 
 import "mat"
 
-# the activations: Relu max(x, 0); Gelu x Phi(x), exactly, through the library's erfc; GeluTanh GELU's tanh form (GPT-2's,
-# PyTorch's approximate="tanh"), vectorized; Silu x sigmoid(x); Sigmoid, Tanh; Softplus log(1 + e^x)
-type Act enum {
-    Relu
-    Gelu
-    GeluTanh
-    Silu
-    Sigmoid
-    Tanh
-    Softplus
-}
+# the activations are mat.Act (declared beside the operand, shared with a product's epilogue): Relu max(x, 0); Gelu x Phi(x),
+# exactly, through the library's erfc; GeluTanh GELU's tanh form (GPT-2's, PyTorch's approximate="tanh"), vectorized; Silu
+# x sigmoid(x); Sigmoid, Tanh; Softplus log(1 + e^x)
 
 # ---- the exponential, tanh and sigmoid that vectorize ----
 
@@ -159,30 +151,30 @@ fn geluExact<A Float>(x A) A {
 }
 
 # act(x)
-fn Apply<A Float>(x A, a Act) A {
+fn Apply<A Float>(x A, a mat.Act) A {
     return match a {
-        case Act.Relu: relu(x)
-        case Act.Gelu: geluExact(x)
-        case Act.GeluTanh: FastGeluTanh(x)
-        case Act.Silu: x * FastSigmoid(x)
-        case Act.Sigmoid: FastSigmoid(x)
-        case Act.Tanh: FastTanh(x)
-        case Act.Softplus: softplus(x)
+        case mat.Act.Relu: relu(x)
+        case mat.Act.Gelu: geluExact(x)
+        case mat.Act.GeluTanh: FastGeluTanh(x)
+        case mat.Act.Silu: x * FastSigmoid(x)
+        case mat.Act.Sigmoid: FastSigmoid(x)
+        case mat.Act.Tanh: FastTanh(x)
+        case mat.Act.Softplus: softplus(x)
     }
 }
 
 # act'(x): Relu's 1 where x > 0 and 0 elsewhere (at 0 too, as PyTorch has it); Gelu's Phi(x) + x phi(x); GeluTanh's
 # s + 2 x s (1 - s) u' with s = sigmoid(2u), u' = sqrt(2 / pi) (1 + 3 0.044715 x^2); Silu's s (1 + x (1 - s)); Sigmoid's
 # s (1 - s); Tanh's 1 - tanh(x)^2; Softplus' sigmoid(x) - all from x, the activation's input
-fn Slope<A Float>(x A, a Act) A {
+fn Slope<A Float>(x A, a mat.Act) A {
     return match a {
-        case Act.Relu: 1.0 if x > 0.0 else 0.0
-        case Act.Gelu: geluExactSlope(x)
-        case Act.GeluTanh: geluTanhSlope(x)
-        case Act.Silu: siluSlope(x)
-        case Act.Sigmoid: sigmoidSlope(x)
-        case Act.Tanh: tanhSlope(x)
-        case Act.Softplus: FastSigmoid(x)
+        case mat.Act.Relu: 1.0 if x > 0.0 else 0.0
+        case mat.Act.Gelu: geluExactSlope(x)
+        case mat.Act.GeluTanh: geluTanhSlope(x)
+        case mat.Act.Silu: siluSlope(x)
+        case mat.Act.Sigmoid: sigmoidSlope(x)
+        case mat.Act.Tanh: tanhSlope(x)
+        case mat.Act.Softplus: FastSigmoid(x)
     }
 }
 
@@ -215,44 +207,44 @@ fn tanhSlope<A Float>(x A) A {
 # ---- activations over arrays ----
 
 # dst[i] = act(x[i]), computed in F32 (F64 for F64), rounded once; dst may be x
-fn Activate<T>(dst mut Array<T>&, x Array<T>&, a Act) {
+fn Act<T>(dst mut Array<T>&, x Array<T>&, a mat.Act) {
     match T {
-        case F64 { activate<T, F64>(dst, x, a) }
-        case _ { activate<T, F32>(dst, x, a) }
+        case F64 { act<T, F64>(dst, x, a) }
+        case _ { act<T, F32>(dst, x, a) }
     }
 }
 
 # one loop per activation, so each is a straight vectorizable pass
-fn activate<S, A>(dst mut Array<S>&, x Array<S>&, a Act) {
+fn act<S, A>(dst mut Array<S>&, x Array<S>&, a mat.Act) {
     n := x.Len()
     match a {
-        case Act.Relu { for i in range n: dst[i] = S(relu(A(x[i]))) }
-        case Act.Gelu { for i in range n: dst[i] = S(geluExact(A(x[i]))) }
-        case Act.GeluTanh { for i in range n: dst[i] = S(FastGeluTanh(A(x[i]))) }
-        case Act.Silu { for i in range n: dst[i] = S(A(x[i]) * FastSigmoid(A(x[i]))) }
-        case Act.Sigmoid { for i in range n: dst[i] = S(FastSigmoid(A(x[i]))) }
-        case Act.Tanh { for i in range n: dst[i] = S(FastTanh(A(x[i]))) }
-        case Act.Softplus { for i in range n: dst[i] = S(softplus(A(x[i]))) }
+        case mat.Act.Relu { for i in range n: dst[i] = S(relu(A(x[i]))) }
+        case mat.Act.Gelu { for i in range n: dst[i] = S(geluExact(A(x[i]))) }
+        case mat.Act.GeluTanh { for i in range n: dst[i] = S(FastGeluTanh(A(x[i]))) }
+        case mat.Act.Silu { for i in range n: dst[i] = S(A(x[i]) * FastSigmoid(A(x[i]))) }
+        case mat.Act.Sigmoid { for i in range n: dst[i] = S(FastSigmoid(A(x[i]))) }
+        case mat.Act.Tanh { for i in range n: dst[i] = S(FastTanh(A(x[i]))) }
+        case mat.Act.Softplus { for i in range n: dst[i] = S(softplus(A(x[i]))) }
     }
 }
 
 # dx[i] = dy[i] act'(x[i]), or dx[i] += that where add; x is what the activation was applied to. dx may be dy
-fn ActivateGrad<T>(dx mut Array<T>&, dy Array<T>&, x Array<T>&, a Act, add Bool) {
+fn ActGrad<T>(dx mut Array<T>&, dy Array<T>&, x Array<T>&, a mat.Act, add Bool) {
     match T {
-        case F64 { activateGrad<T, F64>(dx, dy, x, a, add) }
-        case _ { activateGrad<T, F32>(dx, dy, x, a, add) }
+        case F64 { actGrad<T, F64>(dx, dy, x, a, add) }
+        case _ { actGrad<T, F32>(dx, dy, x, a, add) }
     }
 }
 
-fn activateGrad<S, A>(dx mut Array<S>&, dy Array<S>&, x Array<S>&, a Act, add Bool) {
+fn actGrad<S, A>(dx mut Array<S>&, dy Array<S>&, x Array<S>&, a mat.Act, add Bool) {
     match a {
-        case Act.Relu { gradLoop<S, A>(dx, dy, x, add, fn(v): return 1.0 if v > 0.0 else 0.0) }
-        case Act.Gelu { gradLoop<S, A>(dx, dy, x, add, fn(v): return geluExactSlope(v)) }
-        case Act.GeluTanh { gradLoop<S, A>(dx, dy, x, add, fn(v): return geluTanhSlope(v)) }
-        case Act.Silu { gradLoop<S, A>(dx, dy, x, add, fn(v): return siluSlope(v)) }
-        case Act.Sigmoid { gradLoop<S, A>(dx, dy, x, add, fn(v): return sigmoidSlope(v)) }
-        case Act.Tanh { gradLoop<S, A>(dx, dy, x, add, fn(v): return tanhSlope(v)) }
-        case Act.Softplus { gradLoop<S, A>(dx, dy, x, add, fn(v): return FastSigmoid(v)) }
+        case mat.Act.Relu { gradLoop<S, A>(dx, dy, x, add, fn(v): return 1.0 if v > 0.0 else 0.0) }
+        case mat.Act.Gelu { gradLoop<S, A>(dx, dy, x, add, fn(v): return geluExactSlope(v)) }
+        case mat.Act.GeluTanh { gradLoop<S, A>(dx, dy, x, add, fn(v): return geluTanhSlope(v)) }
+        case mat.Act.Silu { gradLoop<S, A>(dx, dy, x, add, fn(v): return siluSlope(v)) }
+        case mat.Act.Sigmoid { gradLoop<S, A>(dx, dy, x, add, fn(v): return sigmoidSlope(v)) }
+        case mat.Act.Tanh { gradLoop<S, A>(dx, dy, x, add, fn(v): return tanhSlope(v)) }
+        case mat.Act.Softplus { gradLoop<S, A>(dx, dy, x, add, fn(v): return FastSigmoid(v)) }
     }
 }
 
@@ -582,19 +574,19 @@ fn fill<T>(a mut Array<T>&, r mut rand.Rand&, sd F64) {
 }
 
 # act(x) in F64 with the C library's functions, the formulas written as the definitions give them
-fn reference(x F64, a Act) F64 {
+fn reference(x F64, a mat.Act) F64 {
     return match a {
-        case Act.Relu: 0.0 if x < 0.0 else x
-        case Act.Gelu: 0.5 * x * (1.0 + (x * 0.7071067811865476).Erf())
-        case Act.GeluTanh: 0.5 * x * (1.0 + (0.7978845608028654 * (x + 0.044715 * x * x * x)).Tanh())
-        case Act.Silu: x / (1.0 + (-x).Exp())
-        case Act.Sigmoid: 1.0 / (1.0 + (-x).Exp())
-        case Act.Tanh: x.Tanh()
-        case Act.Softplus: (1.0 + x.Exp()).Log()
+        case mat.Act.Relu: 0.0 if x < 0.0 else x
+        case mat.Act.Gelu: 0.5 * x * (1.0 + (x * 0.7071067811865476).Erf())
+        case mat.Act.GeluTanh: 0.5 * x * (1.0 + (0.7978845608028654 * (x + 0.044715 * x * x * x)).Tanh())
+        case mat.Act.Silu: x / (1.0 + (-x).Exp())
+        case mat.Act.Sigmoid: 1.0 / (1.0 + (-x).Exp())
+        case mat.Act.Tanh: x.Tanh()
+        case mat.Act.Softplus: (1.0 + x.Exp()).Log()
     }
 }
 
-allActs Array<Act> = Array<Act>[Act.Relu, Act.Gelu, Act.GeluTanh, Act.Silu, Act.Sigmoid, Act.Tanh, Act.Softplus]
+allActs Array<mat.Act> = Array<mat.Act>[mat.Act.Relu, mat.Act.Gelu, mat.Act.GeluTanh, mat.Act.Silu, mat.Act.Sigmoid, mat.Act.Tanh, mat.Act.Softplus]
 
 test FastExp "stays within 3.0e-7 (F32) and 6.0e-16 (F64) relative to the C library's exp, and saturates" {
     n := 200000
@@ -644,9 +636,9 @@ test FastGeluTanh "stays within 1.5e-7 (F32) and 5e-16 (F64) times max(1, |x|) o
     g64 F64
     for i in range n + 1 {
         x32 := F32(grid(i, n, -10.0, 10.0))
-        g32 = g32.Max((F64(FastGeluTanh(x32)) - reference(F64(x32), Act.GeluTanh)).Abs() / F64(x32).Abs().Max(1.0))
+        g32 = g32.Max((F64(FastGeluTanh(x32)) - reference(F64(x32), mat.Act.GeluTanh)).Abs() / F64(x32).Abs().Max(1.0))
         x64 := grid(i, n, -10.0, 10.0)
-        g64 = g64.Max((FastGeluTanh(x64) - reference(x64, Act.GeluTanh)).Abs() / x64.Abs().Max(1.0))
+        g64 = g64.Max((FastGeluTanh(x64) - reference(x64, mat.Act.GeluTanh)).Abs() / x64.Abs().Max(1.0))
     }
     assert g32 <= 1.5e-7, "F32 " $g32
     assert g64 <= 5.0e-16, "F64 " $g64
@@ -654,12 +646,12 @@ test FastGeluTanh "stays within 1.5e-7 (F32) and 5e-16 (F64) times max(1, |x|) o
 }
 
 # a stated bound for each activation in each type: relative to max(1, |reference|)
-fn activateWithin<T>(bound F64, r mut rand.Rand&) {
+fn actWithin<T>(bound F64, r mut rand.Rand&) {
     x := Array<T>(1001)
     y := Array<T>(1001)
     for i in range x.Len(): x[i] = T(grid(i, 1000, -9.0, 9.0))
     for a in allActs {
-        Activate(y, x, a)
+        Act(y, x, a)
         worst F64
         for i in range x.Len() {
             want := reference(F64(x[i]), a)
@@ -669,46 +661,46 @@ fn activateWithin<T>(bound F64, r mut rand.Rand&) {
     }
 }
 
-test Activate "every activation is its formula: F64 to 1e-14, F32 to 1e-6, F16 to 2e-3, BF16 to 1e-2 (relative to max(1, |value|))" {
+test Act "every activation is its formula: F64 to 1e-14, F32 to 1e-6, F16 to 2e-3, BF16 to 1e-2 (relative to max(1, |value|))" {
     r := rand.Rand(1)
-    activateWithin<F64>(1.0e-14, r)
-    activateWithin<F32>(1.0e-6, r)
-    activateWithin<F16>(2.0e-3, r)
-    activateWithin<BF16>(1.0e-2, r)
+    actWithin<F64>(1.0e-14, r)
+    actWithin<F32>(1.0e-6, r)
+    actWithin<F16>(2.0e-3, r)
+    actWithin<BF16>(1.0e-2, r)
 }
 
-test Activate "in place gives what a separate destination gives" {
+test Act "in place gives what a separate destination gives" {
     x := Array<F32>[F32(grid(i, 39, -5.0, 5.0)) for i in range 40]
     y := Array<F32>(40)
     for a in allActs {
-        Activate(y, x, a)
+        Act(y, x, a)
         z := x.Copy()
-        Activate(z, z, a)
+        Act(z, z, a)
         assert z == y
     }
 }
 
-test ActivateGrad "equals the central difference of the activation, in F64, with add and in place" {
+test ActGrad "equals the central difference of the activation, in F64, with add and in place" {
     h := 1.0e-6
     x := Array<F64>[grid(i, 60, -6.0, 6.0) + 0.0137 for i in range 61]
     dy := Array<F64>[1.0 + F64(i % 5) * 0.25 for i in range 61]
     dx := Array<F64>(61)
     for a in allActs {
-        ActivateGrad(dx, dy, x, a, false)
+        ActGrad(dx, dy, x, a, false)
         for i in range 61 {
             want := (reference(x[i] + h, a) - reference(x[i] - h, a)) / (2.0 * h) * dy[i]
             assert (dx[i] - want).Abs() <= 1.0e-6 * want.Abs().Max(1.0), $a " at " $x[i] ": " $dx[i] " against " $want
         }
         again := Array<F64>[1.0 for _ in range 61]
-        ActivateGrad(again, dy, x, a, true)
+        ActGrad(again, dy, x, a, true)
         for i in range 61: assert (again[i] - (1.0 + dx[i])).Abs() <= 1.0e-12 * dx[i].Abs().Max(1.0)
         inplace := dy.Copy()
-        ActivateGrad(inplace, inplace, x, a, false)
+        ActGrad(inplace, inplace, x, a, false)
         assert inplace == dx
     }
 }
 
-test ActivateGrad "in F32 and BF16 follows the F64 slope" {
+test ActGrad "in F32 and BF16 follows the F64 slope" {
     x := Array<F32>[F32(grid(i, 60, -6.0, 6.0)) for i in range 61]
     xb := Array<BF16>[BF16(v) for v in x]
     ones32 := Array<F32>[F32(1.0) for _ in range 61]
@@ -716,8 +708,8 @@ test ActivateGrad "in F32 and BF16 follows the F64 slope" {
     d32 := Array<F32>(61)
     db := Array<BF16>(61)
     for a in allActs {
-        ActivateGrad(d32, ones32, x, a, false)
-        ActivateGrad(db, onesb, xb, a, false)
+        ActGrad(d32, ones32, x, a, false)
+        ActGrad(db, onesb, xb, a, false)
         for i in range 61 {
             e := (Slope(F64(x[i]), a) - F64(d32[i])).Abs()
             assert e <= 2.0e-6 * Slope(F64(x[i]), a).Abs().Max(1.0), $a " F32 at " $x[i] ": " $e
