@@ -8,9 +8,10 @@ OLANG ?= ../olang/build/olang
 TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
+	dyn/neuron.olang dyn/conn.olang dyn/system.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle sample clean
+.PHONY: test data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -84,6 +85,12 @@ board:
 sparse:
 	$(OLANG) build -output build/bench_sparse bench/sparse.olang
 	./build/bench_sparse $(ARGS)
+
+# dyn's settle against circuit.olang's on the 784-128-10 network, the same weights side by side, batch 1 and 128
+# (docs/redesign.md 4.3, M7) - ARGS: rounds, threads for dyn's tasked run, beta x 100
+settlebench:
+	$(OLANG) build -output build/bench_settle bench/settle.olang
+	./build/bench_settle $(ARGS)
 
 # sleep against interference (consolidator.olang): days of a flip-flop with and without nights - ARGS: nights or
 # retention, seeds, days, sequences a day, repeats, hidden, window, passes, the day's step, the night's rate

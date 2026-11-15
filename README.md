@@ -33,6 +33,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `conv.olang`, `vision.olang` | convolution and max pooling on images held as rows; the convolution layer |
 | `quant.olang`, `checkpoint.olang` | INT8 post-training quantization; safetensors |
 | `tokenizer.olang` | byte-level BPE |
+| `dyn/` | the redesign's dynamical-system core: systems of populations and connections, the settle (`dyn/README.md`) |
 | `circuit.olang`, `board.olang`, `sparse.olang` | settling networks; the FPGA engine simulated in integers; sparse products |
 | `agent.olang`, `store.olang`, `consolidator.olang` | an agent living on a circuit; its memory store; sleep |
 | `datasets/` | IDX, MNIST, a character corpus, and the Loader over a Dataset trait |

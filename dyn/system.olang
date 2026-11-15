@@ -858,3 +858,47 @@ test System.Settle "a lesson allocates nothing: resident memory does not grow ov
     grown := resident() - before
     assert grown <= 16, "resident memory grew by " $grown " pages"
 }
+
+# two inputs, five hidden units and two squared-error readouts of model, hidden and readout reciprocal, every relaxing
+# unit biased above its threshold: a spiking system and its rate model alike
+fn System<T>.lifty(model neuron.Neuron) System<T> {
+    r := rand.Rand(21)
+    s := System<T>(2)
+    root := s.Root()
+    x := s.Population(root, "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 5, model)
+    o := s.Population(root, "o", 2, model, neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, o, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    w := s.Weights(Conn(1)).Flat()!
+    for i in range w.Len(): w[i] = w[i] * T(2)
+    for j in range 5: s.E.Params[s.Pop(h).Bias + j] = T(1.3 + 0.1 * F64(j))
+    for j in range 2: s.E.Params[s.Pop(o).Bias + j] = T(1.5)
+    for j in range 4: s.Pop(x).Drive[j] = T(r.Uniform(0.0, 1.0))
+    t := s.Pop(o).Target
+    t[0], t[1], t[2], t[3] = T(0.15), T(0.02), T(0.02), T(0.15)
+    return s
+}
+
+test System.Settle "a spiking system settles to its rate model's equilibrium, free and nudged" {
+    window I64 = 20000
+    a := System<F64>.lifty(neuron.Neuron.Lif(0.1, 1.0, 0.1, window))
+    b := System<F64>.lifty(neuron.Neuron.Rate(neuron.Rho.LifRate(0.1, 1.0)))
+    spiking := a.Settle(settle.Phase.Free, settle.Budget(40 * window, 2.0 / F64(window)))
+    rate := b.Settle(settle.Phase.Free, settle.Budget(20000, 1e-12, 0.75))
+    assert spiking.Converged and rate.Converged, "spiking " $spiking ", rate " $rate
+    worst F64 = 0.0
+    for p in range 1, 3 {
+        for row in range 2 {
+            for j in range a.Pop(Pop(p)).Size: worst = worst.Max((a.Activity(settle.Phase.Free, Pop(p)).Get(row, j) - b.Activity(settle.Phase.Free, Pop(p)).Get(row, j)).Abs())
+        }
+    }
+    assert worst < 0.015, "rates within " $worst
+    nudged := a.Nudged(settle.Budget(40 * window, 2.0 / F64(window)), 1.0)
+    assert nudged.Converged
+    # the plus phase moved its readout toward the targets: 0.15 and 0.02 in row 0
+    plus := a.Activity(settle.Phase.Plus, Pop(2))
+    free := a.Activity(settle.Phase.Free, Pop(2))
+    assert (plus.Get(0, 0) - 0.15).Abs() <= (free.Get(0, 0) - 0.15).Abs() + 2.0 / F64(window)
+}

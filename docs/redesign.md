@@ -278,6 +278,65 @@ an amortizer (any graph) proposes the starting state.
 (`s.Contraction()`), a gain clamp, divergence detection in `Settlement`, and a top-level `assert` where the weights
 are constant and the evaluator can decide the bound.
 
+**As built (B2a, 2026-11-15).** `dyn/system.olang`, `dyn/neuron.olang`, `dyn/conn.olang`, `dyn/settle.olang`
+(`dyn/README.md`). Where the build departs from the sketch above, and why:
+
+1. **Four modules, not one `dyn`.** An olang module is a file and an alias names one module, so programs import the
+   four and write `system.System<F32>(...)`, `neuron.Neuron.Rate(neuron.Rho.Tanh)`, `conn.Wiring.Symmetric`,
+   `settle.Budget()`, `settle.Phase.Free`. `Role` and `Cost` live in `neuron` (a population's units), `Phase`,
+   `Budget`, `Settlement` in `settle`; the `@Keep` attribute is `@neuron.Keep`. A planned system's running part is
+   `settle.Engine<T>` (populations, connections, regions, workspaces), which `System` holds and drives.
+2. **Cells' fields are capitalized**: `RateCell<T>(U, S)`, `LifCell<T>(V, S, Syn, Spike, Trace, Count, @Keep Theta)` -
+   readable by `dyn/learn` and by reflection over `Columns<C>.Fields` (empty for lower-case fields: `repro/colfields.olang`).
+3. **`System<T>`'s T is the state's and the weights' element**: F32 to run (decision 3's settle state), F64 for
+   checks. Low-precision weights under F32 state wait for a product taking operands of two storage types (gemm's
+   `Gemm<S, A>` holds one S for c, a and b); recorded for the kernels.
+4. **Neurons**: `Lif(leak, threshold, synapse, window)` keeps circuit's synaptic rate, `Neuron.Spiking(...)` its
+   defaults; `Rho` keeps circuit's `LifRate`. `Cost` is `Squared` (the sketch's `Squared(beta)` carried the nudge's
+   beta, which is `Nudged`'s) or `CrossEntropy(temperature, groups)`, `Cost.Classes(T)` for one group.
+5. **Wirings**: `Connect(pre, post, w, frozen = false, reciprocal = false)`. `Symmetric` is the dense block read both
+   ways; `Csr`, `Tiles` and `LowRank` are reciprocal by the flag; `Events` is one-way and stores its weights pre x post
+   (a row per unit that can change, as `sparse.Transport` reads them). `Weights(c)` is the parameter view: [post, pre]
+   dense, [pre, post] events, A ([post, rank], B after it) low-rank, the stored values sparse.
+6. **Targets**: `Target(p, Tensor<I32>&)` for classes and `TargetValues(p, Tensor<T>&)` for a squared cost (olang
+   overloads by receiver only). `Clamp` sets any population's drive: an input's state, anything else's added drive.
+7. **Settling**: `Settle(phase, b)` runs from the phase's committed state (`Reset` for a cold start, `Warm` to copy
+   one phase into another; inputs are set from their drive at every settle); `Nudged(b, beta = 0.5, centered = true)`
+   warms the plus (and minus) phase from the free one and settles them side by side. `Budget(Sweeps, Tol, Damping)`:
+   Damping shortens the step by a factor; Anderson acceleration is not built. `Settlement(Sweeps, Residual,
+   Converged)` with `Diverged()`; the energy is not in it (`dyn/energy`, B2b, evaluates one). The residual's sup norm
+   is kept as the integer order of |r|'s bits, which makes a NaN the largest and the loop's maximum vectorize.
+8. **Rules are run by `dyn/learn`**: `Attach` records a rule, `Rules(clock)` lists a clock's, and `learn.Tick(s, clock)`
+   (B2b) runs them - a `Tick` method in system.olang would import learn, which imports system (a cycle). `Energy<E>`
+   and `ImplicitGrad` are B2b's likewise; `Rule`, `Update` and `Implicit` are declared here.
+9. **Threads**: a sweep's units are one population's rows of one phase, 128 rows at most; they do not depend on the
+   thread count, so a settle is the same bit for bit for any (tested with every wiring, free and nudged). A sweep is
+   split over tasks only when it does at least `TaskWork` (2M) multiply-adds: a join costs more than a small sweep, and
+   every join keeps about 110 bytes until the program ends (`repro/joinleak.olang`, an olang bug), so a long run in
+   tasks grows; one thread is flat (M9). The constants (inputs folded through their connections, once a settle) are
+   whole-batch products split by gemm's own threads. Gauss-Seidel sweeps are not built.
+10. **Run-time structure** (decision 3): `Prune(c, keep)` masks weights (or tiles) in place, gradients with them
+    (`Link.MaskGrads` for learning rules); `Compact()` drops a sparse connection's masked entries in place
+    (`Csr.Drop`, `Tiles.Compact`, the gradient squeezed alike); `Retire(p, j)` holds a unit at rest. Compacting a dense
+    block or retired units is a re-plan with the weights kept (not built; the engine records every offset it laid
+    out). Stability: `Gain`, `Certify`, `Restrain`, `Rate`, `LessonTolerance`, `BudgetFor` as circuit's;
+    `Contraction()` (a spectral bound by power iteration) is not built.
+
+Measured (tests in `dyn/system.olang`, `bench/settle.olang`): a certified system at kappa 0.9 whose bound is tight
+settles cold in exactly 64 sweeps at the lesson tolerance (1.25e-3), 66 at 1e-3 and 71 at the life tolerance
+(6.25e-4) - settling.md 1.2's `ln(tol) / ln 0.9`; linear neurons reach the solution of `(I - W) v = c` to 1e-10;
+spiking neurons fire at the analytic rate and a spiking system settles within 0.015 of its LifRate model; resident
+memory is flat over 400 lessons (M9). M7 (`make settlebench`, 784-128-10, circuit's weights copied into the system,
+F32, one thread, medians of 15 interleaved rounds, the machine shared, load 3-7 on 4 cores): at its Glorot draw the
+network settles cold in 3 sweeps in both (the free equilibria within 1.2e-7 of each other); a free settle takes 13 us
+in dyn against 25 us in circuit at batch 1 (4.4 against 8.4 us a sweep) and 1.25 against 1.02 ms at batch 128; a
+lesson's settles (dyn: free and both nudged phases side by side; circuit: Teach, its contrast included) 34 against
+70 us at batch 1 and 3.8 against 3.5 ms at batch 128. With a positive lateral block at the hidden units (9-11 sweeps a
+settle): 6.7 against 10.5 us a sweep at batch 1, 328 against 234 us at batch 128; a lesson 0.11 against 0.21 ms and
+6.1 against 6.4 ms. At batch 128 the sweep is gemm-bound (75% of a profile; kernels' Gemm and linalg's take the same
+time on these shapes), and dyn's settles in four tasks are slower than one thread on this loaded machine (two units
+a sweep, one of them tiny; a join's wake-up costs more than its share).
+
 ### 1.5 Models: `nn/*.olang`, `models/*.olang`
 
 `nn/` holds what models are built from: `layers.olang` (Dense, Mlp, Norm, AttentionBlock, SsmBlock, DeltaBlock,
