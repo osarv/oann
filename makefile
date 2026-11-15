@@ -5,7 +5,7 @@
 OLANG ?= ../olang/build/olang
 
 # every module with test blocks
-TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
+TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang board/engine.olang \

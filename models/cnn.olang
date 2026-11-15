@@ -10,6 +10,7 @@ import "../ad/graph"
 import "../kernels/conv"
 import "../kernels/mat"
 import "../nn/layers"
+import "../nn/quant"
 import "../nn/train"
 
 # images of side x side pixels in "channels" channels, a stage for each of Stages' widths (each halves the side), and
@@ -87,6 +88,18 @@ fn (m Cnn&) Task<T>(g mut graph.Graph<T>&) train.Classifier {
     x := g.Input(m.Config.Side, m.Config.Side, m.Config.Channels)
     y := g.Classes()
     return train.Classifier.On(g, x, y, m.Logits(g, x))
+}
+
+# the trained network as an INT8 model (nn/quant) of up to "batch" images a call: each convolution with ReLU and pooling
+# after it, and the dense layer
+fn (m Cnn&) Int8<T>(g graph.Graph<T>&, batch I64, threads I64 = 1) quant.Model {
+    q := quant.Model(batch, m.Config.Inputs(), threads)
+    for i, c in m.Convs {
+        q.Conv(g, c, true)
+        q.Pool(m.Pools[i])
+    }
+    q.Dense(g, m.Head, false)
+    return q
 }
 
 # ---- tests ----
@@ -185,4 +198,38 @@ test Cnn "learns to find the lit quadrant: F32 and BF16, and a run repeats bit f
     assert again == first and last2 == last and right2 == right
     bfirst, blast, bright := learn<BF16>()
     assert blast < bfirst * 0.5 and bright > 0.9
+}
+
+test Cnn "its INT8 model gives the graph's classes, within the quantization's bound on the logits" {
+    g mut graph.Graph<F32>& = graph.Graph<F32>(8)
+    m := Cnn.New(g, CnnConfig.Tiny())!
+    c := m.Task(g)
+    g.Plan(rand.Rand(3))!
+    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 0.01, spans = optim.Spans(g))
+    l := loader.Loader(quadrants(64, 1), 8, 5)
+    for _ in range 12: train.Epoch(g, c, l, o)
+    held := loader.Loader(quadrants(40, 2), 8, 1, false)
+    q := m.Int8(g, 8)
+    held.Epoch()
+    xs := g.Data(c.X).Flat()!
+    ys := g.Ints(c.Y).Flat()!
+    agree I64 = 0
+    for b in range held.Batches() {
+        n := held.Fill(b, xs, ys)
+        g.Forward(n)
+        got := Array<F32>(n * 4)
+        q.Forward(n, xs, got)
+        z := g.Value(c.Logits)
+        for i in range n {
+            best I64 = 0
+            top I64 = 0
+            for k in range 4 {
+                if got[i * 4 + k] > got[i * 4 + best]: best = k
+                if z.Get(i, k) > z.Get(i, top): top = k
+                assert (got[i * 4 + k] - z.Get(i, k)).Abs() < 0.1
+            }
+            if best == top: agree++
+        }
+    }
+    assert agree == 40
 }
