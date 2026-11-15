@@ -780,6 +780,30 @@ fn (w Tiles<S>&) MulAdd<A>(y mut mat.Mat<A>&, x mat.Mat<A>&, trans Bool = false,
     }
 }
 
+# g[t Tile Tile + i Tile + k] = alpha (A B^T)[r Tile + i, c Tile + k] (+ g[...] when accumulate) for each live tile t = (r, c):
+# the product of two batches sampled at the tiles - a is Rows rows of width, b Cols rows of width - a contrast's sum over
+# the batch at the tiles that exist; g is laid out like Data, the dead tiles' and the edges' elements untouched. Adds Dense
+# Rows Cols width and Effective the live tiles' area times width
+fn (w Tiles<S>&) Sampled<A>(g mut Array<A>&, a mat.Mat<A>&, b mat.Mat<A>&, alpha A = 1, accumulate Bool = false, macs mut Macs?& = null) {
+    z A
+    width := a.Cols
+    if macs != null: macs.Add(w.Rows * w.Cols * width, w.liveArea(Array<Bool>(0)) * width)
+    tt := w.Tile * w.Tile
+    for r in range w.TileRows {
+        for e in range w.Ptr[r], w.Ptr[r + 1] {
+            if not w.Live[e]: continue
+            c := I64(w.Col[e])
+            for i in range w.height(r) {
+                for k in range w.width(c) {
+                    d := alpha * dotAs(a.Data, a.Off + (r * w.Tile + i) * a.Ld, b.Data, b.Off + (c * w.Tile + k) * b.Ld, width)
+                    at := e * tt + i * w.Tile + k
+                    g[at] = (g[at] if accumulate else z) + d
+                }
+            }
+        }
+    }
+}
+
 # out[b] = whether block b of x (Tile rows of it, the last clipped) holds an entry of magnitude above threshold: the flags
 # Tiles.MulAdd takes to skip what a quiet block of the batch would add. One flag per block
 fn Active<A>(out mut Array<Bool>&, x mat.Mat<A>&, tile I64, threshold A) {
@@ -1597,4 +1621,29 @@ test "the sparse-code products: a weighted gather of k rows, and a rank-1 write 
     err := Array<F64>[1.0, 0.0, -1.0]
     ScatterRank1(table, idx, w, 2, err, 0.1)
     assert table[12] == 12.0 + 0.05 and table[14] == 14.0 - 0.05 and table[3] == 3.0 - 0.2 and table[0] == 0.0
+}
+
+test Tiles "the sampled product at the tiles is the dense contrast read at them, and counts the live tiles' area" {
+    r := rand.Rand(12)
+    m := blocky(40, 50, 16, 0.5, r)
+    w := Tiles<F64>.Of(m, 16)
+    a := gappy(40, 7, F64(0), r)
+    b := gappy(50, 7, F64(0), r)
+    g := Array<F64>(w.Data.Len())
+    macs := Macs()
+    w.Sampled(g, a, b, 1.0, false, macs)
+    w.Sampled(g, a, b, 0.5, true)
+    assert macs.Dense == 40 * 50 * 7 and macs.Effective == w.liveArea(Array<Bool>(0)) * 7
+    for rr in range w.TileRows {
+        for e in range w.Ptr[rr], w.Ptr[rr + 1] {
+            c := I64(w.Col[e])
+            for i in range w.height(rr) {
+                for k in range w.width(c) {
+                    sum F64 = 0.0
+                    for t in range 7: sum += a[rr * 16 + i, t] * b[c * 16 + k, t]
+                    assert (g[e * 256 + i * 16 + k] - 1.5 * sum).Abs() < 1e-13
+                }
+            }
+        }
+    }
 }
