@@ -956,7 +956,17 @@ M1-M12 hold on the new code, and moves `agent`, `store`, `consolidator` and thei
   check:** question 2 below says "nothing moves out of oann in C3" (the user's 2026-11-15 words keep the agent's machinery
   in oann); C3 followed its brief and the module map above, which move the agent. Reverting is `git checkout pre-c3 --
   agent.olang store.olang consolidator.olang` plus their legacy modules.
-- *M15, the build time of `make test`:* M15_PLACEHOLDER
+- *M15, the build time of `make test`:* `make test` over the 38 files (292 tests) took 15 min 56 s of wall time on the shared 4-core machine at a load of 5 to 13
+  (olang master of 2026-11-15, objects cached from the first run): before the cut-over the same command over 52 files
+  (461 tests, the old modules and their duplicates of the new ones) took 18 min 22 s at a load of 10 to 17. One model
+  built cold (a fresh object directory, so std too) at a load of 10: `examples/mnist_mlp` 39 s, `examples/charlm` 41 s.
+  Round 2's reference is not recorded; these are the figures to measure against.
+- *Allocation tests.* The five "a step allocates nothing" tests (`ad/graph`, `nn/optim`, `nn/train`, `models/gpt`,
+  `models/ssm`) failed on the current compiler every time (not flakily: 12 to 40 kB, the same on each run and constant
+  from 20 to 400 steps - not a leak). They read the anonymous resident memory (`RssAnon`, not `VmRSS`, which also counts
+  the code pages a path maps in the first time it runs) through a probe that has already run, and allow four pages for
+  what moves once; the `Graph` test warms both batch sizes first and `nn/optim` takes its reading at step 6. They pass
+  on every run since (`nn/optim` three in a row).
 
 ### 4.3 What is measured
 
