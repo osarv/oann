@@ -1258,6 +1258,12 @@ fn (g mut Graph<T>&) refreshView(v Var) {
     g.vals[v] = g.vals[root]
 }
 
+# a tensor over storage, its dims and strides taken by value: given straight to Strided's references, a temporary was
+# allocated at every call where the storage lives, never reclaimed (repro/tempref.olang)
+fn over<E>(data mut Array<E>&, at I64, dims tensor.Shape, strides tensor.Shape) tensor.Tensor<E> {
+    return tensor.Tensor<E>.Strided(data, at, dims, strides)!
+}
+
 # ---- mixed precision ----
 
 # whether the graph keeps its parameters' masters in F32 beside the arena: a BF16 or F16 graph does
@@ -1274,7 +1280,7 @@ fn (g Graph<T>&) Masters() tensor.Tensor<F32> { return tensor.Tensor<F32>.Over(g
 # parameter v's master, a view of Masters()
 fn (g Graph<T>&) Master(v Var) tensor.Tensor<F32> {
     nd := g.nodes[v]
-    return tensor.Tensor<F32>.Strided(g.masters, nd.Offset, nd.Dims, rowMajor(nd.Dims))!
+    return over<F32>(g.masters, nd.Offset, nd.Dims, rowMajor(nd.Dims))
 }
 
 # the parameters in the arena set from their masters, each rounded to nearest even - after the masters change (an
@@ -1301,7 +1307,7 @@ fn (g Graph<T>&) Value(v Var) tensor.Tensor<T> {
     nd := g.nodes[v]
     root := g.rootOf(v)
     at := nd.Offset + (g.nodes[root].Offset if nd.Base >= 0 else 0)
-    return tensor.Tensor<T>.Strided(g.vals[root].mem, at, g.inUse(nd), nd.Strides)!
+    return over<T>(g.vals[root].mem, at, g.inUse(nd), nd.Strides)
 }
 
 # v's gradient, laid out row-major in v's shape - for a node that has one (a parameter, or anything depending on one)
@@ -1309,7 +1315,7 @@ fn (g Graph<T>&) Grad(v Var) tensor.Tensor<T> {
     nd := g.nodes[v]
     if nd.GradOffset < 0: unreachable "oann: the gradient of a node that depends on no parameter"
     d := g.inUse(nd)
-    return tensor.Tensor<T>.Strided(g.vals[v].mem, nd.GradOffset, d, rowMajor(d))!
+    return over<T>(g.vals[v].mem, nd.GradOffset, d, rowMajor(d))
 }
 
 # v's gradient to contribute to, or an empty tensor where v has none
@@ -1319,7 +1325,7 @@ fn (g Graph<T>&) gradOf(v I64) tensor.Tensor<T> {
 }
 
 fn (g Graph<T>&) empty() tensor.Tensor<T> {
-    return tensor.Tensor<T>.Strided(g.vals[0].mem, 0, tensor.Shape.Of(0), tensor.Shape.Of(1))!
+    return over<T>(g.vals[0].mem, 0, tensor.Shape.Of(0), tensor.Shape.Of(1))
 }
 
 # v's value, or an empty tensor for None
@@ -1337,14 +1343,14 @@ fn (g mut Graph<T>&) acc(v I64) Bool {
 # entries in use)
 fn (g Graph<T>&) Data(v Var) tensor.Tensor<T> {
     nd := g.nodes[v]
-    return tensor.Tensor<T>.Strided(g.vals[v].mem, nd.Offset, nd.Dims, nd.Strides)!
+    return over<T>(g.vals[v].mem, nd.Offset, nd.Dims, nd.Strides)
 }
 
 # the tokens or classes of v (Tokens, Classes), the whole planned batch: where the caller puts a batch's
 fn (g Graph<T>&) Ints(v Var) tensor.Tensor<I32> {
     nd := g.nodes[v]
     if nd.IntOffset < 0: unreachable "oann: Ints of a node holding no tokens or classes"
-    return tensor.Tensor<I32>.Strided(g.ints[v].mem, nd.IntOffset, nd.Dims, rowMajor(nd.Dims))!
+    return over<I32>(g.ints[v].mem, nd.IntOffset, nd.Dims, rowMajor(nd.Dims))
 }
 
 fn (g Graph<T>&) intsOf(v I64) mut Array<I32>& {
@@ -1367,7 +1373,7 @@ fn (g Graph<T>&) scratch(i I64, start I64, n I64) mut Array<T>& {
 
 # node i's scratch from start as a tensor of these dims
 fn (g Graph<T>&) scratchTensor(i I64, start I64, d tensor.Shape) tensor.Tensor<T> {
-    return tensor.Tensor<T>.Strided(g.vals[i].mem, g.nodes[i].ScratchOffset + start, d, rowMajor(d))!
+    return over<T>(g.vals[i].mem, g.nodes[i].ScratchOffset + start, d, rowMajor(d))
 }
 
 # node i's elements in the accumulator A
@@ -1536,7 +1542,7 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
 
 # node i's kept elements as a tensor of these dims
 fn (g Graph<T>&) savedLike(i I64, d tensor.Shape) tensor.Tensor<T> {
-    return tensor.Tensor<T>.Strided(g.vals[i].mem, g.nodes[i].SavedOffset, d, rowMajor(d))!
+    return over<T>(g.vals[i].mem, g.nodes[i].SavedOffset, d, rowMajor(d))
 }
 
 # rows x cols of node i's accumulator elements from start, a matrix
@@ -1629,124 +1635,159 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
     dy := g.Grad(Var(i))
     match nd.Kind {
         case Op.Linear(x, w, b) {
-            dx, ax := g.gradOf(x), g.acc(x)
-            dw, aw := g.gradOf(w), g.acc(w)
-            db, ab := g.gradOf(b), g.acc(b)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            dw := g.gradOf(w)
+            aw := g.acc(w)
+            db := g.gradOf(b)
+            ab := g.acc(b)
             ops.LinearBackward<T, A>(ws, dy, g.Value(x), g.Value(w), dx, ax, dw, aw, db, ab)
         }
         case Op.MatMul(a, b, ta, tb) {
-            da, aa := g.gradOf(a), g.acc(a)
-            db, ab := g.gradOf(b), g.acc(b)
+            da := g.gradOf(a)
+            aa := g.acc(a)
+            db := g.gradOf(b)
+            ab := g.acc(b)
             ops.MatMulBackward<T, A>(ws, dy, g.Value(a), ta, g.Value(b), tb, da, aa, db, ab)
         }
         case Op.Add(a, b): g.combineBack<A>(dy, a, b, A(1.0))
         case Op.Sub(a, b): g.combineBack<A>(dy, a, b, A(-1.0))
         case Op.Mul(a, b) {
-            da, aa := g.gradOf(a), g.acc(a)
-            db, ab := g.gradOf(b), g.acc(b)
+            da := g.gradOf(a)
+            aa := g.acc(a)
+            db := g.gradOf(b)
+            ab := g.acc(b)
             ops.MulBackward<T, A>(dy, g.Value(a), g.Value(b), da, aa, db, ab)
         }
         case Op.Scale(x, k) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(k), ax)
         }
         case Op.Act(x, a) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.ActBackward(dy, g.Value(x), a, dx, ax)
         }
         case Op.LeakyRelu(x, slope) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.LeakyReluBackward<T, A>(dy, g.Value(x), A(slope), dx, ax)
         }
         case Op.Softmax(x) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.SoftmaxBackward<T, A>(dy, g.Value(Var(i)), dx, ax)
         }
         case Op.LogSoftmax(x) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.LogSoftmaxBackward<T, A>(dy, g.Value(Var(i)), dx, ax)
         }
         case Op.Norm(x, gain, b, rms, _) {
-            dx, ax := g.gradOf(x), g.acc(x)
-            dg, ag := g.gradOf(gain), g.acc(gain)
-            db, ab := g.gradOf(b), g.acc(b)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            dg := g.gradOf(gain)
+            ag := g.acc(gain)
+            db := g.gradOf(b)
+            ab := g.acc(b)
             ops.NormBackward(dy, g.Value(x), g.Value(gain), rms, g.saved(i), dx, ax, dg, ag, db, ab)
         }
         case Op.Embedding(t, w) {
-            dw, aw := g.gradOf(w), g.acc(w)
+            dw := g.gradOf(w)
+            aw := g.acc(w)
             if ops.Wanted(dw): ops.EmbeddingBackward<T, A>(dy, g.intsOf(t), dw, aw)
         }
         case Op.Positions(x, w) {
-            dx, ax := g.gradOf(x), g.acc(x)
-            dw, aw := g.gradOf(w), g.acc(w)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            dw := g.gradOf(w)
+            aw := g.acc(w)
             ops.PositionsBackward<T, A>(dy, nd.Dims[1], g.Pos, dx, ax, dw, aw)
         }
         case Op.Rope(x, heads, base) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             tmp := g.scratchTensor(i, 0, dy.Dims)
             if ops.Wanted(dx): ops.RopeBackward<T, A>(dy, heads, nd.Dims[1], g.Pos, base, dx, ax, tmp)
         }
         case Op.Attention(q, k, v, heads, causal) {
-            dq, aq := g.gradOf(q), g.acc(q)
-            dk, ak := g.gradOf(k), g.acc(k)
-            dv, av := g.gradOf(v), g.acc(v)
+            dq := g.gradOf(q)
+            aq := g.acc(q)
+            dk := g.gradOf(k)
+            ak := g.acc(k)
+            dv := g.gradOf(v)
+            av := g.acc(v)
             sc := g.scratch(i, 0, g.extrasOf(i).scratch)
             ops.AttentionBackward<T, A>(ws, dy, g.Value(q), g.Value(k), g.Value(v), g.saved(i), sc, heads, nd.Dims[1], causal, dq, aq, dk, ak, dv, av)
         }
         case Op.Dropout(x, p) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if not ops.Wanted(dx): return
             if g.Training: ops.DropoutBackward<T, A>(dy, g.saved(i), p, dx, ax)
             else: ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax)
         }
         case Op.CrossEntropy(z, c) {
-            dz, az := g.gradOf(z), g.acc(z)
+            dz := g.gradOf(z)
+            az := g.acc(z)
             probs := g.savedLike(i, g.inUse(g.nodes[z]))
             if ops.Wanted(dz): ops.CrossEntropyBackward<T, A>(A(dy.Get(0)), g.intsOf(c), probs, dz, az)
         }
         case Op.Mse(a, b) {
-            da, aa := g.gradOf(a), g.acc(a)
-            db, ab := g.gradOf(b), g.acc(b)
+            da := g.gradOf(a)
+            aa := g.acc(a)
+            db := g.gradOf(b)
+            ab := g.acc(b)
             ops.MseBackward<T, A>(A(dy.Get(0)), g.Value(a), g.Value(b), da, aa, db, ab)
         }
         case Op.Conv2d(x, w, b, s) {
-            dx, ax := g.gradOf(x), g.acc(x)
-            dw, aw := g.gradOf(w), g.acc(w)
-            db, ab := g.gradOf(b), g.acc(b)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            dw := g.gradOf(w)
+            aw := g.acc(w)
+            db := g.gradOf(b)
+            ab := g.acc(b)
             cols := g.scratch(i, 0, g.extrasOf(i).scratch)
             ops.Conv2dBackward<T, A>(ws, dy, g.Value(x), g.Value(w), s, cols, g.Threads, dx, ax, dw, aw, db, ab)
         }
         case Op.MaxPool2d(x, p) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.MaxPool2dBackward(dy, g.intsOf(i), p, g.Threads, dx, ax)
         }
         case Op.Scan(x, a, b): g.scanBack<A>(i, sw, dy, x, a, b)
         case Op.SelectiveScan(x, d, a, b, c, skip): g.selectiveBack<A>(i, sw, dy, x, d, a, b, c, skip)
         case Op.DeltaRule(q, k, v, beta, gate): g.deltaBack<A>(i, sw, dy, q, k, v, beta, gate)
         case Op.Reshape(x), Op.Contiguous(x) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax)
         }
         case Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x): g.viewBack<A>(i, dy, x)
         case Op.Sum(x, mean) {
-            dx, ax := g.gradOf(x), g.acc(x)
+            dx := g.gradOf(x)
+            ax := g.acc(x)
             if ops.Wanted(dx): ops.SumLastBackward<T, A>(dy, mean, dx, ax)
         }
-        case Op.Custom(f, first, count): g.customBack<A>(i, f, first, count, dy)
+        case Op.Custom(f, first, count): g.customBack<A>(i, f, first, count)
         case _ { }
     }
 }
 
 fn (g mut Graph<T>&) combineBack<A>(dy tensor.Tensor<T>&, a Var, b Var, k A) {
-    da, aa := g.gradOf(a), g.acc(a)
-    db, ab := g.gradOf(b), g.acc(b)
+    da := g.gradOf(a)
+    aa := g.acc(a)
+    db := g.gradOf(b)
+    ab := g.acc(b)
     ops.CombineBackward<T, A>(dy, k, da, aa, db, ab)
 }
 
 # a view's backward: dy added into x's gradient through the view's strides (relative to x's own layout, dense) - zeroed
 # first where this is the first contribution, since a slice or a broadcast reaches only part of it, or parts many times
 fn (g mut Graph<T>&) viewBack<A>(i I64, dy tensor.Tensor<T>&, x Var) {
-    dx, ax := g.gradOf(x), g.acc(x)
+    dx := g.gradOf(x)
+    ax := g.acc(x)
     if not ops.Wanted(dx): return
     nd := g.nodes[i]
     xn := g.nodes[x]
@@ -1755,7 +1796,7 @@ fn (g mut Graph<T>&) viewBack<A>(i I64, dy tensor.Tensor<T>&, x Var) {
     off := nd.Offset - (xn.Offset if xn.Base >= 0 else 0)
     target := match nd.Kind {
         case Op.Permute(_): permuted(dx, nd, xn, st)
-        case Op.Slice(_, axis, _): tensor.Tensor<T>.Strided(dx.Flat()!, off / xn.Strides[axis] * st[axis], dy.Dims, st)!
+        case Op.Slice(_, axis, _): over<T>(dx.Flat()!, off / xn.Strides[axis] * st[axis], dy.Dims, st)
         case _: expanded(dx, nd, xn, dy.Dims, st)
     }
     if not ax: dx.Fill(T(0.0))
@@ -1771,7 +1812,7 @@ fn permuted<T>(dx tensor.Tensor<T>&, nd Node&, xn Node&, st tensor.Shape&) tenso
             if xn.Strides[a] == nd.Strides[k] and xn.Dims[a] == nd.Dims[k]: s[k] = st[a]
         }
     }
-    return tensor.Tensor<T>.Strided(dx.Flat()!, 0, withAxis(nd.Dims, 0, dx.Dims[0]) if nd.Batched else nd.Dims, tensor.Shape.Of(...s[0:r]))!
+    return over<T>(dx.Flat()!, 0, withAxis(nd.Dims, 0, dx.Dims[0]) if nd.Batched else nd.Dims, tensor.Shape.Of(...s[0:r]))
 }
 
 # x's gradient seen through an Expand: an axis of the view x has (aligned to the last) at x's stride, a new or
@@ -1782,7 +1823,7 @@ fn expanded<T>(dx tensor.Tensor<T>&, nd Node&, xn Node&, d tensor.Shape&, st ten
     for k in range xn.Dims.Rank {
         if xn.Dims[k] == nd.Dims[lead + k]: s[lead + k] = st[k]
     }
-    return tensor.Tensor<T>.Strided(dx.Flat()!, 0, d, tensor.Shape.Of(...s[0:d.Rank]))!
+    return over<T>(dx.Flat()!, 0, d, tensor.Shape.Of(...s[0:d.Rank]))
 }
 
 # where the next piece of a node's scratch starts
@@ -1863,10 +1904,13 @@ fn (g mut Graph<T>&) deltaBack<A>(i I64, sw mut scan.Work<A>&, dy tensor.Tensor<
     ops.DeltaRuleBackward<T, A>(sw, dy, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), nd.Dims[1], heads, keep, dstate, dq, aq, dk, ak, dv, av, db, ab, dg, ag)
 }
 
-# a Custom's backward: the function writes each input's gradient into scratch, which is then added where it goes
-fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count I64, dy tensor.Tensor<T>&) {
+# a Custom's backward: the function writes each input's gradient into scratch, which is then added where it goes. Its
+# own tensors are made here: given to an `any`, which may keep anything, a tensor is built where the graph lives at every
+# call, so a step through a Custom allocates (a little) where no other does
+fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count I64) {
     match T {
         case F32 {
+            dy := g.Grad(Var(i))
             ins := g.customIns(first, count)
             dins := Vec<tensor.Tensor<T>>()
             at I64 = 0
@@ -1878,7 +1922,8 @@ fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count 
             f.Backward(dy, ins.View(), dins.ViewMut())
             for j in range count {
                 x := g.customIn[first + j]
-                dx, ax := g.gradOf(x), g.acc(x)
+                dx := g.gradOf(x)
+                ax := g.acc(x)
                 if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dins[j].Flat()!, A(1.0), ax)
             }
         }
@@ -2262,4 +2307,38 @@ test Graph "decoding with a cache of keys and values equals the full forward, a 
             }
         }
     }
+}
+
+# this process's resident memory in kB (VmRSS, Linux)
+fn resident() I64 {
+    text := try os.ReadFile("/proc/self/status") catch { return 0 }
+    for line in text.Lines() {
+        if not line.StartsWith("VmRSS:"): continue
+        kb := try line[6:].Trim().Split(" ")[0].ParseInt() catch { return 0 }
+        return kb
+    }
+    return 0
+}
+
+test Graph "a step allocates nothing: the resident memory does not grow over 20 steps after the first, F32 and BF16" {
+    a := Graph<F32>(2)
+    ax, ay, aloss := mixedNet(a, 5, 0.1)
+    b := Graph<BF16>(2)
+    bx, by, bloss := mixedNet(b, 5, 0.1)
+    try a.Plan(rand.Rand(6))
+    try b.Plan(rand.Rand(6))
+    fillMixed(a, ax, ay, 5)
+    fillMixed(b, bx, by, 5)
+    a.Forward(2)
+    a.Backward(aloss)
+    b.Forward(2)
+    b.Backward(bloss)
+    before := resident()
+    for step in range 20 {
+        a.Forward(2 - step % 2)
+        a.Backward(aloss)
+        b.Forward(2 - step % 2)
+        b.Backward(bloss)
+    }
+    assert resident() == before, "grew by " $(resident() - before) " kB"
 }

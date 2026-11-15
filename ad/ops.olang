@@ -36,7 +36,7 @@ fn none<S>(t tensor.Tensor<S>&) mat.Mat<S> { return mat.Mat<S>(t.Flat()!, 0, 0, 
 fn gradRows<S>(t tensor.Tensor<S>&) mat.Mat<S> { return none(t) if t.Count() == 0 else rows(t) }
 
 # whether a gradient is wanted
-fn Wanted<S>(t tensor.Tensor<S>&) Bool { return t.Count() > 0 }
+fn Wanted<S>(t tensor.Tensor<S>) Bool { return t.Count() > 0 }
 
 # 1 where add, else 0: a product's beta
 fn betaOf<A>(add Bool) A { return A(1.0) if add else A(0.0) }
@@ -64,35 +64,35 @@ fn putTimes<S, A>(dx mut Array<S>&, dy Array<S>&, b Array<S>&, k A, add Bool) {
 }
 
 # y = a + k b: Add (k 1) and Sub (k -1)
-fn Combine<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&, k A) {
+fn Combine<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>, k A) {
     yd := flat(y)
     ad := flat(a)
     bd := flat(b)
     for i in range yd.Len(): yd[i] = S(A(ad[i]) + k * A(bd[i]))
 }
 
-fn CombineBackward<S, A>(dy tensor.Tensor<S>&, k A, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn CombineBackward<S, A>(dy tensor.Tensor<S>, k A, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
     g := flat(dy)
     if Wanted(da): Put<S, A>(flat(da), g, A(1.0), addA)
     if Wanted(db): Put<S, A>(flat(db), g, k, addB)
 }
 
 # y = a b, element by element
-fn Mul<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&) {
+fn Mul<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>) {
     yd := flat(y)
     ad := flat(a)
     bd := flat(b)
     for i in range yd.Len(): yd[i] = S(A(ad[i]) * A(bd[i]))
 }
 
-fn MulBackward<S, A>(dy tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn MulBackward<S, A>(dy tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
     g := flat(dy)
     if Wanted(da): putTimes<S, A>(flat(da), g, flat(b), A(1.0), addA)
     if Wanted(db): putTimes<S, A>(flat(db), g, flat(a), A(1.0), addB)
 }
 
 # y = k x
-fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, k A) {
+fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A) {
     yd := flat(y)
     xd := flat(x)
     for i in range yd.Len(): yd[i] = S(k * A(xd[i]))
@@ -102,7 +102,7 @@ fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, k A) {
 
 # y = x w^T + b over the last axis: x [..., in], w [out, in], b [out] or empty. An F32 bias is added in the product's
 # epilogue, as each block is summed; another type's after it
-fn Linear<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, w tensor.Tensor<S>&, b tensor.Tensor<S>&) {
+fn Linear<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>, w tensor.Tensor<S>, b tensor.Tensor<S>) {
     ym := rows(y)
     if b.Count() == 0 {
         gemm.Gemm(ws, ym, rows(x), false, rows(w), true)
@@ -126,10 +126,16 @@ fn addBias<S, A>(y mut mat.Mat<S>&, b Array<S>&) {
 }
 
 # dx (+)= dy w, dw (+)= dy^T x, db (+)= the column sums of dy
-fn LinearBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>&, x tensor.Tensor<S>&, w tensor.Tensor<S>&, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn LinearBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor.Tensor<S>, w tensor.Tensor<S>, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool) {
     g := rows(dy)
-    if Wanted(dx): gemm.Gemm(ws, rows(dx), g, false, rows(w), false, A(1.0), betaOf<A>(addX))
-    if Wanted(dw): gemm.Gemm(ws, rows(dw), g, true, rows(x), false, A(1.0), betaOf<A>(addW))
+    if Wanted(dx) {
+        d := rows(dx)
+        gemm.Gemm(ws, d, g, false, rows(w), false, A(1.0), betaOf<A>(addX))
+    }
+    if Wanted(dw) {
+        d := rows(dw)
+        gemm.Gemm(ws, d, g, true, rows(x), false, A(1.0), betaOf<A>(addW))
+    }
     if Wanted(db): elem.ColumnSums(flat(db), g, S(1.0) if addB else S(0.0))
 }
 
@@ -155,13 +161,15 @@ fn storageOf<S>(t tensor.Tensor<S>&) mut Array<S>& {
 
 # y = op(a) op(b): rank 2 operands, or batched over one or two leading axes (b may be rank 2, shared by the batch); a
 # product of rank 2 operands, or of a batched a and a shared b not transposed, is one Gemm over the folded rows
-fn MatMul<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, a tensor.Tensor<S>&, ta Bool, b tensor.Tensor<S>&, tb Bool) {
+fn MatMul<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, a tensor.Tensor<S>, ta Bool, b tensor.Tensor<S>, tb Bool) {
     if b.Rank() == 2 and (a.Rank() == 2 or not ta) {
-        gemm.Gemm(ws, rows(y), rows(a), ta, rows(b), tb)
+        ym := rows(y)
+        gemm.Gemm(ws, ym, rows(a), ta, rows(b), tb)
         return
     }
     g, m := leading(y)
-    gemm.GemmBatch(ws, batchOf(y, g, m), batchOf(a, g, m), ta, batchOf(b, g, m), tb)
+    yb := batchOf(y, g, m)
+    gemm.GemmBatch(ws, yb, batchOf(a, g, m), ta, batchOf(b, g, m), tb)
 }
 
 # the groups and members of a batched result: its leading axes
@@ -172,43 +180,47 @@ fn leading<S>(y tensor.Tensor<S>&) I64, I64 {
 }
 
 # C = op(A) op(B):  op(A)'s gradient dC op(B)^T,  op(B)'s op(A)^T dC - each transposed back where its operand was
-fn MatMulBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>&, a tensor.Tensor<S>&, ta Bool, b tensor.Tensor<S>&, tb Bool, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn MatMulBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, a tensor.Tensor<S>, ta Bool, b tensor.Tensor<S>, tb Bool, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
     one A = 1.0
     if b.Rank() == 2 and (a.Rank() == 2 or not ta) {
         g := rows(dy)
         if Wanted(da) {
-            if ta: gemm.Gemm(ws, rows(da), rows(b), tb, g, true, one, betaOf<A>(addA))
-            else: gemm.Gemm(ws, rows(da), g, false, rows(b), not tb, one, betaOf<A>(addA))
+            d := rows(da)
+            if ta: gemm.Gemm(ws, d, rows(b), tb, g, true, one, betaOf<A>(addA))
+            else: gemm.Gemm(ws, d, g, false, rows(b), not tb, one, betaOf<A>(addA))
         }
         if Wanted(db) {
-            if tb: gemm.Gemm(ws, rows(db), g, true, rows(a), ta, one, betaOf<A>(addB))
-            else: gemm.Gemm(ws, rows(db), rows(a), not ta, g, false, one, betaOf<A>(addB))
+            d := rows(db)
+            if tb: gemm.Gemm(ws, d, g, true, rows(a), ta, one, betaOf<A>(addB))
+            else: gemm.Gemm(ws, d, rows(a), not ta, g, false, one, betaOf<A>(addB))
         }
         return
     }
     gs, ms := leading(dy)
     g := batchOf(dy, gs, ms)
     if Wanted(da) {
-        if ta: gemm.GemmBatch(ws, batchOf(da, gs, ms), batchOf(b, gs, ms), tb, g, true, one, betaOf<A>(addA))
-        else: gemm.GemmBatch(ws, batchOf(da, gs, ms), g, false, batchOf(b, gs, ms), not tb, one, betaOf<A>(addA))
+        d := batchOf(da, gs, ms)
+        if ta: gemm.GemmBatch(ws, d, batchOf(b, gs, ms), tb, g, true, one, betaOf<A>(addA))
+        else: gemm.GemmBatch(ws, d, g, false, batchOf(b, gs, ms), not tb, one, betaOf<A>(addA))
     }
     if Wanted(db) {
-        if tb: gemm.GemmBatch(ws, batchOf(db, gs, ms), g, true, batchOf(a, gs, ms), ta, one, betaOf<A>(addB))
-        else: gemm.GemmBatch(ws, batchOf(db, gs, ms), batchOf(a, gs, ms), not ta, g, false, one, betaOf<A>(addB))
+        d := batchOf(db, gs, ms)
+        if tb: gemm.GemmBatch(ws, d, g, true, batchOf(a, gs, ms), ta, one, betaOf<A>(addB))
+        else: gemm.GemmBatch(ws, d, batchOf(a, gs, ms), not ta, g, false, one, betaOf<A>(addB))
     }
 }
 
 # ---- activations ----
 
-fn Act<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, a mat.Act) { elem.Act(flat(y), flat(x), a) }
+fn Act<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, a mat.Act) { elem.Act(flat(y), flat(x), a) }
 
 # dx (+)= dy act'(x)
-fn ActBackward<S>(dy tensor.Tensor<S>&, x tensor.Tensor<S>&, a mat.Act, dx mut tensor.Tensor<S>&, add Bool) {
+fn ActBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, a mat.Act, dx mut tensor.Tensor<S>&, add Bool) {
     elem.ActGrad(flat(dx), flat(dy), flat(x), a, add)
 }
 
 # y = x where x > 0, slope x elsewhere
-fn LeakyRelu<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, slope A) {
+fn LeakyRelu<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, slope A) {
     yd := flat(y)
     xd := flat(x)
     for i in range yd.Len() {
@@ -217,7 +229,7 @@ fn LeakyRelu<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, slope A) {
     }
 }
 
-fn LeakyReluBackward<S, A>(dy tensor.Tensor<S>&, x tensor.Tensor<S>&, slope A, dx mut tensor.Tensor<S>&, add Bool) {
+fn LeakyReluBackward<S, A>(dy tensor.Tensor<S>, x tensor.Tensor<S>, slope A, dx mut tensor.Tensor<S>&, add Bool) {
     g := flat(dy)
     xd := flat(x)
     d := flat(dx)
@@ -230,13 +242,13 @@ fn LeakyReluBackward<S, A>(dy tensor.Tensor<S>&, x tensor.Tensor<S>&, slope A, d
 # ---- softmax ----
 
 # y = softmax over the last axis
-fn Softmax<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&) {
+fn Softmax<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>) {
     ym := rows(y)
     elem.RowSoftmax(ym, rows(x), S(1.0))
 }
 
 # dx = y (dy - <dy, y>) row by row
-fn SoftmaxBackward<S, A>(dy tensor.Tensor<S>&, y tensor.Tensor<S>&, dx mut tensor.Tensor<S>&, add Bool) {
+fn SoftmaxBackward<S, A>(dy tensor.Tensor<S>, y tensor.Tensor<S>, dx mut tensor.Tensor<S>&, add Bool) {
     g := rows(dy)
     p := rows(y)
     d := rows(dx)
@@ -253,7 +265,7 @@ fn SoftmaxBackward<S, A>(dy tensor.Tensor<S>&, y tensor.Tensor<S>&, dx mut tenso
 }
 
 # y = x - log(sum exp x) over the last axis
-fn LogSoftmax<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&) {
+fn LogSoftmax<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>) {
     xm := rows(x)
     ym := rows(y)
     for r in range xm.Rows {
@@ -265,7 +277,7 @@ fn LogSoftmax<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&) {
 }
 
 # dx = dy - exp(y) sum(dy), row by row
-fn LogSoftmaxBackward<S, A>(dy tensor.Tensor<S>&, y tensor.Tensor<S>&, dx mut tensor.Tensor<S>&, add Bool) {
+fn LogSoftmaxBackward<S, A>(dy tensor.Tensor<S>, y tensor.Tensor<S>, dx mut tensor.Tensor<S>&, add Bool) {
     g := rows(dy)
     p := rows(y)
     d := rows(dx)
@@ -285,7 +297,7 @@ fn LogSoftmaxBackward<S, A>(dy tensor.Tensor<S>&, y tensor.Tensor<S>&, dx mut te
 
 # the mean over the rows whose class is not negative of -log softmax(logits)[class] - the log-sum-exp less the class's
 # logit, so nothing overflows or takes a log of zero - in F64; probs keeps each row's softmax for the backward
-fn CrossEntropy<S, A>(logits tensor.Tensor<S>&, classes Array<I32>&, probs mut tensor.Tensor<S>&) F64 {
+fn CrossEntropy<S, A>(logits tensor.Tensor<S>, classes Array<I32>&, probs mut tensor.Tensor<S>&) F64 {
     z := rows(logits)
     p := rows(probs)
     elem.RowSoftmax(p, z, S(1.0))
@@ -310,7 +322,7 @@ fn logSumExp<S, A>(x Array<S>&, from I64, n I64) A {
 }
 
 # dlogits (+)= dloss (probs - onehot(class)) / counted, zero for an ignored row
-fn CrossEntropyBackward<S, A>(dloss A, classes Array<I32>&, probs tensor.Tensor<S>&, dz mut tensor.Tensor<S>&, add Bool) {
+fn CrossEntropyBackward<S, A>(dloss A, classes Array<I32>&, probs tensor.Tensor<S>, dz mut tensor.Tensor<S>&, add Bool) {
     p := rows(probs)
     d := rows(dz)
     counted I64 = 0
@@ -330,7 +342,7 @@ fn CrossEntropyBackward<S, A>(dloss A, classes Array<I32>&, probs tensor.Tensor<
 }
 
 # the mean of (a - b)^2, in F64
-fn Mse<S, A>(a tensor.Tensor<S>&, b tensor.Tensor<S>&) F64 {
+fn Mse<S, A>(a tensor.Tensor<S>, b tensor.Tensor<S>) F64 {
     ad := flat(a)
     bd := flat(b)
     total F64 = 0.0
@@ -342,7 +354,7 @@ fn Mse<S, A>(a tensor.Tensor<S>&, b tensor.Tensor<S>&) F64 {
 }
 
 # da (+)= 2 dloss (a - b) / n, db (+)= -that
-fn MseBackward<S, A>(dloss A, a tensor.Tensor<S>&, b tensor.Tensor<S>&, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn MseBackward<S, A>(dloss A, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
     ad := flat(a)
     bd := flat(b)
     k := A(2.0) * dloss / A(ad.Len())
@@ -366,7 +378,7 @@ fn MseBackward<S, A>(dloss A, a tensor.Tensor<S>&, b tensor.Tensor<S>&, da mut t
 
 # y = (x - mean) inv gain + bias over the last axis (rms: no mean taken out, no bias); stats keeps mean and inv, two
 # rows of the rows' count
-fn Norm<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, gain tensor.Tensor<S>&, bias tensor.Tensor<S>&, rms Bool, eps F64, stats mut Array<S>&) {
+fn Norm<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, gain tensor.Tensor<S>, bias tensor.Tensor<S>, rms Bool, eps F64, stats mut Array<S>&) {
     xm := rows(x)
     n := xm.Rows
     mean := stats[0:n]
@@ -377,13 +389,16 @@ fn Norm<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, gain tensor.Tensor<S>&,
 }
 
 # dx, dgain, dbias, each written or added to
-fn NormBackward<S>(dy tensor.Tensor<S>&, x tensor.Tensor<S>&, gain tensor.Tensor<S>&, rms Bool, stats Array<S>&, dx mut tensor.Tensor<S>&, addX Bool, dgain mut tensor.Tensor<S>&, addG Bool, dbias mut tensor.Tensor<S>&, addB Bool) {
+fn NormBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, gain tensor.Tensor<S>, rms Bool, stats Array<S>&, dx mut tensor.Tensor<S>&, addX Bool, dgain mut tensor.Tensor<S>&, addG Bool, dbias mut tensor.Tensor<S>&, addB Bool) {
     g := rows(dy)
     xm := rows(x)
     n := xm.Rows
     mean := stats[0:n]
     inv := stats[n:2 * n]
-    if Wanted(dx): elem.RowNormGrad(rows(dx), g, xm, mean, inv, flat(gain), rms, addX)
+    if Wanted(dx) {
+        d := rows(dx)
+        elem.RowNormGrad(d, g, xm, mean, inv, flat(gain), rms, addX)
+    }
     if Wanted(dgain): elem.RowNormParamGrad(flat(dgain), flat(dgain)[0:0], g, xm, mean, inv, addG)
     if Wanted(dbias): elem.RowNormParamGrad(flat(dbias)[0:0], flat(dbias), g, xm, mean, inv, addB)
 }
@@ -391,7 +406,7 @@ fn NormBackward<S>(dy tensor.Tensor<S>&, x tensor.Tensor<S>&, gain tensor.Tensor
 # ---- lookups and positions ----
 
 # row r of y: the table's row tokens[r]
-fn Embedding<S>(y mut tensor.Tensor<S>&, tokens Array<I32>&, table tensor.Tensor<S>&) {
+fn Embedding<S>(y mut tensor.Tensor<S>&, tokens Array<I32>&, table tensor.Tensor<S>) {
     ym := rows(y)
     t := rows(table)
     for r in range ym.Rows {
@@ -402,7 +417,7 @@ fn Embedding<S>(y mut tensor.Tensor<S>&, tokens Array<I32>&, table tensor.Tensor
 }
 
 # dtable (+)= the rows of dy added at their tokens' rows
-fn EmbeddingBackward<S, A>(dy tensor.Tensor<S>&, tokens Array<I32>&, dtable mut tensor.Tensor<S>&, add Bool) {
+fn EmbeddingBackward<S, A>(dy tensor.Tensor<S>, tokens Array<I32>&, dtable mut tensor.Tensor<S>&, add Bool) {
     g := rows(dy)
     d := rows(dtable)
     if not add: dtable.Fill(S(0.0))
@@ -414,7 +429,7 @@ fn EmbeddingBackward<S, A>(dy tensor.Tensor<S>&, tokens Array<I32>&, dtable mut 
 }
 
 # x [b, t, ...] plus the table's row (first + t) mod T at every position t of every sequence (T the table's rows)
-fn Positions<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, table tensor.Tensor<S>&, ctx I64, first I64) {
+fn Positions<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, table tensor.Tensor<S>, ctx I64, first I64) {
     ym := rows(y)
     xm := rows(x)
     t := rows(table)
@@ -424,7 +439,7 @@ fn Positions<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, table tensor.Te
     }
 }
 
-fn PositionsBackward<S, A>(dy tensor.Tensor<S>&, ctx I64, first I64, dx mut tensor.Tensor<S>&, addX Bool, dtable mut tensor.Tensor<S>&, addT Bool) {
+fn PositionsBackward<S, A>(dy tensor.Tensor<S>, ctx I64, first I64, dx mut tensor.Tensor<S>&, addX Bool, dtable mut tensor.Tensor<S>&, addT Bool) {
     g := rows(dy)
     if Wanted(dx): Put<S, A>(flat(dx), flat(dy), A(1.0), addX)
     if not Wanted(dtable): return
@@ -437,14 +452,14 @@ fn PositionsBackward<S, A>(dy tensor.Tensor<S>&, ctx I64, first I64, dx mut tens
 }
 
 # y = x rotated (Su et al.) at positions first + t of sequences of ctx
-fn Rope<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, heads I64, ctx I64, first I64, base F64) {
+fn Rope<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64) {
     try y.Convert(x) catch { unreachable }
     ym := rows(y)
     attention.Rope(ym, first, attention.Heads(heads, ctx), base)
 }
 
 # dx (+)= dy rotated back; tmp holds dy's elements while they are rotated, where dx is added to
-fn RopeBackward<S, A>(dy tensor.Tensor<S>&, heads I64, ctx I64, first I64, base F64, dx mut tensor.Tensor<S>&, add Bool, tmp mut tensor.Tensor<S>&) {
+fn RopeBackward<S, A>(dy tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64, dx mut tensor.Tensor<S>&, add Bool, tmp mut tensor.Tensor<S>&) {
     at := attention.Heads(heads, ctx)
     if not add {
         try dx.Convert(dy) catch { unreachable }
@@ -461,14 +476,14 @@ fn RopeBackward<S, A>(dy tensor.Tensor<S>&, heads I64, ctx I64, first I64, base 
 # ---- attention ----
 
 # out = attention(q, k, v) over sequences of ctx rows, probs keeping the weights
-fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>&, k tensor.Tensor<S>&, v tensor.Tensor<S>&, probs mut Array<S>&, heads I64, ctx I64, causal Bool) {
+fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, heads I64, ctx I64, causal Bool) {
     om := rows(out)
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
     attention.Attention(ws, om, qm, rows(k), rows(v), pm, attention.Heads(heads, ctx, causal))
 }
 
-fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>&, q tensor.Tensor<S>&, k tensor.Tensor<S>&, v tensor.Tensor<S>&, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
+fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
     dqm := gradRows(dq)
@@ -478,7 +493,7 @@ fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>&, q 
 }
 
 # causal attention while decoding: rows are positions first ... of one sequence, keys and values kept in the cache
-fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>&, k tensor.Tensor<S>&, v tensor.Tensor<S>&, cache mut Array<S>&, ctx I64, scores mut Array<A>&, first I64, heads I64) {
+fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, cache mut Array<S>&, ctx I64, scores mut Array<A>&, first I64, heads I64) {
     qm := rows(q)
     d := qm.Cols
     keys := mat.Mat<S>(cache, 0, ctx, d, d)
@@ -490,7 +505,7 @@ fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>&, k tensor.
 # ---- dropout ----
 
 # y = x mask / (1 - p), the mask drawn from r (each element kept with probability 1 - p) and kept
-fn Dropout<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, mask mut Array<S>&, p F64, r mut rand.Rand&) {
+fn Dropout<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, mask mut Array<S>&, p F64, r mut rand.Rand&) {
     yd := flat(y)
     xd := flat(x)
     k := A(1.0 / (1.0 - p))
@@ -501,7 +516,7 @@ fn Dropout<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, mask mut Array<S>
     }
 }
 
-fn DropoutBackward<S, A>(dy tensor.Tensor<S>&, mask Array<S>&, p F64, dx mut tensor.Tensor<S>&, add Bool) {
+fn DropoutBackward<S, A>(dy tensor.Tensor<S>, mask Array<S>&, p F64, dx mut tensor.Tensor<S>&, add Bool) {
     putTimes<S, A>(flat(dx), flat(dy), mask[0:flat(dx).Len()], A(1.0 / (1.0 - p)), add)
 }
 
@@ -514,7 +529,7 @@ fn images<S>(t tensor.Tensor<S>&) mat.Mat<S> {
     return mat.Mat<S>(t.Flat()!, 0, n, per, per)
 }
 
-fn Conv2d<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, w tensor.Tensor<S>&, b tensor.Tensor<S>&, s conv.Shape&) {
+fn Conv2d<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>, w tensor.Tensor<S>, b tensor.Tensor<S>, s conv.Shape&) {
     ym := images(y)
     xm := images(x)
     wm := rows(w)
@@ -533,7 +548,7 @@ fn Conv2d<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Ten
     addBias<S, A>(out, flat(b))
 }
 
-fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>&, x tensor.Tensor<S>&, w tensor.Tensor<S>&, s conv.Shape&, cols mut Array<S>&, threads I64, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor.Tensor<S>, w tensor.Tensor<S>, s conv.Shape&, cols mut Array<S>&, threads I64, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool) {
     n := dy.Dim(0)
     patches := mat.Mat<S>(cols, 0, n * s.Positions(), s.Patch(), s.Patch())
     dxm := images(dx) if Wanted(dx) else none(dx)
@@ -542,13 +557,13 @@ fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>&, x tenso
     conv.Conv2dBackward<S, A>(ws, images(dy), images(x), rows(w), s, dxm, addX, dwm, addW, dbd, addB, patches, threads)
 }
 
-fn MaxPool2d<S>(y mut tensor.Tensor<S>&, where mut Array<I32>&, x tensor.Tensor<S>&, p conv.Pool&, threads I64) {
+fn MaxPool2d<S>(y mut tensor.Tensor<S>&, where mut Array<I32>&, x tensor.Tensor<S>, p conv.Pool&, threads I64) {
     ym := images(y)
     wm := mat.Mat<I32>(where, 0, ym.Rows, ym.Cols, ym.Cols)
     conv.MaxPool2d(ym, wm, images(x), p, threads)
 }
 
-fn MaxPool2dBackward<S>(dy tensor.Tensor<S>&, where mut Array<I32>&, p conv.Pool&, threads I64, dx mut tensor.Tensor<S>&, add Bool) {
+fn MaxPool2dBackward<S>(dy tensor.Tensor<S>, where mut Array<I32>&, p conv.Pool&, threads I64, dx mut tensor.Tensor<S>&, add Bool) {
     g := images(dy)
     wm := mat.Mat<I32>(where, 0, g.Rows, g.Cols, g.Cols)
     dxm := images(dx)
@@ -559,7 +574,7 @@ fn MaxPool2dBackward<S>(dy tensor.Tensor<S>&, where mut Array<I32>&, p conv.Pool
 
 # h = the gated scan h_t = a_t h_{t-1} + b_t x_t over sequences of ctx positions, from a zero state (state: seqs x D in
 # A, left holding the last positions' states)
-fn Scan<S, A>(work mut scan.Work<A>&, h mut tensor.Tensor<S>&, state mut mat.Mat<A>&, x tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&, ctx I64) {
+fn Scan<S, A>(work mut scan.Work<A>&, h mut tensor.Tensor<S>&, state mut mat.Mat<A>&, x tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, ctx I64) {
     zero(state)
     hm := rows(h)
     scan.GatedScan(work, hm, state, rows(x), rows(a), rows(b), scan.Seq(ctx))
@@ -574,7 +589,7 @@ fn zero<A>(m mut mat.Mat<A>&) {
 
 # dx, da, db (each wanted one written or added to; one not wanted given scratch to write into); init and dstate are
 # seqs x D scratch in A
-fn ScanBackward<S, A>(work mut scan.Work<A>&, dh tensor.Tensor<S>&, h tensor.Tensor<S>&, x tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&, ctx I64, init mut mat.Mat<A>&, dstate mut mat.Mat<A>&, dx mut tensor.Tensor<S>&, dxAdd Bool, da mut tensor.Tensor<S>&, daAdd Bool, db mut tensor.Tensor<S>&, dbAdd Bool) {
+fn ScanBackward<S, A>(work mut scan.Work<A>&, dh tensor.Tensor<S>, h tensor.Tensor<S>, x tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, ctx I64, init mut mat.Mat<A>&, dstate mut mat.Mat<A>&, dx mut tensor.Tensor<S>&, dxAdd Bool, da mut tensor.Tensor<S>&, daAdd Bool, db mut tensor.Tensor<S>&, dbAdd Bool) {
     zero(init)
     zero(dstate)
     freshZero(dx, dxAdd)
@@ -593,7 +608,7 @@ fn freshZero<S>(t mut tensor.Tensor<S>&, add Bool) {
 
 # Mamba's selective scan (kernels/scan's SelectiveScan): x, delta [b, t, D], a [N, D], b and c [b, t, N], skip [D] or
 # empty; keep receives the state at the start of every chunk
-fn SelectiveScan<S, A>(work mut scan.Work<A>&, y mut tensor.Tensor<S>&, state mut mat.Mat<A>&, x tensor.Tensor<S>&, delta tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&, c tensor.Tensor<S>&, skip tensor.Tensor<S>&, ctx I64, keep mut Array<A>&) {
+fn SelectiveScan<S, A>(work mut scan.Work<A>&, y mut tensor.Tensor<S>&, state mut mat.Mat<A>&, x tensor.Tensor<S>, delta tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, c tensor.Tensor<S>, skip tensor.Tensor<S>, ctx I64, keep mut Array<A>&) {
     zero(state)
     ym := rows(y)
     sk := flat(skip) if skip.Count() > 0 else flat(y)[0:0]
@@ -601,7 +616,7 @@ fn SelectiveScan<S, A>(work mut scan.Work<A>&, y mut tensor.Tensor<S>&, state mu
 }
 
 # the gradients (each written or added to; one not wanted given scratch to write into), dstate scratch in A
-fn SelectiveScanBackward<S, A>(work mut scan.Work<A>&, dy tensor.Tensor<S>&, x tensor.Tensor<S>&, delta tensor.Tensor<S>&, a tensor.Tensor<S>&, b tensor.Tensor<S>&, c tensor.Tensor<S>&, skip tensor.Tensor<S>&, ctx I64, keep Array<A>&, dstate mut mat.Mat<A>&, dx mut tensor.Tensor<S>&, addX Bool, ddelta mut tensor.Tensor<S>&, addD Bool, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool, dc mut tensor.Tensor<S>&, addC Bool, dskip mut tensor.Tensor<S>&, addS Bool) {
+fn SelectiveScanBackward<S, A>(work mut scan.Work<A>&, dy tensor.Tensor<S>, x tensor.Tensor<S>, delta tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, c tensor.Tensor<S>, skip tensor.Tensor<S>, ctx I64, keep Array<A>&, dstate mut mat.Mat<A>&, dx mut tensor.Tensor<S>&, addX Bool, ddelta mut tensor.Tensor<S>&, addD Bool, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool, dc mut tensor.Tensor<S>&, addC Bool, dskip mut tensor.Tensor<S>&, addS Bool) {
     zero(dstate)
     freshZero(dx, addX)
     freshZero(ddelta, addD)
@@ -621,13 +636,13 @@ fn SelectiveScanBackward<S, A>(work mut scan.Work<A>&, dy tensor.Tensor<S>&, x t
 }
 
 # the delta rule (kernels/scan's DeltaRule): q, k [b, t, H dk], v [b, t, H dv], beta and gate [b, t, H]
-fn DeltaRule<S, A>(work mut scan.Work<A>&, out mut tensor.Tensor<S>&, state mut mat.Mat<A>&, q tensor.Tensor<S>&, k tensor.Tensor<S>&, v tensor.Tensor<S>&, beta tensor.Tensor<S>&, gate tensor.Tensor<S>&, ctx I64, heads I64, keep mut Array<A>&) {
+fn DeltaRule<S, A>(work mut scan.Work<A>&, out mut tensor.Tensor<S>&, state mut mat.Mat<A>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, ctx I64, heads I64, keep mut Array<A>&) {
     zero(state)
     om := rows(out)
     scan.DeltaRule(work, om, state, rows(q), rows(k), rows(v), rows(beta), rows(gate), scan.Seq(ctx, 64, heads), keep)
 }
 
-fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>&, q tensor.Tensor<S>&, k tensor.Tensor<S>&, v tensor.Tensor<S>&, beta tensor.Tensor<S>&, gate tensor.Tensor<S>&, ctx I64, heads I64, keep Array<A>&, dstate mut mat.Mat<A>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool, dbeta mut tensor.Tensor<S>&, addB Bool, dgate mut tensor.Tensor<S>&, addG Bool) {
+fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, ctx I64, heads I64, keep Array<A>&, dstate mut mat.Mat<A>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool, dbeta mut tensor.Tensor<S>&, addB Bool, dgate mut tensor.Tensor<S>&, addG Bool) {
     zero(dstate)
     freshZero(dq, addQ)
     freshZero(dk, addK)
@@ -645,7 +660,7 @@ fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>&, q ten
 # ---- reductions ----
 
 # y = the sum over x's last axis (mean: divided by its length)
-fn SumLast<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, mean Bool) {
+fn SumLast<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, mean Bool) {
     xm := rows(x)
     yd := flat(y)
     k := A(1.0) / A(xm.Cols) if mean else A(1.0)
@@ -653,7 +668,7 @@ fn SumLast<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>&, mean Bool) {
 }
 
 # dx (+)= dy spread over each row (divided by its length for the mean)
-fn SumLastBackward<S, A>(dy tensor.Tensor<S>&, mean Bool, dx mut tensor.Tensor<S>&, add Bool) {
+fn SumLastBackward<S, A>(dy tensor.Tensor<S>, mean Bool, dx mut tensor.Tensor<S>&, add Bool) {
     d := rows(dx)
     g := flat(dy)
     k := A(1.0) / A(d.Cols) if mean else A(1.0)
@@ -668,7 +683,7 @@ fn SumLastBackward<S, A>(dy tensor.Tensor<S>&, mean Bool, dx mut tensor.Tensor<S
 
 # dst += src, element by element, both of one shape and any strides, dd being dst's storage (written where not add):
 # the backward of a view, through the view's strides over its base's gradient
-fn AddInto<S, A>(dd mut Array<S>&, dst mut tensor.Tensor<S>&, src tensor.Tensor<S>&, add Bool) {
+fn AddInto<S, A>(dd mut Array<S>&, dst mut tensor.Tensor<S>&, src tensor.Tensor<S>, add Bool) {
     if not add {
         try dst.Convert(src) catch { unreachable }
         return
