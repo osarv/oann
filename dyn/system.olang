@@ -695,3 +695,130 @@ test System.Nudged "the nudged phases start from the free fixed point: +beta low
         assert d.Abs() < 1e-5 and (p.Get(1, j) - f.Get(1, j)).Abs() < 1e-2
     }
 }
+
+test System.Settle "a spiking population under a constant drive fires at the rate the analytic formula gives" {
+    window I64 = 4000
+    leak F64 = 0.05
+    r := rand.Rand(14)
+    s := System<F64>(6, 1, 1)
+    h := s.Population(s.Root(), "h", 1, neuron.Neuron.Lif(leak, 1.0, 1.0, window))
+    s.Plan(r)!
+    drives := Array<F64>[0.5, 0.98, 1.05, 1.5, 2.5, 6.0]
+    for b in range 6: s.Pop(h).Drive[b] = drives[b]
+    out := s.Settle(settle.Phase.Free, settle.Budget(40 * window, 2.0 / F64(window)))
+    assert out.Converged and out.Sweeps >= 2 * window and out.Sweeps % window == 0
+    for b in range 6 {
+        rate := s.Activity(settle.Phase.Free, h).Get(b, 0)
+        f := neuron.LifRateOf(drives[b], leak, 1.0)
+        if f == 0.0 { assert rate == 0.0 } else { assert (rate - f).Abs() <= f * f / (1.0 - f) + 1.0 / F64(window) }
+    }
+}
+
+test System.Reset "a cold start clears the state but the fields kept across settles (@Keep)" {
+    r := rand.Rand(15)
+    s := System<F64>(2, 1, 1)
+    h := s.Population(s.Root(), "h", 3, neuron.Neuron.Spiking(window = 8))
+    s.Plan(r)!
+    cells := s.State<neuron.LifCell<F64>>(h)
+    cells.Theta[4] = 0.5
+    cells.V[4] = 0.25
+    cells.Trace[4] = 0.125
+    s.Reset(settle.Phase.Free)
+    assert cells.Theta[4] == 0.5 and cells.V[4] == 0.0 and cells.Trace[4] == 0.0
+}
+
+# a population whose model is its own: leaky linear units, u += dt (drive - u), activity u - the rate model of
+# Rho.Linear written as a Dynamics
+type leaky struct(rows I64, size I64) {
+    size
+    u mut Array<F32>& = Array<F32>(rows * size)
+}
+
+fn (l mut leaky&) Relax(drive tensor.Tensor<F32>&, dt F64, lo I64, hi I64) F64 {
+    d := drive.Flat()!
+    worst F32 = 0.0
+    for i in range lo * l.size, hi * l.size {
+        r := d[i] - l.u[i]
+        worst = worst.Max(r.Abs())
+        l.u[i] = l.u[i] + F32(dt) * r
+    }
+    return F64(worst)
+}
+
+fn (l leaky&) Activity() tensor.Tensor<F32> { return tensor.Tensor<F32>.Over(l.u, 0, l.u.Len())! }
+
+fn (l mut leaky&) RelaxVjp(dy tensor.Tensor<F32>&, dx mut tensor.Tensor<F32>&) { }
+
+test System.Settle "a custom model settles where the built-in model it restates does" {
+    built := System<F32>.withHidden(neuron.Neuron.Rate(neuron.Rho.Linear))
+    mine := leaky(2, 6)
+    own := System<F32>.withHidden(neuron.Neuron.Custom(mine))
+    a := built.Settle(settle.Phase.Free, settle.Budget(200, 1e-5))
+    b := own.Settle(settle.Phase.Free, settle.Budget(200, 1e-5))
+    assert a.Converged and b.Converged and a.Sweeps == b.Sweeps
+    for i in range 12: assert built.State<neuron.RateCell<F32>>(Pop(1)).S[i] == own.State<neuron.RateCell<F32>>(Pop(1)).S[i]
+}
+
+fn System<T>.withHidden(model neuron.Neuron) System<T> {
+    r := rand.Rand(16)
+    s := System<T>(2, 2, 1)
+    x := s.Population(s.Root(), "x", 4, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 6, model)
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Dense)
+    s.Plan(r)!
+    for i in range 8: s.Pop(x).Drive[i] = T(r.Uniform(-1.0, 1.0))
+    s.Weights(Conn(1)).Fill(T(0.1))                 # a gain of 0.6 (a custom model has no slope to certify by)
+    return s
+}
+
+test System.Prune "a pruned weight is a zero weight, a retired unit rests, and compacting changes no equilibrium" {
+    a := System<F64>.mixed(3, 2)
+    b := System<F64>.mixed(3, 2)
+    keep := Array<Bool>(b.Link(Conn(5)).Count, true)
+    for e in range 0, keep.Len(), 4: keep[e] = false
+    b.Prune(Conn(5), keep)
+    w := a.Weights(Conn(5))
+    for e in range 0, keep.Len(), 4: w.Flat()![e] = 0.0
+    a.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    b.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    assert sameState(a, b)
+    # a sparse block's entries masked, then dropped: the same equilibrium, fewer entries
+    csr := b.Link(Conn(1)).Csr!
+    nnz := csr.Nnz()
+    drop := Array<Bool>(b.Link(Conn(1)).Count, true)
+    for e in range 0, nnz, 3: drop[e] = false
+    b.Prune(Conn(1), drop)
+    b.Reset(settle.Phase.Free)
+    b.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    before := b.State<neuron.RateCell<F64>>(Pop(2)).S.Copy()
+    assert b.Compact() == (nnz + 2) / 3 and csr.Nnz() == nnz - (nnz + 2) / 3
+    b.Reset(settle.Phase.Free)
+    b.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    after := b.State<neuron.RateCell<F64>>(Pop(2)).S
+    for i in range before.Len(): assert (before[i] - after[i]).Abs() < 1e-9
+    b.Retire(Pop(1), 2)
+    b.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    for row in range 3: assert b.Activity(settle.Phase.Free, Pop(1)).Get(row, 2) == 0.0
+}
+
+fn has<T>(s System<T>&, m Mod, name String&) Bool {
+    try s.Read(m, name) catch SignalError.Missing { return false }
+    return true
+}
+
+test System.Read "a module reads its own signal first, then its parent's" {
+    s := System<F32>(1)
+    child := s.Module(s.Root(), "child")
+    mine := s.Signal(child, "reward")
+    theirs := s.Signal(s.Root(), "reward")
+    arousal := s.Signal(s.Root(), "arousal", 2)
+    s.Population(s.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    s.Plan(rand.Rand(1))!
+    s.Set(mine, tensor.Tensor<F32>.Of(Array<F32>[1.0], 1)!)!
+    s.Set(theirs, tensor.Tensor<F32>.Of(Array<F32>[2.0], 1)!)!
+    s.Set(arousal, tensor.Tensor<F32>.Of(Array<F32>[3.0, 4.0], 2)!)!
+    assert s.Read(child, "reward")!.Get(0) == 1.0 and s.Read(s.Root(), "reward")!.Get(0) == 2.0
+    assert s.Read(child, "arousal")!.Get(1) == 4.0
+    assert not has(s, child, "nothing") and has(s, child, "arousal")
+}
