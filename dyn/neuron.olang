@@ -241,6 +241,18 @@ fn crossEntropy<T Float>(s Array<T>&, at I64, w I64, temperature F64, y I64) F64
     return sum.Log() - (F64(s[at + y]) - top) / temperature
 }
 
+# ---- what must not allocate, decided while compiling (S17a, G42): the per-element work of every sweep ----
+
+fn rateStepOf(u Array<F32>&, s mut Array<F32>&) F32 { return RateStep(Rho.Tanh, u, u, s, s, 0, 1, 1.0) }
+fn lifStepOf(a Columns<LifCell<F32>>&, b mut Columns<LifCell<F32>>&, x Array<F32>&) { LifStep(a, b, x, x, 0, x, true, 0, 1, 0.1, 1.0, 0.25, 0.5) }
+fn lifWindowOf(b mut Columns<LifCell<F32>>&) F32 { return LifWindow(b, 0, 1, 8) }
+fn forceOf(s mut Array<F32>&, y Array<I32>&) { AddForce(Cost.Classes(), s, 0, 1, s, 0.5, y, 0, s, 0) }
+
+assert not rateStepOf.Allocates, "a rate step allocates"
+assert not lifStepOf.Allocates, "a spiking step allocates"
+assert not lifWindowOf.Allocates, "a spiking window's end allocates"
+assert not forceOf.Allocates, "a readout's force allocates"
+
 test LifRateOf "below the threshold nothing fires; far above, one spike a step at most" {
     assert LifRateOf(0.5, 0.1, 1.0) == 0.0
     assert LifRateOf(1000.0, 0.1, 1.0) == 1.0

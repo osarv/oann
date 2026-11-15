@@ -395,17 +395,22 @@ fn (e Engine<T>&) ForceSlope() F64 {
 
 # rows r0 .. r1 of a rate (or custom) population stepped from buffer cur into the other; gives their residual
 fn (e mut Engine<T>&) rateStep(p mut Population<T>&, r0 I64, r1 I64) T {
+    model := p.Model
+    if model != neuron.Neuron.Custom: return e.builtStep(p, r0, r1)
+    b := p.rate(1 - e.cur)
+    worst := custom(model.d, p, b, r0, r1, e.step(r0 / e.Batch, e.damping))
+    if p.Retired > 0: retire(p, b, r0, r1)
+    return worst
+}
+
+# a built-in rate model's rows: the residual and the step, the retired units held at rest
+fn (e mut Engine<T>&) builtStep(p mut Population<T>&, r0 I64, r1 I64) T {
+    model := p.Model
+    if model != neuron.Neuron.Rate: unreachable "a spiking population steps by lifStep"
     a := p.rate(e.cur)
     b := p.rate(1 - e.cur)
-    dt := e.step(r0 / e.Batch, e.damping)
     n := p.Size
-    model := p.Model
-    worst T = T(0)
-    match model {
-        case neuron.Neuron.Rate(rho) { worst = neuron.RateStep(rho, a.U, p.Total, b.U, b.S, r0 * n, r1 * n, T(dt)) }
-        case neuron.Neuron.Custom(d) { worst = custom(d, p, b, r0, r1, dt) }
-        case neuron.Neuron.Lif { unreachable "a spiking population steps by lifStep" }
-    }
+    worst := neuron.RateStep(model.rho, a.U, p.Total, b.U, b.S, r0 * n, r1 * n, T(e.step(r0 / e.Batch, e.damping)))
     if p.Retired > 0: retire(p, b, r0, r1)
     return worst
 }
@@ -509,3 +514,30 @@ fn (e mut Engine<T>&) spikes(b Budget) Settlement {
     }
     return out
 }
+
+# ---- what must not allocate, decided while compiling (S17a, G42) ----
+# Pinned: every step of a population, the state's moves between settles and phases, the units' plan, an input's closed
+# form. Not pinned, and why: a sweep's products go through gemm's Gemm, which grows its workspace's panels on its
+# first products (the fact holds for every call, never "after the first": run -> task -> totals -> conn.Link.Forward
+# -> gemm.Gemm -> Workspace.panelsA); a sparse connection's product holds the kernel's join for its threads; a sweep in
+# tasks holds a join (which keeps ~110 bytes a join: repro/joinleak.olang); a custom model's step is a call through
+# `any Dynamics&`, which no fact sees through. Resident memory over many settles is measured instead (system.olang).
+
+fn builtStepOf(e mut Engine<F32>&, p mut Population<F32>&) F32 { return e.builtStep(p, 0, 1) }
+fn lifStepOf(e mut Engine<F32>&, p mut Population<F32>&) F32 { return e.lifStep(p, 0, 1) }
+fn resetOf(e mut Engine<F32>&) { e.Reset(0) }
+fn warmOf(e mut Engine<F32>&) { e.Warm(1, 0) }
+fn commitOf(e mut Engine<F32>&) { e.commit(0, 1) }
+fn planOf(e mut Engine<F32>&) { e.plan(0, 1) }
+fn closedFormOf(e mut Engine<F32>&, p mut Population<F32>&) {
+    e.closedForm(p, 0, 1)
+    e.clearCounts(p, 0, 1)
+}
+
+assert not builtStepOf.Allocates, "a rate population's step allocates"
+assert not lifStepOf.Allocates, "a spiking population's step allocates"
+assert not resetOf.Allocates, "a cold start allocates"
+assert not warmOf.Allocates, "a warm start allocates"
+assert not commitOf.Allocates, "committing a settle allocates"
+assert not planOf.Allocates, "a settle's units allocate"
+assert not closedFormOf.Allocates, "an input's closed form allocates"

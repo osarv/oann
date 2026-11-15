@@ -383,6 +383,26 @@ fn clearPast<T>(params mut Array<T>&, grads mut Array<T>&, lo I64, hi I64) {
     }
 }
 
+# ---- what must not allocate, decided while compiling (S17a, G42): pruning in place, an event-driven connection's
+# carry and reset, the gain's sums. The products are not pinned: gemm's Gemm grows its workspace's panels on its first products
+# (a fact holds for every call, not "after the first"), and the sparse kernels' products hold a join for their threads ----
+
+fn pruneOf(l mut Link<F32>&, k Array<Bool>&, a mut Array<F32>&) { l.Prune(k, a, a) }
+fn compactOf(l mut Link<F32>&, a mut Array<F32>&) { l.Compact(a, a) }
+fn maskOf(l mut Link<F32>&, a mut Array<F32>&) { l.MaskGrads(a) }
+fn forgetOf(l mut Link<F32>&) { l.Forget(0, 1) }
+fn massOf(l Link<F32>&, a Array<F32>&, m mut Array<F64>&) { l.AddMass(a, m, 0, 0) }
+fn scaleOf(l Link<F32>&, a mut Array<F32>&) { l.Scale(a, 0.5) }
+fn eventsOf(l mut Link<F32>&, sc mut Scratch<F32>&, a mut Array<F32>&) { l.events(sc, a, a, 0, 1, 0.0) }
+
+assert not pruneOf.Allocates, "pruning allocates"
+assert not compactOf.Allocates, "compacting allocates"
+assert not maskOf.Allocates, "masking gradients allocates"
+assert not forgetOf.Allocates, "an event-driven connection's reset allocates"
+assert not massOf.Allocates, "the incoming mass allocates"
+assert not scaleOf.Allocates, "scaling allocates"
+assert not eventsOf.Allocates, "an event-driven carry allocates"
+
 # ---- tests ----
 
 # a connection laid out alone over its own parameters, rows rows of state

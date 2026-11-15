@@ -322,6 +322,15 @@ are constant and the evaluator can decide the bound.
     out). Stability: `Gain`, `Certify`, `Restrain`, `Rate`, `LessonTolerance`, `BudgetFor` as circuit's;
     `Contraction()` (a spectral bound by power iteration) is not built.
 
+11. **Allocation-free, pinned while compiling** (top-level `assert not f.Allocates`, S17a/G42): every population's
+    step (rate, spiking), a readout's force, the window's end, cold and warm starts, committing a settle, a settle's
+    units, an input's closed form, pruning, retiring, compacting, masking gradients, an event-driven carry and its
+    reset, the gain's sums. Not pinnable as written: the sweep and the settle as wholes - their products go through
+    gemm's `Gemm`, which grows its workspace's panels on its first products (a fact holds for every call; pinning it
+    wants a workspace reserved at Plan and a product that never grows - a kernels change), a sparse product holds the
+    kernel's join, a sweep in tasks holds a join, and a custom model is a call through `any Dynamics&`, which no fact
+    sees through. For those, resident memory is measured (M9).
+
 Measured (tests in `dyn/system.olang`, `bench/settle.olang`): a certified system at kappa 0.9 whose bound is tight
 settles cold in exactly 64 sweeps at the lesson tolerance (1.25e-3), 66 at 1e-3 and 71 at the life tolerance
 (6.25e-4) - settling.md 1.2's `ln(tol) / ln 0.9`; linear neurons reach the solution of `(I - W) v = c` to 1e-10;
