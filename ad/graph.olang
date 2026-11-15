@@ -197,7 +197,6 @@ type Node struct(Kind Op, Dims tensor.Shape, Batched Bool) {
     AccOffset I64 = -1          # elements in the type computed in: scan states, what a scan keeps, decoding's scores
     Keep Bool = false           # its value and gradient kept to the step's end
     Watch Bool = false          # its gradient wanted though it depends on no parameter (an input's)
-    Args I64 = -1               # a Custom's operands: its index in Graph.customs
 }
 
 # the row-major strides of dims
@@ -311,12 +310,6 @@ type slot<E> struct(mem mut Array<E>&) {
     mem
 }
 
-# a Custom node's operands, made once and refreshed in place at each call
-type customArgs struct(ins mut Array<tensor.Tensor<F32>>&, dins mut Array<tensor.Tensor<F32>>&) {
-    ins
-    dins
-}
-
 # what a node needs besides its value and gradient: kept elements, backward scratch, I32s, elements in the type
 # computed in
 type extras struct(saved I64, scratch I64, ints I64, acc I64) {
@@ -336,7 +329,6 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     Decode Bool = decode
     nodes mut list.List<Node>& = list.List<Node>()
     customIn mut list.List<Var>& = list.List<Var>()
-    customs mut list.List<customArgs>& = list.List<customArgs>()
     vals mut list.List<slot<T>>& = list.List<slot<T>>()
     ints mut list.List<slot<I32>>& = list.List<slot<I32>>()
     accs32 mut list.List<slot<F32>>& = list.List<slot<F32>>()
@@ -960,7 +952,6 @@ fn (g mut Graph<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError {
         g.accs32.Push(slot<F32>(g.acc32))
         g.accs64.Push(slot<F64>(g.acc64))
     }
-    g.makeCustoms()
     for i in range count: g.initParam(i, r)
     g.SyncParams()
 }
@@ -1063,7 +1054,7 @@ fn (g Graph<T>&) buffersOf(i I64, last I64, first I64, out mut list.List<buffer>
         out.Push(buffer(i, 1, n, from, end if nd.Keep else g.back(i)))
     }
     e := g.extrasOf(i)
-    if e.saved > 0 and not g.Decode: out.Push(buffer(i, 2, e.saved, i, g.back(i) if wanted else i))
+    if e.saved > 0 and not (g.Decode and nd.Kind == Op.Attention): out.Push(buffer(i, 2, e.saved, i, g.back(i) if wanted else i))
     if e.scratch > 0 and wanted: out.Push(buffer(i, 3, e.scratch, g.back(i), g.back(i)))
 }
 
@@ -1195,30 +1186,6 @@ fn initialize<E>(p mut tensor.Tensor<E>&, init Init, r mut rand.Rand&) {
     }
 }
 
-# every Custom node's operand arrays
-fn (g mut Graph<T>&) makeCustoms() {
-    for i in range g.nodes.Len() {
-        match g.nodes[i].Kind {
-            case Op.Custom(_, first, count): g.makeCustom(i, first, count)
-            case _ { }
-        }
-    }
-}
-
-fn (g mut Graph<T>&) makeCustom(i I64, first I64, count I64) {
-    match T {
-        case F32 {
-            ins := Array<tensor.Tensor<F32>>[g.Value(g.customIn[first + j]) for j in range count]
-            dins := Array<tensor.Tensor<F32>>[g.Value(g.customIn[first + j]) for j in range count]
-            nd := g.nodes[i]
-            nd.Args = g.customs.Len()
-            g.nodes[i] = nd
-            g.customs.Push(customArgs(ins, dins))
-        }
-        case _ { }
-    }
-}
-
 # ---- eager ----
 
 # node v laid out on storage of its own - value, gradient where wanted, what it keeps, its scratch - and run
@@ -1257,10 +1224,6 @@ fn (g mut Graph<T>&) eagerNode(v Var) {
         }
     }
     g.grow(i)
-    match nd.Kind {
-        case Op.Custom(_, first, count): g.makeCustom(i, first, count)
-        case _ { }
-    }
     if nd.Kind == Op.Param: g.initParam(i, g.draw)
     if g.problem == "" and not isLeaf(nd.Kind): g.forwardNode(i)
 }
@@ -1370,17 +1333,24 @@ fn (g mut Graph<T>&) acc(v I64) Bool {
     return was
 }
 
-# the tokens or classes of v (Tokens, Classes) for the entries in use: where the caller puts a batch's
+# an input's whole planned batch, whatever the last Forward ran on: where the caller puts the next step's (Value is the
+# entries in use)
+fn (g Graph<T>&) Data(v Var) tensor.Tensor<T> {
+    nd := g.nodes[v]
+    return tensor.Tensor<T>.Strided(g.vals[v].mem, nd.Offset, nd.Dims, nd.Strides)!
+}
+
+# the tokens or classes of v (Tokens, Classes), the whole planned batch: where the caller puts a batch's
 fn (g Graph<T>&) Ints(v Var) tensor.Tensor<I32> {
     nd := g.nodes[v]
     if nd.IntOffset < 0: unreachable "oann: Ints of a node holding no tokens or classes"
-    d := g.inUse(nd)
-    return tensor.Tensor<I32>.Strided(g.ints[v].mem, nd.IntOffset, d, rowMajor(d))!
+    return tensor.Tensor<I32>.Strided(g.ints[v].mem, nd.IntOffset, nd.Dims, rowMajor(nd.Dims))!
 }
 
 fn (g Graph<T>&) intsOf(v I64) mut Array<I32>& {
     nd := g.nodes[v]
-    return g.ints[v].mem[nd.IntOffset:nd.IntOffset + g.inUse(nd).Count()]
+    n := nd.Dims.Count() if not nd.Batched else withAxis(nd.Dims, 1 if g.Decode and nd.Dims.Rank >= 2 else 0, g.N).Count()
+    return g.ints[v].mem[nd.IntOffset:nd.IntOffset + n]
 }
 
 # what node i keeps for its backward, from its place to the end of what was planned for it
@@ -1559,7 +1529,7 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         }
         case Op.Contiguous(x): try y.Convert(g.Value(x)) catch { unreachable }
         case Op.Sum(x, mean): ops.SumLast<T, A>(y, g.Value(x), mean)
-        case Op.Custom(f, _, _): g.customForward(i, f)
+        case Op.Custom(f, first, count): g.customForward(i, f, first, count)
         case _ { }
     }
 }
@@ -1595,18 +1565,22 @@ fn (g Graph<T>&) deltaKeep(i I64) I64 {
     }
 }
 
-fn (g mut Graph<T>&) customForward(i I64, f mut any Function&) {
+# a Custom's forward: its operands gathered (into its block's arena, reclaimed as it returns) and the function run
+fn (g mut Graph<T>&) customForward(i I64, f mut any Function&, first I64, count I64) {
     match T {
         case F32 {
-            nd := g.nodes[i]
-            args := g.customs[nd.Args]
-            first := nd.Kind.first
-            for j in range args.ins.Len(): args.ins[j] = g.Value(g.customIn[first + j])
+            ins := g.customIns(first, count)
             out := g.Value(Var(i))
-            f.Forward(out, args.ins)
+            f.Forward(out, ins.View())
         }
         case _ { }
     }
+}
+
+fn (g Graph<T>&) customIns(first I64, count I64) Vec<tensor.Tensor<T>> {
+    ins := Vec<tensor.Tensor<T>>()
+    for j in range count: ins.Push(g.Value(g.customIn[first + j]))
+    return ins
 }
 
 # the gradients of loss - a one-element node - with respect to every node it depends on, parameters included, after a
@@ -1893,21 +1867,19 @@ fn (g mut Graph<T>&) deltaBack<A>(i I64, sw mut scan.Work<A>&, dy tensor.Tensor<
 fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count I64, dy tensor.Tensor<T>&) {
     match T {
         case F32 {
-            nd := g.nodes[i]
-            args := g.customs[nd.Args]
+            ins := g.customIns(first, count)
+            dins := Vec<tensor.Tensor<T>>()
             at I64 = 0
             for j in range count {
-                x := g.customIn[first + j]
-                args.ins[j] = g.Value(x)
-                d := g.inUse(g.nodes[x])
-                args.dins[j] = g.scratchTensor(i, at, d)
+                d := g.inUse(g.nodes[g.customIn[first + j]])
+                dins.Push(g.scratchTensor(i, at, d))
                 at += d.Count()
             }
-            f.Backward(dy, args.ins, args.dins)
+            f.Backward(dy, ins.View(), dins.ViewMut())
             for j in range count {
                 x := g.customIn[first + j]
                 dx, ax := g.gradOf(x), g.acc(x)
-                if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, args.dins[j].Flat()!, A(1.0), ax)
+                if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dins[j].Flat()!, A(1.0), ax)
             }
         }
         case _ { }
@@ -1935,4 +1907,359 @@ test Graph "records, plans and runs a small network" {
     assert g.Value(h).Get(1, 0) == 6.0
     g.Backward(loss)
     assert g.Grad(w).Get(0, 0) != 0.0
+}
+
+test Graph "the kernels compute what they say: ReLU, a product, a linear layer, softmax cross-entropy" {
+    g := Graph<F64>(2)
+    a := g.Input(3)
+    b := g.Input(3)
+    w := g.Constant(4, 3)
+    bias := g.Constant(4)
+    y := g.Classes()
+    relu := g.Act(a, mat.Act.Relu)
+    prod := g.Mul(a, b)
+    out := g.Linear(a, w, bias)
+    g.Keep(out)
+    loss := g.CrossEntropy(out, y)
+    try g.Plan(rand.Rand(1))
+    set(g, a, Array<F64>[1, -2, 3, -4, 5, -6])
+    set(g, b, Array<F64>[0.5, 1, 1.5, 2, 2.5, 3])
+    set(g, w, Array<F64>[1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1])
+    set(g, bias, Array<F64>[10, 20, 30, 40])
+    c := g.Ints(y).Flat()!
+    c[0] = 3
+    c[1] = 1
+    g.Forward(2)
+    r := g.Value(relu)
+    assert r.Get(0, 0) == 1.0 and r.Get(0, 1) == 0.0 and r.Get(1, 2) == 0.0
+    assert g.Value(prod).Get(1, 1) == 12.5
+    o := g.Value(out)
+    assert o.Get(0, 0) == 11.0 and o.Get(0, 3) == 42.0 and o.Get(1, 1) == 25.0
+    assert g.Scalar(loss) > 0.0
+}
+
+fn set<T>(g mut Graph<T>&, v Var, values Array<F64>&) {
+    d := g.Value(v).Flat()!
+    for i in range values.Len(): d[i] = T(values[i])
+}
+
+# a small transformer-like network on g: a dense layer, GELU, layer normalization, causal attention in two heads, RMS
+# normalization, another dense layer and softmax cross-entropy over sequences of 8 - every kind of kernel a model runs.
+# An eager graph's inputs are filled (from seed) as they are made, a captured one's by fillMixed after Plan
+fn mixedNet<T>(g mut Graph<T>&, seed U64, dropout F64 = 0.0) Var, Var, Var {
+    x := g.Input(8, 8)
+    y := g.Classes(8)
+    if g.Eager: fillMixed(g, x, y, seed)
+    w1 := g.Param(Init.Normal(0.0, 0.4), true, 16, 8)
+    b1 := g.Param(Init.Normal(0.0, 0.1), false, 16)
+    h := g.Act(g.Linear(x, w1, b1), mat.Act.GeluTanh)
+    n := g.Norm(h, g.Param(Init.Constant(1.0), false, 16), g.Param(Init.Zeros, false, 16))
+    wq := g.Param(Init.Normal(0.0, 0.25), true, 16, 16)
+    a := g.Attention(g.Linear(n, wq), n, n, 2, true)
+    r := g.Norm(g.Dropout(g.Add(a, n), dropout), g.Param(Init.Constant(1.0), false, 16), None, true)
+    logits := g.Linear(r, g.Param(Init.Normal(0.0, 0.25), true, 5, 16), g.Param(Init.Zeros, false, 5))
+    return x, y, g.CrossEntropy(logits, y)
+}
+
+fn fillMixed<T>(g mut Graph<T>&, x Var, y Var, seed U64) {
+    r := rand.Rand(seed)
+    xd := g.Value(x).Flat()!
+    for i in range xd.Len(): xd[i] = T(F32(r.Normal()))
+    yd := g.Ints(y).Flat()!
+    for i in range yd.Len(): yd[i] = I32(r.Below(5))
+}
+
+test Graph "eager equals captured bit for bit: the loss and every parameter's gradient, with dropout and without" {
+    for dropout in Array<F64>[0.0, 0.2] {
+        c := Graph<F32>(2)
+        cx, cy, closs := mixedNet(c, 3, dropout)
+        try c.Plan(rand.Rand(21))
+        fillMixed(c, cx, cy, 3)
+        c.Forward(2)
+        c.Backward(closs)
+        e := Graph<F32>(2, 1, Mode.Eager)
+        try e.Plan(rand.Rand(21))
+        _, _, eloss := mixedNet(e, 3, dropout)
+        try e.Check()
+        e.Backward(eloss)
+        assert e.Scalar(eloss) == c.Scalar(closs)
+        for i in range c.Size() {
+            v := Var(i)
+            if c.Info(v).Kind != Op.Param: continue
+            assert e.Value(v) == c.Value(v) and e.Grad(v) == c.Grad(v), "parameter " $i
+        }
+        # and a second step of each, on a short batch
+        c.Forward(1)
+        c.Backward(closs)
+        e.Forward(1)
+        e.Backward(eloss)
+        assert e.Scalar(eloss) == c.Scalar(closs)
+    }
+}
+
+test Graph "liveness reuse: a smaller arena, and every number the same as with each buffer apart" {
+    a := Graph<F32>(2)
+    ax, ay, aloss := mixedNet(a, 4)
+    b := Graph<F32>(2)
+    bx, by, bloss := mixedNet(b, 4)
+    b.Reuse = false
+    try a.Plan(rand.Rand(5))
+    try b.Plan(rand.Rand(5))
+    fillMixed(a, ax, ay, 4)
+    fillMixed(b, bx, by, 4)
+    for step in range 2 {
+        a.Forward(2 - step)
+        a.Backward(aloss)
+        b.Forward(2 - step)
+        b.Backward(bloss)
+        assert a.Scalar(aloss) == b.Scalar(bloss) and a.ParamGrads() == b.ParamGrads()
+    }
+    assert a.ActivationSize < b.ActivationSize * 2 / 3, "reused " $a.ActivationSize " of " $b.ActivationSize
+}
+
+test Graph "Backward with accumulate adds to the gradients already there" {
+    g := Graph<F64>(2)
+    w := g.Param(Init.Normal(0.0, 1.0), true, 2, 2)
+    target := g.Param(Init.Normal(0.0, 1.0), true, 2, 2)
+    loss := g.Mse(w, target)
+    try g.Plan(rand.Rand(2))
+    g.Forward(2)
+    g.Backward(loss)
+    once := g.Grad(w).Get(0, 1)
+    g.Backward(loss, true)
+    assert (g.Grad(w).Get(0, 1) - 2.0 * once).Abs() < 1e-12
+    g.Backward(loss)
+    assert g.Grad(w).Get(0, 1) == once
+}
+
+test Graph "causal attention: a position's output depends on no later position" {
+    g := Graph<F64>(1)
+    x := g.Input(32, 8)
+    w := g.Param(Init.Normal(0.0, 0.5), true, 8, 8)
+    q := g.Linear(x, w)
+    a := g.Attention(q, q, x, 2, true)
+    g.Keep(a)
+    g.Mse(a, g.Input(32, 8))
+    r := rand.Rand(13)
+    try g.Plan(r)
+    xd := g.Value(x).Flat()!
+    for i in range xd.Len(): xd[i] = r.Normal()
+    g.Forward(1)
+    early := g.Value(a).Slice(1, 0, 20)!.Clone()
+    later := g.Value(a).Get(0, 25, 0)
+    for c in range 8: xd[25 * 8 + c] = 7.0
+    g.Forward(1)
+    assert g.Value(a).Slice(1, 0, 20)! == early
+    assert g.Value(a).Get(0, 25, 0) != later
+}
+
+test Graph "GELU through tanh is within 1e-3 of the exact GELU" {
+    g := Graph<F64>(1)
+    w := g.Param(Init.Normal(0.0, 2.0), true, 4, 8)
+    a := g.Act(w, mat.Act.GeluTanh)
+    b := g.Act(w, mat.Act.Gelu)
+    try g.Plan(rand.Rand(15))
+    g.Forward(1)
+    worst F64 = 0.0
+    for i in range 32: worst = worst.Max((g.Value(a).Flat()![i] - g.Value(b).Flat()![i]).Abs())
+    assert worst < 1e-3 and worst > 0.0
+}
+
+test Graph "a checkpoint saves the parameters and loads them back into a graph built the same way, whatever its batch" {
+    a := Graph<F32>(4)
+    wa := a.Param(Init.Normal(0.0, 1.0), true, 3, 5)
+    a.Param(Init.Uniform(-1.0, 1.0), false, 5)
+    r := rand.Rand(16)
+    try a.Plan(r)
+    try a.Save("build/ad_checkpoint.safetensors")
+    b := Graph<F32>(8)
+    wb := b.Param(Init.Zeros, true, 3, 5)
+    b.Param(Init.Zeros, false, 5)
+    try b.Plan(r)
+    try b.Load("build/ad_checkpoint.safetensors")
+    assert b.Params() == a.Params() and b.Value(wb).Get(2, 4) == a.Value(wa).Get(2, 4)
+    c := Graph<F32>(4)
+    c.Param(Init.Zeros, true, 3, 4)
+    try c.Plan(r)
+    bad := false
+    try c.Load("build/ad_checkpoint.safetensors") catch tensor.ShapeError { bad = true } catch { }
+    assert bad
+}
+
+test Graph "a step split over tasks gives exactly what one task gives, forward and backward" {
+    want := Vec<F64>()
+    wantLoss F64 = 0.0
+    for threads in Array<I64>[1, 3] {
+        g := Graph<F64>(8, threads)
+        x := g.Input(64, 64)
+        q := g.Linear(x, g.Param(Init.Normal(0.0, 0.1), true, 64, 64))
+        a := g.Attention(q, x, x, 2, true)
+        loss := g.Mse(g.Linear(a, g.Param(Init.Normal(0.0, 0.1), true, 64, 64)), g.Input(64, 64))
+        try g.Plan(rand.Rand(17))
+        xd := g.Value(x).Flat()!
+        for i in range xd.Len(): xd[i] = F64(i % 7) * 0.25 - 0.5
+        g.Forward(8)
+        g.Backward(loss)
+        got := g.ParamGrads().Flat()!
+        if threads == 1 {
+            for v in got: want.Push(v)
+            wantLoss = g.Scalar(loss)
+            continue
+        }
+        assert g.Scalar(loss) == wantLoss
+        for i in range got.Len(): assert got[i] == want[i]
+    }
+}
+
+test Graph "a BF16 graph keeps F32 masters drawn as an F32 graph's, and computes as the F64 graph does to BF16's precision" {
+    a := Graph<F64>(2)
+    ax, ay, aloss := mixedNet(a, 3)
+    b := Graph<BF16>(2)
+    bx, by, bloss := mixedNet(b, 3)
+    c := Graph<F32>(2)
+    mixedNet(c, 3)
+    try a.Plan(rand.Rand(21))
+    try b.Plan(rand.Rand(21))
+    try c.Plan(rand.Rand(21))
+    assert b.Masters() == c.Params()
+    p := b.Params().Flat()!
+    m := b.Masters().Flat()!
+    for i in range b.ParamCount: assert p[i] == BF16(m[i])
+    pa := a.Params()
+    try pa.Convert(b.Params())
+    fillMixed(a, ax, ay, 3)
+    fillMixed(b, bx, by, 3)
+    for n in Array<I64>[2, 1] {
+        a.Forward(n)
+        a.Backward(aloss)
+        b.Forward(n)
+        b.Backward(bloss)
+        assert (b.Scalar(bloss) - a.Scalar(aloss)).Abs() < 1e-3 * a.Scalar(aloss)
+        ga := a.ParamGrads().Flat()!
+        gb := b.ParamGrads().Flat()!
+        diff F64 = 0.0
+        norm F64 = 0.0
+        for i in range a.ParamCount {
+            d := F64(gb[i]) - ga[i]
+            diff += d * d
+            norm += ga[i] * ga[i]
+        }
+        assert (diff / norm).Sqrt() < 2e-2, "relative " $(diff / norm).Sqrt()
+    }
+}
+
+test Graph "a BF16 graph's checkpoint is its F32 masters, and loads into an F32 graph or a BF16 one exactly" {
+    b := Graph<BF16>(2)
+    mixedNet(b, 1)
+    try b.Plan(rand.Rand(22))
+    m := b.Masters().Flat()!
+    for i in range b.ParamCount: m[i] = m[i] + 1e-4
+    b.SyncParams()
+    try b.Save("build/ad_mixed.safetensors")
+    c := Graph<F32>(1)
+    mixedNet(c, 1)
+    try c.Plan(rand.Rand(1))
+    try c.Load("build/ad_mixed.safetensors")
+    assert c.Params() == b.Masters()
+    d := Graph<BF16>(2)
+    mixedNet(d, 1)
+    try d.Plan(rand.Rand(1))
+    try d.Load("build/ad_mixed.safetensors")
+    assert d.Masters() == b.Masters() and d.Params() == b.Params()
+}
+
+test Graph.Plan "a shape that does not fit is reported by Plan, naming it, and nothing after it runs" {
+    g := Graph<F32>(4)
+    x := g.Input(3)
+    w := g.Param(Init.Zeros, true, 2, 4)
+    g.Act(g.Linear(x, w), mat.Act.Relu)
+    said := ""
+    try g.Plan(rand.Rand(1)) catch tensor.ShapeError e { said = $e }
+    assert said.Contains("Linear")
+    e := Graph<F32>(2, 1, Mode.Eager)
+    try e.Plan(rand.Rand(1))
+    y := e.Input(3)
+    e.MatMul(y, e.Param(Init.Zeros, true, 2, 2))
+    failed := false
+    try e.Check() catch tensor.ShapeError { failed = true }
+    assert failed
+}
+
+# x squared, element by element: a Custom operation for the test below
+type square struct() { }
+
+fn (s square&) Shape(inputs Array<tensor.Shape>&) tensor.Shape { return inputs[0] }
+
+fn (s mut square&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) {
+    try out.Map(inputs[0], fn(v): return v * v) catch { unreachable }
+}
+
+fn (s mut square&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
+    d := dinputs[0]
+    try d.Map2(dout, inputs[0], fn(g, v): return 2.0 * g * v) catch { unreachable }
+}
+
+test Graph.Custom "an operation defined outside runs forward and backward as the graph's own: x^2 as Mul(x, x)" {
+    f := square()
+    for eager in Array<Bool>[false, true] {
+        a := Graph<F32>(3, 1, Mode.Eager if eager else Mode.Captured)
+        b := Graph<F32>(3)
+        if eager: try a.Plan(rand.Rand(4))
+        wa := a.Param(Init.Normal(0.0, 1.0), true, 4, 4)
+        wb := b.Param(Init.Normal(0.0, 1.0), true, 4, 4)
+        la := a.Mse(a.Custom(f, a.Act(wa, mat.Act.Tanh)), a.Param(Init.Normal(0.0, 1.0), true, 4, 4))
+        tb := b.Act(wb, mat.Act.Tanh)
+        lb := b.Mse(b.Mul(tb, tb), b.Param(Init.Normal(0.0, 1.0), true, 4, 4))
+        if not eager: try a.Plan(rand.Rand(4))
+        try b.Plan(rand.Rand(4))
+        a.Forward(3)
+        a.Backward(la)
+        b.Forward(3)
+        b.Backward(lb)
+        assert a.Scalar(la) == b.Scalar(lb)
+        ga := a.Grad(wa).Flat()!
+        gb := b.Grad(wb).Flat()!
+        for i in range 16: assert (ga[i] - gb[i]).Abs() < 1e-6
+    }
+}
+
+# a causal language model's layers: embedding, learned and rotary positions, causal attention, a norm, tied logits
+fn tinyLm<T>(g mut Graph<T>&, ctx I64) Var, Var {
+    tok := g.Tokens(ctx)
+    table := g.Param(Init.Normal(0.0, 0.5), true, 11, 8)
+    e := g.Positions(g.Embedding(tok, table), g.Param(Init.Normal(0.0, 0.1), true, ctx, 8))
+    q := g.Rope(g.Linear(e, g.Param(Init.Normal(0.0, 0.3), true, 8, 8)), 2)
+    k := g.Rope(g.Linear(e, g.Param(Init.Normal(0.0, 0.3), true, 8, 8)), 2)
+    a := g.Attention(q, k, g.Linear(e, g.Param(Init.Normal(0.0, 0.3), true, 8, 8)), 2, true)
+    h := g.Norm(g.Add(a, e), g.Param(Init.Constant(1.0), false, 8), None, true)
+    return tok, g.Linear(h, table)
+}
+
+test Graph "decoding with a cache of keys and values equals the full forward, a position at a time or several" {
+    ctx I64 = 12
+    full := Graph<F64>(1)
+    ft, fl := tinyLm(full, ctx)
+    try full.Plan(rand.Rand(30))
+    tokens := Array<I32>[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]
+    fd := full.Ints(ft).Flat()!
+    for i in range ctx: fd[i] = tokens[i]
+    full.Forward(1)
+    want := full.Value(fl)
+    for steps in Array<I64>[1, 3] {
+        d := Graph<F64>(1, 1, Mode.Captured, true)
+        dt, dl := tinyLm(d, ctx)
+        try d.Plan(rand.Rand(1))
+        dp := d.Params()
+        try dp.Convert(full.Params())
+        for pos in range 0, ctx, steps {
+            d.Pos = pos
+            td := d.Ints(dt).Flat()!
+            for j in range steps: td[j] = tokens[pos + j]
+            d.Forward(steps)
+            got := d.Value(dl)
+            for j in range steps {
+                for c in range 11: assert (got.Get(0, j, c) - want.Get(0, pos + j, c)).Abs() < 1e-12, "position " $(pos + j)
+            }
+        }
+    }
 }
