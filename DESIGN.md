@@ -1,8 +1,8 @@
 # oann - design
 
 oann is a neural-network library written in olang: a recorded graph with automatic differentiation, layers, losses,
-optimizers, datasets and the training loop, on top of the standard library's 2-D `Matrix<T>` (std/linalg) and its
-seeded generator (std/rand). The C version it replaces is gone; `bench/ref/mlp.c` is the one C file left, a reference
+optimizers, datasets and the training loop, on top of a 2-D `Matrix<T>` (`linalg.olang`, oann's own since olang dropped
+std/linalg: section 25) and std/rand's seeded generator. The C version it replaces is gone; `bench/ref/mlp.c` is the one C file left, a reference
 trainer over OpenBLAS written for the benchmark.
 
 The yardstick is olang's own (PRINCIPLES.md in the olang repository): no manual memory management, C-like performance
@@ -53,8 +53,8 @@ is no N-d tensor - data is interpreted in one place only, by the operation that 
   `y = x W^T + b`, its backward `dx = dy W`, `dW = dy^T x`, `db` = the column sums of `dy` - each one `linalg.Gemm`
   with transposes as parameters. Nothing is ever transposed in memory.
 - **A bias is a `1 x C` matrix**, added to every row by an explicit row operation; there is no implicit broadcasting.
-- **Views are by row stride.** A matrix is shape, stride and a reference to storage; `linalg.View(data, offset, rows,
-  cols)` makes one over the graph's arena without allocating, and a short batch is the view of its first rows.
+- **Views are by row stride.** A matrix is shape, stride and a reference to storage; `linalg.Matrix.View(data, offset,
+  rows, cols)` makes one over the graph's arena without allocating, and a short batch is the view of its first rows.
 - **Structure beyond two dimensions lives in the operation.** A convolution reads each row as one `H x W x C` image,
   channels last (im2col into a workspace, one GEMM for the whole batch: section 16); attention reads rows as `B x T`
   tokens and its heads as column blocks (section 11).
@@ -293,19 +293,19 @@ and came out 3.5e-5 low against numpy.
 ## 6. Training and evaluation (`train.olang`, `examples/mnist_mlp.olang`)
 
 ```olang
-data := try mnist.Load("data/mnist", mnist.Source)
+data := try mnist.Mnist.Load("data/mnist", mnist.Source)
 g := nn.Graph<F32>(128, threads)
 x := g.Input(784)
 y := g.Classes()
-net := layers.NewMlp(g, I64[784, 128, 10])
+net := layers.Mlp.New(g, Array<I64>[784, 128, 10])
 logits := net.Apply(g, x)
 loss := g.SoftmaxCrossEntropy(logits, y)
 r := rand.Rand(seed)
 g.Plan(r)
 c := train.Classifier(x, y, logits, loss)
-o optim.AdamW<F32>&g = optim.AdamW<F32>(g)
+o mut optim.AdamW<F32>& = optim.AdamW<F32>(g)
 trainSet := loader.Loader(data.Train, 128, seed)
-testSet := loader.Loader(data.Test, 128, seed, false)
+testSet := loader.Loader(data.Test, 128, seed, shuffle = false)
 for e in range 1, epochs + 1 {
     trainLoss := train.Epoch(g, c, trainSet, o)         # Fill, Forward, Backward, Step per batch
     testLoss, accuracy := train.Evaluate(g, c, testSet) # Forward per batch, ArgMaxRows against the classes
@@ -318,11 +318,11 @@ for e in range 1, epochs + 1 {
 A language model's loop (`train.LanguageModel`, `train.Gpt`, `LmStep`, `LmEvaluate`, `examples/charlm.olang`):
 
 ```olang
-c := try text.Load("data/shakespeare/input.txt")
+c := try text.Corpus.Load("data/shakespeare/input.txt")
 g := nn.Graph<F32>(16 * 64, threads)                      # 16 sequences of 64 characters
-m := train.Gpt(g, c.Size(), 64, 128, 4, 4)                # vocabulary, context, width, heads, layers
+m := train.LanguageModel.Gpt(g, c.Size(), 64, 128, 4, 4)  # vocabulary, context, width, heads, layers
 g.Plan(r)
-o optim.AdamW<F32>&g = optim.AdamW<F32>(g, 1e-3, 0.9, 0.99, 1e-8, optim.Regularizer.WeightDecay(0.1))
+o mut optim.AdamW<F32>& = optim.AdamW<F32>(g, 1e-3, 0.9, 0.99, 1e-8, optim.Regularizer.WeightDecay(0.1))
 rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
 windows := text.Windows(c.Train(), 64, seed)
 for step in range steps {
@@ -689,8 +689,10 @@ the images) and **a `Gemm` with an epilogue** (`GemmAct`: measured, not adopted 
 ## 15. Layout
 
 ```
-makefile                OLANG ?= the compiler; make test, data, mnist, cnn, epoch, charlm, lmbench, lmref, bpe,
+makefile                OLANG ?= the compiler (../olang/build/olang); make test, data, mnist, cnn, epoch, charlm, lmbench, lmref, bpe,
                         bpelm, safetensors, board, sparse, sleep, int8, int8lm, int8bench, clean
+linalg.olang            Matrix<T> and its views, Goto GEMM (GemmWorkspace, GemmBatch, GemmAct, GemmPatches),
+                        element kernels, reductions, Solve, Cast, FastExp/FastTanh - std/linalg's last version
 nn.olang                Graph, Var, Op, Node: recording, Plan, Forward, Backward, decoding, checkpoints,
                         profiling; the gradient checks
 ops.olang               the kernels: forward and backward per primitive, on Matrix
@@ -1881,3 +1883,37 @@ Cost: familiarity's gather and scatter, about 4% on the return task; a moment on
 - `membercascade` (new): reading a constructor parameter that is not a field gives a second error at the same place
   ("a condition is a Bool, found I32").
 - `lambdalend`: still refused (O17). `fieldname`, `joinparen`, `nestedtry`, `tryindex`: deliberate rules, as before.
+
+## 25. olang 374c1e3c: the v1 catch-up (core modules)
+
+oann had last been built by olang efdb82c-ada716d (2026-10-10). Between then and olang's v1 candidate the language
+changed under it: lists by line breaks (QY), type parameter lists (G8b, QW), `Array<T, N>` gone (QP1), errors in
+CamelCase and declared as types (T19), `try` over a whole expression (E24), scopes inferred and never written (QCB),
+builders (D19a), no shadowing of a type's name (D3a), every local read (D3b), one-line bodies (S1b) - and std/linalg
+was dropped from std (olang b6e4a103: "Tensors are part of oann and they declare everything themselves"). This round
+brings the core chain - kernels, conv, ops, quant, nn, layers, optim, vision, checkpoint, train, generate - to it with
+behaviour kept; every one of their tests passes as before. What the language decided:
+
+- **`linalg.olang` is oann's.** It is std/linalg's last version (olang b6e4a103^, 2026-10-26: Goto GEMM with per-target
+  tiles, GemmBatch with causal triangles, GemmAct, GemmPatches, element kernels, reductions, Solve, Cast, the fast
+  activations), brought forward by `olang fix`, its 35 tests kept. A pair of Bool results became a struct (`tiling`,
+  R23). Since a matrix holds its data by reference, the supplied `Copy()` would share it: a matrix's deep copy stays
+  `m.Clone()`, and the copy-from method is `m.CopyFrom(src)` (it was `m.Copy(src)`).
+- **A shape error on the graph's own buffers ends the program.** linalg's operations fail with `ShapeError` (R22, from
+  October), where they aborted when oann was written. A wrong shape inside a planned graph is oann's bug, never the
+  caller's input, so ops, conv, nn and optim write `x!` on those calls (`linalg.Matrix.View(g.mem, ...)!`) and keep
+  their signatures: `g.Value`, `g.Grad`, `g.Params` and every `ops.*` are infallible as before. A shape the caller gives
+  is still refused when the graph is built (`mismatch`, now `noreturn` by `unreachable` with the reason).
+- **The context length is `ctx`** where it was a parameter named `T` beside the element type `T` (D3a). Fields and
+  payloads keep `T` (`Transformer.T`, `Op.Attention`'s `T`).
+- **Builders** (D19a): `layers.Dense.New`, `Mlp.New`, `Norm.New`, `AttentionBlock.New`, `Transformer.New`,
+  `vision.Conv.New`, `train.LanguageModel.Gpt`, `quant.Weights.Quantize` and `QuantizeConv` (they were `NewDense`,
+  `NewMlp`, ... `Gpt`, `QuantizeWeights`).
+- **Code shape.** Functions more than four blocks deep were split along what they do: `nn.Graph.Plan` into
+  `placeParams`, `placeRows` and `placeNode` over a `layout`; conv's im2col, col2im and pooling into per-image and
+  per-window helpers; `quant.Activations.Patches` into `patchRow` and `patchPixels`; optim's projection into
+  `projectLayer` and `scaleByNorms`. One-statement blocks, clauses and lambdas are one-line (S1b, D16).
+- **The makefile** speaks olang's modes in words (`olang test`, `olang build -output build/NAME FILE`), and OLANG is
+  olang's `build/olang` beside oann by default.
+
+How the rest of oann is caught up, and which tools to run in which order, is PROGRESS.md.
