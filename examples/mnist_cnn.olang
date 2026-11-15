@@ -20,7 +20,7 @@ import "../datasets/loader"
 import "../datasets/mnist"
 
 fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
-    if i >= args.Len() or args[i] == "profile" { return fallback }
+    if i >= args.Len() or args[i] == "profile": return fallback
     return try args[i].ParseInt()
 }
 
@@ -31,6 +31,17 @@ fn rss() I64 {
     rest := t[i + 6:]
     j := try rest.Find("kB") catch default 0
     return try rest[:j].Trim().ParseInt() catch default -1
+}
+
+# where the first epoch went, by operation kind
+fn profileReport(g nn.Graph<F32>&) ? io.Error {
+    for k in range nn.KindNames.Len() {
+        f := g.Times[2 * k]
+        bw := g.Times[2 * k + 1]
+        if f + bw == 0: continue
+        try io.Put(("  " $nn.KindNames[k] ": forward " $(F64(f) * 1e-9).Fixed(2) " s, backward "
+            $(F64(bw) * 1e-9).Fixed(2) " s\n"))
+    }
 }
 
 fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, ParseError {
@@ -77,19 +88,12 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, ParseError {
             o.Step(g)
             sum += F64(g.Scalar(c.Loss)) * F64(n)
             seen += n
-            if e == 1 and (b == 9 or b == 99) { try io.Put("  after step " $(b + 1) ": resident " $rss() " kB\n") }
+            if e == 1 and (b == 9 or b == 99): try io.Put("  after step " $(b + 1) ": resident " $rss() " kB\n")
         }
         spent := time.Since(t0)
         total += spent
         if profile and e == 1 {
-            for k in range nn.KindNames.Len() {
-                f := g.Times[2 * k]
-                bw := g.Times[2 * k + 1]
-                if f + bw > 0 {
-                    try io.Put(("  " $nn.KindNames[k] ": forward " $(F64(f) * 1e-9).Fixed(2) " s, backward "
-                        $(F64(bw) * 1e-9).Fixed(2) " s\n"))
-                }
-            }
+            try profileReport(g)
             g.Profiling = false
         }
         testLoss, accuracy := train.Evaluate(g, c, testSet)

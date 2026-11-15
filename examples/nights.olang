@@ -51,15 +51,15 @@ type Ring struct(size I64, seed U64) {
     Known mut Array<Bool>& = Array<Bool>(size)            # which numbers of the last observation were not dropped
     a F64 = 0.0
     norm F64 = 0.0
-    for j in range size { E[j] = rng.Normal() }
-    for j in range size { norm += E[j] * E[j] }
-    for j in range size { E[j] = E[j] / norm.Sqrt() }
-    for j in range size { E[size + j] = rng.Normal() }
-    for j in range size { a += E[j] * E[size + j] }
-    for j in range size { E[size + j] = E[size + j] - a * E[j] }
+    for j in range size: E[j] = rng.Normal()
+    for j in range size: norm += E[j] * E[j]
+    for j in range size: E[j] = E[j] / norm.Sqrt()
+    for j in range size: E[size + j] = rng.Normal()
+    for j in range size: a += E[j] * E[size + j]
+    for j in range size: E[size + j] = E[size + j] - a * E[j]
     norm = 0.0
-    for j in range size { norm += E[size + j] * E[size + j] }
-    for j in range size { E[size + j] = E[size + j] / norm.Sqrt() }
+    for j in range size: norm += E[size + j] * E[size + j]
+    for j in range size: E[size + j] = E[size + j] / norm.Sqrt()
     Turn = rng.Uniform(0.0, Pi)
 }
 
@@ -68,7 +68,7 @@ type Ring struct(size I64, seed U64) {
 fn (w mut Ring&) Observe(theta F64, noise F64 = 0.0, drop F64 = 0.0) Array<F32>& {
     for j in range w.Size {
         x F64 = theta.Cos() * w.E[j] + theta.Sin() * w.E[w.Size + j]
-        if noise > 0.0 { x += noise * w.rng.Normal() }
+        if noise > 0.0: x += noise * w.rng.Normal()
         w.Known[j] = true
         if drop > 0.0 and w.rng.Float() < drop {
             x = 0.0
@@ -86,7 +86,7 @@ fn (w Ring&) Pay(theta F64, a I64) F64 {
 
 fn (w Ring&) Best(theta F64) F64 {
     top F64 = 0.0
-    for a in range 4 { top = top.Max(w.Pay(theta, a)) }
+    for a in range 4: top = top.Max(w.Pay(theta, a))
     return top
 }
 
@@ -118,7 +118,7 @@ type Life struct(blocks I64) {
 fn argmax(x Array<F32>&) I64 {
     best I64 = 0
     for j in range 1, x.Len() {
-        if x[j] > x[best] { best = j }
+        if x[j] > x[best]: best = j
     }
     return best
 }
@@ -130,7 +130,7 @@ fn answer(a mut agent.Agent<F32>&, obs Array<F32>&, recall mut Array<F32>&, know
     s := a.Net.Activity(circuit.Phase.Scratch, a.Choice)
     best I64 = 0
     for j in range 1, 4 {
-        if s.Get(0, j) > s.Get(0, best) { best = j }
+        if s.Get(0, j) > s.Get(0, best): best = j
     }
     sleeper := a.Sleeper
     if sleeper is null: return best, -1
@@ -148,17 +148,26 @@ fn Test.examine(a mut agent.Agent<F32>&, w mut Ring&, points I64) Test {
         sumR F64 = 0.0
         for i in range n {
             theta F64 = w.Point(i, points)
-            if set == 1 { theta = w.Turn + 2.0 * Pi * (F64(i) + 0.5) / 64.0 }
-            if set >= 2 { theta = w.Point(i % points, points) }
+            if set == 1: theta = w.Turn + 2.0 * Pi * (F64(i) + 0.5) / 64.0
+            if set >= 2: theta = w.Point(i % points, points)
             obs := w.Observe(theta, Noise if set == 2 else 0.0, Partial if set == 3 else 0.0)
             act, rec := answer(a, obs, recall, w.Known if set == 3 else null)
             sumA += w.Best(theta) - w.Pay(theta, act)
-            if rec >= 0 { sumR += w.Best(theta) - w.Pay(theta, rec) }
+            if rec >= 0: sumR += w.Best(theta) - w.Pay(theta, rec)
         }
         t.Answer[set] = sumA / F64(n)
         t.Recall[set] = sumR / F64(n)
     }
     return t
+}
+
+# each number of the last observation zeroed, and marked missing, with probability Partial
+fn (w mut Ring&) lose(gaps mut rand.Rand&) {
+    for j in range w.Size {
+        if gaps.Float() >= Partial: continue
+        w.seen[j] = 0.0
+        w.Known[j] = false
+    }
 }
 
 fn Life.live(seed U64, train I64, after I64, points I64, block I64, hidden I64, s agent.Settings) Life {
@@ -189,19 +198,12 @@ fn Life.live(seed U64, train I64, after I64, points I64, block I64, hidden I64, 
         theta = w.Point(pick.Below(points), points) if t + 1 < train else pick.Uniform(0.0, 2.0 * Pi)
         obs := w.Observe(theta)
         lacking Bool = Missing > 0.0 and gaps.Float() < Missing
-        if lacking {
-            for j in range w.Size {
-                if gaps.Float() < Partial {
-                    w.seen[j] = 0.0
-                    w.Known[j] = false
-                }
-            }
-        }
+        if lacking: w.lose(gaps)
         known Array<Bool>?& = w.Known if lacking else null
         next := try a.Step(obs, reward, true, known) catch circuit.NotSettled { } default action
         action = next
     }
-    if nights > 0 { life.NightMs = F64(nightNs) * 1e-6 / F64(nights) }
+    if nights > 0: life.NightMs = F64(nightNs) * 1e-6 / F64(nights)
     sleeper := a.Sleeper
     if sleeper is not null: life.Cues = F64(sleeper.Cues())
     life.Mix = a.Reads.Mix
@@ -210,8 +212,8 @@ fn Life.live(seed U64, train I64, after I64, points I64, block I64, hidden I64, 
 }
 
 fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
-    if i >= args.Len() { return fallback }
-    return try (try json.Json.Parse(args[i])).AsNum()
+    if i >= args.Len(): return fallback
+    return try json.Json.Parse(args[i]).AsNum()
 }
 
 fn settings(args Array<String&>&, from I64) agent.Settings ? json.Error {
@@ -219,33 +221,36 @@ fn settings(args Array<String&>&, from I64) agent.Settings ? json.Error {
     for i in range from, args.Len() {
         at := try args[i].Find("=") catch { continue }
         name := args[i][:at]
-        v := try (try json.Json.Parse(args[i][at + 1:])).AsNum()
-        if name == "threshold" { s.Threshold = v }
-        if name == "rate" { s.Rate = v }
-        if name == "memoryrate" { s.MemoryRate = v }
-        if name == "memorygain" { s.MemoryGain = v }
-        if name == "tracegain" { s.TraceGain = v }
-        if name == "sleep" { s.Consolidate = v != 0.0 }
-        if name == "recallgain" { s.RecallGain = v }
-        if name == "recallrate" { s.RecallRate = v }
-        if name == "recallhalflife" { s.RecallHalfLife = v }
-        if name == "sleephidden" { s.SleepHidden = I64(v) }
-        if name == "passes" { s.SleepPasses = I64(v) }
-        if name == "sleepcells" { s.SleepCells = I64(v) }
-        if name == "sleepactive" { s.SleepActive = I64(v) }
-        if name == "cues" { s.SleepCues = I64(v) }
-        if name == "weigh" { s.Weigh = v != 0.0 }
-        if name == "recallalone" { s.RecallAlone = v != 0.0 }
-        if name == "weighrate" { s.WeighRate = v }
-        if name == "familiarity" { s.Familiarity = v != 0.0 }
-        if name == "guess" { s.Guess = v }
-        if name == "guessrate" { s.GuessRate = v }
-        if name == "night" { Night = I64(v) }
-        if name == "noise" { Noise = v }
-        if name == "partial" { Partial = v }
-        if name == "missing" { Missing = v }
-        if name == "completion" { s.Completion = v != 0.0 }
-        if name == "perlife" { PerLife = v != 0.0 }
+        v := try json.Json.Parse(args[i][at + 1:]).AsNum()
+        match name {
+            case "threshold": s.Threshold = v
+            case "rate": s.Rate = v
+            case "memoryrate": s.MemoryRate = v
+            case "memorygain": s.MemoryGain = v
+            case "tracegain": s.TraceGain = v
+            case "sleep": s.Consolidate = v != 0.0
+            case "recallgain": s.RecallGain = v
+            case "recallrate": s.RecallRate = v
+            case "recallhalflife": s.RecallHalfLife = v
+            case "sleephidden": s.SleepHidden = I64(v)
+            case "passes": s.SleepPasses = I64(v)
+            case "sleepcells": s.SleepCells = I64(v)
+            case "sleepactive": s.SleepActive = I64(v)
+            case "cues": s.SleepCues = I64(v)
+            case "weigh": s.Weigh = v != 0.0
+            case "recallalone": s.RecallAlone = v != 0.0
+            case "weighrate": s.WeighRate = v
+            case "familiarity": s.Familiarity = v != 0.0
+            case "guess": s.Guess = v
+            case "guessrate": s.GuessRate = v
+            case "night": Night = I64(v)
+            case "noise": Noise = v
+            case "partial": Partial = v
+            case "missing": Missing = v
+            case "completion": s.Completion = v != 0.0
+            case "perlife": PerLife = v != 0.0
+            case _: continue
+        }
     }
     return s
 }
@@ -253,10 +258,10 @@ fn settings(args Array<String&>&, from I64) agent.Settings ? json.Error {
 fn interval(x Array<F64>&) F64, F64 {
     n F64 = F64(x.Len())
     mean F64 = 0.0
-    for v in x { mean += v }
+    for v in x: mean += v
     mean = mean / n
     sq F64 = 0.0
-    for v in x { sq += (v - mean) * (v - mean) }
+    for v in x: sq += (v - mean) * (v - mean)
     return mean, 1.96 * (sq / (n - 1.0) / n).Sqrt()
 }
 
@@ -292,13 +297,13 @@ fn main() ? io.Error, json.Error {
         if PerLife {
             line := StringBuilder()
             line.Push("life " $(k + 1))
-            for b in range blocks { line.Push(" " $(life.Regret[b])) }
-            for set in range 4 { line.Push(" " $(life.Exam.Answer[set])) }
-            for set in range 4 { line.Push(" " $(life.Exam.Recall[set])) }
+            for b in range blocks: line.Push(" " $(life.Regret[b]))
+            for set in range 4: line.Push(" " $(life.Exam.Answer[set]))
+            for set in range 4: line.Push(" " $(life.Exam.Recall[set]))
             line.Push("\n")
             try io.Put(line.ToString())
         }
-        for b in range blocks { regret[b * lives + k] = life.Regret[b] }
+        for b in range blocks: regret[b * lives + k] = life.Regret[b]
         for set in range 4 {
             exam[set * lives + k] = life.Exam.Answer[set]
             exam[(4 + set) * lives + k] = life.Exam.Recall[set]
@@ -312,7 +317,7 @@ fn main() ? io.Error, json.Error {
     kind := ", no consolidator"
     if s.Consolidate {
         kind = (", a consolidator, a night every " $Night " moments") if Night > 0 else ", a consolidator, no nights"
-        if s.RecallHalfLife > 0.0 { kind = $kind ", its store's half-life " $(s.RecallHalfLife) " moments" }
+        if s.RecallHalfLife > 0.0: kind = $kind ", its store's half-life " $(s.RecallHalfLife) " moments"
     }
     try io.Put(("ring - " $lives " lives: " $train " moments on " $points " points, then " $after " anywhere; hidden " $hidden
         $kind " (" $(F64(time.Since(t0)) * 1e-9).Fixed(1) " s)\n"))
@@ -328,7 +333,7 @@ fn main() ? io.Error, json.Error {
     }
     try io.Put(("ms a moment (nights excluded) " $show(trainMs) "; ms a night " $show(nightMs) "; cues kept "
         $show(cues) "\n"))
-    if s.Weigh { try io.Put("the recall's share of the readout's drive at the end " $show(mix) "\n") }
-    if s.Familiarity { try io.Put("the slow part's weight at unfamiliar observations at the end " $show(guess) "\n") }
+    if s.Weigh: try io.Put("the recall's share of the readout's drive at the end " $show(mix) "\n")
+    if s.Familiarity: try io.Put("the slow part's weight at unfamiliar observations at the end " $show(guess) "\n")
     try io.Put("\n")
 }
