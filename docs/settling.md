@@ -1052,7 +1052,7 @@ each, measures it against the agent as it was, and keeps what pays. Results in 5
   thirds A, B and C, each with a code of its own, one of B and C with A's answers and the other with each context's best
   and worst arms swapped (sharing first in odd lives, conflicting first in even ones) - and both examples `missing=`
   (a fraction of the moments whose observations lack numbers, the agent told which), `completion=`, `weigh=`,
-  `recallalone=`, `familiarity=`, `guess=` and `guessrate=`. `bench/paired.py` takes the paired differences of two runs'
+  `recallalone=`, `familiarity=`, `guess=` and `guessrate=`. `bench/paired.olang` takes the paired differences of two runs'
   `perlife=1` lines.
 - **Checkpoints** keep each mechanism's state when it is on - the Weigher's means and the last forecasts, the
   familiarity table, the Guesser and the last recall's parts, the completer's matrix and count - with a metadata flag
@@ -1957,7 +1957,7 @@ a transient agent with a reservoir, saved with a fade pending, restores into an 
 `examples/nights.olang` and `examples/bandit_settle.olang` (F32), olang ada716d's compiler (oannc5), the shared
 four-core machine. 40 lives a configuration, 80 for the mixed task; intervals 95%; every agent has 64 hidden neurons and
 a consolidator with 2.14's settings unless a row says otherwise; nights every 500 moments where a table says nights.
-Paired differences as in 5.12 (`bench/paired.py`). Columns are blocks of 250 moments named by their last moment.
+Paired differences as in 5.12 (`bench/paired.olang`). Columns are blocks of 250 moments named by their last moment.
 
 **Which memory drives the readout (question 15).** The agent as it was (both reads at gain 1), the weighed reads (the
 drive `2 ((1 - Mix) m + Mix c)`), the associative memory off with the recall at gain 1 (5.12's gain 0), and the
