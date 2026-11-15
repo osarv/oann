@@ -13,6 +13,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `charlm.olang` | the character transformer (`models/gpt`) on tiny Shakespeare through `nn/train.Fit`, its checkpoint, a sample (M2, M3) | `charlm` |
 | `charlm_sample.olang` | text from its checkpoint, through the key-value cache and by running the context again | `sample` |
 | `charlm_int8.olang` | the same transformer with its linear layers in INT8: loss, a forward's time, cached decoding (M12) | `int8lm` |
+| `charlm_ssm.olang` | the recurrent model (`models/ssm`: Mamba or delta-rule blocks) on tiny Shakespeare with the same recipe, generating by running the context again | |
 | `bpelm.olang` | the same model on byte-level BPE tokens, loss a character against the character model's | `bpelm` |
 | `tinystories.olang` | `prep`, then a GPT or an SSM of 10 million parameters on TinyStories: loss curve, tokens a second (M13) | `tinystories` |
 | `mnist_learn.olang` | MNIST by a settling system of `dyn`, taught by equilibrium propagation (M8) | `mnistlearn` |
