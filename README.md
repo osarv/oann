@@ -24,6 +24,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 
 | | |
 |---|---|
+| `tensor.olang` | `Tensor<T>`, the N-d strided view (rank up to 6): Slice, Select, Permute, Expand, Reshape, Rows, Mat, Flat, element kernels, conversions between storage types, `@` batched (the redesign's storage layer; docs/redesign.md 1.1) |
 | `linalg.olang` | `Matrix<T>` and its views, the GEMM (workspaces, batched, fused, from patches), element kernels, reductions |
 | `kernels.olang` | small kernels over runs of arrays, and the storage/computation conversions of mixed precision |
 | `nn.olang`, `ops.olang` | the graph: recording, planning one arena, forward and backward; each operation's kernels |
