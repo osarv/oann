@@ -104,11 +104,12 @@ fn (s mut System<T>&) Connect(pre Pop, post Pop, w conn.Wiring, frozen Bool = fa
     return Conn(s.E.Links.Len() - 1)
 }
 
-# a signal of width values in module m, zero until Set
+# a signal of width values in module m, zero until Set (declared after Plan, the signals' room grows to hold it)
 fn (s mut System<T>&) Signal(m Mod, name String&, width I64 = 1) Sig {
     at I64 = 0
     for g in s.sigs: at += g.Width
     s.sigs.Push(sigRec(I64(m), name, width, at))
+    if s.Planned: s.signals = Array<T>[s.signals[i] if i < at else T(0) for i in range at + width]
     return Sig(s.sigs.Len() - 1)
 }
 
@@ -857,6 +858,10 @@ test System.Read "a module reads its own signal first, then its parent's" {
     assert s.Read(child, "reward")!.Get(0) == 1.0 and s.Read(s.Root(), "reward")!.Get(0) == 2.0
     assert s.Read(child, "arousal")!.Get(1) == 4.0
     assert not has(s, child, "nothing") and has(s, child, "arousal")
+    # a signal declared after the plan: room is made, the others keep their values
+    late := s.Signal(child, "late")
+    s.Set(late, tensor.Tensor<F32>.Of(Array<F32>[5.0], 1)!)!
+    assert s.Value(late).Get(0) == 5.0 and s.Read(child, "arousal")!.Get(1) == 4.0 and s.Value(mine).Get(0) == 1.0
 }
 
 # the resident set, in pages, from /proc
