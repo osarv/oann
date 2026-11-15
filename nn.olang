@@ -469,92 +469,98 @@ fn (g Graph<T>&) savedShape(nd Node&, inUse Bool) I64, I64 {
 fn (g mut Graph<T>&) Plan(r mut rand.Rand&) {
     count := g.nodes.Len()
     needs := Array<Bool>(count)                 # whether a node's gradient is wanted: it depends on a parameter
-    params I64 = 0
+    params := g.placeParams(needs)
+    l := layout(2 * params)
     for i in range count {
         nd := g.nodes[i]
-        if nd.Kind == Op.Param {
-            needs[i] = true
-            nd.Offset = params
-            params += nd.Rows * nd.Cols
-            g.nodes[i] = nd
-            continue
-        }
-        a, b, c := inputs(nd.Kind)
-        needs[i] = not g.Decoding and ((a >= 0 and needs[a]) or (b >= 0 and needs[b]) or (c >= 0 and needs[c]))
-    }
-    at I64 = 2 * params
-    rows I64 = 0
-    scratch I64 = 0
-    cols I64 = 0                                # the largest convolution's patches
-    for i in range count {
-        nd := g.nodes[i]
-        size I64 = nd.Rows * nd.Cols
         match nd.Kind {
-            case Op.Param(_, _) { nd.GradOffset = params + nd.Offset }
-            case Op.Classes, Op.Tokens {
-                nd.Offset = rows
-                rows += nd.Rows
-                if g.Ahead {
-                    nd.NextOffset = rows
-                    rows += nd.Rows
-                }
-            }
-            case _ {
-                nd.Offset = at
-                at += size
-                if g.Ahead and nd.Kind == Op.Input {
-                    nd.NextOffset = at
-                    at += size
-                }
-                if needs[i] {
-                    nd.GradOffset = at
-                    at += size
-                }
-                sr, sc := g.savedShape(nd, false)
-                if sr > 0 {
-                    nd.SavedOffset = at
-                    at += sr * sc
-                }
-                match nd.Kind {
-                    case Op.Attention(_, _, _, heads, ctx, _) {
-                        ds := ops.AttentionScratch(nd.Rows, heads, ctx)
-                        if not g.Decoding and ds > scratch { scratch = ds }
-                    }
-                    case Op.Conv2d(_, _, _, s) {
-                        if nd.Rows * s.Positions() * s.Patch() > cols { cols = nd.Rows * s.Positions() * s.Patch() }
-                    }
-                    case _ { }
-                }
-            }
+            case Op.Param(_, _): nd.GradOffset = params + nd.Offset
+            case Op.Classes, Op.Tokens: g.placeRows(nd, l)
+            case _: g.placeNode(nd, needs[i], l)
         }
         g.nodes[i] = nd
     }
-    g.scratchOffset = at
-    g.scratchSize = scratch
-    at += scratch
-    g.colsOffset = at
-    g.colsSize = cols
-    at += cols
-    g.mem = Array<T>(at)
-    g.classes = Array<I32>(rows)
+    g.scratchOffset = l.at
+    g.scratchSize = l.scratch
+    g.colsOffset = l.at + l.scratch
+    g.colsSize = l.cols
+    g.mem = Array<T>(l.at + l.scratch + l.cols)
+    g.classes = Array<I32>(l.rows)
     g.losses = Array<F64>(count)
-    if g.HasMasters() { g.masters = Array<F32>(params) }
+    if g.HasMasters(): g.masters = Array<F32>(params)
     g.written = Array<Bool>(count)
     g.ParamCount = params
     g.N = g.Batch
     g.planned = true
     for i in range count {
         nd := g.nodes[i]
-        match nd.Kind {
-            case Op.Param(init, _) {
-                if g.HasMasters(): initialize(linalg.Matrix.View(g.masters, nd.Offset, nd.Rows, nd.Cols)!, init, r)
-                else: initialize(g.Value(Var(i)), init, r)
-            }
-            case _ { }
-        }
+        kind := nd.Kind
+        if kind != Op.Param: continue
+        if g.HasMasters(): initialize(linalg.Matrix.View(g.masters, nd.Offset, nd.Rows, nd.Cols)!, kind.init, r)
+        else: initialize(g.Value(Var(i)), kind.init, r)
     }
     g.SyncParams()
     g.Rng = rand.Rand(r.Next())
+}
+
+# where Plan has got to: the arena's next free element, the classes', and the largest scratch and patches yet
+type layout struct(at I64) {
+    at
+    rows I64 = 0
+    scratch I64 = 0
+    cols I64 = 0                                # the largest convolution's patches
+}
+
+# each parameter's place among the parameters, and whether each node's gradient is wanted (it depends on a
+# parameter): the parameters' count
+fn (g mut Graph<T>&) placeParams(needs mut Array<Bool>&) I64 {
+    params I64 = 0
+    for i in range g.nodes.Len() {
+        nd := g.nodes[i]
+        if nd.Kind != Op.Param {
+            a, b, c := inputs(nd.Kind)
+            needs[i] = not g.Decoding and ((a >= 0 and needs[a]) or (b >= 0 and needs[b]) or (c >= 0 and needs[c]))
+            continue
+        }
+        needs[i] = true
+        nd.Offset = params
+        params += nd.Rows * nd.Cols
+        g.nodes[i] = nd
+    }
+    return params
+}
+
+# a Classes or Tokens node's rows of the classes (twice for a graph planned Ahead)
+fn (g Graph<T>&) placeRows(nd mut Node&, l mut layout&) {
+    nd.Offset = l.rows
+    l.rows += nd.Rows
+    if not g.Ahead: return
+    nd.NextOffset = l.rows
+    l.rows += nd.Rows
+}
+
+# any other node's value in the arena (twice for an Input of a graph planned Ahead), its gradient where wanted, what
+# it saves for its backward, and the scratch and patches it needs
+fn (g Graph<T>&) placeNode(nd mut Node&, wanted Bool, l mut layout&) {
+    size I64 = nd.Rows * nd.Cols
+    nd.Offset = l.at
+    l.at += size
+    if g.Ahead and nd.Kind == Op.Input {
+        nd.NextOffset = l.at
+        l.at += size
+    }
+    if wanted {
+        nd.GradOffset = l.at
+        l.at += size
+    }
+    sr, sc := g.savedShape(nd, false)
+    if sr > 0 {
+        nd.SavedOffset = l.at
+        l.at += sr * sc
+    }
+    kind := nd.Kind
+    if kind == Op.Attention and not g.Decoding: l.scratch = l.scratch.Max(ops.AttentionScratch(nd.Rows, kind.heads, kind.T))
+    if kind == Op.Conv2d: l.cols = l.cols.Max(nd.Rows * kind.s.Positions() * kind.s.Patch())
 }
 
 # p set as init says, from r
@@ -588,7 +594,7 @@ fn (g Graph<T>&) Masters() linalg.Matrix<F32> {
 fn (g Graph<T>&) Master(v Var) linalg.Matrix<F32> {
     nd := g.nodes[v]
     assert g.HasMasters() and nd.Kind == Op.Param
-    return linalg.Matrix.View(g.masters, nd.Offset, nd.Rows, nd.Cols)
+    return linalg.Matrix.View(g.masters, nd.Offset, nd.Rows, nd.Cols)!
 }
 
 # the parameters in the arena set from their masters, each rounded to the nearest BF16 - after the masters change (an
