@@ -355,6 +355,13 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     draw rand.Rand = rand.Rand(0)   # an eager graph's parameters' generator
     Profiling Bool = false          # with it set, Times collects where Forward and Backward spend their time:
     Times mut Array<I64>& = Array<I64>(2 * KindNames.Len())   # ns, Times[2 k] forward, Times[2 k + 1] backward
+    Int8 Bool = false               # once QuantizeLinear has run: every Linear's product in 8-bit integers
+    q8 mut list.List<q8Weights>& = list.List<q8Weights>()   # each Linear's weights quantized (QuantizeLinear)
+    q8At mut list.List<I64>& = list.List<I64>()             # by node: its weights' index in q8, or -1
+    q8Acts mut Array<U8>& = Array<U8>(0)        # a Linear's input quantized
+    q8Sums mut Array<I32>& = Array<I32>(0)      # its integer products
+    q8Scale mut Array<F32>& = Array<F32>(0)     # its dequantization, per output
+    wsI8 mut gemm.Workspace<I32>& = gemm.Workspace<I32>(threads)
     problem String = ""             # the first shape that did not fit, "" while every one has
     planned Bool = false
 }
@@ -1446,6 +1453,104 @@ fn (g mut Graph<T>&) Load(path String&) ? os.Error, checkpoint.SafetensorsError,
     g.SyncParams()
 }
 
+# ---- INT8 inference ----
+#
+# QuantizeLinear quantizes every Linear's weights as they are now - symmetric per output row, w ~ scale[o] q, q in I8 -
+# and with Int8 set Forward runs those products as kernels/gemm's GemmI8: each input quantized over its own range
+# (asymmetric, U8 with a zero point, made per step), the integer products dequantized per output and the bias added.
+# Inference only, an F32 graph only: the quantized weights are a copy, so a graph trained further is quantized again.
+
+# a Linear's weights in 8 bits: out rows of width, a scale per row
+type q8Weights struct(out I64, width I64) {
+    out
+    width
+    q mut Array<I8>& = Array<I8>(out * width)
+    scale mut Array<F32>& = Array<F32>(out)
+}
+
+fn (g mut Graph<T>&) QuantizeLinear() {
+    match T {
+        case F32 { }
+        case _: unreachable "oann: INT8 inference is for a Graph<F32>"
+    }
+    g.q8 = list.List<q8Weights>()
+    g.q8At = list.List<I64>()
+    rows I64 = 0
+    wide I64 = 0
+    outs I64 = 0
+    for i in range g.nodes.Len() {
+        match g.nodes[i].Kind {
+            case Op.Linear(x, w, _) {
+                g.q8At.Push(g.q8.Len())
+                g.q8.Push(q8Weights.quantize(g.Value(w)))
+                d := g.nodes[x].Dims
+                rows = rows.Max(d.Count() / d[d.Rank - 1])
+                wide = wide.Max(d[d.Rank - 1])
+                outs = outs.Max(g.nodes[w].Dims[0])
+            }
+            case _: g.q8At.Push(-1)
+        }
+    }
+    g.q8Acts = Array<U8>(rows * wide)
+    g.q8Sums = Array<I32>(rows * outs)
+    g.q8Scale = Array<F32>(outs)
+}
+
+# w [out, in] quantized row by row: scale = the row's largest magnitude / 127
+fn q8Weights.quantize<T>(w tensor.Tensor<T>) q8Weights {
+    m := w.Mat()!
+    q := q8Weights(m.Rows, m.Cols)
+    for o in range m.Rows {
+        top F64 = 0.0
+        for c in range m.Cols: top = top.Max(F64(m[o, c]).Abs())
+        s := top / 127.0 if top > 0.0 else 1.0
+        q.scale[o] = F32(s)
+        for c in range m.Cols: q.q[o * m.Cols + c] = I8((F64(m[o, c]) / s).Round())
+    }
+    return q
+}
+
+# node i, a Linear of x (bias b), in INT8: x quantized over its range, the product, the dequantization and the bias
+fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
+    match T {
+        case F32 {
+            w := g.q8[g.q8At[i]]
+            xm := g.Value(x).Mat()!
+            n := xm.Rows
+            lo F32 = 0.0
+            hi F32 = 0.0
+            for r in range n {
+                for c in range xm.Cols {
+                    v := F32(xm[r, c])
+                    lo = lo.Min(v)
+                    hi = hi.Max(v)
+                }
+            }
+            sa := (hi - lo) / 255.0 if hi > lo else F32(1.0)
+            zero := I32((-lo / sa).Round())
+            acts := g.q8Acts
+            for r in range n {
+                for c in range xm.Cols: acts[r * xm.Cols + c] = U8((F32(xm[r, c]) / sa).Round() + F32(zero))
+            }
+            scale := g.q8Scale
+            for o in range w.out: scale[o] = sa * w.scale[o]
+            am := mat.Mat<U8>(acts, 0, n, xm.Cols, xm.Cols)
+            bm := mat.Mat<I8>(w.q, 0, w.out, w.width, w.width)
+            cm := mat.Mat<I32>(g.q8Sums, 0, n, w.out, w.out)
+            y := g.Value(Var(i))
+            ym := y.Mat()!
+            om := mat.Mat<F32>(ym.Data, ym.Off, ym.Rows, ym.Cols, ym.Ld)
+            gemm.GemmI8(g.wsI8, cm, am, bm, scale[0:w.out], om, zero)
+            if b < 0: return
+            bd := g.Value(b).Flat()!
+            for r in range n {
+                for o in range w.out: om.Data[om.Off + r * om.Ld + o] = om.Data[om.Off + r * om.Ld + o] + F32(bd[o])
+            }
+        }
+        case _ { }
+    }
+}
+
 # ---- running ----
 
 # runs every node in the order recorded, on the first n entries of the batch (decoding: positions Pos ... Pos + n - 1)
@@ -1479,7 +1584,9 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
     nd := g.nodes[i]
     y := g.Value(Var(i))
     match nd.Kind {
-        case Op.Linear(x, w, b): ops.Linear<T, A>(ws, y, g.Value(x), g.Value(w), g.opt(b))
+        case Op.Linear(x, w, b) {
+            if g.Int8 { g.linearInt8(i, x, b) } else { ops.Linear<T, A>(ws, y, g.Value(x), g.Value(w), g.opt(b)) }
+        }
         case Op.MatMul(a, b, ta, tb): ops.MatMul<T, A>(ws, y, g.Value(a), ta, g.Value(b), tb)
         case Op.Add(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(1.0))
         case Op.Sub(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(-1.0))
@@ -1932,6 +2039,37 @@ fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count 
 }
 
 # ---- tests ----
+
+test Graph.QuantizeLinear "a graph's linear layers in INT8: within 2% of the F32 outputs' range, and F32 again when Int8 is off" {
+    g := Graph<F32>(16)
+    x := g.Input(40)
+    w1 := g.Param(Init.Normal(0.0, 0.2), true, 24, 40)
+    b1 := g.Param(Init.Normal(0.0, 0.1), false, 24)
+    w2 := g.Param(Init.Normal(0.0, 0.2), true, 8, 24)
+    b2 := g.Param(Init.Normal(0.0, 0.1), false, 8)
+    out := g.Linear(g.Act(g.Linear(x, w1, b1), mat.Act.Relu), w2, b2)
+    r := rand.Rand(5)
+    try g.Plan(r)
+    xd := g.Value(x).Flat()!
+    for i in range xd.Len(): xd[i] = F32(r.Normal())
+    g.Forward(16)
+    exact := g.Value(out).Clone()
+    g.QuantizeLinear()
+    g.Int8 = true
+    g.Forward(16)
+    got := g.Value(out).Flat()!
+    want := exact.Flat()!
+    scale F32 = 0.0
+    worst F32 = 0.0
+    for i in range 16 * 8 {
+        scale = scale.Max(want[i].Abs())
+        worst = worst.Max((got[i] - want[i]).Abs())
+    }
+    assert worst > 0.0 and worst < 0.02 * scale, "worst " $worst " of " $scale
+    g.Int8 = false
+    g.Forward(16)
+    assert g.Value(out) == exact
+}
 
 test Graph "records, plans and runs a small network" {
     g := Graph<F64>(4)
