@@ -271,55 +271,61 @@ fn quantizeOne(v F32, inv F32, zp F32) U8 {
 fn (a mut Activations&) Patches(x linalg.Matrix<F32>&, s conv.Shape&, r Range&) {
     assert x.Cols == s.H * s.W * s.C
     a.begin(x.Rows * s.Positions(), s.Patch(), r)
-    if a.Pixels.Len() < x.Rows * x.Cols { a.Pixels = Array<U8>(x.Rows * x.Cols) }
+    if a.Pixels.Len() < x.Rows * x.Cols: a.Pixels = Array<U8>(x.Rows * x.Cols)
     inv F32 = 1.0 / a.Step
     zp F32 = F32(a.Zero)
     px := a.Pixels
     for b in range x.Rows {
         img := x.Row(b)
         o I64 = b * x.Cols
-        for k in range x.Cols { px[o + k] = quantizeOne(img[k], inv, zp) }
+        for k in range x.Cols: px[o + k] = quantizeOne(img[k], inv, zp)
     }
-    z := U8(a.Zero)
-    d := a.Data
-    C := s.C
-    K := s.K
-    W := s.W
-    KC I64 = K * C
-    row I64 = 0
     for b in range x.Rows {
-        img I64 = b * x.Cols
-        for oy in range s.OutH {
-            y0 I64 = oy * s.Stride - s.Pad
-            for ox in range s.OutW {
-                x0 I64 = ox * s.Stride - s.Pad
-                o I64 = row * a.Cols
-                inside Bool = x0 >= 0 and x0 + K <= W
-                for ky in range K {
-                    iy I64 = y0 + ky
-                    t I64 = o + ky * KC
-                    if iy < 0 or iy >= s.H {
-                        for j in range KC { d[t + j] = z }
-                    } else if inside {
-                        at I64 = img + (iy * W + x0) * C
-                        for j in range KC { d[t + j] = px[at + j] }
-                    } else {
-                        for kx in range K {
-                            ix I64 = x0 + kx
-                            if ix < 0 or ix >= W {
-                                for c in range C { d[t + kx * C + c] = z }
-                            } else {
-                                at I64 = img + (iy * W + ix) * C
-                                for c in range C { d[t + kx * C + c] = px[at + c] }
-                            }
-                        }
-                    }
-                }
-                row++
-            }
-        }
+        for p in range s.Positions(): a.patchRow(b * s.Positions() + p, b * x.Cols, p / s.OutW, p % s.OutW, s)
     }
     a.pad()
+}
+
+# patch row "row": output pixel (oy, ox) of the image whose quantized pixels start at img in Pixels, a kernel row at a
+# time - one run of K C values where the window's row is on the image, the zero point where it is above or below it
+fn (a mut Activations&) patchRow(row I64, img I64, oy I64, ox I64, s conv.Shape&) {
+    z := U8(a.Zero)
+    d := a.Data
+    px := a.Pixels
+    KC I64 = s.K * s.C
+    y0 I64 = oy * s.Stride - s.Pad
+    x0 I64 = ox * s.Stride - s.Pad
+    inside Bool = x0 >= 0 and x0 + s.K <= s.W
+    for ky in range s.K {
+        iy I64 = y0 + ky
+        t I64 = row * a.Cols + ky * KC
+        if iy < 0 or iy >= s.H {
+            for j in range KC: d[t + j] = z
+        } else if inside {
+            at I64 = img + (iy * s.W + x0) * s.C
+            for j in range KC: d[t + j] = px[at + j]
+        } else {
+            a.patchPixels(t, img, iy, x0, s)
+        }
+    }
+}
+
+# a kernel row of a window hanging over the image's left or right edge, pixel by pixel into the patches at t: the
+# zero point off the image
+fn (a mut Activations&) patchPixels(t I64, img I64, iy I64, x0 I64, s conv.Shape&) {
+    z := U8(a.Zero)
+    d := a.Data
+    px := a.Pixels
+    for kx in range s.K {
+        ix I64 = x0 + kx
+        o I64 = t + kx * s.C
+        if ix < 0 or ix >= s.W {
+            for c in range s.C: d[o + c] = z
+            continue
+        }
+        at I64 = img + (iy * s.W + ix) * s.C
+        for c in range s.C: d[o + c] = px[at + c]
+    }
 }
 
 # ---- the product ----
@@ -694,25 +700,23 @@ fn (m mut Model&) inputRange(i I64, x linalg.Matrix<F32>&, observe Bool) Range {
 
 # y = the maximum of each window, per channel (conv.MaxPool2d's forward, without the positions its backward keeps)
 fn maxPool(y mut linalg.Matrix<F32>&, x linalg.Matrix<F32>&, p conv.Pool&) {
-    C := p.C
     for b in range x.Rows {
         img := x.Row(b)
         out := y.Row(b)
-        for oy in range p.OutH {
-            for ox in range p.OutW {
-                o I64 = (oy * p.OutW + ox) * C
-                first I64 = (oy * p.Stride * p.W + ox * p.Stride) * C
-                for c in range C { out[o + c] = img[first + c] }
-                for ky in range p.K {
-                    for kx in range p.K {
-                        at I64 = ((oy * p.Stride + ky) * p.W + ox * p.Stride + kx) * C
-                        for c in range C {
-                            v := img[at + c]
-                            out[o + c] = v if v > out[o + c] else out[o + c]
-                        }
-                    }
-                }
-            }
+        for q in range p.OutH * p.OutW: windowMax(img, p, q / p.OutW, q % p.OutW, out)
+    }
+}
+
+# the maximum per channel of output pixel (oy, ox)'s window, into out
+fn windowMax(img Array<F32>&, p conv.Pool&, oy I64, ox I64, out mut Array<F32>&) {
+    C := p.C
+    o I64 = (oy * p.OutW + ox) * C
+    first I64 = (oy * p.Stride * p.W + ox * p.Stride) * C
+    for c in range C: out[o + c] = img[first + c]
+    for ky in range p.K {
+        for kx in range p.K {
+            at I64 = ((oy * p.Stride + ky) * p.W + ox * p.Stride + kx) * C
+            for c in range C: out[o + c] = img[at + c] if img[at + c] > out[o + c] else out[o + c]
         }
     }
 }
@@ -787,20 +791,24 @@ test "the INT8 product equals the F32 product of the dequantized operands" {
             for threads in Array<I64>[1, 3] {
                 y := linalg.Matrix<F32>(m, n)
                 Linear(y, a, q, bias.Row(0), relu, threads)
-                # the reference: the dequantized activations times the dequantized weights, in F64
-                for i in range m {
-                    for j in range n {
-                        s F64 = F64(bias.Get(0, j))
-                        for p in range k {
-                            s += F64(a.Step) * F64(I32(a.Data[i * k + p]) - a.Zero) * F64(q.At(j, p)) * F64(q.Scale[j])
-                        }
-                        if relu and s < 0.0 { s = 0.0 }
-                        assert (F64(y.Get(i, j)) - s).Abs() <= 1e-5 * (1.0 + s.Abs())
-                    }
-                }
+                assert matchesDequantized(y, a, q, bias, relu)
             }
         }
     }
+}
+
+# whether y is the dequantized activations a times the dequantized weights q (in F64), plus the bias, through ReLU
+fn matchesDequantized(y linalg.Matrix<F32>&, a Activations&, q Weights&, bias linalg.Matrix<F32>&, relu Bool) Bool {
+    k := a.Cols
+    for i in range y.Rows {
+        for j in range y.Cols {
+            s F64 = F64(bias.Get(0, j))
+            for p in range k: s += F64(a.Step) * F64(I32(a.Data[i * k + p]) - a.Zero) * F64(q.At(j, p)) * F64(q.Scale[j])
+            if relu and s < 0.0: s = 0.0
+            if not ((F64(y.Get(i, j)) - s).Abs() <= 1e-5 * (1.0 + s.Abs())): return false
+        }
+    }
+    return true
 }
 
 test "the INT8 product is within the quantization's bound of the F32 product" {
