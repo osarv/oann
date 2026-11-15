@@ -639,17 +639,19 @@ fn gemmBlocks<SA, SB, A, S, H>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bo
             depth I64 = lesser(kc, k - pc)
             sb.pack(tb, jc, pc, cols, depth, bPanel(), sh, false, 0, bp)
             bk := block<A>(pc, depth, k, cols, jc, bp, al, be if pc == 0 else 1, lower, result, diag, exchanged)
-            if tasks <= 1 {
-                gemmRows(sa, ta, 0, m, bk, ap, c, ldc, sh, ep)
-                continue
-            }
-            join {
-                for t in range tasks {
-                    lo I64 = t * share
-                    hi I64 = lesser(m, lo + share)
-                    if lo < hi: spawn gemmRows(sa, ta, lo, hi, bk, ap[t * panel:(t + 1) * panel], c, ldc, sh, ep)
-                }
-            }
+            if tasks <= 1: gemmRows(sa, ta, 0, m, bk, ap, c, ldc, sh, ep)
+            else: rowsInTasks(sa, ta, m, share, tasks, bk, ap, panel, c, ldc, sh, ep)
+        }
+    }
+}
+
+# one block's rows in runs of share, a task each, each packing into its own panel of ap
+fn rowsInTasks<SA, A, S, H>(sa SA, ta Bool, m I64, share I64, tasks I64, bk block<A>&, ap mut Array<A>&, panel I64, c mut Array<S>&, ldc I64, sh H, ep Epilogue) {
+    join {
+        for t in range tasks {
+            lo I64 = t * share
+            hi I64 = lesser(m, lo + share)
+            if lo < hi: spawn gemmRows(sa, ta, lo, hi, bk, ap[t * panel:(t + 1) * panel], c, ldc, sh, ep)
         }
     }
 }
