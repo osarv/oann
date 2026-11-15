@@ -1716,7 +1716,7 @@ fn circuitOf(s system.System<F64>&) circuit.Circuit<F64> {
 }
 
 # s's weights and biases into c (the same structure): a learning step's result pushed to the other side
-fn pull(c mut circuit.Circuit<F64>&, s system.System<F64>&) {
+fn pull<T>(c mut circuit.Circuit<T>&, s system.System<T>&) {
     for k in range s.E.Links.Len() {
         l := s.E.Links[k]
         w := c.Weights(circuit.Projection(k))
@@ -1732,7 +1732,7 @@ fn pull(c mut circuit.Circuit<F64>&, s system.System<F64>&) {
 }
 
 # the other way: c's weights and biases into s
-fn push(s system.System<F64>&, c circuit.Circuit<F64>&) {
+fn push<T>(s system.System<T>&, c circuit.Circuit<T>&) {
     for k in range s.E.Links.Len() {
         l := s.E.Links[k]
         w := c.Weights(circuit.Projection(k))
@@ -2390,4 +2390,106 @@ test "what the board cannot run is refused when lowering, saying why" {
     refused = false
     try Engine.Lower(v) catch LowerError { refused = true }
     assert refused
+}
+
+# ---- MNIST through the board (M11) ----
+
+import "std/time"
+import "../data/loader"
+import "../data/mnist"
+
+# the test set answered on the board and by dyn in F32, by free settles: the board's accuracy, dyn's, the fraction of
+# samples both answer alike, and the sweeps a settle took on the board (a refused settle counts as wrong)
+fn answer<D>(s mut system.System<F32>&, e mut Engine&, l mut loader.Loader<D>&, pixels system.Pop, digits system.Pop) F64, F64, F64, F64 {
+    l.Epoch()
+    classes := Array<I32>(s.Batch)
+    floatAnswers := Array<I32>(s.Batch)
+    right, floatRight, agree, seen, sweeps, settles := 0, 0, 0, 0, 0, 0
+    tol := s.LessonTolerance(0.5)
+    budget := s.BudgetFor(tol).Sweeps
+    col := e.RegionDesc[I64(digits) * RegionWords + 1]
+    e.Nudge(settle.Phase.Free, 0)
+    for b in range l.Batches() {
+        n := l.Fill(b, s.Pop(pixels).Drive, classes)
+        seen += n
+        s.Settle(settle.Phase.Free, settle.Budget(budget, tol))
+        s.Predict(settle.Phase.Free, digits, floatAnswers)
+        e.Inputs(s, n)
+        ok Bool = true
+        try e.Settle(settle.Phase.Free, budget, tol) catch NotSettled { ok = false }
+        sweeps += e.Last.Sweeps
+        settles++
+        for i in range n {
+            best I64 = 0
+            for j in range 1, 10 {
+                if e.Activity(settle.Phase.Free, i, col + j) > e.Activity(settle.Phase.Free, i, col + best): best = j
+            }
+            boardRight := ok and I32(best) == classes[i]
+            if boardRight: right++
+            if floatAnswers[i] == classes[i]: floatRight++
+            if ok and I32(best) == floatAnswers[i]: agree++
+        }
+    }
+    return F64(right) / F64(seen), F64(floatRight) / F64(seen), F64(agree) / F64(seen), F64(sweeps) / F64(settles)
+}
+
+test "MNIST through the board (M11): a certified 784-128-10 taught at T = 0.25, its test set answered by the engine lowered from a dyn system" {
+    if not os.Exists("data/mnist/t10k-images-idx3-ubyte") {
+        try io.PutLine("MNIST is not fetched (make data): skipped")
+        return
+    }
+    data := try mnist.Mnist.Load("data/mnist", mnist.Source)
+    batch I64 = 32
+    # the circuit that teaches (equilibrium propagation, as docs/settling.md 5.9 ran it: Adam 1e-3, beta 0.5, held in the
+    # certified set after every step) - dyn's learning rules replace it when they land
+    c := circuit.Circuit<F32>(batch)
+    cx := c.Input(784)
+    ch := c.Hidden(128)
+    cy := c.Readout(10, circuit.Cost.CrossEntropy(0.25))
+    c.Project(cx, ch, circuit.Wiring.OneWay)
+    c.Project(ch, cy)
+    cr := rand.Rand(1)
+    c.Plan(cr)
+    c.Certify(0.9)
+    # the system the board runs, and the engine lowered from it
+    s := system.System<F32>(batch)
+    x := s.Population(s.Root(), "pixels", 784, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "hidden", 128, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "digits", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes(0.25)))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Dense, reciprocal = true)
+    sr := rand.Rand(1)
+    s.Plan(sr)!
+    push(s, c)
+    e := Engine.Lower(s)!
+    opt := optim.FlatAdamW<F32>(c.ParamCount, 0.001)
+    lesson := circuit.Lesson(0.5)
+    classes := Array<I32>(batch)
+    trainSet := loader.Loader(data.Train, batch, 1)
+    testSet := loader.Loader(data.Test, batch, 1, false)
+    last F64 = 0.0
+    for epoch in range 1, 4 {
+        t0 := time.Now()
+        trainSet.Epoch()
+        for b in range trainSet.Batches() {
+            n := trainSet.Fill(b, c.DriveData(cx), classes)
+            for i in range n: c.LabelData(cy)[i] = classes[i]
+            taught := try c.Teach(n, lesson) catch circuit.NotSettled { } default -1
+            if taught < 0: continue
+            opt.Step(c.ParamData(), c.GradData())
+            c.Restrain(0.9)
+        }
+        trained := F64(time.Since(t0)) * 1e-9
+        push(s, c)
+        e.Load(s)!
+        t1 := time.Now()
+        boardAccuracy, floatAccuracy, agree, sweeps := answer(s, e, testSet, x, y)
+        try io.PutLine(("MNIST epoch " $epoch ": test accuracy " $(100.0 * boardAccuracy).Fixed(2) "% on the board, " $(100.0 * floatAccuracy).Fixed(2)
+            "% in dyn's F32, the answers agreeing on " $(100.0 * agree).Fixed(2) "%; " $sweeps.Fixed(1) " sweeps a settle on the board; trained in "
+            $trained.Fixed(1) " s, answered in " $(F64(time.Since(t1)) * 1e-9).Fixed(1) " s; saturated " $(e.Saturations) " times, constants clipped "
+            $(100.0 * F64(e.Clipped) / F64(e.Constants)).Fixed(2) "%"))
+        last = boardAccuracy
+        assert agree > 0.995 and (boardAccuracy - floatAccuracy).Abs() < 0.005
+    }
+    assert last > 0.905 and last < 0.92
 }
