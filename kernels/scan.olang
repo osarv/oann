@@ -30,6 +30,7 @@
 # nothing.
 
 import "mat"
+import "gemm"
 
 # how n rows are cut: sequences of Len rows, a chunk of Chunk positions (the chunked forms), the delta rule's Heads
 type Seq struct(Len I64, Chunk I64 = 64, Heads I64 = 1) {
@@ -51,12 +52,12 @@ fn (w mut Work<A>&) scratch(n I64) mut Array<A>& {
 
 # ---- tasks ----
 
-# runs the job's units lo ... hi - 1 in at most `threads` runs of consecutive units; the first on the calling thread when
-# there is one run. Units do not overlap, so a task writes only its own
+# runs the job's units lo ... hi - 1 in at most `threads` runs of consecutive units (run's third argument is the run's
+# number, for the scratch each has); with one run, on the calling thread. Units do not overlap, so a task writes only its own
 fn spread<J>(j J&, units I64, threads I64) {
     tasks := threads if threads < units else units
     if tasks <= 1 {
-        j.run(0, units)
+        j.run(0, units, 0)
         return
     }
     share := (units + tasks - 1) / tasks
@@ -64,7 +65,7 @@ fn spread<J>(j J&, units I64, threads I64) {
         for t in range tasks {
             lo := t * share
             hi := lo + share if lo + share < units else units
-            if lo < hi: spawn j.run(lo, hi)
+            if lo < hi: spawn j.run(lo, hi, t)
         }
     }
 }
@@ -126,7 +127,7 @@ type scanJob<S, A> struct(h mat.Mat<S>, st mat.Mat<A>, x mat.Mat<S>, a mat.Mat<S
 }
 
 # unit u: sequence u / blocks, channel block u % blocks
-fn (j scanJob<S, A>&) run(lo I64, hi I64) {
+fn (j scanJob<S, A>&) run(lo I64, hi I64, task I64) {
     blocks := blocksOf(j.h.Cols)
     for u in range lo, hi {
         s := u / blocks
@@ -152,7 +153,7 @@ type scanSummaryJob<S, A> struct(x mat.Mat<S>, a mat.Mat<S>, b mat.Mat<S>, ps mu
     at
 }
 
-fn (j scanSummaryJob<S, A>&) run(lo I64, hi I64) {
+fn (j scanSummaryJob<S, A>&) run(lo I64, hi I64, task I64) {
     cols := j.x.Cols
     blocks := blocksOf(cols)
     chunks := chunksOf(j.at)
@@ -179,7 +180,7 @@ type scanCarryJob<A> struct(st mat.Mat<A>, ps mut Array<A>&, es mut Array<A>&, c
 
 # the chunks' starts, backward the chunks' incoming gradients: es (what chunk k leaves from nothing) replaced by the state
 # it starts from, st the state after the last chunk
-fn (j scanCarryJob<A>&) run(lo I64, hi I64) {
+fn (j scanCarryJob<A>&) run(lo I64, hi I64, task I64) {
     blocks := blocksOf(j.cols)
     for u in range lo, hi {
         s := u / blocks
@@ -208,7 +209,7 @@ type scanChunkJob<S, A> struct(h mat.Mat<S>, x mat.Mat<S>, a mat.Mat<S>, b mat.M
     at
 }
 
-fn (j scanChunkJob<S, A>&) run(lo I64, hi I64) {
+fn (j scanChunkJob<S, A>&) run(lo I64, hi I64, task I64) {
     cols := j.h.Cols
     blocks := blocksOf(cols)
     chunks := chunksOf(j.at)
@@ -292,7 +293,7 @@ fn (j scanGradJob<S, A>&) steps(gd mut Array<A>&, go I64, r0 I64, r1 I64, c0 I64
     }
 }
 
-fn (j scanGradJob<S, A>&) run(lo I64, hi I64) {
+fn (j scanGradJob<S, A>&) run(lo I64, hi I64, task I64) {
     cols := j.h.Cols
     blocks := blocksOf(cols)
     chunks := chunksOf(j.at)
@@ -321,7 +322,7 @@ type scanGradSummaryJob<S, A> struct(dh mat.Mat<S>, a mat.Mat<S>, ps mut Array<A
     at
 }
 
-fn (j scanGradSummaryJob<S, A>&) run(lo I64, hi I64) {
+fn (j scanGradSummaryJob<S, A>&) run(lo I64, hi I64, task I64) {
     cols := j.dh.Cols
     blocks := blocksOf(cols)
     chunks := chunksOf(j.at)
@@ -371,6 +372,246 @@ fn GatedScanGradChunked<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Ma
     spread(scanGradSummaryJob<S, A>(dh, a, ps, es, at), units, ws.Threads)
     spread(scanCarryJob<A>(dstate, ps, es, cols, chunks, true), seqs * blocksOf(cols), ws.Threads)
     spread(scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, es, at, true, add), units, ws.Threads)
+}
+
+# ---- the delta rule ----
+
+# S_t = alpha_t S_{t-1} (I - beta_t k_t k_t^T) + beta_t v_t k_t^T,  o_t = S_t q_t - an associative memory of values by key
+# that, given a key, first takes away what it holds there (S k) and writes the difference from the value wanted, at rate
+# beta (the delta rule, Widrow and Hoff; DeltaNet's linear attention), the whole thing leaking by alpha (Gated DeltaNet).
+# alpha = 1 is DeltaNet's. Per head h, S is dv x dk; it is KEPT TRANSPOSED, dk x dv - row c of a head's state is
+# S[:, c], so that every step is a pass of axpys along contiguous rows - and held in `state`, a Mat<A> of
+# seqs Heads dk rows and dv columns: row ((s Heads + h) dk + c), column i, is S_t[i, c] of sequence s, head h.
+# q and k are n x (Heads dk), v and out n x (Heads dv); head h of a row is columns h dk ... of q and k and h dv ... of v and
+# out. beta and gate are n x Heads (a scalar per position and head) - a gate of ones is the plain delta rule. Scale q (by
+# 1 / sqrt(dk)) and normalize k (to unit length, which keeps beta in (0, 1] stable) before: a kernel does neither.
+#
+# `keep`, when it has elements, receives the state at the start of every chunk of at.Chunk positions (seqs Heads chunks
+# dk dv elements, the chunks of a head one after another) - what the backward needs; of a kernel run in pieces, a piece
+# must begin at a chunk.
+
+type deltaArgs<S> struct(q mat.Mat<S>, k mat.Mat<S>, v mat.Mat<S>, beta mat.Mat<S>, gate mat.Mat<S>, at Seq) {
+    q
+    k
+    v
+    beta
+    gate
+    at
+}
+
+fn (a deltaArgs<S>&) dk() I64 { return a.q.Cols / a.at.Heads }
+
+fn (a deltaArgs<S>&) dv() I64 { return a.v.Cols / a.at.Heads }
+
+# the number of A's of scratch a task needs: the sequential form's vectors, the chunked form's matrices
+fn deltaScratch(sequential Bool, at Seq, dk I64, dv I64) I64 {
+    c := at.Chunk
+    if sequential: return 6 * dv
+    return 3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv + 3 * c
+}
+
+# ---- sequential ----
+
+# one head of one sequence, position by position: a = S^T k, e = beta (v - alpha a), S <- alpha S + k e^T, o = S^T q
+fn deltaSteps<S, A>(a deltaArgs<S>&, out mat.Mat<S>&, st mat.Mat<A>&, keep mut Array<A>&, w mut Array<A>&, s I64, h I64) {
+    dk := a.dk()
+    dv := a.dv()
+    base := st.Off + (s * a.at.Heads + h) * dk * st.Ld
+    sd := st.Data
+    chunks := chunksOf(a.at)
+    av := w[0:dv]
+    ev := w[dv:2 * dv]
+    ov := w[2 * dv:3 * dv]
+    for t in range a.at.Len {
+        if t % a.at.Chunk == 0 and keep.Len() > 0: saveState(keep, ((s * a.at.Heads + h) * chunks + t / a.at.Chunk) * dk * dv, st, base, dk, dv)
+        r := s * a.at.Len + t
+        bt := A(a.beta.Data[a.beta.Off + r * a.beta.Ld + h])
+        al := A(a.gate.Data[a.gate.Off + r * a.gate.Ld + h])
+        qo := a.q.Off + r * a.q.Ld + h * dk
+        ko := a.k.Off + r * a.k.Ld + h * dk
+        vo := a.v.Off + r * a.v.Ld + h * dv
+        for i in range dv: av[i] = 0.0
+        for c in range dk {
+            kc := A(a.k.Data[ko + c])
+            row := base + c * st.Ld
+            for i in range dv: av[i] += kc * sd[row + i]
+        }
+        for i in range dv: ev[i] = bt * (A(a.v.Data[vo + i]) - al * av[i])
+        for i in range dv: ov[i] = 0.0
+        for c in range dk {
+            kc := A(a.k.Data[ko + c])
+            qc := A(a.q.Data[qo + c])
+            row := base + c * st.Ld
+            for i in range dv {
+                p := al * sd[row + i] + kc * ev[i]
+                sd[row + i] = p
+                ov[i] += qc * p
+            }
+        }
+        oo := out.Off + r * out.Ld + h * dv
+        for i in range dv: out.Data[oo + i] = S(ov[i])
+    }
+}
+
+# the state of one head (dk rows of dv from st[base ...]) copied to keep[at ...]
+fn saveState<A>(keep mut Array<A>&, at I64, st mat.Mat<A>&, base I64, dk I64, dv I64) {
+    for c in range dk {
+        for i in range dv: keep[at + c * dv + i] = st.Data[base + c * st.Ld + i]
+    }
+}
+
+# ---- chunked ----
+
+# a chunk's matrices, slices of one task's scratch (C = at.Chunk; "rows" of a chunk is its length, at most C). Matrices
+# of C columns have row stride C, the others their width: x is C x (dv + dk), its left dv columns the pseudo-values U and
+# the rest W (the WY form's)
+type deltaBuf<A> struct(z mut Array<A>&, c I64, dk I64, dv I64) {
+    c
+    dk
+    dv
+    qc mut Array<A>& = z[0:c * dk]
+    kc mut Array<A>& = z[c * dk:2 * c * dk]
+    kg mut Array<A>& = z[2 * c * dk:3 * c * dk]
+    kk mut Array<A>& = z[3 * c * dk:3 * c * dk + c * c]
+    gm mut Array<A>& = z[3 * c * dk + c * c:3 * c * dk + 2 * c * c]
+    ag mut Array<A>& = z[3 * c * dk + 2 * c * c:3 * c * dk + 3 * c * c]
+    x mut Array<A>& = z[3 * c * dk + 3 * c * c:3 * c * dk + 3 * c * c + c * (dv + dk)]
+    d mut Array<A>& = z[3 * c * dk + 3 * c * c + c * (dv + dk):3 * c * dk + 3 * c * c + c * (dv + dk) + c * dv]
+    oc mut Array<A>& = z[3 * c * dk + 3 * c * c + c * (dv + dk) + c * dv:3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv]
+    bet mut Array<A>& = z[3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv:3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv + c]
+    alp mut Array<A>& = z[3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv + c:3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv + 2 * c]
+    gam mut Array<A>& = z[3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv + 2 * c:3 * c * dk + 3 * c * c + c * (dv + dk) + 2 * c * dv + 3 * c]
+}
+
+fn view<A>(a mut Array<A>&, off I64, rows I64, cols I64, ld I64) mat.Mat<A> { return mat.Mat<A>(a, off, rows, cols, ld) }
+
+# q, k of head h for the chunk's `rows` positions from row r0 into qc and kc; v into x's left columns scaled for the
+# triangular system's right-hand side; beta and gate; the products of the gate (gam) and its ratios (gm: gm[i, j] =
+# gate_{j+1} ... gate_i, 1 on the diagonal, 0 above)
+fn deltaLoad<S, A>(a deltaArgs<S>&, b deltaBuf<A>&, r0 I64, rows I64, h I64) {
+    dk := b.dk
+    dv := b.dv
+    wd := dv + dk
+    for i in range rows {
+        r := r0 + i
+        qo := a.q.Off + r * a.q.Ld + h * dk
+        ko := a.k.Off + r * a.k.Ld + h * dk
+        vo := a.v.Off + r * a.v.Ld + h * dv
+        b.bet[i] = A(a.beta.Data[a.beta.Off + r * a.beta.Ld + h])
+        b.alp[i] = A(a.gate.Data[a.gate.Off + r * a.gate.Ld + h])
+        b.gam[i] = b.alp[i] * (b.gam[i - 1] if i > 0 else 1.0)
+        for c in range dk {
+            b.qc[i * dk + c] = A(a.q.Data[qo + c])
+            b.kc[i * dk + c] = A(a.k.Data[ko + c])
+        }
+        for c in range dv: b.x[i * wd + c] = A(a.v.Data[vo + c])
+        for c in range dk: b.x[i * wd + dv + c] = b.gam[i] * b.kc[i * dk + c]
+        for j in range i: b.gm[i * b.c + j] = b.gm[(i - 1) * b.c + j] * b.alp[i]
+        b.gm[i * b.c + i] = 1.0
+    }
+}
+
+# the products of a chunk that do not depend on the state it starts from: x solved from the triangular system
+#   x_i = beta_i (x_i - sum over j < i of gm[i, j] (k_i . k_j) x_j)       (x_i = (v_i, gam_i k_i) before),
+# i.e. U = T V and W = T diag(gam) K with T = (I + diag(beta) tril(gm * K K^T, -1))^-1 diag(beta); ag the causal weights
+# gm * (Q K^T) on and below the diagonal; qc scaled by gam (the state's decay to each position); kg the keys scaled by
+# the decay to the chunk's end
+fn deltaPrepare<A>(ws mut gemm.Workspace<A>&, b deltaBuf<A>&, rows I64) {
+    dk := b.dk
+    dv := b.dv
+    wd := dv + dk
+    c := b.c
+    km := view(b.kc, 0, rows, dk, dk)
+    gemm.Gemm(ws, view(b.kk, 0, rows, rows, c), km, false, km, true)
+    gemm.Gemm(ws, view(b.ag, 0, rows, rows, c), view(b.qc, 0, rows, dk, dk), false, km, true)
+    for i in range rows {
+        xi := b.x[i * wd:(i + 1) * wd]
+        for j in range i {
+            coef := b.gm[i * c + j] * b.kk[i * c + j]
+            xj := b.x[j * wd:(j + 1) * wd]
+            for e in range wd: xi[e] -= coef * xj[e]
+        }
+        for e in range wd: xi[e] = b.bet[i] * xi[e]
+        for j in range i + 1: b.ag[i * c + j] = b.gm[i * c + j] * b.ag[i * c + j]
+        for j in range i + 1, rows: b.ag[i * c + j] = 0.0
+        for e in range dk {
+            b.kg[i * dk + e] = b.gm[(rows - 1) * c + i] * b.kc[i * dk + e]
+            b.qc[i * dk + e] = b.gam[i] * b.qc[i * dk + e]
+        }
+    }
+}
+
+# one head of one sequence by chunks: per chunk D = U - W S (the new values), O = (gam Q) S + ag D, then S <- gam_end S +
+# kg^T D - three products of the chunk's size by the head's, beside the chunk's own
+fn deltaChunks<S, A>(a deltaArgs<S>&, out mat.Mat<S>&, st mat.Mat<A>&, keep mut Array<A>&, ws mut gemm.Workspace<A>&, b deltaBuf<A>&, s I64, h I64) {
+    dk := b.dk
+    dv := b.dv
+    wd := dv + dk
+    chunks := chunksOf(a.at)
+    base := st.Off + (s * a.at.Heads + h) * dk * st.Ld
+    state := mat.Mat<A>(st.Data, base, dk, dv, st.Ld)
+    for k in range chunks {
+        if keep.Len() > 0: saveState(keep, ((s * a.at.Heads + h) * chunks + k) * dk * dv, st, base, dk, dv)
+        r0 := s * a.at.Len + k * a.at.Chunk
+        rows := lesser(a.at.Chunk, (s + 1) * a.at.Len - r0)
+        deltaLoad(a, b, r0, rows, h)
+        deltaPrepare(ws, b, rows)
+        for i in range rows {
+            for c in range dv: b.d[i * dv + c] = b.x[i * wd + c]
+        }
+        dm := view(b.d, 0, rows, dv, dv)
+        om := view(b.oc, 0, rows, dv, dv)
+        gemm.Gemm(ws, dm, view(b.x, dv, rows, dk, wd), false, state, false, -1.0, 1.0)
+        gemm.Gemm(ws, om, view(b.qc, 0, rows, dk, dk), false, state, false)
+        gemm.Gemm(ws, om, view(b.ag, 0, rows, rows, b.c), false, dm, false, 1.0, 1.0)
+        for i in range rows {
+            oo := out.Off + (r0 + i) * out.Ld + h * dv
+            for c in range dv: out.Data[oo + c] = S(b.oc[i * dv + c])
+        }
+        gemm.Gemm(ws, state, view(b.kg, 0, rows, dk, dk), true, dm, false, 1.0, b.gam[rows - 1])
+    }
+}
+
+type deltaJob<S, A> struct(args deltaArgs<S>, out mat.Mat<S>, st mat.Mat<A>, keep mut Array<A>&, z mut Array<A>&, per I64, chunked Bool) {
+    args
+    out
+    st
+    keep
+    z
+    per
+    chunked
+}
+
+# unit u: sequence u / Heads, head u % Heads; task t works in z's t-th share
+fn (j deltaJob<S, A>&) run(lo I64, hi I64, task I64) {
+    mine := j.z[task * j.per:(task + 1) * j.per]
+    if not j.chunked {
+        for u in range lo, hi: deltaSteps<S, A>(j.args, j.out, j.st, j.keep, mine, u / j.args.at.Heads, u % j.args.at.Heads)
+        return
+    }
+    products := gemm.Workspace<A>(1)
+    b := deltaBuf<A>(mine, j.args.at.Chunk, j.args.dk(), j.args.dv())
+    for u in range lo, hi: deltaChunks<S, A>(j.args, j.out, j.st, j.keep, products, b, u / j.args.at.Heads, u % j.args.at.Heads)
+}
+
+fn deltaRun<S, A>(ws mut Work<A>&, chunked Bool, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>&) {
+    units := q.Rows / at.Len * at.Heads
+    tasks := ws.Threads if ws.Threads < units else units
+    per := deltaScratch(not chunked, at, q.Cols / at.Heads, v.Cols / at.Heads)
+    z := ws.scratch(tasks * per)
+    spread(deltaJob<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), out, state, keep, z, per, chunked), units, ws.Threads)
+}
+
+# out = the delta rule over q, k, v, beta and gate from state, which holds the state after the last position on return.
+# The sequential form: one pass over the positions per head and sequence, heads and sequences in tasks
+fn DeltaRule<S, A>(ws mut Work<A>&, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
+    deltaRun(ws, false, out, state, q, k, v, beta, gate, at, keep)
+}
+
+# the chunked form (the WY form): the same result, a chunk at a time through gemm's products. Chunks of 32 to 64 are
+# the useful sizes; scratch grows with Chunk squared
+fn DeltaRuleChunked<S, A>(ws mut Work<A>&, out mut mat.Mat<S>&, state mut mat.Mat<A>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, beta mat.Mat<S>&, gate mat.Mat<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
+    deltaRun(ws, true, out, state, q, k, v, beta, gate, at, keep)
 }
 
 # ---- tests ----
@@ -628,4 +869,150 @@ test GatedScan "the consolidator's recurrence h = l h_prev + (1 - l) z is a scan
         }
     }
     assert state == prev
+}
+
+# ---- the delta rule's tests ----
+
+# the delta rule as the formula gives it, in F64 on contiguous arrays: S (dv x dk) per head and sequence, kept in the
+# kernel's transposed layout state[((s heads + h) dk + c) dv + i] = S[i][c], updated by S <- alpha S (I - beta k k^T) +
+# beta v k^T as a product with the matrix (I - beta k k^T), and o = S q
+fn deltaReference(q Array<F64>&, k Array<F64>&, v Array<F64>&, beta Array<F64>&, gate Array<F64>&, state mut Array<F64>&, seqs I64, len I64, heads I64, dk I64, dv I64) Array<F64> {
+    out := Array<F64>(seqs * len * heads * dv)
+    for s in range seqs {
+        for h in range heads {
+            m := Array<F64>(dv * dk)
+            for c in range dk {
+                for i in range dv: m[i * dk + c] = state[((s * heads + h) * dk + c) * dv + i]
+            }
+            for t in range len {
+                r := s * len + t
+                bt := beta[r * heads + h]
+                al := gate[r * heads + h]
+                next := Array<F64>(dv * dk)
+                for i in range dv {
+                    for c in range dk {
+                        total F64
+                        for j in range dk {
+                            kron := 1.0 if j == c else 0.0
+                            total += m[i * dk + j] * (kron - bt * k[r * heads * dk + h * dk + j] * k[r * heads * dk + h * dk + c])
+                        }
+                        next[i * dk + c] = al * total + bt * v[r * heads * dv + h * dv + i] * k[r * heads * dk + h * dk + c]
+                    }
+                }
+                for e in range dv * dk: m[e] = next[e]
+                for i in range dv {
+                    total F64
+                    for c in range dk: total += m[i * dk + c] * q[r * heads * dk + h * dk + c]
+                    out[r * heads * dv + h * dv + i] = total
+                }
+            }
+            for c in range dk {
+                for i in range dv: state[((s * heads + h) * dk + c) * dv + i] = m[i * dk + c]
+            }
+        }
+    }
+    return out
+}
+
+# one random problem: q, v normal, k unit length per head, beta in (0.1, 1), gate in (0.8, 1) or all ones
+type deltaData<S, A> struct(seqs I64, len I64, heads I64, dk I64, dv I64, ones Bool, seed I64) {
+    seqs
+    len
+    heads
+    dk
+    dv
+    ones
+    seed
+    n I64 = seqs * len
+    q mut Array<S>& = Array<S>(seqs * len * heads * dk)
+    k mut Array<S>& = Array<S>(seqs * len * heads * dk)
+    v mut Array<S>& = Array<S>(seqs * len * heads * dv)
+    beta mut Array<S>& = Array<S>(seqs * len * heads)
+    gate mut Array<S>& = Array<S>(seqs * len * heads)
+    state mut Array<A>& = Array<A>(seqs * heads * dk * dv)
+}
+
+fn deltaData<S, A>.Random(seqs I64, len I64, heads I64, dk I64, dv I64, ones Bool, seed I64) deltaData<S, A> {
+    d := deltaData<S, A>(seqs, len, heads, dk, dv, ones, seed)
+    r := rand.Rand(U64(seed))
+    fill(d.q, r, 0.5)
+    fill(d.v, r, 1.0)
+    fill(d.k, r, 1.0)
+    for row in range seqs * len * heads {
+        norm F64
+        for c in range dk: norm += F64(d.k[row * dk + c]) * F64(d.k[row * dk + c])
+        norm = norm.Sqrt()
+        for c in range dk: d.k[row * dk + c] = S(F64(d.k[row * dk + c]) / norm)
+    }
+    fillGates(d.beta, r, 0.1, 1.0)
+    fillGates(d.gate, r, 0.8, 1.0)
+    if ones {
+        for i in range d.gate.Len(): d.gate[i] = S(1.0)
+    }
+    fill(d.state, r, 0.3)
+    return d
+}
+
+fn f64Of<T>(a Array<T>&) Array<F64> {
+    out := Array<F64>(a.Len())
+    for i in range a.Len(): out[i] = F64(a[i])
+    return out
+}
+
+# the kernel's outputs and final state against the formula's, from the same stored numbers: got, want, gotState, wantState
+fn deltaCase<S, A>(chunked Bool, threads I64, d deltaData<S, A>&, chunk I64) Array<F64>, Array<F64>, Array<F64>, Array<F64> {
+    n := d.seqs * d.len
+    start := f64Of(d.state)
+    want := deltaReference(f64Of(d.q), f64Of(d.k), f64Of(d.v), f64Of(d.beta), f64Of(d.gate), start, d.seqs, d.len, d.heads, d.dk, d.dv)
+    out := Array<S>(n * d.heads * d.dv)
+    state := Array<A>(d.state.Len())
+    for i in range state.Len(): state[i] = d.state[i]
+    ws := Work<A>(threads)
+    at := Seq(d.len, chunk, d.heads)
+    qm := whole(d.q, n, d.heads * d.dk)
+    km := whole(d.k, n, d.heads * d.dk)
+    vm := whole(d.v, n, d.heads * d.dv)
+    bm := whole(d.beta, n, d.heads)
+    gm := whole(d.gate, n, d.heads)
+    om := whole(out, n, d.heads * d.dv)
+    sm := whole(state, d.seqs * d.heads * d.dk, d.dv)
+    if chunked: DeltaRuleChunked(ws, om, sm, qm, km, vm, bm, gm, at)
+    else: DeltaRule(ws, om, sm, qm, km, vm, bm, gm, at)
+    return f64Of(out), want, f64Of(state), start
+}
+
+test DeltaRule "the sequential form is the formula S = alpha S (I - beta k k^T) + beta v k^T, o = S q: F64 to 1e-12, F32 to 1e-5, BF16 stored to 3e-2; gated and not, any thread count" {
+    for ones in Array<Bool>[true, false] {
+        for threads in Array<I64>[1, 3] {
+            d64 := deltaData<F64, F64>.Random(2, 23, 3, 12, 10, ones, 1)
+            g, w, gs, ws := deltaCase(false, threads, d64, 8)
+            assert maxRelDiff(g, w) < 1.0e-12 and maxRelDiff(gs, ws) < 1.0e-12
+            d32 := deltaData<F32, F32>.Random(2, 23, 3, 12, 10, ones, 2)
+            g2, w2, gs2, ws2 := deltaCase(false, threads, d32, 8)
+            assert maxRelDiff(g2, w2) < 1.0e-5 and maxRelDiff(gs2, ws2) < 1.0e-5
+            db := deltaData<BF16, F32>.Random(2, 23, 3, 12, 10, ones, 3)
+            g3, w3, gs3, ws3 := deltaCase(false, threads, db, 8)
+            assert maxRelDiff(g3, w3) < 3.0e-2 and maxRelDiff(gs3, ws3) < 1.0e-5
+        }
+    }
+}
+
+test DeltaRuleChunked "equals the formula (F64 to 1e-11) and the sequential form (F32 to 1e-5): chunks of every size, the last short, gated and not, any thread count" {
+    for ones in Array<Bool>[true, false] {
+        for chunk in Array<I64>[1, 3, 8, 23, 64] {
+            for threads in Array<I64>[1, 3] {
+                d64 := deltaData<F64, F64>.Random(2, 23, 3, 12, 10, ones, 1)
+                g, w, gs, ws := deltaCase(true, threads, d64, chunk)
+                assert maxRelDiff(g, w) < 1.0e-11, "chunk " $chunk
+                assert maxRelDiff(gs, ws) < 1.0e-11
+                d32 := deltaData<F32, F32>.Random(2, 23, 3, 12, 10, ones, 2)
+                g2, w2, gs2, ws2 := deltaCase(true, threads, d32, chunk)
+                assert maxRelDiff(g2, w2) < 1.0e-5, "chunk " $chunk
+                assert maxRelDiff(gs2, ws2) < 1.0e-5
+            }
+        }
+    }
+    db := deltaData<BF16, F32>.Random(2, 23, 3, 12, 10, false, 3)
+    g, w, _, _ := deltaCase(true, 2, db, 8)
+    assert maxRelDiff(g, w) < 3.0e-2
 }
