@@ -375,6 +375,402 @@ fn GatedScanGradChunked<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Ma
     spread(scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, es, at, true, add), units, ws.Threads)
 }
 
+# ---- the selective scan ----
+
+# Mamba's selective state-space scan: per channel d, N states, h_t[n] = exp(delta_t[d] A[n, d]) h_{t-1}[n] + delta_t[d]
+# B_t[n] x_t[d] (the zero-order-hold discretization of h' = A h + B x with the input-dependent step delta, its B bar
+# simplified to delta B as the reference implementation does) and y_t[d] = sum over n of C_t[n] h_t[n] + skip[d] x_t[d]. The
+# operands: x and delta n x D (delta is the step already through its softplus), a N x D (A transposed from the usual D x
+# N, so that a step's work runs along the contiguous channels; real, negative for a decaying state), b and c n x N (the
+# input-dependent B and C, shared by every channel of a position), skip D numbers or none (an empty array). The state is
+# seqs N rows of D columns - row s N + n, column d - in the accumulator, passed in and changed as the others are.
+# `keep`, when it has elements, receives the state at the start of every chunk (row ((s chunks + k) N + n), D columns:
+# seqs chunks N D elements) - what the backward needs.
+
+type selArgs<S> struct(x mat.Mat<S>, delta mat.Mat<S>, a mat.Mat<S>, b mat.Mat<S>, c mat.Mat<S>, skip Array<S>&, at Seq) {
+    x
+    delta
+    a
+    b
+    c
+    skip
+    at
+}
+
+# positions r0 ... r1 - 1 of sequence s, channels d0 ... d1 - 1 (at most scanWidth), from the states in sd[base + n stride + d];
+# w holds three vectors of scanWidth. A chunk's start state is saved to keep where a position starts one
+fn selSteps<S, A>(f selArgs<S>&, y mat.Mat<S>&, sd mut Array<A>&, base I64, stride I64, s I64, r0 I64, r1 I64, d0 I64, d1 I64, w mut Array<A>&, keep mut Array<A>&) {
+    n := f.a.Rows
+    cols := f.x.Cols
+    chunks := chunksOf(f.at)
+    yb := w[0:scanWidth]
+    dlb := w[scanWidth:2 * scanWidth]
+    dxb := w[2 * scanWidth:3 * scanWidth]
+    for r in range r0, r1 {
+        t := r - s * f.at.Len
+        if keep.Len() > 0 and t % f.at.Chunk == 0: saveRows(keep, ((s * chunks + t / f.at.Chunk) * n) * cols, sd, base, stride, n, d0, d1, cols)
+        xo := f.x.Off + r * f.x.Ld
+        lo := f.delta.Off + r * f.delta.Ld
+        for d in range d0, d1 {
+            xv := A(f.x.Data[xo + d])
+            dlb[d - d0] = A(f.delta.Data[lo + d])
+            dxb[d - d0] = dlb[d - d0] * xv
+            yb[d - d0] = A(f.skip[d]) * xv if f.skip.Len() > 0 else 0.0
+        }
+        for k in range n {
+            bn := A(f.b.Data[f.b.Off + r * f.b.Ld + k])
+            cn := A(f.c.Data[f.c.Off + r * f.c.Ld + k])
+            so := base + k * stride
+            ao := f.a.Off + k * f.a.Ld
+            for d in range d0, d1 {
+                ex := elem.FastExp(dlb[d - d0] * A(f.a.Data[ao + d]))
+                hv := ex * sd[so + d] + bn * dxb[d - d0]
+                sd[so + d] = hv
+                yb[d - d0] += cn * hv
+            }
+        }
+        yo := y.Off + r * y.Ld
+        for d in range d0, d1: y.Data[yo + d] = S(yb[d - d0])
+    }
+}
+
+# n rows of the states sd[base + k stride + d0 ...] (d0 ... d1 - 1) copied to keep[at + k cols + d]
+fn saveRows<A>(keep mut Array<A>&, at I64, sd Array<A>&, base I64, stride I64, n I64, d0 I64, d1 I64, cols I64) {
+    for k in range n {
+        for d in range d0, d1: keep[at + k * cols + d] = sd[base + k * stride + d]
+    }
+}
+
+type selJob<S, A> struct(f selArgs<S>, y mat.Mat<S>, st mat.Mat<A>, keep mut Array<A>&, z mut Array<A>&, per I64) {
+    f
+    y
+    st
+    keep
+    z
+    per
+}
+
+# unit u: sequence u / blocks, channel block u % blocks
+fn (j selJob<S, A>&) run(lo I64, hi I64, task I64) {
+    mine := j.z[task * j.per:(task + 1) * j.per]
+    cols := j.f.x.Cols
+    blocks := blocksOf(cols)
+    n := j.f.a.Rows
+    for u in range lo, hi {
+        s := u / blocks
+        d0 := u % blocks * scanWidth
+        selSteps<S, A>(j.f, j.y, j.st.Data, j.st.Off + s * n * j.st.Ld, j.st.Ld, s, s * j.f.at.Len, (s + 1) * j.f.at.Len, d0, lesser(d0 + scanWidth, cols), mine, j.keep)
+    }
+}
+
+# the summaries of chunks (pass 1) at p and e [((s N + n) chunks + k) D + d]: the product of the chunk's decays and its end
+# state from a state of zero
+type selSummaryJob<S, A> struct(f selArgs<S>, ps mut Array<A>&, es mut Array<A>&, z mut Array<A>&, per I64) {
+    f
+    ps
+    es
+    z
+    per
+}
+
+fn (j selSummaryJob<S, A>&) run(lo I64, hi I64, task I64) {
+    mine := j.z[task * j.per:(task + 1) * j.per]
+    f := j.f
+    cols := f.x.Cols
+    blocks := blocksOf(cols)
+    chunks := chunksOf(f.at)
+    n := f.a.Rows
+    dlb := mine[0:scanWidth]
+    dxb := mine[scanWidth:2 * scanWidth]
+    for u in range lo, hi {
+        sk := u / blocks
+        d0 := u % blocks * scanWidth
+        d1 := lesser(d0 + scanWidth, cols)
+        s := sk / chunks
+        k := sk % chunks
+        r0 := s * f.at.Len + k * f.at.Chunk
+        r1 := lesser(r0 + f.at.Chunk, (s + 1) * f.at.Len)
+        for nn in range n {
+            o := ((s * n + nn) * chunks + k) * cols
+            for d in range d0, d1 {
+                j.ps[o + d] = 1.0
+                j.es[o + d] = 0.0
+            }
+        }
+        for r in range r0, r1 {
+            for d in range d0, d1 {
+                dlb[d - d0] = A(f.delta.Data[f.delta.Off + r * f.delta.Ld + d])
+                dxb[d - d0] = dlb[d - d0] * A(f.x.Data[f.x.Off + r * f.x.Ld + d])
+            }
+            for nn in range n {
+                bn := A(f.b.Data[f.b.Off + r * f.b.Ld + nn])
+                o := ((s * n + nn) * chunks + k) * cols
+                ao := f.a.Off + nn * f.a.Ld
+                for d in range d0, d1 {
+                    ex := elem.FastExp(dlb[d - d0] * A(f.a.Data[ao + d]))
+                    j.ps[o + d] = ex * j.ps[o + d]
+                    j.es[o + d] = ex * j.es[o + d] + bn * dxb[d - d0]
+                }
+            }
+        }
+    }
+}
+
+# pass 3: each chunk from its start state (the carry's, in es), saving it to keep where that has elements
+type selChunkJob<S, A> struct(f selArgs<S>, y mat.Mat<S>, es mut Array<A>&, keep mut Array<A>&, z mut Array<A>&, per I64) {
+    f
+    y
+    es
+    keep
+    z
+    per
+}
+
+fn (j selChunkJob<S, A>&) run(lo I64, hi I64, task I64) {
+    mine := j.z[task * j.per:(task + 1) * j.per]
+    f := j.f
+    cols := f.x.Cols
+    blocks := blocksOf(cols)
+    chunks := chunksOf(f.at)
+    n := f.a.Rows
+    for u in range lo, hi {
+        sk := u / blocks
+        d0 := u % blocks * scanWidth
+        s := sk / chunks
+        k := sk % chunks
+        r0 := s * f.at.Len + k * f.at.Chunk
+        r1 := lesser(r0 + f.at.Chunk, (s + 1) * f.at.Len)
+        base := ((s * n) * chunks + k) * cols
+        selSteps<S, A>(f, j.y, j.es, base, chunks * cols, s, r0, r1, d0, lesser(d0 + scanWidth, cols), mine, j.keep)
+    }
+}
+
+# y = the selective scan, sequential: one pass over each sequence, sequences and channel blocks in tasks
+fn SelectiveScan<S, A>(ws mut Work<A>&, y mut mat.Mat<S>&, state mut mat.Mat<A>&, x mat.Mat<S>&, delta mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, c mat.Mat<S>&, skip Array<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
+    units := x.Rows / at.Len * blocksOf(x.Cols)
+    tasks := ws.Threads if ws.Threads < units else units
+    z := ws.scratch(tasks * 3 * scanWidth)
+    spread(selJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, state, keep, z, 3 * scanWidth), units, ws.Threads)
+}
+
+# the chunked form: per (sequence, chunk, channel block) what the chunk leaves behind, the carry over the chunks, then
+# each chunk from its start - the same numbers in another order, the time axis in tasks too. Scratch: 2 seqs N chunks D
+fn SelectiveScanChunked<S, A>(ws mut Work<A>&, y mut mat.Mat<S>&, state mut mat.Mat<A>&, x mat.Mat<S>&, delta mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, c mat.Mat<S>&, skip Array<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
+    cols := x.Cols
+    n := a.Rows
+    seqs := x.Rows / at.Len
+    chunks := chunksOf(at)
+    size := seqs * n * chunks * cols
+    units := seqs * chunks * blocksOf(cols)
+    tasks := ws.Threads if ws.Threads < units else units
+    z := ws.scratch(tasks * 3 * scanWidth + 2 * size)
+    vecs := z[0:tasks * 3 * scanWidth]
+    ps := z[tasks * 3 * scanWidth:tasks * 3 * scanWidth + size]
+    es := z[tasks * 3 * scanWidth + size:tasks * 3 * scanWidth + 2 * size]
+    spread(selSummaryJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), ps, es, vecs, 3 * scanWidth), units, ws.Threads)
+    spread(scanCarryJob<A>(state, ps, es, cols, chunks, false), seqs * n * blocksOf(cols), ws.Threads)
+    spread(selChunkJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, es, keep, vecs, 3 * scanWidth), units, ws.Threads)
+}
+
+# ---- the selective scan's backward ----
+
+# With g_t[n, d] the gradient of the loss in h_t (g_t = dy_t[d] C_t[n] + a_{t+1} g_{t+1}, a_t = exp(delta_t A), plus dstate
+# at the end) and h_{t-1} the state before:
+#   dx_t[d] = sum_n g delta B_t[n] + skip dy,   ddelta_t[d] = sum_n g (A a h_{t-1} + B_t[n] x_t[d]),
+#   dA[n, d] = sum_t g delta a h_{t-1},   dB_t[n] = sum_d g delta x_t[d],   dC_t[n] = sum_d dy_t[d] h_t[n, d],
+#   dskip[d] = sum_t dy x_t[d];   the initial state's gradient is a_0 g_0 (dstate on return).
+# Per (sequence, channel block) the chunks are taken last to first, each one's states recomputed from `keep`. The sums over
+# channels (dB, dC) and over sequences (dA, dskip) are kept per block and per sequence in scratch and added in a fixed
+# order, so the result is the same for every thread count.
+type selGradArgs<S, A> struct(f selArgs<S>, dx mat.Mat<S>, ddelta mat.Mat<S>, da mat.Mat<S>, db mat.Mat<S>, dc mat.Mat<S>, dskip mut Array<S>&, ds mat.Mat<A>, dy mat.Mat<S>, keep Array<A>&, add Bool) {
+    f
+    dx
+    ddelta
+    da
+    db
+    dc
+    dskip
+    ds
+    dy
+    keep
+    add
+}
+
+# the A's of scratch a task needs: a chunk's states (Chunk + 1 of N x scanWidth) and five vectors
+fn selGradScratch(at Seq, n I64) I64 { return (at.Chunk + 1) * n * scanWidth + 5 * scanWidth }
+
+type selGradJob<S, A> struct(g selGradArgs<S, A>, z mut Array<A>&, per I64, pdb mut Array<A>&, pdc mut Array<A>&, pda mut Array<A>&, pds mut Array<A>&) {
+    g
+    z
+    per
+    pdb
+    pdc
+    pda
+    pds
+}
+
+fn (j selGradJob<S, A>&) run(lo I64, hi I64, task I64) {
+    mine := j.z[task * j.per:(task + 1) * j.per]
+    f := j.g.f
+    cols := f.x.Cols
+    blocks := blocksOf(cols)
+    n := f.a.Rows
+    for u in range lo, hi {
+        s := u / blocks
+        d0 := u % blocks * scanWidth
+        d1 := lesser(d0 + scanWidth, cols)
+        j.sweep(s, u, d0, d1, n, mine)
+    }
+}
+
+# one sequence's channel block d0 ... d1 - 1, chunks last to first
+fn (j selGradJob<S, A>&) sweep(s I64, u I64, d0 I64, d1 I64, n I64, w mut Array<A>&) {
+    g := j.g
+    f := g.f
+    cols := f.x.Cols
+    chunks := chunksOf(f.at)
+    hs := w[0:(f.at.Chunk + 1) * n * scanWidth]
+    vecs := w[(f.at.Chunk + 1) * n * scanWidth:(f.at.Chunk + 1) * n * scanWidth + 5 * scanWidth]
+    gbase := g.ds.Off + s * n * g.ds.Ld
+    for i in range chunks {
+        k := chunks - 1 - i
+        r0 := s * f.at.Len + k * f.at.Chunk
+        r1 := lesser(r0 + f.at.Chunk, (s + 1) * f.at.Len)
+        selStates<S, A>(f, g.keep, ((s * chunks + k) * n) * cols, r0, r1, d0, d1, hs, vecs)
+        for q in range r1 - r0 {
+            r := r1 - 1 - q
+            selGradStep<S, A>(g, r, r - r0, s, u, d0, d1, hs, g.ds.Data, gbase, vecs, j.pdb, j.pdc, j.pda, j.pds)
+        }
+    }
+}
+
+# the states of positions r0 ... r1 - 1 from the chunk's start in keep[at ...] (rows of `cols`): hs[(t N + n) scanWidth + d - d0] is
+# the state of position r0 + t - 1 (t = 0: the start) of state n, channel d
+fn selStates<S, A>(f selArgs<S>&, keep Array<A>&, at I64, r0 I64, r1 I64, d0 I64, d1 I64, hs mut Array<A>&, w mut Array<A>&) {
+    n := f.a.Rows
+    cols := f.x.Cols
+    dl := w[0:scanWidth]
+    for k in range n {
+        for d in range d0, d1: hs[k * scanWidth + d - d0] = keep[at + k * cols + d]
+    }
+    for t in range r1 - r0 {
+        r := r0 + t
+        for d in range d0, d1: dl[d - d0] = A(f.delta.Data[f.delta.Off + r * f.delta.Ld + d])
+        for k in range n {
+            bn := A(f.b.Data[f.b.Off + r * f.b.Ld + k])
+            for d in range d0, d1 {
+                ex := elem.FastExp(dl[d - d0] * A(f.a.Data[f.a.Off + k * f.a.Ld + d]))
+                hs[((t + 1) * n + k) * scanWidth + d - d0] = ex * hs[(t * n + k) * scanWidth + d - d0] + bn * dl[d - d0] * A(f.x.Data[f.x.Off + r * f.x.Ld + d])
+            }
+        }
+    }
+}
+
+# position r (t within its chunk) backward over channels d0 ... d1 - 1; g[n][d] in gd[gbase + n ds.Ld + d] is what the later
+# positions pass back, replaced by what this one does
+fn selGradStep<S, A>(g selGradArgs<S, A>&, r I64, t I64, s I64, u I64, d0 I64, d1 I64, hs Array<A>&, gd mut Array<A>&, gbase I64, w mut Array<A>&, pdb mut Array<A>&, pdc mut Array<A>&, pda mut Array<A>&, pds mut Array<A>&) {
+    f := g.f
+    n := f.a.Rows
+    cols := f.x.Cols
+    dl := w[0:scanWidth]
+    xv := w[scanWidth:2 * scanWidth]
+    dyv := w[2 * scanWidth:3 * scanWidth]
+    ddl := w[3 * scanWidth:4 * scanWidth]
+    dxg := w[4 * scanWidth:5 * scanWidth]
+    pt := (u * f.at.Len + r - s * f.at.Len) * n
+    for d in range d0, d1 {
+        dl[d - d0] = A(f.delta.Data[f.delta.Off + r * f.delta.Ld + d])
+        xv[d - d0] = A(f.x.Data[f.x.Off + r * f.x.Ld + d])
+        dyv[d - d0] = A(g.dy.Data[g.dy.Off + r * g.dy.Ld + d])
+        ddl[d - d0] = 0.0
+        dxg[d - d0] = 0.0
+        if f.skip.Len() > 0: pds[s * cols + d] += dyv[d - d0] * xv[d - d0]
+    }
+    for k in range n {
+        bn := A(f.b.Data[f.b.Off + r * f.b.Ld + k])
+        cn := A(f.c.Data[f.c.Off + r * f.c.Ld + k])
+        dB A = 0.0
+        dC A = 0.0
+        for d in range d0, d1 {
+            av := A(f.a.Data[f.a.Off + k * f.a.Ld + d])
+            ex := elem.FastExp(dl[d - d0] * av)
+            hp := hs[(t * n + k) * scanWidth + d - d0]
+            hn := hs[((t + 1) * n + k) * scanWidth + d - d0]
+            gv := gd[gbase + k * g.ds.Ld + d] + dyv[d - d0] * cn
+            dC += dyv[d - d0] * hn
+            dB += gv * dl[d - d0] * xv[d - d0]
+            dxg[d - d0] += gv * dl[d - d0] * bn
+            ddl[d - d0] += gv * (av * ex * hp + bn * xv[d - d0])
+            pda[(s * n + k) * cols + d] += gv * dl[d - d0] * ex * hp
+            gd[gbase + k * g.ds.Ld + d] = ex * gv
+        }
+        pdb[pt + k] = dB
+        pdc[pt + k] = dC
+    }
+    for d in range d0, d1 {
+        skipped := A(f.skip[d]) * dyv[d - d0] if f.skip.Len() > 0 else 0.0
+        xi := g.dx.Off + r * g.dx.Ld + d
+        di := g.ddelta.Off + r * g.ddelta.Ld + d
+        g.dx.Data[xi] = put<S, A>(g.dx.Data, xi, dxg[d - d0] + skipped, g.add)
+        g.ddelta.Data[di] = put<S, A>(g.ddelta.Data, di, ddl[d - d0], g.add)
+    }
+}
+
+# dx, ddelta, da (N x D), db, dc (n x N) and dskip (D, or none), written or added to where add is set, for a loss with
+# gradient dy in y; keep is the forward's. dstate: the state's gradient in (zeros if unused), the initial state's out.
+# Sequential in time, in tasks over sequences and channel blocks; scratch: tasks (Chunk N + 6) scanWidth plus 2 seqs
+# blocks Len N + seqs N D + seqs D
+fn SelectiveScanGrad<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, ddelta mut mat.Mat<S>&, da mut mat.Mat<S>&, db mut mat.Mat<S>&, dc mut mat.Mat<S>&, dskip mut Array<S>&, dstate mut mat.Mat<A>&, dy mat.Mat<S>&, x mat.Mat<S>&, delta mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, c mat.Mat<S>&, skip Array<S>&, keep Array<A>&, at Seq, add Bool = false) {
+    cols := x.Cols
+    n := a.Rows
+    seqs := x.Rows / at.Len
+    blocks := blocksOf(cols)
+    units := seqs * blocks
+    tasks := ws.Threads if ws.Threads < units else units
+    per := selGradScratch(at, n)
+    partial := units * at.Len * n
+    total := tasks * per + 2 * partial + seqs * n * cols + seqs * cols
+    z := ws.scratch(total)
+    o := tasks * per
+    pdb := z[o:o + partial]
+    pdc := z[o + partial:o + 2 * partial]
+    pda := z[o + 2 * partial:o + 2 * partial + seqs * n * cols]
+    pds := z[o + 2 * partial + seqs * n * cols:total]
+    for i in range seqs * n * cols: pda[i] = 0.0
+    for i in range seqs * cols: pds[i] = 0.0
+    spread(selGradJob<S, A>(selGradArgs<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), dx, ddelta, da, db, dc, dskip, dstate, dy, keep, add), z, per, pdb, pdc, pda, pds), units, ws.Threads)
+    # the sums over channel blocks (dB, dC), sequences (dA) and sequences again (dskip), in a fixed order
+    for r in range seqs * at.Len {
+        s := r / at.Len
+        for k in range n {
+            tb A = 0.0
+            tc A = 0.0
+            for blk in range blocks {
+                tb += pdb[((s * blocks + blk) * at.Len + r % at.Len) * n + k]
+                tc += pdc[((s * blocks + blk) * at.Len + r % at.Len) * n + k]
+            }
+            bi := db.Off + r * db.Ld + k
+            ci := dc.Off + r * dc.Ld + k
+            db.Data[bi] = put<S, A>(db.Data, bi, tb, add)
+            dc.Data[ci] = put<S, A>(dc.Data, ci, tc, add)
+        }
+    }
+    for k in range n {
+        for d in range cols {
+            sum A = 0.0
+            for s in range seqs: sum += pda[(s * n + k) * cols + d]
+            ai := da.Off + k * da.Ld + d
+            da.Data[ai] = put<S, A>(da.Data, ai, sum, add)
+        }
+    }
+    if skip.Len() == 0: return
+    for d in range cols {
+        sum A = 0.0
+        for s in range seqs: sum += pds[s * cols + d]
+        dskip[d] = put<S, A>(dskip, d, sum, add)
+    }
+}
+
 # ---- the delta rule ----
 
 # S_t = alpha_t S_{t-1} (I - beta_t k_t k_t^T) + beta_t v_t k_t^T,  o_t = S_t q_t - an associative memory of values by key
@@ -1601,4 +1997,110 @@ test DeltaRuleGrad "the chunked backward equals the sequential one: F32 to 1e-4 
     top := 0.0
     for i in range sb.Len(): top = top.Max(sb[i].Abs())
     for i in range sb.Len(): assert (gb[i] - sb[i]).Abs() < 5.0e-2 * top, "bf16 " $i
+}
+
+# ---- the selective scan's tests ----
+
+# the scan as the equations give it, in F64: x, delta n x D; a N x D; b, c n x N; state seqs N x D
+fn selReference(x Array<F64>&, delta Array<F64>&, a Array<F64>&, b Array<F64>&, c Array<F64>&, skip Array<F64>&, state mut Array<F64>&, seqs I64, len I64, cols I64, n I64) Array<F64> {
+    y := Array<F64>(seqs * len * cols)
+    for s in range seqs {
+        for t in range len {
+            r := s * len + t
+            for d in range cols {
+                acc := skip[d] * x[r * cols + d] if skip.Len() > 0 else 0.0
+                for k in range n {
+                    h := (delta[r * cols + d] * a[k * cols + d]).Exp() * state[(s * n + k) * cols + d] + delta[r * cols + d] * b[r * n + k] * x[r * cols + d]
+                    state[(s * n + k) * cols + d] = h
+                    acc += c[r * n + k] * h
+                }
+                y[r * cols + d] = acc
+            }
+        }
+    }
+    return y
+}
+
+type selData<S, A> struct(seqs I64, len I64, cols I64, n I64, skipped Bool) {
+    seqs
+    len
+    cols
+    n
+    skipped
+    x mut Array<S>& = Array<S>(seqs * len * cols)
+    delta mut Array<S>& = Array<S>(seqs * len * cols)
+    a mut Array<S>& = Array<S>(n * cols)
+    b mut Array<S>& = Array<S>(seqs * len * n)
+    c mut Array<S>& = Array<S>(seqs * len * n)
+    skip mut Array<S>& = Array<S>(cols if skipped else 0)
+    state mut Array<A>& = Array<A>(seqs * n * cols)
+}
+
+fn selData<S, A>.Random(seqs I64, len I64, cols I64, n I64, skipped Bool, seed I64) selData<S, A> {
+    d := selData<S, A>(seqs, len, cols, n, skipped)
+    r := rand.Rand(U64(seed))
+    fill(d.x, r, 1.0)
+    fillGates(d.delta, r, 0.05, 0.6)
+    fillGates(d.a, r, -2.0, -0.1)
+    fill(d.b, r, 1.0)
+    fill(d.c, r, 1.0)
+    fill(d.skip, r, 1.0)
+    fill(d.state, r, 0.5)
+    return d
+}
+
+# the kernel's output and final state against the equations': got, want, gotState, wantState
+fn selCase<S, A>(chunked Bool, threads I64, d selData<S, A>&, chunk I64) Array<F64>, Array<F64>, Array<F64>, Array<F64> {
+    n := d.seqs * d.len
+    start := f64Of(d.state)
+    want := selReference(f64Of(d.x), f64Of(d.delta), f64Of(d.a), f64Of(d.b), f64Of(d.c), f64Of(d.skip), start, d.seqs, d.len, d.cols, d.n)
+    y := Array<S>(n * d.cols)
+    state := Array<A>(d.state.Len())
+    for i in range state.Len(): state[i] = d.state[i]
+    ws := Work<A>(threads)
+    at := Seq(d.len, chunk)
+    xm := whole(d.x, n, d.cols)
+    dm := whole(d.delta, n, d.cols)
+    am := whole(d.a, d.n, d.cols)
+    bm := whole(d.b, n, d.n)
+    cm := whole(d.c, n, d.n)
+    ym := whole(y, n, d.cols)
+    sm := whole(state, d.seqs * d.n, d.cols)
+    if chunked: SelectiveScanChunked(ws, ym, sm, xm, dm, am, bm, cm, d.skip, at)
+    else: SelectiveScan(ws, ym, sm, xm, dm, am, bm, cm, d.skip, at)
+    return f64Of(y), want, f64Of(state), start
+}
+
+test SelectiveScan "the sequential scan is the equations: F64 to 1e-12, F32 to 1e-5 (the library's exponential is within 3e-7), BF16 stored to 3e-2, with and without the skip" {
+    for skipped in Array<Bool>[true, false] {
+        for threads in Array<I64>[1, 3] {
+            d64 := selData<F64, F64>.Random(2, 21, 70, 5, skipped, 41)
+            g, w, gs, ws := selCase(false, threads, d64, 8)
+            assert maxRelDiff(g, w) < 1.0e-12 and maxRelDiff(gs, ws) < 1.0e-12
+            d32 := selData<F32, F32>.Random(2, 21, 70, 5, skipped, 42)
+            g2, w2, gs2, ws2 := selCase(false, threads, d32, 8)
+            assert maxRelDiff(g2, w2) < 1.0e-5 and maxRelDiff(gs2, ws2) < 1.0e-5
+            db := selData<BF16, F32>.Random(2, 21, 70, 5, skipped, 43)
+            g3, w3, gs3, ws3 := selCase(false, threads, db, 8)
+            assert maxRelDiff(g3, w3) < 3.0e-2 and maxRelDiff(gs3, ws3) < 1.0e-4
+        }
+    }
+}
+
+test SelectiveScanChunked "equals the equations (F64 to 1e-12) and the sequential scan (F32 to 1e-5): chunks of every size, blocks of channels, any thread count" {
+    for chunk in Array<I64>[1, 4, 8, 21, 64] {
+        for threads in Array<I64>[1, 3] {
+            d64 := selData<F64, F64>.Random(2, 21, 70, 5, true, 41)
+            g, w, gs, ws := selCase(true, threads, d64, chunk)
+            assert maxRelDiff(g, w) < 1.0e-12, "chunk " $chunk
+            assert maxRelDiff(gs, ws) < 1.0e-12
+            d32 := selData<F32, F32>.Random(2, 21, 70, 5, false, 42)
+            g2, w2, gs2, ws2 := selCase(true, threads, d32, chunk)
+            assert maxRelDiff(g2, w2) < 1.0e-5, "chunk " $chunk
+            assert maxRelDiff(gs2, ws2) < 1.0e-5
+        }
+    }
+    wide := selData<F32, F32>.Random(1, 30, 1100, 3, true, 44)
+    g, w, _, _ := selCase(true, 2, wide, 7)
+    assert maxRelDiff(g, w) < 1.0e-5
 }
