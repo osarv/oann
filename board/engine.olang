@@ -99,8 +99,8 @@ PotMin I64 = -131072
 FloorLsb I64 = 5                            # the board's least tolerance: 5 steps of Q4.14, 3.05e-4
 TraceOne I64 = 16777216                     # 2^24: a spiking neuron's rate trace of 1
 
-# the readout temperature of a supervised circuit meant for the board (docs/settling.md 6, decision 55): a certified
-# circuit bounds each readout's input, and a low temperature lets the softmax separate classes all the same - measured
+# the readout temperature of a supervised system meant for the board (docs/settling.md 6, decision 55): a certified
+# system bounds each readout's input, and a low temperature lets the softmax separate classes all the same - measured
 # on MNIST, 0.05 beat 0.1 by 0.2 points and 0.25 by 2.6 at the same sweeps a lesson as 0.1. An agent's policy needs
 # T >= 40 x the board's floor / (1 - kappa), about 0.12 at kappa 0.9, for its life tolerance to be above the floor
 Temperature F64 = 0.05
@@ -115,7 +115,7 @@ RegionWords I64 = 12
 BlockWords I64 = 8
 
 # the engine and everything it holds: descriptors, weights, biases, tables, inputs and the state of four phases (two
-# slots each: committed and candidate), all integers - for a spiking circuit also each phase's synaptic currents,
+# slots each: committed and candidate), all integers - for a spiking system also each phase's synaptic currents,
 # spikes and rate traces, and a window's spike counts
 type Engine struct(Rows I64, Neurons I64, regions I64, blocks I64, weights I64, labels I64, spiking Bool = false) {
     Rows
@@ -142,14 +142,14 @@ type Engine struct(Rows I64, Neurons I64, regions I64, blocks I64, weights I64, 
     Tr mut Array<I32>& = Array<I32>(8 * Rows * Neurons if spiking else 0)      # rate traces, Q.24
     Counts mut Array<I32>& = Array<I32>(Rows * Neurons if spiking else 0)      # the window's spike counts
     traceAct mut Array<I16>& = Array<I16>(Rows * Neurons if spiking else 0)    # the readouts' traces as activities
-    Window I64 = 1                                          # a spiking circuit's window, in steps
+    Window I64 = 1                                          # a spiking system's window, in steps
     FollowQ I64 = 0                                         # its rate traces' step, Q.24
     current mut Array<I64>& = Array<I64>(4)
     betas mut Array<I64>& = Array<I64>(4)                  # each phase's nudge, Q.14
     acc mut Array<I64>& = Array<I64>(Rows * Neurons)
     column mut Array<I64>& = Array<I64>(Neurons)
     N I64 = Rows                                            # the rows in use
-    DtQ I64 = 65536                                         # the step of a sweep, Q.16 (the circuit's Dt)
+    DtQ I64 = 65536                                         # the step of a sweep, Q.16 (the system's Dt)
     Attempts I64 = 1
     Lambda F64 = 0.0                                        # the nudge's largest self-slope, per unit of beta
     Last settle.Settlement = settle.Settlement()
@@ -566,7 +566,7 @@ fn SpikeTolerance(tau F64) I64 {
     return q if q > 1 else 1
 }
 
-# this engine's tolerance for tau: Tolerance's, or SpikeTolerance's for a spiking circuit
+# this engine's tolerance for tau: Tolerance's, or SpikeTolerance's for a spiking system
 fn (e Engine&) tolerance(tau F64) I64 {
     return SpikeTolerance(tau) if e.Spiking else Tolerance(tau)
 }
@@ -773,7 +773,7 @@ fn (e mut Engine&) transport(at I64, betaQ I64) {
 }
 
 # total += rnd(beta force, 16) on readout d's neurons in row b, the force taken at the activities in act's slot at at
-# (the activities, or a spiking circuit's rate traces)
+# (the activities, or a spiking system's rate traces)
 fn (e mut Engine&) nudge(d I64, b I64, act Array<I16>&, at I64, betaQ I64) {
     n := e.Neurons
     row I64 = b * n
@@ -856,7 +856,7 @@ fn (e mut Engine&) step(at I64, dtQ I64) {
 # ---- settling ----
 
 # settles phase p from its committed state, as dyn's Settle does, to the board's tolerance for tolerance
-# (Tolerance(tolerance) steps of Q4.14, or for a spiking circuit SpikeTolerance(tolerance) steps of Q1.15): a qualified
+# (Tolerance(tolerance) steps of Q4.14, or for a spiking system SpikeTolerance(tolerance) steps of Q1.15): a qualified
 # state is committed, else NotSettled and nothing changes
 fn (e mut Engine&) Settle(p settle.Phase, budget I64, tolerance F64) settle.Settlement ? NotSettled {
     return try e.relax(p, budget, e.tolerance(tolerance), true)
@@ -897,7 +897,7 @@ fn (e mut Engine&) relax(p settle.Phase, budget I64, tolQ I64, fresh Bool) settl
 }
 
 # runs phase p for sweeps sweeps with no stopping test and commits the state reached, reporting its residual - for a
-# spiking circuit whole windows of steps, at least one
+# spiking system whole windows of steps, at least one
 fn (e mut Engine&) Run(p settle.Phase, sweeps I64) settle.Settlement {
     pi := phaseIndex(p)
     at := e.slot(pi, 1 - e.current[pi])
@@ -1182,7 +1182,7 @@ fn (e Engine&) Bound<T>(s mut system.System<T>&, tolQ I64 = FloorLsb, beta F64 =
 # the engine's image and its last settle, in the safetensors layout (an 8-byte little-endian header length, a JSON
 # header naming every tensor's dtype, shape and byte range, the tensors little-endian): the descriptor tables, the
 # weights, biases and tables, the inputs, every phase's committed state and the settle's residuals - and for a spiking
-# circuit every phase's synaptic currents, spikes and rate traces and the window's counts - what a testbench feeds an
+# system every phase's synaptic currents, spikes and rate traces and the window's counts - what a testbench feeds an
 # HLS or hardware engine and compares its result with, bit for bit
 fn (e Engine&) Image() Array<U8> {
     count I64 = 17 if e.Spiking else 13
@@ -1464,7 +1464,7 @@ fn exact(s mut system.System<F64>&) {
     assert s.Settle(settle.Phase.Free, settle.Budget(20000, 1e-13)).Converged
 }
 
-# a certified system for the board's checks, as the circuit's: three inputs (tanh when tanhIn, else linear) one-way into
+# a certified system for the board's checks, as board.olang's circuit: three inputs (tanh when tanhIn, else linear) one-way into
 # five hidden units with a lateral block, a readout of three (cross-entropy at T = 0.25, or squared error toward random
 # targets), every recurrent block read both ways, certified at kappa, with biases, drives and classes drawn from r
 fn fixture(batch I64, r mut rand.Rand&, kappa F64, tanhIn Bool, squared Bool) system.System<F64> {
@@ -1633,7 +1633,7 @@ test "a lesson on the board: its three phases' states, stored back into the syst
     assert worst <= bound
 }
 
-test "the board refuses as dyn's settle does not: a refused settle leaves the committed state as it was" {
+test "a settle the budget refuses leaves the board's committed state as it was (dyn commits the state it reached)" {
     r := rand.Rand(5)
     s := lateral(2, 4, r)
     s.Weights(system.Conn(0)).Fill(0.375)          # effective weights 0.75: kappa 3, bistable
@@ -2172,7 +2172,7 @@ test "a spiking system on the board settles where dyn's floating-point one does,
     assert e.Saturations == 0
 }
 
-test "board.olang's parity, spiking: the same image, settles, lessons and golden vectors; an engine deterministic, refusing as the circuit does" {
+test "board.olang's parity, spiking: the same image, settles, lessons and golden vectors; an engine deterministic, refusing as board.olang does" {
     window I64 = 64
     r := rand.Rand(31)
     s := lifFixture(2, neuron.Neuron.Spiking(0.1, 1.0, 0.25, window), r)
