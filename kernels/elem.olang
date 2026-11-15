@@ -64,7 +64,7 @@ fn fastExp32(x F32) F32 {
     ki U32 = kb.Bits() - U32(0x4B400000)
     r F32 = t - k * 0.693145751953125 - k * 1.428606765330187e-06
     p F32 = F32(expTaylor[6])
-    for i in range 6: p = p * r + F32(expTaylor[5 - i])
+    comptime for i in range 6: p = p * r + F32(expTaylor[5 - i])
     # 2^k from its bits - as 2^(k - 1) * 2 for k > 0, so that 2^128 never has to be made
     up Bool = k > 0.0
     scale F32 = F32.FromBits((ki - (U32(1) if up else U32(0)) + 127) << 23)
@@ -82,7 +82,7 @@ fn fastExp64(x F64) F64 {
     ki U64 = kb.Bits() - U64(0x4338000000000000)
     r F64 = t - k * 0.6931471803691238 - k * 1.9082149292705877e-10
     p F64 = expTaylor[12]
-    for i in range 12: p = p * r + expTaylor[11 - i]
+    comptime for i in range 12: p = p * r + expTaylor[11 - i]
     up Bool = k > 0.0
     scale F64 = F64.FromBits((ki - (U64(1) if up else U64(0)) + 1023) << 52)
     e F64 = p * scale * (2.0 if up else 1.0)
@@ -206,7 +206,9 @@ fn tanhSlope<A Float>(x A) A {
 
 # ---- activations over arrays ----
 
-# dst[i] = act(x[i]), computed in F32 (F64 for F64), rounded once; dst may be x
+# dst[i] = act(x[i]), computed in F32 (F64 for F64), rounded once. dst must not overlap x: a loop over two arrays is
+# vectorized behind a check that they are apart, and given the same array twice it runs scalar - correct, but three times as
+# slowly; ActInPlace is the form for x over itself
 fn Act<T>(dst mut Array<T>&, x Array<T>&, a mat.Act) {
     match T {
         case F64 { act<T, F64>(dst, x, a) }
@@ -228,7 +230,29 @@ fn act<S, A>(dst mut Array<S>&, x Array<S>&, a mat.Act) {
     }
 }
 
-# dx[i] = dy[i] act'(x[i]), or dx[i] += that where add; x is what the activation was applied to. dx may be dy
+# x[i] = act(x[i]), computed as Act does
+fn ActInPlace<T>(x mut Array<T>&, a mat.Act) {
+    match T {
+        case F64 { actInPlace<T, F64>(x, a) }
+        case _ { actInPlace<T, F32>(x, a) }
+    }
+}
+
+fn actInPlace<S, A>(x mut Array<S>&, a mat.Act) {
+    n := x.Len()
+    match a {
+        case mat.Act.Relu { for i in range n: x[i] = S(relu(A(x[i]))) }
+        case mat.Act.Gelu { for i in range n: x[i] = S(geluExact(A(x[i]))) }
+        case mat.Act.GeluTanh { for i in range n: x[i] = S(FastGeluTanh(A(x[i]))) }
+        case mat.Act.Silu { for i in range n: x[i] = S(A(x[i]) * FastSigmoid(A(x[i]))) }
+        case mat.Act.Sigmoid { for i in range n: x[i] = S(FastSigmoid(A(x[i]))) }
+        case mat.Act.Tanh { for i in range n: x[i] = S(FastTanh(A(x[i]))) }
+        case mat.Act.Softplus { for i in range n: x[i] = S(softplus(A(x[i]))) }
+    }
+}
+
+# dx[i] = dy[i] act'(x[i]), or dx[i] += that where add; x is what the activation was applied to. dx must not overlap dy or x
+# (ActGradInPlace is the form for dy over itself)
 fn ActGrad<T>(dx mut Array<T>&, dy Array<T>&, x Array<T>&, a mat.Act, add Bool) {
     match T {
         case F64 { actGrad<T, F64>(dx, dy, x, a, add) }
@@ -246,6 +270,30 @@ fn actGrad<S, A>(dx mut Array<S>&, dy Array<S>&, x Array<S>&, a mat.Act, add Boo
         case mat.Act.Tanh { gradLoop<S, A>(dx, dy, x, add, fn(v): return tanhSlope(v)) }
         case mat.Act.Softplus { gradLoop<S, A>(dx, dy, x, add, fn(v): return FastSigmoid(v)) }
     }
+}
+
+# dy[i] = dy[i] act'(x[i]): the gradient of the activation's output made the gradient of its input, in place
+fn ActGradInPlace<T>(dy mut Array<T>&, x Array<T>&, a mat.Act) {
+    match T {
+        case F64 { actGradInPlace<T, F64>(dy, x, a) }
+        case _ { actGradInPlace<T, F32>(dy, x, a) }
+    }
+}
+
+fn actGradInPlace<S, A>(dy mut Array<S>&, x Array<S>&, a mat.Act) {
+    match a {
+        case mat.Act.Relu { gradIn<S, A>(dy, x, fn(v): return 1.0 if v > 0.0 else 0.0) }
+        case mat.Act.Gelu { gradIn<S, A>(dy, x, fn(v): return geluExactSlope(v)) }
+        case mat.Act.GeluTanh { gradIn<S, A>(dy, x, fn(v): return geluTanhSlope(v)) }
+        case mat.Act.Silu { gradIn<S, A>(dy, x, fn(v): return siluSlope(v)) }
+        case mat.Act.Sigmoid { gradIn<S, A>(dy, x, fn(v): return sigmoidSlope(v)) }
+        case mat.Act.Tanh { gradIn<S, A>(dy, x, fn(v): return tanhSlope(v)) }
+        case mat.Act.Softplus { gradIn<S, A>(dy, x, fn(v): return FastSigmoid(v)) }
+    }
+}
+
+fn gradIn<S, A>(dy mut Array<S>&, x Array<S>&, slope fn&(v A) A) {
+    for i in range x.Len(): dy[i] = S(A(dy[i]) * slope(A(x[i])))
 }
 
 fn gradLoop<S, A>(dx mut Array<S>&, dy Array<S>&, x Array<S>&, add Bool, slope fn&(v A) A) {
@@ -330,11 +378,25 @@ fn Axpy<T>(y mut Array<T>&, yf I64, alpha T, x Array<T>&, xf I64, n I64) {
 
 # ---- softmax ----
 
-# softmax in place of a run: dst[d + j] = exp((src[s + j] - max) inv) / sum over j < n, the largest element taken out
+# softmax in place of a run: row[from + j] = exp((row[from + j] - max) inv) / sum over j < n, the largest element taken out
 # first so nothing overflows; inv = 1 / temperature. The exponentials are FastExp (3.0e-7 relative in F32), a pass of their
 # own that vectorizes, and their sum a second pass in eight lanes: a running sum beside the exponential kept the loop
-# scalar. dst may be src. Rounded to S after the exponential and again after the scaling
-fn SoftmaxRun<S, A>(dst mut Array<S>&, d I64, src Array<S>&, s I64, n I64, inv A) {
+# scalar. Rounded to S after the exponential and again after the scaling. (One array on purpose: a loop reading `src` and
+# writing `dst` passed as two arrays is vectorized behind a check that they do not overlap, and when they are the same array
+# the check fails and the scalar loop runs, three times as slowly)
+fn SoftmaxRun<S, A>(row mut Array<S>&, from I64, n I64, inv A) {
+    if n == 0: return
+    top A = A(row[from])
+    for j in range 1, n {
+        v A = A(row[from + j])
+        top = v if v > top else top
+    }
+    for j in range n: row[from + j] = S(FastExp((A(row[from + j]) - top) * inv))
+    softmaxScale<S, A>(row, from, n)
+}
+
+# the same from src to dst, which must not overlap src (or be it, slowly): row r of a Mat softmax with a destination
+fn SoftmaxRunTo<S, A>(dst mut Array<S>&, d I64, src Array<S>&, s I64, n I64, inv A) {
     if n == 0: return
     top A = A(src[s])
     for j in range 1, n {
@@ -342,11 +404,16 @@ fn SoftmaxRun<S, A>(dst mut Array<S>&, d I64, src Array<S>&, s I64, n I64, inv A
         top = v if v > top else top
     }
     for j in range n: dst[d + j] = S(FastExp((A(src[s + j]) - top) * inv))
-    scale A = 1.0 / SumIn<S, A>(dst, d, n)
-    for j in range n: dst[d + j] = S(A(dst[d + j]) * scale)
+    softmaxScale<S, A>(dst, d, n)
 }
 
-# dst's row r = the softmax of src's row r over temperature (> 0), row by row; dst may be src
+fn softmaxScale<S, A>(row mut Array<S>&, from I64, n I64) {
+    scale A = 1.0 / SumIn<S, A>(row, from, n)
+    for j in range n: row[from + j] = S(A(row[from + j]) * scale)
+}
+
+# dst's row r = the softmax of src's row r over temperature (> 0), row by row; dst must not overlap src (RowSoftmaxInPlace is
+# for x over itself: the same array given twice works, three times as slowly)
 fn RowSoftmax<T>(dst mut mat.Mat<T>&, src mat.Mat<T>&, temperature T) {
     match T {
         case F64 { rowSoftmax<T, F64>(dst, src, temperature) }
@@ -356,7 +423,20 @@ fn RowSoftmax<T>(dst mut mat.Mat<T>&, src mat.Mat<T>&, temperature T) {
 
 fn rowSoftmax<S, A>(dst mut mat.Mat<S>&, src mat.Mat<S>&, temperature S) {
     inv A = 1.0 / A(temperature)
-    for r in range src.Rows: SoftmaxRun<S, A>(dst.Data, dst.Off + r * dst.Ld, src.Data, src.Off + r * src.Ld, src.Cols, inv)
+    for r in range src.Rows: SoftmaxRunTo<S, A>(dst.Data, dst.Off + r * dst.Ld, src.Data, src.Off + r * src.Ld, src.Cols, inv)
+}
+
+# x's rows replaced by their softmax over temperature (> 0)
+fn RowSoftmaxInPlace<T>(x mut mat.Mat<T>&, temperature T) {
+    match T {
+        case F64 { rowSoftmaxInPlace<T, F64>(x, temperature) }
+        case _ { rowSoftmaxInPlace<T, F32>(x, temperature) }
+    }
+}
+
+fn rowSoftmaxInPlace<S, A>(x mut mat.Mat<S>&, temperature S) {
+    inv A = 1.0 / A(temperature)
+    for r in range x.Rows: SoftmaxRun<S, A>(x.Data, x.Off + r * x.Ld, x.Cols, inv)
 }
 
 # the sum of exp((x[from + j] - top) inv) for j < n: the exponentials a block of 64 at a time into a stack block, a
@@ -428,7 +508,7 @@ fn rowNormStats<S, A>(mean mut Array<S>&, inv mut Array<S>&, x mat.Mat<S>&, eps 
     }
 }
 
-# y's row r = (x - mean[r]) inv[r] gain + bias; bias may be empty (RMS norm); y may be x
+# the rows of y = (x - mean[r]) inv[r] gain + bias; bias may be empty (RMS norm); y must not overlap x (the same array works, slower, as Act explains)
 fn RowNormApply<T>(y mut mat.Mat<T>&, x mat.Mat<T>&, mean Array<T>&, inv Array<T>&, gain Array<T>&, bias Array<T>&) {
     match T {
         case F64 { rowNormApply<T, F64>(y, x, mean, inv, gain, bias) }
@@ -452,7 +532,7 @@ fn rowNormApply<S, A>(y mut mat.Mat<S>&, x mat.Mat<S>&, mean Array<S>&, inv Arra
 
 # the gradient of RowNormApply with respect to x: with xhat = (x - mean) inv and g = dy gain,
 # dx = inv (g - mean(g) - xhat mean(g xhat)), row by row (mean(g) is left out where rms: the mean was not taken out);
-# dx += that where add. dx may be dy
+# dx += that where add. dx must not overlap dy or x (the same array works, slower)
 fn RowNormGrad<T>(dx mut mat.Mat<T>&, dy mat.Mat<T>&, x mat.Mat<T>&, mean Array<T>&, inv Array<T>&, gain Array<T>&, rms Bool, add Bool) {
     match T {
         case F64 { rowNormGrad<T, F64>(dx, dy, x, mean, inv, gain, rms, add) }
@@ -675,8 +755,11 @@ test Act "in place gives what a separate destination gives" {
     for a in allActs {
         Act(y, x, a)
         z := x.Copy()
-        Act(z, z, a)
+        ActInPlace(z, a)
         assert z == y
+        w := x.Copy()
+        Act(w, w, a)
+        assert w == y
     }
 }
 
@@ -695,8 +778,11 @@ test ActGrad "equals the central difference of the activation, in F64, with add 
         ActGrad(again, dy, x, a, true)
         for i in range 61: assert (again[i] - (1.0 + dx[i])).Abs() <= 1.0e-12 * dx[i].Abs().Max(1.0)
         inplace := dy.Copy()
-        ActGrad(inplace, inplace, x, a, false)
+        ActGradInPlace(inplace, x, a)
         assert inplace == dx
+        aliased := dy.Copy()
+        ActGrad(aliased, aliased, x, a, false)
+        assert aliased == dx
     }
 }
 
@@ -751,7 +837,7 @@ fn softmaxWithin<T>(bound F64, scale F64, r mut rand.Rand&) {
         }
         assert (total - 1.0).Abs() <= bound * F64(cols), "row " $i " sums to " $total
     }
-    RowSoftmax(src, src, T(0.8))
+    RowSoftmaxInPlace(src, T(0.8))
     for i in range rows {
         for j in range cols: assert data[3 + i * (cols + 5) + j] == out[3 + i * (cols + 5) + j]
     }
@@ -767,7 +853,7 @@ test RowSoftmax "equals the F64 softmax on strided rows, in place too: F64 1e-14
 test RowSoftmax "large and small scores neither overflow nor vanish: the largest is taken out first" {
     d := Array<F32>[1000.0, 1001.0, 1002.0, -1.0e4, 5.0e4, 5.0e4]
     m := mat.Mat<F32>(d, 0, 2, 3, 3)
-    RowSoftmax(m, m, 1.0)
+    RowSoftmaxInPlace(m, 1.0)
     want := softmaxReference(Array<F64>[1000.0, 1001.0, 1002.0], 0, 3, 1.0)
     for j in range 3: assert (F64(d[j]) - want[j]).Abs() <= 2.0e-6
     assert d[3] == 0.0 and (d[4] - 0.5).Abs() <= 1.0e-6 and d[4] == d[5]
@@ -776,7 +862,7 @@ test RowSoftmax "large and small scores neither overflow nor vanish: the largest
 test SoftmaxRun "a run of a row leaves the rest alone" {
     x := Array<F32>[9.0, 1.0, 2.0, 3.0, 9.0]
     y := Array<F32>[7.0, 7.0, 7.0, 7.0, 7.0]
-    SoftmaxRun<F32, F32>(y, 1, x, 1, 3, 1.0)
+    SoftmaxRunTo<F32, F32>(y, 1, x, 1, 3, 1.0)
     assert y[0] == 7.0 and y[4] == 7.0
     assert (y[1] + y[2] + y[3] - 1.0).Abs() <= 1.0e-6 and y[1] < y[2] and y[2] < y[3]
 }

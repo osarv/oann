@@ -27,20 +27,40 @@ type Heads struct(Count I64, Ctx I64, Causal Bool = true) {
     Causal
 }
 
-# body(task, lo, hi) for 0 .. count split into consecutive runs, one per task, at most `threads` of them; with one run
-# body runs on the calling thread. Runs do not overlap, so a body writing only its own part needs no synchronisation
-fn parallel(count I64, threads I64, body fn&(task I64, lo I64, hi I64)) {
-    tasks := threads if threads < count else count
+# the softmax of matrices e0 ... e1 - 1, forward (p the scores, made weights) or backward (d the gradient of the weights, made
+# the gradient of the scores, p the weights), a run of them per task. A named job, not a lambda: a lambda's body ran three
+# times as slowly here (its loops were not vectorized)
+type rowsJob<S, A> struct(d mat.Mat<S>, p mat.Mat<S>, at Heads, scale A, backward Bool) {
+    d
+    p
+    at
+    scale
+    backward
+}
+
+fn (j rowsJob<S, A>&) one(e I64) {
+    if j.backward: softmaxBackward<S, A>(weightsOf(j.d, e, j.at), weightsOf(j.p, e, j.at), j.at.Causal, j.scale)
+    else: softmaxRows<S, A>(weightsOf(j.p, e, j.at), j.at.Causal)
+}
+
+fn (j rowsJob<S, A>&) run(lo I64, hi I64) {
+    for e in range lo, hi: j.one(e)
+}
+
+# the job over matrices e0 ... e1 - 1 in runs, at most `threads` of them; with one run on the calling thread. Runs do not
+# overlap, so a task writes only its own matrices
+fn spread<S, A>(j rowsJob<S, A>&, e0 I64, e1 I64, threads I64) {
+    tasks := threads if threads < e1 - e0 else e1 - e0
     if tasks <= 1 {
-        body(0, 0, count)
+        for e in range e0, e1: j.one(e)
         return
     }
-    share := (count + tasks - 1) / tasks
+    share := (e1 - e0 + tasks - 1) / tasks
     join {
         for t in range tasks {
-            lo := t * share
-            hi := lo + share if lo + share < count else count
-            if lo < hi: spawn body(t, lo, hi)
+            lo := e0 + t * share
+            hi := lo + share if lo + share < e1 else e1
+            if lo < hi: spawn j.run(lo, hi)
         }
     }
 }
@@ -133,31 +153,34 @@ fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&
         e0, e1 := attentionPart(i, seqs, at.Count, each)
         p := stackOf(probs, e0, e1, at)
         gemm.GemmBatch(ws, p, partOf(q, e0, e1, at), false, partOf(k, e0, e1, at), true, scale, 0.0, resultOf(at.Causal))
-        parallel(e1 - e0, ws.Threads, fn(task, lo, hi) {
-            for e in range e0 + lo, e0 + hi: softmaxRows<S, A>(weightsOf(probs, e, at), at.Causal)
-        })
+        spread(rowsJob<S, A>(probs, probs, at, scale, false), e0, e1, ws.Threads)
         gemm.GemmBatch(ws, partOf(out, e0, e1, at), p, false, partOf(v, e0, e1, at), false, 1.0, 0.0, leftOf(at.Causal))
     }
 }
 
 # each row of the scores p (Ctx x Ctx) replaced by its softmax - over positions 0 ... i in row i when causal, zeros after
 fn softmaxRows<S, A>(p mat.Mat<S>&, causal Bool) {
+    data := p.Data
+    cols := p.Cols
     for i in range p.Rows {
         o := p.Off + i * p.Ld
-        last := i + 1 if causal else p.Cols
-        elem.SoftmaxRun<S, A>(p.Data, o, p.Data, o, last, 1.0)
-        for j in range last, p.Cols: p.Data[o + j] = S(0.0)
+        last := i + 1 if causal else cols
+        elem.SoftmaxRun<S, A>(data, o, last, 1.0)
+        for j in range last, cols: data[o + j] = S(0.0)
     }
 }
 
 # dP (in d) made dS = scale P (dP - rowsum(dP P)) row by row - softmax's backward, scaled; causal, row i only up to position
 # i, the rest of d never read
 fn softmaxBackward<S, A>(d mat.Mat<S>&, p mat.Mat<S>&, causal Bool, scale A) {
+    dd := d.Data
+    pd := p.Data
     for i in range d.Rows {
         last := i + 1 if causal else d.Cols
         o := d.Off + i * d.Ld
-        dot := elem.DotIn<S, A>(d.Data, o, p.Data, p.Off + i * p.Ld, last)
-        for j in range last: d.Data[o + j] = S(scale * A(p.Data[p.Off + i * p.Ld + j]) * (A(d.Data[o + j]) - dot))
+        q := p.Off + i * p.Ld
+        dot := elem.DotIn<S, A>(dd, o, pd, q, last)
+        for j in range last: dd[o + j] = S(scale * A(pd[q + j]) * (A(dd[o + j]) - dot))
     }
 }
 
@@ -182,9 +205,7 @@ fn AttentionGrad<S, A>(ws mut gemm.Workspace<A>&, dq mut mat.Mat<S>&, dk mut mat
         dS := stackOf(ds, e0, e1, at)
         dO := partOf(dout, e0, e1, at)
         gemm.GemmBatch(ws, dS, dO, false, partOf(v, e0, e1, at), true, 1.0, 0.0, resultOf(at.Causal))
-        parallel(e1 - e0, ws.Threads, fn(task, lo, hi) {
-            for e in range e0 + lo, e0 + hi: softmaxBackward<S, A>(weightsOf(ds, e, at), weightsOf(probs, e, at), at.Causal, scale)
-        })
+        spread(rowsJob<S, A>(ds, probs, at, scale, true), e0, e1, ws.Threads)
         left := leftOf(at.Causal)
         if dq.Rows > 0: gemm.GemmBatch(ws, partOf(dq, e0, e1, at), dS, false, partOf(k, e0, e1, at), false, 1.0, 1.0 if addQ else 0.0, left)
         if dk.Rows > 0: gemm.GemmBatch(ws, partOf(dk, e0, e1, at), dS, true, partOf(q, e0, e1, at), false, 1.0, 1.0 if addK else 0.0, left)
