@@ -39,8 +39,9 @@ type rowsJob<S, A> struct(d mat.Mat<S>, p mat.Mat<S>, at Heads, scale A, backwar
 }
 
 fn (j rowsJob<S, A>&) one(e I64) {
-    if j.backward: softmaxBackward<S, A>(weightsOf(j.d, e, j.at), weightsOf(j.p, e, j.at), j.at.Causal, j.scale)
-    else: softmaxRows<S, A>(weightsOf(j.p, e, j.at), j.at.Causal)
+    d, p := weightsOf(j.d, e, j.at), weightsOf(j.p, e, j.at)
+    if j.backward: softmaxBackward<S, A>(d, p, j.at.Causal, j.scale)
+    else: softmaxRows<S, A>(p, j.at.Causal)
 }
 
 fn (j rowsJob<S, A>&) run(lo I64, hi I64) {
@@ -121,13 +122,15 @@ fn partOf<S>(x mat.Mat<S>&, e0 I64, e1 I64, at Heads) gemm.Batch<S> {
     whole := count % at.Count == 0
     heads := at.Count if whole else count
     rows := count / at.Count * at.Ctx if whole else at.Ctx
-    return gemm.Batch<S>.Heads(block(x, e0 / at.Count * at.Ctx, e0 % at.Count * dh, rows, heads * dh), at.Ctx, heads)
+    b := block(x, e0 / at.Count * at.Ctx, e0 % at.Count * dh, rows, heads * dh)
+    return gemm.Batch<S>.Heads(b, at.Ctx, heads)
 }
 
 # the weights of matrices e0 ... e1 - 1 (rows of probs or scratch), stacked
 fn stackOf<S>(p mat.Mat<S>&, e0 I64, e1 I64, at Heads) gemm.Batch<S> {
     heads := at.Count if (e1 - e0) % at.Count == 0 else e1 - e0
-    return gemm.Batch<S>.Stacked(block(p, e0 * at.Ctx, 0, (e1 - e0) * at.Ctx, at.Ctx), at.Ctx, heads)
+    b := block(p, e0 * at.Ctx, 0, (e1 - e0) * at.Ctx, at.Ctx)
+    return gemm.Batch<S>.Stacked(b, at.Ctx, heads)
 }
 
 # scores and dP are confined to the lower triangle, P and dS (zero above it) are read there only
@@ -141,9 +144,15 @@ fn leftOf(causal Bool) gemm.Triangle {
 
 # ---- attention ----
 
+# room in ws for Attention and AttentionGrad over sequences of ctx positions in heads dh columns wide, stored in S: every
+# product's m, n and k is ctx or dh, and where S is narrower than A a depth past 256 sums its results in the accumulator
+fn ReserveAttention<S, A>(ws mut gemm.Workspace<A>&, ctx I64, dh I64, like S) {
+    ws.ReserveLayer(ctx, ctx, dh, like, true)
+}
+
 # out = attention(q, k, v) over the sequences and heads `at` names, the weights kept in probs (n heads rows of Ctx
-# columns). out, q, k and v are n x D, any row stride. ws is the products' workspace and fixes the thread count; it grows
-# on the first call and then allocates nothing
+# columns). out, q, k and v are n x D, any row stride. ws is the products' workspace and fixes the thread count, its room
+# given by ReserveAttention; nothing is allocated
 fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, probs mut mat.Mat<S>&, at Heads) {
     dh := q.Cols / at.Count
     scale A = 1.0 / A(dh).Sqrt()
@@ -151,10 +160,13 @@ fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&
     each := attentionEach(seqs, at.Count, ws.Threads, at.Ctx * at.Ctx * S.Size)
     for i in range attentionParts(seqs, at.Count, each) {
         e0, e1 := attentionPart(i, seqs, at.Count, each)
+        # every operand a local: a call's value lent straight to a product reads as allocating (repro/tempfacts)
         p := stackOf(probs, e0, e1, at)
-        gemm.GemmBatch(ws, p, partOf(q, e0, e1, at), false, partOf(k, e0, e1, at), true, scale, 0.0, resultOf(at.Causal))
-        spread(rowsJob<S, A>(probs, probs, at, scale, false), e0, e1, ws.Threads)
-        gemm.GemmBatch(ws, partOf(out, e0, e1, at), p, false, partOf(v, e0, e1, at), false, 1.0, 0.0, leftOf(at.Causal))
+        qp, kp, vp, op := partOf(q, e0, e1, at), partOf(k, e0, e1, at), partOf(v, e0, e1, at), partOf(out, e0, e1, at)
+        job := rowsJob<S, A>(probs, probs, at, scale, false)
+        gemm.GemmBatch(ws, p, qp, false, kp, true, scale, 0.0, resultOf(at.Causal))
+        spread(job, e0, e1, ws.Threads)
+        gemm.GemmBatch(ws, op, p, false, vp, false, 1.0, 0.0, leftOf(at.Causal))
     }
 }
 
@@ -204,14 +216,28 @@ fn AttentionGrad<S, A>(ws mut gemm.Workspace<A>&, dq mut mat.Mat<S>&, dk mut mat
         e0, e1 := attentionPart(i, seqs, at.Count, each)
         dS := stackOf(ds, e0, e1, at)
         dO := partOf(dout, e0, e1, at)
-        gemm.GemmBatch(ws, dS, dO, false, partOf(v, e0, e1, at), true, 1.0, 0.0, resultOf(at.Causal))
-        spread(rowsJob<S, A>(ds, probs, at, scale, true), e0, e1, ws.Threads)
+        qp, kp, vp, pp := partOf(q, e0, e1, at), partOf(k, e0, e1, at), partOf(v, e0, e1, at), stackOf(probs, e0, e1, at)
+        job := rowsJob<S, A>(ds, probs, at, scale, true)
+        gemm.GemmBatch(ws, dS, dO, false, vp, true, 1.0, 0.0, resultOf(at.Causal))
+        spread(job, e0, e1, ws.Threads)
         left := leftOf(at.Causal)
-        if dq.Rows > 0: gemm.GemmBatch(ws, partOf(dq, e0, e1, at), dS, false, partOf(k, e0, e1, at), false, 1.0, 1.0 if addQ else 0.0, left)
-        if dk.Rows > 0: gemm.GemmBatch(ws, partOf(dk, e0, e1, at), dS, true, partOf(q, e0, e1, at), false, 1.0, 1.0 if addK else 0.0, left)
-        if dv.Rows > 0: gemm.GemmBatch(ws, partOf(dv, e0, e1, at), stackOf(probs, e0, e1, at), true, dO, false, 1.0, 1.0 if addV else 0.0, left)
+        attentionGrad(ws, dq, dS, false, kp, addQ, left, e0, e1, at)
+        attentionGrad(ws, dk, dS, true, qp, addK, left, e0, e1, at)
+        attentionGrad(ws, dv, pp, true, dO, addV, left, e0, e1, at)
     }
 }
+
+# d's part (where d is wanted: it has rows) += or = op(a) b over matrices e0 ... e1 - 1
+fn attentionGrad<S, A>(ws mut gemm.Workspace<A>&, d mut mat.Mat<S>&, a gemm.Batch<S>&, ta Bool, b gemm.Batch<S>&, add Bool, left gemm.Triangle, e0 I64, e1 I64, at Heads) {
+    if d.Rows == 0: return
+    dp := partOf(d, e0, e1, at)
+    gemm.GemmBatch(ws, dp, a, ta, b, false, A(1.0), A(1.0) if add else A(0.0), left)
+}
+
+# attention allocates nothing, its products' room reserved (ReserveAttention) and its weights the caller's (S17a, G42)
+assert not Attention<F32, F32>.Allocates, "attention allocates"
+assert not AttentionGrad<F32, F32>.Allocates, "attention's gradients allocate"
+assert not AttentionStep<F32, F32>.Allocates, "a decoding step allocates"
 
 # ---- decoding ----
 
@@ -369,6 +395,7 @@ fn attentionWithin<T, A>(bound F64, causal Bool, threads I64, r mut rand.Rand&) 
     pa := Array<T>(n * heads * ctx)
     at := Heads(heads, ctx, causal)
     ws := gemm.Workspace<A>(threads)
+    ReserveAttention(ws, ctx, dim / heads, T(0))
     Attention(ws, mat.Mat<T>(out, 0, n, dim, dim), mat.Mat<T>(qa, 0, n, dim, dim), mat.Mat<T>(ka, 0, n, dim, dim), mat.Mat<T>(va, 0, n, dim, dim), mat.Mat<T>(pa, 0, n * heads, ctx, ctx), at)
     y, p := reference(Array<F64>[F64(x) for x in qa], Array<F64>[F64(x) for x in ka], Array<F64>[F64(x) for x in va], seqs, ctx, heads, dim, causal)
     for i in range y.Len(): assert (F64(out[i]) - y[i]).Abs() <= bound, "y[" + $i + "] " + $out[i] + " against " + $y[i] + " in " + $T.Name
@@ -408,6 +435,7 @@ test Attention "on strided views of wider storage, the result is the contiguous 
     at := Heads(heads, ctx)
     probs := Array<F32>(n * heads * ctx)
     ws := gemm.Workspace<F32>(1)
+    ReserveAttention(ws, ctx, dim / heads, F32(0))
     Attention(ws, mat.Mat<F32>(plain, 0, n, dim, dim), mat.Mat<F32>(qa, 0, n, dim, dim), mat.Mat<F32>(ka, 0, n, dim, dim), mat.Mat<F32>(va, 0, n, dim, dim), mat.Mat<F32>(probs, 0, n * heads, ctx, ctx), at)
     out := Array<F32>(3 + n * 2 * dim)
     probs2 := Array<F32>(n * heads * ctx)
@@ -466,7 +494,7 @@ test AttentionGrad "dq, dk and dv equal the central differences of sum(w y) in F
         pr := Array<F64>(n * heads * ctx)
         at := Heads(heads, ctx, causal)
         m := fn(a mut Array<F64>&): return mat.Mat<F64>(a, 0, n, dim, dim)
-        ws := gemm.Workspace<F64>(1)
+        ws := gemm.Workspace<F64>(1, dim)
         Attention(ws, m(out), m(q), m(k), m(v), mat.Mat<F64>(pr, 0, n * heads, ctx, ctx), at)
         dq := Array<F64>(n * dim)
         dk := Array<F64>(n * dim)
@@ -493,7 +521,7 @@ test AttentionGrad "dq, dk and dv equal the central differences of sum(w y) in F
         dq3 := Array<F64>(n * dim)
         dk3 := Array<F64>(n * dim)
         dv3 := Array<F64>(n * dim)
-        AttentionGrad(gemm.Workspace<F64>(3), m(dq3), m(dk3), m(dv3), m(w), m(q), m(k), m(v), pm, scratch, at)
+        AttentionGrad(gemm.Workspace<F64>(3, dim), m(dq3), m(dk3), m(dv3), m(w), m(q), m(k), m(v), pm, scratch, at)
         assert dq3 == dq and dk3 == dk and dv3 == dv
     }
 }
@@ -512,7 +540,7 @@ test AttentionStep "decoding position by position, and in one go, gives the rows
     full := Array<F32>(ctx * dim)
     pr := Array<F32>(heads * ctx * ctx)
     m := fn(a mut Array<F32>&): return mat.Mat<F32>(a, 0, ctx, dim, dim)
-    ws := gemm.Workspace<F32>(1)
+    ws := gemm.Workspace<F32>(1, dim)
     Attention(ws, m(full), m(q), m(k), m(v), mat.Mat<F32>(pr, 0, heads * ctx, ctx, ctx), Heads(heads, ctx))
     keys := Array<F32>(ctx * dim)
     values := Array<F32>(ctx * dim)
@@ -592,6 +620,7 @@ fn longRun<S, A>(causal Bool, threads I64) Array<S>, Array<S>, Array<S>, Array<S
     out := Array<S>(n * dim)
     pr := Array<S>(n * heads * ctx)
     ws := gemm.Workspace<A>(threads)
+    ReserveAttention(ws, ctx, dim / heads, S(0))
     at := Heads(heads, ctx, causal)
     pm := mat.Mat<S>(pr, 0, n * heads, ctx, ctx)
     Attention(ws, mat.Mat<S>(out, 0, n, dim, dim), mat.Mat<S>(q, 0, n, dim, dim), mat.Mat<S>(k, 0, n, dim, dim), mat.Mat<S>(v, 0, n, dim, dim), pm, at)

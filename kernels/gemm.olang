@@ -91,53 +91,95 @@ fn Batch<S>.Stacked(m mat.Mat<S>&, rows I64, members I64 = 1) Batch<S> {
     return Batch<S>(m.Data, m.Off, rows, m.Cols, m.Ld, m.Rows / (rows * members), rows * members * m.Ld, members, rows * m.Ld)
 }
 
-# The panels a product packs its operands into, and its thread count. Workspace<F32>(4) is empty; it grows where it
-# lives, on the first products, to what the largest needs, and never shrinks - so a loop of products (a step, a settle)
-# allocates nothing after its first. A panel too small is replaced by one at least twice its size, so products growing
-# a step at a time replace it a logarithmic number of times. It holds no result: one workspace serves products of any
-# shape, one at a time (two at once from two tasks would write the same panels, a data race)
-type Workspace<A> struct(threads I64) {
+# The panels a product packs its operands into, and its thread count. Workspace<F32>(4) is empty, Workspace<F32>(4,
+# dim, wide) has Reserve(dim, wide)'s room: room for every product up to a size, made once where the products are planned - a product never grows it, so a loop
+# of products (a step, a settle) allocates nothing, which `assert not f.Allocates` can pin. A product the workspace has
+# no room for ends the program, naming Reserve. It holds no result: one workspace serves products of any shape, one at
+# a time (two at once from two tasks would write the same panels, a data race)
+type Workspace<A> struct(threads I64, dim I64 = 0, wide I64 = 0) {
     Threads I64 = threads if threads > 0 else 1
-    a mut Array<A>& = Array<A>(0)               # op(A)'s panels, one per task
-    b mut Array<A>& = Array<A>(0)               # op(B)'s panel (GemmBatch: one per task)
-    c mut Array<A>& = Array<A>(0)               # a result in the accumulator, where storage is narrower
+    a mut Array<A>& = Array<A>(roomA(Threads, dim, A(0)))     # op(A)'s panels, one per task
+    b mut Array<A>& = Array<A>(roomB(Threads, dim, A(0)))     # op(B)'s panel (GemmBatch: one per task)
+    c mut Array<A>& = Array<A>(wide)            # a result in the accumulator, where storage is narrower
     qa mut Array<U8>& = Array<U8>(0)            # GemmI8's row tiles, one per task
     qb mut Array<I8>& = Array<I8>(0)            # GemmI8's weight panels
     corr mut Array<I32>& = Array<I32>(0)        # GemmI8's zero-point corrections
 }
 
+# room for every Gemm, GemmLeft and GemmBatch whose m, n and k are each at most dim, on up to ws.Threads tasks; wide is
+# the accumulator elements a result narrower than A over a depth of more than 256 (kc) is summed in: a Gemm's m n, a
+# GemmBatch's m n per task (0 where storage is A or no depth exceeds 256). Never shrinks; reserving again for a larger
+# size replaces the panels
+fn (ws mut Workspace<A>&) Reserve(dim I64, wide I64 = 0) {
+    z A
+    if ws.a.Len() < roomA(ws.Threads, dim, z): ws.a = Array<A>(roomA(ws.Threads, dim, z))
+    if ws.b.Len() < roomB(ws.Threads, dim, z): ws.b = Array<A>(roomB(ws.Threads, dim, z))
+    if ws.c.Len() < wide: ws.c = Array<A>(wide)
+}
+
+# the panels' room for products of every size up to dim on threads tasks: op(A)'s, a block of tile rows by a block
+# of the depth per task, and op(B)'s, a block of tile columns by the depth per task (one, but GemmBatch's)
+fn roomA<A>(threads I64, dim I64, z A) I64 { return threads * lesser(roundUp(dim, microRows), blockRows(z)) * lesser(dim, kc) }
+fn roomB<A>(threads I64, dim I64, z A) I64 { return threads * lesser(roundUp(dim, tileCols(z)), blockCols(z)) * lesser(dim, kc) }
+
+# room for a layer's three products, stored in S (like): sizes x, y and z, each pair of them a result and the third
+# its depth - a linear layer's rows, inputs and outputs (its forward and its two gradients), a convolution's, attention's
+# context, context and head. perTask: they are GemmBatch's, each task summing a result of its own in the accumulator
+fn (ws mut Workspace<A>&) ReserveLayer<S>(x I64, y I64, z I64, like S, perTask Bool = false) {
+    wide I64 = 0
+    if S.Size < A.Size {
+        if z > kc: wide = x * y
+        if x > kc and y * z > wide: wide = y * z
+        if y > kc and x * z > wide: wide = x * z
+    }
+    dim I64 = x if x >= y and x >= z else (y if y >= z else z)
+    ws.Reserve(dim, wide * ws.Threads if perTask else wide)
+}
+
+# room for every GemmI8 of at most n outputs (b's rows) and depth k, on up to ws.Threads tasks
+fn (ws mut Workspace<A>&) ReserveI8(n I64, k I64) {
+    if ws.corr.Len() < n: ws.corr = Array<I32>(n)
+    if ws.qb.Len() < roundUp(n, i8WideCols) * k: ws.qb = Array<I8>(roundUp(n, i8WideCols) * k)
+    if ws.qa.Len() < ws.Threads * i8ThinRows * k: ws.qa = Array<U8>(ws.Threads * i8ThinRows * k)
+}
+
 fn (ws mut Workspace<A>&) panelsA(n I64) mut Array<A>& {
-    if ws.a.Len() < n: ws.a = Array<A>(grown(ws.a.Len(), n))
+    if ws.a.Len() < n: unreserved("op(A)'s panels", n, ws.a.Len())
     return ws.a
 }
 
 fn (ws mut Workspace<A>&) panelsB(n I64) mut Array<A>& {
-    if ws.b.Len() < n: ws.b = Array<A>(grown(ws.b.Len(), n))
+    if ws.b.Len() < n: unreserved("op(B)'s panels", n, ws.b.Len())
     return ws.b
 }
 
 fn (ws mut Workspace<A>&) wideC(n I64) mut Array<A>& {
-    if ws.c.Len() < n: ws.c = Array<A>(grown(ws.c.Len(), n))
+    if ws.c.Len() < n: unreserved("a result in the accumulator (Reserve's wide)", n, ws.c.Len())
     return ws.c
 }
 
 fn (ws mut Workspace<A>&) bytesA(n I64) mut Array<U8>& {
-    if ws.qa.Len() < n: ws.qa = Array<U8>(grown(ws.qa.Len(), n))
+    if ws.qa.Len() < n: unreserved("GemmI8's rows (ReserveI8)", n, ws.qa.Len())
     return ws.qa
 }
 
 fn (ws mut Workspace<A>&) bytesB(n I64) mut Array<I8>& {
-    if ws.qb.Len() < n: ws.qb = Array<I8>(grown(ws.qb.Len(), n))
+    if ws.qb.Len() < n: unreserved("GemmI8's weight panels (ReserveI8)", n, ws.qb.Len())
     return ws.qb
 }
 
 fn (ws mut Workspace<A>&) corrections(n I64) mut Array<I32>& {
-    if ws.corr.Len() < n: ws.corr = Array<I32>(grown(ws.corr.Len(), n))
+    if ws.corr.Len() < n: unreserved("GemmI8's corrections (ReserveI8)", n, ws.corr.Len())
     return ws.corr
 }
 
-# the length a panel holding have elements is replaced by when a product needs n: n, or twice have when that is more
-fn grown(have I64, n I64) I64 { return n if n > have * 2 else have * 2 }
+# a product its workspace has no room for: the program's mistake, never grown past
+fn unreserved(what String, need I64, have I64) noreturn {
+    unreachable "gemm: a product needs " + $need + " elements of " + what + " and its workspace has " + $have + " - Reserve it for the product's size where the products are planned"
+}
+
+# n rounded up to a multiple of m
+fn roundUp(n I64, m I64) I64 { return (n + m - 1) / m * m }
 
 # the number of cores online (84 is glibc's _SC_NPROCESSORS_ONLN on Linux) - the usual thread count
 fn Cores() I64 {
@@ -171,7 +213,10 @@ fn Gemm<S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a mat.Mat<S>&, ta Bool, b
 # dst[q depth]) holding, for each step p, the wr values (w0 + q + w, p0 + p), zeros past the width. Never exchanged
 fn GemmLeft<L, S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a L, k I64, b mat.Mat<S>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
     if c.Rows == 0 or c.Cols == 0: return
-    product(c.Rows, c.Cols, k, foreign<L>(a), false, operand<S>.of(b), tb, alpha, beta, c.Data[c.Off:], c.Ld, ws, epi, false)
+    fa := foreign<L>(a)
+    ob := operand<S>.of(b)
+    cd := c.Data[c.Off:]
+    product(c.Rows, c.Cols, k, fa, false, ob, tb, alpha, beta, cd, c.Ld, ws, epi, false)
 }
 
 # c[g, m] = alpha op(a[g, m]) op(b[g, m]) + beta c[g, m] for every matrix of the batches (one Groups and Members), each
@@ -238,6 +283,14 @@ fn Ger2<S, A>(a mut mat.Mat<S>&, x1 Array<A>&, y1 Array<A>&, x2 Array<A>&, y2 Ar
         for j in range a.Cols: a.Data[d + j] = cast(decay * cast(a.Data[d + j], p) + (p * y1[j] + q * y2[j]), like)
     }
 }
+
+# no product allocates: every panel is the workspace's, reserved beforehand (S17a, G42) - so a step or a settle made of
+# them can be pinned allocation-free
+assert not Gemm<F32, F32>.Allocates, "a product allocates"
+assert not Gemm<BF16, F32>.Allocates, "a BF16 product allocates"
+assert not GemmBatch<F32, F32>.Allocates, "a batch of products allocates"
+assert not Gemv<F32, F32>.Allocates, "a matrix-vector product allocates"
+assert not GemmI8.Allocates, "an INT8 product allocates"
 
 # ---- the operands as packing reads them ----
 
@@ -1310,13 +1363,16 @@ fn fill<S>(m mut mat.Mat<S>&, v S) {
     }
 }
 
+# the largest of three sizes: a test product's room
+fn most(a I64, b I64, c I64) I64 { return a if a >= b and a >= c else (b if b >= c else c) }
+
 fn productCase(m I64, n I64, k I64, form I64, r mut rand.Rand&) {
     ta, tb := form % 2 == 1, form >= 2
     z F64 = 0.0
     a := uniform(k, m, z, r) if ta else uniform(m, k, z, r)
     b := uniform(n, k, z, r) if tb else uniform(k, n, z, r)
     want, _ := reference(a, ta, b, tb)
-    ws := Workspace<F64>(1)
+    ws := Workspace<F64>(1, most(m, n, k))
     c := gappy(m, n, z)
     Gemm(ws, c, a, ta, b, tb)
     assert maxDiff(c, want) < 1e-12 * F64(k), $m + "x" + $n + "x" + $k + " form " + $form
@@ -1328,7 +1384,7 @@ fn productCase(m I64, n I64, k I64, form I64, r mut rand.Rand&) {
     Gemm(ws, c, a, ta, b, tb)
     assert maxDiff(c, want) < 1e-12 * F64(k)
     # threads change nothing, bit for bit
-    four := Workspace<F64>(4)
+    four := Workspace<F64>(4, most(m, n, k))
     d := gappy(m, n, z)
     Gemm(four, d, a, ta, b, tb)
     assert sameBits(c, d)
@@ -1355,7 +1411,7 @@ fn exactCase<S>(m I64, n I64, k I64, ta Bool, like S) {
     }
     want, _ := reference(a, ta, b, false)
     c := gappy(m, n, like)
-    ws := Workspace<S>(2)
+    ws := Workspace<S>(2, most(m, n, k))
     Gemm(ws, c, a, ta, b, false)
     assert maxDiff(c, want) == 0.0, "the product " + $m + "x" + $k + "x" + $n
 }
@@ -1390,7 +1446,7 @@ fn mixedCase<S>(m I64, n I64, k I64, form I64, like S, r mut rand.Rand&) {
     a := uniform(k, m, like, r) if ta else uniform(m, k, like, r)
     b := uniform(n, k, like, r) if tb else uniform(k, n, like, r)
     want, mag := reference(a, ta, b, tb)
-    ws := Workspace<F32>(3)
+    ws := Workspace<F32>(3, most(m, n, k), m * n)
     c := gappy(m, n, like)
     Gemm(ws, c, a, ta, b, tb)
     for i in range m {
@@ -1452,7 +1508,7 @@ test Gemm "a product's multiply-adds are fused exactly where the target has fuse
 # triangular batch are evaluable, so these globals are data in the program - checked against the run time's
 fn bakedSums() F64 {
     r := rand.Rand(3)
-    ws := Workspace<F64>(2)
+    ws := Workspace<F64>(2, 30)
     a := uniform(20, 24, F64(0), r)
     b := uniform(24, 30, F64(0), r)
     c := gappy(20, 30, F64(0))
@@ -1476,33 +1532,37 @@ test Gemm "a product computed while compiling is the run time's" {
     assert baked == bakedSums()
 }
 
-test Workspace "keeps its panels from one product to the next, and they at least double as products grow" {
+test Workspace "room reserved once serves every product up to its size, and no product replaces a panel" {
     r := rand.Rand(11)
     ws := Workspace<F64>(1)
+    ws.Reserve(517)
+    big, bigA := ws.b, ws.a
     a := uniform(300, 517, F64(0), r)
     b := uniform(517, 270, F64(0), r)
     c := gappy(300, 270, F64(0))
     Gemm(ws, c, a, false, b, false)
-    big, bigA := ws.b, ws.a
-    small := gappy(37, 29, F64(0))
-    Gemm(ws, small, uniform(37, 41, F64(0), r), false, uniform(41, 29, F64(0), r), false)
-    Gemm(ws, c, a, false, b, false)
+    Gemm(ws, gappy(37, 29, F64(0)), uniform(37, 41, F64(0), r), false, uniform(41, 29, F64(0), r), false)
+    Gemm(ws, gappy(270, 300, F64(0)), b, true, a, true)
     assert ws.b == big and ws.a == bigA
-    # attention over a growing context: B's panel is replaced a logarithmic number of times, not once a step
-    grow := Workspace<F32>(1)
+    ws.Reserve(100)                             # a smaller size keeps what is there
+    assert ws.b == big and ws.a == bigA
+    # attention over a growing context, reserved for its longest: no product touches the workspace's storage
+    grow := Workspace<F32>(1, 1600)
+    before := grow.b
     q := gappy(64, 64, F32(0))
     fill(q, 1.0)
-    replaced I64 = 0
     for t in range 64, 1600, 16 {
         k := gappy(t, 64, F32(0))
         fill(k, 0.5)
         sc := gappy(64, t, F32(0))
-        before := grow.b.Len()
         Gemm(grow, sc, q, false, k, true)
         assert sc[63, t - 1] == 32.0
-        if grow.b.Len() != before: replaced++
     }
-    assert replaced <= 7, $replaced + " replacements"
+    assert grow.b == before
+    # four threads' room, for every task's panels
+    four := Workspace<F64>(4, 600)
+    d := gappy(600, 600, F64(0))
+    Gemm(four, d, uniform(600, 600, F64(0), r), false, uniform(600, 600, F64(0), r), false)
 }
 
 # a batch of groups x members matrices, rows x cols each, in one gappy storage - members' matrices side by side,
@@ -1520,7 +1580,7 @@ fn batchCase(m I64, n I64, k I64, form I64, r mut rand.Rand&) {
     c := Batch<F64>.random(m, n, 3, 2, z, r)
     c0 := Array<F64>(c.Data.Len())
     for e in range c0.Len(): c0[e] = c.Data[e]
-    ws := Workspace<F64>(1)
+    ws := Workspace<F64>(1, most(m, n, k))
     GemmBatch(ws, c, a, ta, b, tb, 2.0, 0.5)
     old := Batch<F64>(c0, c.Off, c.Rows, c.Cols, c.Ld, c.Groups, c.GroupStride, c.Members, c.MemberStride)
     for e in range 6 {
@@ -1534,7 +1594,7 @@ fn batchCase(m I64, n I64, k I64, form I64, r mut rand.Rand&) {
     d := Array<F64>(c0.Len())
     for e in range d.Len(): d[e] = c0[e]
     dc := Batch<F64>(d, c.Off, c.Rows, c.Cols, c.Ld, c.Groups, c.GroupStride, c.Members, c.MemberStride)
-    four := Workspace<F64>(4)
+    four := Workspace<F64>(4, most(m, n, k))
     GemmBatch(four, dc, a, ta, b, tb, 2.0, 0.5)
     for e in range d.Len(): assert d[e] == c.Data[e] or (c0[e] == c.Data[e] and d[e] == c0[e])
 }
@@ -1561,7 +1621,7 @@ fn resultCase(T I64, first I64, d I64, r mut rand.Rand&) {
     s := gappy(4 * T, T + first, z)
     fill(s, NaN)
     S, Q, K := Batch.Stacked(s, T, 2), Batch.Heads(q, T, 2), Batch.Heads(k, T + first, 2)
-    ws := Workspace<F64>(2)
+    ws := Workspace<F64>(2, T + first + 26)
     GemmBatch(ws, S, Q, false, K, true, 0.5, 0.0, Triangle.Result(d))
     GemmBatch(ws, S, Q, false, K, true, 0.5, 1.0, Triangle.Result(d))
     for e in range 4 {
@@ -1596,7 +1656,7 @@ fn leftCase(T I64, d I64, ta Bool, r mut rand.Rand&) {
     v := uniform(3 * T, 19, z, r)
     y := gappy(3 * T, 19, z)
     fill(y, 1.0)
-    ws := Workspace<F64>(1)
+    ws := Workspace<F64>(1, T + 19)
     GemmBatch(ws, Batch.Stacked(y, T), P, ta, Batch.Stacked(v, T), false, 1.0, 2.0, Triangle.Left(d))
     for g in range 3 {
         want, _ := reference(C[g, 0], ta, Batch.Stacked(v, T)[g, 0], false)
@@ -1655,7 +1715,7 @@ test Gemm "one to four rows and one column take the vector paths, every transpos
             b := uniform(n, 37, F32(0), r) if tb else uniform(37, n, F32(0), r)
             c := gappy(m, n, F32(0))
             fill(c, 1.0)
-            ws := Workspace<F32>(1)
+            ws := Workspace<F32>(1, 300)
             Gemm(ws, c, a, ta, b, tb, 1.0, 1.0)
             want, _ := reference(a, ta, b, tb)
             assert maxDiff(c, want, 1.0, 1.0) < 1e-5
@@ -1670,7 +1730,7 @@ fn epilogueCase(m I64, n I64, k I64, act mat.Act, r mut rand.Rand&) {
     for j in range n: bias[j] = F32(r.Uniform(-1.0, 1.0))
     want, mag := reference(a, false, b, false)
     c := gappy(m, n, F32(0))
-    ws := Workspace<F32>(4)
+    ws := Workspace<F32>(4, most(m, n, k))
     Gemm(ws, c, a, false, b, false, 1.0, 0.0, Epilogue.BiasAct(bias, act))
     kind := actKind(act)
     for i in range m {
@@ -1726,7 +1786,7 @@ test GemmLeft "a left operand packed by its own type is the matrix it reads" {
     b := uniform(270, 517, F64(0), r)
     want, _ := reference(a, false, b, true)
     c := gappy(300, 270, F64(0))
-    ws := Workspace<F64>(4)
+    ws := Workspace<F64>(4, 517)
     GemmLeft(ws, c, rowsOf(a), 517, b, true, 1.0, 0.0, Epilogue.Bias(Array<F32>(270)))
     assert maxDiff(c, want) < 1e-12 * 517.0
 }
@@ -1745,6 +1805,7 @@ fn i8Case(m I64, n I64, k I64, zero I32, r mut rand.Rand&) {
     c := gappy(m, n, I32(0))
     out := gappy(m, n, F32(0))
     ws := Workspace<I32>(1)
+    ws.ReserveI8(n, k)
     GemmI8(ws, c, a, b, scale, out, zero)
     for i in range m {
         for j in range n {
@@ -1758,6 +1819,7 @@ fn i8Case(m I64, n I64, k I64, zero I32, r mut rand.Rand&) {
         }
     }
     four := Workspace<I32>(4)
+    four.ReserveI8(n, k)
     out4 := gappy(m, n, F32(0))
     GemmI8(four, gappy(m, n, I32(0)), a, b, scale, out4, zero)
     assert sameBits(out, out4)
@@ -1791,7 +1853,7 @@ test GemmBatch "BF16 storage over a depth of several blocks is summed in F32 and
     b := Batch<BF16>.random(20, 300, 2, 2, z, r)
     c := Batch<BF16>.random(20, 20, 2, 2, z, r)
     before := c[1, 1][0, 5]
-    ws := Workspace<F32>(2)
+    ws := Workspace<F32>(2, 300, 2 * 20 * 20)
     GemmBatch(ws, c, a, false, b, true, F32(1), F32(0), Triangle.Result(0))
     for e in range 4 {
         want, mag := reference(a[e / 2, e % 2], false, b[e / 2, e % 2], true)

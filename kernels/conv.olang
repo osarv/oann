@@ -97,6 +97,9 @@ fn cast<X, D>(x X, like D) D {
 # the patch matrix of a convolution over images - a row for every output position of every image, (b OutH + oy) OutW +
 # ox, and a column for every input the kernel sees there, (c K + ky) K + kx - as Im2col would make it but never made:
 # gemm's GemmLeft reads it through Pack, panel by panel, as the product needs it
+# the most positions a panel of Patches has: gemm's tile rows (12 on AVX-512) with room to spare
+panelMost I64 = 32
+
 type Patches<S> struct(images mat.Mat<S>&, geometry Shape&) {
     Images mat.Mat<S>& = images
     Geometry Shape& = geometry
@@ -120,9 +123,10 @@ fn (x Patches<S>&) Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut
     kk I64 = K * K
     hu U64 = U64(H)
     wu U64 = U64(W)
-    at := Array<I64>(wr)
-    wy := Array<I64>(wr)
-    wx := Array<I64>(wr)
+    if wr > panelMost: unreachable "conv: a panel wider than " + $panelMost + " positions"
+    at := Array<I64>(panelMost)                 # laid out in place: a panel is the tile's rows, 12 at most today
+    wy := Array<I64>(panelMost)
+    wx := Array<I64>(panelMost)
     # the position w0, and its image, row and column of the output
     img I64 = w0 / per
     oy I64 = (w0 - img * per) / ow
@@ -329,6 +333,12 @@ fn scatterWindow<S, A>(dx mut mat.Mat<S>&, patch Array<S>&, row I64, s Shape&, b
 
 # ---- the convolution ----
 
+# room in ws for Conv2d and Conv2dBackward over up to n images, stored in S: the products are n OutH OutW rows by the
+# patch (C K K) by OutC, each way round, and where S is narrower than A a depth past 256 sums a result in the accumulator
+fn ReserveConv<S, A>(ws mut gemm.Workspace<A>&, n I64, s Shape&, like S) {
+    ws.ReserveLayer(n * s.Positions(), s.Patch(), s.OutC, like)
+}
+
 # y = act(the convolution of x by w plus a bias): x is n images (n x H W C), w OutC x C K K, y n x OutH OutW OutC (rows
 # contiguous), epi gemm's epilogue - the bias (OutC values) and an activation. One GemmLeft: the product of the patches
 # and w^T, the patches packed straight from the images as the product reads them - never made - so the forward writes no
@@ -356,6 +366,10 @@ fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy mat.Mat<S>&, x mat.Mat<S>&
         Col2im<S, A>(dx, cols, s, accX, threads)
     }
 }
+
+# a convolution and its backward allocate nothing once the workspace is reserved (ReserveConv; S17a, G42)
+assert not Conv2d<F32, F32>.Allocates, "a convolution allocates"
+assert not Conv2dBackward<F32, F32>.Allocates, "a convolution's backward allocates"
 
 # ---- max pooling ----
 
@@ -558,6 +572,7 @@ test Conv2d "a convolution as one product of its patches equals its definition: 
         for threads in Array<I64>[1, 3] {
             y := plain(n, shape.Positions() * shape.OutC, F64(0))
             ws := gemm.Workspace<F64>(threads)
+            ReserveConv(ws, n, shape, F64(0))
             Conv2d(ws, y, x, w, shape, gemm.Epilogue.Bias(b))
             # the bias is F32 (gemm's epilogue), added in F64 to the sum: its rounding is the bound
             assert gap(y, want) < 1e-6
@@ -583,6 +598,7 @@ fn forwardAgrees<S, A>(like S, acc A, r mut rand.Rand&) {
         b := Array<F32>[F32(r.Normal()) for _ in range shape.OutC]
         for threads in Array<I64>[1, 4] {
             ws := gemm.Workspace<A>(threads)
+            ReserveConv(ws, n, shape, like)
             want := plain(n, shape.Positions() * shape.OutC, like)
             byIm2col(ws, want, x, w, b, shape)
             y := plain(n, shape.Positions() * shape.OutC, like)
@@ -606,6 +622,7 @@ test Conv2d "BF16 storage: the forward is the F64 convolution of the same values
     w := normal(s.OutC, s.Patch(), BF16(0), r, 0.3)
     y := plain(4, s.Positions() * s.OutC, BF16(0))
     ws := gemm.Workspace<F32>(2)
+    ReserveConv(ws, 4, s, BF16(0))
     Conv2d(ws, y, x, w, s)
     want := direct(x, w, Array<F32>(0), s)
     # a BF16 result keeps 8 bits: its error is at most one part in 2^8 of the value, the sum in F32 adds far less
@@ -676,6 +693,7 @@ test Conv2dBackward "the gradients against central differences of the definition
     db := Array<F64>(s.OutC)
     cols := plain(n * s.Positions(), s.Patch(), F64(0))
     ws := gemm.Workspace<F64>(2)
+    ReserveConv(ws, n, s, F64(0))
     Conv2dBackward(ws, dyc, x, w, s, dx, false, dw, false, db, false, cols, 2)
     h F64 = 1e-6
     for k in Array<I64>[0, 7, 19, 33, 50, 58] {
