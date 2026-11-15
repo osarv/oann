@@ -398,7 +398,7 @@ fn resumes<T, O>(m LanguageModel&, g1 mut graph.Graph<T>&, o1 mut O&, g2 mut gra
 }
 
 test Resume "a run saved after three steps and resumed in a fresh graph continues as if never stopped: AdamW and Sgd, F32, and AdamW on a BF16 graph's masters" {
-    try os.MkDirAll("build/train_test")
+    try os.MkDirAll("build/nntrain_test")
     g1, m := lm<F32>(5)
     g2, _ := lm<F32>(5)
     g3, _ := lm<F32>(99)
@@ -406,21 +406,21 @@ test Resume "a run saved after three steps and resumed in a fresh graph continue
     adam1 := optim.AdamW(g1.Params(), g1.ParamGrads(), spans = optim.Spans(g1))
     adam2 := optim.AdamW(g2.Params(), g2.ParamGrads(), spans = optim.Spans(g2))
     adam3 := optim.AdamW(g3.Params(), g3.ParamGrads(), spans = optim.Spans(g3))
-    try resumes(m, g1, adam1, g2, adam2, g3, adam3, "build/train_test/adam.ckpt")
+    try resumes(m, g1, adam1, g2, adam2, g3, adam3, "build/nntrain_test/adam.ckpt")
     h1, _ := lm<F32>(5)
     h2, _ := lm<F32>(5)
     h3, _ := lm<F32>(99)
     sgd1 := optim.Sgd(h1.Params(), h1.ParamGrads(), momentum = 0.9)
     sgd2 := optim.Sgd(h2.Params(), h2.ParamGrads(), momentum = 0.9)
     sgd3 := optim.Sgd(h3.Params(), h3.ParamGrads(), momentum = 0.9)
-    try resumes(m, h1, sgd1, h2, sgd2, h3, sgd3, "build/train_test/sgd.ckpt")
+    try resumes(m, h1, sgd1, h2, sgd2, h3, sgd3, "build/nntrain_test/sgd.ckpt")
     b1, _ := lm<BF16>(5)
     b2, _ := lm<BF16>(5)
     b3, _ := lm<BF16>(99)
     mix1 := optim.AdamW(b1.Masters(), b1.ParamGrads())
     mix2 := optim.AdamW(b2.Masters(), b2.ParamGrads())
     mix3 := optim.AdamW(b3.Masters(), b3.ParamGrads())
-    try resumes(m, b1, mix1, b2, mix2, b3, mix3, "build/train_test/bf16.ckpt")
+    try resumes(m, b1, mix1, b2, mix2, b3, mix3, "build/nntrain_test/bf16.ckpt")
 }
 
 type Row struct(run String, seed I64, step I64, loss F64) {
@@ -431,8 +431,8 @@ type Row struct(run String, seed I64, step I64, loss F64) {
 }
 
 test Fit "reports and measures as the config asks, writes the run's record and a checkpoint, and a run resumed from it ends where one never stopped" {
-    try os.MkDirAll("build/train_test")
-    try os.WriteFile("build/train_test/fit.jsonl", "")
+    try os.MkDirAll("build/nntrain_test")
+    try os.WriteFile("build/nntrain_test/fit.jsonl", "")
     g1, m := lm<F32>(5)
     g2, _ := lm<F32>(99)
     o1 := optim.AdamW(g1.Params(), g1.ParamGrads(), spans = optim.Spans(g1))
@@ -441,25 +441,25 @@ test Fit "reports and measures as the config asks, writes the run's record and a
     reports mut list.List<Progress>& = list.List<Progress>()
     never := cycle(8, 1)
     valid := cycle(8, 2)
-    cfg := Config(40, rate, Every = 10, EvalEvery = 20, EvalBatches = 3, Name = "cycle", Seed = 7, Log = "build/train_test/fit.jsonl")
+    cfg := Config(40, rate, Every = 10, EvalEvery = 20, EvalBatches = 3, Name = "cycle", Seed = 7, Log = "build/nntrain_test/fit.jsonl")
     last := try Fit(g1, m, never, valid, o1, cfg, fn(p): reports.Push(p))
     assert reports.Len() == 4 and last.Step == 40 and last.Rate == rate(39)
     assert reports[0].Validation != reports[0].Validation and reports[1].Step == 20 and reports[1].Validation == reports[1].Validation
     assert reports[3].Loss < reports[0].Loss and last.Validation < 0.5
-    rows := try runlog.Read<Row>("build/train_test/fit.jsonl")
+    rows := try runlog.Read<Row>("build/nntrain_test/fit.jsonl")
     assert rows.Len() == 4 and rows.step == Array<I64>[10, 20, 30, 40] and rows.seed[0] == 7 and rows.run[3] == "cycle"
     assert rows.loss[2] == reports[2].Loss
     lines := Vec<String>()
-    for l in (try os.ReadFile("build/train_test/fit.jsonl")).Lines(): lines.Push($l)
+    for l in (try os.ReadFile("build/nntrain_test/fit.jsonl")).Lines(): lines.Push($l)
     assert (try (try json.Json.Parse(lines[0]))["validation"]).IsNull()
     assert (try (try (try json.Json.Parse(lines[1]))["validation"]).AsNum()) == reports[1].Validation
     # the first half, checkpointed, then a fresh graph picks it up
     stopped := cycle(8, 1)
     g3, _ := lm<F32>(5)
     o3 := optim.AdamW(g3.Params(), g3.ParamGrads(), spans = optim.Spans(g3))
-    half := Config(20, rate, Every = 10, EvalEvery = 20, EvalBatches = 3, Checkpoint = "build/train_test/fit.ckpt")
+    half := Config(20, rate, Every = 10, EvalEvery = 20, EvalBatches = 3, Checkpoint = "build/nntrain_test/fit.ckpt")
     try Fit(g3, m, stopped, valid, o3, half, fn(p): reports.Push(p))
-    at := try Resume("build/train_test/fit.ckpt", g2, o2)
+    at := try Resume("build/nntrain_test/fit.ckpt", g2, o2)
     assert at == 20
     rest := Config(40, rate, Every = 10, EvalEvery = 20, EvalBatches = 3, From = at)
     try Fit(g2, m, stopped, valid, o2, rest, fn(p): reports.Push(p))
