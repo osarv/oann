@@ -926,9 +926,6 @@ type buffer struct(node I64, what I64, size I64, start I64, end I64) {
 # activation buffers are laid out a multiple of 16 elements apart (64 bytes of F32), so each starts aligned for vectors
 fn padded(n I64) I64 { return (n + 15) / 16 * 16 }
 
-# where every node's buffers are and how big the arena is: the whole of what Plan decides from the recorded graph, plain
-# data, so it can be computed while compiling and baked (`comptime`, PlanBaked). Offsets are in elements of the graph's
-# type (IntOffset in I32s, AccOffset in the accumulator's type)
 type Placed struct(Offset I64, GradOffset I64, SavedOffset I64, ScratchOffset I64, IntOffset I64, AccOffset I64) {
     Offset
     GradOffset
@@ -948,108 +945,33 @@ type Layout struct(nodes Array<Placed>, needs Array<Bool>, ParamCount I64, Activ
     Accs
 }
 
-# the arena laid out for the recorded graph, nothing allocated and nothing drawn: what Plan decides. A graph that is
-# laid out is not planned; Plan or PlanBaked follow on a graph recorded the same way. A shape that does not fit is
-# reported as Plan does
-fn (g mut Graph<T>&) Lay() Layout ? tensor.ShapeError {
-    try g.Check()
-    if g.Eager: unreachable "oann: an eager graph has no layout"
-    g.needs = g.wants()
-    params := g.placeParams()
-    fixed := g.placeFixed(2 * params)
-    acts := g.lifetimes()
-    size := place(acts, g.Reuse)
-    for b in acts: g.setOffset(b, fixed + b.at)
-    ints, accs := g.layoutSides()
-    return Layout(g.placed(), g.needs, params, size, fixed + size, ints, accs)
-}
-
-# every node's places, as the layout holds them
-fn (g Graph<T>&) placed() Array<Placed> {
-    out := Array<Placed>(g.nodes.Len())
-    for i in range out.Len() {
-        nd := g.nodes[i]
-        out[i] = Placed(nd.Offset, nd.GradOffset, nd.SavedOffset, nd.ScratchOffset, nd.IntOffset, nd.AccOffset)
-    }
-    return out
-}
-
-# the layout of a planned graph, as Plan decided it
-fn (g Graph<T>&) Layout() Layout {
-    if not g.planned or g.Eager: unreachable "oann: only a planned, captured graph has a layout"
-    return Layout(g.placed(), g.needs, g.ParamCount, g.ActivationSize, g.mem.Len(), g.intMem.Len(), g.accLen())
-}
-
-fn (g Graph<T>&) accLen() I64 {
-    match T {
-        case F64: return g.acc64.Len()
-        case _: return g.acc32.Len()
-    }
-}
-
 # lays the arena out, allocates it, and draws the parameters' starting values from r - after which the graph runs. A
 # shape the caller gave that does not fit is reported here. An eager graph is planned before anything is recorded: r
 # is kept to draw each parameter as it is made, in the order a captured graph draws them
 fn (g mut Graph<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError {
     try g.Check()
     if g.planned: unreachable "oann: a graph is planned once"
-    if g.Eager {
-        g.begin(r)
-        return
-    }
-    l := try g.Lay()
-    g.begin(r)
-    g.arrange(l, r)
-}
-
-# Plan with the layout computed beforehand - baked while compiling, `PlanBaked(r, comptime layoutOf())` - or taken from
-# another graph recorded the same way: nothing is laid out here. A layout that does not fit the graph (another node
-# count, another size) is an error of the program
-fn (g mut Graph<T>&) PlanBaked(r mut rand.Rand&, l Layout&) ? tensor.ShapeError {
-    try g.Check()
-    if g.planned: unreachable "oann: a graph is planned once"
-    if g.Eager: unreachable "oann: an eager graph has no layout"
-    if l.nodes.Len() != g.nodes.Len(): unreachable "oann: the baked layout is of another graph"
-    g.needs = l.needs.Copy()
-    for i in range l.nodes.Len() {
-        p := l.nodes[i]
-        nd := g.nodes[i]
-        nd.Offset = p.Offset
-        nd.GradOffset = p.GradOffset
-        nd.SavedOffset = p.SavedOffset
-        nd.ScratchOffset = p.ScratchOffset
-        nd.IntOffset = p.IntOffset
-        nd.AccOffset = p.AccOffset
-        g.nodes[i] = nd
-    }
-    g.begin(r)
-    g.arrange(l, r)
-}
-
-# the planned state: the dropout generator drawn from r, the whole batch in use; an eager graph keeps r
-fn (g mut Graph<T>&) begin(r mut rand.Rand&) {
     g.Rng = rand.Rand(r.Next())
     g.planned = true
     g.N = g.Batch
-    if not g.Eager: return
-    if g.nodes.Len() > 0 or g.Decode: unreachable "oann: an eager graph is planned first, and does not decode"
-    g.draw = r
-}
-
-# the storage a layout asks for, and the parameters' starting values
-fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
-    g.mem = Array<T>(l.Size)
-    g.intMem = Array<I32>(l.Ints)
-    match T {
-        case F64: g.acc64 = Array<F64>(l.Accs)
-        case _: g.acc32 = Array<F32>(l.Accs)
+    if g.Eager {
+        if g.nodes.Len() > 0 or g.Decode: unreachable "oann: an eager graph is planned first, and does not decode"
+        g.draw = r
+        return
     }
-    g.ActivationSize = l.ActivationSize
-    g.ParamCount = l.ParamCount
+    g.needs = g.wants()
+    params := g.placeParams()
+    fixed := g.placeFixed(2 * params)
+    acts := g.lifetimes()
+    g.ActivationSize = place(acts, g.Reuse)
+    for b in acts: g.setOffset(b, fixed + b.at)
+    g.mem = Array<T>(fixed + g.ActivationSize)
+    g.layoutSides()
+    g.ParamCount = params
     count := g.nodes.Len()
     g.losses = Array<F64>(count)
     g.written = Array<Bool>(count)
-    if g.HasMasters(): g.masters = Array<F32>(l.ParamCount)
+    if g.HasMasters(): g.masters = Array<F32>(params)
     for _ in range count {
         g.vals.Push(slot<T>(g.mem))
         g.ints.Push(slot<I32>(g.intMem))
@@ -1240,7 +1162,7 @@ fn (g mut Graph<T>&) setOffset(b buffer&, at I64) {
 }
 
 # the I32 region (tokens, classes, pooling's places) and the accumulator's (scan states), one after another
-fn (g mut Graph<T>&) layoutSides() I64, I64 {
+fn (g mut Graph<T>&) layoutSides() {
     ints I64 = 0
     accs I64 = 0
     for i in range g.nodes.Len() {
@@ -1256,7 +1178,11 @@ fn (g mut Graph<T>&) layoutSides() I64, I64 {
         }
         g.nodes[i] = nd
     }
-    return ints, accs
+    g.intMem = Array<I32>(ints)
+    match T {
+        case F64: g.acc64 = Array<F64>(accs)
+        case _: g.acc32 = Array<F32>(accs)
+    }
 }
 
 # p set as init says, from r: into the F32 masters where the graph keeps them
@@ -2572,63 +2498,4 @@ test Graph "a step allocates nothing: the resident memory does not grow over 20 
         b.Backward(bloss)
     }
     assert resident() == before, "grew by " $(resident() - before) " kB"
-}
-
-# ---- baked plans (C4) ----
-
-# the 784-128-10 perceptron of the MNIST example's shape, recorded: the graph whose plan is baked below
-fn recordMlp(g mut Graph<F32>&) {
-    x := g.Input(784)
-    y := g.Classes()
-    w1 := g.Param(Init.Normal(0.0, 0.05), true, 128, 784)
-    b1 := g.Param(Init.Zeros, false, 128)
-    w2 := g.Param(Init.Normal(0.0, 0.05), true, 10, 128)
-    b2 := g.Param(Init.Zeros, false, 10)
-    z := g.Linear(g.Act(g.Linear(x, w1, b1), mat.Act.Relu), w2, b2)
-    g.CrossEntropy(z, y)
-}
-
-# the plan of the perceptron, computed while compiling
-mlpBaked Layout = comptime Layout.Mlp()
-
-fn Layout.Mlp() Layout {
-    g := Graph<F32>(64)
-    recordMlp(g)
-    return g.Lay()!
-}
-
-# a batch for the perceptron: inputs from a pattern, the classes in turn
-fn feedMlp(g mut Graph<F32>&) {
-    xs := g.Data(Var(0)).Flat()!
-    for i in range xs.Len(): xs[i] = F32(i % 17) / 17.0
-    ys := g.Ints(Var(1)).Flat()!
-    for i in range ys.Len(): ys[i] = I32(i % 10)
-    g.Forward(64)
-}
-
-test Graph.Lay "the perceptron's plan baked while compiling equals the plan captured at run time" {
-    g := Graph<F32>(64)
-    recordMlp(g)
-    try g.Plan(rand.Rand(3))
-    got := g.Layout()
-    assert got.nodes.Len() == mlpBaked.nodes.Len()
-    assert got.needs == mlpBaked.needs
-    assert got.ParamCount == mlpBaked.ParamCount and got.ParamCount == 784 * 128 + 128 + 10 * 128 + 10
-    assert got.ActivationSize == mlpBaked.ActivationSize and got.Size == mlpBaked.Size
-    assert got.Ints == mlpBaked.Ints and got.Accs == mlpBaked.Accs
-    for i in range got.nodes.Len(): assert got.nodes[i] == mlpBaked.nodes[i], "node " $i
-}
-
-test Graph.PlanBaked "a graph planned from the baked layout runs as the one that laid itself out" {
-    a := Graph<F32>(64)
-    b := Graph<F32>(64)
-    recordMlp(a)
-    recordMlp(b)
-    try a.Plan(rand.Rand(4))
-    try b.PlanBaked(rand.Rand(4), mlpBaked)
-    assert a.Params() == b.Params()
-    feedMlp(a)
-    feedMlp(b)
-    last := Var(a.nodes.Len() - 1)
-    assert a.Value(last).Flat()![0] == b.Value(last).Flat()![0]
 }
