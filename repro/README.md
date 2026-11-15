@@ -23,5 +23,7 @@ where the library changed) so each builds or fails as its header says.
 | `allocfacts.olang` | reproduces (new) | G42 too coarse to pin a hot path allocation-free while compiling: a local fixed array (`Array<F32>(8)`, kernels/elem's lanes) and an error carrying a literal text (`!` on any tensor view) read `Allocates` true |
 | `methodfacts.olang` | reproduces (new) | G42 through a method of a generic type's instance (`Box<I64>.Fill.Allocates`) is refused at build: "it does not check a generic name as a value yet" |
 | `tryindex.olang` | fixed | builds and runs: `try` no longer makes an array index inside its operand a checked one (indexing is unchecked, `try a.Get(i)` the checked form) |
+| `learnerarg.olang` | reproduces (new) | C2d: a struct of another module holding a reference parameter (dyn/learn's `Learner`, dyn/bridge's `Bridge`), made inside a function from that function's reference parameter, "would outlive" the argument, though it is a local dropped there; the same struct copied into the root module builds. dyn/bridge's tests build the system inside the helper instead |
+| `factcascade.olang` | reproduces (new) | any other error in a program (an unused import here) makes every `assert not f.Allocates` (S17a, G42) read false: 36 spurious S17a errors from dyn/ and nn/optim behind one unneeded `try` while writing models/hybrid |
 
 The `Status` line in each file's header repeats the row.

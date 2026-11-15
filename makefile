@@ -8,10 +8,10 @@ OLANG ?= ../olang/build/olang
 TESTS = linalg.olang tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang kernels.olang ops.olang nn.olang layers.olang optim.olang train.olang datasets/idx.olang \
 	datasets/loader.olang datasets/mnist.olang datasets/text.olang generate.olang tokenizer.olang checkpoint.olang conv.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
-	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang board/engine.olang \
+	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
 	vision.olang sparse.olang store.olang circuit.olang board.olang agent.olang consolidator.olang quant.olang
 
-.PHONY: test mlpad arenaad charlmnn data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench mnistlearn sample clean
+.PHONY: test mlpad arenaad charlmnn data bench epoch mnist cnn charlm lmbench lmref bpe bpelm safetensors board sparse sleep nights int8 int8lm int8bench xor spiking bandit mnistsettle settlebench hybridbench mnistlearn sample clean
 
 test:
 	$(OLANG) test $(TESTS)
@@ -108,6 +108,13 @@ sparse:
 settlebench:
 	$(OLANG) build -output build/bench_settle bench/settle.olang
 	./build/bench_settle $(ARGS)
+
+# M14 (docs/redesign.md 4.3): models/hybrid's transformer with a settle block on tiny Shakespeare, trained twice - every
+# settle from rest, then from the amortizer's guess - and the sweeps a settle takes in each (bench/hybrid.olang) - ARGS:
+# steps, seed, units, gradient (exact, jfb, ep), tolerance, kappa, report interval
+hybridbench:
+	$(OLANG) build -output build/bench_hybrid bench/hybrid.olang
+	./build/bench_hybrid $(ARGS)
 
 # sleep against interference (consolidator.olang): days of a flip-flop with and without nights - ARGS: nights or
 # retention, seeds, days, sequences a day, repeats, hidden, window, passes, the day's step, the night's rate
