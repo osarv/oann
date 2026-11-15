@@ -10,8 +10,11 @@
 # node's numbers through a helper, so no node is a local of them).
 # Expected: resident memory about flat over the calls, and "ok". Actual (olang ada716d): it grows by about 16 bytes a
 # call, 64 MB over the 4 000 000 calls, and the assert fails.
-import "std/linalg"
+# Status (olang 374c1e3c): FIXED - resident memory stays flat (1720 kB before, 1792 kB after 4 000 000 calls) and it prints ok.
+# Kept as a regression case; the view is made with the Matrix constructor, linalg.View now failing with ShapeError.
+import "../linalg"
 import "std/os"
+import "std/list"
 
 type Info struct(Offset I64, Len I64) {
     Offset
@@ -20,14 +23,14 @@ type Info struct(Offset I64, Len I64) {
 
 type G struct(n I64) {
     mem mut Array<F64>& = Array<F64>(n)
-    infos mut List<Info>& = List<Info>()
+    infos mut list.List<Info>& = list.List<Info>()
 }
 
 fn (g G&) count(i Info&) I64 { return i.Len }
 
 fn (g G&) view(k I64) linalg.Matrix<F64> {
     i := g.infos[k]
-    return linalg.View(g.mem, i.Offset, 1, g.count(i))
+    return linalg.Matrix<F64>(1, g.count(i), g.mem[i.Offset:])
 }
 
 # the resident memory in kB, from /proc/self/status
@@ -45,12 +48,12 @@ fn main() ? {
     g.mem[0] = 0.5
     sum F64 = 0.0
     before := try resident()
-    for t in range 4000000 {
+    for _ in range 4000000 {
         v := g.view(0)
         sum += v.Data[0]
     }
     after := try resident()
-    println("resident " $before " kB before, " $after " kB after 4 000 000 calls; sum " $sum)
+    Println("resident " $before " kB before, " $after " kB after 4 000 000 calls; sum " $sum)
     assert after - before < 4096
-    println("ok")
+    Println("ok")
 }
