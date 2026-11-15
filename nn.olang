@@ -25,8 +25,7 @@
 # starting values into them, an optimizer steps them from the BF16 gradients and rounds them into the arena
 # (SyncParams), and a checkpoint is them. A loss's value is kept in F64 (Scalar), whatever the element type.
 
-import "std/linalg"
-import "std/math"
+import "linalg"
 import "std/os"
 import "std/rand"
 import "std/time"
@@ -34,6 +33,7 @@ import "ops"
 import "conv"
 import "kernels"
 import "quant"
+import "std/list"
 
 # a node's handle: an index into the graph's nodes
 type Var I64
@@ -82,43 +82,43 @@ type Op enum {
 # ---- profiling ----
 
 # the kinds of operation, by name: KindOf numbers an operation's kind as its position here
-KindNames := String&[
-    "Input", "Classes", "Tokens", "Constant", "Param", "MatMul", "Linear", "AddRow", "Add", "Sub", "Mul", "Scale",
-    "Relu", "LeakyRelu", "Gelu", "GeluTanh", "Sigmoid", "Tanh", "Softmax", "Embedding", "Positions", "LayerNorm",
+KindNames := Array<String&>[
+    "Input", "Classes", "Tokens", "Constant", "Param", "MatMul", "Linear", "AddRow", "Add", "Sub", "Mul", "Scale"
+    "Relu", "LeakyRelu", "Gelu", "GeluTanh", "Sigmoid", "Tanh", "Softmax", "Embedding", "Positions", "LayerNorm"
     "RmsNorm", "Attention", "Dropout", "SoftmaxCrossEntropy", "Mse", "Conv2d", "MaxPool2d"
 ]
 
 fn KindOf(k Op) I64 {
     return match k {
-        case Op.Input => 0
-        case Op.Classes => 1
-        case Op.Tokens => 2
-        case Op.Constant => 3
-        case Op.Param(_, _) => 4
-        case Op.MatMul(_, _, _, _) => 5
-        case Op.Linear(_, _, _) => 6
-        case Op.AddRow(_, _) => 7
-        case Op.Add(_, _) => 8
-        case Op.Sub(_, _) => 9
-        case Op.Mul(_, _) => 10
-        case Op.Scale(_, _) => 11
-        case Op.Relu(_) => 12
-        case Op.LeakyRelu(_, _) => 13
-        case Op.Gelu(_) => 14
-        case Op.GeluTanh(_) => 15
-        case Op.Sigmoid(_) => 16
-        case Op.Tanh(_) => 17
-        case Op.Softmax(_) => 18
-        case Op.Embedding(_, _) => 19
-        case Op.Positions(_, _, _) => 20
-        case Op.LayerNorm(_, _, _, _) => 21
-        case Op.RmsNorm(_, _, _) => 22
-        case Op.Attention(_, _, _, _, _, _) => 23
-        case Op.Dropout(_, _) => 24
-        case Op.SoftmaxCrossEntropy(_, _) => 25
-        case Op.Mse(_, _) => 26
-        case Op.Conv2d(_, _, _, _) => 27
-        case Op.MaxPool2d(_, _) => 28
+        case Op.Input: 0
+        case Op.Classes: 1
+        case Op.Tokens: 2
+        case Op.Constant: 3
+        case Op.Param(_, _): 4
+        case Op.MatMul(_, _, _, _): 5
+        case Op.Linear(_, _, _): 6
+        case Op.AddRow(_, _): 7
+        case Op.Add(_, _): 8
+        case Op.Sub(_, _): 9
+        case Op.Mul(_, _): 10
+        case Op.Scale(_, _): 11
+        case Op.Relu(_): 12
+        case Op.LeakyRelu(_, _): 13
+        case Op.Gelu(_): 14
+        case Op.GeluTanh(_): 15
+        case Op.Sigmoid(_): 16
+        case Op.Tanh(_): 17
+        case Op.Softmax(_): 18
+        case Op.Embedding(_, _): 19
+        case Op.Positions(_, _, _): 20
+        case Op.LayerNorm(_, _, _, _): 21
+        case Op.RmsNorm(_, _, _): 22
+        case Op.Attention(_, _, _, _, _, _): 23
+        case Op.Dropout(_, _): 24
+        case Op.SoftmaxCrossEntropy(_, _): 25
+        case Op.Mse(_, _): 26
+        case Op.Conv2d(_, _, _, _): 27
+        case Op.MaxPool2d(_, _): 28
     }
 }
 
@@ -143,7 +143,7 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     Batch
     Threads
     Decoding
-    nodes mut List<Node>& = List<Node>()
+    nodes mut list.List<Node>& = list.List<Node>()
     mem mut Array<T>& = Array<T>(0)
     classes mut Array<I32>& = Array<I32>(0)
     written mut Array<Bool>& = Array<Bool>(0)
@@ -165,84 +165,83 @@ type Graph<T> struct(Batch I64, Threads I64 = 1, Decoding Bool = false) {
     losses mut Array<F64>& = Array<F64>(0)    # each loss node's last value, in F64
     planned Bool = false
     Int8 Bool = false               # once QuantizeLinear has run: every Linear's product in 8-bit integers (quant.olang)
-    int8Weights mut List<quant.Weights>& = List<quant.Weights>()  # each Linear node's weights quantized
-    int8At mut List<I64>& = List<I64>()                           # by node: its weights' index there, or -1
+    int8Weights mut list.List<quant.Weights>& = list.List<quant.Weights>()  # each Linear node's weights quantized
+    int8At mut list.List<I64>& = list.List<I64>()                           # by node: its weights' index there, or -1
     int8Acts mut quant.Activations& = quant.Activations(0)       # a Linear's input quantized
 }
 
 # ---- recording ----
 
 # a shape that does not fit where it is used: the network is wrong, so this stops it with what is wrong
-fn mismatch(what String&) {
-    eprintln("oann: " $what)
-    fail
+fn mismatch(what String&) noreturn {
+    unreachable "oann: " $what
 }
 
-fn (g mut Graph<<T>>&) add(kind Op, rows I64, cols I64, batched Bool) Var {
+fn (g mut Graph<T>&) add(kind Op, rows I64, cols I64, batched Bool) Var {
     if g.planned { mismatch("the graph is planned already - operations are recorded before Plan") }
     g.nodes.Push(Node(kind, rows, cols, batched))
     return Var(g.nodes.Len() - 1)
 }
 
 # the node behind v
-fn (g Graph<<T>>&) Info(v Var) Node {
+fn (g Graph<T>&) Info(v Var) Node {
     return g.nodes[v]
 }
 
 # how many nodes the graph has
-fn (g Graph<<T>>&) Size() I64 {
+fn (g Graph<T>&) Size() I64 {
     return g.nodes.Len()
 }
 
 # the elements of the arena Plan laid out: parameters, gradients, values, what backwards keep, scratch and patches
-fn (g Graph<<T>>&) ArenaSize() I64 {
+fn (g Graph<T>&) ArenaSize() I64 {
     return g.mem.Len()
 }
 
 # the bytes the arena takes, and a BF16 graph's F32 masters with it
-fn (g Graph<<T>>&) ArenaBytes() I64 {
+fn (g Graph<T>&) ArenaBytes() I64 {
     like T
     width I64 = match T {
-        case F64 => 8
-        case F32 => 4
-        case BF16 => 2
+        case F64: 8
+        case F32: 4
+        case BF16: 2
     }
     return width * g.mem.Len() + 4 * g.masters.Len()
 }
 
-fn (g Graph<<T>>&) shape(v Var) String {
+fn (g Graph<T>&) shape(v Var) String {
     n := g.nodes[v]
     return $(n.Rows) "x" $(n.Cols)
 }
 
 # a batch input of cols features per row
-fn (g mut Graph<<T>>&) Input(cols I64) Var {
+fn (g mut Graph<T>&) Input(cols I64) Var {
     return g.add(Op.Input, g.Batch, cols, true)
 }
 
 # a class index per row of the batch
-fn (g mut Graph<<T>>&) Classes() Var {
+fn (g mut Graph<T>&) Classes() Var {
     return g.add(Op.Classes, g.Batch, 1, true)
 }
 
 # a token per row of the batch, the input of an Embedding
-fn (g mut Graph<<T>>&) Tokens() Var {
+fn (g mut Graph<T>&) Tokens() Var {
     return g.add(Op.Tokens, g.Batch, 1, true)
 }
 
 # a rows x cols matrix the caller sets and nothing trains - a target, a mask, a fixed table
-fn (g mut Graph<<T>>&) Constant(rows I64, cols I64) Var {
+fn (g mut Graph<T>&) Constant(rows I64, cols I64) Var {
     return g.add(Op.Constant, rows, cols, false)
 }
 
 # a trainable rows x cols matrix, set by init when the graph is planned; weight decay applies to it when decay
-fn (g mut Graph<<T>>&) Param(rows I64, cols I64, init Init, decay Bool) Var {
+fn (g mut Graph<T>&) Param(rows I64, cols I64, init Init, decay Bool) Var {
     return g.add(Op.Param(init, decay), rows, cols, false)
 }
 
 # op(a) op(b), op(m) being m or, where its flag is set, m's transpose - a matrix product. (Named Product until olang
 # took a method for the @ operator only when it has the operator's shape - one parameter - in db2af5d's E31)
-fn (g mut Graph<<T>>&) MatMul(a Var, b Var, ta Bool, tb Bool) Var {
+fn (g mut Graph<T>&) MatMul(a Var, b Var, ta Bool, tb Bool) Var {
     x := g.nodes[a]
     y := g.nodes[b]
     m I64 = x.Cols if ta else x.Rows
@@ -255,7 +254,7 @@ fn (g mut Graph<<T>>&) MatMul(a Var, b Var, ta Bool, tb Bool) Var {
 }
 
 # x w^T + b: w is out x in, b 1 x out
-fn (g mut Graph<<T>>&) Linear(x Var, w Var, b Var) Var {
+fn (g mut Graph<T>&) Linear(x Var, w Var, b Var) Var {
     xs := g.nodes[x]
     ws := g.nodes[w]
     bs := g.nodes[b]
@@ -266,14 +265,14 @@ fn (g mut Graph<<T>>&) Linear(x Var, w Var, b Var) Var {
 }
 
 # x + b, b one row added to every row
-fn (g mut Graph<<T>>&) AddRow(x Var, b Var) Var {
+fn (g mut Graph<T>&) AddRow(x Var, b Var) Var {
     xs := g.nodes[x]
     bs := g.nodes[b]
     if bs.Rows != 1 or bs.Cols != xs.Cols { mismatch("AddRow of " $g.shape(x) " and " $g.shape(b)) }
     return g.add(Op.AddRow(x, b), xs.Rows, xs.Cols, xs.Batched)
 }
 
-fn (g mut Graph<<T>>&) sameShape(name String&, a Var, b Var) {
+fn (g mut Graph<T>&) sameShape(name String&, a Var, b Var) {
     x := g.nodes[a]
     y := g.nodes[b]
     if x.Rows != y.Rows or x.Cols != y.Cols or x.Batched != y.Batched {
@@ -281,48 +280,48 @@ fn (g mut Graph<<T>>&) sameShape(name String&, a Var, b Var) {
     }
 }
 
-fn (g mut Graph<<T>>&) Add(a Var, b Var) Var {
+fn (g mut Graph<T>&) Add(a Var, b Var) Var {
     g.sameShape("Add", a, b)
     x := g.nodes[a]
     return g.add(Op.Add(a, b), x.Rows, x.Cols, x.Batched)
 }
 
-fn (g mut Graph<<T>>&) Sub(a Var, b Var) Var {
+fn (g mut Graph<T>&) Sub(a Var, b Var) Var {
     g.sameShape("Sub", a, b)
     x := g.nodes[a]
     return g.add(Op.Sub(a, b), x.Rows, x.Cols, x.Batched)
 }
 
 # a * b, element by element
-fn (g mut Graph<<T>>&) Mul(a Var, b Var) Var {
+fn (g mut Graph<T>&) Mul(a Var, b Var) Var {
     g.sameShape("Mul", a, b)
     x := g.nodes[a]
     return g.add(Op.Mul(a, b), x.Rows, x.Cols, x.Batched)
 }
 
-fn (g mut Graph<<T>>&) Scale(x Var, k F64) Var {
+fn (g mut Graph<T>&) Scale(x Var, k F64) Var {
     xs := g.nodes[x]
     return g.add(Op.Scale(x, k), xs.Rows, xs.Cols, xs.Batched)
 }
 
-fn (g mut Graph<<T>>&) like(kind Op, x Var) Var {
+fn (g mut Graph<T>&) like(kind Op, x Var) Var {
     xs := g.nodes[x]
     return g.add(kind, xs.Rows, xs.Cols, xs.Batched)
 }
 
-fn (g mut Graph<<T>>&) Relu(x Var) Var { return g.like(Op.Relu(x), x) }
-fn (g mut Graph<<T>>&) LeakyRelu(x Var, slope F64) Var { return g.like(Op.LeakyRelu(x, slope), x) }
-fn (g mut Graph<<T>>&) Gelu(x Var) Var { return g.like(Op.Gelu(x), x) }
-fn (g mut Graph<<T>>&) GeluTanh(x Var) Var { return g.like(Op.GeluTanh(x), x) }
-fn (g mut Graph<<T>>&) Sigmoid(x Var) Var { return g.like(Op.Sigmoid(x), x) }
-fn (g mut Graph<<T>>&) Tanh(x Var) Var { return g.like(Op.Tanh(x), x) }
-fn (g mut Graph<<T>>&) Softmax(x Var) Var { return g.like(Op.Softmax(x), x) }
+fn (g mut Graph<T>&) Relu(x Var) Var { return g.like(Op.Relu(x), x) }
+fn (g mut Graph<T>&) LeakyRelu(x Var, slope F64) Var { return g.like(Op.LeakyRelu(x, slope), x) }
+fn (g mut Graph<T>&) Gelu(x Var) Var { return g.like(Op.Gelu(x), x) }
+fn (g mut Graph<T>&) GeluTanh(x Var) Var { return g.like(Op.GeluTanh(x), x) }
+fn (g mut Graph<T>&) Sigmoid(x Var) Var { return g.like(Op.Sigmoid(x), x) }
+fn (g mut Graph<T>&) Tanh(x Var) Var { return g.like(Op.Tanh(x), x) }
+fn (g mut Graph<T>&) Softmax(x Var) Var { return g.like(Op.Softmax(x), x) }
 
 # each row's token looked up in table - a vocabulary x width matrix, a parameter: a batch of width-wide rows
-fn (g mut Graph<<T>>&) Embedding(tokens Var, table Var) Var {
+fn (g mut Graph<T>&) Embedding(tokens Var, table Var) Var {
     t := g.nodes[tokens]
     w := g.nodes[table]
-    if not (t.Kind is Op.Tokens) or w.Batched {
+    if not (t.Kind == Op.Tokens) or w.Batched {
         mismatch("Embedding of " $g.shape(table) ": the tokens must be a Tokens() and the table not batched")
     }
     return g.add(Op.Embedding(tokens, table), t.Rows, w.Cols, true)
@@ -330,7 +329,7 @@ fn (g mut Graph<<T>>&) Embedding(tokens Var, table Var) Var {
 
 # x plus a learned position: row r gets the table's row (Pos + r) mod T, T being the table's rows - the length of the
 # sequences the batch's rows are cut into
-fn (g mut Graph<<T>>&) Positions(x Var, table Var) Var {
+fn (g mut Graph<T>&) Positions(x Var, table Var) Var {
     xs := g.nodes[x]
     ts := g.nodes[table]
     if not xs.Batched or ts.Batched or ts.Cols != xs.Cols or g.Batch % ts.Rows != 0 {
@@ -340,7 +339,7 @@ fn (g mut Graph<<T>>&) Positions(x Var, table Var) Var {
 }
 
 # layer normalization (Ba et al.) of each row, gain and bias 1 x Cols - PyTorch's LayerNorm
-fn (g mut Graph<<T>>&) LayerNorm(x Var, gain Var, bias Var, eps F64 = 1e-5) Var {
+fn (g mut Graph<T>&) LayerNorm(x Var, gain Var, bias Var, eps F64 = 1e-5) Var {
     xs := g.nodes[x]
     gs := g.nodes[gain]
     bs := g.nodes[bias]
@@ -351,7 +350,7 @@ fn (g mut Graph<<T>>&) LayerNorm(x Var, gain Var, bias Var, eps F64 = 1e-5) Var 
 }
 
 # root-mean-square normalization (Zhang and Sennrich) of each row, gain 1 x Cols
-fn (g mut Graph<<T>>&) RmsNorm(x Var, gain Var, eps F64 = 1e-5) Var {
+fn (g mut Graph<T>&) RmsNorm(x Var, gain Var, eps F64 = 1e-5) Var {
     xs := g.nodes[x]
     gs := g.nodes[gain]
     if gs.Rows != 1 or gs.Cols != xs.Cols { mismatch("RmsNorm of " $g.shape(x) " by gain " $g.shape(gain)) }
@@ -360,35 +359,35 @@ fn (g mut Graph<<T>>&) RmsNorm(x Var, gain Var, eps F64 = 1e-5) Var {
 
 # multi-head attention, fused: q, k and v are batches of sequences of T rows, each head a block of D / heads columns;
 # causal: a row attends only to itself and the rows before it in its sequence
-fn (g mut Graph<<T>>&) Attention(q Var, k Var, v Var, heads I64, T I64, causal Bool) Var {
+fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, ctx I64, causal Bool) Var {
     g.sameShape("Attention", q, k)
     g.sameShape("Attention", q, v)
     qs := g.nodes[q]
-    if not qs.Batched or heads < 1 or qs.Cols % heads != 0 or T < 1 or g.Batch % T != 0 {
-        mismatch("Attention of " $g.shape(q) ": " $heads " heads must divide the columns and " $T " the batch")
+    if not qs.Batched or heads < 1 or qs.Cols % heads != 0 or ctx < 1 or g.Batch % ctx != 0 {
+        mismatch("Attention of " $g.shape(q) ": " $heads " heads must divide the columns and " $ctx " the batch")
     }
-    return g.add(Op.Attention(q, k, v, heads, T, causal), qs.Rows, qs.Cols, true)
+    return g.add(Op.Attention(q, k, v, heads, ctx, causal), qs.Rows, qs.Cols, true)
 }
 
 # x with each element zeroed with probability p and the rest scaled by 1 / (1 - p), while the graph is Training; x
 # itself otherwise
-fn (g mut Graph<<T>>&) Dropout(x Var, p F64) Var {
+fn (g mut Graph<T>&) Dropout(x Var, p F64) Var {
     if p < 0.0 or p >= 1.0 { mismatch("Dropout with p = " $p ": p must be in [0, 1)") }
     return g.like(Op.Dropout(x, p), x)
 }
 
 # the mean over the rows of the cross-entropy of softmax(logits) against the class of each row
-fn (g mut Graph<<T>>&) SoftmaxCrossEntropy(logits Var, classes Var) Var {
+fn (g mut Graph<T>&) SoftmaxCrossEntropy(logits Var, classes Var) Var {
     z := g.nodes[logits]
     c := g.nodes[classes]
-    if not (c.Kind is Op.Classes) or c.Rows != z.Rows or not z.Batched {
+    if not (c.Kind == Op.Classes) or c.Rows != z.Rows or not z.Batched {
         mismatch("SoftmaxCrossEntropy of " $g.shape(logits) ": the classes must be a Classes() of the same batch")
     }
     return g.add(Op.SoftmaxCrossEntropy(logits, classes), 1, 1, false)
 }
 
 # the mean of (a - b)^2
-fn (g mut Graph<<T>>&) Mse(a Var, b Var) Var {
+fn (g mut Graph<T>&) Mse(a Var, b Var) Var {
     g.sameShape("Mse", a, b)
     return g.add(Op.Mse(a, b), 1, 1, false)
 }
@@ -396,7 +395,7 @@ fn (g mut Graph<<T>>&) Mse(a Var, b Var) Var {
 # a convolution of the images x - rows of H x W pixels of inC channels, the channels of a pixel together - by outC
 # kernels of kernel x kernel, w outC x (inC kernel kernel) (PyTorch's Conv2d weight) and b 1 x outC, moved stride
 # pixels at a time over the images padded with "padding" zeros: rows of OutH x OutW pixels of outC channels (conv)
-fn (g mut Graph<<T>>&) Conv2d(x Var, w Var, b Var, inC I64, outC I64, kernel I64, stride I64, padding I64, H I64,
+fn (g mut Graph<T>&) Conv2d(x Var, w Var, b Var, inC I64, outC I64, kernel I64, stride I64, padding I64, H I64
         W I64) Var {
     s := conv.Shape(inC, H, W, outC, kernel, stride, padding)
     xs := g.nodes[x]
@@ -404,15 +403,15 @@ fn (g mut Graph<<T>>&) Conv2d(x Var, w Var, b Var, inC I64, outC I64, kernel I64
     bs := g.nodes[b]
     if not s.Valid() or xs.Cols != H * W * inC or ws.Rows != outC or ws.Cols != s.Patch() or bs.Rows != 1 or
             bs.Cols != outC or ws.Batched or bs.Batched {
-        mismatch("Conv2d of " $g.shape(x) " as " $H "x" $W "x" $inC " images by weights " $g.shape(w) " and bias "
-            $g.shape(b) ": " $outC " kernels of " $kernel "x" $kernel ", stride " $stride ", padding " $padding)
+        mismatch(("Conv2d of " $g.shape(x) " as " $H "x" $W "x" $inC " images by weights " $g.shape(w) " and bias "
+            $g.shape(b) ": " $outC " kernels of " $kernel "x" $kernel ", stride " $stride ", padding " $padding))
     }
     return g.add(Op.Conv2d(x, w, b, s), xs.Rows, s.Positions() * outC, xs.Batched)
 }
 
 # max pooling of the images x - rows of H x W pixels of C channels, channels last - over kernel x kernel windows
 # moved stride pixels at a time: rows of OutH x OutW pixels of C channels
-fn (g mut Graph<<T>>&) MaxPool2d(x Var, C I64, H I64, W I64, kernel I64, stride I64) Var {
+fn (g mut Graph<T>&) MaxPool2d(x Var, C I64, H I64, W I64, kernel I64, stride I64) Var {
     p := conv.Pool(C, H, W, kernel, stride)
     xs := g.nodes[x]
     if not p.Valid() or xs.Cols != H * W * C {
@@ -424,7 +423,7 @@ fn (g mut Graph<<T>>&) MaxPool2d(x Var, C I64, H I64, W I64, kernel I64, stride 
 # ---- planning ----
 
 # the inputs of an operation, -1 where it has fewer than three
-fn inputs(k Op) (I64, I64, I64) {
+fn inputs(k Op) I64, I64, I64 {
     match k {
         case Op.MatMul(a, b, _, _) { return a, b, -1 }
         case Op.Linear(x, w, b) { return x, w, b }
@@ -448,7 +447,7 @@ fn first(k Op) I64 {
 
 # what an operation keeps for its backward, as a matrix's rows and columns (0 x 0: nothing) - for the rows planned,
 # or with inUse those the last Forward ran on
-fn (g Graph<<T>>&) savedShape(nd Node&, inUse Bool) (I64, I64) {
+fn (g Graph<T>&) savedShape(nd Node&, inUse Bool) I64, I64 {
     rows I64 = g.rows(nd) if inUse else nd.Rows
     match nd.Kind {
         case Op.SoftmaxCrossEntropy(z, _) {
@@ -457,23 +456,23 @@ fn (g Graph<<T>>&) savedShape(nd Node&, inUse Bool) (I64, I64) {
         }
         case Op.LayerNorm(_, _, _, _) { return rows, 2 }
         case Op.RmsNorm(_, _, _) { return rows, 1 }
-        case Op.Attention(_, _, _, heads, T, _) {
-            if g.Decoding { return 2 * T * nd.Cols + T, 1 }     # the cache: keys and values, T x Cols each, and scores
-            return rows * heads, T
+        case Op.Attention(_, _, _, heads, ctx, _) {
+            if g.Decoding { return 2 * ctx * nd.Cols + ctx, 1 }     # the cache: keys and values, T x Cols each, and scores
+            return rows * heads, ctx
         }
         case Op.Dropout(_, _), Op.MaxPool2d(_, _) { return rows, nd.Cols }     # the mask; each maximum's place
-        nomatch { return 0, 0 }
+        case _ { return 0, 0 }
     }
 }
 
 # lays the arena out, allocates it, and draws the parameters' starting values from r - after which the graph runs
-fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
+fn (g mut Graph<T>&) Plan(r mut rand.Rand&) {
     count := g.nodes.Len()
     needs := Array<Bool>(count)                 # whether a node's gradient is wanted: it depends on a parameter
     params I64 = 0
     for i in range count {
         nd := g.nodes[i]
-        if nd.Kind is Op.Param {
+        if nd.Kind == Op.Param {
             needs[i] = true
             nd.Offset = params
             params += nd.Rows * nd.Cols
@@ -487,7 +486,6 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
     rows I64 = 0
     scratch I64 = 0
     cols I64 = 0                                # the largest convolution's patches
-    like T
     for i in range count {
         nd := g.nodes[i]
         size I64 = nd.Rows * nd.Cols
@@ -501,10 +499,10 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
                     rows += nd.Rows
                 }
             }
-            nomatch {
+            case _ {
                 nd.Offset = at
                 at += size
-                if g.Ahead and nd.Kind is Op.Input {
+                if g.Ahead and nd.Kind == Op.Input {
                     nd.NextOffset = at
                     at += size
                 }
@@ -518,14 +516,14 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
                     at += sr * sc
                 }
                 match nd.Kind {
-                    case Op.Attention(_, _, _, heads, T, _) {
-                        ds := ops.AttentionScratch(nd.Rows, heads, T)
+                    case Op.Attention(_, _, _, heads, ctx, _) {
+                        ds := ops.AttentionScratch(nd.Rows, heads, ctx)
                         if not g.Decoding and ds > scratch { scratch = ds }
                     }
                     case Op.Conv2d(_, _, _, s) {
                         if nd.Rows * s.Positions() * s.Patch() > cols { cols = nd.Rows * s.Positions() * s.Patch() }
                     }
-                    nomatch { }
+                    case _ { }
                 }
             }
         }
@@ -549,13 +547,10 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
         nd := g.nodes[i]
         match nd.Kind {
             case Op.Param(init, _) {
-                if g.HasMasters() {
-                    initialize(linalg.View(g.masters, nd.Offset, nd.Rows, nd.Cols), init, r)
-                } else {
-                    initialize(g.Value(Var(i)), init, r)
-                }
+                if g.HasMasters(): initialize(linalg.Matrix.View(g.masters, nd.Offset, nd.Rows, nd.Cols)!, init, r)
+                else: initialize(g.Value(Var(i)), init, r)
             }
-            nomatch { }
+            case _ { }
         }
     }
     g.SyncParams()
@@ -563,7 +558,7 @@ fn (g mut Graph<<T>>&) Plan(r mut rand.Rand&) {
 }
 
 # p set as init says, from r
-fn initialize(p mut linalg.Matrix<<T>>&, init Init, r mut rand.Rand&) {
+fn initialize<T>(p mut linalg.Matrix<T>&, init Init, r mut rand.Rand&) {
     like T
     match init {
         case Init.Zeros { }
@@ -576,29 +571,29 @@ fn initialize(p mut linalg.Matrix<<T>>&, init Init, r mut rand.Rand&) {
 # ---- mixed precision ----
 
 # whether the graph keeps its parameters' masters in F32 beside the arena: a BF16 graph does, computing in F32
-fn (g Graph<<T>>&) HasMasters() Bool {
+fn (g Graph<T>&) HasMasters() Bool {
     return match T {
-        case BF16 => true
-        nomatch => false
+        case BF16: true
+        case _: false
     }
 }
 
 # a BF16 graph's parameters in F32, laid out as Params() is - what an optimizer steps and a checkpoint keeps
-fn (g Graph<<T>>&) Masters() linalg.Matrix<F32> {
+fn (g Graph<T>&) Masters() linalg.Matrix<F32> {
     assert g.HasMasters()
-    return linalg.View(g.masters, 0, 1, g.ParamCount)
+    return linalg.Matrix.View(g.masters, 0, 1, g.ParamCount)!
 }
 
 # parameter v's master in F32, a view of Masters()
-fn (g Graph<<T>>&) Master(v Var) linalg.Matrix<F32> {
+fn (g Graph<T>&) Master(v Var) linalg.Matrix<F32> {
     nd := g.nodes[v]
-    assert g.HasMasters() and nd.Kind is Op.Param
-    return linalg.View(g.masters, nd.Offset, nd.Rows, nd.Cols)
+    assert g.HasMasters() and nd.Kind == Op.Param
+    return linalg.Matrix.View(g.masters, nd.Offset, nd.Rows, nd.Cols)
 }
 
 # the parameters in the arena set from their masters, each rounded to the nearest BF16 - after the masters change (an
 # optimizer's step, a checkpoint loaded); nothing for a graph without masters
-fn (g mut Graph<<T>>&) SyncParams() {
+fn (g mut Graph<T>&) SyncParams() {
     if not g.HasMasters() { return }
     like T
     mem := g.mem                        # taken out of the graph first: a BF16 store reached through it at every element
@@ -609,26 +604,26 @@ fn (g mut Graph<<T>>&) SyncParams() {
 # ---- reading and writing values ----
 
 # the rows of a node in use: the batch's rows in use for a batched node, its own rows otherwise
-fn (g Graph<<T>>&) rows(nd Node&) I64 {
+fn (g Graph<T>&) rows(nd Node&) I64 {
     return g.N if nd.Batched else nd.Rows
 }
 
 # v's value, as a view of the arena: writing it writes the graph. Its place is read through place, so that no node is a
 # local of a function giving a view: such a local passed to a method of the graph was kept in the graph's scope at
 # every call (olang ada716d, repro/resultgrowth)
-fn (g Graph<<T>>&) Value(v Var) linalg.Matrix<T> {
+fn (g Graph<T>&) Value(v Var) linalg.Matrix<T> {
     at, rows, cols := g.place(v, 0)
-    return linalg.View(g.mem, at, rows, cols)
+    return linalg.Matrix.View(g.mem, at, rows, cols)!
 }
 
 # v's gradient, as a view of the arena - for a node that has one (a parameter, or anything depending on one)
-fn (g Graph<<T>>&) Grad(v Var) linalg.Matrix<T> {
+fn (g Graph<T>&) Grad(v Var) linalg.Matrix<T> {
     at, rows, cols := g.place(v, 1)
-    return linalg.View(g.mem, at, rows, cols)
+    return linalg.Matrix.View(g.mem, at, rows, cols)!
 }
 
 # where node v's value (what 0), gradient (1) or saved matrix (2) is in the arena, and its rows and columns in use
-fn (g Graph<<T>>&) place(v Var, what I64) (I64, I64, I64) {
+fn (g Graph<T>&) place(v Var, what I64) I64, I64, I64 {
     nd := g.nodes[v]
     if what == 1 {
         assert nd.GradOffset >= 0
@@ -642,19 +637,19 @@ fn (g Graph<<T>>&) place(v Var, what I64) (I64, I64, I64) {
 }
 
 # where the caller puts an input's batch: Batch rows of its columns, one after another
-fn (g Graph<<T>>&) InputData(v Var) mut Array<T>&g {
+fn (g Graph<T>&) InputData(v Var) mut Array<T>& {
     nd := g.nodes[v]
     return g.mem[nd.Offset:nd.Offset + nd.Rows * nd.Cols]
 }
 
 # where the caller puts a batch's classes, one per row (a negative class is padding the loss ignores)
-fn (g Graph<<T>>&) ClassData(v Var) mut Array<I32>&g {
+fn (g Graph<T>&) ClassData(v Var) mut Array<I32>& {
     nd := g.nodes[v]
     return g.classes[nd.Offset:nd.Offset + nd.Rows]
 }
 
 # where the caller puts a batch's tokens, one per row
-fn (g Graph<<T>>&) TokenData(v Var) mut Array<I32>&g {
+fn (g Graph<T>&) TokenData(v Var) mut Array<I32>& {
     return g.ClassData(v)
 }
 
@@ -664,25 +659,25 @@ fn (g Graph<<T>>&) TokenData(v Var) mut Array<I32>&g {
 # steps, makes the next region this one.
 
 # where the next step's batch of input v goes, in a graph planned Ahead
-fn (g Graph<<T>>&) NextInputData(v Var) mut Array<T>&g {
+fn (g Graph<T>&) NextInputData(v Var) mut Array<T>& {
     nd := g.nodes[v]
     if nd.NextOffset < 0 { mismatch("NextInputData of a graph not planned Ahead, or of a node no Input") }
     return g.mem[nd.NextOffset:nd.NextOffset + nd.Rows * nd.Cols]
 }
 
 # where the next step's classes (or tokens) go, in a graph planned Ahead
-fn (g Graph<<T>>&) NextClassData(v Var) mut Array<I32>&g {
+fn (g Graph<T>&) NextClassData(v Var) mut Array<I32>& {
     nd := g.nodes[v]
     if nd.NextOffset < 0 { mismatch("NextClassData of a graph not planned Ahead, or of a node no Classes or Tokens") }
     return g.classes[nd.NextOffset:nd.NextOffset + nd.Rows]
 }
 
-fn (g Graph<<T>>&) NextTokenData(v Var) mut Array<I32>&g {
+fn (g Graph<T>&) NextTokenData(v Var) mut Array<I32>& {
     return g.NextClassData(v)
 }
 
 # makes every input's next region the one the next Forward reads, and this one the region filled after it
-fn (g mut Graph<<T>>&) Flip() {
+fn (g mut Graph<T>&) Flip() {
     for i in range g.nodes.Len() {
         nd := g.nodes[i]
         if nd.NextOffset >= 0 {
@@ -695,32 +690,32 @@ fn (g mut Graph<<T>>&) Flip() {
 }
 
 # attention's scratch: a region of the arena
-fn (g Graph<<T>>&) scratch() mut Array<T>&g {
+fn (g Graph<T>&) scratch() mut Array<T>& {
     return g.mem[g.scratchOffset:g.scratchOffset + g.scratchSize]
 }
 
 # a convolution's patches for n images, in the region every convolution shares
-fn (g Graph<<T>>&) patches(s conv.Shape&, n I64) linalg.Matrix<T> {
-    return linalg.View(g.mem, g.colsOffset, n * s.Positions(), s.Patch())
+fn (g Graph<T>&) patches(s conv.Shape&, n I64) linalg.Matrix<T> {
+    return linalg.Matrix.View(g.mem, g.colsOffset, n * s.Positions(), s.Patch())!
 }
 
 # a loss's value, in F64 - computed in the type the graph computes in, then summed in F64 - or any 1 x 1 node's element
-fn (g Graph<<T>>&) Scalar(v Var) F64 {
+fn (g Graph<T>&) Scalar(v Var) F64 {
     nd := g.nodes[v]
     match nd.Kind {
         case Op.SoftmaxCrossEntropy(_, _), Op.Mse(_, _) { return g.losses[v] }
-        nomatch { return F64(g.mem[nd.Offset]) }
+        case _ { return F64(g.mem[nd.Offset]) }
     }
 }
 
 # every parameter, one after another as one 1 x ParamCount matrix - what an optimizer updates
-fn (g Graph<<T>>&) Params() linalg.Matrix<T> {
-    return linalg.View(g.mem, 0, 1, g.ParamCount)
+fn (g Graph<T>&) Params() linalg.Matrix<T> {
+    return linalg.Matrix.View(g.mem, 0, 1, g.ParamCount)!
 }
 
 # every parameter's gradient, laid out as Params() is
-fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<T> {
-    return linalg.View(g.mem, g.ParamCount, 1, g.ParamCount)
+fn (g Graph<T>&) ParamGrads() linalg.Matrix<T> {
+    return linalg.Matrix.View(g.mem, g.ParamCount, 1, g.ParamCount)!
 }
 
 # ---- INT8 inference ----
@@ -730,36 +725,36 @@ fn (g Graph<<T>>&) ParamGrads() linalg.Matrix<T> {
 # range (dynamically), the bias added in the product's store. Inference only, an F32 graph only: the weights quantized
 # are a copy, so training on and quantizing again is the way to quantize new weights.
 
-fn (g mut Graph<<T>>&) QuantizeLinear() {
+fn (g mut Graph<T>&) QuantizeLinear() {
     match T {
         case F32 { }
-        nomatch { mismatch("INT8 inference is for an F32 graph") }
+        case _ { mismatch("INT8 inference is for an F32 graph") }
     }
-    g.int8Weights = List<quant.Weights>()
-    g.int8At = List<I64>()
+    g.int8Weights = list.List<quant.Weights>()
+    g.int8At = list.List<I64>()
     widest I64 = 0
     for i in range g.nodes.Len() {
         match g.nodes[i].Kind {
-            case Op.Linear(x, w, b) {
+            case Op.Linear(x, w, _) {
                 g.int8At.Push(g.int8Weights.Len())
-                g.int8Weights.Push(quant.QuantizeWeights(g.Value(w)))
+                g.int8Weights.Push(quant.Weights.Quantize(g.Value(w)))
                 widest = widest if widest > g.nodes[x].Cols else g.nodes[x].Cols
             }
-            nomatch { g.int8At.Push(-1) }
+            case _ { g.int8At.Push(-1) }
         }
     }
     g.int8Acts = quant.Activations(quant.ElementsFor(g.Batch, widest))
 }
 
 # a Linear node's product in INT8: its input quantized over its own range into acts, the bias added in the store
-fn linearInt8(acts mut quant.Activations&, w quant.Weights&, yd mut Array<<T>>&, ys I64, x linalg.Matrix<T>&,
+fn linearInt8<T>(acts mut quant.Activations&, w quant.Weights&, yd mut Array<T>&, ys I64, x linalg.Matrix<T>&
         b linalg.Matrix<T>&, th I64) {
     match T {
         case F32 {
             acts.QuantizeDynamic(x)
             quant.LinearInto(yd, ys, acts, w, b.Row(0), false, th)
         }
-        nomatch { mismatch("INT8 inference is for an F32 graph") }
+        case _ { mismatch("INT8 inference is for an F32 graph") }
     }
 }
 
@@ -769,19 +764,19 @@ fn linearInt8(acts mut quant.Activations&, w quant.Weights&, yd mut Array<<T>>&,
 # a BF16 graph's F32 masters, so that a BF16 graph's checkpoint is an F32 graph's. A graph built the same way loads
 # it back whatever its batch.
 
-error CheckpointError {
-    MALFORMED          # not a checkpoint, or one of another element type or size
+type CheckpointError error {
+    Malformed          # not a checkpoint, or one of another element type or size
 }
 
 # the parameters of g written to "path"
-fn (g Graph<<T>>&) Save(path String&) ? os.OsError {
+fn (g Graph<T>&) Save(path String&) ? os.Error {
     match T {
         case BF16 { try saveParams(g.masters, path) }
-        nomatch { try saveParams(g.mem[:g.ParamCount], path) }
+        case _ { try saveParams(g.mem[:g.ParamCount], path) }
     }
 }
 
-fn saveParams(params Array<<E>>&, path String&) ? os.OsError {
+fn saveParams<E>(params Array<E>&, path String&) ? os.Error {
     like E
     width I64 = elementWidth(like)
     out := Array<U8>(16 + width * params.Len())
@@ -791,8 +786,8 @@ fn saveParams(params Array<<E>>&, path String&) ? os.OsError {
     putWord(out, 8, U64(params.Len()), 8)
     for i in range params.Len() {
         bits U64 = match E {
-            case F32 => U64(params[i].Bits())
-            case F64 => params[i].Bits()
+            case F32: U64(params[i].Bits())
+            case F64: params[i].Bits()
         }
         putWord(out, 16 + i * width, bits, width)
     }
@@ -800,37 +795,37 @@ fn saveParams(params Array<<E>>&, path String&) ? os.OsError {
 }
 
 # the parameters of g read from "path", written by Save from a graph with the same parameters
-fn (g mut Graph<<T>>&) Load(path String&) ? os.OsError + CheckpointError {
+fn (g mut Graph<T>&) Load(path String&) ? os.Error, CheckpointError {
     match T {
         case BF16 {
             try loadParams(g.masters, path)
             g.SyncParams()
         }
-        nomatch { try loadParams(g.mem[:g.ParamCount], path) }
+        case _ { try loadParams(g.mem[:g.ParamCount], path) }
     }
 }
 
-fn loadParams(params mut Array<<E>>&, path String&) ? os.OsError + CheckpointError {
+fn loadParams<E>(params mut Array<E>&, path String&) ? os.Error, CheckpointError {
     data := try os.ReadFile(path)
     like E
     width I64 = elementWidth(like)
     if data.Len() != 16 + width * params.Len() or data[:4] != "oann" or I64(U8(data[4])) != width {
-        error CheckpointError.MALFORMED
+        error CheckpointError.Malformed
     }
-    if getWord(data, 8, 8) != U64(params.Len()) { error CheckpointError.MALFORMED }
+    if getWord(data, 8, 8) != U64(params.Len()) { error CheckpointError.Malformed }
     for i in range params.Len() {
         bits := getWord(data, 16 + i * width, width)
         params[i] = match E {
-            case F32 => U32(bits).F32FromBits()
-            case F64 => bits.F64FromBits()
+            case F32: F32.FromBits(U32(bits))
+            case F64: F64.FromBits(bits)
         }
     }
 }
 
-fn elementWidth(like <T>) I64 {
+fn elementWidth<T>(like T) I64 {
     return match T {
-        case F32 => 4
-        case F64 => 8
+        case F32: 4
+        case F64: 8
     }
 }
 
@@ -847,7 +842,7 @@ fn getWord(data String&, at I64, width I64) U64 {
 # ---- running ----
 
 # runs every node in the order recorded, on the first n rows of the batch (n at most Batch)
-fn (g mut Graph<<T>>&) Forward(n I64) {
+fn (g mut Graph<T>&) Forward(n I64) {
     if not g.planned { mismatch("Forward before Plan") }
     if n < 1 or n > g.Batch { mismatch("Forward on " $n " rows of a graph planned for " $(g.Batch)) }
     g.N = n
@@ -865,10 +860,10 @@ fn (g mut Graph<<T>>&) Forward(n I64) {
 }
 
 # node v's forward: its value from its inputs' - computed in F32 for a BF16 graph, in the graph's own type otherwise
-fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
+fn (g mut Graph<T>&) forward(node Var, nd Node&, th I64) {
     match T {
         case BF16 { g.forwardIn(node, nd, th, F32(0)) }
-        nomatch {
+        case _ {
             like T
             g.forwardIn(node, nd, th, like)
         }
@@ -876,7 +871,7 @@ fn (g mut Graph<<T>>&) forward(node Var, nd Node&, th I64) {
 }
 
 # node v's forward, computed in the type of z
-fn (g mut Graph<<T>>&) forwardIn(node Var, nd Node&, th I64, z <A>) {
+fn (g mut Graph<T>&) forwardIn<A>(node Var, nd Node&, th I64, z A) {
     like T
     y := g.Value(node)
     match nd.Kind {
@@ -901,28 +896,28 @@ fn (g mut Graph<<T>>&) forwardIn(node Var, nd Node&, th I64, z <A>) {
         case Op.Tanh(x) { ops.Tanh(y, g.Value(x), z) }
         case Op.Softmax(x) { ops.Softmax(y, g.Value(x), z) }
         case Op.Embedding(t, w) { ops.Embedding(y, g.classData(t), g.Value(w)) }
-        case Op.Positions(x, w, T) { ops.Positions(y, g.Value(x), g.Value(w), T, g.Pos, z) }
+        case Op.Positions(x, w, ctx) { ops.Positions(y, g.Value(x), g.Value(w), ctx, g.Pos, z) }
         case Op.LayerNorm(x, a, b, eps) {
             ops.LayerNorm(y, g.Value(x), g.Value(a), g.Value(b), linalg.Cast(eps, z), g.saved(node))
         }
         case Op.RmsNorm(x, a, eps) { ops.RmsNorm(y, g.Value(x), g.Value(a), linalg.Cast(eps, z), g.saved(node)) }
-        case Op.Attention(q, k, v, heads, T, causal) {
+        case Op.Attention(q, k, v, heads, ctx, causal) {
             if g.Decoding {
-                if not causal or g.Pos < 0 or g.Pos + g.N > T {
-                    mismatch("decoding positions " $(g.Pos) " ... " $(g.Pos + g.N - 1) " of causal attention over " $T)
+                if not causal or g.Pos < 0 or g.Pos + g.N > ctx {
+                    mismatch("decoding positions " $(g.Pos) " ... " $(g.Pos + g.N - 1) " of causal attention over " $ctx)
                 }
                 o := nd.SavedOffset
-                keys := linalg.View(g.mem, o, T, nd.Cols)
-                values := linalg.View(g.mem, o + T * nd.Cols, T, nd.Cols)
-                scores := g.mem[o + 2 * T * nd.Cols:o + 2 * T * nd.Cols + T]
+                keys := linalg.Matrix.View(g.mem, o, ctx, nd.Cols)!
+                values := linalg.Matrix.View(g.mem, o + ctx * nd.Cols, ctx, nd.Cols)!
+                scores := g.mem[o + 2 * ctx * nd.Cols:o + 2 * ctx * nd.Cols + ctx]
                 ops.AttentionCached(y, g.Value(q), g.Value(k), g.Value(v), heads, g.Pos, keys, values, scores)
             } else {
-                if g.N % T != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $T) }
-                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, T, causal, g.saved(node), th, g.ws, z)
+                if g.N % ctx != 0 { mismatch("Forward on " $(g.N) " rows: not whole sequences of " $ctx) }
+                ops.Attention(y, g.Value(q), g.Value(k), g.Value(v), heads, ctx, causal, g.saved(node), th, g.ws, z)
             }
         }
         case Op.Dropout(x, p) {
-            if g.Training { ops.Dropout(y, g.Value(x), g.saved(node), p, g.Rng, z) } else { y.Copy(g.Value(x)) }
+            if g.Training { ops.Dropout(y, g.Value(x), g.saved(node), p, g.Rng, z) } else { y.CopyFrom(g.Value(x))! }
         }
         case Op.SoftmaxCrossEntropy(l, c) {
             g.losses[node] = ops.SoftmaxCrossEntropy(g.Value(l), g.classData(c), g.saved(node), z)
@@ -940,27 +935,27 @@ fn (g mut Graph<<T>>&) forwardIn(node Var, nd Node&, th I64, z <A>) {
 }
 
 # the classes of the rows in use
-fn (g Graph<<T>>&) classData(v Var) Array<I32>&g {
+fn (g Graph<T>&) classData(v Var) Array<I32>& {
     nd := g.nodes[v]
     return g.classes[nd.Offset:nd.Offset + g.N]
 }
 
 # the matrix an operation keeps for its backward, for the rows in use: a loss's softmax, a normalization's row
 # statistics, attention's probabilities, dropout's mask
-fn (g Graph<<T>>&) saved(v Var) linalg.Matrix<T> {
+fn (g Graph<T>&) saved(v Var) linalg.Matrix<T> {
     at, sr, sc := g.place(v, 2)
-    return linalg.View(g.mem, at, sr, sc)
+    return linalg.Matrix.View(g.mem, at, sr, sc)!
 }
 
 # v's gradient to write into for a contribution, or an empty matrix where v needs none; whether to add to it is
 # acc(v)
-fn (g Graph<<T>>&) gradOf(v I64) linalg.Matrix<T> {
-    if v < 0 or g.nodes[v].GradOffset < 0 { return linalg.View(g.mem, 0, 0, 0) }
+fn (g Graph<T>&) gradOf(v I64) linalg.Matrix<T> {
+    if v < 0 or g.nodes[v].GradOffset < 0 { return linalg.Matrix.View(g.mem, 0, 0, 0)! }
     return g.Grad(Var(v))
 }
 
 # whether a contribution to v's gradient adds to one already made this backward - and from now on, one has been
-fn (g Graph<<T>>&) acc(v I64) Bool {
+fn (g Graph<T>&) acc(v I64) Bool {
     if v < 0 { return false }
     was := g.written[v]
     g.written[v] = true
@@ -970,13 +965,13 @@ fn (g Graph<<T>>&) acc(v I64) Bool {
 # the gradients of loss - a 1 x 1 node - with respect to every node it depends on, parameters included, after a
 # Forward. A parameter's gradient is written afresh (zero where the loss does not depend on it); with accumulate
 # set it is added to the one already there instead, summing several batches' gradients before one update
-fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
+fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false) {
     if g.Decoding { mismatch("Backward on a graph for decoding") }
     top := g.nodes[loss]
     if top.Rows != 1 or top.Cols != 1 or top.GradOffset < 0 {
         mismatch("Backward from a node that is no loss depending on a parameter")
     }
-    for i in range g.nodes.Len() { g.written[i] = accumulate and g.nodes[i].Kind is Op.Param }
+    for i in range g.nodes.Len() { g.written[i] = accumulate and g.nodes[i].Kind == Op.Param }
     g.mem[top.GradOffset] = 1.0
     g.written[loss] = true
     th := g.Threads
@@ -996,16 +991,16 @@ fn (g mut Graph<<T>>&) Backward(loss Var, accumulate Bool = false) {
         i--
     }
     for k in range g.nodes.Len() {
-        if g.nodes[k].Kind is Op.Param and not g.written[k] { g.Grad(Var(k)).Fill(zero) }
+        if g.nodes[k].Kind == Op.Param and not g.written[k] { g.Grad(Var(k)).Fill(zero) }
     }
 }
 
 # node v's backward: its inputs' gradients from its own - computed in F32 for a BF16 graph, in the graph's own type
 # otherwise
-fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
+fn (g mut Graph<T>&) backward(v Var, nd Node&, th I64) {
     match T {
         case BF16 { g.backwardIn(v, nd, th, F32(0)) }
-        nomatch {
+        case _ {
             like T
             g.backwardIn(v, nd, th, like)
         }
@@ -1013,7 +1008,7 @@ fn (g mut Graph<<T>>&) backward(v Var, nd Node&, th I64) {
 }
 
 # node v's backward, computed in the type of z
-fn (g mut Graph<<T>>&) backwardIn(v Var, nd Node&, th I64, z <A>) {
+fn (g mut Graph<T>&) backwardIn<A>(v Var, nd Node&, th I64, z A) {
     dy := g.Grad(v)
     match nd.Kind {
         case Op.Input, Op.Classes, Op.Tokens, Op.Constant, Op.Param(_, _) { }
@@ -1090,12 +1085,12 @@ fn (g mut Graph<<T>>&) backwardIn(v Var, nd Node&, th I64, z <A>) {
         case Op.Embedding(t, w) {
             if g.nodes[w].GradOffset >= 0 { ops.EmbeddingBackward(dy, g.classData(t), g.Grad(w), g.acc(w), z) }
         }
-        case Op.Positions(x, w, T) {
+        case Op.Positions(x, w, ctx) {
             dx := g.gradOf(x)
             cx := g.acc(x)
             dw := g.gradOf(w)
             cw := g.acc(w)
-            ops.PositionsBackward(dy, T, g.Pos, dx, cx, dw, cw, z)
+            ops.PositionsBackward(dy, ctx, g.Pos, dx, cx, dw, cw, z)
         }
         case Op.LayerNorm(x, a, b, _) {
             dx := g.gradOf(x)
@@ -1113,28 +1108,25 @@ fn (g mut Graph<<T>>&) backwardIn(v Var, nd Node&, th I64, z <A>) {
             ca := g.acc(a)
             ops.RmsNormBackward(dy, g.Value(x), g.Value(a), g.saved(v), dx, cx, da, ca, z)
         }
-        case Op.Attention(q, k, w, heads, T, causal) {
+        case Op.Attention(q, k, w, heads, ctx, causal) {
             dq := g.gradOf(q)
             cq := g.acc(q)
             dk := g.gradOf(k)
             ck := g.acc(k)
             dw := g.gradOf(w)
             cw := g.acc(w)
-            ops.AttentionBackward(dy, g.Value(q), g.Value(k), g.Value(w), heads, T, causal, g.saved(v), dq, cq, dk, ck,
+            ops.AttentionBackward(dy, g.Value(q), g.Value(k), g.Value(w), heads, ctx, causal, g.saved(v), dq, cq, dk, ck
                 dw, cw, g.scratch(), th, g.ws, z)
         }
         case Op.Dropout(x, p) {
             if g.nodes[x].GradOffset >= 0 {
-                if g.Training {
-                    ops.DropoutBackward(dy, g.saved(v), p, g.Grad(x), g.acc(x), z)
-                } else {
-                    ops.AddBackward(dy, g.Grad(x), g.acc(x), g.gradOf(-1), false, z)
-                }
+                if g.Training: ops.DropoutBackward(dy, g.saved(v), p, g.Grad(x), g.acc(x), z)
+                else: ops.AddBackward(dy, g.Grad(x), g.acc(x), g.gradOf(-1), false, z)
             }
         }
         case Op.SoftmaxCrossEntropy(l, c) {
             if g.nodes[l].GradOffset >= 0 {
-                ops.SoftmaxCrossEntropyBackward(linalg.Cast(dy.Data[0], z), g.classData(c), g.saved(v), g.Grad(l),
+                ops.SoftmaxCrossEntropyBackward(linalg.Cast(dy.Data[0], z), g.classData(c), g.saved(v), g.Grad(l)
                     g.acc(l))
             }
         }
@@ -1152,7 +1144,7 @@ fn (g mut Graph<<T>>&) backwardIn(v Var, nd Node&, th I64, z <A>) {
             cw := g.acc(w)
             db := g.gradOf(b)
             cb := g.acc(b)
-            conv.Conv2dBackward(dy, g.Value(x), g.Value(w), s, dx, cx, dw, cw, db, cb, g.patches(s, dy.Rows), th,
+            conv.Conv2dBackward(dy, g.Value(x), g.Value(w), s, dx, cx, dw, cw, db, cb, g.patches(s, dy.Rows), th
                 g.ws)
         }
         case Op.MaxPool2d(x, p) {
@@ -1209,33 +1201,33 @@ fn GradientError(g mut Graph<F64>&, loss Var, n I64, h F64 = 1e-6) F64 {
         a := analytic.Data[i]
         # relative, with a floor: a gradient near zero is compared absolutely, below the difference's own rounding
         # error (about 1e-16 * loss / h) but far above any mistake in a backward
-        scale F64 = math.Max(math.Abs(numeric) + math.Abs(a), 1e-3)
-        e F64 = math.Abs(numeric - a) / scale
+        scale F64 = (numeric.Abs() + a.Abs()).Max(1e-3)
+        e F64 = (numeric - a).Abs() / scale
         if e > worst { worst = e }
     }
     return worst
 }
 
-fn normal(g mut Graph<F64>&, rows I64, cols I64) Var {
+fn Var.normal(g mut Graph<F64>&, rows I64, cols I64) Var {
     return g.Param(rows, cols, Init.Normal(0.0, 1.0), true)
 }
 
 test "every operation's backward agrees with central differences" {
     g := Graph<F64>(5)
-    a := normal(g, 3, 4)
-    b := normal(g, 4, 2)
-    bt := normal(g, 2, 4)
-    at := normal(g, 4, 3)
+    a := Var.normal(g, 3, 4)
+    b := Var.normal(g, 4, 2)
+    bt := Var.normal(g, 2, 4)
+    at := Var.normal(g, 4, 3)
     p1 := g.MatMul(a, b, false, false)          # 3 x 2
     p2 := g.MatMul(a, bt, false, true)
     p3 := g.MatMul(at, b, true, false)
     p4 := g.MatMul(at, bt, true, true)
     s := g.Add(g.Sub(p1, p2), g.Mul(p3, g.Scale(p4, 0.7)))
-    row := normal(g, 1, 2)
+    row := Var.normal(g, 1, 2)
     acts := g.Add(g.Add(g.Relu(g.AddRow(s, row)), g.LeakyRelu(s, 0.1)), g.Add(g.Gelu(s), g.Sigmoid(s)))
     t := g.Add(g.Tanh(acts), g.Softmax(acts))
-    target := normal(g, 3, 2)
-    unused := normal(g, 2, 2)
+    target := Var.normal(g, 3, 2)
+    unused := Var.normal(g, 2, 2)
     loss := g.Mse(t, target)
     r := rand.Rand(5)
     g.Plan(r)
@@ -1247,10 +1239,10 @@ test "a batched network's gradients agree, on a short batch and with a value use
     g := Graph<F64>(6)
     x := g.Input(4)
     y := g.Classes()
-    w1 := normal(g, 5, 4)
-    b1 := normal(g, 1, 5)
-    w2 := normal(g, 3, 5)
-    b2 := normal(g, 1, 3)
+    w1 := Var.normal(g, 5, 4)
+    b1 := Var.normal(g, 1, 5)
+    w2 := Var.normal(g, 3, 5)
+    b2 := Var.normal(g, 1, 3)
     h := g.Gelu(g.Linear(x, w1, b1))
     twice := g.Add(h, g.Tanh(h))                  # h feeds two operations: its gradient is collected from both
     logits := g.Linear(twice, w2, b2)
@@ -1267,8 +1259,8 @@ test "a batched network's gradients agree, on a short batch and with a value use
 
 test "Backward with accumulate adds to the gradients already there" {
     g := Graph<F64>(2)
-    w := normal(g, 2, 2)
-    target := normal(g, 2, 2)
+    w := Var.normal(g, 2, 2)
+    target := Var.normal(g, 2, 2)
     loss := g.Mse(w, target)
     r := rand.Rand(2)
     g.Plan(r)
@@ -1276,7 +1268,7 @@ test "Backward with accumulate adds to the gradients already there" {
     g.Backward(loss)
     once := g.Grad(w).Get(0, 1)
     g.Backward(loss, true)
-    assert math.Abs(g.Grad(w).Get(0, 1) - 2.0 * once) < 1e-12
+    assert (g.Grad(w).Get(0, 1) - 2.0 * once).Abs() < 1e-12
     g.Backward(loss)
     assert g.Grad(w).Get(0, 1) == once
 }
@@ -1285,19 +1277,19 @@ test "embedding, positions and both normalizations agree with central difference
     g := Graph<F64>(6)
     tok := g.Tokens()
     y := g.Classes()
-    table := normal(g, 5, 4)                      # a vocabulary of 5, width 4
-    pos := normal(g, 3, 4)                        # sequences of 3: the batch is two
+    table := Var.normal(g, 5, 4)                      # a vocabulary of 5, width 4
+    pos := Var.normal(g, 3, 4)                        # sequences of 3: the batch is two
     e := g.Positions(g.Embedding(tok, table), pos)
-    h := g.LayerNorm(e, normal(g, 1, 4), normal(g, 1, 4))
-    h2 := g.RmsNorm(g.Tanh(h), normal(g, 1, 4))
+    h := g.LayerNorm(e, Var.normal(g, 1, 4), Var.normal(g, 1, 4))
+    h2 := g.RmsNorm(g.Tanh(h), Var.normal(g, 1, 4))
     logits := g.MatMul(h2, table, false, true)   # the table again: tied weights, two contributions to its gradient
     loss := g.SoftmaxCrossEntropy(logits, y)
     r := rand.Rand(11)
     g.Plan(r)
     td := g.TokenData(tok)
-    for i in range 6 { td[i] = I32(I32[3, 1, 3, 0, 4, 3][i]) }
+    for i in range 6 { td[i] = I32(Array<I32>[3, 1, 3, 0, 4, 3][i]) }
     yd := g.ClassData(y)
-    for i in range 6 { yd[i] = I32[1, 3, -1, 4, 4, 0][i] }
+    for i in range 6 { yd[i] = Array<I32>[1, 3, -1, 4, 4, 0][i] }
     assert GradientError(g, loss, 6) < 1e-6
     assert GradientError(g, loss, 3) < 1e-6
     # the padding row changes nothing: the loss is the mean over the other five rows
@@ -1312,9 +1304,9 @@ test "embedding, positions and both normalizations agree with central difference
 test "attention agrees with central differences: causal and not, several heads, itself as q, k and v" {
     g := Graph<F64>(6)
     x := g.Input(4)
-    q := g.MatMul(x, normal(g, 4, 4), false, true)
-    k := g.MatMul(x, normal(g, 4, 4), false, true)
-    v := g.MatMul(x, normal(g, 4, 4), false, true)
+    q := g.MatMul(x, Var.normal(g, 4, 4), false, true)
+    k := g.MatMul(x, Var.normal(g, 4, 4), false, true)
+    v := g.MatMul(x, Var.normal(g, 4, 4), false, true)
     a := g.Attention(q, k, v, 2, 3, true)
     b := g.Attention(a, a, a, 1, 3, false)
     target := g.Input(4)
@@ -1332,7 +1324,7 @@ test "attention agrees with central differences: causal and not, several heads, 
 test "attention agrees with central differences on longer sequences, the causal products confined to their triangles" {
     # T 8 in two heads: a product a tile or two, straddling the diagonal; T 130 in heads of 16: tiles wholly above the
     # diagonal skipped, the rest packed and blocked as a large product is
-    for T in I64[8, 130] {
+    for T in Array<I64>[8, 130] {
         g := Graph<F64>(2 * T)
         x := g.Input(16)
         q := g.MatMul(x, g.Param(16, 16, Init.Normal(0.0, 0.25), true), false, true)
@@ -1376,21 +1368,21 @@ test "causal attention: a row's output depends on no later row" {
     hd := h.InputData(hx)
     for i in range hd.Len() { hd[i] = r.Normal() }
     h.Forward(32)
-    early := h.Value(ha).RowRange(0, 20).Clone()
+    early := try h.Value(ha).RowRange(0, 20).Clone()
     for c in range 8 { hd[25 * 8 + c] = 7.0 }
     h.Forward(32)
-    assert h.Value(ha).RowRange(0, 20).MaxAbsDifference(early) == 0.0
-    assert h.Value(ha).RowRange(25, 26).MaxAbsDifference(early.RowRange(0, 1)) != 0.0
+    assert try h.Value(ha).RowRange(0, 20).MaxAbsDifference(early) == 0.0
+    assert try h.Value(ha).RowRange(25, 26).MaxAbsDifference(early.RowRange(0, 1)) != 0.0
     h.Backward(hl)
     assert GradientError(h, hl, 32) < 1e-6
 }
 
 test "dropout: a fixed mask's gradient agrees, the kept are scaled up, and off when not training" {
     g := Graph<F64>(8)
-    w := normal(g, 8, 16)
+    w := Var.normal(g, 8, 16)
     th := g.Tanh(w)
     d := g.Dropout(th, 0.25)
-    target := normal(g, 8, 16)
+    target := Var.normal(g, 8, 16)
     loss := g.Mse(d, target)
     r := rand.Rand(14)
     g.Plan(r)
@@ -1400,25 +1392,25 @@ test "dropout: a fixed mask's gradient agrees, the kept are scaled up, and off w
     t := g.Value(th)
     out := g.Value(d)
     for i in range 128 {
-        if out.Data[i] == 0.0 { dropped++ } else { assert math.Abs(out.Data[i] - t.Data[i] / 0.75) < 1e-12 }
+        if out.Data[i] == 0.0 { dropped++ } else { assert (out.Data[i] - t.Data[i] / 0.75).Abs() < 1e-12 }
     }
     assert dropped > 16 and dropped < 50
     g.Training = false
     g.Forward(8)
-    assert g.Value(d).MaxAbsDifference(t) == 0.0
+    assert try g.Value(d).MaxAbsDifference(t) == 0.0
 }
 
 test "GELU through tanh agrees with central differences, and within 1e-3 of the exact GELU" {
     g := Graph<F64>(4)
-    w := normal(g, 4, 8)
+    w := Var.normal(g, 4, 8)
     a := g.GeluTanh(g.Scale(w, 2.0))
     b := g.Gelu(g.Scale(w, 2.0))
-    loss := g.Mse(a, normal(g, 4, 8))
+    loss := g.Mse(a, Var.normal(g, 4, 8))
     r := rand.Rand(15)
     g.Plan(r)
     assert GradientError(g, loss, 4) < 1e-6
     g.Forward(4)
-    assert g.Value(a).MaxAbsDifference(g.Value(b)) < 1e-3
+    assert try g.Value(a).MaxAbsDifference(g.Value(b)) < 1e-3
 }
 
 test "a checkpoint saves the parameters and loads them back into a graph built the same way" {
@@ -1427,13 +1419,13 @@ test "a checkpoint saves the parameters and loads them back into a graph built t
     a.Param(1, 5, Init.Uniform(-1.0, 1.0), false)
     r := rand.Rand(16)
     a.Plan(r)
-    try a.Save("build/nn_checkpoint") catch { fail }
+    try a.Save("build/nn_checkpoint")
     b := Graph<F32>(8)
     wb := b.Param(3, 5, Init.Zeros, true)
     b.Param(1, 5, Init.Zeros, false)
     b.Plan(r)
-    try b.Load("build/nn_checkpoint") catch { fail }
-    assert b.Params().MaxAbsDifference(a.Params()) == 0.0 and b.Value(wb).Get(2, 4) == a.Value(wa).Get(2, 4)
+    try b.Load("build/nn_checkpoint")
+    assert try b.Params().MaxAbsDifference(a.Params()) == 0.0 and b.Value(wb).Get(2, 4) == a.Value(wa).Get(2, 4)
     c := Graph<F32>(4)
     c.Param(3, 4, Init.Zeros, true)
     c.Plan(r)
@@ -1455,7 +1447,7 @@ test "attention split over tasks gives exactly what one task gives, forward and 
         for threads in range 1, 4, 2 {
             g := Graph<F64>(rows, threads)
             x := g.Input(cols)
-            q := g.MatMul(x, normal(g, cols, cols), false, true)
+            q := g.MatMul(x, Var.normal(g, cols, cols), false, true)
             a := g.Attention(q, x, x, 2, T, true)
             loss := g.Mse(a, g.Input(cols))
             r := rand.Rand(17)
@@ -1465,10 +1457,10 @@ test "attention split over tasks gives exactly what one task gives, forward and 
             g.Forward(rows)
             g.Backward(loss)
             if threads == 1 {
-                want.Copy(g.ParamGrads())
+                try want.CopyFrom(g.ParamGrads())
                 wantLoss = g.Scalar(loss)
             } else {
-                assert g.ParamGrads().MaxAbsDifference(want) == 0.0 and g.Scalar(loss) == wantLoss
+                assert try g.ParamGrads().MaxAbsDifference(want) == 0.0 and g.Scalar(loss) == wantLoss
             }
         }
     }
@@ -1478,7 +1470,7 @@ test "attention split over tasks gives exactly what one task gives, forward and 
 
 # a small transformer-like network on g: a dense layer, GELU, layer and RMS normalization, causal attention over two
 # heads, dropout off, another dense layer and softmax cross-entropy - every kind of kernel a BF16 graph runs
-fn mixedNet(g mut Graph<<T>>&) (Var, Var, Var) {
+fn mixedNet<T>(g mut Graph<T>&) Var, Var, Var {
     x := g.Input(8)
     y := g.Classes()
     w1 := g.Param(16, 8, Init.Normal(0.0, 0.4), true)
@@ -1492,7 +1484,7 @@ fn mixedNet(g mut Graph<<T>>&) (Var, Var, Var) {
     return x, y, g.SoftmaxCrossEntropy(logits, y)
 }
 
-fn fillMixed(g mut Graph<<T>>&, x Var, y Var, seed U64) {
+fn fillMixed<T>(g mut Graph<T>&, x Var, y Var, seed U64) {
     r := rand.Rand(seed)
     xd := g.InputData(x)
     like T
@@ -1511,16 +1503,16 @@ test "a BF16 graph keeps F32 masters drawn as an F32 graph's, and computes as th
     c := Graph<F32>(16)
     mixedNet(c)
     c.Plan(rand.Rand(21))
-    assert b.Masters().MaxAbsDifference(c.Params()) == 0.0         # the same starting values, drawn in F32
+    assert try b.Masters().MaxAbsDifference(c.Params()) == 0.0         # the same starting values, drawn in F32
     for i in range b.ParamCount { assert b.Params().Data[i] == kernels.Down(b.Masters().Data[i], b.Params().Data[i]) }
-    a.Params().Convert(b.Params())                                   # the F64 graph from the very values b computes with
+    try a.Params().Convert(b.Params())                                   # the F64 graph from the very values b computes with
     fillMixed(a, ax, ay, 3)
     fillMixed(b, bx, by, 3)
     a.Forward(16)
     a.Backward(aloss)
     b.Forward(16)
     b.Backward(bloss)
-    assert math.Abs(b.Scalar(bloss) - a.Scalar(aloss)) < 1e-3 * a.Scalar(aloss)       # measured: 9e-5
+    assert (b.Scalar(bloss) - a.Scalar(aloss)).Abs() < 1e-3 * a.Scalar(aloss)       # measured: 9e-5
     ga := a.ParamGrads()
     gb := b.ParamGrads()
     diff F64 = 0.0
@@ -1530,13 +1522,13 @@ test "a BF16 graph keeps F32 masters drawn as an F32 graph's, and computes as th
         diff += d * d
         norm += ga.Data[i] * ga.Data[i]
     }
-    assert math.Sqrt(diff / norm) < 2e-2            # measured: 0.7%
+    assert (diff / norm).Sqrt() < 2e-2            # measured: 0.7%
     # a short batch too
     a.Forward(8)
     a.Backward(aloss)
     b.Forward(8)
     b.Backward(bloss)
-    assert math.Abs(b.Scalar(bloss) - a.Scalar(aloss)) < 1e-3 * a.Scalar(aloss)
+    assert (b.Scalar(bloss) - a.Scalar(aloss)).Abs() < 1e-3 * a.Scalar(aloss)
 }
 
 test "a BF16 graph's checkpoint is its F32 masters, and loads into an F32 graph or a BF16 one exactly" {
@@ -1545,17 +1537,17 @@ test "a BF16 graph's checkpoint is its F32 masters, and loads into an F32 graph 
     b.Plan(rand.Rand(22))
     for i in range b.ParamCount { b.Masters().Data[i] = b.Masters().Data[i] + 1e-4 }    # masters BF16 cannot hold
     b.SyncParams()
-    try b.Save("build/nn_mixed_checkpoint") catch { fail }
+    try b.Save("build/nn_mixed_checkpoint")
     c := Graph<F32>(8)
     mixedNet(c)
     c.Plan(rand.Rand(1))
-    try c.Load("build/nn_mixed_checkpoint") catch { fail }
-    assert c.Params().MaxAbsDifference(b.Masters()) == 0.0
+    try c.Load("build/nn_mixed_checkpoint")
+    assert try c.Params().MaxAbsDifference(b.Masters()) == 0.0
     d := Graph<BF16>(16)
     mixedNet(d)
     d.Plan(rand.Rand(1))
-    try d.Load("build/nn_mixed_checkpoint") catch { fail }
-    assert d.Masters().MaxAbsDifference(b.Masters()) == 0.0 and d.Params().MaxAbsDifference(b.Params()) == 0.0
+    try d.Load("build/nn_mixed_checkpoint")
+    assert try d.Masters().MaxAbsDifference(b.Masters()) == 0.0 and try d.Params().MaxAbsDifference(b.Params()) == 0.0
 }
 
 test "QuantizeLinear runs a graph's linear layers in INT8: within 2% of the F32 outputs' range, and F32 again when Int8 is off" {
@@ -1579,8 +1571,8 @@ test "QuantizeLinear runs a graph's linear layers in INT8: within 2% of the F32 
     scale F32 = 0.0
     worst F32 = 0.0
     for i in range 16 * 8 {
-        scale = math.Max(scale, math.Abs(exact.Data[i]))
-        worst = math.Max(worst, math.Abs(got.Data[i] - exact.Data[i]))
+        scale = scale.Max(exact.Data[i].Abs())
+        worst = worst.Max((got.Data[i] - exact.Data[i]).Abs())
     }
     assert worst > 0.0 and worst < 0.02 * scale
     g.Int8 = false
