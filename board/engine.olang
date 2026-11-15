@@ -1184,7 +1184,7 @@ fn (e Engine&) Bound<T>(s mut system.System<T>&, tolQ I64 = FloorLsb, beta F64 =
 # weights, biases and tables, the inputs, every phase's committed state and the settle's residuals - and for a spiking
 # circuit every phase's synaptic currents, spikes and rate traces and the window's counts - what a testbench feeds an
 # HLS or hardware engine and compares its result with, bit for bit
-fn (e Engine&) Dump(path String&) ? os.Error {
+fn (e Engine&) Image() Array<U8> {
     count I64 = 17 if e.Spiking else 13
     names := Array<String&>["regions", "blocks", "weights", "biases", "tables", "drives", "labels", "targets", "v", "s"
         "constant", "residuals", "scalars", "syn", "spikes", "traces", "counts"]
@@ -1257,7 +1257,12 @@ fn (e Engine&) Dump(path String&) ? os.Error {
         }
         for i in range whole: at = put(out, at, I64(e.Counts[i]), 4)
     }
-    try os.WriteFile(path, out)
+    return out
+}
+
+# the image written to path
+fn (e Engine&) Dump(path String&) ? os.Error {
+    try os.WriteFile(path, e.Image())
 }
 
 # x's low width bytes, little-endian, at out[at ..]; gives where they end
@@ -1658,6 +1663,7 @@ test "the board refuses as dyn's settle does not: a refused settle leaves the co
 
 import "../board"
 import "../circuit"
+import "../optim"
 
 fn rhoOf(f neuron.Rho) circuit.Rho {
     return match f {
@@ -1815,4 +1821,268 @@ test "board.olang's parity: the same image, the same settles and the same golden
         sameBytes(a, e, "rate")
         for j in range e.Neurons: assert a.Potential(circuit.Phase.Plus, 0, j) == e.Potential(settle.Phase.Plus, 0, j)
     }
+}
+
+test "board.olang's parity: a lesson's settles, the three phases, bit for bit; readout groups" {
+    r := rand.Rand(8)
+    # a readout of two groups of three beside the fixture's kind: x -> h <-> y
+    s := system.System<F64>(3)
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 5, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 6, neuron.Neuron.Rate(neuron.Rho.HardSigmoid), neuron.Role.Readout(neuron.Cost.CrossEntropy(0.25, 2)))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    s.Connect(h, y, conn.Wiring.Dense, reciprocal = true)
+    s.Plan(r)!
+    s.Certify(0.8)
+    for j in range s.Pop(x).Drive.Len(): s.Pop(x).Drive[j] = r.Uniform(-0.9, 0.9)
+    for j in range s.Pop(y).Labels.Len(): s.Pop(y).Labels[j] = I32(r.Below(3))
+    c := circuitOf(s)
+    a := board.Engine.Board(c)
+    e := Engine.Lower(s)!
+    same(a, e)
+    tol := 2.0 / F64(PotOne)
+    for beta in Array<F64>[0.5, 1.0] {
+        try a.Teach(c, 3, circuit.Lesson(beta, tol, 4000))
+        try e.Lesson(s, beta, true, 0, tol, 4000)
+        same(a, e)
+    }
+    sameBytes(a, e, "lesson")
+    # the stored states are the engine's values: phase p's potentials and activities in the system
+    for p in range 3 {
+        phase := settle.Phase.Free if p == 0 else (settle.Phase.Plus if p == 1 else settle.Phase.Minus)
+        for b in range 3 {
+            for j in range 5 {
+                assert potential(s, phase, 1, b, j) == e.Potential(phase, b, e.RegionDesc[RegionWords + 1] + j)
+                assert activity(s, phase, 1, b, j) == e.Activity(phase, b, e.RegionDesc[RegionWords + 1] + j)
+            }
+        }
+    }
+}
+
+test "board.olang's parity: XOR learned with its settles on both engines - identical after every lesson" {
+    s := system.System<F64>(4)
+    root := s.Root()
+    x := s.Population(root, "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 8, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    o := s.Population(root, "o", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes(0.25)))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, o, conn.Wiring.Dense, reciprocal = true)
+    r := rand.Rand(1)
+    s.Plan(r)!
+    for b in range 4 {
+        s.Pop(x).Drive[2 * b] = 1.0 if b / 2 == 1 else -1.0
+        s.Pop(x).Drive[2 * b + 1] = 1.0 if b % 2 == 1 else -1.0
+        s.Pop(o).Labels[b] = I32((b / 2) ^ (b % 2))
+    }
+    c := circuitOf(s)
+    c.Certify(0.9)
+    push(s, c)
+    a := board.Engine.Board(c)
+    e := Engine.Lower(s)!
+    opt := optim.FlatAdamW<F64>(c.ParamCount, 0.05)
+    same(a, e)
+    sweeps I64 = 0
+    for _ in range 400 {
+        tol := c.LessonTolerance(0.5)
+        budget := c.Budget(tol, 0.5)
+        taught := try a.Teach(c, 4, circuit.Lesson(0.5, tol, budget))
+        assert taught == (try e.Lesson(s, 0.5, true, 0, tol, budget))
+        sweeps += taught
+        same(a, e)
+        opt.Step(c.ParamData(), c.GradData())
+        c.Restrain(0.9)
+        a.Load(c)
+        push(s, c)
+        e.Load(s)!
+        same(a, e)
+    }
+    # answered on the board
+    a.Inputs(c)
+    e.Inputs(s)
+    a.Nudge(circuit.Phase.Free, 0)
+    e.Nudge(settle.Phase.Free, 0)
+    try a.Settle(circuit.Phase.Free, 1000, 1e-4)
+    try e.Settle(settle.Phase.Free, 1000, 1e-4)
+    same(a, e)
+    right I64 = 0
+    for b in range 4 {
+        col := e.RegionDesc[2 * RegionWords + 1]
+        pick I64 = 1 if e.Activity(settle.Phase.Free, b, col + 1) > e.Activity(settle.Phase.Free, b, col) else 0
+        if pick == I64(s.Pop(o).Labels[b]): right++
+    }
+    try io.PutLine("XOR, 400 lessons settled on both engines, identical after every one: " $right "/4 right, " $(F64(sweeps) / 400.0) " sweeps a lesson")
+    assert right == 4
+}
+
+# a and b are the same engine: every integer of the image and of the last settle (but where each neuron came from)
+fn alike(a Engine&, b Engine&) {
+    assert a.Rows == b.Rows and a.Neurons == b.Neurons and a.N == b.N and a.Spiking == b.Spiking
+    assert a.RegionDesc == b.RegionDesc and a.BlockDesc == b.BlockDesc and a.Weights == b.Weights and a.Biases == b.Biases
+    assert a.Drives == b.Drives and a.Labels == b.Labels and a.Targets == b.Targets
+    assert a.V == b.V and a.S == b.S and a.Constant == b.Constant and a.Total == b.Total and a.Residuals == b.Residuals
+    assert a.Syn == b.Syn and a.Spk == b.Spk and a.Tr == b.Tr and a.Counts == b.Counts
+    assert a.DtQ == b.DtQ and a.Window == b.Window and a.FollowQ == b.FollowQ and a.Sweeps == b.Sweeps
+    assert a.Saturations == b.Saturations and a.Clipped == b.Clipped and a.Spikes == b.Spikes and a.Events == b.Events
+    assert a.Last == b.Last
+}
+
+# a system of the structure of a with every connection a plain block holding the weights it stands for, and the same
+# biases, drives, classes and targets
+fn twinDense(a system.System<F64>&) system.System<F64> {
+    b := system.System<F64>(a.Batch)
+    for p in a.E.Pops: b.Population(b.Root(), "p", p.Size, p.Model, p.Role)
+    for l in a.E.Links: b.Connect(system.Pop(l.Pre), system.Pop(l.Post), conn.Wiring.Dense, false, l.Both)
+    r := rand.Rand(1)
+    b.Plan(r)!
+    for k in range a.E.Links.Len() {
+        l := a.E.Links[k]
+        dense := expand(l, a.E.Params)
+        for x in range l.PostSize * l.PreSize: b.E.Params[b.E.Links[k].Off + x] = element(l, a.E.Params, dense, x / l.PreSize, x % l.PreSize)
+    }
+    for k in range a.E.Pops.Len() {
+        p := a.E.Pops[k]
+        q := b.E.Pops[k]
+        for j in range p.Size: b.E.Params[q.Bias + j] = a.E.Params[p.Bias + j]
+        for j in range p.Drive.Len(): q.Drive[j] = p.Drive[j]
+        for j in range p.Labels.Len(): q.Labels[j] = p.Labels[j]
+        for j in range p.Target.Len(): q.Target[j] = p.Target[j]
+    }
+    return b
+}
+
+# x (4 inputs) -> h (6) <-> h, h <-> o (5, squared error), the last block wired as given, certified at 0.8 with biases,
+# drives and targets drawn from r
+fn wired(w conn.Wiring, both Bool, r mut rand.Rand&) system.System<F64> {
+    s := system.System<F64>(3)
+    root := s.Root()
+    x := s.Population(root, "x", 4, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 6, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    o := s.Population(root, "o", 5, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    s.Connect(h, o, w, reciprocal = both)
+    s.Plan(r)!
+    s.Certify(0.8)
+    for k in range 3 {
+        pop := s.Pop(system.Pop(k))
+        for j in range pop.Drive.Len(): pop.Drive[j] = r.Uniform(-0.9, 0.9)
+        for j in range pop.Target.Len(): pop.Target[j] = r.Uniform(-0.8, 0.8)
+        if k > 0 {
+            for j in range pop.Size: s.E.Params[pop.Bias + j] = r.Uniform(-0.3, 0.3)
+        }
+    }
+    return s
+}
+
+test "every wiring lowers to the dense block it stands for - as built, pruned, then compacted - bit for bit, settles and lessons too" {
+    for w in Array<conn.Wiring>[conn.Wiring.Csr(0.5), conn.Wiring.Tiles(2, 0.7), conn.Wiring.Events(0.0), conn.Wiring.LowRank(2)] {
+        r := rand.Rand(12)
+        a := wired(w, w != conn.Wiring.Events, r)
+        weights := Array<I64>(3)
+        for round in range 3 {
+            if round == 1 {
+                keep := Array<Bool>(a.Link(system.Conn(2)).Keep.Len(), true)
+                for x in range 0, keep.Len(), 3: keep[x] = false
+                a.Prune(system.Conn(2), keep)
+            }
+            if round == 2: a.Compact()
+            b := twinDense(a)
+            ea := Engine.Lower(a)!
+            eb := Engine.Lower(b)!
+            alike(ea, eb)
+            weights[round] = ea.Nonzero()
+            ea.Inputs(a)
+            eb.Inputs(b)
+            try ea.Settle(settle.Phase.Free, 1000, 1e-4)
+            try eb.Settle(settle.Phase.Free, 1000, 1e-4)
+            alike(ea, eb)
+            try ea.Lesson(a, 0.5, true, 0, 2.0 / F64(PotOne), 4000)
+            try eb.Lesson(b, 0.5, true, 0, 2.0 / F64(PotOne), 4000)
+            alike(ea, eb)
+            pa, sa := gap(ea, a, settle.Phase.Plus)
+            pb, sb := gap(eb, b, settle.Phase.Plus)
+            assert pa == pb and sa == sb
+        }
+        assert weights[1] <= weights[0] and weights[2] == weights[1]
+        try io.PutLine(("lowered " $w ": " $(weights[0]) " stored synapses, " $(weights[1]) " after pruning, " $(weights[2]) " after compacting - the dense twin's engine each time"))
+    }
+}
+
+test "retired units are dropped: the engine of a system with units retired is the engine of one built without them" {
+    r := rand.Rand(13)
+    a := system.System<F64>(3)
+    root := a.Root()
+    x := a.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := a.Population(root, "h", 6, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    o := a.Population(root, "o", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    a.Connect(x, h, conn.Wiring.Dense)
+    a.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    a.Connect(h, o, conn.Wiring.Dense, reciprocal = true)
+    a.Plan(r)!
+    a.Certify(0.8)
+    for k in range 3 {
+        pop := a.Pop(system.Pop(k))
+        for j in range pop.Drive.Len(): pop.Drive[j] = r.Uniform(-0.9, 0.9)
+        for j in range pop.Target.Len(): pop.Target[j] = r.Uniform(-0.8, 0.8)
+        if k > 0 {
+            for j in range pop.Size: a.E.Params[pop.Bias + j] = r.Uniform(-0.3, 0.3)
+        }
+    }
+    a.Retire(h, 1)
+    a.Retire(h, 4)
+    # the same system built with four hidden units: those of a that are alive
+    alive := Array<I64>[0, 2, 3, 5]
+    b := system.System<F64>(3)
+    bx := b.Population(b.Root(), "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    bh := b.Population(b.Root(), "h", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    bo := b.Population(b.Root(), "o", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    b.Connect(bx, bh, conn.Wiring.Dense)
+    b.Connect(bh, bh, conn.Wiring.Dense, reciprocal = true)
+    b.Connect(bh, bo, conn.Wiring.Dense, reciprocal = true)
+    rb := rand.Rand(2)
+    b.Plan(rb)!
+    for i in range 4 {
+        for j in range 3: b.E.Params[b.E.Links[0].Off + i * 3 + j] = a.E.Params[a.E.Links[0].Off + alive[i] * 3 + j]
+        for j in range 4: b.E.Params[b.E.Links[1].Off + i * 4 + j] = a.E.Params[a.E.Links[1].Off + alive[i] * 6 + alive[j]]
+        for k in range 3: b.E.Params[b.E.Links[2].Off + k * 4 + i] = a.E.Params[a.E.Links[2].Off + k * 6 + alive[i]]
+        b.E.Params[b.Pop(bh).Bias + i] = a.E.Params[a.Pop(h).Bias + alive[i]]
+        for row in range 3: b.Pop(bh).Drive[row * 4 + i] = a.Pop(h).Drive[row * 6 + alive[i]]
+    }
+    for j in range 3 {
+        b.E.Params[b.Pop(bo).Bias + j] = a.E.Params[a.Pop(o).Bias + j]
+        for row in range 3 {
+            b.Pop(bx).Drive[row * 3 + j] = a.Pop(x).Drive[row * 3 + j]
+            b.Pop(bo).Drive[row * 3 + j] = a.Pop(o).Drive[row * 3 + j]
+            b.Pop(bo).Target[row * 3 + j] = a.Pop(o).Target[row * 3 + j]
+        }
+    }
+    ea := Engine.Lower(a)!
+    eb := Engine.Lower(b)!
+    assert ea.Neurons == 3 + 4 + 3 and ea.Neurons == eb.Neurons
+    alike(ea, eb)
+    ea.Inputs(a)
+    eb.Inputs(b)
+    try ea.Settle(settle.Phase.Free, 1000, 1e-4)
+    try eb.Settle(settle.Phase.Free, 1000, 1e-4)
+    alike(ea, eb)
+    # and dyn holds the retired units at rest: its equilibrium is the board's, within the bound (its residual still counts
+    # a retired unit's total against its zero - it never reports converging, so a fixed number of sweeps stands in)
+    a.Reset(settle.Phase.Free)
+    a.Settle(settle.Phase.Free, settle.Budget(600, 1e-13))
+    pv, ps := gap(ea, a, settle.Phase.Free)
+    bound := ea.Bound(a, FloorLsb, 0.0, 1e-13)
+    try io.PutLine("two of six hidden units retired: dropped from the engine (" $(ea.Neurons) " neurons), the potentials within " $pv " of dyn's, the bound " $bound)
+    assert pv <= bound and ps <= bound + ea.ActError
+    # a readout's retired unit is no board system
+    a2 := system.System<F64>(1)
+    p := a2.Population(a2.Root(), "o", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes(0.25)))
+    a2.Connect(p, p, conn.Wiring.Dense, reciprocal = true)
+    r2 := rand.Rand(1)
+    a2.Plan(r2)!
+    a2.Retire(p, 0)
+    lowered Bool = true
+    try Engine.Lower(a2) catch LowerError { lowered = false }
+    assert not lowered
 }
