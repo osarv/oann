@@ -1,0 +1,631 @@
+# kernels/scan - linear recurrences over a sequence, forward and backward, each as a sequential scan and as a chunked
+# form that spreads one sequence over tasks (and, for the delta rule, over gemm's products), on `mat.Mat` operands.
+#
+# n rows are `seqs` sequences of `at.Len` rows (row r is position r % Len of sequence r / Len, as attention's); the
+# columns of a row are channels, each an independent recurrence - except the delta rule's heads. A state is kept in the
+# accumulator A (F32, or F64 for F64), whatever the storage S (F32, BF16, F16 or F64) of the inputs and outputs: the
+# running state is never rounded to S, only the outputs written are, once each. A state is passed in and comes back
+# changed (the state after the last position), so a sequence may be run in pieces - decoding one position at a time is
+# the same call with Len 1 - and a caller who wants a fresh sequence passes zeros. Kernels check nothing: shapes are the
+# caller's, checked once where the operands are made.
+#
+#   GatedScan        h_t = a_t h_{t-1} + b_t x_t                        elementwise: the consolidator's slow part
+#                    (l, (1 - l) z), a state-space model after discretization, QRNN's f-pooling
+#   SelectiveScan    h_t = exp(delta_t A) h_{t-1} + delta_t B_t x_t,    Mamba's selective state-space scan (Gu and Dao 2023):
+#                    y_t = C_t h_t + D x_t                              N states per channel, the readout in the same pass
+#   DeltaRule        S_t = alpha_t S_{t-1} (I - beta_t k_t k_t^T) + beta_t v_t k_t^T,   o_t = S_t q_t
+#                    DeltaNet (Yang et al. 2024) at alpha 1, Gated DeltaNet's gate otherwise (Yang, Kautz, Hatamizadeh 2024)
+#
+# Every kernel here has a sequential form (the loop the equation is) and a chunked one that computes the same numbers in
+# another order. The diagonal recurrences are chunked as a scan is - a pass over the chunks (in tasks) for what each
+# leaves behind (the product of its a's and its end state from nothing), a short pass over those in order for the state
+# each chunk starts from, a pass over the chunks (in tasks) from their starts - so the time axis is parallel: twice the
+# work, the span of a chunk and a pass over the chunks. The delta rule is chunked in the WY form (DeltaNet's chunkwise
+# parallel algorithm): the state's changes within a chunk are solved for at once by a triangular system, and everything
+# else is gemm's products - a chunk costs a few matrix products of the chunk's size instead of one rank-1 update per
+# position. Both forms are exact reorderings, so they agree to rounding (the tests hold F32 to 1e-5).
+#
+# Work is split over tasks by sequence, channel block or head - never across a sum - so a result is the same for every
+# thread count. The work object holds the thread count and the scratch; it grows on the first call and then allocates
+# nothing.
+
+import "mat"
+
+# how n rows are cut: sequences of Len rows, a chunk of Chunk positions (the chunked forms), the delta rule's Heads
+type Seq struct(Len I64, Chunk I64 = 64, Heads I64 = 1) {
+    Len
+    Chunk
+    Heads
+}
+
+# the thread count and the scratch the kernels need, grown on the first call
+type Work<A> struct(threads I64) {
+    Threads I64 = threads if threads > 0 else 1
+    buf mut Array<A>& = Array<A>(0)
+}
+
+fn (w mut Work<A>&) scratch(n I64) mut Array<A>& {
+    if w.buf.Len() < n: w.buf = Array<A>(n if n > w.buf.Len() * 2 else w.buf.Len() * 2)
+    return w.buf
+}
+
+# ---- tasks ----
+
+# runs the job's units lo ... hi - 1 in at most `threads` runs of consecutive units; the first on the calling thread when
+# there is one run. Units do not overlap, so a task writes only its own
+fn spread<J>(j J&, units I64, threads I64) {
+    tasks := threads if threads < units else units
+    if tasks <= 1 {
+        j.run(0, units)
+        return
+    }
+    share := (units + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo := t * share
+            hi := lo + share if lo + share < units else units
+            if lo < hi: spawn j.run(lo, hi)
+        }
+    }
+}
+
+# the columns a unit takes: a block this wide (a row of a block is a few vectors long, and its state stays in cache)
+scanWidth I64 = 512
+
+fn blocksOf(cols I64) I64 { return (cols + scanWidth - 1) / scanWidth }
+
+fn lesser(a I64, b I64) I64 { return a if a < b else b }
+
+fn chunksOf(at Seq) I64 { return (at.Len + at.Chunk - 1) / at.Chunk }
+
+# ---- GatedScan ----
+
+# h_t = a_t h_{t-1} + b_t x_t, per channel: positions r0 ... r1 - 1 (rows) and channels c0 ... c1 - 1, from the state in
+# sd[so ...] (indexed by channel), which is left holding the state after row r1 - 1
+fn scanSteps<S, A>(h mat.Mat<S>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, sd mut Array<A>&, so I64, r0 I64, r1 I64, c0 I64, c1 I64) {
+    hd := h.Data
+    for r in range r0, r1 {
+        ho := h.Off + r * h.Ld
+        xo := x.Off + r * x.Ld
+        ao := a.Off + r * a.Ld
+        bo := b.Off + r * b.Ld
+        for c in range c0, c1 {
+            v := A(a.Data[ao + c]) * sd[so + c] + A(b.Data[bo + c]) * A(x.Data[xo + c])
+            sd[so + c] = v
+            hd[ho + c] = S(v)
+        }
+    }
+}
+
+# what rows r0 ... r1 - 1 leave behind over channels c0 ... c1 - 1: ps their a's product and es the state they end in from
+# a state of zero, both at [o + c ...]
+fn scanSummary<S, A>(x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, ps mut Array<A>&, es mut Array<A>&, o I64, r0 I64, r1 I64, c0 I64, c1 I64) {
+    for c in range c0, c1 {
+        ps[o + c] = 1.0
+        es[o + c] = 0.0
+    }
+    for r in range r0, r1 {
+        xo := x.Off + r * x.Ld
+        ao := a.Off + r * a.Ld
+        bo := b.Off + r * b.Ld
+        for c in range c0, c1 {
+            av := A(a.Data[ao + c])
+            ps[o + c] = av * ps[o + c]
+            es[o + c] = av * es[o + c] + A(b.Data[bo + c]) * A(x.Data[xo + c])
+        }
+    }
+}
+
+type scanJob<S, A> struct(h mat.Mat<S>, st mat.Mat<A>, x mat.Mat<S>, a mat.Mat<S>, b mat.Mat<S>, at Seq) {
+    h
+    st
+    x
+    a
+    b
+    at
+}
+
+# unit u: sequence u / blocks, channel block u % blocks
+fn (j scanJob<S, A>&) run(lo I64, hi I64) {
+    blocks := blocksOf(j.h.Cols)
+    for u in range lo, hi {
+        s := u / blocks
+        c0 := u % blocks * scanWidth
+        scanSteps<S, A>(j.h, j.x, j.a, j.b, j.st.Data, j.st.Off + s * j.st.Ld, s * j.at.Len, (s + 1) * j.at.Len, c0, lesser(c0 + scanWidth, j.h.Cols))
+    }
+}
+
+# h = the scan of x with gates a and inputs b from state (seqs x D, in the accumulator), the sequential form: one pass
+# over each sequence, the sequences and channel blocks in tasks. state holds the last position's state afterwards
+fn GatedScan<S, A>(ws mut Work<A>&, h mut mat.Mat<S>&, state mut mat.Mat<A>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, at Seq) {
+    seqs := h.Rows / at.Len
+    spread(scanJob<S, A>(h, state, x, a, b, at), seqs * blocksOf(h.Cols), ws.Threads)
+}
+
+# the summaries (pass 1) of chunks: unit u = (sequence s, chunk k, channel block), at ps and es [(s chunks + k) D ...]
+type scanSummaryJob<S, A> struct(x mat.Mat<S>, a mat.Mat<S>, b mat.Mat<S>, ps mut Array<A>&, es mut Array<A>&, at Seq) {
+    x
+    a
+    b
+    ps
+    es
+    at
+}
+
+fn (j scanSummaryJob<S, A>&) run(lo I64, hi I64) {
+    cols := j.x.Cols
+    blocks := blocksOf(cols)
+    chunks := chunksOf(j.at)
+    for u in range lo, hi {
+        sk := u / blocks
+        c0 := u % blocks * scanWidth
+        s := sk / chunks
+        r0 := s * j.at.Len + sk % chunks * j.at.Chunk
+        r1 := lesser(r0 + j.at.Chunk, (s + 1) * j.at.Len)
+        scanSummary<S, A>(j.x, j.a, j.b, j.ps, j.es, sk * cols, r0, r1, c0, lesser(c0 + scanWidth, cols))
+    }
+}
+
+# the carry (pass 2) of the forward scan runs the chunks first to last, the backward one last to first: per (sequence,
+# channel block) the chunks' start (or, backward, incoming) states in order, written over es; st takes the end
+type scanCarryJob<A> struct(st mat.Mat<A>, ps mut Array<A>&, es mut Array<A>&, cols I64, chunks I64, backward Bool) {
+    st
+    ps
+    es
+    cols
+    chunks
+    backward
+}
+
+# the chunks' starts, backward the chunks' incoming gradients: es (what chunk k leaves from nothing) replaced by the state
+# it starts from, st the state after the last chunk
+fn (j scanCarryJob<A>&) run(lo I64, hi I64) {
+    blocks := blocksOf(j.cols)
+    for u in range lo, hi {
+        s := u / blocks
+        c0 := u % blocks * scanWidth
+        c1 := lesser(c0 + scanWidth, j.cols)
+        so := j.st.Off + s * j.st.Ld
+        for i in range j.chunks {
+            k := j.chunks - 1 - i if j.backward else i
+            o := (s * j.chunks + k) * j.cols
+            for c in range c0, c1 {
+                cur := j.st.Data[so + c]
+                j.st.Data[so + c] = j.ps[o + c] * cur + j.es[o + c]
+                j.es[o + c] = cur
+            }
+        }
+    }
+}
+
+# pass 3: each chunk from its start state, which it leaves changed in es
+type scanChunkJob<S, A> struct(h mat.Mat<S>, x mat.Mat<S>, a mat.Mat<S>, b mat.Mat<S>, es mut Array<A>&, at Seq) {
+    h
+    x
+    a
+    b
+    es
+    at
+}
+
+fn (j scanChunkJob<S, A>&) run(lo I64, hi I64) {
+    cols := j.h.Cols
+    blocks := blocksOf(cols)
+    chunks := chunksOf(j.at)
+    for u in range lo, hi {
+        sk := u / blocks
+        c0 := u % blocks * scanWidth
+        s := sk / chunks
+        r0 := s * j.at.Len + sk % chunks * j.at.Chunk
+        r1 := lesser(r0 + j.at.Chunk, (s + 1) * j.at.Len)
+        scanSteps<S, A>(j.h, j.x, j.a, j.b, j.es, sk * cols, r0, r1, c0, lesser(c0 + scanWidth, cols))
+    }
+}
+
+# GatedScan's chunked form, the same result in another order: the time axis in tasks too. Scratch: 2 seqs chunks D
+fn GatedScanChunked<S, A>(ws mut Work<A>&, h mut mat.Mat<S>&, state mut mat.Mat<A>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, at Seq) {
+    cols := h.Cols
+    seqs := h.Rows / at.Len
+    chunks := chunksOf(at)
+    size := seqs * chunks * cols
+    buf := ws.scratch(2 * size)
+    ps := buf[0:size]
+    es := buf[size:2 * size]
+    spread(scanSummaryJob<S, A>(x, a, b, ps, es, at), seqs * chunks * blocksOf(cols), ws.Threads)
+    spread(scanCarryJob<A>(state, ps, es, cols, chunks, false), seqs * blocksOf(cols), ws.Threads)
+    spread(scanChunkJob<S, A>(h, x, a, b, es, at), seqs * chunks * blocksOf(cols), ws.Threads)
+}
+
+# ---- GatedScan's gradients ----
+
+# With g_t the gradient of the loss in the state after position t, g_t = dh_t + a_{t+1} g_{t+1} (dh_t the gradient of the
+# output h_t, and the gradient of the final state added at the end), the gradients are
+#   dx_t = b_t g_t,   db_t = x_t g_t,   da_t = h_{t-1} g_t,   and the initial state's  a_0 g_0
+# - a scan again, backward in time, which the chunked form runs as it runs the forward one.
+type scanGradJob<S, A> struct(dx mat.Mat<S>, da mat.Mat<S>, db mat.Mat<S>, dh mat.Mat<S>, h mat.Mat<S>, init mat.Mat<A>, x mat.Mat<S>, a mat.Mat<S>, b mat.Mat<S>, st mat.Mat<A>, es mut Array<A>&, at Seq, chunked Bool, add Bool) {
+    dx
+    da
+    db
+    dh
+    h
+    init
+    x
+    a
+    b
+    st
+    es
+    at
+    chunked
+    add
+}
+
+# one row r, channels c0 ... c1 - 1, g (in gd[go ...]) the gradient reaching its position from later ones; hp the previous
+# state, h's row before r or the initial state
+fn (j scanGradJob<S, A>&) row<P>(r I64, hp Array<P>&, ho I64, gd mut Array<A>&, go I64, c0 I64, c1 I64) {
+    dho := j.dh.Off + r * j.dh.Ld
+    xo := j.x.Off + r * j.x.Ld
+    ao := j.a.Off + r * j.a.Ld
+    bo := j.b.Off + r * j.b.Ld
+    dxo := j.dx.Off + r * j.dx.Ld
+    dao := j.da.Off + r * j.da.Ld
+    dbo := j.db.Off + r * j.db.Ld
+    for c in range c0, c1 {
+        g := gd[go + c] + A(j.dh.Data[dho + c])
+        nx := A(j.b.Data[bo + c]) * g
+        nb := A(j.x.Data[xo + c]) * g
+        na := A(hp[ho + c]) * g
+        j.dx.Data[dxo + c] = S(nx + A(j.dx.Data[dxo + c]) if j.add else nx)
+        j.db.Data[dbo + c] = S(nb + A(j.db.Data[dbo + c]) if j.add else nb)
+        j.da.Data[dao + c] = S(na + A(j.da.Data[dao + c]) if j.add else na)
+        gd[go + c] = A(j.a.Data[ao + c]) * g
+    }
+}
+
+# rows r0 ... r1 - 1 of one sequence last to first, the incoming gradient in gd[go ...], left holding what flows on
+fn (j scanGradJob<S, A>&) steps(gd mut Array<A>&, go I64, r0 I64, r1 I64, c0 I64, c1 I64) {
+    first := r0 / j.at.Len * j.at.Len
+    s := r0 / j.at.Len
+    for i in range r1 - r0 {
+        r := r1 - 1 - i
+        if r == first: j.row<A>(r, j.init.Data, j.init.Off + s * j.init.Ld, gd, go, c0, c1)
+        else: j.row<S>(r, j.h.Data, j.h.Off + (r - 1) * j.h.Ld, gd, go, c0, c1)
+    }
+}
+
+fn (j scanGradJob<S, A>&) run(lo I64, hi I64) {
+    cols := j.h.Cols
+    blocks := blocksOf(cols)
+    chunks := chunksOf(j.at)
+    for u in range lo, hi {
+        c0 := u % blocks * scanWidth
+        c1 := lesser(c0 + scanWidth, cols)
+        if not j.chunked {
+            s := u / blocks
+            j.steps(j.st.Data, j.st.Off + s * j.st.Ld, s * j.at.Len, (s + 1) * j.at.Len, c0, c1)
+            continue
+        }
+        sk := u / blocks
+        s := sk / chunks
+        r0 := s * j.at.Len + sk % chunks * j.at.Chunk
+        r1 := lesser(r0 + j.at.Chunk, (s + 1) * j.at.Len)
+        j.steps(j.es, sk * cols, r0, r1, c0, c1)
+    }
+}
+
+# pass 1 backward: what rows r0 ... r1 - 1 pass on to earlier ones from a gradient of zero (es) and their a's product (ps)
+type scanGradSummaryJob<S, A> struct(dh mat.Mat<S>, a mat.Mat<S>, ps mut Array<A>&, es mut Array<A>&, at Seq) {
+    dh
+    a
+    ps
+    es
+    at
+}
+
+fn (j scanGradSummaryJob<S, A>&) run(lo I64, hi I64) {
+    cols := j.dh.Cols
+    blocks := blocksOf(cols)
+    chunks := chunksOf(j.at)
+    for u in range lo, hi {
+        sk := u / blocks
+        c0 := u % blocks * scanWidth
+        c1 := lesser(c0 + scanWidth, cols)
+        s := sk / chunks
+        r0 := s * j.at.Len + sk % chunks * j.at.Chunk
+        r1 := lesser(r0 + j.at.Chunk, (s + 1) * j.at.Len)
+        for c in range c0, c1 {
+            j.ps[sk * cols + c] = 1.0
+            j.es[sk * cols + c] = 0.0
+        }
+        for i in range r1 - r0 {
+            r := r1 - 1 - i
+            ao := j.a.Off + r * j.a.Ld
+            dho := j.dh.Off + r * j.dh.Ld
+            for c in range c0, c1 {
+                av := A(j.a.Data[ao + c])
+                j.ps[sk * cols + c] = av * j.ps[sk * cols + c]
+                j.es[sk * cols + c] = av * (j.es[sk * cols + c] + A(j.dh.Data[dho + c]))
+            }
+        }
+    }
+}
+
+# dx, da and db (written, or added to where add is set) for a loss whose gradient in the outputs h is dh; h, x, a and b
+# are the forward's, init the state it started from (seqs x D). dstate holds on entry the gradient in the state after
+# the last position (zeros when nothing reads it) and on return the gradient in the initial state. Sequential
+fn GatedScanGrad<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Mat<S>&, db mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dh mat.Mat<S>&, h mat.Mat<S>&, init mat.Mat<A>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, at Seq, add Bool = false) {
+    seqs := h.Rows / at.Len
+    job := scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, Array<A>(0), at, false, add)
+    spread(job, seqs * blocksOf(h.Cols), ws.Threads)
+}
+
+# GatedScanGrad's chunked form: the backward scan as the forward one is chunked. Scratch: 2 seqs chunks D
+fn GatedScanGradChunked<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Mat<S>&, db mut mat.Mat<S>&, dstate mut mat.Mat<A>&, dh mat.Mat<S>&, h mat.Mat<S>&, init mat.Mat<A>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, at Seq, add Bool = false) {
+    cols := h.Cols
+    seqs := h.Rows / at.Len
+    chunks := chunksOf(at)
+    size := seqs * chunks * cols
+    buf := ws.scratch(2 * size)
+    ps := buf[0:size]
+    es := buf[size:2 * size]
+    units := seqs * chunks * blocksOf(cols)
+    spread(scanGradSummaryJob<S, A>(dh, a, ps, es, at), units, ws.Threads)
+    spread(scanCarryJob<A>(dstate, ps, es, cols, chunks, true), seqs * blocksOf(cols), ws.Threads)
+    spread(scanGradJob<S, A>(dx, da, db, dh, h, init, x, a, b, dstate, es, at, true, add), units, ws.Threads)
+}
+
+# ---- tests ----
+
+import "std/rand"
+
+fn fill<T>(a mut Array<T>&, r mut rand.Rand&, sd F64) {
+    for i in range a.Len(): a[i] = T(r.Normal() * sd)
+}
+
+# gates in (lo, hi): a plausible decay
+fn fillGates<T>(a mut Array<T>&, r mut rand.Rand&, lo F64, hi F64) {
+    for i in range a.Len(): a[i] = T(lo + (hi - lo) * r.Float())
+}
+
+# the recurrence as written, in F64 on contiguous arrays; state is seqs x D and ends holding the last state
+fn gatedReference(x Array<F64>&, a Array<F64>&, b Array<F64>&, state mut Array<F64>&, seqs I64, len I64, cols I64) Array<F64> {
+    h := Array<F64>(seqs * len * cols)
+    for s in range seqs {
+        for t in range len {
+            for c in range cols {
+                r := (s * len + t) * cols + c
+                state[s * cols + c] = a[r] * state[s * cols + c] + b[r] * x[r]
+                h[r] = state[s * cols + c]
+            }
+        }
+    }
+    return h
+}
+
+fn maxRelDiff<T, U>(a Array<T>&, b Array<U>&) F64 {
+    worst F64
+    for i in range a.Len() {
+        d := (F64(a[i]) - F64(b[i])).Abs() / F64(b[i]).Abs().Max(1.0)
+        worst = worst.Max(d)
+    }
+    return worst
+}
+
+fn whole<S>(a mut Array<S>&, rows I64, cols I64) mat.Mat<S> { return mat.Mat<S>(a, 0, rows, cols, cols) }
+
+# one run of GatedScan on the reference's inputs, in S storage: the outputs and the final states, in F64
+fn gatedRun<S, A>(chunked Bool, threads I64, seqs I64, len I64, cols I64, chunk I64, seed I64) Array<F64>, Array<F64>, Array<F64>, Array<F64> {
+    r := rand.Rand(U64(seed))
+    n := seqs * len
+    x := Array<S>(n * cols)
+    a := Array<S>(n * cols)
+    b := Array<S>(n * cols)
+    fill(x, r, 1.0)
+    fillGates(a, r, 0.5, 1.0)
+    fill(b, r, 0.5)
+    state := Array<A>(seqs * cols)
+    fill(state, r, 1.0)
+    # the F64 reference from the same stored numbers
+    xr := Array<F64>(n * cols)
+    ar := Array<F64>(n * cols)
+    br := Array<F64>(n * cols)
+    sr := Array<F64>(seqs * cols)
+    for i in range n * cols {
+        xr[i] = F64(x[i])
+        ar[i] = F64(a[i])
+        br[i] = F64(b[i])
+    }
+    for i in range seqs * cols: sr[i] = F64(state[i])
+    want := gatedReference(xr, ar, br, sr, seqs, len, cols)
+    h := Array<S>(n * cols)
+    ws := Work<A>(threads)
+    at := Seq(len, chunk)
+    if chunked: GatedScanChunked(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
+    else: GatedScan(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
+    got := Array<F64>(n * cols)
+    gs := Array<F64>(seqs * cols)
+    for i in range n * cols: got[i] = F64(h[i])
+    for i in range seqs * cols: gs[i] = F64(state[i])
+    return got, want, gs, sr
+}
+
+test GatedScan "the sequential scan is the recurrence: F64 to 1e-13, F32 to 1e-5, BF16 stored and F32 carried to 2e-2" {
+    g, w, gs, ws := gatedRun<F64, F64>(false, 1, 3, 37, 70, 8, 1)
+    assert maxRelDiff(g, w) < 1.0e-13 and maxRelDiff(gs, ws) < 1.0e-13
+    g2, w2, gs2, ws2 := gatedRun<F32, F32>(false, 1, 3, 37, 70, 8, 2)
+    assert maxRelDiff(g2, w2) < 1.0e-5 and maxRelDiff(gs2, ws2) < 1.0e-5
+    g3, w3, gs3, ws3 := gatedRun<BF16, F32>(false, 1, 3, 37, 70, 8, 3)
+    assert maxRelDiff(g3, w3) < 2.0e-2 and maxRelDiff(gs3, ws3) < 1.0e-5
+}
+
+test GatedScanChunked "equals the sequential scan: F32 to 1e-5, one and four threads, chunks that do not divide the length, blocks of channels" {
+    for chunk in Array<I64>[1, 7, 16, 100] {
+        for threads in Array<I64>[1, 4] {
+            g, w, gs, ws := gatedRun<F32, F32>(true, threads, 3, 37, 70, chunk, 4)
+            assert maxRelDiff(g, w) < 1.0e-5, "chunk " $chunk
+            assert maxRelDiff(gs, ws) < 1.0e-5
+        }
+    }
+    g, w, _, _ := gatedRun<F64, F64>(true, 2, 2, 50, 1100, 9, 5)
+    assert maxRelDiff(g, w) < 1.0e-13
+    g2, w2, _, _ := gatedRun<BF16, F32>(true, 2, 2, 50, 100, 9, 6)
+    assert maxRelDiff(g2, w2) < 2.0e-2
+}
+
+# the loss sum(w h) + sum(u final) of the recurrence, in F64
+fn gatedLoss(x Array<F64>&, a Array<F64>&, b Array<F64>&, init Array<F64>&, w Array<F64>&, u Array<F64>&, seqs I64, len I64, cols I64) F64 {
+    st := Array<F64>(init.Len())
+    for i in range init.Len(): st[i] = init[i]
+    h := gatedReference(x, a, b, st, seqs, len, cols)
+    loss F64
+    for i in range h.Len(): loss += w[i] * h[i]
+    for i in range st.Len(): loss += u[i] * st[i]
+    return loss
+}
+
+# the central difference of the loss in element i of arr
+fn centralDifference(arr mut Array<F64>&, i I64, loss fn&() F64) F64 {
+    keep := arr[i]
+    step := 1.0e-6
+    arr[i] = keep + step
+    up := loss()
+    arr[i] = keep - step
+    down := loss()
+    arr[i] = keep
+    return (up - down) / (2.0 * step)
+}
+
+fn gradCase(chunked Bool, threads I64, add Bool) {
+    r := rand.Rand(11)
+    seqs := 2
+    len := 13
+    cols := 5
+    n := seqs * len
+    x := Array<F64>(n * cols)
+    a := Array<F64>(n * cols)
+    b := Array<F64>(n * cols)
+    w := Array<F64>(n * cols)
+    init := Array<F64>(seqs * cols)
+    u := Array<F64>(seqs * cols)
+    fill(x, r, 1.0)
+    fillGates(a, r, 0.3, 1.1)
+    fill(b, r, 1.0)
+    fill(w, r, 1.0)
+    fill(init, r, 1.0)
+    fill(u, r, 1.0)
+    # forward through the kernel
+    h := Array<F64>(n * cols)
+    state := Array<F64>(seqs * cols)
+    for i in range seqs * cols: state[i] = init[i]
+    ws := Work<F64>(threads)
+    at := Seq(len, 4)
+    GatedScan(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
+    dx := Array<F64>(n * cols)
+    da := Array<F64>(n * cols)
+    db := Array<F64>(n * cols)
+    if add {
+        for i in range n * cols {
+            dx[i] = 1.0
+            da[i] = 2.0
+            db[i] = 3.0
+        }
+    }
+    ds := Array<F64>(seqs * cols)
+    for i in range seqs * cols: ds[i] = u[i]
+    ini := Array<F64>(seqs * cols)
+    for i in range seqs * cols: ini[i] = init[i]
+    if chunked: GatedScanGradChunked(ws, whole(dx, n, cols), whole(da, n, cols), whole(db, n, cols), whole(ds, seqs, cols), whole(w, n, cols), whole(h, n, cols), whole(ini, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at, add)
+    else: GatedScanGrad(ws, whole(dx, n, cols), whole(da, n, cols), whole(db, n, cols), whole(ds, seqs, cols), whole(w, n, cols), whole(h, n, cols), whole(ini, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at, add)
+    loss := fn(): return gatedLoss(x, a, b, init, w, u, seqs, len, cols)
+    extra := 1.0 if add else 0.0
+    for i in range n * cols {
+        assert (centralDifference(x, i, loss) + extra * 1.0 - dx[i]).Abs() < 1.0e-7, "dx[" $i "]"
+        assert (centralDifference(a, i, loss) + extra * 2.0 - da[i]).Abs() < 1.0e-7, "da[" $i "]"
+        assert (centralDifference(b, i, loss) + extra * 3.0 - db[i]).Abs() < 1.0e-7, "db[" $i "]"
+    }
+    for i in range seqs * cols: assert (centralDifference(init, i, loss) - ds[i]).Abs() < 1.0e-7, "dinit[" $i "]"
+}
+
+test GatedScanGrad "dx, da, db and the initial state's gradient equal the central differences in F64: sequential, chunked, one and three threads, adding" {
+    for chunked in Array<Bool>[false, true] {
+        for threads in Array<I64>[1, 3] {
+            gradCase(chunked, threads, false)
+            gradCase(chunked, threads, true)
+        }
+    }
+}
+
+# the gradients of one random problem through GatedScanGrad (sequential or chunked), in S storage: dx, da, db, dinit in F64
+fn gradRun<S, A>(chunked Bool, threads I64, seqs I64, len I64, cols I64, chunk I64) Array<F64> {
+    r := rand.Rand(12)
+    n := seqs * len
+    x := Array<S>(n * cols)
+    a := Array<S>(n * cols)
+    b := Array<S>(n * cols)
+    w := Array<S>(n * cols)
+    fill(x, r, 1.0)
+    fillGates(a, r, 0.5, 1.0)
+    fill(b, r, 0.5)
+    fill(w, r, 1.0)
+    init := Array<A>(seqs * cols)
+    fill(init, r, 1.0)
+    h := Array<S>(n * cols)
+    state := Array<A>(seqs * cols)
+    for i in range seqs * cols: state[i] = init[i]
+    ws := Work<A>(threads)
+    at := Seq(len, chunk)
+    GatedScan(ws, whole(h, n, cols), whole(state, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
+    dx := Array<S>(n * cols)
+    da := Array<S>(n * cols)
+    db := Array<S>(n * cols)
+    ds := Array<A>(seqs * cols)
+    fill(ds, r, 1.0)
+    if chunked: GatedScanGradChunked(ws, whole(dx, n, cols), whole(da, n, cols), whole(db, n, cols), whole(ds, seqs, cols), whole(w, n, cols), whole(h, n, cols), whole(init, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
+    else: GatedScanGrad(ws, whole(dx, n, cols), whole(da, n, cols), whole(db, n, cols), whole(ds, seqs, cols), whole(w, n, cols), whole(h, n, cols), whole(init, seqs, cols), whole(x, n, cols), whole(a, n, cols), whole(b, n, cols), at)
+    out := Array<F64>(3 * n * cols + seqs * cols)
+    for i in range n * cols {
+        out[i] = F64(dx[i])
+        out[n * cols + i] = F64(da[i])
+        out[2 * n * cols + i] = F64(db[i])
+    }
+    for i in range seqs * cols: out[3 * n * cols + i] = F64(ds[i])
+    return out
+}
+
+test GatedScanGradChunked "equals the sequential backward scan: F32 to 1e-5 for chunks of any size, and the same for every thread count" {
+    want := gradRun<F32, F32>(false, 1, 3, 41, 70, 8)
+    for chunk in Array<I64>[1, 5, 16, 64] {
+        for threads in Array<I64>[1, 4] {
+            got := gradRun<F32, F32>(true, threads, 3, 41, 70, chunk)
+            assert maxRelDiff(got, want) < 1.0e-5, "chunk " $chunk
+        }
+    }
+    again := gradRun<F32, F32>(false, 4, 3, 41, 70, 8)
+    assert again == want
+    bf := gradRun<BF16, F32>(true, 2, 2, 30, 40, 7)
+    bw := gradRun<BF16, F32>(false, 1, 2, 30, 40, 7)
+    assert maxRelDiff(bf, bw) < 3.0e-2
+}
+
+test GatedScan "the consolidator's recurrence h = l h_prev + (1 - l) z is a scan with a = l, b = 1 - l, x = z" {
+    r := rand.Rand(13)
+    len := 20
+    cols := 6
+    z := Array<F32>(len * cols)
+    l := Array<F32>(len * cols)
+    fill(z, r, 1.0)
+    fillGates(l, r, 0.0, 1.0)
+    one := Array<F32>(len * cols)
+    for i in range len * cols: one[i] = 1.0 - l[i]
+    h := Array<F32>(len * cols)
+    state := Array<F32>(cols)
+    ws := Work<F32>(1)
+    GatedScan(ws, whole(h, len, cols), whole(state, 1, cols), whole(z, len, cols), whole(l, len, cols), whole(one, len, cols), Seq(len))
+    prev := Array<F32>(cols)
+    for t in range len {
+        for c in range cols {
+            prev[c] = l[t * cols + c] * prev[c] + (1.0 - l[t * cols + c]) * z[t * cols + c]
+            assert (h[t * cols + c] - prev[c]).Abs() < 1.0e-6
+        }
+    }
+    assert state == prev
+}
