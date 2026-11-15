@@ -433,9 +433,13 @@ fn main() ? {
    base; a kernel of our own is written only where it measurably gains (fused element work, the settle's small blocks,
    attention variants cuDNN lacks). How our own GPU kernels are compiled (an NVPTX target in olang, or CUDA C through a
    C import) is decided when the first one is needed, by what that kernel needs. Meanwhile CPU only.
-2. **Where research models live.** Recommendation: oann is the library and its reference models (MLP, CNN, GPT,
-   SSM, the settling circuit, the hybrid); the agent, its store and sleep (agent, store, consolidator and their
-   examples) and the energy-based reasoners move to oagent, which links oann. Default: they move in C3.
+2. **Where research models live - decided (the user, 2026-11-15: "you can have the amendments to settling networks ...
+   in oann ... what I want in oagent is the bootstrapping AGI model that we are building, basically, make the framework
+   public, hide the weights (and similarly)").** oann is the public framework, everything general in it: tensors,
+   kernels, autodiff, the dynamical-system core with every settling mechanism (memory store, consolidation and sleep,
+   the agent's machinery, energy-based reasoners as model kinds) and the reference models. oagent, private, holds the
+   AGI model being bootstrapped: its configuration and architecture choices, trained weights and checkpoints, training
+   data and recipes, its experiments and their results. Nothing moves out of oann in C3.
 3. **Structure changes - decided (the user, 2026-11-15: "we want the networks to be prunable at runtime eventually at
    least. its not the most important first step, but dont depend it never being the case").** The first build may
    re-plan between runs, but nothing may assume a planned system's structure is fixed: connections carry an active mask
