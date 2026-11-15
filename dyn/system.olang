@@ -221,7 +221,7 @@ fn isF32<T>() Bool {
 fn (s System<T>&) batchOf<Y>(p Pop, x tensor.Tensor<Y>&, width I64) mut Array<Y>& ? tensor.ShapeError {
     if not s.Planned: error tensor.ShapeError.Mismatch("a batch given before Plan")
     if x.Rank() != 2 or x.Dim(0) != s.Batch or x.Dim(1) != width {
-        error tensor.ShapeError.Mismatch("population " $I64(p) " takes [" $s.Batch ", " $width "], not " $x.Dims)
+        error tensor.ShapeError.Mismatch("population " + $I64(p) + " takes [" + $s.Batch + ", " + $width + "], not " + $x.Dims)
     }
     return try x.Flat()
 }
@@ -238,7 +238,7 @@ fn (s mut System<T>&) Clamp(p Pop, x tensor.Tensor<T>&) ? tensor.ShapeError {
 fn (s mut System<T>&) Target(p Pop, y tensor.Tensor<I32>&) ? tensor.ShapeError {
     pop := s.E.Pops[I64(p)]
     groups := settle.GroupsOf(pop.Role)
-    if groups == 0: error tensor.ShapeError.Mismatch("population " $I64(p) " is no cross-entropy readout")
+    if groups == 0: error tensor.ShapeError.Mismatch("population " + $I64(p) + " is no cross-entropy readout")
     from := try s.batchOf(p, y, groups)
     for i in range from.Len(): pop.Labels[i] = from[i]
 }
@@ -246,7 +246,7 @@ fn (s mut System<T>&) Target(p Pop, y tensor.Tensor<I32>&) ? tensor.ShapeError {
 # a squared-error readout's targets, [batch, size]
 fn (s mut System<T>&) TargetValues(p Pop, y tensor.Tensor<T>&) ? tensor.ShapeError {
     pop := s.E.Pops[I64(p)]
-    if pop.Target.Len() == 0: error tensor.ShapeError.Mismatch("population " $I64(p) " is no readout")
+    if pop.Target.Len() == 0: error tensor.ShapeError.Mismatch("population " + $I64(p) + " is no readout")
     from := try s.batchOf(p, y, pop.Size)
     for i in range from.Len(): pop.Target[i] = from[i]
 }
@@ -256,7 +256,7 @@ fn (s mut System<T>&) TargetValues(p Pop, y tensor.Tensor<T>&) ? tensor.ShapeErr
 # a signal's values, set
 fn (s mut System<T>&) Set(sig Sig, v tensor.Tensor<T>&) ? tensor.ShapeError {
     g := s.sigs[I64(sig)]
-    if v.Count() != g.Width: error tensor.ShapeError.Mismatch("signal " $g.Name " holds " $g.Width " values, not " $v.Count())
+    if v.Count() != g.Width: error tensor.ShapeError.Mismatch("signal " + $g.Name + " holds " + $g.Width + " values, not " + $v.Count())
     from := try v.Flat()
     for i in range g.Width: s.signals[g.At + i] = from[i]
 }
@@ -295,7 +295,7 @@ fn (s System<T>&) Within(p Pop, m Mod) Bool {
 # targets as given: allocation-free. Its state is committed either way; the Settlement says how it went
 fn (s mut System<T>&) Settle(phase settle.Phase, b settle.Budget) settle.Settlement {
     ph := phase.Index()
-    if ph >= s.Phases: unreachable "a system of " $s.Phases " phases has no " $phase
+    if ph >= s.Phases: unreachable "a system of " + $s.Phases + " phases has no " + $phase
     s.E.Beta[ph] = 0.0 if phase == settle.Phase.Free else s.E.Beta[ph]
     return s.E.Settle(ph, ph + 1, b, true)
 }
@@ -304,7 +304,7 @@ fn (s mut System<T>&) Settle(phase settle.Phase, b settle.Budget) settle.Settlem
 # centered, -beta away (Minus) - one product per connection per sweep for both
 fn (s mut System<T>&) Nudged(b settle.Budget, beta F64 = 0.5, centered Bool = true) settle.Settlement {
     hi := 3 if centered else 2
-    if s.Phases < hi: unreachable "a system of " $s.Phases " phases cannot hold these nudged phases"
+    if s.Phases < hi: unreachable "a system of " + $s.Phases + " phases cannot hold these nudged phases"
     s.E.Beta[1] = beta
     if centered: s.E.Beta[2] = -beta
     for ph in range 1, hi: s.E.Warm(ph, 0)
@@ -650,7 +650,7 @@ test System.Settle "the certificate's sweep counts at kappa 0.9: a cold settle n
         want := wants[i]
         s.Reset(settle.Phase.Free)
         out := s.Settle(settle.Phase.Free, settle.Budget(128, tol))
-        assert out.Converged and out.Sweeps == want, "tol " $tol ": " $out.Sweeps " sweeps"
+        assert out.Converged and out.Sweeps == want, "tol " + $tol + ": " + $out.Sweeps + " sweeps"
         assert out.Sweeps <= I64((tol.Log() / 0.9.Log()).Ceil())
     }
     # the equilibrium: v = 1 + 0.9 v, every unit
@@ -666,6 +666,29 @@ test System.Settle "a refusal: a budget too small ends unconverged, with the swe
     s.Weights(Conn(1)).Fill(1e300)
     s.Reset(settle.Phase.Free)
     assert s.Settle(settle.Phase.Free, settle.Budget(20, 1e-3)).Diverged()
+}
+
+test System.Settle "damping changes the path, not the equilibrium, and removes a period-2 cycle" {
+    # a linear neuron feeding itself with weight -1: v <- 1 - v swings between 0 and 1 with a residual that never
+    # shrinks; a step shortened by half lands on 1 / 2 at once
+    s := System<F64>(1)
+    h := s.Population(s.Root(), "h", 1, neuron.Neuron.Rate(neuron.Rho.Linear))
+    s.Connect(h, h, conn.Wiring.Dense)
+    s.Plan(rand.Rand(7))!
+    s.Weights(Conn(0)).Fill(-1.0)
+    s.Bias(h).Fill(1.0)
+    out := s.Settle(settle.Phase.Free, settle.Budget(100, 1e-10))
+    assert not out.Converged and out.Sweeps == 100
+    s.Reset(settle.Phase.Free)
+    damped := s.Settle(settle.Phase.Free, settle.Budget(100, 1e-10, 0.5))
+    assert damped.Converged and (s.Activity(settle.Phase.Free, h).Get(0, 0) - 0.5).Abs() < 1e-12
+    # a damped settle of a certified system ends where an undamped one does
+    t := System<F64>.tight(8, 0.9)
+    t.Settle(settle.Phase.Free, settle.Budget(400, 1e-13))
+    star := Array<F64>[t.Activity(settle.Phase.Free, Pop(1)).Get(0, i) for i in range 8]
+    t.Reset(settle.Phase.Free)
+    assert t.Settle(settle.Phase.Free, settle.Budget(2000, 1e-13, 0.5)).Converged
+    for i in range 8: assert (t.Activity(settle.Phase.Free, Pop(1)).Get(0, i) - star[i]).Abs() < 2e-12
 }
 
 # x (20 inputs) -> a (24 tanh) <-> b (16 tanh) <-> y (6, cross-entropy in two groups) with every wiring: a dense input,
@@ -707,13 +730,13 @@ test System.Settle "Jacobi sweeps in tasks equal one thread bit for bit, free an
     one := System<F32>.mixed(130, 1)
     free := one.Settle(settle.Phase.Free, settle.Budget())
     nudged := one.Nudged(settle.Budget())
-    assert free.Converged and nudged.Converged, "free " $free " nudged " $nudged
+    assert free.Converged and nudged.Converged, "free " + $free + " nudged " + $nudged
     for threads in range 2, 5 {
         s := System<F32>.mixed(130, threads)
         s.E.TaskWork = 0                            # every sweep in tasks, however small
         assert s.Settle(settle.Phase.Free, settle.Budget()).Sweeps == free.Sweeps
         assert s.Nudged(settle.Budget()).Sweeps == nudged.Sweeps
-        assert sameState(one, s), $threads " threads"
+        assert sameState(one, s), $threads + " threads"
     }
 }
 
@@ -895,7 +918,7 @@ test System.Settle "a lesson allocates nothing: resident memory does not grow ov
         s.Nudged(b)
     }
     grown := resident() - before
-    assert grown <= 16, "resident memory grew by " $grown " pages"
+    assert grown <= 16, "resident memory grew by " + $grown + " pages"
 }
 
 # two inputs, five hidden units and two squared-error readouts of model, hidden and readout reciprocal, every relaxing
@@ -926,14 +949,14 @@ test System.Settle "a spiking system settles to its rate model's equilibrium, fr
     b := System<F64>.lifty(neuron.Neuron.Rate(neuron.Rho.LifRate(0.1, 1.0)))
     spiking := a.Settle(settle.Phase.Free, settle.Budget(40 * window, 2.0 / F64(window)))
     rate := b.Settle(settle.Phase.Free, settle.Budget(20000, 1e-12, 0.75))
-    assert spiking.Converged and rate.Converged, "spiking " $spiking ", rate " $rate
+    assert spiking.Converged and rate.Converged, "spiking " + $spiking + ", rate " + $rate
     worst F64 = 0.0
     for p in range 1, 3 {
         for row in range 2 {
             for j in range a.Pop(Pop(p)).Size: worst = worst.Max((a.Activity(settle.Phase.Free, Pop(p)).Get(row, j) - b.Activity(settle.Phase.Free, Pop(p)).Get(row, j)).Abs())
         }
     }
-    assert worst < 0.015, "rates within " $worst
+    assert worst < 0.015, "rates within " + $worst
     nudged := a.Nudged(settle.Budget(40 * window, 2.0 / F64(window)), 1.0)
     assert nudged.Converged
     # the plus phase moved its readout toward the targets: 0.15 and 0.02 in row 0

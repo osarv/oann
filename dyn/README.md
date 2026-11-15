@@ -19,8 +19,7 @@ Programs import the modules (`import "dyn/system"` and so on) and write `system.
 the rules) `learn.Learner<F32>(s)!` teaches it: `l.Lesson(s.Root(), beta)!`, an optimizer's step over `s.E.Params` and
 `s.E.Grads`, `l.Tick(system.Clock.Step)!`.
 
-Tests: `olang test dyn/FILE.olang` (`make test` runs them). Speed against `circuit.olang`, the same network and
-weights side by side: `make settlebench ARGS="ROUNDS THREADS"` (bench/settle.olang). MNIST taught by EP on dyn:
+Tests: `olang test dyn/FILE.olang` (`make test` runs them). The settle was measured against `circuit.olang`'s (M7, section 4.3 of docs/redesign.md) before that module went at C3 (branch `pre-c3`). MNIST taught by EP on dyn:
 `make mnistlearn ARGS="EPOCHS"` (examples/mnist_learn.olang; `make data` first). A transformer with a settle block
 through the bridge is `models/hybrid.olang`; `make hybridbench ARGS="STEPS SEED UNITS exact|jfb|ep TOL KAPPA"` trains it
 on tiny Shakespeare cold and amortized and tables the sweeps a settle takes in each (bench/hybrid.olang, M14).

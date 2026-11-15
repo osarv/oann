@@ -17,14 +17,11 @@ Storage and accumulation: F32 x F32, F64 x F64, and BF16, F16, F8E4M3, F8E5M2 st
 operands are packed, rounded to `S` once as each element is stored, also over a depth of several blocks; integers sum
 in themselves (I32), and `GemmI8` sums U8 activations times I8 weights in I32.
 
-Tests are in each file (`olang test kernels/gemm.olang`); scan's hold the chunked forms to the sequential ones to 1e-5 in F32 and every backward to central differences in F64. Speed: `bench/gemm.olang` measures `Gemm` against linalg's
-product on the networks' shapes (F32 and BF16), `Gemv` on a settle's blocks, and `GemmI8` against quant's product -
-`olang build -output build/bench_gemm bench/gemm.olang && build/bench_gemm ROUNDS THREADS`.
+Tests are in each file (`olang test kernels/gemm.olang`); scan's hold the chunked forms to the sequential ones to 1e-5 in F32 and every backward to central differences in F64. Speed against linalg's product, `Gemv` on a settle's blocks and `GemmI8` against quant's product were measured before C3 removed those modules (M4, M5, M12 of docs/redesign.md 4.3; the driver is `bench/gemm.olang` at branch `pre-c3`).
 
 Sparse and event-driven (`sparse.olang`, `conv.olang`): weights are stored in S and widened as they are read; batches (feature-major: row j
 holds feature j of every sample), results and gradients are in the accumulator A. A pattern a caller gives is checked once, where the matrix is
 made (`PatternError`, `GeometryError`). A product given `threads` splits its output over tasks and is the same for every count; given a `Macs` it adds
 the multiply-adds a dense product would have done and those it did. Pruning at run time: `Mask` zeroes entries in place, `Drop` removes them in
 place (a `Tiles` retires whole tiles, `Compact` moves the live ones together), `Squeeze` moves a companion array (gradient, moments) the same way.
-Speed against dense and against the old modules: `bench/sparse_kernels.olang` -
-`olang build -output build/bench_sparse_kernels bench/sparse_kernels.olang && build/bench_sparse_kernels ROUNDS THREADS [pec]`.
+Speed against dense and against the old modules was measured before C3 removed them (M10 of docs/redesign.md 4.3; `bench/sparse_kernels.olang` at branch `pre-c3`).

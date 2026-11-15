@@ -909,7 +909,7 @@ not flags. Sizes: S < 600 lines, M 600-1500, L 1500-3000.
 |---|---|---|---|---|---|
 | C1 | models | `models/*.olang`, `nn/quant.olang`, `examples/` | B1, B2b, B3 | each reference model trains to its round 2 number; INT8 accuracy and speed kept (M12); a GPT and an SSM block at 10M on TinyStories as the first yardstick run (loss curve, tokens per second, M13) | L |
 | C2 | bridge | `dyn/bridge.olang` (the settle as a `Custom` op), `models/hybrid.olang` | B1, B2b | the op's backward against central differences for each `Implicit`; a transformer with a settle block and an amortizer trains; sweeps used with and without the amortizer (M14) | M |
-| C3 | cut-over | delete the old modules; README.md, DESIGN.md, makefile, PROGRESS.md | all | every old test ported or recorded as moved to oagent; `make test` green; build time of the test suite measured (M15) | M |
+| C3 (built, 2026-11-15) | cut-over | delete the old modules; README.md, DESIGN.md, makefile, PROGRESS.md | all | every old test ported or recorded as moved to oagent; `make test` green; build time of the test suite measured (M15) | M |
 | C4 (built, 2026-11-15) | baked plans | `ad/graph.olang` (a `comptime` plan) | B1 | the MLP's plan baked as constant data equals the captured one; compile time stated | S |
 
 Order: A1-A6 together (at most two agents in a full test run at a time); B1 and B2a as soon as A1-A3 merge, B2b
@@ -920,6 +920,53 @@ path: A2 -> B1 -> B3 -> C1 -> C3.
 
 C3 deletes `linalg`, `kernels`, `ops`, `nn`, `layers`, `conv`, `vision`, `circuit`, `board`, `sparse` only when
 M1-M12 hold on the new code, and moves `agent`, `store`, `consolidator` and their examples to oagent (question 2).
+
+**As built (C3, 2026-11-15).** Branch `pre-c3` is the last commit with the old modules (`git show pre-c3:linalg.olang`).
+
+- *Migrated first* (its own commit): `textjoin_migrate` (text joins with `+`, 561 joins in 82 files, none needed
+  parentheses for a catch's `default`); the null test was already `==`. Everything compiled and `make test` ran.
+- *Deleted:* `linalg kernels ops nn layers conv vision circuit board sparse optim train generate quant checkpoint`
+  (root modules), `datasets/` (identical to `data/` but for its tests), `agent store consolidator`, the examples on them
+  (`mnist_settle`, `sleep_retention`, `nights`, `bandit_settle`), repro cases `lambdalend` and `resultgrowth` (both fixed
+  regression cases on `linalg`), and the bench drivers that compared the new code with the old (`each`, `attention`,
+  `attention_kernels`, `elem`, `gemm`, `sparse_kernels`, `conv`, `sparse`, `settle`, `train`, `safetensors`: their
+  numbers are M4 to M7, M10 and M12 above; `io/checkpoint`'s test has numpy read what is written). Kept: `tokenizer.olang`
+  (the module map says so).
+- *Ported:* `bench/lm`, `bench/lmref`, `bench/bpe` and `bench/data` to `ad`, `nn` and `data`; `examples/mnist_board` to
+  `dyn` and `board/engine` (rate neurons: its spiking option is covered by the engine's XOR and firing-rate tests);
+  `data/loader` no longer imports the old `kernels` (`T(x)` rounds as `Down` did). `board/engine`'s five parity tests and
+  their helpers, which imported `board` and `circuit`, are gone: the golden digests (sha256 of each scenario's image, the
+  three of them taken from board.olang's own dumps before it went) carry what they checked; the M11 test now steps with
+  `nn/optim`'s AdamW.
+- *Tests, old to new.* Every test of the old `nn`, `ops`, `layers`, `conv`, `vision`, `sparse`, `optim`, `train`,
+  `generate`, `quant`, `checkpoint`, `kernels` and `linalg` has its counterpart in `ad/graph`, `tools/gradcheck`,
+  `kernels/*`, `tensor`, `nn/*`, `io/checkpoint` (by name or in the package's list above). Ported new at C3: circuit's
+  damping test, as `System.Settle "damping changes the path ..."` in `dyn/system`. Not ported, with the reason:
+  linalg's `Solve`/`Inverse` (dyn has its own Gaussian elimination, tested through the linear-neuron settle) and
+  `ParallelRows` (kernels split with `join`/`spawn`); circuit's policy-score and expected-actor-update tests, the
+  eligibility trace against its explicit sum, the asymmetric-feedback negative and the strong-positive-feedback refusal -
+  they test circuit's own agent-facing API and live on in oagent's `agent/legacy/circuit.olang` with the rest of the
+  circuit tests (the bandit test in `dyn/learn` covers three-factor learning on dyn); board's 14 tests are the engine's
+  (the same names, plus the parity ones that became digests).
+- *Moved to oagent* (`agent/`, commit bafa823 there): `agent`, `store`, `consolidator`, `examples/sleep_retention`,
+  `nights`, `bandit_settle`, `bench/paired`, and the engine they are written on, frozen as it was in `agent/legacy/`
+  (`circuit`, `linalg`, `optim`, `sparse`, `nn`, `ops`, `conv`, `kernels`, `quant`: 14 400 lines, 130 tests, `make test`
+  there is green). They do not import oann yet: the agent stands on `circuit`, which `dyn` replaced, so rebuilding it on
+  `dyn` (whose rules - `DeltaWrite`, `ThreeFactor`, `Homeostasis` - exist) is the work that lets `legacy/` go. **Decision to
+  check:** question 2 below says "nothing moves out of oann in C3" (the user's 2026-11-15 words keep the agent's machinery
+  in oann); C3 followed its brief and the module map above, which move the agent. Reverting is `git checkout pre-c3 --
+  agent.olang store.olang consolidator.olang` plus their legacy modules.
+- *M15, the build time of `make test`:* `make test` over the 35 files (292 tests) took 15 min 56 s of wall time on the shared 4-core machine at a load of 5 to 13
+  (olang master of 2026-11-15, objects cached from the first run): before the cut-over the same command over 57 files
+  (461 tests, the old modules and their duplicates of the new ones) took 18 min 22 s at a load of 10 to 17. One model
+  built cold (a fresh object directory, so std too) at a load of 10: `examples/mnist_mlp` 39 s, `examples/charlm` 41 s.
+  Round 2's reference is not recorded; these are the figures to measure against.
+- *Allocation tests.* The five "a step allocates nothing" tests (`ad/graph`, `nn/optim`, `nn/train`, `models/gpt`,
+  `models/ssm`) failed on the current compiler every time (not flakily: 12 to 40 kB, the same on each run and constant
+  from 20 to 400 steps - not a leak). They read the anonymous resident memory (`RssAnon`, not `VmRSS`, which also counts
+  the code pages a path maps in the first time it runs) through a probe that has already run, and allow four pages for
+  what moves once; the `Graph` test warms both batch sizes first and `nn/optim` takes its reading at step 6. They pass
+  on every run since (`nn/optim` three in a row).
 
 ### 4.3 What is measured
 
