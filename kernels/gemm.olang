@@ -203,7 +203,7 @@ fn GemmBatch<S, A>(ws mut Workspace<A>&, c mut Batch<S>&, a Batch<S>&, ta Bool, 
     wsize I64 = 0 if k <= kc or sameType(c.Data, z) else m * n
     wd := ws.wideC(tasks * wsize)
     share I64 = (count + tasks - 1) / tasks
-    run := batchRun<S, A>(c, a, ta, b, tb, m, n, k, alpha, beta, thin, lower, result, diag)
+    run := batchRun<S, A>(c.Data[c.Off:], strides.of(c), a.Data[a.Off:], strides.of(a), ta, b.Data[b.Off:], strides.of(b), tb, m, n, k, alpha, beta, thin, lower, result, diag)
     if tasks <= 1 {
         run.go(0, count, ap, bp, wd)
         return
@@ -715,11 +715,14 @@ fn confine.of(t Triangle) confine {
 }
 
 # GemmBatch's products lo .. hi, in order, each on one thread into its own panels
-type batchRun<S, A> struct(c mut Batch<S>&, a Batch<S>&, ta Bool, b Batch<S>&, tb Bool, m I64, n I64, k I64, al A, be A, thin Bool, lower Bool, result Bool, diag I64) {
-    c
-    a
+type batchRun<S, A> struct(cd mut Array<S>&, cst strides, ad Array<S>&, ast strides, ta Bool, bd Array<S>&, bst strides, tb Bool, m I64, n I64, k I64, al A, be A, thin Bool, lower Bool, result Bool, diag I64) {
+    cd
+    cst
+    ad
+    ast
     ta
-    b
+    bd
+    bst
     tb
     m
     n
@@ -732,21 +735,32 @@ type batchRun<S, A> struct(c mut Batch<S>&, a Batch<S>&, ta Bool, b Batch<S>&, t
     diag
 }
 
+# a batch's strides: its rows', its groups' and its members' (its storage kept apart, as a slice)
+type strides struct(ld I64, gs I64, ms I64, members I64) {
+    ld
+    gs
+    ms
+    members
+}
+
+fn strides.of<S>(b Batch<S>&) strides { return strides(b.Ld, b.GroupStride, b.MemberStride, b.Members) }
+
+# where matrix e of a batch begins in its storage
+fn (s strides&) at(e I64) I64 { return e / s.members * s.gs + e % s.members * s.ms }
+
 fn (r batchRun<S, A>&) go(lo I64, hi I64, ap mut Array<A>&, bp mut Array<A>&, wide mut Array<A>&) {
     for e in range lo, hi {
-        g I64 = e / r.c.Members
-        h I64 = e - g * r.c.Members
-        sa := operand<S>.of(r.a[g, h])
-        sb := operand<S>.of(r.b[g, h])
-        cd := r.c.Data[r.c.Off + g * r.c.GroupStride + h * r.c.MemberStride:]
+        sa := operand<S>(r.ad[r.ast.at(e):], r.ast.ld)
+        sb := operand<S>(r.bd[r.bst.at(e):], r.bst.ld)
+        cd := r.cd[r.cst.at(e):]
         if r.k <= kc or sameType(cd, r.al) {
-            r.blocks(sa, sb, cd, r.c.Ld, ap, bp)
+            r.blocks(sa, sb, cd, r.cst.ld, ap, bp)
             continue
         }
         # a depth of several blocks into narrower storage: the partial sums kept in the accumulator (see product)
-        if r.be != 0: copyInto(wide, r.n, cd, r.c.Ld, r.m, r.n, r.al, r.diag + 1 if r.result else r.n)
+        if r.be != 0: copyInto(wide, r.n, cd, r.cst.ld, r.m, r.n, r.al, r.diag + 1 if r.result else r.n)
         r.blocks(sa, sb, wide, r.n, ap, bp)
-        copyInto(cd, r.c.Ld, wide, r.n, r.m, r.n, cd[0], r.diag + 1 if r.result else r.n)
+        copyInto(cd, r.cst.ld, wide, r.n, r.m, r.n, cd[0], r.diag + 1 if r.result else r.n)
     }
 }
 

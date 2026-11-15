@@ -8,6 +8,7 @@ where the library changed) so each builds or fails as its header says.
 |---|---|---|
 | `fieldname.olang` | reproduces | D3a: a constructor field may not share a function's name in its module. A deliberate rule, kept as a record of the friction |
 | `joinparen.olang` | reproduces | E13b: `$alpha (" x")` calls what was rendered. The rule is deliberate, but the message is now `E13b: F64 is not a function`, not the E11b that named the way out (`$(...)`) - worth restoring |
+| `lambdacapture.olang` | reproduces (new) | O17: a value captured by a lambda and lent to a callee that only reads it (building a local struct holding the read-only parameter) is "the callee can store through it"; the same call outside the lambda is accepted |
 | `nullmigrate.olang` | reproduces (new) | `olang fix` crashes in `tools/null_migrate.olang:162` (slice bounds out of range) on a T2c error reported inside a generic's instance; the tools after it do not run |
 | `fieldofresult.olang` | fixed | builds and prints ok: region inference (QCB) replaced the O10d refusal. Kept as a regression case |
 | `lambdalend.olang` | fixed | builds and prints ok: O17 no longer refuses the lent value. `linalg.View` now fails with `ShapeError`, so the matrix is made with the `Matrix` constructor |
