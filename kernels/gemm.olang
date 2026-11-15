@@ -3,10 +3,13 @@
 # own type, a convolution's patches), Gemv (one vector, no packing), Ger2 (a decayed rank-2 update) and GemmI8 (8-bit
 # integers accumulated in 32 bits, for quantized inference).
 #
-# Storage and accumulation. Every product is generic over the storage type S of its matrices and the accumulator A
-# its sums are kept in, which is the type of its workspace: F32 x F32, F64 x F64, and the low-precision storage
-# BF16, F16, F8E4M3 and F8E5M2 x F32 - widened to A as the operands are packed, every sum kept in A, rounded to S once
-# as the result is stored. Integer types accumulate in themselves, wrapping (E6c).
+# Storage and accumulation. Every product is generic over the storage type of each of its matrices - C's, A's and B's,
+# which may differ: BF16 or INT8 weights under F32 activations - and the accumulator A its sums are kept in, which is
+# the type of its workspace: F32 x F32, F64 x F64, and the low-precision storage BF16, F16, F8E4M3, F8E5M2 and the
+# integers x F32 - each operand widened to A as it is packed or read, every sum kept in A, rounded to C's type once as
+# the result is stored. A product of operands stored narrower is the product of the operands widened first, bit for
+# bit (a test), so weights kept in BF16 or INT8 (their scale in alpha) cost no accuracy beyond their own rounding.
+# Integer types accumulate in themselves, wrapping (E6c).
 #
 # The algorithm is BLIS's (Goto's). C is computed in blocks sized for the caches - kc steps of the depth by nc columns
 # of op(B) packed into one contiguous panel (L3), mc rows of op(A) by kc into another (L2) - and every block by a
@@ -192,12 +195,12 @@ fn Cores() I64 {
 # c = alpha op(a) op(b) + beta c, then the epilogue: op(x) is x, or its transpose where its flag is set - read where x
 # is, never transposed in memory. beta = 0 never reads c, so c may hold anything (BLAS's rule); c must not overlap a or
 # b. Packs into ws, split over ws.Threads tasks when large enough
-fn Gemm<S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a mat.Mat<S>&, ta Bool, b mat.Mat<S>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
+fn Gemm<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&, ta Bool, b mat.Mat<SB>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
     m, n := c.Rows, c.Cols
     k I64 = a.Rows if ta else a.Cols
     if m == 0 or n == 0: return
-    oa := operand<S>.of(a)
-    ob := operand<S>.of(b)
+    oa := operand<SA>.of(a)
+    ob := operand<SB>.of(b)
     cd := c.Data[c.Off:]
     if k > 0 and unpacked(m, n, k, ta, tb, cd, alpha) {
         unpackedProduct(m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
@@ -211,10 +214,10 @@ fn Gemm<S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a mat.Mat<S>&, ta Bool, b
 # made. op(a) is c.Rows x k; L needs Pack<A>(w0 I64, p0 I64, width I64, depth I64, wr I64, dst mut Array<A>&), which
 # fills dst with op(a)'s rows w0 .. w0 + width and depth p0 .. p0 + depth in panels wr rows wide: panel q (from
 # dst[q depth]) holding, for each step p, the wr values (w0 + q + w, p0 + p), zeros past the width. Never exchanged
-fn GemmLeft<L, S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a L, k I64, b mat.Mat<S>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
+fn GemmLeft<L, SC, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a L, k I64, b mat.Mat<SB>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
     if c.Rows == 0 or c.Cols == 0: return
     fa := foreign<L>(a)
-    ob := operand<S>.of(b)
+    ob := operand<SB>.of(b)
     cd := c.Data[c.Off:]
     product(c.Rows, c.Cols, k, fa, false, ob, tb, alpha, beta, cd, c.Ld, ws, epi, false)
 }
@@ -225,7 +228,7 @@ fn GemmLeft<L, S, A>(ws mut Workspace<A>&, c mut mat.Mat<S>&, a L, k I64, b mat.
 #     GemmBatch(ws, Batch.Stacked(p, T, heads), Batch.Heads(q, T, heads), false, Batch.Heads(k, T, heads), true, scale, 0, Triangle.Result(0))
 #     (the softmax of each row over its first i + 1 columns, then)
 #     GemmBatch(ws, Batch.Heads(y, T, heads), Batch.Stacked(p, T, heads), false, Batch.Heads(v, T, heads), false, 1, 0, Triangle.Left(0))
-fn GemmBatch<S, A>(ws mut Workspace<A>&, c mut Batch<S>&, a Batch<S>&, ta Bool, b Batch<S>&, tb Bool, alpha A = 1, beta A = 0, tri Triangle = Triangle.Full) {
+fn GemmBatch<SC, SA, SB, A>(ws mut Workspace<A>&, c mut Batch<SC>&, a Batch<SA>&, ta Bool, b Batch<SB>&, tb Bool, alpha A = 1, beta A = 0, tri Triangle = Triangle.Full) {
     m, n := c.Rows, c.Cols
     k I64 = a.Rows if ta else a.Cols
     count I64 = c.Groups * c.Members
@@ -248,7 +251,7 @@ fn GemmBatch<S, A>(ws mut Workspace<A>&, c mut Batch<S>&, a Batch<S>&, ta Bool, 
     wsize I64 = 0 if k <= kc or sameType(c.Data, z) else m * n
     wd := ws.wideC(tasks * wsize)
     share I64 = (count + tasks - 1) / tasks
-    run := batchRun<S, A>(c.Data[c.Off:], strides.of(c), a.Data[a.Off:], strides.of(a), ta, b.Data[b.Off:], strides.of(b), tb, m, n, k, alpha, beta, thin, lower, result, diag)
+    run := batchRun<SC, SA, SB, A>(c.Data[c.Off:], strides.of(c), a.Data[a.Off:], strides.of(a), ta, b.Data[b.Off:], strides.of(b), tb, m, n, k, alpha, beta, thin, lower, result, diag)
     if tasks <= 1 {
         run.go(0, count, ap, bp, wd)
         return
@@ -286,9 +289,10 @@ fn Ger2<S, A>(a mut mat.Mat<S>&, x1 Array<A>&, y1 Array<A>&, x2 Array<A>&, y2 Ar
 
 # no product allocates: every panel is the workspace's, reserved beforehand (S17a, G42) - so a step or a settle made of
 # them can be pinned allocation-free
-assert not Gemm<F32, F32>.Allocates, "a product allocates"
-assert not Gemm<BF16, F32>.Allocates, "a BF16 product allocates"
-assert not GemmBatch<F32, F32>.Allocates, "a batch of products allocates"
+assert not Gemm<F32, F32, F32, F32>.Allocates, "a product allocates"
+assert not Gemm<BF16, BF16, BF16, F32>.Allocates, "a BF16 product allocates"
+assert not Gemm<F32, F32, I8, F32>.Allocates, "a product of INT8 weights allocates"
+assert not GemmBatch<F32, F32, F32, F32>.Allocates, "a batch of products allocates"
 assert not Gemv<F32, F32>.Allocates, "a matrix-vector product allocates"
 assert not GemmI8.Allocates, "an INT8 product allocates"
 
@@ -768,7 +772,7 @@ fn confine.of(t Triangle) confine {
 }
 
 # GemmBatch's products lo .. hi, in order, each on one thread into its own panels
-type batchRun<S, A> struct(cd mut Array<S>&, cst strides, ad Array<S>&, ast strides, ta Bool, bd Array<S>&, bst strides, tb Bool, m I64, n I64, k I64, al A, be A, thin Bool, lower Bool, result Bool, diag I64) {
+type batchRun<S, SA, SB, A> struct(cd mut Array<S>&, cst strides, ad Array<SA>&, ast strides, ta Bool, bd Array<SB>&, bst strides, tb Bool, m I64, n I64, k I64, al A, be A, thin Bool, lower Bool, result Bool, diag I64) {
     cd
     cst
     ad
@@ -801,10 +805,10 @@ fn strides.of<S>(b Batch<S>&) strides { return strides(b.Ld, b.GroupStride, b.Me
 # where matrix e of a batch begins in its storage
 fn (s strides&) at(e I64) I64 { return e / s.members * s.gs + e % s.members * s.ms }
 
-fn (r batchRun<S, A>&) go(lo I64, hi I64, ap mut Array<A>&, bp mut Array<A>&, wide mut Array<A>&) {
+fn (r batchRun<S, SA, SB, A>&) go(lo I64, hi I64, ap mut Array<A>&, bp mut Array<A>&, wide mut Array<A>&) {
     for e in range lo, hi {
-        sa := operand<S>(r.ad[r.ast.at(e):], r.ast.ld)
-        sb := operand<S>(r.bd[r.bst.at(e):], r.bst.ld)
+        sa := operand<SA>(r.ad[r.ast.at(e):], r.ast.ld)
+        sb := operand<SB>(r.bd[r.bst.at(e):], r.bst.ld)
         cd := r.cd[r.cst.at(e):]
         if r.k <= kc or sameType(cd, r.al) {
             r.blocks(sa, sb, cd, r.cst.ld, ap, bp)
@@ -817,7 +821,7 @@ fn (r batchRun<S, A>&) go(lo I64, hi I64, ap mut Array<A>&, bp mut Array<A>&, wi
     }
 }
 
-fn (r batchRun<S, A>&) blocks<T>(sa operand<S>&, sb operand<S>&, cd mut Array<T>&, ldc I64, ap mut Array<A>&, bp mut Array<A>&) {
+fn (r batchRun<S, SA, SB, A>&) blocks<T>(sa operand<SA>&, sb operand<SB>&, cd mut Array<T>&, ldc I64, ap mut Array<A>&, bp mut Array<A>&) {
     if r.thin: gemmBlocks(r.m, r.n, r.k, sa, r.ta, sb, not r.tb, r.al, r.be, cd, ldc, r.m, ap, 0, bp, thinTile(), false, r.lower, r.result, r.diag, Epilogue.None)
     else: gemmBlocks(r.m, r.n, r.k, sa, r.ta, sb, not r.tb, r.al, r.be, cd, ldc, r.m, ap, 0, bp, wideTile(), false, r.lower, r.result, r.diag, Epilogue.None)
 }
@@ -855,7 +859,7 @@ fn unpacked<S, A>(m I64, n I64, k I64, ta Bool, tb Bool, c Array<S>&, z A) Bool 
 
 # the unpacked product: a vector-matrix product per row of up to four, a matrix-vector product for one column, and the
 # i-k-j loop otherwise (S being A; narrower storage only takes the dot products, gemvRows)
-fn unpackedProduct<S, A>(m I64, n I64, k I64, a operand<S>&, ta Bool, b operand<S>&, tb Bool, alpha A, beta A, c mut Array<S>&, ldc I64) {
+fn unpackedProduct<SA, SB, S, A>(m I64, n I64, k I64, a operand<SA>&, ta Bool, b operand<SB>&, tb Bool, alpha A, beta A, c mut Array<S>&, ldc I64) {
     if m <= 4 {
         # c's row i = alpha (a's row i, or column where ta) op(b) + beta c's row i
         for i in range m {
@@ -876,7 +880,7 @@ fn unpackedProduct<S, A>(m I64, n I64, k I64, a operand<S>&, ta Bool, b operand<
 }
 
 # a small product in A without packing: each row of C updated from rows of B, the i-k-j loop vectorized along the rows
-fn gemmDirect<S, A>(ta Bool, m I64, n I64, k I64, alpha A, a Array<S>&, lda I64, b Array<S>&, ldb I64, beta A, c mut Array<S>&, ldc I64) {
+fn gemmDirect<SA, SB, S, A>(ta Bool, m I64, n I64, k I64, alpha A, a Array<SA>&, lda I64, b Array<SB>&, ldb I64, beta A, c mut Array<S>&, ldc I64) {
     like S
     for i in range m {
         ci I64 = i * ldc
@@ -1079,20 +1083,49 @@ fn actOf<A, K>(x A, kind K) A {
 # width; a tile's rows of activations are packed step by step as its products begin them. Fewer than four rows take
 # dot products along the rows with nothing packed - the decoding step, a single sample
 fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat<I8>&, scale Array<F32>&, out mut mat.Mat<F32>&, zero I32 = 0
-        sums Array<I32>& = Array<I32>(0)) {
+        sums Array<I32>& = noSums) {
     m, n, k := a.Rows, b.Rows, a.Cols
     if m == 0 or n == 0: return
     corr := ws.corrections(n)
-    if zero == 0 { for j in range n: corr[j] = 0 }
-    else if sums.Len() >= n { for j in range n: corr[j] = zero * sums[j] }
-    else { for j in range n: corr[j] = zero * rowSum(b, j) }
-    q := quant(operand<U8>.of(a), operand<I8>.of(b), m, n, k, scale, corr, c.Data[c.Off:], c.Ld, out.Data[out.Off:], out.Ld)
+    corrections(corr, b, zero, sums)
+    oa, ob := operand<U8>.of(a), operand<I8>.of(b)
+    cd, od := c.Data[c.Off:], out.Data[out.Off:]
+    q := quant(oa, ob, m, n, k, scale, corr, cd, c.Ld, od, out.Ld)
     if m < 4 {
         for i in range m: q.rowI8(i)
         return
     }
-    if n > i8Lanes: q.blocked(ws, wideI8())
-    else: q.blocked(ws, thinI8())
+    if n > i8Lanes: q.blocked(ws, wideI8(), oa)
+    else: q.blocked(ws, thinI8(), oa)
+}
+
+# GemmI8 whose activations are not a matrix but read by their own type as they are packed - a convolution's patches of
+# quantized pixels, never made (conv.Patches<U8>, the zero point its fill): op(a) is m x k, and L needs Pack<U8>(w0 I64,
+# p0 I64, width I64, depth I64, wr I64, dst mut Array<U8>&) as GemmLeft's left operand has. Always packed, a tile of
+# rows at a time
+fn GemmI8Left<L>(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a L, m I64, k I64, b mat.Mat<I8>&, scale Array<F32>&, out mut mat.Mat<F32>&, zero I32 = 0
+        sums Array<I32>& = noSums) {
+    n := b.Rows
+    if m == 0 or n == 0: return
+    corr := ws.corrections(n)
+    corrections(corr, b, zero, sums)
+    fa, ob, none := foreign<L>(a), operand<I8>.of(b), operand<U8>(noBytes, 0)
+    cd, od := c.Data[c.Off:], out.Data[out.Off:]
+    q := quant(none, ob, m, n, k, scale, corr, cd, c.Ld, od, out.Ld)
+    if n > i8Lanes: q.blocked(ws, wideI8(), fa)
+    else: q.blocked(ws, thinI8(), fa)
+}
+
+# no row sums given: a constant, so a product given none allocates nothing
+noSums Array<I32> = Array<I32>(0)
+noBytes Array<U8> = Array<U8>(0)
+
+# zero times each weight row's sum: none where the zero point is 0, from sums where given, else summed here
+fn corrections(corr mut Array<I32>&, b mat.Mat<I8>&, zero I32, sums Array<I32>&) {
+    n := b.Rows
+    if zero == 0 { for j in range n: corr[j] = 0 }
+    else if sums.Len() >= n { for j in range n: corr[j] = zero * sums[j] }
+    else { for j in range n: corr[j] = zero * rowSum(b, j) }
 }
 
 # a GemmI8's operands and results, as its tasks read them
@@ -1129,7 +1162,7 @@ fn i8Shape<H>(sh H) I64, I64 {
 }
 
 # the packed product: b in column panels of nr (zeros past n) into ws, then runs of the row tiles over ws.Threads tasks
-fn (q quant&) blocked<H>(ws mut Workspace<I32>&, sh H) {
+fn (q quant&) blocked<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     mr, nr := i8Shape(sh)
     m, n, k := q.m, q.n, q.k
     panels I64 = (n + nr - 1) / nr
@@ -1140,14 +1173,14 @@ fn (q quant&) blocked<H>(ws mut Workspace<I32>&, sh H) {
     share I64 = (tiles + tasks - 1) / tasks
     qa := ws.bytesA(tasks * mr * k)
     if tasks <= 1 {
-        q.tilesI8(0, tiles, qa, qb, sh)
+        q.tilesI8(0, tiles, qa, qb, sh, src)
         return
     }
     join {
         for t in range tasks {
             lo I64 = t * share
             hi I64 = lesser(tiles, lo + share)
-            if lo < hi: spawn q.tilesI8(lo, hi, qa[t * mr * k:(t + 1) * mr * k], qb, sh)
+            if lo < hi: spawn q.tilesI8(lo, hi, qa[t * mr * k:(t + 1) * mr * k], qb, sh, src)
         }
     }
 }
@@ -1165,20 +1198,29 @@ fn packI8(b operand<I8>&, k I64, j0 I64, cols I64, nr I64, dst mut Array<I8>&, o
 
 # row tiles lo .. hi: each tile's rows packed step by step into pa (k mr + i, zeros below the last row), then its product
 # with every panel
-fn (q quant&) tilesI8<H>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, sh H) {
+fn (q quant&) tilesI8<H, P>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, sh H, src P) {
     mr, nr := i8Shape(sh)
     m, n, k := q.m, q.n, q.k
     for r in range lo, hi {
         rows I64 = lesser(mr, m - r * mr)
-        for i in range rows {
-            s I64 = (r * mr + i) * q.a.ld
-            for p in range k: pa[p * mr + i] = q.a.d[s + p]
-        }
-        for i in range rows, mr {
-            for p in range k: pa[p * mr + i] = 0
-        }
+        src.packI8(r * mr, rows, k, mr, pa)
         for p in range 0, n, nr: q.tileI8(r * mr, rows, p, lesser(nr, n - p), pa, qb, sh)
     }
+}
+
+# activations' rows r0 .. r0 + rows into a panel mr wide, step by step (pa[p mr + i] = a[r0 + i, p]), zeros past rows
+fn (x operand<U8>&) packI8(r0 I64, rows I64, k I64, mr I64, pa mut Array<U8>&) {
+    for i in range rows {
+        s I64 = (r0 + i) * x.ld
+        for p in range k: pa[p * mr + i] = x.d[s + p]
+    }
+    for i in range rows, mr {
+        for p in range k: pa[p * mr + i] = 0
+    }
+}
+
+fn (f foreign<L>&) packI8(r0 I64, rows I64, k I64, mr I64, pa mut Array<U8>&) {
+    f.x.Pack<U8>(r0, 0, rows, k, mr, pa)
 }
 
 # the tile of rows i0 .. i0 + rows and outputs j0 .. j0 + cols, summed over the depth then stored
@@ -1889,4 +1931,59 @@ test Gemm "thin products and exchanged ones: a convolution's sixteen channels, i
     for s in range sizes.Len() / 3 {
         for form in range 4: productCase(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], form, r)
     }
+}
+
+# x's elements widened to F32, in storage of their own
+fn widened<S>(x mat.Mat<S>&) mat.Mat<F32> {
+    out := gappy(x.Rows, x.Cols, F32(0))
+    for i in range x.Rows {
+        for j in range x.Cols: out[i, j] = cast(x[i, j], F32(0))
+    }
+    return out
+}
+
+# F32 activations times weights stored in S: the product of the weights widened first, bit for bit - for every
+# transpose, the unpacked paths, packed and exchanged ones, several blocks of depth, one thread and four
+fn storageCase<S>(m I64, n I64, k I64, form I64, like S, r mut rand.Rand&) {
+    ta, tb := form % 2 == 1, form >= 2
+    a := uniform(k, m, F32(0), r) if ta else uniform(m, k, F32(0), r)
+    b := uniform(n, k, like, r, -100.0, 100.0) if tb else uniform(k, n, like, r, -100.0, 100.0)
+    bw := widened(b)
+    for threads in Array<I64>[1, 4] {
+        ws := Workspace<F32>(threads, most(m, n, k))
+        c := gappy(m, n, F32(0))
+        fill(c, 0.25)
+        want := gappy(m, n, F32(0))
+        fill(want, 0.25)
+        Gemm(ws, c, a, ta, b, tb, F32(0.5), F32(1))
+        Gemm(ws, want, a, ta, bw, tb, F32(0.5), F32(1))
+        assert sameBits(c, want), $S.Name + " " + $m + "x" + $n + "x" + $k + " form " + $form
+    }
+}
+
+test Gemm "a storage type per operand - BF16, F16, F8E4M3 or INT8 weights under F32 activations - is the product of the widened weights, bit for bit" {
+    r := rand.Rand(21)
+    sizes := Array<I64>[1, 10, 300, 3, 70, 41, 9, 1, 20, 30, 24, 20, 64, 128, 784, 200, 16, 300, 300, 260, 600]
+    for s in range sizes.Len() / 3 {
+        m, n, k := sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2]
+        for form in range 4 {
+            storageCase(m, n, k, form, BF16(0), r)
+            storageCase(m, n, k, form, F16(0), r)
+            storageCase(m, n, k, form, F8E4M3(0), r)
+            storageCase(m, n, k, form, I8(0), r)
+        }
+    }
+}
+
+test GemmBatch "a storage type per operand: BF16 keys under F32 queries are the widened keys' product, bit for bit" {
+    r := rand.Rand(22)
+    q := uniform(4 * 20, 24, F32(0), r)
+    kb := uniform(4 * 20, 24, BF16(0), r)
+    kw := widened(kb)
+    p := gappy(4 * 20, 20, F32(0))
+    pw := gappy(4 * 20, 20, F32(0))
+    ws := Workspace<F32>(2, 24)
+    GemmBatch(ws, Batch.Stacked(p, 20), Batch.Stacked(q, 20), false, Batch.Stacked(kb, 20), true, F32(1), F32(0), Triangle.Result(0))
+    GemmBatch(ws, Batch.Stacked(pw, 20), Batch.Stacked(q, 20), false, Batch.Stacked(kw, 20), true, F32(1), F32(0), Triangle.Result(0))
+    assert sameBits(p, pw)
 }

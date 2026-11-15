@@ -1,0 +1,74 @@
+# kernels/gemm's product with a storage type per operand: F32 activations times weights stored in F32, BF16 or INT8
+# (widened as they are packed, the INT8 ones' scale in alpha), y = alpha x w^T as a linear layer's forward - interleaved,
+# the median of each over rounds, every speed a ratio to F32 weights taken in the same minutes. Arguments: rounds (7),
+# threads (1). From the repository's root: olang build -output build/bench_storage bench/storage.olang &&
+# build/bench_storage
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/gemm"
+import "../kernels/mat"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn random<S>(rows I64, cols I64, like S, r mut rand.Rand&, scale F64) mat.Mat<S> {
+    m := mat.Mat<S>(Array<S>(rows * cols), 0, rows, cols, cols)
+    for i in range rows * cols: m.Data[i] = S(r.Uniform(-1.0, 1.0) * scale)
+    return m
+}
+
+# ns a product of y = alpha x w^T, the weights in S, repeated until a round takes about 20 ms
+fn timed<S>(ws mut gemm.Workspace<F32>&, y mut mat.Mat<F32>&, x mat.Mat<F32>&, w mat.Mat<S>&, alpha F32, reps I64) F64 {
+    t0 := time.Now()
+    for _ in range reps: gemm.Gemm(ws, y, x, false, w, true, alpha)
+    return F64(time.Since(t0)) / F64(reps)
+}
+
+# a linear layer's forward at batch 1, 64 and 128 (the perceptron's 784 x 128), the character transformer's
+# perceptron (1024 rows), and squares - m, k and n of each product
+Shapes Array<I64> = Array<I64>[1, 784, 128, 64, 784, 128, 128, 784, 128, 1024, 128, 512, 1024, 512, 128, 512, 512, 512
+    1024, 1024, 1024, 1, 1024, 1024]
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try number(args, 1, 7)
+    threads := try number(args, 2, 1)
+    r := rand.Rand(1)
+    for i in range 0, Shapes.Len(), 3 {
+        m, k, n := Shapes[i], Shapes[i + 1], Shapes[i + 2]
+        ws := gemm.Workspace<F32>(threads, m.Max(k).Max(n))
+        x := random(m, k, F32(0), r, 1.0)
+        y := mat.Mat<F32>(Array<F32>(m * n), 0, m, n, n)
+        w32 := random(n, k, F32(0), r, 0.1)
+        w16 := random(n, k, BF16(0), r, 0.1)
+        w8 := random(n, k, I8(0), r, 127.0)
+        reps I64 = 1
+        for {
+            t0 := time.Now()
+            for _ in range reps: gemm.Gemm(ws, y, x, false, w32, true)
+            if time.Since(t0) > 20000000 or reps > 1000000: break
+            reps = reps * 2
+        }
+        f32s, bf16s, i8s := Array<F64>(rounds), Array<F64>(rounds), Array<F64>(rounds)
+        for t in range rounds {
+            f32s[t] = timed(ws, y, x, w32, F32(1), reps)
+            bf16s[t] = timed(ws, y, x, w16, F32(1), reps)
+            i8s[t] = timed(ws, y, x, w8, F32(0.1 / 127.0), reps)
+        }
+        f, b, q := median(f32s), median(bf16s), median(i8s)
+        ops F64 = 2.0 * F64(m) * F64(n) * F64(k)
+        try io.Put($m + " x " + $k + " x " + $n + ": F32 " + $(f * 1e-3).Fixed(2) + " us (" + $(ops / f).Fixed(1) +
+            " GFLOPS), BF16 weights " + $(b * 1e-3).Fixed(2) + " us (" + $(f / b).Fixed(2) + "x), INT8 weights " +
+            $(q * 1e-3).Fixed(2) + " us (" + $(f / q).Fixed(2) + "x)\n")
+    }
+}
