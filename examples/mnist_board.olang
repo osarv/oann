@@ -26,12 +26,12 @@ import "../datasets/idx"
 import "../datasets/loader"
 import "../datasets/mnist"
 
-fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.JsonError {
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
     if i >= args.Len() { return fallback }
-    return try (try json.Parse(args[i])).AsNum()
+    return try (try json.Json.Parse(args[i])).AsNum()
 }
 
-fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + json.JsonError {
+fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error {
     args := os.Args()
     epochs := I64(try number(args, 1, 3))
     onBoard Bool = args.Len() <= 2 or args[2] == "board"
@@ -47,12 +47,12 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + json.Jso
     restrain Bool = try number(args, 10, 0 if spiking else 1) == 1.0
     if spiking and args.Len() <= 7 { rate = 0.005 }
     if spiking and args.Len() <= 8 { beta = 1.0 }
-    data := try mnist.Load("data/mnist", mnist.Source)
+    data := try mnist.Mnist.Load("data/mnist", mnist.Source)
     part := loader.Labeled(data.Train.Features[:samples * 784], data.Train.Labels[:samples], 784, 10)
 
     c := circuit.Circuit<F32>(batch)
     pixels := c.Input(784)
-    lif := circuit.LifNeuron(0.1, 1.0, 0.25, window if spiking else 1)
+    lif := circuit.Neuron.LifNeuron(0.1, 1.0, 0.25, window if spiking else 1)
     inner := c.Hidden(hidden, lif) if spiking else c.Hidden(hidden)
     digits := c.Readout(10, circuit.Cost.Squared, lif) if spiking else c.Readout(10, circuit.Cost.CrossEntropy(temperature))
     c.Project(pixels, inner, circuit.Wiring.OneWay)
@@ -66,13 +66,13 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + json.Jso
     } else {
         c.Certify(0.9)
     }
-    e := board.Board(c)
+    e := board.Engine.Board(c)
     opt := optim.FlatAdamW<F32>(c.ParamCount, rate)
     lesson := circuit.Lesson(beta)
     classes := Array<I32>(batch)
-    println("784-" $hidden "-10 settling circuit for the board, " $(c.ParamCount) " parameters, lessons settled " $("on the board" if onBoard else "in F32")
+    try io.PutLine(("784-" $hidden "-10 settling circuit for the board, " $(c.ParamCount) " parameters, lessons settled " $("on the board" if onBoard else "in F32")
         ", batches of " $batch ", beta " $beta ", " $("spiking, a window of " $window " steps" if spiking else "T " $temperature)
-        "; a sweep " $(e.SweepCycles()) " cycles and the constant " $(e.ConstantCycles()) " at one row on the board")
+        "; a sweep " $(e.SweepCycles()) " cycles and the constant " $(e.ConstantCycles()) " at one row on the board"))
     trainSet := loader.Loader(part, batch, seed)
     testSet := loader.Loader(data.Test, batch, seed, false)
     for k in range 1, epochs + 1 {
@@ -109,11 +109,11 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + json.Jso
         gain := ("gain " $(c.Gain()).Fixed(2) if not spiking else "per answering step a row "
             $(F64(e.Spikes - spikesBefore) / F64(e.Steps - stepsBefore)).Fixed(1) " spikes and "
             $(F64(e.Events - eventsBefore) / F64(e.Steps - stepsBefore)).Fixed(0) " synaptic events")
-        println("epoch " $k ": train loss " $(loss / F64(seen)).Fixed(4) ", " $(F64(sweeps) / F64(trainSet.Batches() - refused)).Fixed(1)
+        try io.PutLine(("epoch " $k ": train loss " $(loss / F64(seen)).Fixed(4) ", " $(F64(sweeps) / F64(trainSet.Batches() - refused)).Fixed(1)
             $(" steps" if spiking else " sweeps") " a lesson, " $refused " refused, " $spent.Fixed(1) " s; test accuracy " $(100.0 * floatRight).Fixed(2) "% in F32 ("
             $floatSweeps.Fixed(1) "), " $(100.0 * boardRight).Fixed(2) "% on the board (" $boardSweeps.Fixed(1) "), answers agreeing on "
             $(100.0 * agree).Fixed(2) "% (" $answering.Fixed(1) " s); " $gain ", constants clipped " $(100.0 * F64(e.Clipped) / F64(e.Constants)).Fixed(2)
-            "%, totals or potentials saturated " $(e.Saturations) " times")
+            "%, totals or potentials saturated " $(e.Saturations) " times"))
     }
 }
 
@@ -132,8 +132,8 @@ fn label(c mut circuit.Circuit<F32>&, digits circuit.Region, classes Array<I32>&
 
 # the test set answered by free settles in F32 and on the board: each one's accuracy, the fraction of samples on which
 # the two answer alike, and each one's mean sweeps an answer (a refused settle counts as wrong)
-fn evaluate(c mut circuit.Circuit<F32>&, e mut board.Engine&, l mut loader.Loader<<D>>&, pixels circuit.Region, digits circuit.Region,
-        tolerance F64) (F64, F64, F64, F64, F64) {
+fn evaluate<D>(c mut circuit.Circuit<F32>&, e mut board.Engine&, l mut loader.Loader<D>&, pixels circuit.Region, digits circuit.Region
+        tolerance F64) F64, F64, F64, F64, F64 {
     l.Epoch()
     classes := Array<I32>(c.Rows)
     floatAnswers := Array<I32>(c.Rows)
@@ -175,6 +175,5 @@ fn evaluate(c mut circuit.Circuit<F32>&, e mut board.Engine&, l mut loader.Loade
             if floatOk and boardOk and floatAnswers[i] == boardAnswers[i] { agree++ }
         }
     }
-    return F64(floatRight) / F64(seen), F64(boardRight) / F64(seen), F64(agree) / F64(seen), F64(floatSweeps) / F64(settles),
-        F64(boardSweeps) / F64(settles)
+    return F64(floatRight) / F64(seen), F64(boardRight) / F64(seen), F64(agree) / F64(seen), F64(floatSweeps) / F64(settles), F64(boardSweeps) / F64(settles)
 }

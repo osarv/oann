@@ -30,17 +30,17 @@ fn median(xs mut Array<F64>&) F64 {
     return xs[xs.Len() / 2]
 }
 
-fn main() ? io.IoError + os.OsError + text.TextError + ParseError + nn.CheckpointError {
+fn main() ? io.Error, os.Error, text.CorpusError, ParseError, nn.CheckpointError {
     args := os.Args()
     count := try number(args, 1, 500)
     rounds := try number(args, 2, 5)
     threads := try number(args, 3, 1)
-    c := try text.Load("data/shakespeare/input.txt")
+    c := try text.Corpus.Load("data/shakespeare/input.txt")
     r := rand.Rand(1)
 
     # the validation loss, F32 then INT8, and the time of one forward over 16 x 64 characters
     g := nn.Graph<F32>(sequences * context, threads)
-    m := train.Gpt(g, c.Size(), context, width, heads, depth)
+    m := train.LanguageModel.Gpt(g, c.Size(), context, width, heads, depth)
     g.Plan(r)
     try g.Load("data/shakespeare/charlm.ckpt")
     valSet := text.Windows(c.Val(), context)
@@ -48,8 +48,8 @@ fn main() ? io.IoError + os.OsError + text.TextError + ParseError + nn.Checkpoin
     g.QuantizeLinear()
     g.Int8 = true
     int8Loss := train.LmEvaluate(g, m, valSet, 10)
-    try io.Print("validation loss over 10 batches: F32 " $f32Loss.Fixed(4) ", INT8 " $int8Loss.Fixed(4) " ("
-        $(int8Loss - f32Loss).Fixed(4) ")\n")
+    try io.Put(("validation loss over 10 batches: F32 " $f32Loss.Fixed(4) ", INT8 " $int8Loss.Fixed(4) " ("
+        $(int8Loss - f32Loss).Fixed(4) ")\n"))
     f32s := Array<F64>(rounds)
     int8s := Array<F64>(rounds)
     for t in range rounds {
@@ -64,12 +64,12 @@ fn main() ? io.IoError + os.OsError + text.TextError + ParseError + nn.Checkpoin
     }
     fwd := median(f32s)
     fwdInt8 := median(int8s)
-    try io.Print("a forward over " $g.Batch " characters: F32 " $(fwd * 1e-6).Fixed(2) " ms, INT8 " $(fwdInt8 * 1e-6).Fixed(2)
-        " ms (" $(fwd / fwdInt8).Fixed(2) "x)\n")
+    try io.Put(("a forward over " $g.Batch " characters: F32 " $(fwd * 1e-6).Fixed(2) " ms, INT8 " $(fwdInt8 * 1e-6).Fixed(2)
+        " ms (" $(fwd / fwdInt8).Fixed(2) "x)\n"))
 
     # generation one character at a time through the cache
     dec := nn.Graph<F32>(context, threads, true)
-    dm := train.Gpt(dec, c.Size(), context, width, heads, depth)
+    dm := train.LanguageModel.Gpt(dec, c.Size(), context, width, heads, depth)
     dec.Plan(r)
     try dec.Load("data/shakespeare/charlm.ckpt")
     dec.QuantizeLinear()
@@ -79,8 +79,8 @@ fn main() ? io.IoError + os.OsError + text.TextError + ParseError + nn.Checkpoin
     greedyInt8 := try generate.Cached(dec, dm, c, "ROMEO:", context - 6, 0.0, r)
     same I64 = 0
     for { if same >= greedy.Len() or greedy[same] != greedyInt8[same] { break } else { same++ } }
-    try io.Print("greedy from \"ROMEO:\": the same for " $same " of " $greedy.Len() " characters\n--- F32 ---\n" $greedy
-        "\n--- INT8 ---\n" $greedyInt8 "\n---\n")
+    try io.Put(("greedy from \"ROMEO:\": the same for " $same " of " $greedy.Len() " characters\n--- F32 ---\n" $greedy
+        "\n--- INT8 ---\n" $greedyInt8 "\n---\n"))
     cached := Array<F64>(rounds)
     cachedInt8 := Array<F64>(rounds)
     for t in range rounds {
@@ -98,6 +98,6 @@ fn main() ? io.IoError + os.OsError + text.TextError + ParseError + nn.Checkpoin
     }
     cf := median(cached)
     ci := median(cachedInt8)
-    try io.Print($count " characters with the cache: F32 " $(F64(count) / (cf * 1e-9)).Fixed(0) " a second, INT8 "
-        $(F64(count) / (ci * 1e-9)).Fixed(0) " (" $(cf / ci).Fixed(2) "x)\n")
+    try io.Put(($count " characters with the cache: F32 " $(F64(count) / (cf * 1e-9)).Fixed(0) " a second, INT8 "
+        $(F64(count) / (ci * 1e-9)).Fixed(0) " (" $(cf / ci).Fixed(2) "x)\n"))
 }

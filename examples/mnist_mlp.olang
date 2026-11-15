@@ -24,7 +24,7 @@ fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
     return try args[i].ParseInt()
 }
 
-fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError + json.JsonError {
+fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, ParseError, json.Error {
     all := os.Args()
     bf16 Bool = all.Len() > 1 and all[all.Len() - 1] == "bf16"
     args := all[:all.Len() - 1] if bf16 else all
@@ -37,10 +37,9 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
     }
 }
 
-fn trainIn(args Array<String&>&, like <T>) ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError +
-        json.JsonError {
+fn trainIn<T>(args Array<String&>&, like T) ? io.Error, os.Error, mnist.MnistError, idx.IdxError, ParseError, json.Error {
     epochs := try number(args, 1, 10)
-    names := String&["adamw", "projected", "sgd"]
+    names := Array<String&>["adamw", "projected", "sgd"]
     kind I64 = 0
     for i, name in names {
         if args.Len() > 2 and args[2] == name { kind = i }
@@ -48,16 +47,16 @@ fn trainIn(args Array<String&>&, like <T>) ? io.IoError + os.OsError + mnist.Mni
     seed := U64(try number(args, 3, 1))
     threads := try number(args, 4, 1)
     alpha F64 = 0.001
-    if args.Len() > 5 { alpha = try (try json.Parse(args[5])).AsNum() }
+    if args.Len() > 5 { alpha = try (try json.Json.Parse(args[5])).AsNum() }
     normalized Bool = try number(args, 6, 1) == 1
-    data := try mnist.Load("data/mnist", mnist.Source)
+    data := try mnist.Mnist.Load("data/mnist", mnist.Source)
 
     batch I64 = 128
     g := nn.Graph<T>(batch, threads)
     g.Ahead = true                      # the next batch filled on a task while this one trains
     x := g.Input(784)
     y := g.Classes()
-    net := layers.NewMlp(g, I64[784, 128, 10])
+    net := layers.Mlp.New(g, Array<I64>[784, 128, 10])
     logits := net.Apply(g, x)
     loss := g.SoftmaxCrossEntropy(logits, y)
     r := rand.Rand(seed)
@@ -66,26 +65,26 @@ fn trainIn(args Array<String&>&, like <T>) ? io.IoError + os.OsError + mnist.Mni
 
     trainSet := loader.Loader(data.Train, batch, seed)
     testSet := loader.Loader(data.Test, batch, seed, false)
-    try io.Print("784-128-10, " $g.ParamCount " parameters, " $names[kind] ", batches of " $batch ", "
+    try io.Put(("784-128-10, " $g.ParamCount " parameters, " $names[kind] ", batches of " $batch ", "
         $("BF16 with F32 masters" if g.HasMasters() else "F32") ", an arena of "
-        $(F64(g.ArenaBytes()) / 1048576.0).Fixed(2) " MB")
-    if kind == 1 { try io.Print(", alpha " $alpha) }
-    if kind == 1 and normalized { try io.Print(", normalized by |x|^2") }
-    try io.Print("\n")
+        $(F64(g.ArenaBytes()) / 1048576.0).Fixed(2) " MB"))
+    if kind == 1 { try io.Put(", alpha " $alpha) }
+    if kind == 1 and normalized { try io.Put(", normalized by |x|^2") }
+    try io.Put("\n")
     if kind == 2 {
-        o mut optim.Sgd<T>&g = optim.Sgd<T>(g, 0.05, 0.9)
+        o mut optim.Sgd<T>& = optim.Sgd<T>(g, 0.05, 0.9)
         try run(g, c, trainSet, testSet, o, epochs)
     } else if kind == 1 {
-        o mut optim.AdamW<T>&g = optim.AdamWProjected(g, 0.001, alpha, normalized)
+        o mut optim.AdamW<T>& = optim.AdamW.Projected(g, 0.001, alpha, normalized)
         try run(g, c, trainSet, testSet, o, epochs)
     } else {
-        o mut optim.AdamW<T>&g = optim.AdamW<T>(g)
+        o mut optim.AdamW<T>& = optim.AdamW<T>(g)
         try run(g, c, trainSet, testSet, o, epochs)
     }
 }
 
-fn run(g mut nn.Graph<<T>>&, c train.Classifier&, trainSet mut loader.Loader<<D>>&, testSet mut loader.Loader<D>&,
-        o mut <O optim.Optimizer<T>>&, epochs I64) ? io.IoError {
+fn run<T, D, O optim.Optimizer<T>>(g mut nn.Graph<T>&, c train.Classifier&, trainSet mut loader.Loader<D>&, testSet mut loader.Loader<D>&
+        o mut O&, epochs I64) ? io.Error {
     total I64 = 0
     for e in range 1, epochs + 1 {
         t0 := time.Now()
@@ -93,8 +92,8 @@ fn run(g mut nn.Graph<<T>>&, c train.Classifier&, trainSet mut loader.Loader<<D>
         spent := time.Since(t0)
         total += spent
         testLoss, accuracy := train.Evaluate(g, c, testSet)
-        try io.Print("epoch " $e ": train loss " $trainLoss.Fixed(4) ", test loss " $testLoss.Fixed(4) ", test accuracy ")
-        try io.Print($(100.0 * accuracy).Fixed(2) "%, " $(F64(spent) * 1e-9).Fixed(3) " s\n")
+        try io.Put("epoch " $e ": train loss " $trainLoss.Fixed(4) ", test loss " $testLoss.Fixed(4) ", test accuracy ")
+        try io.Put($(100.0 * accuracy).Fixed(2) "%, " $(F64(spent) * 1e-9).Fixed(3) " s\n")
     }
-    try io.Print("mean epoch " $(F64(total) * 1e-9 / F64(epochs)).Fixed(3) " s\n")
+    try io.Put("mean epoch " $(F64(total) * 1e-9 / F64(epochs)).Fixed(3) " s\n")
 }

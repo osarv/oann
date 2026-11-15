@@ -8,7 +8,7 @@
 # the timing rounds (7).
 
 import "std/io"
-import "std/linalg"
+import "../linalg"
 import "std/os"
 import "std/rand"
 import "std/time"
@@ -22,6 +22,7 @@ import "../conv"
 import "../datasets/idx"
 import "../datasets/loader"
 import "../datasets/mnist"
+import "std/list"
 
 fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
     if i >= args.Len() { return fallback }
@@ -33,14 +34,14 @@ fn median(xs mut Array<F64>&) F64 {
     return xs[xs.Len() / 2]
 }
 
-fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseError {
+fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, ParseError {
     args := os.Args()
     cnn Bool = args.Len() > 1 and args[1] == "cnn"
     epochs := try number(args, 2, 2 if cnn else 5)
     seed := U64(try number(args, 3, 1))
     threads := try number(args, 4, 1)
     rounds := try number(args, 5, 7)
-    data := try mnist.Load("data/mnist", mnist.Source)
+    data := try mnist.Mnist.Load("data/mnist", mnist.Source)
     batch I64 = 128
 
     g := nn.Graph<F32>(batch, threads)
@@ -50,12 +51,12 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
     q.Threads = threads
     logits nn.Var = x
     # the layers' handles, to read their trained values from
-    dense := List<layers.Dense>()
-    convs := List<vision.Conv>()
+    dense := list.List<layers.Dense>()
+    convs := list.List<vision.Conv>()
     if cnn {
-        c1 := vision.NewConv(g, 1, 16, 3, 28, 28, 1, 1)
-        c2 := vision.NewConv(g, 16, 32, 3, 14, 14, 1, 1)
-        head := layers.NewDense(g, 7 * 7 * 32, 10)
+        c1 := vision.Conv.New(g, 1, 16, 3, 28, 28, 1, 1)
+        c2 := vision.Conv.New(g, 16, 32, 3, 14, 14, 1, 1)
+        head := layers.Dense.New(g, 7 * 7 * 32, 10)
         h1 := g.MaxPool2d(g.Relu(c1.Apply(g, x)), 16, 28, 28, 2, 2)
         h2 := g.MaxPool2d(g.Relu(c2.Apply(g, h1)), 32, 14, 14, 2, 2)
         logits = head.Apply(g, h2)
@@ -63,7 +64,7 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
         convs.Push(c2)
         dense.Push(head)
     } else {
-        net := layers.NewMlp(g, I64[784, 128, 10])
+        net := layers.Mlp.New(g, Array<I64>[784, 128, 10])
         logits = net.Apply(g, x)
         for d in net.Layers { dense.Push(d) }
     }
@@ -71,15 +72,15 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
     r := rand.Rand(seed)
     g.Plan(r)
     c := train.Classifier(x, y, logits, loss)
-    o mut optim.AdamW<F32>&g = optim.AdamW<F32>(g)
+    o mut optim.AdamW<F32>& = optim.AdamW<F32>(g)
     trainSet := loader.Loader(data.Train, batch, seed)
     testSet := loader.Loader(data.Test, batch, seed, false)
     shape String& = "conv 3x3 1->16, relu, pool; conv 3x3 16->32, relu, pool; dense 1568->10" if cnn else "784-128-10, relu"
-    try io.Print($shape ", " $g.ParamCount " parameters, AdamW, " $epochs " epochs\n")
+    try io.Put($shape ", " $g.ParamCount " parameters, AdamW, " $epochs " epochs\n")
     for e in range 1, epochs + 1 {
         t0 := time.Now()
         trainLoss := train.Epoch(g, c, trainSet, o)
-        try io.Print("epoch " $e ": train loss " $trainLoss.Fixed(4) ", " $(F64(time.Since(t0)) * 1e-9).Fixed(2) " s\n")
+        try io.Put("epoch " $e ": train loss " $trainLoss.Fixed(4) ", " $(F64(time.Since(t0)) * 1e-9).Fixed(2) " s\n")
     }
 
     # the trained network quantized
@@ -96,10 +97,10 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
         q.Dense(g.Value(dense[1].W), g.Value(dense[1].B), false)
     }
     qb, fb := q.Bytes()
-    try io.Print("parameters: F32 " $fb " bytes, INT8 " $qb " bytes (" $(F64(fb) / F64(qb)).Fixed(2) "x smaller)\n")
+    try io.Put("parameters: F32 " $fb " bytes, INT8 " $qb " bytes (" $(F64(fb) / F64(qb)).Fixed(2) "x smaller)\n")
 
     # accuracy: F32, then INT8 dynamic, then static over ranges calibrated on ten training batches
-    testLoss, f32Accuracy := train.Evaluate(g, c, testSet)
+    _, f32Accuracy := train.Evaluate(g, c, testSet)
     xs := linalg.Matrix<F32>(batch, 784)
     out := linalg.Matrix<F32>(batch, 10)
     classes := Array<I32>(batch)
@@ -107,26 +108,26 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
     trainSet.Epoch()
     for b in range 10 {
         n := trainSet.Fill(b, xs.Data, classes)
-        part mut linalg.Matrix<F32>&out = out.RowRange(0, n)
-        q.Calibrate(part, xs.RowRange(0, n))
+        part mut linalg.Matrix<F32>& = out.RowRange(0, n)!
+        q.Calibrate(part, xs.RowRange(0, n)!)
     }
     q.Static = true
     stat, statAgree := measure(q, g, c, testSet, xs, out, classes)
-    try io.Print("test accuracy: F32 " $(100.0 * f32Accuracy).Fixed(2) "%, INT8 dynamic " $(100.0 * dyn).Fixed(2)
+    try io.Put(("test accuracy: F32 " $(100.0 * f32Accuracy).Fixed(2) "%, INT8 dynamic " $(100.0 * dyn).Fixed(2)
         "% (the same class as F32 for " $(100.0 * dynAgree).Fixed(2) "%), INT8 static " $(100.0 * stat).Fixed(2)
-        "% (" $(100.0 * statAgree).Fixed(2) "%)\n")
+        "% (" $(100.0 * statAgree).Fixed(2) "%)\n"))
 
     # throughput, interleaved: the graph's forward in F32, the model in INT8 dynamic and static, at batch 1 and batch
     testSet.Epoch()
     n := testSet.Fill(0, g.InputData(c.X), g.ClassData(c.Y))
     for i in range n * 784 { xs.Data[i] = g.InputData(c.X)[i] }
-    for size in I64[1, 64, batch] {
-        one := xs.RowRange(0, size)
-        res mut linalg.Matrix<F32>&out = out.RowRange(0, size)
+    for size in Array<I64>[1, 64, batch] {
+        one := xs.RowRange(0, size)!
+        res mut linalg.Matrix<F32>& = out.RowRange(0, size)!
         reps I64 = 1
         for {
             t0 := time.Now()
-            for i in range reps { g.Forward(size) }
+            for _ in range reps { g.Forward(size) }
             if time.Since(t0) > 20000000 or reps > 1000000 { break }
             reps = reps * 2
         }
@@ -135,53 +136,53 @@ fn main() ? io.IoError + os.OsError + mnist.MnistError + idx.IdxError + ParseErr
         stats := Array<F64>(rounds)
         for t in range rounds {
             t0 := time.Now()
-            for i in range reps { g.Forward(size) }
+            for _ in range reps { g.Forward(size) }
             f32s[t] = F64(time.Since(t0)) / F64(reps)
             q.Static = false
             t1 := time.Now()
-            for i in range reps { q.Forward(res, one) }
+            for _ in range reps { q.Forward(res, one) }
             dyns[t] = F64(time.Since(t1)) / F64(reps)
             q.Static = true
             t2 := time.Now()
-            for i in range reps { q.Forward(res, one) }
+            for _ in range reps { q.Forward(res, one) }
             stats[t] = F64(time.Since(t2)) / F64(reps)
         }
         f := median(f32s)
         d := median(dyns)
         s := median(stats)
-        try io.Print("batch " $size ": F32 " $(f * 1e-3).Fixed(1) " us (" $(F64(size) * 1e9 / f).Fixed(0)
+        try io.Put(("batch " $size ": F32 " $(f * 1e-3).Fixed(1) " us (" $(F64(size) * 1e9 / f).Fixed(0)
             " samples/s), INT8 dynamic " $(d * 1e-3).Fixed(1) " us (" $(F64(size) * 1e9 / d).Fixed(0) ", "
             $(f / d).Fixed(2) "x), static " $(s * 1e-3).Fixed(1) " us (" $(F64(size) * 1e9 / s).Fixed(0) ", "
-            $(f / s).Fixed(2) "x)\n")
+            $(f / s).Fixed(2) "x)\n"))
     }
 
     # where the INT8 model's time goes, layer by layer: its input's quantization, then its product (or pooling)
-    names := String&["dense", "conv", "pool"]
-    for size in I64[1, batch] {
-        one := xs.RowRange(0, size)
-        res mut linalg.Matrix<F32>&out = out.RowRange(0, size)
+    names := Array<String&>["dense", "conv", "pool"]
+    for size in Array<I64>[1, batch] {
+        one := xs.RowRange(0, size)!
+        res mut linalg.Matrix<F32>& = out.RowRange(0, size)!
         for i in range q.Times.Len() { q.Times[i] = 0 }
         q.Profiling = true
         reps I64 = 2000 / size + 10
-        for i in range reps { q.Forward(res, one) }
+        for _ in range reps { q.Forward(res, one) }
         q.Profiling = false
-        try io.Print("batch " $size ", us a forward:")
+        try io.Put("batch " $size ", us a forward:")
         for i in range q.Layers.Len() {
             kind I64 = match q.Layers[i] {
-                case quant.Layer.Dense(_, _, _) => 0
-                case quant.Layer.Conv(_, _, _, _) => 1
-                case quant.Layer.Pool(_) => 2
+                case quant.Layer.Dense(_, _, _): 0
+                case quant.Layer.Conv(_, _, _, _): 1
+                case quant.Layer.Pool(_): 2
             }
-            try io.Print(" " $names[kind] " " $(F64(q.Times[2 * i]) * 1e-3 / F64(reps)).Fixed(1) "+"
-                $(F64(q.Times[2 * i + 1]) * 1e-3 / F64(reps)).Fixed(1))
+            try io.Put((" " $names[kind] " " $(F64(q.Times[2 * i]) * 1e-3 / F64(reps)).Fixed(1) "+"
+                $(F64(q.Times[2 * i + 1]) * 1e-3 / F64(reps)).Fixed(1)))
         }
-        try io.Print("\n")
+        try io.Put("\n")
     }
 }
 
 # the INT8 model's accuracy over the test set, and how often it picks the class the F32 graph picks
-fn measure(q mut quant.Model&, g mut nn.Graph<F32>&, c train.Classifier&, l mut loader.Loader<<D>>&,
-        xs mut linalg.Matrix<F32>&, out mut linalg.Matrix<F32>&, classes mut Array<I32>&) (F64, F64) {
+fn measure<D>(q mut quant.Model&, g mut nn.Graph<F32>&, c train.Classifier&, l mut loader.Loader<D>&
+        xs mut linalg.Matrix<F32>&, out mut linalg.Matrix<F32>&, classes mut Array<I32>&) F64, F64 {
     l.Epoch()
     mine := Array<I32>(g.Batch)
     theirs := Array<I32>(g.Batch)
@@ -190,12 +191,12 @@ fn measure(q mut quant.Model&, g mut nn.Graph<F32>&, c train.Classifier&, l mut 
     seen I64 = 0
     for b in range l.Batches() {
         n := l.Fill(b, xs.Data, classes)
-        part mut linalg.Matrix<F32>&out = out.RowRange(0, n)
-        q.Forward(part, xs.RowRange(0, n))
-        part.ArgMaxRows(mine[:n])
+        part mut linalg.Matrix<F32>& = out.RowRange(0, n)!
+        q.Forward(part, xs.RowRange(0, n)!)
+        part.ArgMaxRows(mine[:n])!
         for i in range n * 784 { g.InputData(c.X)[i] = xs.Data[i] }
         g.Forward(n)
-        g.Value(c.Logits).ArgMaxRows(theirs[:n])
+        g.Value(c.Logits).ArgMaxRows(theirs[:n])!
         for i in range n {
             if mine[i] == classes[i] { right++ }
             if mine[i] == theirs[i] { same++ }
