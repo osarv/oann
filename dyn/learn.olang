@@ -860,3 +860,118 @@ test Learner.Lesson "the centered contrast is the gradient of the cost at the fr
     l.Lesson(s.Root(), 0.001)!
     assert relative(s.E.Grads, reference) < 1e-5
 }
+
+# x (3 tanh inputs) -> a (5 tanh) <-> b (4 tanh) <-> y (3 tanh): a dense input; symmetric (every recurrent connection
+# reciprocal: a sparse block, a low-rank one, a lateral tiled one, a symmetric readout) or one-way (a dense block
+# forward, an event-driven one back, one-way readout connections both ways, a symmetric lateral block); two rows,
+# certified at 0.8, random drives and biases
+fn wired(symmetric Bool, r mut rand.Rand&) system.System<F64> {
+    s := system.System<F64>(2)
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Input)
+    a := s.Population(root, "a", 5, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    b := s.Population(root, "b", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, a, conn.Wiring.Dense)
+    if symmetric {
+        s.Connect(a, b, conn.Wiring.Csr(0.6), reciprocal = true)
+        s.Connect(a, b, conn.Wiring.LowRank(2), reciprocal = true)
+        s.Connect(a, a, conn.Wiring.Tiles(2, 0.7), reciprocal = true)
+        s.Connect(b, y, conn.Wiring.Symmetric)
+    } else {
+        s.Connect(a, b, conn.Wiring.Dense)
+        s.Connect(b, a, conn.Wiring.Events(0.0))
+        s.Connect(a, a, conn.Wiring.Symmetric)
+        s.Connect(b, y, conn.Wiring.Dense)
+        s.Connect(y, b, conn.Wiring.Dense)
+    }
+    s.Plan(r)!
+    for lk in s.E.Links {
+        if lk.Folded: continue
+        for i in range lk.Off, lk.Off + lk.Count: s.E.Params[i] = 2.0 * s.E.Params[i]
+    }
+    s.Certify(0.8)
+    for i in range 6: s.Pop(x).Drive[i] = r.Uniform(-1.0, 1.0)
+    for j in range 12: s.E.Params[s.Pop(a).Bias + j] = r.Uniform(-0.5, 0.5)
+    return s
+}
+
+# L = sum dz s_y at the free equilibrium, settled to 1e-14
+fn readLoss(s mut system.System<F64>&, dz Array<F64>&) F64 {
+    s.Settle(settle.Phase.Free, settle.Budget(20000, 1e-14))
+    y := s.Pop(system.Pop(3)).Activity(0)
+    total F64 = 0.0
+    for i in range dz.Len(): total += dz[i] * y[i]
+    return total
+}
+
+# the central differences, step 1e-5, of L in every element of a
+fn differences(s mut system.System<F64>&, a mut Array<F64>&, dz Array<F64>&) Array<F64> {
+    out := Array<F64>(a.Len())
+    for i in range a.Len() {
+        old := a[i]
+        a[i] = old + 1e-5
+        up := readLoss(s, dz)
+        a[i] = old - 1e-5
+        down := readLoss(s, dz)
+        a[i] = old
+        out[i] = (up - down) / 2e-5
+    }
+    readLoss(s, dz)
+    return out
+}
+
+# the parameters' gradient and the inputs' and a's drives' by how, at the free equilibrium
+fn implicitOf(l mut Learner<F64>&, dz tensor.Tensor<F64>&, how system.Implicit) Array<F64>, Array<F64>, Array<F64> {
+    dx := tensor.Tensor<F64>.Zeros(2, 3)
+    da := tensor.Tensor<F64>.Zeros(2, 5)
+    l.ImplicitGrad(system.Pop(3), dz, how, system.Pop(0), dx)!
+    l.ImplicitGrad(system.Pop(3), dz, how, system.Pop(1), da)!
+    return l.S.E.Grads.Copy(), dx.Flat()!.Copy(), da.Flat()!.Copy()
+}
+
+fn dot(a Array<F64>&, b Array<F64>&) F64 {
+    total F64 = 0.0
+    for i in range a.Len(): total += a[i] * b[i]
+    return total
+}
+
+test Learner.ImplicitGrad "exact, JFB and EP gradients at a fixed point against each other and against central differences, every reciprocal wiring" {
+    r := rand.Rand(31)
+    s := wired(true, r)
+    dz := tensor.Tensor<F64>.Zeros(2, 3)
+    dz.FillUniform(r, -1.0, 1.0)
+    d := dz.Flat()!
+    readLoss(s, d)
+    params := differences(s, s.E.Params, d)
+    inputs := differences(s, s.Pop(system.Pop(0)).Drive, d)
+    hidden := differences(s, s.Pop(system.Pop(1)).Drive, d)
+    l := Learner<F64>(s)!
+    l.Tol = 1e-13
+    l.Sweeps = 20000
+    g, dx, da := implicitOf(l, dz, system.Implicit.Exact(1e-14, 20000))
+    assert l.Adjoint.Converged and relative(g, params) < 1e-7 and relative(dx, inputs) < 1e-7 and relative(da, hidden) < 1e-7, $l.Adjoint " " $relative(g, params) " " $relative(dx, inputs) " " $relative(da, hidden)
+    e, ex, ea := implicitOf(l, dz, system.Implicit.Ep(1e-3))
+    assert relative(e, g) < 1e-5 and relative(ex, dx) < 1e-5 and relative(ea, da) < 1e-5, $relative(e, g) " " $relative(ex, dx) " " $relative(ea, da)
+    j, jx, _ := implicitOf(l, dz, system.Implicit.Jfb)
+    # JFB's adjoint stays on the readout: a descent direction for the connections into it, nothing for the inputs
+    # two connections away
+    cosine := dot(j, g) / (dot(j, j) * dot(g, g)).Sqrt()
+    assert cosine > 0.5 and dot(jx, jx) == 0.0, "cosine " $cosine
+    # the drives are as they were: the free state is the equilibrium of the given ones
+    assert (readLoss(s, d) - dot(d, s.Pop(system.Pop(3)).Activity(0)[0:6])).Abs() < 1e-12
+}
+
+test Learner.ImplicitGrad "the exact gradient through one-way connections (dense, event-driven) against central differences" {
+    r := rand.Rand(32)
+    s := wired(false, r)
+    dz := tensor.Tensor<F64>.Zeros(2, 3)
+    dz.FillUniform(r, -1.0, 1.0)
+    d := dz.Flat()!
+    readLoss(s, d)
+    params := differences(s, s.E.Params, d)
+    inputs := differences(s, s.Pop(system.Pop(0)).Drive, d)
+    l := Learner<F64>(s)!
+    g, dx, _ := implicitOf(l, dz, system.Implicit.Exact(1e-14, 20000))
+    assert relative(g, params) < 1e-7 and relative(dx, inputs) < 1e-7, $relative(g, params) " " $relative(dx, inputs)
+}
