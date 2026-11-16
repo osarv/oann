@@ -374,6 +374,7 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     views mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]
     gradViews mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]
     viewsN I64 = -1                 # the entries in use they were made for, -1 while they are not made
+    unplaced mut Array<Bool>& = Array<Bool>(0)  # by node: given no storage (nothing reads it), so it has no value view
 }
 
 # ---- recording ----
@@ -1081,6 +1082,7 @@ fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
     for i in range count: g.reserve(i)
     g.views = Array<tensor.Tensor<T>>(count, g.empty())
     g.gradViews = Array<tensor.Tensor<T>>(count, g.empty())
+    g.unplaced = Array<Bool>(count)
     g.customRoom()
     g.SyncParams()
 }
@@ -1461,8 +1463,9 @@ fn (g Graph<T>&) inUse(nd Node&) tensor.Shape {
 # v's value, a view of its storage: writing it writes the graph. Valid until a later operation of the step reuses the
 # storage, unless v is an input, a parameter, an output, a loss or kept (Keep)
 fn (g Graph<T>&) Value(v Var) tensor.Tensor<T> {
-    if g.viewsN == g.N: return g.views[v]
-    return g.valueView(v)
+    if g.viewsN != g.N: return g.valueView(v)
+    if g.unplaced[v]: unreachable "oann: the value of a node given no storage (nothing reads it); Keep it to read it"
+    return g.views[v]
 }
 
 # every node's views for the entries in use (N), made again whenever a Forward runs on another number of them - a
@@ -1471,7 +1474,8 @@ fn (g mut Graph<T>&) makeViews() {
     if g.Eager: return
     g.viewsN = -1
     for i in range g.nodes.Len() {
-        g.views[i] = g.valueView(Var(i)) if g.placedAt(i) >= 0 else g.empty()
+        g.unplaced[i] = g.placedAt(i) < 0
+        g.views[i] = g.empty() if g.unplaced[i] else g.valueView(Var(i))
         g.gradViews[i] = g.gradView(i)
     }
     g.viewsN = g.N
