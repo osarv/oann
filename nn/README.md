@@ -1,6 +1,6 @@
 # nn
 
-What models are built from and trained with, on the autodiff graph (`ad/`). docs/redesign.md section 1.5.
+What models are built from and trained with, on the autodiff graph (`ad/`).
 
 - `layers.olang` - layers as plain data (handles and sizes) with a `New` on a graph that registers the parameters and an
   `Apply` that records the operations: `Dense`, `Embedding` (also a tied output head), `Norm` (layer or RMS), `Mlp`,
@@ -25,4 +25,4 @@ A step, an optimizer step and a training step allocate nothing: each has a test 
 asserts the process's resident memory did not grow.
 
 Test with `olang test nn/FILE.olang`; `make test` runs them all. `make charlm` trains the character transformer
-through them (M2, M3 of docs/redesign.md 4.3; `examples/charlm.olang`, the model is `models/gpt`).
+through them (`examples/charlm.olang`, the model is `models/gpt`).

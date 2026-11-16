@@ -1,6 +1,6 @@
 # data
 
-What a training loop reads from. The first four are the modules of the old `datasets/` (removed at C3), the last is new.
+What a training loop reads from.
 
 - `idx.olang` - the IDX file format MNIST is distributed in.
 - `loader.olang` - `Dataset`, `Labeled` and `Loader<D>`: seeded random batches, filling a batch allocates nothing.

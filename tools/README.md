@@ -1,6 +1,6 @@
 # tools
 
-Checks and counters that run on oann's layers, not part of a model (docs/redesign.md, section 1.8).
+Checks and counters that run on oann's layers, not part of a model.
 
 | file | what |
 |---|---|

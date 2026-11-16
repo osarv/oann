@@ -1,6 +1,6 @@
 # ad
 
-Reverse-mode autodiff on N-d tensors: the recorded graph oann's models train on (docs/redesign.md, section 1.3).
+Reverse-mode autodiff on N-d tensors: the recorded graph oann's models train on.
 
 | file | what |
 |---|---|
@@ -13,6 +13,6 @@ value or gradient is valid within its step only (the activation region is reused
 (nodes nothing reads), losses and nodes given to `Keep` live to the step's end.
 
 Tests: `olang test ad/graph.olang` (the graph's own), `olang test tools/gradcheck.olang` (a gradient check per operation
-in F64). Measures: `bench/mlp_ad.olang` (M1, MNIST MLP), `bench/arena_ad.olang` (M9, the transformer's arena and
+in F64). Measures: `bench/mlp_ad.olang` (MNIST MLP), `bench/arena_ad.olang` (the transformer's arena and
 resident memory per step), `bench/smallgraph.olang` (a small recurrence where the cost per node dominates) - `make mlpad`,
 `make arenaad`.
