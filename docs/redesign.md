@@ -348,9 +348,12 @@ are constant and the evaluator can decide the bound.
    whole-batch products split by gemm's own threads. Gauss-Seidel sweeps are not built.
 10. **Run-time structure** (decision 3): `Prune(c, keep)` masks weights (or tiles) in place, gradients with them
     (`Link.MaskGrads` for learning rules); `Compact()` drops a sparse connection's masked entries in place
-    (`Csr.Drop`, `Tiles.Compact`, the gradient squeezed alike); `Retire(p, j)` holds a unit at rest. Compacting a dense
-    block or retired units is a re-plan with the weights kept (not built; the engine records every offset it laid
-    out). Stability: `Gain`, `Certify`, `Restrain`, `Rate`, `LessonTolerance`, `BudgetFor` as circuit's;
+    (`Csr.Drop`, `Tiles.Compact`, the gradient squeezed alike); `Retire(p, j)` holds a unit at rest. Which weights go is
+    the `Prune` rule's (`Rule.Prune(by, target, pace, regrow)`, dyn/learn: scores over each connection's mean ranked
+    across a module, regrowth where units coincide, loose units retired; allocation-free). A dense block is compacted
+    by `Sparsify`, into sparse rows over its own region (the one step that allocates, where the caller chooses);
+    compacting retired units out of a population is a re-plan with the weights kept (not built; the engine records
+    every offset it laid out). PROGRESS.md, "Pruning at run time", has the measurements. Stability: `Gain`, `Certify`, `Restrain`, `Rate`, `LessonTolerance`, `BudgetFor` as circuit's;
     `Contraction()` (a spectral bound by power iteration) is not built.
 
 11. **Allocation-free, pinned while compiling** (top-level `assert not f.Allocates`, S17a/G42): every population's

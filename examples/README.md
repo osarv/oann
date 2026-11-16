@@ -18,6 +18,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `tinystories.olang` | `prep`, then a GPT or an SSM of 10 million parameters on TinyStories: loss curve, tokens a second | `tinystories` |
 | `mnist_learn.olang` | MNIST by a settling system of `dyn`, taught by equilibrium propagation | `mnistlearn` |
 | `xor_settle.olang`, `xor_spiking.olang` | XOR by rate and by spiking `dyn` systems | `xor`, `spiking` |
+| `prune_settle.olang` | a settling system learning XOR of two coordinates beside noise inputs, pruned while it runs by `dyn/learn`'s `Prune` rule toward a fraction of its weights, then stored as sparse rows (`System.Sparsify`): accuracy on unseen points and multiply-adds a sweep and a settle at each fraction | `prune` |
 | `sleep_replay.olang` | days of a flip-flop task and then its opposite, with and without nights (`dyn/sleep`: replay through EP on the Sleep clock, the store of `dyn/store` rewritten at dawn): recall and generalization of the first task | `sleepreplay` |
 | `mnist_board.olang` | MNIST through the simulated board (`board/engine`): lessons settled in F32 or on the board, the test set answered both ways, their agreement | `board` |
 
