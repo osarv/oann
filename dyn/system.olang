@@ -42,7 +42,7 @@ type Rule enum {
     ThreeFactor(signal Sig, decay F64, rate F64)    # eligibility trace x the module's signal
     Homeostasis(target F64, rate F64)               # thresholds or gains toward a target rate
     DeltaWrite(c Conn, gate Sig)                    # fast weights written while settling
-    Prune(by conn.Score, target F64, pace F64, regrow F64)   # weights masked by a score, toward a fraction kept
+    Prune(by conn.Score, target F64, pace F64, regrow F64, schedule conn.Schedule)   # weights masked by a score, toward a fraction kept
     Custom(r mut any Update&)
 }
 
@@ -943,6 +943,33 @@ test System.Sparsify "dense blocks thinned by pruning, stored as sparse rows: th
 fn has<T>(s System<T>&, m Mod, name String&) Bool {
     try s.Read(m, name) catch SignalError.Missing { return false }
     return true
+}
+
+test System.Restrain "the gain caps what the recurrent connections carry into a readout unit (a hidden layer's whole vote), not a folded skip into it: the skip's carry can outvote every hidden unit" {
+    s := System<F64>(1)
+    x := s.Population(s.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 8, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    vote := s.Connect(h, y, conn.Wiring.Symmetric)
+    skip := s.Connect(x, y, conn.Wiring.Dense)
+    s.Plan(rand.Rand(3))!
+    for i in range s.E.Params.Len(): s.E.Params[i] = 4.0 * s.E.Params[i]
+    k := s.Link(skip)
+    before := Array<F64>[s.E.Params[i] for i in range k.Off, k.Off + k.Count]
+    s.Restrain(0.9)
+    assert s.Gain() <= 0.9 + 1e-9
+    v := s.Link(vote)
+    for j in range 2 {
+        # |sum_i W_ji h_i| <= sum_i |W_ji| for any hidden state (|h_i| <= 1, tanh's slope 1)
+        mass := 0.0
+        for i in range 8: mass += s.E.Params[v.Off + j * 8 + i].Abs()
+        assert mass <= 0.9 + 1e-9, "hidden vote " + $mass
+        # the skip, untouched, at the input corner (3, 3) or (3, -3) its carry is larger than that
+        for i in range 2: assert s.E.Params[k.Off + j * 2 + i] == before[j * 2 + i]
+        w0, w1 := s.E.Params[k.Off + j * 2], s.E.Params[k.Off + j * 2 + 1]
+        assert 3.0 * (w0.Abs() + w1.Abs()) > 0.9, "skip " + $w0 + " " + $w1
+    }
 }
 
 test System.Read "a module reads its own signal first, then its parent's" {

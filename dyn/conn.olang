@@ -18,8 +18,9 @@
 #
 # Pruning at run time (docs/redesign.md, section 3, decision 3): Prune(keep) masks weights in place - zeroed, their
 # mask cleared, a product costs what it did - Revive unmasks one (regrowth), Hold puts masked weights back to zero
-# after an optimizer's momentum moved them, and Compact drops a sparse form's masked entries in place, after which its
-# products are cheaper. Sparsify stores a dense block's live weights as compressed sparse rows over the same region: the
+# after an optimizer's momentum moved them, and Compact drops a sparse form's masked entries (a low-rank form's masked
+# ranks) in place, after which its products are cheaper. A tiled form is masked a tile at a time, a low-rank one a rank
+# at a time (Group). Sparsify stores a dense block's live weights as compressed sparse rows over the same region: the
 # one step that allocates (the pattern), so it runs where the caller chooses. Which weights go is a rule's
 # (dyn/learn's Prune, ranking them by a Score); Macs says what a product costs as the connection now stands.
 
@@ -42,6 +43,11 @@ type Wiring enum {
 # what a pruning rule ranks a connection's weights by (dyn/learn's Prune): the weight's magnitude |w|, the current it
 # carries |w| mean|s_pre|, or its term of the energy |w mean(s_post s_pre)| (the coupling -s_post w s_pre)
 type Score enum { Magnitude, Activity, Energy }
+
+# how a pruning rule's pace runs toward its target (dyn/learn's Prune): Linear masks the pace fraction of the weights
+# every tick; Cubic (Zhu and Gupta 2017) reaches the target in the ticks Linear takes, the fraction kept target +
+# (1 - target)(1 - t/n)^3 after tick t of n - fast while much is left, slowing near the target
+type Schedule enum { Linear, Cubic }
 
 # what a connection given wrongly says, at Plan
 type WiringError error {
@@ -337,7 +343,7 @@ fn (l Link<T>&) Scale(params mut Array<T>&, f F64) {
 fn (l mut Link<T>&) Prune(keep Array<Bool>&, params mut Array<T>&, grads mut Array<T>&) {
     if l.Tiles != null {
         l.Tiles!.Drop(keep)
-        for e in range keep.Len() {
+        for e in range l.Keep.Len() {
             if not keep[e] and l.Keep[e]: l.Pruned++
             l.Keep[e] = l.Keep[e] and keep[e]
         }
@@ -361,11 +367,13 @@ fn (l Link<T>&) MaskGrads(grads mut Array<T>&) {
 }
 
 # the masked entries of a sparse form removed in place (their gradients moved with them; what is left past them is
-# zero), every mask set again: its products are cheaper from now on. A dense form keeps its mask. Gives the entries
-# (tiles) removed
+# zero), every mask set again: its products are cheaper from now on. A low-rank form's masked ranks go the same way,
+# its rank smaller (all of them masked: kept as they are). A dense form keeps its mask. Gives the entries (tiles,
+# parameters of the ranks) removed. A low-rank form's parameters move, so an optimizer made before is made again
 fn (l mut Link<T>&) Compact(params mut Array<T>&, grads mut Array<T>&) I64 {
     if l.Pruned == 0: return 0
     removed := l.Pruned
+    if l.Kind == Wiring.LowRank: return l.fewerRanks(params, grads)
     if l.Csr != null {
         sparse.Squeeze(grads[l.Off:l.Off + l.Count], l.Keep)
         l.Csr!.Drop(l.Keep)
@@ -384,18 +392,111 @@ fn (l mut Link<T>&) Compact(params mut Array<T>&, grads mut Array<T>&) I64 {
     return removed
 }
 
+# a low-rank form's live ranks moved down in place (both factors, params and grads alike), its rank theirs, the rest of
+# its region zero; gives the parameters removed (0 where no rank is live)
+fn (l mut Link<T>&) fewerRanks(params mut Array<T>&, grads mut Array<T>&) I64 {
+    rank, post, pre := l.Groups(), l.PostSize, l.PreSize
+    kept I64 = 0
+    for g in range rank: kept += 1 if l.Keep[g] else 0
+    if kept == 0: return 0
+    keepRanks(l.Keep, params, l.Off, rank, post, pre)
+    keepRanks(l.Keep, grads, l.Off, rank, post, pre)
+    removed := l.Count - kept * (post + pre)
+    clearPast(params, grads, l.Off + kept * (post + pre), l.Off + l.Count)
+    l.Kind = Wiring.LowRank(kept)
+    l.Count = kept * (post + pre)
+    l.W = mat.Mat<T>(params, l.Off, post, kept, kept)
+    l.B = mat.Mat<T>(params, l.Off + post * kept, kept, pre, pre)
+    for e in range l.Keep.Len(): l.Keep[e] = true
+    l.Pruned = 0
+    return removed
+}
+
+# the factors at a[off ..] (post x rank, then rank x pre) with only the ranks whose mask (keep[g]) holds, moved down:
+# every write lands at or before what is still to be read
+fn keepRanks<T>(keep Array<Bool>&, a mut Array<T>&, off I64, rank I64, post I64, pre I64) {
+    to := off
+    for i in range post {
+        for g in range rank {
+            if not keep[g]: continue
+            a[to] = a[off + i * rank + g]
+            to++
+        }
+    }
+    for g in range rank {
+        if not keep[g]: continue
+        for j in range pre: a[to + j] = a[off + post * rank + g * pre + j]
+        to += pre
+    }
+}
+
 # whether a pruning rule may change it: a learnt connection whose parameters are its weights, one each (dense,
-# symmetric, sparse rows, event-driven)
+# symmetric, sparse rows, event-driven), masked one at a time; or a tiled or low-rank one, masked a group at a time (a
+# tile, a rank)
 fn (l Link<T>&) Prunable() Bool {
     if l.Frozen: return false
     return match l.Kind {
-        case Wiring.Dense, Wiring.Symmetric, Wiring.Csr, Wiring.Events: true
+        case Wiring.Dense, Wiring.Symmetric, Wiring.Csr, Wiring.Events, Wiring.Tiles, Wiring.LowRank: true
         case _: false
     }
 }
 
-# the weights not masked (a prunable connection's)
-fn (l Link<T>&) Live() I64 { return l.Count - l.Pruned }
+# the weights not masked: a tiled connection's live tiles' elements, a low-rank one's live ranks' factors, else its live
+# parameters
+fn (l Link<T>&) Live() I64 {
+    if l.Tiles != null: return l.Tiles!.Alive() * l.Tiles!.Tile * l.Tiles!.Tile
+    return l.Count - l.Pruned
+}
+
+# what a pruning rule counts as the connection's whole: a product's multiply-adds with nothing masked - a dense
+# block's post x pre (a sparse-row one's dense shape too), a tiled one's stored tiles, a low-rank one's factors
+fn (l Link<T>&) Full() I64 {
+    if l.Tiles != null or l.Kind == Wiring.LowRank: return l.Count
+    return l.PostSize * l.PreSize
+}
+
+# the weights a pruning rule masks together: a tile's, a rank's column and row of the factors, else one
+fn (l Link<T>&) Group() I64 {
+    return match l.Kind {
+        case Wiring.LowRank: l.PostSize + l.PreSize
+        case Wiring.Tiles(tile, _): tile * tile
+        case _: 1
+    }
+}
+
+# the groups of a tiled or low-rank connection: its stored tiles, its ranks (Count, one weight each, for the rest)
+fn (l Link<T>&) Groups() I64 {
+    return match l.Kind {
+        case Wiring.LowRank(rank): rank
+        case Wiring.Tiles: l.Tiles!.Stored()
+        case _: l.Count
+    }
+}
+
+# whether group g is live: tile g, or rank g (its first parameter's mask)
+fn (l Link<T>&) Kept(g I64) Bool { return l.Keep[g] }
+
+# group g marked false in keep (laid out as Keep): tile g, or rank g's column of the first factor and row of the second
+fn (l Link<T>&) Unkeep(g I64, keep mut Array<Bool>&) {
+    if l.Kind != Wiring.LowRank {
+        keep[g] = false
+        return
+    }
+    rank := l.Groups()
+    for i in range l.PostSize: keep[i * rank + g] = false
+    for j in range l.PreSize: keep[l.PostSize * rank + g * l.PreSize + j] = false
+}
+
+# the tile row and tile column of stored tile g (a tiled connection's)
+fn (l Link<T>&) TileAt(g I64) I64, I64 {
+    w := l.Tiles!
+    lo, hi := 0, w.TileRows
+    for hi - lo > 1 {
+        mid := (lo + hi) / 2
+        if w.Ptr[mid] <= g { lo = mid } else { hi = mid }
+    }
+    return lo, I64(w.Col[g])
+}
 
 # the post and pre units weight e joins (a prunable connection's)
 fn (l Link<T>&) Ends(e I64) I64, I64 {
@@ -427,7 +528,8 @@ fn (l Link<T>&) Hold(params mut Array<T>&) {
 }
 
 # the multiply-adds of carrying one row one way, as the connection now stands: a dense block's every weight, masked or
-# not; a sparse one's entries (live tiles); a low-rank one's two factors; an event-driven one's every weight at most
+# not; a sparse one's entries (live tiles); a low-rank one's two factors (masked ranks too, until Compact); an
+# event-driven one's every weight at most
 fn (l Link<T>&) Macs() I64 {
     return match l.Kind {
         case Wiring.LowRank(rank): rank * (l.PostSize + l.PreSize)

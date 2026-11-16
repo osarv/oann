@@ -10,7 +10,10 @@
 # (lateral, symmetric) and to a readout of two classes; recurrent weights restrained to a gain of 0.9 after every step.
 # Arguments, all optional: the score (magnitude, activity, energy; energy), the fraction kept (0.05), the fraction pruned
 # a tick (0.05), the fraction regrown a tick (0), the hidden units (32), the noise inputs (2), the lessons before pruning
-# and after (2000), the lessons between ticks (50), the seed (1), the learning rate (0.05).
+# and after (2000), the lessons between ticks (50), the seed (1), the learning rate (0.05), the schedule (linear, cubic;
+# cubic), and a skip connection from the inputs into the readout (none, drawn, zero; none): drawn as any connection, or
+# from zero with each readout unit's incoming mass held at Skip or below. A drawn one stops the system learning XOR: the
+# certificate caps what the hidden units carry into a readout unit at the gain, and nothing caps the skip (PROGRESS.md).
 
 import "std/io"
 import "std/json"
@@ -25,10 +28,16 @@ import "../nn/optim"
 
 Rows := 256        # training points, and test points
 Spread := 3.0      # every input uniform in [-Spread, Spread]
+Skip := 0.1        # a skip from zero: the largest incoming mass of a readout unit
 
 fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
     if i >= args.Len(): return fallback
     return try json.Json.Parse(args[i]).AsNum()
+}
+
+fn word(args Array<String&>&, i I64, fallback String&) String& {
+    if i >= args.Len(): return fallback
+    return args[i]
 }
 
 fn scoreOf(args Array<String&>&) conn.Score {
@@ -91,9 +100,22 @@ fn report(s mut system.System<F32>&, held Points&, x system.Pop, y system.Pop, w
         $sweeps + " sweeps)")
 }
 
+# a skip connection's weights scaled so that no readout unit's incoming mass over it is above Skip
+fn capped(s mut system.System<F32>&, skip system.Conn) {
+    lk := s.Link(skip)
+    worst := 0.0
+    for j in range lk.PostSize {
+        m := 0.0
+        for i in range lk.PreSize: m += F64(s.E.Params[lk.Off + j * lk.PreSize + i].Abs())
+        worst = worst.Max(m)
+    }
+    if worst > Skip: lk.Scale(s.E.Params, Skip / worst)
+}
+
 # lessons lessons on the training points, each with an optimizer step, the masks held and the gain restrained; gives the
-# lessons refused (a phase that did not settle)
-fn teach(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.AdamW<F32, F32>&, lessons I64) I64 {
+# lessons refused (a phase that did not settle). A skip from zero (its connection, else -1) is held to Skip
+# after every step
+fn teach(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.AdamW<F32, F32>&, lessons I64, skip I64) I64 {
     refused I64 = 0
     for _ in range lessons {
         ok := true
@@ -105,6 +127,7 @@ fn teach(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.Ada
         opt.Step()
         s.Hold()
         s.Restrain(0.9)
+        if skip >= 0: capped(s, system.Conn(skip))
     }
     return refused
 }
@@ -121,6 +144,8 @@ fn main() ? io.Error, json.Error, learn.LearnError {
     between := I64(try number(args, 8, 50))
     seed := U64(try number(args, 9, 1))
     rate := try number(args, 10, 0.05)
+    schedule := conn.Schedule.Linear if word(args, 11, "cubic") == "linear" else conn.Schedule.Cubic
+    skip := word(args, 12, "none")
     r := rand.Rand(seed)
     s := system.System<F32>(Rows)
     x := s.Population(s.Root(), "x", 2 + noise, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
@@ -129,25 +154,29 @@ fn main() ? io.Error, json.Error, learn.LearnError {
     s.Connect(x, h, conn.Wiring.Dense)
     s.Connect(h, h, conn.Wiring.Symmetric)
     s.Connect(h, y, conn.Wiring.Symmetric)
-    s.Attach(s.Root(), system.Rule.Prune(by, target, pace, regrow), system.Clock.Episode)
+    held I64 = -1
+    if skip != "none": held = I64(s.Connect(x, y, conn.Wiring.Dense))
+    s.Attach(s.Root(), system.Rule.Prune(by, target, pace, regrow, schedule), system.Clock.Episode)
     s.Plan(r)!
     s.Certify(0.5)
+    if skip == "zero": s.Link(system.Conn(held)).Scale(s.E.Params, 0.0)
+    if skip != "zero": held = -1
     train := Points(2 + noise, r)
     unseen := Points(2 + noise, r)
     l := learn.Learner<F32>(s)!
     opt := optim.AdamW(s.Params(), s.ParamGrads(), rate = rate)
     train.Into(s, x, y)
-    refused := teach(s, l, opt, lessons)
+    refused := teach(s, l, opt, lessons, held)
     try report(s, unseen, x, y, "trained (" + $refused + " refused)")
     for not thinned(s, target) {
         train.Into(s, x, y)
         s.Settle(settle.Phase.Free, settle.Budget())
         try l.Tick(system.Clock.Episode)
-        refused = teach(s, l, opt, between)
+        refused = teach(s, l, opt, between, held)
         try report(s, unseen, x, y, "pruned (" + $refused + " refused)")
     }
     train.Into(s, x, y)
-    refused = teach(s, l, opt, lessons)
+    refused = teach(s, l, opt, lessons, held)
     try report(s, unseen, x, y, "relearned (" + $refused + " refused)")
     converted := s.Sparsify(0.5)
     try report(s, unseen, x, y, "sparse rows (" + $converted + " connections)")
