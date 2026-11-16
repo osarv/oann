@@ -222,7 +222,7 @@ search over structures change it between plans (question 3).
 long. Fields marked `@dyn.Keep` persist across settles (slow state: traces, thresholds, adaptation); the rest is
 reset or warm-started per settle. A column is viewed as a tensor `[phases, batch, size]` for the products. State is
 double-buffered (a sweep reads one buffer and writes the other), so every population of a sweep can relax in its own
-task (Jacobi sweeps; Gauss-Seidel as an option per module).
+task (Jacobi sweeps; Gauss-Seidel and Anderson acceleration as options of the settle).
 
 **Timescales** are clocks: `Sweep` (inside a settle), `Step` (a sample or a moment), `Episode`, `Sleep`. A rule runs
 on one clock; a field's timescale is the clock of the rules writing it.
@@ -281,7 +281,8 @@ fn (s System<T>&) Weights(c Conn) Tensor<T>
 fn (s System<T>&) Params() Tensor<T>                                  # flat, as the graph's: optimizers and checkpoints
 fn (s System<T>&) ParamGrads() Tensor<T>
 
-type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Anderson I64 = 0) { ... }
+type Sweeping struct(Anderson I64 = 0, GaussSeidel Bool = false) { ... }
+type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Scheme Sweeping = Sweeping()) { ... }
 type Settlement struct(Sweeps I64, Residual F64, Converged Bool, Energy F64) { ... }
 type Rule enum {
     Ep(beta F64, centered Bool)                               # contrast of nudged phases into ParamGrads
@@ -334,7 +335,12 @@ are constant and the evaluator can decide the bound.
 7. **Settling**: `Settle(phase, b)` runs from the phase's committed state (`Reset` for a cold start, `Warm` to copy
    one phase into another; inputs are set from their drive at every settle); `Nudged(b, beta = 0.5, centered = true)`
    warms the plus (and minus) phase from the free one and settles them side by side. `Budget(Sweeps, Tol, Damping)`:
-   Damping shortens the step by a factor; Anderson acceleration is not built. `Settlement(Sweeps, Residual,
+   Damping shortens the step by a factor; `Budget.Scheme`, a `Sweeping(Anderson, GaussSeidel)`, picks the
+   sweeps (`System.Use` sets the one `BudgetFor` and a Learner's budgets carry, and reserves Anderson's room): Anderson
+   acceleration of depth m (type II, Walker and Ni 2011; the least-squares combination of the last m steps' differences,
+   in F64 normal equations; where the residual grows the extrapolated state is dropped with the history and the plain
+   step from the last accepted state taken; rate populations only). Jacobi stays the default: neither option was
+   faster on every case with accuracy unchanged (PROGRESS.md, "Settle options"). `Settlement(Sweeps, Residual,
    Converged)` with `Diverged()`; the energy is not in it (`dyn/energy`, B2b, evaluates one). The residual's sup norm
    is kept as the integer order of |r|'s bits, which makes a NaN the largest and the loop's maximum vectorize.
 8. **Rules are run by `dyn/learn`**: `Attach` records a rule, `Rules(clock)` lists a clock's, and `learn.Tick(s, clock)`
@@ -345,7 +351,10 @@ are constant and the evaluator can decide the bound.
    split over tasks only when it does at least `TaskWork` (2M) multiply-adds: a join costs more than a small sweep, and
    every join keeps about 110 bytes until the program ends (`repro/joinleak.olang`, an olang bug), so a long run in
    tasks grows; one thread is flat (M9). The constants (inputs folded through their connections, once a settle) are
-   whole-batch products split by gemm's own threads. Gauss-Seidel sweeps are not built.
+   whole-batch products split by gemm's own threads. Gauss-Seidel sweeps (`Sweeping.GaussSeidel`): the populations
+   in a topological order of the one-way connections, each reading what the sweep already wrote of the ones before
+   it, its own rows a Jacobi block in tasks as before (so still the same bit for bit for any thread count); a
+   certified system (kappa < 1) contracts at least as a Jacobi sweep does in any order; a spiking system stays Jacobi.
 10. **Run-time structure** (decision 3): `Prune(c, keep)` masks weights (or tiles) in place, gradients with them
     (`Link.MaskGrads` for learning rules); `Compact()` drops a sparse connection's masked entries in place
     (`Csr.Drop`, `Tiles.Compact`, the gradient squeezed alike); `Retire(p, j)` holds a unit at rest. Which weights go is
@@ -354,7 +363,9 @@ are constant and the evaluator can decide the bound.
     by `Sparsify`, into sparse rows over its own region (the one step that allocates, where the caller chooses);
     compacting retired units out of a population is a re-plan with the weights kept (not built; the engine records
     every offset it laid out). PROGRESS.md, "Pruning at run time", has the measurements. Stability: `Gain`, `Certify`, `Restrain`, `Rate`, `LessonTolerance`, `BudgetFor` as circuit's;
-    `Contraction()` (a spectral bound by power iteration) is not built.
+    `Contraction()`: the activations' largest slope times the coupling's largest singular value (power iteration on
+    W^T W through the connections' own products, `Engine.Spectral`): the Euclidean-norm kappa, read directly; at most
+    `Gain()` for a symmetric coupling.
 
 11. **Allocation-free, pinned while compiling** (top-level `assert not f.Allocates`, S17a/G42): every population's
     step (rate, spiking), a readout's force, the window's end, cold and warm starts, committing a settle, a settle's

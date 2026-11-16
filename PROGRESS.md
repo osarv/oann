@@ -237,6 +237,60 @@ quantize and dequantize passes), but the whole CNN is now ahead of F32 at batche
 (the patches are built in F32 then quantized; one pass saved of three) - a direct kernel would save under 0.2 ms of 12 ms. Accuracy is untouched (the
 products are bit-identical). The batch-1 path is the old one-row dot products.
 
+## Settle options: Anderson, Gauss-Seidel, Contraction (wt-oannsettle, 2026-11-16)
+
+docs/redesign.md's three unbuilt settle features, in dyn: `settle.Sweeping(Anderson, GaussSeidel)` in `Budget.Scheme`, set for a
+system by `System.Use` (its `BudgetFor` and a Learner's budgets carry it; Anderson's history is reserved there, so a settle still
+allocates nothing), and `System.Contraction()`. Tests: the same fixed point as plain sweeps (every wiring, free and nudged; 2e-10
+without the event-driven connection, whose 1e-5 threshold makes the end path-dependent by ~1e-6 with it), fewer sweeps, bit for bit
+in tasks; a one-way chain made in reverse order settles in one Gauss-Seidel sweep (Jacobi: 3); EP's centered contrast still the
+cost's gradient against central differences (1e-5) with each; `Contraction` exactly kappa on the uniform block, the dense
+coupling's largest singular value on `small`, below the gain on `mixed`.
+
+Measured on a loaded machine (load 5-16 on 4 cores; logs/ in the worktree, not committed): `mnist_learn` 784-128-10, batch 32, seeds
+1 / 2, dense 3 epochs (`3 60000 128 32 SEED 0.001 0.5 1 1 0.1 200 1 0 WAY`) and pruned to 20% (`2 60000 128 32 SEED 0.001 0.5 1 0.2
+0.1 200 1 0 WAY`, after Sparsify), and `xor_settle` (300 lessons, best of 3 runs). Sweeps a lesson (free + nudged, epoch 3 or the
+relearn epoch), sweeps an answer (a test-set free settle), wall time of a test settle (a batch of 32), refused lessons, accuracy:
+
+| MNIST dense | sweeps a lesson | sweeps an answer | us a settle | epoch s | refused | accuracy |
+|---|---|---|---|---|---|---|
+| plain (Jacobi) | 32.4 / 32.0 | 14.7 / 14.2 | 258 / 386 | 2.6 / 2.6 | 0 / 0 | 96.71 / 97.10% |
+| Anderson 5 | 29.4 / 31.2 | 14.7 / 16.4 | 511 / 589 | 3.9 / 3.3 | 0 / 1 | 96.71 / 96.85% |
+| Anderson 3 | 29.7 / 31.2 | 14.9 / 15.8 | 498 / 507 | 3.6 / 3.6 | 0 / 0 | 96.65 / 97.05% |
+| Gauss-Seidel | 21.1 / 21.7 | 7.8 / 7.4 | 217 / 191 | 2.2 / 2.2 | 0 / 0 | 96.63 / 97.09% |
+| both (GS, Anderson 5) | 16.6 / 16.3 | 5.8 / 5.7 | 233 / 232 | 2.6 / 2.8 | 1 / 1 | 96.69 / 96.96% |
+
+| MNIST pruned 20% | sweeps a lesson | sweeps an answer | us a settle | refused (relearn) | accuracy |
+|---|---|---|---|---|---|
+| plain (Jacobi) | 42.7 / 43.4 | 18.7 / 19.9 | 236 / 296 | 0 / 0 | 97.43 / 97.52% |
+| Anderson 5 | 41.5 / 44.5 | 20.3 / 24.3 | 684 / 460 | 6 / 12 | 97.38 / 97.36% |
+| Anderson 3 | 42.1 / 46.2 | 20.5 / 24.3 | 635 / 598 | 6 / 14 | 97.33 / 97.41% |
+| Gauss-Seidel | 27.8 / 28.4 | 10.2 / 10.8 | 229 / 223 | 0 / 0 | 97.30 / 97.40% |
+| both | 21.4 / 21.6 | 6.7 / 6.9 | 359 / 362 | 0 / 0 | 97.37 / 97.37% |
+
+| XOR (8 hidden) | sweeps a lesson | us a lesson | loss at 300, right |
+|---|---|---|---|
+| plain | 9.1 | 7.7 | 0.0001, 4/4 |
+| Anderson 5 | 6.7 (1 refused) | 7.6 | 0.0005, 4/4 |
+| Anderson 3 | 7.1 | 7.3 | 0.0006, 4/4 |
+| Gauss-Seidel | 8.0 | 7.6 | 0.0005, 4/4 |
+| both | 5.8 | 6.6 | 0.0005, 4/4 |
+
+Reading: Gauss-Seidel saves a third of a lesson's sweeps and half an answer's on MNIST (the hidden population is swept before the
+readout, which then reads it new) and is as fast or faster in wall time everywhere, but it is level on XOR's time and its accuracy is
+not unchanged (-0.01 to -0.13 points, lower in all four MNIST runs; the trained path moves with the fixed point's error, within the
+tolerance). Anderson cuts sweeps where the system stays near certified (XOR, MNIST's first epochs: 20 against 30 a lesson before the
+safeguard was made strict) but costs more than a sweep here: MNIST's recurrent block is 128 x 10 (2560 multiply-adds a row), so its
+gather, Gram updates and extrapolation over 138 units a row are as dear as the sweep they replace, and on the trained, uncertified
+system (spectral bound past 1, below) it stalls and some lessons are refused. Its first safeguard (only dropping the history where the residual grew)
+saved more sweeps (20-24 a lesson) but refused 4-12 lessons an epoch; the strict one (back to the plain step from the last accepted
+state) refuses fewer and saves little. **The default stays Jacobi**: no option is faster on every case with accuracy unchanged.
+Anderson should pay where a sweep is dear (wide recurrent blocks) and the system is certified; Gauss-Seidel is the option to take
+where sweeps count (an answer's latency). `Contraction()` (printed now by both programs) reads kappa where the sup-norm gain over-counts: MNIST certified at gain 0.900 has
+a spectral bound of 0.107 (the 784-wide input is folded; the 128 x 10 symmetric block's singular value is small), and after
+epochs 1-3 the gain is 7.7 / 8.9 / 10.1 against a spectral bound of 0.97 / 1.18 / 1.37 - the trained system leaves even the
+Euclidean certificate from epoch 2, where Anderson stalls. XOR at lesson 300: gain 6.13, spectral bound 3.12.
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
