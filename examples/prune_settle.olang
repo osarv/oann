@@ -1,0 +1,154 @@
+# Pruning a settling system while it runs (dyn/learn's Prune rule, dyn/system's Sparsify): XOR of the signs of two
+# coordinates in the plane, beside distractor inputs of noise, learned by EP and AdamW; then thinned by a Prune rule on
+# the Episode clock toward a fraction of its weights kept, relearning between ticks; then relearned, and its thinned
+# dense blocks stored as sparse rows. Each line gives the weights kept (and each connection's), the accuracy on unseen
+# points, and the multiply-adds of a settle of one point: a sweep's, and the whole settle's (the input carried once, a
+# sweep times the sweeps it took). While pruned weights are only masked a sweep costs what the dense one did; after
+# Sparsify only the live weights cost.
+#
+# The system: 2 + noise inputs carried into a hidden population of tanh units, the hidden units reciprocal to each other
+# (lateral, symmetric) and to a readout of two classes; recurrent weights restrained to a gain of 0.9 after every step.
+# Arguments, all optional: the score (magnitude, activity, energy; energy), the fraction kept (0.05), the fraction pruned
+# a tick (0.05), the fraction regrown a tick (0), the hidden units (32), the noise inputs (2), the lessons before pruning
+# and after (2000), the lessons between ticks (50), the seed (1), the learning rate (0.05).
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "../dyn/system"
+import "../dyn/neuron"
+import "../dyn/conn"
+import "../dyn/settle"
+import "../dyn/learn"
+import "../nn/optim"
+
+Rows := 256        # training points, and test points
+Spread := 3.0      # every input uniform in [-Spread, Spread]
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
+    if i >= args.Len(): return fallback
+    return try json.Json.Parse(args[i]).AsNum()
+}
+
+fn scoreOf(args Array<String&>&) conn.Score {
+    if args.Len() < 2: return conn.Score.Energy
+    return match args[1] {
+        case "magnitude": conn.Score.Magnitude
+        case "activity": conn.Score.Activity
+        case _: conn.Score.Energy
+    }
+}
+
+# Rows points: every input uniform, the class the XOR of the first two inputs' signs, the rest noise
+type Points struct(width I64, r mut rand.Rand&) {
+    X Array<F32> = Array<F32>[F32(r.Uniform(-Spread, Spread)) for _ in range Rows * width]
+    Y Array<I32> = Array<I32>[I32(1 if (X[b * width] > 0.0) != (X[b * width + 1] > 0.0) else 0) for b in range Rows]
+}
+
+fn (p Points&) Into(s mut system.System<F32>&, x system.Pop, y system.Pop) {
+    for i in range p.X.Len(): s.Pop(x).Drive[i] = p.X[i]
+    for b in range Rows: s.Pop(y).Labels[b] = p.Y[b]
+}
+
+# the points settled from rest: the fraction answered right, and the sweeps the settle took
+fn (p Points&) Test(s mut system.System<F32>&, x system.Pop, y system.Pop) F64, I64 {
+    p.Into(s, x, y)
+    s.Reset(settle.Phase.Free)
+    done := s.Settle(settle.Phase.Free, settle.Budget())
+    predicted := Array<I32>(Rows)
+    s.Predict(settle.Phase.Free, y, predicted)
+    right I64 = 0
+    for b in range Rows: right += 1 if predicted[b] == p.Y[b] else 0
+    return F64(right) / F64(Rows), done.Sweeps
+}
+
+# the weights live, of every connection, and of all
+fn kept(s system.System<F32>&) I64, I64 {
+    live, all := 0, 0
+    for c in range s.E.Links.Len() {
+        lk := s.Link(system.Conn(c))
+        live += lk.Live()
+        all += lk.PostSize * lk.PreSize
+    }
+    return live, all
+}
+
+# whether the weights are down to the fraction kept (the rule's floor)
+fn thinned(s system.System<F32>&, target F64) Bool {
+    live, all := kept(s)
+    return live <= I64((target * F64(all)).Ceil())
+}
+
+fn report(s mut system.System<F32>&, held Points&, x system.Pop, y system.Pop, what String&) ? io.Error {
+    live, all := kept(s)
+    accuracy, sweeps := held.Test(s, x, y)
+    each := ""
+    for c in range s.E.Links.Len(): each += (" " if c == 0 else " / ") + $s.Link(system.Conn(c)).Live()
+    m := s.Macs()
+    try io.PutLn(what + ": " + $live + " of " + $all + " weights (" + $(100.0 * F64(live) / F64(all)).Fixed(1) + "%:" + each +
+        "), test " + $(100.0 * accuracy).Fixed(1) + "%, multiply-adds " + $m.Sweep + " a sweep, " + $m.Settle(sweeps) + " a settle (" +
+        $sweeps + " sweeps)")
+}
+
+# lessons lessons on the training points, each with an optimizer step, the masks held and the gain restrained; gives the
+# lessons refused (a phase that did not settle)
+fn teach(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.AdamW<F32, F32>&, lessons I64) I64 {
+    refused I64 = 0
+    for _ in range lessons {
+        ok := true
+        try l.Lesson(s.Root(), 0.5) catch { ok = false }
+        if not ok {
+            refused++
+            continue
+        }
+        opt.Step()
+        s.Hold()
+        s.Restrain(0.9)
+    }
+    return refused
+}
+
+fn main() ? io.Error, json.Error, learn.LearnError {
+    args := os.Args()
+    by := scoreOf(args)
+    target := try number(args, 2, 0.05)
+    pace := try number(args, 3, 0.05)
+    regrow := try number(args, 4, 0.0)
+    hidden := I64(try number(args, 5, 32))
+    noise := I64(try number(args, 6, 2))
+    lessons := I64(try number(args, 7, 2000))
+    between := I64(try number(args, 8, 50))
+    seed := U64(try number(args, 9, 1))
+    rate := try number(args, 10, 0.05)
+    r := rand.Rand(seed)
+    s := system.System<F32>(Rows)
+    x := s.Population(s.Root(), "x", 2 + noise, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", hidden, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Symmetric)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Attach(s.Root(), system.Rule.Prune(by, target, pace, regrow), system.Clock.Episode)
+    s.Plan(r)!
+    s.Certify(0.5)
+    train := Points(2 + noise, r)
+    unseen := Points(2 + noise, r)
+    l := learn.Learner<F32>(s)!
+    opt := optim.AdamW(s.Params(), s.ParamGrads(), rate = rate)
+    train.Into(s, x, y)
+    refused := teach(s, l, opt, lessons)
+    try report(s, unseen, x, y, "trained (" + $refused + " refused)")
+    for not thinned(s, target) {
+        train.Into(s, x, y)
+        s.Settle(settle.Phase.Free, settle.Budget())
+        try l.Tick(system.Clock.Episode)
+        refused = teach(s, l, opt, between)
+        try report(s, unseen, x, y, "pruned (" + $refused + " refused)")
+    }
+    train.Into(s, x, y)
+    refused = teach(s, l, opt, lessons)
+    try report(s, unseen, x, y, "relearned (" + $refused + " refused)")
+    converted := s.Sparsify(0.5)
+    try report(s, unseen, x, y, "sparse rows (" + $converted + " connections)")
+}

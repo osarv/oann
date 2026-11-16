@@ -25,6 +25,13 @@
 # signal - fast weights; on the Sweep clock between sweeps (the settle runs no rule of its own: a program that wants
 # writes while settling settles a sweep at a time and ticks).
 #
+# Pruning (Prune; docs/redesign.md section 3, decision 3): a module's learnt connections thinned while running, as one
+# pool - each weight ranked by a conn.Score (its magnitude, the current it carries, or its term of the energy) over its
+# connection's mean, the lowest masked a pace at a time toward a fraction kept - optionally regrowing masked weights
+# whose units coincide most (activity-dependent growth, the count unchanged), and hidden units left with no live weight
+# retired. Masks change in place; the products skip the pruned work once System.Sparsify stores the thinned dense blocks
+# as sparse rows.
+#
 # Gradients at a fixed point (ImplicitGrad), for a loss L given through dL/ds of one population's activities: exact
 # (the adjoint lambda = rho'(u) (dz + W_eff^T lambda) solved by a fixed-point iteration on the transposed Jacobian),
 # JFB (Jacobian-free: lambda = rho'(u) dz, the feedback ignored - Fung et al. 2022) or EP (two phases nudged through
@@ -63,7 +70,7 @@ type slotRec struct(In I64, Signal I64, When system.Clock, At I64) { In, Signal,
 # the learning of a planned system: its rules' state (eligibility traces) and the room its lessons, ticks and gradients
 # work in, all laid out once. Tol and Sweeps are a lesson's settles' tolerance and budget: 0 for the lesson tolerance of
 # its beta (System.LessonTolerance) and the budget the certificate gives (System.BudgetFor)
-type Learner<T> struct(s mut system.System<T>&) ? LearnError {
+type Learner<T> struct(s mut system.System<T>&, pruning Bool = false) ? LearnError {
     if not s.Planned: error LearnError.Unsupported("a learner of a system not yet planned")
     S mut system.System<T>& = s
     Tol F64 = 0
@@ -89,6 +96,26 @@ type Learner<T> struct(s mut system.System<T>&) ? LearnError {
     work mut Array<T>& = Array<T>(s.E.Params.Len())          # a three-factor rule's local term
     slots mut Vec<slotRec>& = slotsOf(s)
     traces mut Array<T>& = Array<T>(slots.Len() * s.E.Params.Len())
+    score mut Array<F64>& = Array<F64>(pruneRoom(s, pruning, false))   # pruning: the scores, laid out as the parameters
+    pick mut Array<F64>& = Array<F64>(pruneRoom(s, pruning, false))    # what a cut is chosen among
+    keep mut Array<Bool>& = Array<Bool>(pruneRoom(s, pruning, true), true)   # which of a connection's weights stay
+    mean mut Array<F64>& = Array<F64>(s.E.Units)                     # each unit's mean |activity|
+    live mut Array<I64>& = Array<I64>(s.E.Units)                     # each unit's live weights
+}
+
+# a pruning rule's room - the parameters (score, pick) and the largest connection's weights (keep) - where the learner
+# prunes (pruning, or a Prune rule attached); else 0
+fn pruneRoom<T>(s system.System<T>&, pruning Bool, one Bool) I64 {
+    wanted := pruning
+    for i in range s.Attachments() {
+        what := s.AttachedAt(i).What
+        if what == system.Rule.Prune: wanted = true
+    }
+    if not wanted: return 0
+    if not one: return s.E.Params.Len()
+    n I64 = 0
+    for lk in s.E.Links: n = n.Max(lk.Count)
+    return n
 }
 
 fn widest<T>(s system.System<T>&) I64 {
@@ -134,6 +161,7 @@ fn (l mut Learner<T>&) apply(a system.Attached, c system.Clock) ? LearnError {
         case system.Rule.ThreeFactor(signal, decay, rate) { l.threeFactor(a.Where, signal, decay, rate, c) }
         case system.Rule.Homeostasis(target, rate) { l.Homeostasis(a.Where, target, rate) }
         case system.Rule.DeltaWrite(link, gate) { try l.DeltaWrite(link, gate) }
+        case system.Rule.Prune(by, target, pace, regrow) { try l.Prune(a.Where, by, target, pace, regrow) }
         case system.Rule.Custom(r) { l.custom(r) }
     }
 }
@@ -417,6 +445,207 @@ fn masked<T>(lk conn.Link<T>&, params mut Array<T>&) {
     }
 }
 
+# ---- pruning ----
+
+# module m's prunable connections (conn's Prunable: dense, symmetric, sparse rows, event-driven; learnt) thinned while
+# running, as one pool: the pace fraction of their weights (post x pre each) with the lowest scores (by) masked, never
+# below the target fraction of them live. Each score is taken over its connection's mean live score and ranked across
+# the pool, so a connection whose weights matter alike shrinks with the rest while one whose weights differ gives up its
+# weakest; ranking the raw scores would empty a connection kept small (a restrained readout) before any other. With regrow above 0 that fraction of the live count is revived among the
+# masked weights whose units coincide most, |mean s_post s_pre| (from zero), and as many more are masked: regrowth moves
+# weights without adding any. The activities are the free phase's as last settled. A hidden unit of m left with no live
+# weight, in or out, is retired. Nothing is allocated: masks change in place, and a dense block's product costs what it
+# did until System.Sparsify. An optimizer's momentum moves masked weights: System.Hold after its step. Refused by a
+# learner made without room for it (pruning = true, or a Prune rule attached before it was made)
+fn (l mut Learner<T>&) Prune(m system.Mod, by conn.Score, target F64, pace F64, regrow F64 = 0) ? LearnError {
+    s := l.S
+    e := s.E
+    if l.keep.Len() == 0: error LearnError.Unsupported("pruning by a learner made without room for it (pruning = true)")
+    for p in e.Pops: absMeans(p.Activity(0), l.n, p.Size, l.mean, p.Unit)
+    full, live, held, n := 0, 0, 0, 0
+    for lk in e.Links {
+        if not l.prunes(lk, m): continue
+        full += lk.PostSize * lk.PreSize
+        live += lk.Live()
+        held += lk.Pruned
+        if by == conn.Score.Energy or regrow > 0.0: l.coincide(lk)
+        n = l.scores(lk, by, n)
+    }
+    grow := I64((regrow * F64(live)).Ceil()).Min(held)
+    drop := (I64((pace * F64(full)).Ceil()).Min(live - I64((target * F64(full)).Ceil())).Max(0) + grow).Min(live)
+    if drop == 0: return
+    cut, ties := cutoff(l.pick, n, drop)
+    gcut, gties := l.growCut(m, grow)
+    for lk in e.Links {
+        if not l.prunes(lk, m): continue
+        ties = l.marked(lk, cut, ties)
+        if grow > 0: gties = l.regrow(lk, gcut, gties)
+        lk.Prune(l.keep, e.Params, e.Grads)
+    }
+    l.retireLoose(m)
+}
+
+fn (l Learner<T>&) prunes(lk conn.Link<T>&, m system.Mod) Bool { return lk.Prunable() and l.S.Within(system.Pop(lk.Post), m) }
+
+# mean[at + j] = the mean of |a| over the n rows (size a row) at unit j
+fn absMeans<T>(a Array<T>&, n I64, size I64, mean mut Array<F64>&, at I64) {
+    for j in range size: mean[at + j] = 0.0
+    for r in range n {
+        for j in range size: mean[at + j] += F64(a[r * size + j]).Abs()
+    }
+    for j in range size: mean[at + j] /= F64(n)
+}
+
+# the mean over the free rows of s_post s_pre at each of lk's weights, into work (laid out as the parameters)
+fn (l mut Learner<T>&) coincide(lk conn.Link<T>&) {
+    e := l.S.E
+    clear(l.work, lk.Off, lk.Count)
+    l.pair(lk, l.work, e.Pops[lk.Post].Activity(0), 0, e.Pops[lk.Pre].Activity(0), 0, T(1.0 / F64(l.n)))
+}
+
+# lk's live weights' scores, each over their mean, into score (laid out as the parameters) and pick (packed from n);
+# gives the new n
+fn (l mut Learner<T>&) scores(lk conn.Link<T>&, by conn.Score, n I64) I64 {
+    p := l.S.E.Params
+    at := l.S.E.Pops[lk.Pre].Unit
+    sum F64 = 0.0
+    for i in range lk.Count {
+        if not lk.Keep[i]: continue
+        _, j := lk.Ends(i)
+        l.score[lk.Off + i] = salience(by, F64(p[lk.Off + i]), F64(l.work[lk.Off + i]), l.mean[at + j])
+        sum += l.score[lk.Off + i]
+    }
+    mean := sum / F64(lk.Live().Max(1))
+    k := n
+    for i in range lk.Count {
+        if not lk.Keep[i]: continue
+        l.score[lk.Off + i] = l.score[lk.Off + i] / mean if mean > 0.0 else 0.0
+        l.pick[k] = l.score[lk.Off + i]
+        k++
+    }
+    return k
+}
+
+fn salience(by conn.Score, w F64, c F64, a F64) F64 {
+    return match by {
+        case conn.Score.Magnitude: w.Abs()
+        case conn.Score.Activity: w.Abs() * a
+        case conn.Score.Energy: (w * c).Abs()
+    }
+}
+
+# lk's keep: false for its live weights at most cut (those equal to it while ties last); gives the ties left
+fn (l mut Learner<T>&) marked(lk conn.Link<T>&, cut F64, ties I64) I64 {
+    left := ties
+    for i in range lk.Count {
+        l.keep[i] = true
+        v := l.score[lk.Off + i]
+        if not lk.Keep[i] or v > cut or (v == cut and left == 0): continue
+        if v == cut: left--
+        l.keep[i] = false
+    }
+    return left
+}
+
+# the cut of regrowth, -|coincidence| over m's masked weights whose units coincide at all, and its ties: the grow most
+# coinciding (fewer where fewer coincide)
+fn (l mut Learner<T>&) growCut(m system.Mod, grow I64) F64, I64 {
+    if grow == 0: return 0.0, 0
+    n I64 = 0
+    for lk in l.S.E.Links {
+        if not l.prunes(lk, m): continue
+        for i in range lk.Count {
+            c := F64(l.work[lk.Off + i]).Abs()
+            if lk.Keep[i] or c == 0.0: continue
+            l.pick[n] = -c
+            n++
+        }
+    }
+    if n == 0: return 0.0, 0
+    return cutoff(l.pick, n, grow.Min(n))
+}
+
+# lk's masked weights at most the regrowth cut (those equal to it while ties last) revived; gives the ties left
+fn (l mut Learner<T>&) regrow(lk mut conn.Link<T>&, cut F64, ties I64) I64 {
+    left := ties
+    for i in range lk.Count {
+        g := -F64(l.work[lk.Off + i]).Abs()
+        if lk.Keep[i] or g == 0.0 or g > cut or (g == cut and left == 0): continue
+        if g == cut: left--
+        lk.Revive(i, l.S.E.Params)
+    }
+    return left
+}
+
+# the k-th smallest of a[0 .. n) (1 <= k <= n), found in place (a's order is lost), and how many values equal to it the
+# k smallest hold
+fn cutoff(a mut Array<F64>&, n I64, k I64) F64, I64 {
+    lo, hi := 0, n - 1
+    for lo < hi {
+        p := a[(lo + hi) / 2]
+        i, j := split(a, lo, hi, p)
+        if k - 1 <= j {
+            hi = j
+        } else if k - 1 >= i {
+            lo = i
+        } else {
+            break
+        }
+    }
+    v := a[k - 1]
+    less I64 = 0
+    for t in range n: less += 1 if a[t] < v else 0
+    return v, k - less
+}
+
+# a[lo .. hi] split around p (Hoare): at most p up to j, at least p from i, p between
+fn split(a mut Array<F64>&, lo I64, hi I64, p F64) I64, I64 {
+    i, j := lo, hi
+    for i <= j {
+        for a[i] < p: i++
+        for a[j] > p: j--
+        if i > j: break
+        t := a[i]
+        a[i] = a[j]
+        a[j] = t
+        i++
+        j--
+    }
+    return i, j
+}
+
+# module m's hidden units with no live weight, in or out, retired: they carry nothing
+fn (l mut Learner<T>&) retireLoose(m system.Mod) {
+    s := l.S
+    e := s.E
+    for u in range e.Units: l.live[u] = 0
+    for lk in e.Links: l.countLive(lk)
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        if p.Role != neuron.Role.Hidden or not s.Within(system.Pop(i), m): continue
+        for j in range p.Size {
+            if l.live[p.Unit + j] == 0: s.Retire(system.Pop(i), j)
+        }
+    }
+}
+
+# each unit's live weights in lk added to live (a low-rank or tiled connection's every unit counted once)
+fn (l mut Learner<T>&) countLive(lk conn.Link<T>&) {
+    e := l.S.E
+    post, pre := e.Pops[lk.Post], e.Pops[lk.Pre]
+    if lk.Kind == conn.Wiring.LowRank or lk.Kind == conn.Wiring.Tiles {
+        for j in range post.Size: l.live[post.Unit + j]++
+        for j in range pre.Size: l.live[pre.Unit + j]++
+        return
+    }
+    for i in range lk.Count {
+        if not lk.Keep[i]: continue
+        a, b := lk.Ends(i)
+        l.live[post.Unit + a]++
+        l.live[pre.Unit + b]++
+    }
+}
+
 # ---- gradients at a fixed point ----
 
 # the gradient of a loss L at the free phase's fixed point (settled), given dz = dL/ds of population out's activities
@@ -666,6 +895,7 @@ assert not deltaOf.Allocates, "a delta write's error allocates"
 assert not slopeOf.Allocates, "the slopes allocate"
 assert not adjointOf.Allocates, "an adjoint's step allocates"
 assert not nudgeOf.Allocates, "a nudge through the drive allocates"
+assert not Learner<F32>.Prune.Allocates, "pruning by a score allocates"
 assert not Learner<F32>.ImplicitGrad.Allocates, "an implicit gradient (EP, exact or JFB) allocates"
 
 # ---- tests ----
@@ -1030,6 +1260,64 @@ test Learner.Lesson "XOR by rate neurons: two inputs, eight tanh units, two read
     assert xorRight(s, y) == 4 and s.Loss(settle.Phase.Free) < 0.02, "loss " + $s.Loss(settle.Phase.Free) + ", " + $(F64(sweeps) / 300.0) + " sweeps a lesson"
 }
 
+test cutoff "the k-th smallest and the ties the k smallest hold" {
+    a := Array<F64>[3.0, 1.0, 2.0, 2.0, 5.0, 2.0, 0.0]
+    v, ties := cutoff(a, 7, 3)
+    assert v == 2.0 and ties == 1
+    b := Array<F64>[4.0, 4.0, 4.0]
+    w, all := cutoff(b, 3, 3)
+    assert w == 4.0 and all == 3
+}
+
+# whether hidden unit j of XOR's system has no live weight, in or out
+fn loose(s system.System<F32>&, j I64) Bool {
+    a, b := s.Link(system.Conn(0)), s.Link(system.Conn(1))
+    for i in range 2 {
+        if a.Keep[j * 2 + i]: return false
+    }
+    for i in range 2 {
+        if b.Keep[i * 8 + j]: return false
+    }
+    return true
+}
+
+# XOR's weights live, of both connections
+fn liveOf(s system.System<F32>&) I64 { return s.Link(system.Conn(0)).Live() + s.Link(system.Conn(1)).Live() }
+
+test Learner.Prune "a rule prunes a trained XOR system to a quarter of its weights by their energy terms, relearning between ticks, still right; regrowth moves weights at a constant count" {
+    r := rand.Rand(1)
+    s := system.System<F32>(4)
+    x := s.Population(s.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 8, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Attach(s.Root(), system.Rule.Prune(conn.Score.Energy, 0.25, 0.1, 0.0), system.Clock.Episode)
+    s.Plan(r)!
+    s.Certify(0.9)
+    xorData(s, x, y, 0.0)
+    l := Learner<F32>(s)!
+    opt := adam<F32>(s.E.Params.Len(), 0.05)
+    for k in range 600 {
+        l.Lesson(s.Root(), 0.5)!
+        opt.Step(s.E.Params, s.E.Grads)
+        s.Hold()
+        if k < 300 or k % 25 != 0: continue
+        s.Settle(settle.Phase.Free, settle.Budget())
+        l.Tick(system.Clock.Episode)!
+    }
+    s.Settle(settle.Phase.Free, settle.Budget())
+    assert liveOf(s) == 8 and xorRight(s, y) == 4, $liveOf(s) + " live, " + $xorRight(s, y) + "/4 right"
+    lk := s.Link(system.Conn(1))
+    for i in range lk.Count: assert lk.Keep[i] or s.E.Params[lk.Off + i] == 0.0
+    for j in range 8: assert s.Pop(h).Alive[j] != loose(s, j), "unit " + $j + ": retired exactly when it has no live weight"
+    before := Array<Bool>[lk.Keep[i] for i in range lk.Count]
+    l.Prune(s.Root(), conn.Score.Magnitude, 0.25, 0.0, 0.25)!
+    moved I64 = 0
+    for i in range lk.Count: moved += 1 if lk.Keep[i] and not before[i] else 0
+    assert liveOf(s) == 8 and moved > 0, $liveOf(s) + " live, " + $moved + " regrown"
+}
+
 test Learner.Lesson "XOR by spiking neurons: Lif hidden and readout units, their spike counts nudged toward 0.2 spikes a step for the class" {
     r := rand.Rand(1)
     window I64 = 256
@@ -1229,6 +1517,7 @@ fn moment(l mut Learner<F32>&, opt mut adam<F32>&, dz tensor.Tensor<F32>&, dx mu
     s := l.S
     l.Lesson(s.Root(), 0.5)!
     opt.Step(s.E.Params, s.E.Grads)
+    s.Hold()
     l.Tick(system.Clock.Step)!
     l.ImplicitGrad(system.Pop(2), dz, system.Implicit.Exact(1e-4, 500), system.Pop(0), dx)!
 }
@@ -1246,6 +1535,7 @@ test Learner.Lesson "lessons, ticks and implicit gradients allocate nothing: res
     reward := s.Signal(s.Root(), "reward")
     s.Attach(s.Root(), system.Rule.ThreeFactor(reward, 0.9, 0.0), system.Clock.Step)
     s.Attach(s.Root(), system.Rule.Homeostasis(0.2, 1e-3), system.Clock.Step)
+    s.Attach(s.Root(), system.Rule.Prune(conn.Score.Activity, 0.3, 0.002, 0.002), system.Clock.Step)
     s.Plan(r)!
     s.Certify(0.9)
     for i in range 32 * 100: s.Pop(x).Drive[i] = F32(r.Uniform(0.0, 1.0))
