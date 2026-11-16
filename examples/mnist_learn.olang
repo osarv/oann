@@ -7,7 +7,8 @@
 # Adam's rate (0.001), beta (0.5), the threads a sweep may be split over (1), the fraction of the weights kept (1, no
 # pruning: below 1 a Prune rule (magnitude, cubic schedule) thins the trained system tick by tick), the pace of a tick
 # (0.1), the lessons between ticks (200), the epochs relearned after (1) and, for a dense run (keep 1), the lessons taught after
-# the epochs (0: a control with as many lessons as a pruned run took).
+# the epochs (0: a control with as many lessons as a pruned run took), and the sweeps: plain (Jacobi, the default), anderson
+# (Anderson's acceleration, depth 5; andersonN for depth N), seidel (Gauss-Seidel) or both (Gauss-Seidel, Anderson depth 5).
 
 import "std/io"
 import "std/json"
@@ -27,6 +28,17 @@ import "../data/mnist"
 fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
     if i >= args.Len(): return fallback
     return try json.Json.Parse(args[i]).AsNum()
+}
+
+# the sweeps named by args[i]: plain, anderson (depth 5), andersonN (depth N), seidel, both (seidel, depth 5)
+fn sweepsOf(args Array<String&>&, i I64) settle.Sweeping {
+    if i >= args.Len(): return settle.Sweeping()
+    word := args[i]
+    if word == "seidel": return settle.Sweeping(0, true)
+    if word == "both": return settle.Sweeping(5, true)
+    if word == "anderson": return settle.Sweeping(5)
+    if word.StartsWith("anderson"): return settle.Sweeping(I64(word[8:].ParseInt()!))
+    return settle.Sweeping()
 }
 
 fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, learn.LearnError {
@@ -55,12 +67,14 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     s.Connect(inner, digits, conn.Wiring.Symmetric)
     if keep < 1.0: s.Attach(s.Root(), system.Rule.Prune(conn.Score.Magnitude, keep, pace, 0.0, conn.Schedule.Cubic), system.Clock.Episode)
     s.Plan(rand.Rand(seed))!
+    s.Use(sweepsOf(args, 14))
     s.Certify(0.9)
     l := learn.Learner<F32>(s)!
     opt := optim.AdamW(s.Params(), s.ParamGrads(), rate = rate)
     tol := s.LessonTolerance(beta)
     try io.Put(("784-" + $hidden + "-10 settling system (dyn), " + $s.Params().Count() + " parameters, " + $samples + " training samples, batches of " +
-        $batch + ", beta " + $beta + ", lesson tolerance " + $tol + ", budget " + $s.BudgetFor(tol, beta).Sweeps + " sweeps, " + $threads + " threads\n"))
+        $batch + ", beta " + $beta + ", lesson tolerance " + $tol + ", budget " + $s.BudgetFor(tol, beta).Sweeps + " sweeps, " + $threads + " threads, " +
+        $s.Scheme + "\n"))
 
     trainSet := loader.Loader(part, batch, seed)
     testSet := loader.Loader(data.Test, batch, seed, false)
@@ -131,7 +145,9 @@ fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.
 
 # the test accuracy and what an answer costs in multiply-adds, with the weights live of all
 fn show<D>(s mut system.System<F32>&, testSet mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, labels mut Array<I32>&, name String&) ? io.Error {
+    t0 := time.Now()
     accuracy, answer := evaluate(s, testSet, pixels, digits, tol, labels)
+    each := F64(time.Since(t0)) * 1e-3 / F64(testSet.Batches())
     m := s.Macs()
     live, all := 0, 0
     for c in range s.E.Links.Len() {
@@ -139,7 +155,7 @@ fn show<D>(s mut system.System<F32>&, testSet mut loader.Loader<D>&, pixels syst
         live += lk.Live()
         all += lk.PostSize * lk.PreSize
     }
-    try io.Put($name + "test accuracy " + $(100.0 * accuracy).Fixed(2) + "%, " + $answer.Fixed(1) + " sweeps an answer, " + $live + " of " + $all +
+    try io.Put($name + "test accuracy " + $(100.0 * accuracy).Fixed(2) + "%, " + $answer.Fixed(1) + " sweeps an answer, " + $each.Fixed(1) + " us a settle (a batch), " + $live + " of " + $all +
         " weights live, " + $m.Once + " multiply-adds once, " + $m.Sweep + " a sweep, " + $m.Settle(I64(answer.Round())) + " a settle\n")
 }
 

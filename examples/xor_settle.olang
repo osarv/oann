@@ -1,12 +1,14 @@
 # XOR learned by a settling system of dyn: two inputs, a hidden population of tanh units, a readout of two classes, the
 # hidden and readout units reciprocal - taught by equilibrium propagation (learn.Learner.Lesson: a free settle, two nudged
 # ones, their contrast) and nn/optim's AdamW. Arguments, all optional: the lessons (300), the hidden units (8), the seed
-# (1), the learning rate (0.05), beta (0.5).
+# (1), the learning rate (0.05), beta (0.5), and the sweeps: plain (Jacobi, the default), anderson (Anderson's
+# acceleration, depth 5; anderson3 for depth 3), seidel (Gauss-Seidel) or both (Gauss-Seidel, Anderson depth 5).
 
 import "std/io"
 import "std/json"
 import "std/os"
 import "std/rand"
+import "std/time"
 import "../dyn/system"
 import "../dyn/neuron"
 import "../dyn/conn"
@@ -17,6 +19,17 @@ import "../nn/optim"
 fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
     if i >= args.Len(): return fallback
     return try json.Json.Parse(args[i]).AsNum()
+}
+
+# the sweeps named by args[i]: plain, anderson (depth 5), andersonN (depth N), seidel, both (seidel, depth 5)
+fn sweepsOf(args Array<String&>&, i I64) settle.Sweeping {
+    if i >= args.Len(): return settle.Sweeping()
+    word := args[i]
+    if word == "seidel": return settle.Sweeping(0, true)
+    if word == "both": return settle.Sweeping(5, true)
+    if word == "anderson": return settle.Sweeping(5)
+    if word.StartsWith("anderson"): return settle.Sweeping(I64(word[8:].ParseInt()!))
+    return settle.Sweeping()
 }
 
 fn main() ? io.Error, json.Error {
@@ -33,6 +46,7 @@ fn main() ? io.Error, json.Error {
     s.Connect(x, h, conn.Wiring.Dense)
     s.Connect(h, y, conn.Wiring.Symmetric)
     s.Plan(rand.Rand(seed))!
+    s.Use(sweepsOf(args, 6))
     s.Certify(0.9)
     for b in range 4 {
         p := b / 2
@@ -46,6 +60,7 @@ fn main() ? io.Error, json.Error {
     predicted := Array<I32>(4)
     sweeps I64 = 0
     refused I64 = 0
+    t0 := time.Now()
     for k in range 1, lessons + 1 {
         ok := true
         lesson := try l.Lesson(s.Root(), beta) catch { ok = false } default learn.Taught()
@@ -63,7 +78,8 @@ fn main() ? io.Error, json.Error {
                 if I64(predicted[b]) == ((b / 2) ^ (b % 2)): right++
             }
             try io.Put(("lesson " + $k + ": loss " + $s.Loss(settle.Phase.Free).Fixed(4) + ", " + $right + "/4 right, gain " +
-                $s.Gain().Fixed(3) + ", sweeps per lesson " + $(F64(sweeps) / F64((k - refused).Max(1))).Fixed(1) + ", refused " + $refused + "\n"))
+                $s.Gain().Fixed(3) + ", sweeps per lesson " + $(F64(sweeps) / F64((k - refused).Max(1))).Fixed(1) + ", refused " + $refused + ", " +
+                $(F64(time.Since(t0)) * 1e-3 / F64(k)).Fixed(1) + " us a lesson\n"))
         }
     }
 }

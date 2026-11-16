@@ -662,14 +662,21 @@ fn (e Engine<T>&) depthFor(b Budget) I64 {
 
 # ---- Anderson acceleration ----
 
-# after a sweep of rows r0 .. r1 with residual worst: the step the sweep made and the state it read join the history
-# (the history dropped where the residual grew: the plain step stands), and the buffer written becomes the
-# extrapolation x + f - (dX + dF) gamma, gamma the least-squares combination of the steps' differences nearest f
+# after a sweep of rows r0 .. r1 with residual worst: the step the sweep made and the state it read join the history,
+# and the buffer written becomes the extrapolation x + f - (dX + dF) gamma, gamma the least-squares combination of the
+# steps' differences nearest f. The safeguard: where the residual grew, the extrapolated state is dropped with the
+# history, and the buffer written becomes the plain sweep's step from the state before it (which the next sweep takes
+# without comparing)
 fn (e mut Engine<T>&) accelerate(r0 I64, r1 I64, worst F64, m I64) {
     a := e.acc
     n := e.gather(r0, r1)
-    grew := a.Started and worst > a.Last
-    if grew { a.Kept, a.Slot = 0, 0 } else if a.Started { a.push(n, m) }
+    if a.Started and worst > a.Last {
+        a.Kept, a.Slot, a.Started = 0, 0, false
+        for i in range n: a.X[i] = a.PX[i] + a.PF[i]
+        e.scatter(r0, r1)
+        return
+    }
+    if a.Started: a.push(n, m)
     for i in range n {
         a.PX[i] = a.X[i]
         a.PF[i] = a.F[i]
@@ -755,10 +762,11 @@ fn (a mut History<T>&) solve(n I64, m I64) ? Singular {
 
 # X = X + F - sum_j gamma_j (DX_j + DF_j): the next state
 fn (a mut History<T>&) extrapolate(n I64) {
-    for i in range n {
-        v := F64(a.X[i]) + F64(a.F[i])
-        for j in range a.Kept: v -= a.G[j] * (F64(a.DX[j * n + i]) + F64(a.DF[j * n + i]))
-        a.X[i] = T(v)
+    for i in range n: a.X[i] += a.F[i]
+    for j in range a.Kept {
+        g := T(a.G[j])
+        at := j * n
+        for i in range n: a.X[i] -= g * (a.DX[at + i] + a.DF[at + i])
     }
 }
 
