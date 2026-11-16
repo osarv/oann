@@ -1308,36 +1308,29 @@ fn (q quant&) rowI8(i I64) {
     for j in range four, q.n: q.store1(i, j, dotI8(q.a.d, i * q.a.ld, q.b.d, j * q.b.ld, q.k))
 }
 
+# four dot products as plain integer sums, which the loop vectorizer reassociates itself: four vectors of 16 lanes a
+# row, each step a vpmaddwd on AVX-512 (measured: 1.0-1.5x the sums kept in lanes by hand, 1 x 128 x 512 the most). No
+# form reaches VNNI's vpdpbusd, four products a lane (repro/vnnidot)
 fn (q quant&) dot4I8(i I64, j I64) {
     a0, b0, ld := i * q.a.ld, j * q.b.ld, q.b.ld
-    s0, s1, s2, s3 := lanes<I32>(), lanes<I32>(), lanes<I32>(), lanes<I32>()
-    whole I64 = q.k - q.k % 16
-    for p in range 0, whole, 16 {
-        stepDotI8(s0, q.a.d, a0 + p, q.b.d, b0 + p)
-        stepDotI8(s1, q.a.d, a0 + p, q.b.d, b0 + ld + p)
-        stepDotI8(s2, q.a.d, a0 + p, q.b.d, b0 + 2 * ld + p)
-        stepDotI8(s3, q.a.d, a0 + p, q.b.d, b0 + 3 * ld + p)
+    t0, t1, t2, t3 := I32(0), I32(0), I32(0), I32(0)
+    for p in range q.k {
+        x := I32(q.a.d[a0 + p])
+        t0 = t0 + x * I32(q.b.d[b0 + p])
+        t1 = t1 + x * I32(q.b.d[b0 + ld + p])
+        t2 = t2 + x * I32(q.b.d[b0 + 2 * ld + p])
+        t3 = t3 + x * I32(q.b.d[b0 + 3 * ld + p])
     }
-    comptime for r in range 4 {
-        t I32 = laneSum(s0 if r == 0 else (s1 if r == 1 else (s2 if r == 2 else s3)), 16)
-        for p in range whole, q.k: t = t + I32(q.a.d[a0 + p]) * I32(q.b.d[b0 + r * ld + p])
-        q.store1(i, j + r, t)
-    }
+    q.store1(i, j, t0)
+    q.store1(i, j + 1, t1)
+    q.store1(i, j + 2, t2)
+    q.store1(i, j + 3, t3)
 }
 
-fn stepDotI8(acc mut lanes<I32>&, a Array<U8>&, ao I64, b Array<I8>&, bo I64) {
-    for j in range 16: acc.v[j] = acc.v[j] + I32(a[ao + j]) * I32(b[bo + j])
-}
-
-# the sum of a[ao ..] b[bo ..] over k: 16 lanes of partial sums, added in order
+# the sum of a[ao ..] b[bo ..] over k
 fn dotI8(a Array<U8>&, ao I64, b Array<I8>&, bo I64, k I64) I32 {
-    acc := lanes<I32>()
-    whole I64 = k - k % 16
-    for p in range 0, whole, 16 {
-        for j in range 16: acc.v[j] = acc.v[j] + I32(a[ao + p + j]) * I32(b[bo + p + j])
-    }
-    s I32 = laneSum(acc, 16)
-    for p in range whole, k: s = s + I32(a[ao + p]) * I32(b[bo + p])
+    s I32 = 0
+    for p in range k: s = s + I32(a[ao + p]) * I32(b[bo + p])
     return s
 }
 
