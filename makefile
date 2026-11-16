@@ -11,8 +11,17 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
 
-.PHONY: test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking hybridbench sleepreplay mnistlearn sample clean
+.DEFAULT_GOAL := help
 
+.PHONY: help test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking hybridbench sleepreplay mnistlearn sample clean
+
+# prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
+help:
+	@awk '/^#/ { sub(/^# ?/, ""); c = c (c == "" ? "" : " ") $$0; next } \
+	  /^[a-z][a-z0-9 ]*:/ { if (c != "") { n = $$0; sub(/:.*/, "", n); printf "%-16s %s\n", n, c } } \
+	  { c = "" }' $(MAKEFILE_LIST)
+
+# every module's tests (takes minutes) - OLANG=path names another compiler
 test:
 	$(OLANG) test $(TESTS)
 
@@ -166,5 +175,6 @@ epoch:
 	$(OLANG) build -output build/bench_epoch bench/epoch.olang
 	OLANG=$(OLANG) ./build/bench_epoch
 
+# removes build/
 clean:
 	rm -rf build

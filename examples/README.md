@@ -2,7 +2,7 @@
 
 Programs that train and measure oann's models; each is the driver of a number in docs/redesign.md section 4.3, with its
 arguments described at the top of the file. Build and run one from the repository's root with its make target
-(`make mnist ARGS="10"`) or `olang build -output build/examples_NAME examples/NAME.olang && build/examples_NAME ARGS`.
+(`olang examples/mnist_mlp.olang 10`; the make targets below are for developers).
 MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, TinyStories into `data/tinystories`, once.
 
 | file | what | make |

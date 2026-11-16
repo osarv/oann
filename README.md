@@ -6,17 +6,43 @@ and settling networks, systems that learn by settling into a state (docs/settlin
 FPGA. Every kernel is olang; nothing links a BLAS. `DESIGN.md` is the design as it stands; `docs/redesign.md` is the
 plan and what each package measured.
 
-## Building and testing
+## Using oann
 
-oann needs the olang compiler: check olang out beside oann and run `make` there, which bootstraps `build/olang`.
+There is nothing to install or build: import oann's modules from your own program and olang fetches them once and
+compiles them as part of your build (a remote import, `HOST/OWNER/REPO[@REF]/PATH`, the path a file without its extension;
+`@REF` is a branch or tag, `olang.lock` pins the commit).
 
 ```
-make test                          # every module's tests (OLANG=path/to/olang names another compiler)
-make mnist ARGS="10 adamw 1 1"     # the 784-128-10 perceptron on MNIST: epochs, optimizer, seed, threads
-make charlm ARGS="2000 1 2"        # a character transformer on tiny Shakespeare
+import "github.com/osarv/oann/tensor"
+
+fn main() ? tensor.ShapeError {
+    t := try tensor.Tensor<F32>.Of([1.0, 2.0, 3.0, 4.0], 2, 2)
+    Println("shape " + t.Dims.Str() + ", t[1, 0] = " + $t.Get(1, 0))
+}
 ```
 
-The makefile lists every program with its arguments (data, cnn, bpelm, lmbench, int8, board, mnistlearn, ...).
+Other modules the same way: `github.com/osarv/oann/nn/optim`, `.../ad/graph`, `.../models/gpt`, `.../dyn/system`.
+Run a file by naming it - olang builds it fully optimized into its cache and runs it. The examples work as they are:
+
+```
+olang examples/xor_settle.olang                # XOR by a settling system, taught by equilibrium propagation
+olang examples/mnist_mlp.olang 10 adamw 1 1    # the 784-128-10 perceptron on MNIST: epochs, optimizer, seed, threads
+olang examples/charlm.olang 2000 1 2           # a character transformer on tiny Shakespeare
+```
+
+Each example's arguments are described at the top of its file (`examples/README.md`). MNIST and the text corpora are
+fetched into `data/` on first use.
+
+## Developing oann
+
+The makefile is for oann's developers; `make` alone lists its targets, one line each with its ARGS, and runs nothing.
+It needs the olang compiler beside oann (`../olang/build/olang`, or `OLANG=path`).
+
+```
+make test                          # every module's tests, takes minutes
+make mnist ARGS="10 adamw 1 1"     # an example or benchmark built and run with ARGS (data, cnn, int8, lmbench, board, ...)
+```
+
 Downloads go to `data/`, everything built to `build/`; neither is in git.
 
 ## Layout
