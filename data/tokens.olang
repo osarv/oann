@@ -24,15 +24,13 @@ type TokenError error {
 }
 
 # a token file open for reading: Count ids of Width bytes, windows of Ctx + 1
-type Tokens unique struct(fd I32, Count I64, Ctx I64, Width I64, seed U64) {
-    fd
+type Tokens unique struct(file os.File, Count I64, Ctx I64, Width I64, seed U64) {
+    file
     Count
     Ctx
     Width
     rng rand.Rand = rand.Rand(seed)
     raw mut Array<U8>& = Array<U8>((Ctx + 1) * Width)  # the bytes of the window being read
-} destruct {
-    unistd.close(fd)
 }
 
 # the file at "path" as tokens of "width" bytes, windows of "ctx" + 1; "seed" decides Random's places
@@ -40,7 +38,7 @@ fn Tokens.Open(path String&, ctx I64, width I64 = 2, seed U64 = 1) Tokens ? os.E
     if width != 2 and width != 4: error TokenError.Width
     info := try os.FileInfo.Stat(path)
     if info.Size % width != 0 or info.Size / width < ctx + 1: error TokenError.Short
-    return Tokens(try os.Open(path), info.Size / width, ctx, width, seed)
+    return Tokens(try os.File.Open(path), info.Size / width, ctx, width, seed)
 }
 
 # how many windows follow one another without overlapping inputs: the length of an ordered pass
@@ -53,7 +51,7 @@ fn (t mut Tokens&) window(at I64, b I64, tokens mut Array<I32>&, targets mut Arr
     want := t.raw.Len()
     got I64 = 0
     for got < want {
-        n := unistd.pread(t.fd, t.raw[got:], U64(want - got), at * t.Width + got)
+        n := unistd.pread(t.file.Fd(), t.raw[got:], U64(want - got), at * t.Width + got)
         if n <= 0: error TokenError.Cut
         got += n
     }
