@@ -928,6 +928,13 @@ type lanes<A> struct() {
 fn dot2<M, V, A, O>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A, beta A, out mut Array<O>&, i I64) {
     z A
     like O
+    match M {
+        case BF16 {
+            dot2Narrow(mx, o, ld, vec, len, alpha, beta, out, i)
+            return
+        }
+        case _ { }
+    }
     w I64 = vectorLanes(z)
     acc := lanes<A>()
     acc2 := lanes<A>()
@@ -944,6 +951,32 @@ fn dot2<M, V, A, O>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A
     }
     out[i] = gemvOut(s, alpha, beta, out[i], like)
     out[i + 1] = gemvOut(t, alpha, beta, out[i + 1], like)
+}
+
+# BF16 rows: each row on its own, in two vectors of partial sums. Two rows against one read of vec, as above, LLVM's
+# vectorizer pairs the rows' widenings in 128-bit pieces (4.7x slower); four vectors a row it splits likewise. I8 rows
+# are faster as above (measured, bench/storage)
+fn dot2Narrow<M, V, A, O>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A, beta A, out mut Array<O>&, i I64) {
+    z A
+    like O
+    out[i] = gemvOut(dotNarrow(mx, o, vec, len, z), alpha, beta, out[i], like)
+    out[i + 1] = gemvOut(dotNarrow(mx, o + ld, vec, len, z), alpha, beta, out[i + 1], like)
+}
+
+fn dotNarrow<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
+    w I64 = vectorLanes(z)
+    acc := lanes<A>()
+    acc2 := lanes<A>()
+    pairs I64 = len - len % (2 * w)
+    for p in range 0, pairs, 2 * w {
+        dotStep(acc, mx, o + p, vec, p, w)
+        dotStep(acc2, mx, o + p + w, vec, p + w, w)
+    }
+    whole I64 = len - len % w
+    if pairs < whole: dotStep(acc, mx, o + pairs, vec, pairs, w)
+    s A = laneSum(acc, w) + laneSum(acc2, w)
+    for p in range whole, len: s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
+    return s
 }
 
 fn dot1<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
