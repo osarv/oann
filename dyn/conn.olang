@@ -17,8 +17,11 @@
 # once, sized for the system.
 #
 # Pruning at run time (docs/redesign.md, section 3, decision 3): Prune(keep) masks weights in place - zeroed, their
-# mask cleared, a product costs what it did - and Compact drops a sparse form's masked entries in place, after which
-# its products are cheaper. A dense block's mask stays a mask until the system is re-planned.
+# mask cleared, a product costs what it did - Revive unmasks one (regrowth), Hold puts masked weights back to zero
+# after an optimizer's momentum moved them, and Compact drops a sparse form's masked entries in place, after which its
+# products are cheaper. Sparsify stores a dense block's live weights as compressed sparse rows over the same region: the
+# one step that allocates (the pattern), so it runs where the caller chooses. Which weights go is a rule's
+# (dyn/learn's Prune, ranking them by a Score); Macs says what a product costs as the connection now stands.
 
 import "std/list"
 import "std/rand"
@@ -35,6 +38,10 @@ type Wiring enum {
     Events(threshold F64)
     LowRank(rank I64)
 }
+
+# what a pruning rule ranks a connection's weights by (dyn/learn's Prune): the weight's magnitude |w|, the current it
+# carries |w| mean|s_pre|, or its term of the energy |w mean(s_post s_pre)| (the coupling -s_post w s_pre)
+type Score enum { Magnitude, Activity, Energy }
 
 # what a connection given wrongly says, at Plan
 type WiringError error {
@@ -371,9 +378,92 @@ fn (l mut Link<T>&) Compact(params mut Array<T>&, grads mut Array<T>&) I64 {
     } else {
         return 0
     }
+    l.Count = l.Csr!.Nnz() if l.Csr != null else l.Tiles!.Stored() * l.Tiles!.Tile * l.Tiles!.Tile
     for e in range l.Keep.Len(): l.Keep[e] = true
     l.Pruned = 0
     return removed
+}
+
+# whether a pruning rule may change it: a learnt connection whose parameters are its weights, one each (dense,
+# symmetric, sparse rows, event-driven)
+fn (l Link<T>&) Prunable() Bool {
+    if l.Frozen: return false
+    return match l.Kind {
+        case Wiring.Dense, Wiring.Symmetric, Wiring.Csr, Wiring.Events: true
+        case _: false
+    }
+}
+
+# the weights not masked (a prunable connection's)
+fn (l Link<T>&) Live() I64 { return l.Count - l.Pruned }
+
+# the post and pre units weight e joins (a prunable connection's)
+fn (l Link<T>&) Ends(e I64) I64, I64 {
+    if l.Kind == Wiring.Events: return e % l.PostSize, e / l.PostSize
+    if l.Csr == null: return e / l.PreSize, e % l.PreSize
+    w := l.Csr!
+    lo, hi := 0, w.Rows
+    for hi - lo > 1 {
+        mid := (lo + hi) / 2
+        if w.Ptr[mid] <= e { lo = mid } else { hi = mid }
+    }
+    return lo, I64(w.Idx[e])
+}
+
+# masked weight e live again, from zero (regrowth)
+fn (l mut Link<T>&) Revive(e I64) {
+    if l.Keep[e]: return
+    l.Keep[e] = true
+    l.Pruned--
+}
+
+# every masked weight zero again: what an optimizer's momentum moved since the mask was set (a prunable connection's)
+fn (l Link<T>&) Hold(params mut Array<T>&) {
+    if l.Pruned == 0 or l.Tiles != null: return
+    for e in range l.Count {
+        if not l.Keep[e]: params[l.Off + e] = T(0)
+    }
+}
+
+# the multiply-adds of carrying one row one way, as the connection now stands: a dense block's every weight, masked or
+# not; a sparse one's entries (live tiles); a low-rank one's two factors; an event-driven one's every weight at most
+fn (l Link<T>&) Macs() I64 {
+    return match l.Kind {
+        case Wiring.LowRank(rank): rank * (l.PostSize + l.PreSize)
+        case Wiring.Csr: l.Csr!.Nnz()
+        case Wiring.Tiles: l.Tiles!.Alive() * l.Tiles!.Tile * l.Tiles!.Tile
+        case _: l.PostSize * l.PreSize
+    }
+}
+
+# a dense block (Dense or Symmetric) stored as compressed sparse rows over its own region, in place: its live weights
+# moved down in row order (their gradients with them), the rest of the region zero, read both ways if it was
+# reciprocal - its products cost its live weights from now on, and what it computes is unchanged. Allocates the
+# pattern (pointers and columns): the one step of pruning that does, run where the caller chooses. An optimizer's state
+# is laid out as the parameters, so one made before is made again. Refuses a connection that is not a dense block
+fn (l mut Link<T>&) Sparsify(params mut Array<T>&, grads mut Array<T>&) ? WiringError {
+    if l.Kind != Wiring.Dense and l.Kind != Wiring.Symmetric: error WiringError.Invalid("Sparsify of a connection that is not a dense block")
+    post, pre := l.PostSize, l.PreSize
+    ptr mut Array<I64>& = Array<I64>(post + 1)
+    idx mut Array<I32>& = Array<I32>(l.Live())
+    kept I64 = 0
+    for i in range post {
+        for j in range pre {
+            e := i * pre + j
+            if not l.Keep[e]: continue
+            idx[kept] = I32(j)
+            params[l.Off + kept] = params[l.Off + e]
+            grads[l.Off + kept] = grads[l.Off + e]
+            kept++
+        }
+        ptr[i + 1] = kept
+    }
+    clearPast(params, grads, l.Off + kept, l.Off + l.Count)
+    l.Kind = Wiring.Csr(F64(kept) / F64(post * pre))
+    l.Count = kept
+    l.Csr = sparse.Csr<T>(post, pre, ptr, idx, params[l.Off:l.Off + kept])!
+    for e in range l.Keep.Len(): l.Keep[e] = true
+    l.Pruned = 0
 }
 
 fn clearPast<T>(params mut Array<T>&, grads mut Array<T>&, lo I64, hi I64) {
@@ -390,6 +480,12 @@ fn clearPast<T>(params mut Array<T>&, grads mut Array<T>&, lo I64, hi I64) {
 fn pruneOf(l mut Link<F32>&, k Array<Bool>&, a mut Array<F32>&) { l.Prune(k, a, a) }
 fn compactOf(l mut Link<F32>&, a mut Array<F32>&) { l.Compact(a, a) }
 fn maskOf(l mut Link<F32>&, a mut Array<F32>&) { l.MaskGrads(a) }
+fn holdOf(l Link<F32>&, a mut Array<F32>&) { l.Hold(a) }
+fn reviveOf(l mut Link<F32>&) { l.Revive(0) }
+fn endsOf(l Link<F32>&) I64 {
+    i, j := l.Ends(0)
+    return i + j
+}
 fn forgetOf(l mut Link<F32>&) { l.Forget(0, 1) }
 fn massOf(l Link<F32>&, a Array<F32>&, m mut Array<F64>&) { l.AddMass(a, m, 0, 0) }
 fn scaleOf(l Link<F32>&, a mut Array<F32>&) { l.Scale(a, 0.5) }
@@ -398,6 +494,9 @@ fn eventsOf(l mut Link<F32>&, sc mut Scratch<F32>&, a mut Array<F32>&) { l.event
 assert not pruneOf.Allocates, "pruning allocates"
 assert not compactOf.Allocates, "compacting allocates"
 assert not maskOf.Allocates, "masking gradients allocates"
+assert not holdOf.Allocates, "holding masked weights at zero allocates"
+assert not reviveOf.Allocates, "reviving a weight allocates"
+assert not endsOf.Allocates, "a weight's ends allocate"
 assert not forgetOf.Allocates, "an event-driven connection's reset allocates"
 assert not massOf.Allocates, "the incoming mass allocates"
 assert not scaleOf.Allocates, "scaling allocates"
@@ -491,6 +590,70 @@ test Link.Forward "every wiring carries what its dense matrix does, forward and 
     assert carried(Wiring.Tiles(4, 0.5), true, 4) < 1e-12
     assert carried(Wiring.LowRank(3), true, 5) < 1e-12
     assert carried(Wiring.Events(0.0), false, 6) < 1e-12
+}
+
+# the totals a connection's Forward and Backward add to zero, rows rows of s (pre) and sp (post)
+fn bothWays(l mut Link<F64>&, s mut Array<F64>&, sp mut Array<F64>&, rows I64) Array<F64>, Array<F64> {
+    ws := gemm.Workspace<F64>(1, l.PostSize)
+    sc := Scratch<F64>(l.PostSize, rows, 8)
+    f := Array<F64>(rows * l.PostSize)
+    b := Array<F64>(rows * l.PreSize)
+    l.Forward(ws, sc, f, s, 0, rows)
+    l.Backward(ws, sc, b, sp, 0, rows)
+    return f, b
+}
+
+fn largest(a Array<F64>&, b Array<F64>&) F64 {
+    worst F64 = 0.0
+    for i in range a.Len(): worst = worst.Max((a[i] - b[i]).Abs())
+    return worst
+}
+
+test Link.Sparsify "a masked dense block stored as sparse rows carries what it did, both ways, at the cost of its live weights" {
+    r := rand.Rand(7)
+    post, pre, rows := 13, 9, 3
+    l := Link<F64>.lone(Wiring.Symmetric, post, pre, false, rows, r)
+    params := l.W.Data
+    grads := Array<F64>(params.Len())
+    for e in range grads.Len(): grads[e] = F64(e)
+    keep := Array<Bool>(l.Count, true)
+    for e in range 0, l.Count, 3: keep[e] = false
+    l.Prune(keep, params, grads)
+    live := l.Live()
+    s := noise(rows * pre, r)
+    sp := noise(rows * post, r)
+    f0, b0 := bothWays(l, s, sp, rows)
+    assert l.Macs() == post * pre and live == post * pre - (post * pre + 2) / 3
+    l.Sparsify(params, grads)!
+    assert l.Count == live and l.Macs() == live and l.Both and l.Pruned == 0
+    f1, b1 := bothWays(l, s, sp, rows)
+    assert largest(f0, f1) < 1e-12 and largest(b0, b1) < 1e-12
+    assert grads[0] == 1.0 and params[live] == 0.0     # entry 1 moved to the front with its gradient; the rest is zero
+    for e in range live {
+        i, j := l.Ends(e)
+        assert i * pre + j == (e / 2) * 3 + 1 + e % 2   # the live entries of row-major order, every third gone
+    }
+    refused := false
+    try l.Sparsify(params, grads) catch { refused = true }
+    assert refused
+}
+
+test Link.Revive "a revived weight is live again from zero, and Hold puts masked weights an optimizer moved back to zero" {
+    r := rand.Rand(8)
+    l := Link<F64>.lone(Wiring.Dense, 4, 4, false, 1, r)
+    params := l.W.Data
+    grads := Array<F64>(16)
+    keep := Array<Bool>(16, true)
+    keep[3] = false
+    keep[5] = false
+    l.Prune(keep, params, grads)
+    params[3] = 0.25
+    params[5] = 0.5
+    l.Revive(5)
+    l.Hold(params)
+    assert params[3] == 0.0 and params[5] == 0.5 and l.Live() == 15 and l.Keep[5]
+    i, j := l.Ends(6)
+    assert i == 1 and j == 2
 }
 
 test Link.Forward "an event-driven connection carries only changes above its threshold, and catches up when they add up" {
