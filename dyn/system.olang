@@ -10,8 +10,10 @@
 # back, and a learn.Learner's Tick runs a clock's.
 #
 # Structure may change while running (docs/redesign.md section 3, decision 3): a connection's weights are masked in
-# place (Prune), a sparse one's masked entries dropped in place (Compact), a population's units retired (Retire) - the
-# loops stay allocation-free; re-planning with the weights kept is the full compaction.
+# place (Prune; by a rule: Rule.Prune, dyn/learn), a sparse one's masked entries dropped in place (Compact), a
+# population's units retired (Retire) - the loops stay allocation-free. Sparsify stores the dense blocks that pruning
+# thinned as sparse rows, so their products skip what was pruned: the one step that allocates, run where the caller
+# chooses. Macs counts what a settle's products cost as the structure now stands.
 #
 # The stability tools: Gain (kappa, the largest incoming absolute weight sum of a relaxing unit times its activation's
 # largest slope), Certify (every recurrent connection scaled so that kappa is a target, 0.9 by default), Restrain (each
@@ -40,6 +42,7 @@ type Rule enum {
     ThreeFactor(signal Sig, decay F64, rate F64)    # eligibility trace x the module's signal
     Homeostasis(target F64, rate F64)               # thresholds or gains toward a target rate
     DeltaWrite(c Conn, gate Sig)                    # fast weights written while settling
+    Prune(by conn.Score, target F64, pace F64, regrow F64)   # weights masked by a score, toward a fraction kept
     Custom(r mut any Update&)
 }
 
@@ -432,6 +435,44 @@ fn (s mut System<T>&) Compact() I64 {
     return removed
 }
 
+# every masked weight zero again: after an optimizer's step, whose momentum moves a weight whose gradient is held at zero
+fn (s mut System<T>&) Hold() {
+    for l in s.E.Links: l.Hold(s.E.Params)
+}
+
+# every dense block (Dense, Symmetric) with at most the fraction below of its weights live stored as sparse rows over
+# its region (Link.Sparsify): what it computes is unchanged, its products cost its live weights. Allocates the patterns;
+# an optimizer made before is made again (the parameters moved). Gives the connections converted
+fn (s mut System<T>&) Sparsify(below F64 = 0.5) I64 {
+    n I64 = 0
+    for l in s.E.Links {
+        if l.Kind != conn.Wiring.Dense and l.Kind != conn.Wiring.Symmetric: continue
+        if F64(l.Live()) > below * F64(l.Count): continue
+        l.Sparsify(s.E.Params, s.E.Grads)!
+        n++
+    }
+    return n
+}
+
+# the multiply-adds of a settle of one batch row: Once, its folded connections' (an input carried into the constant,
+# once a settle); Sweep, every recurrent connection's carry, both ways where reciprocal (each sweep). As the structure
+# now stands (Link.Macs): a masked weight of a dense block still costs its multiply-add
+type Macs struct(Once I64, Sweep I64) {
+    Once
+    Sweep
+}
+
+# a settle of sweeps sweeps
+fn (m Macs&) Settle(sweeps I64) I64 { return m.Once + sweeps * m.Sweep }
+
+fn (s System<T>&) Macs() Macs {
+    once, sweep := 0, 0
+    for l in s.E.Links {
+        if l.Folded { once += l.Macs() } else { sweep += l.Macs() * (2 if l.Both else 1) }
+    }
+    return Macs(once, sweep)
+}
+
 # ---- stability ----
 
 # every unit's incoming mass over the recurrent connections (a folded one's source is constant and does not count)
@@ -540,6 +581,7 @@ fn roundoff<T>() F64 {
 fn pruneOf(s mut System<F32>&, keep Array<Bool>&) { s.Prune(Conn(0), keep) }
 fn retireOf(s mut System<F32>&) { s.Retire(Pop(0), 0) }
 fn compactOf(s mut System<F32>&) { s.Compact() }
+fn holdOf(s mut System<F32>&) { s.Hold() }
 fn restOf(s mut System<F32>&) {
     s.Reset(settle.Phase.Free)
     s.Warm(settle.Phase.Plus, settle.Phase.Free)
@@ -548,6 +590,7 @@ fn restOf(s mut System<F32>&) {
 assert not pruneOf.Allocates, "pruning allocates"
 assert not retireOf.Allocates, "retiring a unit allocates"
 assert not compactOf.Allocates, "compacting allocates"
+assert not holdOf.Allocates, "holding masked weights at zero allocates"
 assert not restOf.Allocates, "a cold or warm start allocates"
 assert not System<F32>.Settle.Allocates, "a settle allocates"
 assert not System<F32>.Nudged.Allocates, "a nudged settle allocates"
@@ -862,6 +905,39 @@ test System.Prune "a pruned weight is a zero weight, a retired unit rests, and c
     b.Retire(Pop(1), 2)
     b.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
     for row in range 3: assert b.Activity(settle.Phase.Free, Pop(1)).Get(row, 2) == 0.0
+}
+
+# every relaxing population's free activities, one array
+fn activities(s System<F64>&) Array<F64> {
+    v := Vec<F64>()
+    for p in range 1, 4 {
+        a := s.Activity(settle.Phase.Free, Pop(p))
+        for i in range a.Count(): v.Push(a.Flat()![i])
+    }
+    return v.ToArray()
+}
+
+test System.Sparsify "dense blocks thinned by pruning, stored as sparse rows: the same equilibrium, the multiply-adds of their live weights" {
+    s := System<F64>.mixed(3, 1)
+    before := s.Macs()
+    folded := Array<Bool>(s.Link(Conn(0)).Count, true)
+    for e in range 0, folded.Len(), 2: folded[e] = false
+    s.Prune(Conn(0), folded)
+    back := Array<Bool>(s.Link(Conn(5)).Count, true)
+    for e in range 0, back.Len(), 3: back[e] = false
+    s.Prune(Conn(5), back)
+    assert s.Macs().Once == before.Once and s.Macs().Sweep == before.Sweep
+    s.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    want := activities(s)
+    assert s.Sparsify(0.5) == 1 and s.Link(Conn(0)).Kind == conn.Wiring.Csr and s.Link(Conn(5)).Kind == conn.Wiring.Symmetric
+    assert s.Sparsify(0.7) == 1 and s.Link(Conn(5)).Both
+    after := s.Macs()
+    assert after.Once == before.Once - 240 and after.Sweep == before.Sweep - 2 * 32
+    assert after.Settle(10) == after.Once + 10 * after.Sweep
+    s.Reset(settle.Phase.Free)
+    s.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
+    got := activities(s)
+    for i in range want.Len(): assert (want[i] - got[i]).Abs() < 1e-9
 }
 
 fn has<T>(s System<T>&, m Mod, name String&) Bool {

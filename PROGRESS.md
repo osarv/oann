@@ -77,11 +77,67 @@ Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved roun
 - Next here: the packed INT8 micro-kernel (the 64+-row gap) - it waits on `vpdpbusd` or a 16-bit packing that LLVM
   maps to one `vpdpwssd` per pair; ad/ops' `Scan` is `GatedScan` (the prelude now has a `Scan`).
 
+## Pruning at run time (wt-oannmeasure2, 2026-11-16)
+
+docs/redesign.md question 3 beyond the masks. `Rule.Prune(by, target, pace, regrow)` (dyn/learn's `Prune`, on any
+clock) thins a module's learnt dense, symmetric, sparse-row and event-driven connections as one pool: each live weight
+is scored (`conn.Score`: `Magnitude` |w|, `Activity` |w| mean|s_pre|, `Energy` |w mean(s_post s_pre)|, its term of the
+bilinear energy) over its connection's mean, and the lowest `pace` of the pool are masked a tick, down to `target`;
+`regrow` revives that fraction of the live count among masked weights whose units coincide most (and masks as many more);
+a hidden unit left with no live weight is retired. All of it is pinned allocation-free (`Learner<F32>.Prune`, `Hold`,
+`Revive`, `Ends`) and runs on the Step clock in the resident-memory test. `System.Sparsify(below)` is the one step that
+allocates: each dense block with at most `below` of its weights live becomes compressed sparse rows over its own region
+(read both ways if it was symmetric), the same equilibrium to 1e-9 (test), its products costing its live weights;
+an optimizer made before is made again. `System.Hold()` after an optimizer step puts masked weights its momentum moved
+back to zero. `System.Macs()` counts a settle's multiply-adds as the structure stands (once: folded inputs; each sweep:
+recurrent carries, twice where reciprocal).
+
+Ranking raw scores across connections emptied the readout first (its weights are kept small by `Restrain`) and the
+accuracy fell to chance at 15% kept; scores over their connection's mean keep every path.
+
+Result (`make prune ARGS="energy 0.05"`, examples/prune_settle.olang): XOR of the signs of two coordinates beside 2
+noise inputs, 256 training and 256 unseen points, 4 inputs -> 32 tanh hidden (lateral, symmetric) <-> 2 readouts, EP
+(beta 0.5) and AdamW 0.05, gain restrained to 0.9; 2000 lessons, pruned 5% of the weights every 50 lessons, 2000 lessons
+again at the end, then `Sparsify(0.5)`. Accuracy on the unseen points and multiply-adds of one point's settle:
+
+| seed 1, energy score | weights kept (x->h / h<->h / h<->y) | test | a sweep | a settle (sweeps) |
+|---|---|---|---|---|
+| dense | 1216 (128 / 1024 / 64) | 86.3% | 2176 | 13184 (6) |
+| masked 40% | 484 (54 / 376 / 54) | 87.1% | 2176 | 8832 (4) |
+| masked 20% | 240 (49 / 147 / 44) | 85.9% | 2176 | 17536 (8) |
+| masked 10% | 118 (31 / 69 / 18) | 84.0% | 2176 | 17536 (8) |
+| 5%, relearned, sparse rows | 61 (25 / 26 / 10) | 80.5% | 72 | 529 (7) |
+
+Ending at each fraction (relearned, sparse rows), test accuracy dense -> pruned and multiply-adds a sweep / a settle:
+
+| seed | dense | 20% kept | 10% kept | 5% kept |
+|---|---|---|---|---|
+| 1 | 86.3%, 2176 / 13184 | 85.9%, 430 / 3489 | 84.4%, 178 / 1279 | 80.5%, 72 / 529 |
+| 2 | 82.8%, 2176 / 15360 | 83.2%, 394 / 2411 | 47.7%, 194 / 1189 | 64.1%, 80 / 661 |
+| 3 | 62.9%, 2176 / 11008 | 80.5%, 464 / 6536 | 51.2%, 184 / 1134 | 60.5%, 62 / 712 |
+
+- 20% kept holds the dense accuracy on every seed (seed 3's dense run had not learned; pruning the noise inputs and the
+  lateral block let it); 10% holds on seed 1 and falls apart on two of three at pace 0.05. Pace 0.02 at 10%: 83.6 /
+  79.3 / 57.0%; with regrowth 0.01 a tick: 73.4 / 85.5 / 60.5% - neither is better on every seed.
+- Scores at 5% (seed 1): energy 80.5%, activity 65.6%, magnitude 63.3%.
+- A sweep costs the same until `Sparsify` (masks are multiplied); after it a sweep is 5-30x cheaper. Sweeps a settle vary
+  with the weights (4-11 here), so the per-sweep count is the like-for-like one.
+- Not built: pruning `Tiles` by tile and `LowRank` by rank, compacting retired units out of the populations (a re-plan);
+  `Sparsify` keeps an optimizer's moments only if the caller remakes it.
+- Found on the way: a skip connection from the inputs straight into the readout (x -> y, folded) stops this system
+  from learning XOR at all (52%), with or without `Restrain`; not chased.
+
 ## Next
 
-- Rebuild the agent on `dyn` (its rules - `DeltaWrite`, `ThreeFactor`, `Homeostasis` - exist) and drop oagent's
-  `agent/legacy/`.
-- The open work of docs/redesign.md: the GPU route (question 1), pruning at run time beyond the masks (question 3).
+- The open work of docs/redesign.md: the GPU route (question 1).
+- Pruning: a schedule that slows near the target (the 10% collapses above come at the last ticks), and a test of
+  pruning on MNIST (`mnist_learn`).
+
+## Done since C3
+
+- The agent rebuilt on `dyn` (`DeltaWrite`, `ThreeFactor`, `Homeostasis`) and oagent's `agent/legacy/` dropped: oagent
+  main 4ce216c, every example matching legacy within noise.
+- Pruning at run time beyond the masks (docs/redesign.md question 3): above.
 
 ## History moved out of the READMEs (2026-11-16)
 

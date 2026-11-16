@@ -13,7 +13,7 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -110,6 +110,12 @@ hybridbench:
 xor:
 	$(OLANG) build -output build/examples_xor_settle examples/xor_settle.olang
 	./build/examples_xor_settle $(ARGS)
+
+# a settling system pruned while it runs, then stored sparse (examples/prune_settle.olang) - ARGS: score, fraction kept,
+# pace, regrowth, hidden, noise inputs, lessons, lessons between ticks, seed, rate
+prune:
+	$(OLANG) build -output build/examples_prune_settle examples/prune_settle.olang
+	./build/examples_prune_settle $(ARGS)
 
 # XOR by spiking neurons on dyn (examples/xor_spiking.olang)
 spiking:
