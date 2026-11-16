@@ -1,5 +1,5 @@
 # The character transformer examples/charlm.olang trained (data/shakespeare/charlm.ckpt), run with its linear layers in
-# INT8 (nn/quant's `Quantize`: the attention's projections and the perceptrons, weights per output channel, each input
+# INT8 (nn/quantgraph's `Quantize`: the attention's projections and the perceptrons, weights per output channel, each input
 # quantized over its own range; the embeddings, attention scores and the tied head stay F32). Measured three ways
 # against the same graph in F32: the validation loss over ten batches of 16 x 64, greedy text from one prompt (how long
 # the two agree), and characters a second generated with the key-value cache, interleaved, medians (M12).
@@ -14,7 +14,7 @@ import "../data/text"
 import "../io/checkpoint"
 import "../models/gpt"
 import "../nn/generate"
-import "../nn/quant"
+import "../nn/quantgraph"
 import "../nn/train"
 import "../tensor"
 
@@ -46,9 +46,9 @@ fn main() ? io.Error, os.Error, text.CorpusError, ParseError, checkpoint.Safeten
     try g.Load("data/shakespeare/charlm.ckpt")
     valSet := text.Windows(c.Val(), cfg.Ctx)
     f32Loss := train.LmEvaluate(g, m, valSet, 10)
-    quant.Quantize(g)
+    quantgraph.Quantize(g)
     int8Loss := train.LmEvaluate(g, m, valSet, 10)
-    qb, fb := quant.LinearBytes(g)
+    qb, fb := quantgraph.LinearBytes(g)
     try io.Put(("validation loss over 10 batches: F32 " + $f32Loss.Fixed(4) + ", INT8 " + $int8Loss.Fixed(4) + " (" +
         $(int8Loss - f32Loss).Fixed(4) + "); the linear layers' weights " + $qb + " bytes against " + $fb + " (" + $(F64(fb) / F64(qb)).Fixed(2) + "x)\n"))
     f32s := Array<F64>(rounds)
@@ -73,7 +73,7 @@ fn main() ? io.Error, os.Error, text.CorpusError, ParseError, checkpoint.Safeten
     dm := gpt.Gpt.New(dec, cfg).Lm(dec, false)
     try dec.Plan(r)
     try dec.Load("data/shakespeare/charlm.ckpt")
-    quant.Quantize(dec)
+    quantgraph.Quantize(dec)
     dec.Int8 = false
     greedy := try generate.Cached(dec, dm, c, "ROMEO:", cfg.Ctx - 6, 0.0, r)
     dec.Int8 = true

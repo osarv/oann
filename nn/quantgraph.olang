@@ -1,0 +1,224 @@
+# nn/quantgraph - nn/quant's INT8 inference read from the autodiff graph: a quant.Model's dense layers and convolutions
+# from a trained graph's values (`Dense`, `Conv`, a whole perceptron by `Mlp`), and the graph's own hook, `Quantize(g)`,
+# which turns every `Linear` node of a graph into an INT8 product in place (`g.QuantizeLinear()`): its attention
+# projections and perceptrons, so a transformer and its key-value decoding run unchanged. The tied head and attention's
+# own products stay in F32. Inference of an F32 graph only. nn/quant itself works on tensors and arrays alone, so a
+# program quantizing without the graph does not compile it.
+
+import "../ad/graph"
+import "../kernels/conv"
+import "../kernels/mat"
+import "layers"
+import "quant"
+
+# a vector of the graph's values as F32
+fn vector<T>(g graph.Graph<T>&, v graph.Var, n I64) Array<F32> {
+    out := Array<F32>(n)
+    if v == graph.None: return out
+    d := g.Value(v).Flat()!
+    for i in range n: out[i] = F32(d[i])
+    return out
+}
+
+# a dense layer of a trained graph, read from its values: y = x w^T + b, ReLU after it or not
+fn Dense<T>(m mut quant.Model&, g graph.Graph<T>&, d layers.Dense&, relu Bool) {
+    m.DenseOf(g.Value(d.W), vector(g, d.B, d.Out), relu)
+}
+
+# a convolution of a trained graph, ReLU after it or not
+fn Conv<T>(m mut quant.Model&, g graph.Graph<T>&, c layers.Conv&, relu Bool) {
+    m.ConvOf(g.Value(c.W), vector(g, c.B, c.Shape.OutC), c.Shape, relu)
+}
+
+# a perceptron of a trained graph: its dense layers in order, ReLU between them and none after the last. The graph's
+# activation must be ReLU
+fn Mlp<T>(batch I64, g graph.Graph<T>&, net layers.Mlp&, threads I64 = 1) quant.Model {
+    assert net.Act == mat.Act.Relu, "INT8 networks have ReLU between their layers"
+    m := quant.Model(batch, net.Layers[0].In, threads)
+    for i, d in net.Layers: Dense(m, g, d, i < net.Layers.Len() - 1)
+    return m
+}
+
+# ---- a graph's own Linear layers ----
+
+# every Linear node of the graph's inference run as an INT8 product, from now on: the weights quantized as they are now
+# (a graph trained further is quantized again), each input quantized over its own batch's range. The attention's own
+# products, the tied head (a MatMul) and convolutions stay F32. An F32 graph only
+fn Quantize<T>(g mut graph.Graph<T>&) {
+    g.QuantizeLinear()
+    g.Int8 = true
+}
+
+# the Linear layers back in F32
+fn Dequantize<T>(g mut graph.Graph<T>&) { g.Int8 = false }
+
+# the bytes the graph's Linear weights take as INT8 (the weights and a scale per output) and as F32
+fn LinearBytes<T>(g graph.Graph<T>&) I64, I64 {
+    q I64 = 0
+    f I64 = 0
+    for i in range g.Size() {
+        match g.Info(graph.Var(i)).Kind {
+            case graph.Op.Linear(_, w, _) {
+                d := g.Info(w).Dims
+                q += d[0] * d[1] + 4 * d[0]
+                f += 4 * d[0] * d[1]
+            }
+            case _ { }
+        }
+    }
+    return q, f
+}
+
+# ---- tests ----
+
+import "std/os"
+import "std/rand"
+
+# n samples of "width" values in [lo, hi)
+fn samples(n I64, width I64, r mut rand.Rand&, lo F64, hi F64) Array<F32> {
+    return Array<F32>[F32(lo + (hi - lo) * r.Float()) for _ in range n * width]
+}
+
+# a convolution, ReLU, pooling and a dense layer on a graph of 9 images of 6 x 6 x 2, its parameters drawn from seed
+# (weights larger than the starting values, so that outputs are not all near zero): the graph, its input and logits
+fn convNet(seed U64) graph.Graph<F32>, graph.Var, graph.Var, quant.Model {
+    g mut graph.Graph<F32>& = graph.Graph<F32>(9)
+    x := g.Input(6, 6, 2)
+    s := conv.Shape(2, 6, 6, 5, 3, 1, 1)!
+    p := conv.Pool(5, 6, 6, 2, 2)!
+    c := layers.Conv.New(g, s)
+    d := layers.Dense.New(g, 45, 4)
+    y := d.Apply(g, g.Reshape(g.MaxPool2d(g.Act(c.Apply(g, x), mat.Act.Relu), p), 45))
+    g.Keep(y)
+    r := rand.Rand(seed)
+    g.Plan(r)!
+    w := g.Params().Flat()!
+    for i in range w.Len(): w[i] = w[i] * 4.0
+    m := quant.Model(9, 72)
+    Conv(m, g, c, true)
+    m.Pool(p)
+    Dense(m, g, d, false)
+    return g, x, y, m
+}
+
+test Conv "a quantized convolution network runs what the F32 graph runs, dynamically and over calibrated ranges, any batch" {
+    g, x, y, m := convNet(10)
+    assert m.Outputs() == 4 and m.Layers.Len() == 3
+    r := rand.Rand(5)
+    xs := samples(9, 72, r, 0.0, 1.0)
+    copy := g.Data(x).Flat()!
+    for i in range 648: copy[i] = xs[i]
+    g.Forward(9)
+    want := g.Value(y).Flat()!
+    big F32 = 0.0
+    for v in want: big = big.Max(v.Abs())
+    for calibrated in Array<Bool>[false, true] {
+        if calibrated {
+            m.Calibrate(9, xs, Array<F32>(9 * 4))
+            m.Static = true
+        }
+        for n in Array<I64>[9, 5, 1] {
+            got := Array<F32>(n * 4)
+            m.Forward(n, xs, got)
+            for i in range n * 4: assert (got[i] - want[i]).Abs() <= 0.03 * big, "n " + $n + ", " + $i + ": " + $got[i] + " against " + $want[i]
+        }
+    }
+    q, f := m.Bytes()
+    # each weight a byte; a scale, a sum and a bias an output: the F32 form is four bytes a weight and a bias
+    assert f == 4 * (5 * 18 + 5 + 4 * 45 + 4) and q == 5 * 18 + 4 * 45 + 12 * (5 + 4)
+}
+
+test Mlp "a perceptron of a graph, threads or not, gives the same logits and the same classes as the graph" {
+    g := graph.Graph<F32>(16)
+    x := g.Input(20)
+    net := layers.Mlp.New(g, Array<I64>[20, 30, 10])
+    y := net.Apply(g, x)
+    g.Keep(y)
+    try g.Plan(rand.Rand(6))
+    w := g.Params().Flat()!
+    for i in range w.Len(): w[i] = w[i] * 3.0
+    r := rand.Rand(7)
+    xs := samples(16, 20, r, 0.0, 1.0)
+    copy := g.Data(x).Flat()!
+    for i in range 320: copy[i] = xs[i]
+    g.Forward(16)
+    one := Mlp(16, g, net)
+    four := Mlp(16, g, net, 4)
+    a := Array<F32>(160)
+    b := Array<F32>(160)
+    one.Forward(16, xs, a)
+    four.Forward(16, xs, b)
+    assert a == b
+    right I64 = 0
+    for i in range 16 {
+        best I64 = 0
+        want I64 = 0
+        for k in range 10 {
+            if a[i * 10 + k] > a[i * 10 + best]: best = k
+            if g.Value(y).Get(i, k) > g.Value(y).Get(i, want): want = k
+        }
+        if best == want: right++
+    }
+    assert right >= 15
+}
+
+test Quantize "a graph's Linear layers in INT8 and back: close to F32, F32 again after Dequantize, a quarter of the weights' bytes" {
+    g := graph.Graph<F32>(4)
+    x := g.Input(12)
+    net := layers.Mlp.New(g, Array<I64>[12, 16, 5])
+    y := net.Apply(g, x)
+    g.Keep(y)
+    try g.Plan(rand.Rand(8))
+    r := rand.Rand(9)
+    xs := g.Data(x).Flat()!
+    for i in range 48: xs[i] = F32(r.Float())
+    g.Forward(4)
+    want := g.Value(y).Clone()
+    Quantize(g)
+    g.Forward(4)
+    big F32 = 0.0
+    for v in want.Flat()!: big = big.Max(v.Abs())
+    worst F32 = 0.0
+    for i in range 20: worst = worst.Max((g.Value(y).Flat()![i] - want.Flat()![i]).Abs())
+    assert worst > 0.0 and worst < 0.02 * big
+    Dequantize(g)
+    g.Forward(4)
+    assert g.Value(y).Flat()! == want.Flat()!
+    q, f := LinearBytes(g)
+    assert f == 4 * (12 * 16 + 16 * 5) and q == 12 * 16 + 16 * 5 + 4 * (16 + 5)
+}
+
+# this process's resident memory in kB (VmRSS, Linux)
+fn resident() I64 {
+    status := try os.ReadFile("/proc/self/status") catch { return 0 }
+    for line in status.Lines() {
+        if not line.StartsWith("VmRSS:"): continue
+        return try line[6:].Trim().Split(" ")[0].ParseInt() catch { return 0 }
+    }
+    return 0
+}
+
+test Conv "a quantized network allocates nothing per call: the resident memory grows by no more than two pages over 400 calls after 40, dynamic and static" {
+    g, _, _, m := convNet(11)
+    r := rand.Rand(12)
+    xs := samples(9, 72, r, 0.0, 1.0)
+    out := Array<F32>(36)
+    m.Forward(9, xs, out)
+    m.Calibrate(9, xs, out)
+    for static in Array<Bool>[false, true] {
+        m.Static = static
+        for _ in range 40 {
+            m.Forward(9, xs, out)
+            m.Forward(1, xs, out)
+        }
+        for _ in range 3: resident()
+        before := resident()
+        for _ in range 400 {
+            m.Forward(9, xs, out)
+            m.Forward(1, xs, out)
+        }
+        # a page or two is the process's own (a thread's stack, the allocator's bookkeeping): a byte a call would be 800
+        assert resident() <= before + 8, "grew by " + $(resident() - before) + " kB"
+    }
+    assert g.Size() > 0
+}
