@@ -393,12 +393,15 @@ fn (l mut Link<T>&) Compact(params mut Array<T>&, grads mut Array<T>&) I64 {
 }
 
 # a low-rank form's live ranks moved down in place (both factors, params and grads alike), its rank theirs, the rest of
-# its region zero; gives the parameters removed (0 where no rank is live)
+# its region zero; gives the parameters removed. Nothing moves (0) where no rank is live, or where a rank is masked in
+# part (masked weight by weight, not by a rule's rank): its masks stay, as a dense form's do
 fn (l mut Link<T>&) fewerRanks(params mut Array<T>&, grads mut Array<T>&) I64 {
     rank, post, pre := l.Groups(), l.PostSize, l.PreSize
     kept I64 = 0
-    for g in range rank: kept += 1 if l.Keep[g] else 0
-    if kept == 0: return 0
+    for g in range rank {
+        if l.rankMasked(g) == 0 { kept++ } else if l.rankMasked(g) != post + pre { return 0 }
+    }
+    if kept == 0 or kept == rank: return 0
     keepRanks(l.Keep, params, l.Off, rank, post, pre)
     keepRanks(l.Keep, grads, l.Off, rank, post, pre)
     removed := l.Count - kept * (post + pre)
@@ -410,6 +413,15 @@ fn (l mut Link<T>&) fewerRanks(params mut Array<T>&, grads mut Array<T>&) I64 {
     for e in range l.Keep.Len(): l.Keep[e] = true
     l.Pruned = 0
     return removed
+}
+
+# the parameters of rank g masked: its column of the first factor and its row of the second
+fn (l Link<T>&) rankMasked(g I64) I64 {
+    rank, post, pre := l.Groups(), l.PostSize, l.PreSize
+    n I64 = 0
+    for i in range post: n += 0 if l.Keep[i * rank + g] else 1
+    for j in range pre: n += 0 if l.Keep[post * rank + g * pre + j] else 1
+    return n
 }
 
 # the factors at a[off ..] (post x rank, then rank x pre) with only the ranks whose mask (keep[g]) holds, moved down:
