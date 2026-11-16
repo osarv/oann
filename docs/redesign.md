@@ -998,8 +998,8 @@ path: A2 -> B1 -> B3 -> C1 -> C3.
    The range is now taken in 16 lanes of selects (`graph.rangeOf`). Faster one-row INT8 products need VNNI's pairs
    (`vpdpwssd`) at batch 1: summing adjacent pairs into the lanes by hand made it 2.2x slower, so that is left open.
 7. **Looked into in the follow-ups (PROGRESS.md, 2026-11-16)**: a BF16 matrix-vector product was 0.21x F32's - two rows
-   against one read of the vector let LLVM pair the rows' widenings in 128-bit pieces; one row at a time it is 0.65x at
-   1 x 784 x 128 and 2.0x at 1 x 1024 x 1024. `bench/int8`'s F32 products at 12-17 GFLOPS were ThinLTO's (the program
+   against one read of the vector let LLVM pair the rows' widenings in 128-bit pieces; one row at a time it is 0.62-0.68x
+   at 1 x 784 x 128 and 1.9-2.0x at 1 x 1024 x 1024. `bench/int8`'s F32 products at 12-17 GFLOPS were ThinLTO's (the program
    imported ad/graph through nn/quant, repro/crossinline); without the graph they run at 80-142 and INT8 is 0.53-0.75x
    F32 at 64-1024 rows.
 
