@@ -1,0 +1,45 @@
+# vnnidot - the dot-product instructions of AVX-512 VNNI and BF16 cannot be reached from olang. A U8 x I8 dot product
+# summed in I32, written any of three ways (a plain sum, sixteen lanes of partial sums, four adjacent products per lane),
+# builds with -O3 on a Zen 4 (avx512_vnni, avx512_bf16) to vpmovzxbd/vpmovsxbd and vpmaddwd or vpdpwssd - 16 products
+# an instruction - never to vpdpbusd, 64 products an instruction (LLVM 18 forms it only from a vector reduce.add of
+# zero- and sign-extended bytes, which olang's loops do not leave). Likewise vdpbf16ps (32 BF16 products summed in F32
+# pairs) is unreachable: there is no BF16-pair dot in olang and the widening BF16 -> F32 is all LLVM sees. Expected: a
+# way to say "the dot product of 4 U8 with 4 I8 into each I32 lane" (a lane method, e.g. Array<U8>.DotAdd4(b, acc), or
+# the compiler forming vpdpbusd from the four-products-a-lane form below), and the BF16 counterpart. Measured
+# (kernels/gemm's one-row INT8 product, bench/int8): the plain sum is what oann uses, 0.9-1.4x F32 at batch 1 on
+# L2-resident weights, 3.4x at 1 x 1024 x 1024.
+# Status: reproduces (new). Measured 2026-11-16, olang-bin, AVX-512. From the repository's root:
+#   olang build -output build/vnnidot repro/vnnidot.olang && objdump -d build/vnnidot | grep -c vpdpbusd   (0)
+
+import "std/io"
+
+# a plain sum: the loop vectorizer's form (vpmaddwd)
+fn plain(a Array<U8>&, b Array<I8>&) I32 {
+    s I32 = 0
+    for p in range a.Len(): s = s + I32(a[p]) * I32(b[p])
+    return s
+}
+
+type lanes struct() {
+    v := Array<I32>(16)
+}
+
+# four adjacent products into each of sixteen lanes: vpdpbusd's own shape
+fn fours(a Array<U8>&, b Array<I8>&) I32 {
+    acc := lanes()
+    for p in range 0, a.Len() - a.Len() % 64, 64 {
+        for j in range 16 {
+            o I64 = p + 4 * j
+            acc.v[j] = acc.v[j] + (I32(a[o]) * I32(b[o]) + I32(a[o + 1]) * I32(b[o + 1]) + I32(a[o + 2]) * I32(b[o + 2]) + I32(a[o + 3]) * I32(b[o + 3]))
+        }
+    }
+    s I32 = 0
+    for j in range 16: s = s + acc.v[j]
+    return s
+}
+
+fn main() ? io.Error {
+    a := Array<U8>[U8(p % 251) for p in range 1024]
+    b := Array<I8>[I8(p % 127 - 63) for p in range 1024]
+    try io.Put($plain(a, b) + " " + $fours(a, b) + "\n")
+}
