@@ -6,7 +6,7 @@ OLANG ?= ../olang/build/olang
 
 # every module with test blocks
 TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang \
-	ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang \
+	ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
@@ -141,7 +141,7 @@ int8:
 	./build/examples_mnist_int8 $(ARGS)
 
 # the character transformer (data/shakespeare/charlm.ckpt, from make charlm) with its linear layers in INT8
-# (nn/quant's Quantize): validation loss, a forward's time, greedy text and cached decoding against F32 - ARGS:
+# (nn/quantgraph's Quantize): validation loss, a forward's time, greedy text and cached decoding against F32 - ARGS:
 # characters, timing rounds, threads
 int8lm:
 	$(OLANG) build -output build/examples_charlm_int8 examples/charlm_int8.olang

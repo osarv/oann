@@ -49,6 +49,34 @@ What it cost, and what changed:
   a small program linked by full LTO. A fix belongs in olang's link (ThinFrom, ImportLimit, vectorizing at a ThinLTO link),
   not here. bench/arena_ad's transformer step is unchanged (395-447 ms before, 410-417 after).
 
+## Kernel follow-ups (wt-oannkern2, 2026-11-16)
+
+Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved rounds, olang-bin of 2026-11-16:
+
+| | before | after |
+|---|---|---|
+| BF16 weights, batch 1 (`bench/storage`): 1 x 784 x 128 / 1 x 1024 x 1024 against F32 | 0.19x / 0.63x | 0.62-0.68x / 1.9-2.0x |
+| `bench/int8`'s F32 baseline, 64-1024 rows | 12-17 GFLOPS | 80-142 GFLOPS |
+| INT8 against F32 at 64-1024 rows (`bench/int8`, dynamic / static) | 1.04-1.46x (against the slow baseline) | 0.53-0.71x / 0.58-0.75x |
+| INT8 at batch 1 (`bench/int8`, static): 1 x 128 x 512, 1 x 512 x 128, 1 x 128 x 128, 1 x 1024 x 1024 | 0.97, 0.94, 0.99, 3.29x | 1.39, 1.03, 1.36, 3.56x |
+
+- BF16: `Gemv`'s two rows against one read of the vector made LLVM pair the rows' widenings in 128-bit pieces; BF16
+  rows now go one at a time in two 16-lane vectors (`vpmovzxwd`, `vpslld`, `vfmadd231ps` on whole registers). At L2-resident
+  sizes the widening's two shuffle-port instructions per 16 values keep it below F32; where the weights stream from
+  memory it reads half the bytes and is 2x. F32 rows are summed in the same order (two vectors a row), so BF16 storage stays
+  its widened product bit for bit; INT8 weights widened through that path went 0.92x -> 0.78-0.90x at 1 x 784 x 128
+  (GemmI8 is INT8's own path). `vdpbf16ps` would need the activations in BF16 too (repro/vnnidot).
+- `bench/int8`'s F32 ran slow because nn/quant imported ad/graph: the program passed ThinFrom and linked by ThinLTO,
+  which inlines no kernel helper across objects (repro/crossinline). nn/quant is now graph-free (`DenseOf`, `ConvOf`)
+  and nn/quantgraph reads models from a graph. Against the real F32 path INT8 is slower at 64+ rows: its packed
+  micro-kernel (`vpdpwssd`, 16 products an instruction, widened from bytes) runs at 50-97 GOPS against F32's 80-146.
+  Batch-1 products still win where the weights stream from memory (3.3-3.6x at 1 x 1024 x 1024).
+- One-row INT8: the dot products are plain I32 sums the loop vectorizer reassociates (`vpmaddwd`), faster than the
+  hand-kept lanes. `vpdpbusd` (64 U8 x I8 products an instruction) is not reachable from olang in any form tried
+  (repro/vnnidot).
+- Next here: the packed INT8 micro-kernel (the 64+-row gap) - it waits on `vpdpbusd` or a 16-bit packing that LLVM
+  maps to one `vpdpwssd` per pair; ad/ops' `Scan` is `GatedScan` (the prelude now has a `Scan`).
+
 ## Next
 
 - Rebuild the agent on `dyn` (its rules - `DeltaWrite`, `ThreeFactor`, `Homeostasis` - exist) and drop oagent's
