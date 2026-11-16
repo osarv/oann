@@ -186,13 +186,12 @@ grid does not follow units); biases, the kept state fields (@Keep: thresholds, g
 copied by the same map; the learner and optimizer made again. It saves the retired units' state and sweep work only,
 which is small next to the weights `Sparsify` already removes.
 
-**MNIST (`mnist_learn`) not tested:** the data is not in this checkout (`data/mnist`, which `mnist.Mnist.Load`
-fetches into) and the container was not asked to fetch it.
+**MNIST (`mnist_learn`) pruning:** measured 2026-11-16, see "Measured on the data" below.
 
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
-- Pruning: a test on MNIST (`mnist_learn`) once the data is fetched; compacting retired units (above, if it pays).
+- Compacting retired units (above, if it pays).
 
 ## Done since C3
 
@@ -210,3 +209,43 @@ fetches into) and the container was not asked to fetch it.
   (M4, M5, M10, M12) and the settle against `circuit.olang`'s (M7) were measured before C3; drivers at branch `pre-c3`.
 - The settling agent's programs (`bandit_settle`, `sleep_retention`, `nights`) moved to oagent with the agent at C3.
 - The repro cases `lambdalend` and `resultgrowth` (on the old `linalg`) were removed with it.
+
+## Measured on the data (2026-11-16)
+
+`make data` fetched MNIST into `data/mnist` (storage.googleapis.com mirror: train-images 47040016 bytes = 16 + 60000 x 784,
+train-labels 60008, t10k-images 7840016, t10k-labels 10008 = 10000 labels; pixel mean 0.13066, sd 0.30811 against MNIST's
+0.1307, 0.3081). Tiny Shakespeare came with `make charlm` (1115394 characters, vocabulary 65). One core, olang from ~/.local.
+Reproduce each with the `make` target and ARGS shown (olang's `OLANG=olang`).
+
+- **MLP** (`make mnist ARGS=3`, AdamW, batches of 128): test accuracy 93.53 / 95.46 / 96.30% after epochs 1-3, 0.43 s an epoch.
+- **CNN** (`make cnn ARGS=2`, 20490 parameters): 97.29 / 97.93%, 18.2 s an epoch, resident memory flat (110 MB).
+- **INT8** (`make int8 ARGS="mlp 3"`): F32 96.30%, INT8 dynamic 96.31%, static 96.29%; parameters 3.94x smaller; batch 1 2.38x / 2.77x
+  (dynamic / static) faster than F32, batch 64 0.59x / 0.66x, batch 128 0.52x / 0.55x (slower, the known packed-kernel gap).
+  CNN (`ARGS="cnn 1"`): F32 97.29%, INT8 97.33 / 97.30%, 3.88x smaller, 0.61-0.84x (slower at every batch).
+- **Character transformer** (`make charlm ARGS=300`, 4 layers x 128, 809856 parameters, context 64, batch 16 x 64): validation loss
+  4.194 at step 0, 2.360 at step 300, 80.7 ms a step (12683 tokens a second); the sample is still near-nonsense (300 steps).
+  **charlm_int8** (`make int8lm`, on that checkpoint): validation loss F32 2.3598, INT8 2.3601; weights 3.91x smaller; a forward over
+  1024 characters F32 28.96 ms, INT8 43.56 ms (0.66x); cached decoding 5021 characters a second F32, 8244 INT8 (1.64x); greedy
+  text identical for 64 of 64 characters.
+- **Settling `mnist_learn`, dense** (`make mnistlearn ARGS="3 60000 128 32 SEED"`, Adam 1e-3, beta 0.5, not restrained beyond
+  `Certify(0.9)`): seed 1 95.72 / 96.50 / 96.71%, seed 2 (epoch 3) 97.10%, about 2.5-3 s an epoch, 30-32 sweeps a lesson. Matches
+  docs/settling.md's unrestrained 95.69 / 96.48 / 96.58%.
+
+### Pruning `mnist_learn` with `Rule.Prune`
+
+`mnist_learn` takes four more arguments: the fraction kept (9th, default 1 = off), the pace (0.1), the lessons between ticks (200)
+and the epochs relearned (1). A `Rule.Prune(Score.Magnitude, keep, pace, no regrowth, Schedule.Cubic)` (the default schedule) is
+attached; the system trains 2 dense epochs, then each tick prunes and teaches 200 lessons until the fraction is reached, then 1 epoch
+relearns, then `Sparsify(0.5)`. Reproduce: `make mnistlearn ARGS="2 60000 128 32 SEED 0.001 0.5 1 KEEP 0.1 200 1"`. Test accuracy,
+and multiply-adds (`Macs`) of one settle at the sweeps an answer took (once = the pixels' folded constant; a sweep = the recurrent part):
+
+| run | seed | accuracy | weights live | Macs once / a sweep | Macs a settle |
+|---|---|---|---|---|---|
+| dense, 3 epochs | 1 / 2 | 96.71 / 97.10% | 101632 | 100352 / 2560 | 138752 / 136192 |
+| 50% kept (after Sparsify) | 1 / 2 | 97.34 / 97.33% | 50816 | 50141 / 2560 | 88541 / 91083 |
+| 20% kept (after Sparsify) | 1 / 2 | 97.43 / 97.52% | 20327 | 20013 / 628 | 31945 (seed 1) / 33002 |
+
+Pruning at 20% kept holds (even exceeds, by a little more training: the pruned runs also take 1000 more lessons than the dense
+3 epochs) the dense accuracy and costs 4.3x fewer multiply-adds a settle (a sweep 628 against 2560 multiply-adds);
+answers take more sweeps (18.7-19.9 against 14-15). At 50% the recurrent hidden-readout block is not thinned at all (2560 a sweep);
+the pixel connection takes the cut. Two seeds only.
