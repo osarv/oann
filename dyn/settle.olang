@@ -19,10 +19,26 @@
 # product per connection per sweep for both. Between settles the committed state is buffer 0 (a settle that ends on
 # buffer 1 copies its rows back).
 #
+# Gauss-Seidel sweeps (Sweeping.GaussSeidel): the populations are swept one after another in their sweep order (a
+# topological order of the one-way connections, so a chain is carried through in one sweep), each reading the state
+# the sweep already wrote for the populations before it and the state it started from for the rest (itself included:
+# a population's rows still relax as one Jacobi block, in tasks as above). Where the system is certified (kappa < 1)
+# the sweep contracts in the sup norm at least as a Jacobi one does, in any order; a spiking system's sweep is a time
+# step, and stays Jacobi. A population's residual is measured against totals partly new, so a Gauss-Seidel residual
+# is the step each unit made, and the state kept is the one the converged sweep wrote.
+#
+# Anderson acceleration (Sweeping.Anderson = m, Walker and Ni 2011's type II): after a sweep the next state is the
+# combination of the last m + 1 sweeps' states and steps whose steps' combination is smallest in the least-squares
+# sense - x + f - (dX + dF) gamma, gamma = argmin |f - dF gamma| - rather than x + f. The residual is still measured
+# by the sweep, of the state it read; where it grows the history is dropped and the plain step taken (the safeguard).
+# Rate populations only: a system with a spiking or custom population sweeps plainly. Its room is reserved (Reserve)
+# for a depth up to Depth.
+#
 # A step is v += dt r, dt the system's (1: plain fixed-point iteration) - smaller, dt / (1 + beta lambda), in a phase
 # nudged toward its targets (settling.md 1.2: the nudge then only damps) - times 1 - Damping. A spiking system's sweep
 # is a time step and its residual the largest change of a rate over a window, measured at the window's end.
 
+import "std/rand"
 import "../tensor"
 import "../kernels/gemm"
 import "../kernels/sparse"
@@ -43,12 +59,20 @@ fn (p Phase) Index() I64 {
     }
 }
 
+# how a settle sweeps: Jacobi (the default) or Gauss-Seidel sweeps, accelerated by Anderson's method of depth Anderson
+# (0: none; at most the depth reserved, Engine.Reserve)
+type Sweeping struct(Anderson I64 = 0, GaussSeidel Bool = false) {
+    Anderson
+    GaussSeidel
+}
+
 # what a settle may take: at most Sweeps sweeps (time steps, spiking), stopping when every residual is at most Tol; a
-# step shortened by the factor 1 - Damping
-type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0) {
+# step shortened by the factor 1 - Damping; the sweeps of Scheme
+type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Scheme Sweeping = Sweeping()) {
     Sweeps
     Tol
     Damping
+    Scheme
 }
 
 # how a settle went: the sweeps it took, the residual's sup norm at the end (NaN or infinite where it diverged), and
@@ -158,6 +182,31 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     count I64 = 0
     worst mut Array<T>& = Array<T>(0)               # each unit's residual
     Mass mut Array<F64>& = Array<F64>(0)             # each unit's incoming mass (the gain)
+    order mut Array<I64>& = Array<I64>(0)           # the populations in sweep order
+    groups mut Array<I64>& = Array<I64>(0)          # the first unit of each population in that order, and the end
+    fresh mut Array<Bool>& = Array<Bool>(0)         # Gauss-Seidel: whether population i was swept in this sweep
+    seidel Bool = false                             # the running settle's sweeps are Gauss-Seidel
+    acc mut History<T>& = History<T>(0, 0)        # Anderson's history
+}
+
+# Anderson's history: the state a sweep read (X) and the step it made (F), gathered over the rows settled, the last ones
+# (PX, PF), Depth columns of their differences (DX, DF) and the differences' Gram matrix, Kept of them in use; Slot the
+# column written next; Last the last sweep's residual
+type History<T> struct(size I64, depth I64) {
+    Depth I64 = depth
+    X mut Array<T>& = Array<T>(size)
+    F mut Array<T>& = Array<T>(size)
+    PX mut Array<T>& = Array<T>(size)
+    PF mut Array<T>& = Array<T>(size)
+    DX mut Array<T>& = Array<T>(depth * size)
+    DF mut Array<T>& = Array<T>(depth * size)
+    Gram mut Array<F64>& = Array<F64>(depth * depth)
+    A mut Array<F64>& = Array<F64>(depth * depth)
+    G mut Array<F64>& = Array<F64>(depth)
+    Kept I64 = 0
+    Slot I64 = 0
+    Started Bool = false
+    Last F64 = 0.0
 }
 
 # the population numbered i, and connection i
@@ -205,6 +254,52 @@ fn (e mut Engine<T>&) Ready() {
         e.Spiking = true
         e.Window = model.window
     }
+    e.sweepOrder()
+    e.groups = Array<I64>(e.Pops.Len() + 1)
+    e.fresh = Array<Bool>(e.Pops.Len())
+}
+
+# the populations in sweep order: each after every population a one-way connection carries into it from (a
+# topological order; a reciprocal connection's way back and a lateral block do not order), where a cycle of them
+# leaves none ready, the lowest numbered left; else in the order they were made
+fn (e mut Engine<T>&) sweepOrder() {
+    n := e.Pops.Len()
+    need := Array<I64>(n)
+    for l in e.Links {
+        if not l.Folded and l.Pre != l.Post: need[l.Post]++
+    }
+    done := Array<Bool>(n)
+    e.order = Array<I64>(n)
+    for at in range n {
+        pick := firstReady(need, done)
+        done[pick] = true
+        e.order[at] = pick
+        for l in e.Links {
+            if not l.Folded and l.Pre == pick and l.Post != pick: need[l.Post]--
+        }
+    }
+}
+
+# the first population not yet placed that nothing unplaced feeds, or the first not yet placed
+fn firstReady(need Array<I64>&, done Array<Bool>&) I64 {
+    for i in range need.Len() {
+        if not done[i] and need[i] <= 0: return i
+    }
+    for i in range need.Len() {
+        if not done[i]: return i
+    }
+    unreachable "every population is placed"
+}
+
+# room for Anderson acceleration up to depth: the history of every relaxing population's rows, every phase (it
+# allocates, once, where the caller chooses; a smaller depth than reserved needs nothing)
+fn (e mut Engine<T>&) Reserve(depth I64) {
+    if depth <= e.acc.Depth: return
+    size I64 = 0
+    for p in e.Pops {
+        if p.Role != neuron.Role.Input and not p.Spiking: size += e.Rows * p.Size
+    }
+    e.acc = History<T>(size, depth)
 }
 
 # ---- state between settles ----
@@ -295,12 +390,14 @@ fn (e mut Engine<T>&) clearCounts(p mut Population<T>&, r0 I64, r1 I64) {
 
 # ---- units of work ----
 
-# the units of phases lo .. hi: every relaxing population's rows of each, in chunks
+# the units of phases lo .. hi: every relaxing population's rows of each, in chunks, the populations in sweep order
 fn (e mut Engine<T>&) plan(lo I64, hi I64) {
     e.count = 0
     e.work = 0
-    for i in range e.Pops.Len() {
+    for at in range e.Pops.Len() {
+        i := e.order[at]
         p := e.Pops[i]
+        e.groups[at] = e.count
         if p.Role == neuron.Role.Input: continue
         carried := p.Size
         for l in p.In: carried += e.Links[l].Count
@@ -316,29 +413,43 @@ fn (e mut Engine<T>&) plan(lo I64, hi I64) {
             }
         }
     }
+    e.groups[e.Pops.Len()] = e.count
 }
 
-# every unit run, on the system's tasks - each task the units t, t + tasks, ... - and their largest residual (NaN
-# when one is). A sweep too small to pay for tasks runs on the calling thread; the units are the same either way
-fn (e mut Engine<T>&) run() T {
-    tasks := e.Threads.Min(e.count)
-    if e.work < e.TaskWork: tasks = 1
-    if tasks <= 1 {
-        e.task(0, 1)
-    } else {
-        join {
-            for t in range tasks: spawn e.task(t, tasks)
-        }
-    }
+# a sweep: every unit at once (Jacobi), or each population's units after the last's (Gauss-Seidel); the largest
+# residual (NaN when one is)
+fn (e mut Engine<T>&) sweepOnce() T {
+    if not e.seidel: return e.run(0, e.count)
     worst T = T(0)
-    for u in range e.count: worst = neuron.Worse(worst, e.worst[u])
+    for at in range e.Pops.Len() {
+        worst = neuron.Worse(worst, e.run(e.groups[at], e.groups[at + 1]))
+        e.fresh[e.order[at]] = true
+    }
+    for i in range e.fresh.Len(): e.fresh[i] = false
     return worst
 }
 
-fn (e mut Engine<T>&) task(t I64, every I64) {
+# units u0 .. u1 run, on the system's tasks - each task the units u0 + t, u0 + t + tasks, ... - and their largest
+# residual. A sweep too small to pay for tasks runs on the calling thread; the units are the same either way
+fn (e mut Engine<T>&) run(u0 I64, u1 I64) T {
+    tasks := e.Threads.Min(u1 - u0)
+    if e.work < e.TaskWork: tasks = 1
+    if tasks <= 1 {
+        e.task(u0, u1, 0, 1)
+    } else {
+        join {
+            for t in range tasks: spawn e.task(u0, u1, t, tasks)
+        }
+    }
+    worst T = T(0)
+    for u in range u0, u1: worst = neuron.Worse(worst, e.worst[u])
+    return worst
+}
+
+fn (e mut Engine<T>&) task(u0 I64, u1 I64, t I64, every I64) {
     ws := e.ws[t]
     sc := e.sc[t]
-    for u in range t, e.count, every {
+    for u in range u0 + t, u1, every {
         p := e.Pops[e.units[3 * u]]
         r0, r1 := e.units[3 * u + 1], e.units[3 * u + 2]
         e.totals(ws, sc, p, r0, r1)
@@ -370,12 +481,12 @@ fn (e mut Engine<T>&) totals(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>&,
     }
     for i in p.In {
         l := e.Links[i]
-        pre := e.Pops[l.Pre].carried(k)
+        pre := e.Pops[l.Pre].carried(e.bufferOf(l.Pre))
         l.Forward(ws, sc, p.Total, pre, r0, r1)
     }
     for i in p.Back {
         l := e.Links[i]
-        post := e.Pops[l.Post].carried(k)
+        post := e.Pops[l.Post].carried(e.bufferOf(l.Post))
         l.Backward(ws, sc, p.Total, post, r0, r1)
     }
     beta := e.Beta[r0 / e.Batch]
@@ -389,6 +500,9 @@ fn (e mut Engine<T>&) totals(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>&,
         neuron.AddForce(role.cost, from, r * n, n, into, T(beta), p.Labels, b * GroupsOf(role), p.Target, b * n)
     }
 }
+
+# the buffer population i is read from: the one the sweep writes where a Gauss-Seidel sweep has swept it already
+fn (e Engine<T>&) bufferOf(i I64) I64 { return 1 - e.cur if e.fresh[i] else e.cur }
 
 # the step of phase ph: the system's, shortened in a phase nudged toward its targets (settling.md 1.2), times
 # 1 - damping
@@ -509,7 +623,10 @@ fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
     e.plan(lo, hi)
     e.damping = b.Damping
     e.cur = 0
-    out := e.spikes(b) if e.Spiking else e.relax(b)
+    e.seidel = b.Scheme.GaussSeidel and not e.Spiking
+    e.acc.Kept, e.acc.Slot, e.acc.Started = 0, 0, false
+    out := e.spikes(b) if e.Spiking else e.relax(b, lo * e.Batch, hi * e.Batch, e.depthFor(b))
+    e.seidel = false
     if e.cur == 1: e.commit(lo * e.Batch, hi * e.Batch)
     e.cur = 0
     e.Sweeps += out.Sweeps
@@ -517,17 +634,174 @@ fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
     return out
 }
 
-# a rate system's sweeps: the residual of state k measured as the step to k + 1 is made; the first state within the
-# tolerance is the one kept
-fn (e mut Engine<T>&) relax(b Budget) Settlement {
+# a rate system's sweeps over rows r0 .. r1, accelerated by Anderson's method of depth m (0: none): the residual of
+# state k measured as the step to k + 1 is made; the first state within the tolerance is the one kept (Gauss-Seidel:
+# the state its sweep wrote)
+fn (e mut Engine<T>&) relax(b Budget, r0 I64, r1 I64, m I64) Settlement {
     for k in range b.Sweeps + 1 {
         e.sweep = k
-        worst := F64(e.run())
+        worst := F64(e.sweepOnce())
         out := Settlement(k, worst, worst <= b.Tol)
+        if out.Converged and e.seidel: e.cur = 1 - e.cur
         if out.Converged or out.Diverged() or k == b.Sweeps: return out
+        if m > 0: e.accelerate(r0, r1, worst, m)
         e.cur = 1 - e.cur
     }
     unreachable
+}
+
+# the Anderson depth a settle runs at: the budget's, at most the depth reserved; none where a population is spiking
+# or custom (its state is not a rate population's potentials)
+fn (e Engine<T>&) depthFor(b Budget) I64 {
+    for p in e.Pops {
+        model := p.Model
+        if p.Role != neuron.Role.Input and model != neuron.Neuron.Rate: return 0
+    }
+    return b.Scheme.Anderson.Min(e.acc.Depth).Max(0)
+}
+
+# ---- Anderson acceleration ----
+
+# after a sweep of rows r0 .. r1 with residual worst: the step the sweep made and the state it read join the history
+# (the history dropped where the residual grew: the plain step stands), and the buffer written becomes the
+# extrapolation x + f - (dX + dF) gamma, gamma the least-squares combination of the steps' differences nearest f
+fn (e mut Engine<T>&) accelerate(r0 I64, r1 I64, worst F64, m I64) {
+    a := e.acc
+    n := e.gather(r0, r1)
+    grew := a.Started and worst > a.Last
+    if grew { a.Kept, a.Slot = 0, 0 } else if a.Started { a.push(n, m) }
+    for i in range n {
+        a.PX[i] = a.X[i]
+        a.PF[i] = a.F[i]
+    }
+    a.Started = true
+    a.Last = worst
+    if a.Kept == 0: return
+    singular := false
+    try a.solve(n, m) catch { singular = true }
+    if singular {
+        a.Kept, a.Slot = 0, 0
+        return
+    }
+    a.extrapolate(n)
+    e.scatter(r0, r1)
+}
+
+# rows r0 .. r1 of every relaxing population gathered: the potentials read (X) and the step to those written (F);
+# gives how many
+fn (e mut Engine<T>&) gather(r0 I64, r1 I64) I64 {
+    a := e.acc
+    at I64 = 0
+    for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
+        x := p.rate(e.cur)
+        y := p.rate(1 - e.cur)
+        for i in range r0 * p.Size, r1 * p.Size {
+            a.X[at] = x.U[i]
+            a.F[at] = y.U[i] - x.U[i]
+            at++
+        }
+    }
+    return at
+}
+
+# the extrapolated potentials (X) put into the buffer the sweep wrote, its activities from them
+fn (e mut Engine<T>&) scatter(r0 I64, r1 I64) {
+    a := e.acc
+    at I64 = 0
+    for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
+        model := p.Model
+        rho := model.rho if model == neuron.Neuron.Rate else neuron.Rho.Linear
+        b := p.rate(1 - e.cur)
+        lo, hi := r0 * p.Size, r1 * p.Size
+        for i in range lo, hi {
+            b.U[i] = a.X[at]
+            at++
+        }
+        neuron.ActivateRun(rho, b.U, b.S, lo, hi)
+    }
+}
+
+# the differences from the last state and step written into the history's next column (n long), and its Gram row
+fn (a mut History<T>&) push(n I64, m I64) {
+    c := a.Slot
+    for i in range n {
+        a.DX[c * n + i] = a.X[i] - a.PX[i]
+        a.DF[c * n + i] = a.F[i] - a.PF[i]
+    }
+    a.Slot = (c + 1) % m
+    a.Kept = (a.Kept + 1).Min(m)
+    for j in range a.Kept {
+        d := dot(a.DF, c * n, a.DF, j * n, n)
+        a.Gram[c * m + j] = d
+        a.Gram[j * m + c] = d
+    }
+}
+
+# gamma (in G) from the normal equations (dF^T dF + mu I) gamma = dF^T f, mu a relative 1e-10 of the diagonal; false
+# an error where they are singular
+fn (a mut History<T>&) solve(n I64, m I64) ? Singular {
+    k := a.Kept
+    top := 0.0
+    for i in range k {
+        for j in range k: a.A[i * k + j] = a.Gram[i * m + j]
+        a.G[i] = dot(a.DF, i * n, a.F, 0, n)
+        top = top.Max(a.Gram[i * m + i])
+    }
+    for i in range k: a.A[i * k + i] += 1e-10 * top
+    try eliminate(a.A, a.G, k)
+}
+
+# X = X + F - sum_j gamma_j (DX_j + DF_j): the next state
+fn (a mut History<T>&) extrapolate(n I64) {
+    for i in range n {
+        v := F64(a.X[i]) + F64(a.F[i])
+        for j in range a.Kept: v -= a.G[j] * (F64(a.DX[j * n + i]) + F64(a.DF[j * n + i]))
+        a.X[i] = T(v)
+    }
+}
+
+# the sum of a[ao + i] b[bo + i] over n, in F64
+fn dot<T>(a Array<T>&, ao I64, b Array<T>&, bo I64, n I64) F64 {
+    s := 0.0
+    for i in range n: s += F64(a[ao + i]) * F64(b[bo + i])
+    return s
+}
+
+# normal equations with a zero or non-finite pivot
+type Singular error { Pivot }
+
+# a x = b solved in place (x into b) by Gaussian elimination with partial pivoting, k unknowns; an error where a pivot
+# is zero or not finite
+fn eliminate(a mut Array<F64>&, b mut Array<F64>&, k I64) ? Singular {
+    for c in range k {
+        p := c
+        for i in range c + 1, k: p = i if a[i * k + c].Abs() > a[p * k + c].Abs() else p
+        if not (a[p * k + c].Abs() > 0.0 and a[p * k + c].Abs() <= F64.Max): error Singular.Pivot
+        swapRows(a, b, k, c, p)
+        for i in range c + 1, k {
+            f := a[i * k + c] / a[c * k + c]
+            for j in range c, k: a[i * k + j] -= f * a[c * k + j]
+            b[i] -= f * b[c]
+        }
+    }
+    for c := k - 1, c >= 0, c-- {
+        for j in range c + 1, k: b[c] -= a[c * k + j] * b[j]
+        b[c] /= a[c * k + c]
+    }
+}
+
+fn swapRows(a mut Array<F64>&, b mut Array<F64>&, k I64, c I64, p I64) {
+    if p == c: return
+    for j in range k {
+        t := a[c * k + j]
+        a[c * k + j] = a[p * k + j]
+        a[p * k + j] = t
+    }
+    t := b[c]
+    b[c] = b[p]
+    b[p] = t
 }
 
 # a spiking system's time steps, its rates' change measured at the end of each window
@@ -536,13 +810,75 @@ fn (e mut Engine<T>&) spikes(b Budget) Settlement {
     steps := b.Sweeps.Max(e.Window)
     for k in range steps {
         e.sweep = k
-        worst := F64(e.run())
+        worst := F64(e.sweepOnce())
         e.cur = 1 - e.cur
         if (k + 1) % e.Window != 0: continue
         out = Settlement(k + 1, worst, worst <= b.Tol)
         if out.Converged or out.Diverged(): return out
     }
     return out
+}
+
+# ---- the coupling's spectral norm ----
+
+# the largest singular value of W, the coupling between relaxing units (every connection not folded, a reciprocal one
+# both ways), by power iteration on W^T W from a fixed start: sigma = |W v| for the unit v, v <- W^T W v normalized,
+# until sigma moves by at most tol relative or after iterations; 0 where nothing couples. Allocates its vectors
+fn (e mut Engine<T>&) Spectral(iterations I64, tol F64) F64 {
+    v := Vec<mut Array<T>&>()
+    w := Vec<mut Array<T>&>()
+    r := rand.Rand(1)
+    for p in e.Pops {
+        a := Array<T>(p.Size)
+        if p.Role != neuron.Role.Input { for j in range p.Size: a[j] = T(r.Uniform(-1.0, 1.0)) }
+        v.Push(a)
+        w.Push(Array<T>(p.Size))
+    }
+    sigma := 0.0
+    for _ in range iterations {
+        if norm(v) == 0.0: return 0.0
+        normalize(v)
+        e.couple(v, w, false)
+        next := norm(w)
+        e.couple(w, v, true)
+        moved := (next - sigma).Abs()
+        sigma = next
+        if moved <= tol * sigma: break
+    }
+    return sigma
+}
+
+# to = W from (trans: W^T from), every population's vector
+fn (e mut Engine<T>&) couple(from mut Vec<mut Array<T>&>&, to mut Vec<mut Array<T>&>&, trans Bool) {
+    for a in to {
+        for j in range a.Len(): a[j] = T(0)
+    }
+    ws, sc := e.ws[0], e.sc[0]
+    for l in e.Links {
+        if l.Folded: continue
+        into := l.Pre if trans else l.Post
+        out := l.Post if trans else l.Pre
+        l.Carry(ws, sc, to[into], from[out], trans)
+        if l.Both: l.Carry(ws, sc, to[out], from[into], not trans)
+    }
+}
+
+# the Euclidean norm of every population's vector together
+fn norm<T>(v Vec<mut Array<T>&>&) F64 {
+    s := 0.0
+    for a in v {
+        for x in a: s += F64(x) * F64(x)
+    }
+    return s.Sqrt()
+}
+
+# the vectors scaled to norm 1 (left where they are zero)
+fn normalize<T>(v mut Vec<mut Array<T>&>&) {
+    n := norm(v)
+    if not (n > 0.0): return
+    for a in v {
+        for j in range a.Len(): a[j] = T(F64(a[j]) / n)
+    }
 }
 
 # ---- what must not allocate, decided while compiling (S17a, G42) ----

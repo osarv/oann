@@ -74,6 +74,7 @@ type System<T> struct(batch I64, threads I64 = 1, phases I64 = 3) {
     Phases I64 = phases
     E mut settle.Engine<T>& = settle.Engine<T>(batch, phases, threads)
     Planned Bool = false
+    Scheme settle.Sweeping = settle.Sweeping()          # the sweeps of the budgets it gives (BudgetFor)
     mods mut Vec<modRec>& = Vec<modRec>[modRec(-1, "root")]
     pops mut Vec<popRec>& = Vec<popRec>()
     sigs mut Vec<sigRec>& = Vec<sigRec>()
@@ -170,7 +171,15 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError, conn.WiringErr
     for g in s.sigs: width += g.Width
     s.signals = Array<T>(width)
     e.Ready()
+    e.Reserve(s.Scheme.Anderson)
     s.Planned = true
+}
+
+# how its settles sweep from now on, in the budgets it gives (BudgetFor, a Learner's): Anderson's room reserved where
+# planned (allocates, once)
+fn (s mut System<T>&) Use(scheme settle.Sweeping) {
+    s.Scheme = scheme
+    if s.Planned: s.E.Reserve(scheme.Anderson)
 }
 
 # connection i into the lists of the populations it feeds: folded into its post's constant (its pre an input), else
@@ -543,6 +552,16 @@ fn (s System<T>&) worstFactor(p settle.Population<T>&, slope F64, target F64) F6
     return f
 }
 
+# the spectral bound of the coupling: the activations' largest slope times the largest singular value of the recurrent
+# weights between relaxing units (power iteration, Engine.Spectral, to a relative 1e-9 in at most iterations). Below 1
+# a sweep at dt = 1 is a contraction in the Euclidean norm by this factor - at most Gain() where the coupling is
+# symmetric (|W|_2 <= |W|_inf), often far below it; infinite for spiking and custom populations. Allocates
+fn (s mut System<T>&) Contraction(iterations I64 = 1000) F64 {
+    slope := s.slope()
+    sigma := s.E.Spectral(iterations, 1e-9)
+    return 0.0 if sigma == 0.0 else sigma * slope
+}
+
 # the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual - of a free phase, or one nudged
 # with beta at its step - or 1 where nothing is certified
 fn (s mut System<T>&) Rate(beta F64 = 0) F64 {
@@ -562,9 +581,9 @@ fn (s mut System<T>&) LessonTolerance(beta F64) F64 {
 # a budget for a settle to tol, free or nudged with beta: twice the sweeps the certificate says a cold start needs
 # (ln tol / ln q, q held at most 0.95), at least 128; a spiking system's 32 windows
 fn (s mut System<T>&) BudgetFor(tol F64, beta F64 = 0) settle.Budget {
-    if s.E.Spiking: return settle.Budget(32 * s.E.Window, tol)
+    if s.E.Spiking: return settle.Budget(32 * s.E.Window, tol, 0.0, s.Scheme)
     q := s.Rate(beta).Min(0.95)
-    return settle.Budget(I64((2.0 * tol.Log() / q.Log()).Ceil().Max(128.0)), tol)
+    return settle.Budget(I64((2.0 * tol.Log() / q.Log()).Ceil().Max(128.0)), tol, 0.0, s.Scheme)
 }
 
 # the unit roundoff of T
@@ -783,6 +802,130 @@ test System.Settle "Jacobi sweeps in tasks equal one thread bit for bit, free an
         assert s.Nudged(settle.Budget()).Sweeps == nudged.Sweeps
         assert sameState(one, s), $threads + " threads"
     }
+}
+
+# the largest difference of p's potentials from q's, every relaxing population and phase
+fn apart<T>(p System<T>&, q System<T>&) F64 {
+    worst := 0.0
+    for i in range 1, p.E.Pops.Len() {
+        u := p.State<neuron.RateCell<T>>(Pop(i)).U
+        v := q.State<neuron.RateCell<T>>(Pop(i)).U
+        for j in range u.Len(): worst = worst.Max(F64(u[j] - v[j]).Abs())
+    }
+    return worst
+}
+
+test System.Use "Anderson and Gauss-Seidel sweeps settle where plain Jacobi sweeps do, free and nudged, every wiring, in fewer sweeps" {
+    plain := System<F64>.mixed(4, 1)
+    b := settle.Budget(2000, 1e-11)
+    free := plain.Settle(settle.Phase.Free, b)
+    nudged := plain.Nudged(b)
+    assert free.Converged and nudged.Converged
+    ways := Array<settle.Sweeping>[settle.Sweeping(5), settle.Sweeping(0, true), settle.Sweeping(3, true)]
+    for way in ways {
+        s := System<F64>.mixed(4, 2)
+        s.Use(way)
+        f := s.Settle(settle.Phase.Free, s.BudgetFor(1e-11))
+        n := s.Nudged(s.BudgetFor(1e-11, 0.5))
+        assert f.Converged and n.Converged, $way + ": " + $f + " " + $n
+        # the event-driven feedback carries a unit's change only past 1e-5: where it is left depends on the path, by
+        # about that over 1 - kappa
+        assert apart(plain, s) < 1e-5, $way + ": " + $apart(plain, s)
+        assert f.Sweeps < free.Sweeps and n.Sweeps < nudged.Sweeps, $way + ": " + $f.Sweeps + " and " + $n.Sweeps + " sweeps against " + $free.Sweeps + " and " + $nudged.Sweeps
+    }
+    # no event-driven connection: the same fixed point to what the tolerance leaves, tol / (1 - kappa)
+    p := System<F64>(3)
+    small(p, neuron.Rho.Tanh, conn.Wiring.Tiles(2, 0.7), rand.Rand(6))
+    p.Certify(0.9)
+    p.Settle(settle.Phase.Free, b)
+    p.Nudged(b)
+    for way in ways {
+        q := System<F64>(3)
+        small(q, neuron.Rho.Tanh, conn.Wiring.Tiles(2, 0.7), rand.Rand(6))
+        q.Certify(0.9)
+        q.Use(way)
+        assert q.Settle(settle.Phase.Free, q.BudgetFor(1e-11)).Converged and q.Nudged(q.BudgetFor(1e-11, 0.5)).Converged
+        assert apart(p, q) < 2e-10, $way + ": " + $apart(p, q)
+    }
+    # in tasks, bit for bit as one thread
+    one := System<F32>.mixed(130, 1)
+    one.Use(settle.Sweeping(4, true))
+    one.Settle(settle.Phase.Free, one.BudgetFor(1e-5))
+    one.Nudged(one.BudgetFor(1e-5, 0.5))
+    many := System<F32>.mixed(130, 3)
+    many.Use(settle.Sweeping(4, true))
+    many.E.TaskWork = 0
+    many.Settle(settle.Phase.Free, many.BudgetFor(1e-5))
+    many.Nudged(many.BudgetFor(1e-5, 0.5))
+    assert sameState(one, many)
+}
+
+test System.Use "Gauss-Seidel sweeps a one-way chain in its order, whatever order its populations were made in: one sweep reaches the fixed point" {
+    s := System<F64>(2, 1, 1)
+    root := s.Root()
+    c := s.Population(root, "c", 3, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    b := s.Population(root, "b", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    a := s.Population(root, "a", 5, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    x := s.Population(root, "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    s.Connect(x, a, conn.Wiring.Dense)
+    s.Connect(b, c, conn.Wiring.Dense)
+    s.Connect(a, b, conn.Wiring.Dense)
+    s.Plan(rand.Rand(4))!
+    for i in range 4: s.Pop(x).Drive[i] = 0.5 * F64(i) - 0.7
+    jacobi := s.Settle(settle.Phase.Free, settle.Budget(50, 1e-14))
+    s.Reset(settle.Phase.Free)
+    s.Use(settle.Sweeping(0, true))
+    seidel := s.Settle(settle.Phase.Free, s.BudgetFor(1e-14))
+    assert jacobi.Sweeps == 3 and seidel.Sweeps == 1, $jacobi.Sweeps + " and " + $seidel.Sweeps
+}
+
+test System.Contraction "the spectral bound: kappa exactly where the coupling is uniform, the largest singular value of the dense coupling where it is not" {
+    t := System<F64>.tight(16, 0.9)
+    assert (t.Contraction() - 0.9).Abs() < 1e-8, $t.Contraction()
+    r := rand.Rand(2)
+    s := System<F64>(2, 1, 1)
+    small(s, neuron.Rho.Tanh, conn.Wiring.Dense, r)
+    s.Certify(0.8)
+    # W_eff over h (0 .. 5) and y (5 .. 7), as the linear test reads it; its largest singular value by power iteration
+    a := Array<F64>(49)
+    wy := s.Weights(Conn(1))
+    wl := s.Weights(Conn(2))
+    for i in range 5 {
+        for j in range 5: a[i * 7 + j] = wl.Get(i, j) + wl.Get(j, i)
+        for k in range 2 {
+            a[i * 7 + 5 + k] = wy.Get(k, i)
+            a[(5 + k) * 7 + i] = wy.Get(k, i)
+        }
+    }
+    v := Array<F64>(7, 1.0)
+    sigma := 0.0
+    for _ in range 5000 {
+        w := times(a, v, 7, false)
+        sigma = length(w)
+        u := times(a, w, 7, true)
+        size := length(u)
+        for j in range 7: v[j] = u[j] / size
+    }
+    assert (s.Contraction() - sigma).Abs() < 1e-7 * sigma, $s.Contraction() + " against " + $sigma
+    assert s.Contraction() <= s.Gain() + 1e-12
+    # every wiring, F32: at most the gain (the coupling is not symmetric, the bound still well below)
+    m := System<F32>.mixed(4, 1)
+    assert m.Contraction() > 0.0 and m.Contraction() < m.Gain(), $m.Contraction() + " against the gain " + $m.Gain()
+}
+
+# a v (n x n, trans: a^T v)
+fn times(a Array<F64>&, v Array<F64>&, n I64, trans Bool) Array<F64> {
+    out := Array<F64>(n)
+    for i in range n {
+        for j in range n: out[i] += (a[j * n + i] if trans else a[i * n + j]) * v[j]
+    }
+    return out
+}
+
+fn length(v Array<F64>&) F64 {
+    s := 0.0
+    for x in v: s += x * x
+    return s.Sqrt()
 }
 
 test System.Nudged "the nudged phases start from the free fixed point: +beta lowers the cost, -beta raises it" {

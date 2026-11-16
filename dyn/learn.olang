@@ -195,7 +195,7 @@ fn (l mut Learner<T>&) Lesson(m system.Mod, beta F64, centered Bool = true) Taug
 }
 
 fn (l mut Learner<T>&) budget(tol F64, beta F64) settle.Budget {
-    if l.Sweeps > 0: return settle.Budget(l.Sweeps, tol)
+    if l.Sweeps > 0: return settle.Budget(l.Sweeps, tol, 0.0, l.S.Scheme)
     return l.S.BudgetFor(tol, beta)
 }
 
@@ -1220,6 +1220,19 @@ test Learner.Lesson "a skip connection from the inputs into the readout (folded)
     l.Sweeps = 20000
     l.Lesson(s.Root(), 0.001)!
     assert relative(s.E.Grads, reference) < 1e-5, $relative(s.E.Grads, reference)
+}
+
+test Learner.Lesson "Anderson and Gauss-Seidel sweeps leave the centered contrast the cost's gradient" {
+    reference := lossGradient(gradientSystem(rand.Rand(11)))
+    for way in Array<settle.Sweeping>[settle.Sweeping(5), settle.Sweeping(0, true), settle.Sweeping(3, true)] {
+        s := gradientSystem(rand.Rand(11))
+        s.Use(way)
+        l := Learner<F64>(s)!
+        l.Tol = 1e-13
+        l.Sweeps = 20000
+        l.Lesson(s.Root(), 0.001)!
+        assert relative(s.E.Grads, reference) < 1e-5, $way + ": " + $relative(s.E.Grads, reference)
+    }
 }
 
 # x (3 tanh inputs) -> a (5 tanh) <-> b (4 tanh) <-> y (3 tanh): a dense input; symmetric (every recurrent connection

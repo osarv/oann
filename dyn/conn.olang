@@ -227,6 +227,19 @@ fn (l mut Link<T>&) Backward(ws mut gemm.Workspace<T>&, sc mut Scratch<T>&, tota
     }
 }
 
+# one row of the connection's linear map: total[post] += s[pre] W^T (back: total[pre] += s[post] W) - an event-driven
+# one carried whole, as a dense block (what a spectral bound reads; a one-way form read backward as its transpose)
+fn (l mut Link<T>&) Carry(ws mut gemm.Workspace<T>&, sc mut Scratch<T>&, total mut Array<T>&, s mut Array<T>&, back Bool) {
+    if l.Kind != Wiring.Events {
+        if back { l.Backward(ws, sc, total, s, 0, 1) } else { l.Forward(ws, sc, total, s, 0, 1) }
+        return
+    }
+    post, pre := l.PostSize, l.PreSize
+    to := mat.Mat<T>(total, 0, 1, pre if back else post, pre if back else post)
+    from := mat.Mat<T>(s, 0, 1, post if back else pre, post if back else pre)
+    gemm.Gemm(ws, to, from, false, l.W, back, T(1), T(1))
+}
+
 # a sparse form's product on rows r0 .. r1: the rows of s (width in a row) transposed into the scratch, the kernel's
 # feature-major product there, and its result added back into total's rows (out in a row)
 fn (l mut Link<T>&) sparseProduct(sc mut Scratch<T>&, total mut Array<T>&, out I64, s Array<T>&, width I64, r0 I64, r1 I64, trans Bool) {
