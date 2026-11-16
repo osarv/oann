@@ -126,16 +126,73 @@ Ending at each fraction (relearned, sparse rows), test accuracy dense -> pruned 
 - Scores at 5% (seed 1): energy 80.5%, activity 65.6%, magnitude 63.3%.
 - A sweep costs the same until `Sparsify` (masks are multiplied); after it a sweep is 5-30x cheaper. Sweeps a settle vary
   with the weights (4-11 here), so the per-sweep count is the like-for-like one.
-- Not built: pruning `Tiles` by tile and `LowRank` by rank, compacting retired units out of the populations (a re-plan);
-  `Sparsify` keeps an optimizer's moments only if the caller remakes it.
-- Found on the way: a skip connection from the inputs straight into the readout (x -> y, folded) stops this system
-  from learning XOR at all (52%), with or without `Restrain`; not chased.
+- `Sparsify` keeps an optimizer's moments only if the caller remakes it. Tiles, ranks, the schedule and the skip
+  connection: the next section.
+
+## Pruning: schedule, tiles and ranks, the skip connection (wt-oannprune2, 2026-11-16)
+
+**The skip connection (x -> y, folded) is not a bug; it is what the certificate bounds.** The EP contrast through a
+folded input into a readout is the cost's gradient (test: `Learner.Lesson` "a skip connection from the inputs into the
+readout", relative error < 1e-5 against central differences). The failure is the scale: `Certify`/`Restrain` cap every
+unit's incoming recurrent mass at the gain (0.9), so the hidden layer's whole vote into a readout unit is at most 0.9
+in its net input, while a folded connection is outside the certificate (it carries a constant) and is not capped. The
+skip is drawn Glorot-uniform for a 4 -> 2 block (bound 1) over inputs in [-3, 3]: its carry reaches several units, a
+linear function of the inputs, wrong on half of the points for XOR, and no hidden unit can outvote it (test:
+`System.Restrain` "the gain caps ... not a folded skip"). Started from zero and learnt freely it grows the same way
+(to |w| 1-2 in 2000 lessons: the linear fit of the training sample's noise) and the readout saturates (seed 1: 55.9%). Without
+`Restrain` nothing learns (the settles stop converging, 1998 of 2000 lessons refused, skip or not). Held to an incoming
+mass of 0.1 a readout unit and started from zero, the skip is harmless (`make prune ARGS="... cubic zero"`):
+
+| seed | no skip | skip drawn | skip from zero, mass held to 0.1 |
+|---|---|---|---|
+| 1 | 86.3% | 51.6% | 89.1% |
+| 2 | 82.8% | 50.8% | 84.8% |
+| 3 | 62.9% | 64.1% | 70.7% |
+
+So a skip into a certified system's readout has to be scaled to what the recurrent path can carry; nothing in oann
+does that for a folded connection (a rule could: a gain-like cap on a readout's folded mass), and none is built.
+
+**Cubic schedule (Zhu and Gupta 2017) is the default.** `conn.Schedule { Linear, Cubic }`, a field of `Rule.Prune`
+and a parameter of `Learner.Prune` (default Cubic): the fraction kept after tick t of n = (1 - target) / pace is
+target + (1 - target)(1 - t/n)^3, the tick read off the fraction now kept (so a rule stays stateless and regrowth or
+outside masking does not upset it); the same number of ticks as Linear (test `paced`). XOR beside noise (as above,
+energy score, pace 0.05, relearned, sparse rows), test accuracy:
+
+| kept | schedule | seed 1 | seed 2 | seed 3 |
+|---|---|---|---|---|
+| 10% | linear | 84.4% | 47.7% | 51.2% |
+| 10% | cubic | 83.6% | 82.8% | 80.1% |
+| 20% | linear | 85.9% | 83.2% | 80.5% |
+| 20% | cubic | 84.8% | 84.4% | 80.5% |
+
+At 20% the two tie (83.2% mean each); at 10% the linear pace's collapses on seeds 2 and 3 are gone. Sweeps a settle
+rise at 10% cubic (8-17 against 6-7): a sweep costs 164-182 multiply-adds, a settle 1412-3125.
+
+**Tiles by tile, LowRank by rank.** Both are prunable now: each tile or rank is one item of the pool, scored as one
+(a tile: the sum of its weights' scores; a rank a b^T: |a| |b|, |a| sum |b_j| mean|s_j|, or |a^T mean(s_post s_pre^T)
+b|, read off the coincidence's gradient of the first factor), taken over its connection's mean and counted as the
+weights it holds (`Link.Full`: a tiled one's stored tiles, a low-rank one's factors; `Group`). A masked tile is dead
+in the kernels at once; a masked rank's zeros are still multiplied until `Compact`, which moves the live ranks down in
+place and makes the rank smaller (`Macs` follows; allocation-free; an optimizer made before is made again). Regrowth
+stays with the one-weight connections. Test: `Learner.Prune` "a tiled connection loses whole tiles and a low-rank one
+whole ranks".
+
+**Compacting retired units out of the populations (a re-plan): not built**, larger than its worth now. What it needs:
+a `System.Shrunk()` that records a new system from the old one's records (modules, populations at their live sizes,
+signals, rules) and re-plans it; every connection rewired by the map of live units - dense, symmetric and event-driven
+blocks as their live rows and columns, a low-rank one as A's live rows and B's live columns, sparse rows with their old
+pattern restricted (Link has no way to take a pattern from outside `Draw` yet), tiles refused or turned dense (the tile
+grid does not follow units); biases, the kept state fields (@Keep: thresholds, gains), drives, targets and labels
+copied by the same map; the learner and optimizer made again. It saves the retired units' state and sweep work only,
+which is small next to the weights `Sparsify` already removes.
+
+**MNIST (`mnist_learn`) not tested:** the data is not in this checkout (`data/mnist`, which `mnist.Mnist.Load`
+fetches into) and the container was not asked to fetch it.
 
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
-- Pruning: a schedule that slows near the target (the 10% collapses above come at the last ticks), and a test of
-  pruning on MNIST (`mnist_learn`).
+- Pruning: a test on MNIST (`mnist_learn`) once the data is fetched; compacting retired units (above, if it pays).
 
 ## Done since C3
 

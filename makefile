@@ -112,7 +112,8 @@ xor:
 	./build/examples_xor_settle $(ARGS)
 
 # a settling system pruned while it runs, then stored sparse (examples/prune_settle.olang) - ARGS: score, fraction kept,
-# pace, regrowth, hidden, noise inputs, lessons, lessons between ticks, seed, rate
+# pace, regrowth, hidden, noise inputs, lessons, lessons between ticks, seed, rate, schedule (linear, cubic), skip (none,
+# drawn, zero)
 prune:
 	$(OLANG) build -output build/examples_prune_settle examples/prune_settle.olang
 	./build/examples_prune_settle $(ARGS)
