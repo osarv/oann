@@ -25,6 +25,7 @@ where the library changed) so each builds or fails as its header says.
 | `tryindex.olang` | fixed | builds and runs: `try` no longer makes an array index inside its operand a checked one (indexing is unchecked, `try a.Get(i)` the checked form) |
 | `learnerarg.olang` | reproduces (new) | C2d: a struct of another module holding a reference parameter (dyn/learn's `Learner`, dyn/bridge's `Bridge`), made inside a function from that function's reference parameter, "would outlive" the argument, though it is a local dropped there; the same struct copied into the root module builds. dyn/bridge's tests build the system inside the helper instead |
 | `factcascade.olang` | reproduces (new) | any other error in a program (an unused import here) makes every `assert not f.Allocates` (S17a, G42) read false: 36 spurious S17a errors from dyn/ and nn/optim behind one unneeded `try` while writing models/hybrid |
+| `crossinline.olang` | reproduces (new) | a program past ThinFrom (8 MB of IR) links by ThinLTO, which neither inlines a body over ImportLimit instructions from another object nor vectorizes again: gemm 16 x 16 x 11 in F64 is 2.2x slower in a program that also imports ad/graph, and elem's activations called fastExp64 per element (6x slower) until they got array-wide forms. Found by bench/smallgraph |
 
 `lambdalend` and `resultgrowth` (both fixed, regression cases on the old `linalg`) were removed with `linalg` at C3 (branch `pre-c3`).
 

@@ -14,4 +14,5 @@ value or gradient is valid within its step only (the activation region is reused
 
 Tests: `olang test ad/graph.olang` (the graph's own), `olang test tools/gradcheck.olang` (a gradient check per operation
 in F64). Measures: `bench/mlp_ad.olang` (M1, MNIST MLP), `bench/arena_ad.olang` (M9, the transformer's arena and
-resident memory per step) - `make mlpad`, `make arenaad`.
+resident memory per step), `bench/smallgraph.olang` (a small recurrence where the cost per node dominates) - `make mlpad`,
+`make arenaad`.

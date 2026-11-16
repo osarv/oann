@@ -1,0 +1,100 @@
+# bench/smallgraph - ad/graph on a small graph, where the cost per node dominates: the shape of oagent's consolidator's
+# slow part, a gated linear recurrence unrolled over 12 steps (h <- l h + (1 - l) z, l = sigmoid(W u + b), z = tanh(V u +
+# c), a linear readout and an MSE per step), 11 inputs, 16 hidden units, one output, batches of 16, in F64, trained by
+# backpropagation through time with AdamW. Each round is a Forward, a Backward and an optimizer step; the time per round
+# is the best of several runs of `rounds` rounds. Arguments, all optional: rounds (20000), runs (5), hidden (16),
+# window (12). Build and run from the repository's root:
+#   olang build -output build/bench_smallgraph bench/smallgraph.olang && build/bench_smallgraph
+#
+# A second pass with the graph's Profiling on prints the time by kind of node. Numbers: PROGRESS.md, "Small graphs".
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../kernels/mat"
+import "../nn/optim"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+# the recurrence recorded and planned; its loss
+fn recurrence(g mut graph.Graph<F64>&, inputs I64, hidden I64, window I64) graph.Var {
+    a F64 = (6.0 / F64(inputs + hidden)).Sqrt()
+    gw := g.Param(graph.Init.Uniform(-a, a), false, hidden, inputs)
+    gb := g.Param(graph.Init.Constant(1.0), false, hidden)
+    bw := g.Param(graph.Init.Uniform(-a, a), false, hidden, inputs)
+    bb := g.Param(graph.Init.Zeros, false, hidden)
+    c F64 = (6.0 / F64(hidden + 1)).Sqrt()
+    cw := g.Param(graph.Init.Uniform(-c, c), false, 1, hidden)
+    cb := g.Param(graph.Init.Zeros, false, 1)
+    h := g.Input(hidden)
+    loss graph.Var = graph.Var(-1)
+    for t in range window {
+        u := g.Input(inputs)
+        y := g.Input(1)
+        l := g.Act(g.Linear(u, gw, gb), mat.Act.Sigmoid)
+        z := g.Act(g.Linear(u, bw, bb), mat.Act.Tanh)
+        h = g.Add(z, g.Mul(l, g.Sub(h, z)))
+        out := g.Linear(h, cw, cb)
+        g.Keep(h)
+        g.Keep(out)
+        e := g.Mse(out, y)
+        loss = e if t == 0 else g.Add(loss, e)
+    }
+    return g.Scale(loss, 1.0 / F64(window))
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try number(args, 1, 20000)
+    runs := try number(args, 2, 5)
+    hidden := try number(args, 3, 16)
+    window := try number(args, 4, 12)
+    inputs I64 = 11
+    batch I64 = 16
+    g := graph.Graph<F64>(batch)
+    loss := recurrence(g, inputs, hidden, window)
+    r := rand.Rand(1)
+    try g.Plan(r) catch { unreachable }
+    for i in range g.Size() {
+        if g.Info(graph.Var(i)).Kind != graph.Op.Input: continue
+        d := g.Data(graph.Var(i)).Flat()!
+        for j in range d.Len(): d[j] = r.Float() - 0.5
+    }
+    opt := optim.AdamW<F64, F64>(g.Params(), g.ParamGrads(), rate = 1e-3)
+    times := Array<I64>(runs)
+    for k in range runs {
+        t0 := time.Now()
+        for _ in range rounds {
+            g.Forward(batch)
+            g.Backward(loss)
+            opt.Step()
+        }
+        times[k] = time.Since(t0)
+    }
+    best := times[0]
+    for t in times: best = t if t < best else best
+    ns := F64(best) / F64(rounds)
+    try io.Put($g.Size() + " nodes, " + $g.ParamCount + " parameters, loss " + $g.Scalar(loss).Fixed(6) + ", " + $ns.Fixed(0) + " ns a round (best of " + $runs + ")\n")
+    g.Profiling = true
+    t0 := time.Now()
+    for _ in range rounds {
+        g.Forward(batch)
+        g.Backward(loss)
+        opt.Step()
+    }
+    whole := F64(time.Since(t0)) / F64(rounds)
+    timed I64 = 0
+    for t in g.Times: timed += t
+    try io.Put("profiled: " + $whole.Fixed(0) + " ns a round, " + $(F64(timed) / F64(rounds)).Fixed(0) + " of it in the nodes; by kind, forward and backward:\n")
+    for k in range graph.KindNames.Len() {
+        f := g.Times[2 * k]
+        b := g.Times[2 * k + 1]
+        if f + b == 0: continue
+        try io.Put("  " + graph.KindNames[k] + " " + $(F64(f) / F64(rounds)).Fixed(0) + " " + $(F64(b) / F64(rounds)).Fixed(0) + "\n")
+    }
+}
