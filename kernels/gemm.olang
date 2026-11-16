@@ -1315,10 +1315,24 @@ fn (q quant&) rowI8(i I64) {
     for j in range four, q.n: q.store1(i, j, dotI8(q.a.d, i * q.a.ld, q.b.d, j * q.b.ld, q.k))
 }
 
-# four dot products as plain integer sums, which the loop vectorizer reassociates itself: four vectors of 16 lanes a
-# row, each step a vpmaddwd on AVX-512 (measured: 1.0-1.5x the sums kept in lanes by hand, 1 x 128 x 512 the most). No
-# form reaches VNNI's vpdpbusd, four products a lane (repro/vnnidot)
+# four dot products. From a depth of i8SumDepth each is a lane expression summed in I32, the form LLVM makes vpdpbusd of
+# (64 products an instruction on a target with VNNI) - 1.2-2.6x the plain sums at 1 x 512 x 128 and
+# larger. Below it the four plain integer sums against one read of the row win (1 x 128 x 128: 1.1 us against 1.9 us),
+# the horizontal reduction of four lane sums costing more than the short loop saves
 fn (q quant&) dot4I8(i I64, j I64) {
+    if q.k < i8SumDepth { dot4Plain(q, i, j) }
+    else {
+        x := q.a.d[i * q.a.ld:i * q.a.ld + q.k]
+        for r in range 4 {
+            o := (j + r) * q.b.ld
+            q.store1(i, j + r, (x * q.b.d[o:o + q.k]).Sum<I32>())
+        }
+    }
+}
+
+i8SumDepth I64 = 256
+
+fn dot4Plain(q quant&, i I64, j I64) {
     a0, b0, ld := i * q.a.ld, j * q.b.ld, q.b.ld
     t0, t1, t2, t3 := I32(0), I32(0), I32(0), I32(0)
     for p in range q.k {
@@ -1336,9 +1350,7 @@ fn (q quant&) dot4I8(i I64, j I64) {
 
 # the sum of a[ao ..] b[bo ..] over k
 fn dotI8(a Array<U8>&, ao I64, b Array<I8>&, bo I64, k I64) I32 {
-    s I32 = 0
-    for p in range k: s = s + I32(a[ao + p]) * I32(b[bo + p])
-    return s
+    return (a[ao:ao + k] * b[bo:bo + k]).Sum<I32>()
 }
 
 # the sum of row j of b

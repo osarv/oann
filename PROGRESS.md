@@ -65,15 +65,19 @@ Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved roun
   sizes the widening's two shuffle-port instructions per 16 values keep it below F32; where the weights stream from
   memory it reads half the bytes and is 2x. F32 rows are summed in the same order (two vectors a row), so BF16 storage stays
   its widened product bit for bit; INT8 weights widened through that path went 0.92x -> 0.78-0.90x at 1 x 784 x 128
-  (GemmI8 is INT8's own path). `vdpbf16ps` would need the activations in BF16 too (repro/vnnidot).
+  (GemmI8 is INT8's own path). `vdpbf16ps` would need the activations in BF16 too, and olang does not form it.
 - `bench/int8`'s F32 ran slow because nn/quant imported ad/graph: the program passed ThinFrom and linked by ThinLTO,
   which inlines no kernel helper across objects (repro/crossinline). nn/quant is now graph-free (`DenseOf`, `ConvOf`)
   and nn/quantgraph reads models from a graph. Against the real F32 path INT8 is slower at 64+ rows: its packed
   micro-kernel (`vpdpwssd`, 16 products an instruction, widened from bytes) runs at 50-97 GOPS against F32's 80-146.
   Batch-1 products still win where the weights stream from memory (3.3-3.6x at 1 x 1024 x 1024).
-- One-row INT8: the dot products are plain I32 sums the loop vectorizer reassociates (`vpmaddwd`), faster than the
-  hand-kept lanes. `vpdpbusd` (64 U8 x I8 products an instruction) is not reachable from olang in any form tried
-  (repro/vnnidot).
+- One-row INT8 on olang's `a.Sum<A>()` (2026-11-16): `dotI8` and the four-row `dot4I8` are `(x * w).Sum<I32>()` over the
+  U8 and I8 rows, which builds to `vpdpbusd` (repro/vnnidot removed). From depth 256 (`i8SumDepth`); shallower, four
+  plain sums against one read of the row stay (1 x 128 x 128: 1.1 us plain, 1.9 us Sum). bench/int8 batch 1, old -> new,
+  two alternated runs: 1 x 784 x 128 5.0-5.9 -> 2.6-3.2 us (1.8-2.0x); 1 x 512 x 128 3.3-3.6 -> 1.5-2.9 us (1.2-2.4x);
+  1 x 1024 x 1024 54-81 -> 24-27 us (2.2-3.3x; 2.1-2.9x -> 5.0-6.3x of F32); 1 x 128 x 512 and 1 x 128 x 128 unchanged
+  (they take the plain path). The packed micro-kernel (an outer product, one broadcast byte times a vector of weights) has no
+  four-adjacent-products shape and is unchanged; `vdpbf16ps` stays unreachable (olang does not use it: it reorders a float sum).
 - Next here: the packed INT8 micro-kernel (the 64+-row gap) - it waits on `vpdpbusd` or a 16-bit packing that LLVM
   maps to one `vpdpwssd` per pair; ad/ops' `Scan` is `GatedScan` (the prelude now has a `Scan`).
 
