@@ -104,11 +104,19 @@ fn GroupsOf(role neuron.Role) I64 {
 
 fn (p mut Population<T>&) rate(k I64) mut Columns<neuron.RateCell<T>>& { return p.R0 if k == 0 else p.R1 }
 
+fn (p mut Population<T>&) rateS() mut Array<T>& { return p.R0.S }
+
 fn (p mut Population<T>&) lif(k I64) mut Columns<neuron.LifCell<T>>& { return p.L0 if k == 0 else p.L1 }
 
 # the activities the connections out of it carry, in buffer k: rate activities, or a spiking population's spikes
 fn (p mut Population<T>&) carried(k I64) mut Array<T>& {
     if p.Spiking: return p.lif(k).Spike
+    return p.rate(k).S
+}
+
+# the rate activities in buffer k, or the spiking population's trace: what a nudged readout is pulled from
+fn (p mut Population<T>&) readout(k I64) mut Array<T>& {
+    if p.Spiking: return p.lif(k).Trace
     return p.rate(k).S
 }
 
@@ -346,7 +354,7 @@ fn (e mut Engine<T>&) constant(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>
     }
     for i in p.Folds {
         l := e.Links[i]
-        pre := e.Pops[l.Pre].R0.S
+        pre := e.Pops[l.Pre].rateS()
         l.Forward(ws, sc, p.Const, pre, r0, r1)
     }
 }
@@ -374,7 +382,7 @@ fn (e mut Engine<T>&) totals(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>&,
     role := p.Role
     if beta == 0.0 or role != neuron.Role.Readout: return
     into := p.Force if p.Spiking else p.Total
-    from := p.lif(k).Trace if p.Spiking else p.rate(k).S
+    from := p.readout(k)
     for r in range r0, r1 {
         b := r % e.Batch
         if p.Spiking { for j in range n: into[r * n + j] = T(0) }
