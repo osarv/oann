@@ -188,10 +188,40 @@ which is small next to the weights `Sparsify` already removes.
 
 **MNIST (`mnist_learn`) pruning:** measured 2026-11-16, see "Measured on the data" below.
 
+## INT8 packed products on vpdpbusd (wt-oannvnni, 2026-11-16)
+
+`GemmI8`/`GemmI8Left` from 4 rows take padded dot products (`dots` in kernels/gemm) where they pay: each activation
+row and weight row is copied once with its depth padded by zeros to a multiple of 256, and each output is one
+`(x * w).Sum<I32>()` of whole blocks - `vpdpbusd`, 64 products an instruction, checked in the binary's inner loop
+(4 `vpdpbusd` a block, then a horizontal sum). Taken from depth 192 padded by at most half, or from 128 padded by at
+most double where the outputs fit the thin tile (n <= 16); elsewhere the outer-product tiles stay. Integer sums, so
+bit for bit the old results (the tests, the MLP's and CNN's accuracies unchanged). The VNNI layout the brief asked
+for - b as [k/4][16][4], a's four bytes broadcast - does not build to `vpdpbusd` in olang: four adjacent products a
+lane summed into I32 becomes `vpmaddwd` on widened bytes; LLVM forms `vpdpbusd` only from a reduction to one value
+(repro/vnnitile); the 16-bit pair packing (a [k/2][32][2] I16 panel) became `vpmulld`, worse. That lowering, or LaneDot keeping a vector accumulator across its blocks, is what would close the rest.
+
+Measured one core, AVX-512 VNNI, alternated before/after runs on the shared machine (static INT8 against F32):
+
+| | before | after |
+|---|---|---|
+| bench/int8 64 x 784 x 128 / 128 x 784 x 128 | 0.58x / 0.60x (48-55 GOPS) | 1.27-1.33x / 1.08-1.16x (92-111 GOPS) |
+| bench/int8 512^3 / 1024^3 | 0.64x / 0.72x (72-79 GOPS) | 0.99-1.23x / 1.21-1.23x (121-151 GOPS) |
+| bench/int8 128 x 128 x 10 (thin, k 128) | 0.23x | 0.97x |
+| bench/int8 1024 x 512 x 128 / 1024 x 128 x 512 (k 128, wide: old path) | 0.61x / 0.59x | unchanged |
+| bench/int8 convolutions 100352 x 9 x 16 / 25088 x 144 x 32 | 0.15x / 0.40x | unchanged (too shallow to pad) |
+| MLP (`make int8 ARGS="mlp 3"`) batch 1 / 64 / 128 | 2.6x / 0.62-0.71x / 0.55-0.57x | 2.6x / 1.14-1.31x / 0.96-1.10x |
+| CNN (`ARGS="cnn 1"`) batch 1 / 64 / 128 | 0.79x / 0.75x / 0.84x | 0.69x / 0.88x / 0.84x (noise; its convolutions are depth 9 and 144) |
+| bench/int8cnn batch 1 / 64 / 128, two runs each | 0.68x / 1.01-1.02x / 1.01x | 0.67-0.81x / 1.04-1.09x / 1.04-1.09x |
+
+Batch 1 takes the one-row path, unchanged. The CNN stays at F32's speed or below: its products are 9 and 144 deep
+(100352 x 9 x 16 runs at 4 GOPS, 7x F32's time - not yet profiled), and the rest of its forward is not INT8.
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
 - Compacting retired units (above, if it pays).
+- INT8: shallow products (the CNN's depth 9 and 144) and the per-lane `vpdpbusd`
+  lowering (repro/vnnitile).
 
 ## Done since C3
 
