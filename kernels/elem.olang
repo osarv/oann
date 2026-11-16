@@ -92,6 +92,36 @@ fn fastExp64(x F64) F64 {
     return e if x == x else x
 }
 
+# x[i] = sigmoid(x[i]) and tanh(x[i]) over a whole array, as FastSigmoid and FastTanh compute them. Not generic, so
+# each is compiled in this module's object beside fastExp32/64 and vectorized there: a generic instance made in another
+# module's object (act's, FastExp's) is linked by ThinLTO in a large program, which does not inline a body as long as the
+# exponential into it, and called it per element (repro/crossinline.olang)
+fn SigmoidInPlace64(x mut Array<F64>&) {
+    for i in range x.Len(): x[i] = 1.0 / (1.0 + fastExp64(-x[i]))
+}
+
+fn SigmoidInPlace32(x mut Array<F32>&) {
+    for i in range x.Len(): x[i] = 1.0 / (1.0 + fastExp32(-x[i]))
+}
+
+fn TanhInPlace64(x mut Array<F64>&) {
+    for i in range x.Len() {
+        a F64 = x[i].Abs()
+        a = 20.0 if a > 20.0 else a
+        v F64 = 1.0 - 2.0 / (fastExp64(a + a) + 1.0)
+        x[i] = v.CopySign(x[i])
+    }
+}
+
+fn TanhInPlace32(x mut Array<F32>&) {
+    for i in range x.Len() {
+        a F32 = x[i].Abs()
+        a = 10.0 if a > 10.0 else a
+        v F32 = 1.0 - 2.0 / (fastExp32(a + a) + 1.0)
+        x[i] = v.CopySign(x[i])
+    }
+}
+
 # the hyperbolic tangent: 1 - 2 / (e^(2|x|) + 1), with x's sign. |x| is held below the point past which tanh rounds to 1
 # in the type (10 in F32, 20 in F64) so that e^(2|x|) stays finite; a NaN gives a NaN. Maximum absolute error 2.0e-7 in
 # F32, 3.0e-16 in F64 (near zero the relative error is larger)
@@ -225,9 +255,40 @@ fn act<S, A>(dst mut Array<S>&, x Array<S>&, a mat.Act) {
         case mat.Act.Gelu { for i in range n: dst[i] = S(geluExact(A(x[i]))) }
         case mat.Act.GeluTanh { for i in range n: dst[i] = S(FastGeluTanh(A(x[i]))) }
         case mat.Act.Silu { for i in range n: dst[i] = S(A(x[i]) * FastSigmoid(A(x[i]))) }
-        case mat.Act.Sigmoid { for i in range n: dst[i] = S(FastSigmoid(A(x[i]))) }
-        case mat.Act.Tanh { for i in range n: dst[i] = S(FastTanh(A(x[i]))) }
+        case mat.Act.Sigmoid {
+            match S {
+                case F64, F32 {
+                    for i in range n: dst[i] = x[i]
+                    sigmoidIn(dst)
+                }
+                case _ { for i in range n: dst[i] = S(FastSigmoid(A(x[i]))) }
+            }
+        }
+        case mat.Act.Tanh {
+            match S {
+                case F64, F32 {
+                    for i in range n: dst[i] = x[i]
+                    tanhIn(dst)
+                }
+                case _ { for i in range n: dst[i] = S(FastTanh(A(x[i]))) }
+            }
+        }
         case mat.Act.Softplus { for i in range n: dst[i] = S(softplus(A(x[i]))) }
+    }
+}
+
+# sigmoid and tanh of every element in place, F64 or F32 storage, by the array-wide forms
+fn sigmoidIn<S>(d mut Array<S>&) {
+    match S {
+        case F64 { SigmoidInPlace64(d) }
+        case _ { SigmoidInPlace32(d) }
+    }
+}
+
+fn tanhIn<S>(d mut Array<S>&) {
+    match S {
+        case F64 { TanhInPlace64(d) }
+        case _ { TanhInPlace32(d) }
     }
 }
 
@@ -246,8 +307,18 @@ fn actInPlace<S, A>(x mut Array<S>&, a mat.Act) {
         case mat.Act.Gelu { for i in range n: x[i] = S(geluExact(A(x[i]))) }
         case mat.Act.GeluTanh { for i in range n: x[i] = S(FastGeluTanh(A(x[i]))) }
         case mat.Act.Silu { for i in range n: x[i] = S(A(x[i]) * FastSigmoid(A(x[i]))) }
-        case mat.Act.Sigmoid { for i in range n: x[i] = S(FastSigmoid(A(x[i]))) }
-        case mat.Act.Tanh { for i in range n: x[i] = S(FastTanh(A(x[i]))) }
+        case mat.Act.Sigmoid {
+            match S {
+                case F64, F32: sigmoidIn(x)
+                case _ { for i in range n: x[i] = S(FastSigmoid(A(x[i]))) }
+            }
+        }
+        case mat.Act.Tanh {
+            match S {
+                case F64, F32: tanhIn(x)
+                case _ { for i in range n: x[i] = S(FastTanh(A(x[i]))) }
+            }
+        }
         case mat.Act.Softplus { for i in range n: x[i] = S(softplus(A(x[i]))) }
     }
 }
@@ -270,6 +341,52 @@ fn actGrad<S, A>(dx mut Array<S>&, dy Array<S>&, x Array<S>&, a mat.Act, add Boo
         case mat.Act.Sigmoid { gradLoop<S, A>(dx, dy, x, add, fn(v): return sigmoidSlope(v)) }
         case mat.Act.Tanh { gradLoop<S, A>(dx, dy, x, add, fn(v): return tanhSlope(v)) }
         case mat.Act.Softplus { gradLoop<S, A>(dx, dy, x, add, fn(v): return FastSigmoid(v)) }
+    }
+}
+
+# whether act'(x) is read from the activation's output y as cheaply as from x: Relu's (y > 0), Sigmoid's y (1 - y), Tanh's
+# 1 - y^2 - no exponential again, and a backward that keeps y needs x no longer
+fn FromOutput(a mat.Act) Bool {
+    return match a {
+        case mat.Act.Relu, mat.Act.Sigmoid, mat.Act.Tanh: true
+        case _: false
+    }
+}
+
+# dx[i] = dy[i] act'(x[i]) read from y[i] = act(x[i]), or dx[i] += that where add - for an activation FromOutput holds
+# for. dx must not overlap dy or y
+fn ActGradOut<T>(dx mut Array<T>&, dy Array<T>&, y Array<T>&, a mat.Act, add Bool) {
+    match T {
+        case F64 { actGradOut<T, F64>(dx, dy, y, a, add) }
+        case _ { actGradOut<T, F32>(dx, dy, y, a, add) }
+    }
+}
+
+fn actGradOut<S, A>(dx mut Array<S>&, dy Array<S>&, y Array<S>&, a mat.Act, add Bool) {
+    n := y.Len()
+    match a {
+        case mat.Act.Relu {
+            if add {
+                for i in range n: dx[i] = S(A(dx[i]) + (A(dy[i]) if A(y[i]) > 0.0 else 0.0))
+                return
+            }
+            for i in range n: dx[i] = S(A(dy[i]) if A(y[i]) > 0.0 else 0.0)
+        }
+        case mat.Act.Sigmoid {
+            if add {
+                for i in range n: dx[i] = S(A(dx[i]) + A(dy[i]) * (A(y[i]) * (1.0 - A(y[i]))))
+                return
+            }
+            for i in range n: dx[i] = S(A(dy[i]) * (A(y[i]) * (1.0 - A(y[i]))))
+        }
+        case mat.Act.Tanh {
+            if add {
+                for i in range n: dx[i] = S(A(dx[i]) + A(dy[i]) * (1.0 - A(y[i]) * A(y[i])))
+                return
+            }
+            for i in range n: dx[i] = S(A(dy[i]) * (1.0 - A(y[i]) * A(y[i])))
+        }
+        case _: unreachable "oann: ActGradOut of an activation whose slope is not read from its output"
     }
 }
 

@@ -291,6 +291,7 @@ fn isLeaf(k Op) Bool {
 # whether an operation's backward reads its inputs' values
 fn readsInputs(k Op) Bool {
     return match k {
+        case Op.Act(_, a): not ops.ActFromOutput(a)
         case Op.Add(_, _), Op.Sub(_, _), Op.Scale(_, _), Op.Softmax(_), Op.LogSoftmax(_), Op.CrossEntropy(_, _): false
         case Op.Embedding(_, _), Op.Positions(_, _), Op.Rope(_, _, _), Op.Dropout(_, _), Op.MaxPool2d(_, _): false
         case Op.Sum(_, _), Op.Reshape(_), Op.Permute(_), Op.Slice(_, _, _), Op.Expand(_), Op.Contiguous(_): false
@@ -302,6 +303,7 @@ fn readsInputs(k Op) Bool {
 fn readsOwn(k Op) Bool {
     return match k {
         case Op.Softmax(_), Op.LogSoftmax(_), Op.Scan(_, _, _), Op.Custom(_, _, _): true
+        case Op.Act(_, a): ops.ActFromOutput(a)
         case _: false
     }
 }
@@ -367,6 +369,11 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     wsI8 mut gemm.Workspace<I32>& = gemm.Workspace<I32>(threads)
     problem String = ""             # the first shape that did not fit, "" while every one has
     planned Bool = false
+    # a captured graph's views of each node's value and gradient (an empty tensor for none) for the entries in use,
+    # made once per batch size rather than at every read: a small graph's step was a quarter views (bench/smallgraph)
+    views mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]
+    gradViews mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]
+    viewsN I64 = -1                 # the entries in use they were made for, -1 while they are not made
 }
 
 # ---- recording ----
@@ -1072,6 +1079,8 @@ fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
     }
     for i in range count: g.initParam(i, r)
     for i in range count: g.reserve(i)
+    g.views = Array<tensor.Tensor<T>>(count, g.empty())
+    g.gradViews = Array<tensor.Tensor<T>>(count, g.empty())
     g.customRoom()
     g.SyncParams()
 }
@@ -1452,24 +1461,58 @@ fn (g Graph<T>&) inUse(nd Node&) tensor.Shape {
 # v's value, a view of its storage: writing it writes the graph. Valid until a later operation of the step reuses the
 # storage, unless v is an input, a parameter, an output, a loss or kept (Keep)
 fn (g Graph<T>&) Value(v Var) tensor.Tensor<T> {
+    if g.viewsN == g.N: return g.views[v]
+    return g.valueView(v)
+}
+
+# every node's views for the entries in use (N), made again whenever a Forward runs on another number of them - a
+# captured graph's alone: an eager one's storage grows as it records
+fn (g mut Graph<T>&) makeViews() {
+    if g.Eager: return
+    g.viewsN = -1
+    for i in range g.nodes.Len() {
+        g.views[i] = g.valueView(Var(i)) if g.placedAt(i) >= 0 else g.empty()
+        g.gradViews[i] = g.gradView(i)
+    }
+    g.viewsN = g.N
+}
+
+fn (g Graph<T>&) valueView(v Var) tensor.Tensor<T> {
+    nd := g.nodes[v]
+    return over<T>(g.vals[g.rootOf(v)].mem, g.placedAt(v), g.inUse(nd), nd.Strides)
+}
+
+# where node v's value starts in its storage: -1 for a node given none (nothing reads it)
+fn (g Graph<T>&) placedAt(v I64) I64 {
     nd := g.nodes[v]
     root := g.rootOf(v)
-    at := nd.Offset + (g.nodes[root].Offset if nd.Base >= 0 else 0)
-    return over<T>(g.vals[root].mem, at, g.inUse(nd), nd.Strides)
+    if g.nodes[root].Offset < 0: return -1
+    return nd.Offset + (g.nodes[root].Offset if nd.Base >= 0 else 0)
 }
 
 # v's gradient, laid out row-major in v's shape - for a node that has one (a parameter, or anything depending on one)
 fn (g Graph<T>&) Grad(v Var) tensor.Tensor<T> {
+    if g.nodes[v].GradOffset < 0: unreachable "oann: the gradient of a node that depends on no parameter"
+    if g.viewsN == g.N: return g.gradViews[v]
+    return g.gradRaw(v)
+}
+
+fn (g Graph<T>&) gradRaw(v Var) tensor.Tensor<T> {
     nd := g.nodes[v]
-    if nd.GradOffset < 0: unreachable "oann: the gradient of a node that depends on no parameter"
     d := g.inUse(nd)
     return over<T>(g.vals[v].mem, nd.GradOffset, d, rowMajor(d))
 }
 
 # v's gradient to contribute to, or an empty tensor where v has none
 fn (g Graph<T>&) gradOf(v I64) tensor.Tensor<T> {
-    if v < 0 or g.nodes[v].GradOffset < 0: return g.empty()
-    return g.Grad(Var(v))
+    if v < 0: return g.empty()
+    if g.viewsN == g.N: return g.gradViews[v]
+    return g.gradView(v)
+}
+
+fn (g Graph<T>&) gradView(v I64) tensor.Tensor<T> {
+    if g.nodes[v].GradOffset < 0: return g.empty()
+    return g.gradRaw(Var(v))
 }
 
 fn (g Graph<T>&) empty() tensor.Tensor<T> {
@@ -1732,6 +1775,7 @@ fn (g mut Graph<T>&) Forward(n I64) {
     if n < 1 or n > g.Batch and not g.Decode: unreachable "oann: Forward on " + $n + " entries of a graph planned for " + $g.Batch
     if g.Decode and g.Pos + n > limit: unreachable "oann: decoding positions " + $g.Pos + " ... " + $(g.Pos + n - 1) + " of " + $limit
     g.N = n
+    if n != g.viewsN: g.makeViews()
     for i in range g.nodes.Len() {
         if isLeaf(g.nodes[i].Kind): continue
         if not g.Profiling {
@@ -1948,7 +1992,9 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
         case Op.Act(x, a) {
             dx := g.gradOf(x)
             ax := g.acc(x)
-            if ops.Wanted(dx): ops.ActBackward(dy, g.Value(x), a, dx, ax)
+            if not ops.Wanted(dx): return
+            if ops.ActFromOutput(a): ops.ActBackwardOut(dy, g.Value(Var(i)), a, dx, ax)
+            else: ops.ActBackward(dy, g.Value(x), a, dx, ax)
         }
         case Op.LeakyRelu(x, slope) {
             dx := g.gradOf(x)
