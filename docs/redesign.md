@@ -997,10 +997,11 @@ path: A2 -> B1 -> B3 -> C1 -> C3.
    quantization is left to differ - and that cost 9% in `F32.Min`/`Max` calls per element for the activations' range.
    The range is now taken in 16 lanes of selects (`graph.rangeOf`). Faster one-row INT8 products need VNNI's pairs
    (`vpdpwssd`) at batch 1: summing adjacent pairs into the lanes by hand made it 2.2x slower, so that is left open.
-7. **Not looked into**: a BF16 matrix-vector product is 0.21x F32's (`bench/storage` 1 x 784 x 128, 19.5 against 4.1
-   us; INT8 weights 0.84x) - a bit-shift widening (`F32.FromBits(bits << 16)`) made it slower still; and `bench/int8`'s
-   F32 products at 64 to 1024 rows run at 12-17 GFLOPS where `bench/storage`'s same products run at 73-150 (the old
-   binary too), so its INT8 ratios at those sizes are against a slow F32 baseline.
+7. **Looked into in the follow-ups (PROGRESS.md, 2026-11-16)**: a BF16 matrix-vector product was 0.21x F32's - two rows
+   against one read of the vector let LLVM pair the rows' widenings in 128-bit pieces; one row at a time it is 0.65x at
+   1 x 784 x 128 and 2.0x at 1 x 1024 x 1024. `bench/int8`'s F32 products at 12-17 GFLOPS were ThinLTO's (the program
+   imported ad/graph through nn/quant, repro/crossinline); without the graph they run at 80-142 and INT8 is 0.53-0.75x
+   F32 at 64-1024 rows.
 
 Measured (a 4-core machine shared with another compiler agent and this agent's `make test`, load 1-5; speeds are ratios
 within one run, before = branch point b4b5d68 built the same way, alternated run by run):
