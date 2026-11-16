@@ -54,3 +54,14 @@ What it cost, and what changed:
 - Rebuild the agent on `dyn` (its rules - `DeltaWrite`, `ThreeFactor`, `Homeostasis` - exist) and drop oagent's
   `agent/legacy/`.
 - The open work of docs/redesign.md: the GPU route (question 1), pruning at run time beyond the masks (question 3).
+
+## History moved out of the READMEs (2026-11-16)
+
+- C3 removed `board.olang`, `circuit.olang`, `linalg`, `quant`'s product, `datasets/` (the first four of `data/`'s modules were
+  `datasets/`'s) and `bench/sparse_kernels.olang`; `git show pre-c3:PATH` has any of them. The parity tests of `board/engine` against
+  `board.olang` (same image, settles, lesson, golden vectors; XOR 400 lessons, spiking XOR 40) and the golden digests' equality with
+  board.olang's dumps were checked before C3. MNIST through the board was first taught in circuit: 90.05 / 91.02 / 91.09%.
+- Speeds against linalg's product, `Gemv` on a settle's blocks, `GemmI8` against quant's product, dense against sparse kernels
+  (M4, M5, M10, M12) and the settle against `circuit.olang`'s (M7) were measured before C3; drivers at branch `pre-c3`.
+- The settling agent's programs (`bandit_settle`, `sleep_retention`, `nights`) moved to oagent with the agent at C3.
+- The repro cases `lambdalend` and `resultgrowth` (on the old `linalg`) were removed with it.

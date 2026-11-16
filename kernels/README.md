@@ -2,7 +2,7 @@
 
 The numeric kernels every layer of oann runs on: functions over 2-D strided operands (`Mat<S>`) and raw arrays,
 independent of `Tensor`, generic over the storage type `S` and the accumulator `A`. They check nothing per element and
-no shapes either: a caller checks a shape once, where it is given (docs/redesign.md, section 3). Each kernel splits its
+no shapes either: a caller checks a shape once, where it is given. Each kernel splits its
 output over tasks (`join`/`spawn`), so a result is the same for every thread count.
 
 | file | what |
@@ -26,11 +26,10 @@ planned - `ad/graph`'s `Plan`, `dyn`'s `Ready` - and one with too little ends th
 So nothing here allocates, and that is pinned while compiling (`assert not Gemm<F32, F32, F32, F32>.Allocates`, S17a):
 every product, attention forward and backward, convolution and sequential scan.
 
-Tests are in each file (`olang test kernels/gemm.olang`); scan's hold the chunked forms to the sequential ones to 1e-5 in F32 and every backward to central differences in F64. Speed against linalg's product, `Gemv` on a settle's blocks and `GemmI8` against quant's product were measured before C3 removed those modules (M4, M5, M12 of docs/redesign.md 4.3; the driver is `bench/gemm.olang` at branch `pre-c3`).
+Tests are in each file (`olang test kernels/gemm.olang`); scan's hold the chunked forms to the sequential ones to 1e-5 in F32 and every backward to central differences in F64.
 
 Sparse and event-driven (`sparse.olang`, `conv.olang`): weights are stored in S and widened as they are read; batches (feature-major: row j
 holds feature j of every sample), results and gradients are in the accumulator A. A pattern a caller gives is checked once, where the matrix is
 made (`PatternError`, `GeometryError`). A product given `threads` splits its output over tasks and is the same for every count; given a `Macs` it adds
 the multiply-adds a dense product would have done and those it did. Pruning at run time: `Mask` zeroes entries in place, `Drop` removes them in
 place (a `Tiles` retires whole tiles, `Compact` moves the live ones together), `Squeeze` moves a companion array (gradient, moments) the same way.
-Speed against dense and against the old modules was measured before C3 removed them (M10 of docs/redesign.md 4.3; `bench/sparse_kernels.olang` at branch `pre-c3`).

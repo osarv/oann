@@ -1,7 +1,6 @@
 # board
 
-The settling engine of the PYNQ-Z2 board (docs/settling.md 4.2) as a backend of `dyn` (docs/redesign.md 1.4 and
-decision 3: the FPGA form is made from a compacted system). A planned `System<T>` is lowered to Q-format saturating
+The settling engine of the PYNQ-Z2 board (docs/settling.md 4.2) as a backend of `dyn` (the FPGA form is made from a compacted system). A planned `System<T>` is lowered to Q-format saturating
 integers and its sweeps are simulated bit for bit: the reference an HLS or hardware implementation of the engine is
 checked against, and the way to see what a system does on the board before there is one.
 
@@ -24,7 +23,7 @@ e.Load(s)!                            # after a learning step: the weights and b
 `Settle(phase, sweeps, tolerance)` takes the tolerance in the system's units and runs to the board's integer tolerance
 for it, `max(tau, 5 steps of Q4.14)` (a spiking system's: the largest change of a rate between windows, in steps of
 Q1.15). The formats, the arithmetic of a sweep and of a spiking time step, and the cycle model are the header of
-`engine.olang`; they are those of `board.olang`, the module this one replaced (removed at C3, branch `pre-c3`), unchanged.
+`engine.olang`.
 
 ## What lowering does
 
@@ -61,19 +60,12 @@ both costs, tolerances of 0, 1 and 5 steps).
 bisected root, equilibria, nudged phases, a lesson, refusals, spiking rates against the analytic rate), these decide
 acceptance:
 
-- **board.olang bit for bit** (until C3 the parity tests ran a system and the circuit made from it side by side on both
-  engines and found the same image, the same settles of the free and both nudged phases, the same lesson, the same golden
-  vectors - rate and spiking, two readout groups, XOR taught for 400 lessons with the weights pushed to both engines after
-  every step, spiking XOR for 40; they went with `board.olang` and `circuit.olang`, and the digests below carry what they
-  checked).
 - **Golden digests** (`digest`): the sha256 of the image of three scenarios (cross-entropy with tanh inputs, squared
-  error with linear inputs, a spiking settle and lesson); board.olang's own dumps had the same
-  digests (checked before C3), so the digests are the golden vectors.
-- **MNIST through the board** (M11, only when `make data` has fetched it): a certified 784-128-10 at T = 0.25 taught for
+  error with linear inputs, a spiking settle and lesson); the digests are the golden vectors.
+- **MNIST through the board** (only when `make data` has fetched it): a certified 784-128-10 at T = 0.25 taught for
   three epochs by dyn's equilibrium propagation (`learn.Learner`, F32, Adam 1e-3, beta 0.5, restrained to the certified
   set after every step), lowered, the test set answered by the engine: 90.05 / 91.07 / 91.06% after epochs 1 / 2 / 3,
-  the same as dyn's F32 settles (answers agreeing on 99.99-100%), 3.9-4.0 sweeps a settle (taught in circuit before
-  dyn's rules landed: 90.05 / 91.02 / 91.09%).
+  the same as dyn's F32 settles (answers agreeing on 99.99-100%), 3.9-4.0 sweeps a settle.
 
 Allocation-free, pinned while compiling (S17a, G42; `assert not f.Allocates`): a sweep's totals (plain and nudged), its
 residual and step, a settle's constants, a settle (`relax`), a run of sweeps, a spiking time step and a window's end,
@@ -83,9 +75,7 @@ allocate (the processing system's side, once per learning step).
 ## Not built
 
 - Learning rules: the contrast, the optimizer and `Restrain` are dyn's (`dyn/learn`, B2b); `Lesson` settles the three
-  phases on the engine and stores them back for it. board.olang's `Teach` took circuit's contrast (both gone with C3).
+  phases on the engine and stores them back for it.
 - `StoreParams` into a tiled or low-rank block (no stored form to write the board's weights into).
 - dyn's `Budget.Damping`: the engine damps as the board does, by halving the step over `Attempts` parts of the budget.
 - A hardware engine; the PYNQ-Z2 overlay waits for an FPGA toolchain.
-
-board.olang is gone (C3); `git show pre-c3:board.olang` has it.

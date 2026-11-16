@@ -3,8 +3,7 @@
 Neural networks in olang: N-d tensors, kernels, a recorded graph with automatic differentiation, layers, losses,
 optimizers, transformers, state-space models, convolutions, INT8 inference, safetensors checkpoints, byte-pair tokens -
 and settling networks, systems that learn by settling into a state (docs/settling.md), with a fixed-point engine for an
-FPGA. Every kernel is olang; nothing links a BLAS. `DESIGN.md` is the design as it stands; `docs/redesign.md` is the
-plan and what each package measured.
+FPGA. Every kernel is olang; nothing links a BLAS. `DESIGN.md` is the design as it stands.
 
 ## Using oann
 
@@ -64,11 +63,6 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `examples/` | the programs the makefile runs: MNIST, transformers, settling systems, INT8, the board (`examples/README.md`) |
 | `bench/` | benchmarks and the checks against reference implementations (`bench/ref/`) |
 | `docs/settling.md` | settling networks: the model, the papers it rests on, the open questions |
-| `docs/redesign.md` | the redesign: architecture, module map, work packages and what each measured |
-| `docs/design-history.md` | the design record of rounds 1 and 2, before the redesign |
 | `repro/` | minimal programs for olang issues found here (`repro/README.md`) |
 
-The first settling agent (its memory store, sleep, the bandit and nights experiments) was built on the circuit this
-design replaced and lives in oagent's `agent/`; what a library needs of it is `dyn`'s rules.
-
-`PROGRESS.md` is the hand-off note of the work in progress. `git show pre-c3:PATH` has any file the cut-over removed.
+The settling agent (its memory store, sleep, the bandit and nights experiments) lives in oagent's `agent/`; what a library needs of it is `dyn`'s rules.
