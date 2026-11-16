@@ -216,6 +216,27 @@ Measured one core, AVX-512 VNNI, alternated before/after runs on the shared mach
 Batch 1 takes the one-row path, unchanged. The CNN stays at F32's speed or below: its products are 9 and 144 deep
 (100352 x 9 x 16 runs at 4 GOPS, 7x F32's time - not yet profiled), and the rest of its forward is not INT8.
 
+## INT8 convolution at depth 9 (wt-oannconv, 2026-11-16)
+
+Profile (`bench/convprof.olang`, 100352 x 9 x 16, one core, per call): quantize 0.2 ms, `GemmI8` 5.1-5.9 ms, bias and ReLU 0.34-0.44 ms.
+The product was nearly all of it: at depth 9 the thin tile's sixteen-wide outer-product steps run for 9 steps and the pack of the
+activations (`packI8`) read each row with a stride per panel step. Two changes in kernels/gemm.olang: `packI8` walks the panel step by
+step (the writes sequential, the reads one per row), and a depth up to 32 takes `microI8Shallow` - each tile row its own sum over the
+depth, one vector of outputs against the weights' panel. Bit-exact (the gemm tests against the reference pass). `GemmI8` 5.1-5.9 -> 2.1-2.5 ms
+(2.4x); the rest (quantize + dequantize) is now 25% of the call and not fused: it is memory-bound at one pass each.
+Alternated old/new runs, F32 / INT8 (static) in `bench/int8cnn`:
+
+| batch | before dynamic / static | after dynamic / static |
+|---|---|---|
+| 1 | 0.72x / 0.72x | 1.00x / 0.99x |
+| 64 | 0.89x / 1.08x | 1.31x / 1.63x |
+| 128 | 1.01x / 1.00x | 1.33x / 1.45x |
+
+`bench/int8` 100352 x 9 x 16 still reads 0.34x / 0.44x of F32 alone (F32's depth-9 product runs at 22 GFLOPS, INT8's 7-10 GOPS with its
+quantize and dequantize passes), but the whole CNN is now ahead of F32 at batches 64 and 128. Not done: fusing im2col with quantize
+(the patches are built in F32 then quantized; one pass saved of three) - a direct kernel would save under 0.2 ms of 12 ms. Accuracy is untouched (the
+products are bit-identical). The batch-1 path is the old one-row dot products.
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
@@ -275,7 +296,18 @@ and multiply-adds (`Macs`) of one settle at the sweeps an answer took (once = th
 | 50% kept (after Sparsify) | 1 / 2 | 97.34 / 97.33% | 50816 | 50141 / 2560 | 88541 / 91083 |
 | 20% kept (after Sparsify) | 1 / 2 | 97.43 / 97.52% | 20327 | 20013 / 628 | 31945 (seed 1) / 33002 |
 
-Pruning at 20% kept holds (even exceeds, by a little more training: the pruned runs also take 1000 more lessons than the dense
-3 epochs) the dense accuracy and costs 4.3x fewer multiply-adds a settle (a sweep 628 against 2560 multiply-adds);
+Pruning at 20% kept holds the dense accuracy (against a dense run given the same lessons, see below) and costs 4.3x fewer multiply-adds a settle (a sweep 628 against 2560 multiply-adds);
 answers take more sweeps (18.7-19.9 against 14-15). At 50% the recurrent hidden-readout block is not thinned at all (2560 a sweep);
 the pixel connection takes the cut. Two seeds only.
+
+Fair dense control (wt-oannconv): the pruned runs teach 3 epochs plus 8 ticks of 200 lessons = 1600 more (none refused). A dense run
+given the same lessons (`mnist_learn`'s 13th argument: `3 60000 128 32 SEED 0.001 0.5 1 1 0.1 200 1 1600`):
+
+| run | seed 1 / 2 accuracy |
+|---|---|
+| dense, 3 epochs | 96.71 / 97.10% |
+| dense, 3 epochs + 1600 lessons (same lessons as pruned) | 97.32 / 97.43% |
+| 20% kept (after Sparsify) | 97.43 / 97.52% |
+
+So most of the earlier gain was the extra lessons. Pruned to 20% is level with the equal-lesson dense run (+0.11 / +0.09 points, inside what two
+seeds can show) with 4.3x fewer multiply-adds a settle: pruning costs no accuracy here, it does not add any measurable.

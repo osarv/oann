@@ -1,0 +1,62 @@
+# where the time of a depth-9 INT8 product goes: quantize, GemmI8 (tiles + dequantize), finish (bias, ReLU). Arguments: rows (100352), depth (9), outputs (16). olang build -output build/bench_convprof bench/convprof.olang && build/bench_convprof
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../nn/quant"
+import "../tensor"
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    m, k, n := 100352, 9, 16
+    if args.Len() >= 4 {
+        m = try args[1].ParseInt()
+        k = try args[2].ParseInt()
+        n = try args[3].ParseInt()
+    }
+    r := rand.Rand(1)
+    x := Array<F32>[F32(r.Float()) for _ in range m * k]
+    w := tensor.Tensor<F32>.Zeros(n, k)
+    w.FillUniform(r, -0.2, 0.2)
+    bias := Array<F32>[F32(r.Float() * 0.2 - 0.1) for _ in range n]
+    qw := quant.Weights.Quantize(w)
+    acts := Array<U8>(m * k)
+    sums := Array<I32>(m * n)
+    scales := Array<F32>[0.001 for _ in range n]
+    y := Array<F32>(m * n)
+    ws := gemm.Workspace<I32>(1, 1024)
+    ws.ReserveI8(n, k)
+    for _ in range 3 {
+        t0 := time.Now()
+        for _ in range 20: quantize(acts, x, m * k, 0.01, 128)
+        t1 := time.Now()
+        a := mat.Mat<U8>(acts, 0, m, k, k)
+        q := mat.Mat<I8>(qw.Q, 0, n, k, k)
+        c := mat.Mat<I32>(sums, 0, m, n, n)
+        o := mat.Mat<F32>(y, 0, m, n, n)
+        for _ in range 20: gemm.GemmI8(ws, c, a, q, scales, o, 128, qw.Sum)
+        t2 := time.Now()
+        for _ in range 20: finish(m, n, bias, true, y)
+        t3 := time.Now()
+        try io.Put("quantize " + $(F64(t1 - t0) / 20e3).Fixed(0) + " us, gemm " + $(F64(t2 - t1) / 20e3).Fixed(0) + " us, finish " + $(F64(t3 - t2) / 20e3).Fixed(0) + " us\n")
+    }
+}
+
+fn quantize(dst mut Array<U8>&, x Array<F32>&, n I64, step F32, zero I32) {
+    inv F32 = 1.0 / step
+    zp F32 = F32(zero)
+    for k in range n {
+        q F32 = (x[k] * inv).RoundEven() + zp
+        dst[k] = U8(0.0 if q < 0.0 else (255.0 if q > 255.0 else q))
+    }
+}
+
+fn finish(rows I64, outs I64, b Array<F32>&, relu Bool, y mut Array<F32>&) {
+    for r in range rows {
+        base := r * outs
+        if relu { for o in range outs: y[base + o] = (y[base + o] + b[o]).Max(0.0) }
+        else { for o in range outs: y[base + o] = y[base + o] + b[o] }
+    }
+}

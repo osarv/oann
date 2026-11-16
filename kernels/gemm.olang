@@ -1330,12 +1330,10 @@ fn (q quant&) tilesI8<H, P>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, sh
 
 # activations' rows r0 .. r0 + rows into a panel mr wide, step by step (pa[p mr + i] = a[r0 + i, p]), zeros past rows
 fn (x operand<U8>&) packI8(r0 I64, rows I64, k I64, mr I64, pa mut Array<U8>&) {
-    for i in range rows {
-        s I64 = (r0 + i) * x.ld
-        for p in range k: pa[p * mr + i] = x.d[s + p]
-    }
-    for i in range rows, mr {
-        for p in range k: pa[p * mr + i] = 0
+    s I64 = r0 * x.ld
+    for p in range k {
+        for i in range rows: pa[p * mr + i] = x.d[s + i * x.ld + p]
+        for i in range rows, mr: pa[p * mr + i] = 0
     }
 }
 
@@ -1374,12 +1372,36 @@ fn microI8Wide(depth I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&
 }
 
 fn microI8Thin(depth I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
+    if depth <= i8Shallow {
+        microI8Shallow(depth, pa, qb, bo, t)
+        return
+    }
     acc := tile<I32>()
     for p in range depth {
         b I64 = bo + p * i8Lanes
         comptime for i in range i8ThinRows { stepI8(acc, i * i8Lanes, pa[p * i8ThinRows + i], qb, b, i8Lanes) }
     }
     for i in range i8ThinRows * i8Lanes: t.v[i] = acc.v[i]
+}
+
+# a depth too short for the outer products' sixteen-wide steps to pay (the CNN's first convolution, 9 deep): each row
+# of the tile is its own sum over the depth, one vector of outputs against the weights' panel read from L1
+i8Shallow I64 = 32
+
+fn microI8Shallow(depth I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
+    for i in range i8ThinRows {
+        acc := lanesI32()
+        for p in range depth {
+            x := I32(pa[p * i8ThinRows + i])
+            b I64 = bo + p * i8Lanes
+            for j in range i8Lanes: acc.v[j] = acc.v[j] + x * I32(qb[b + j])
+        }
+        for j in range i8Lanes: t.v[i * i8Lanes + j] = acc.v[j]
+    }
+}
+
+type lanesI32 struct() {
+    v := Array<I32>(i8Lanes)
 }
 
 # acc[base + j] += a q[j]: a zero-extended U8 times a sign-extended I8, accumulated in I32

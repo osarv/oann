@@ -6,7 +6,8 @@
 # optional: the epochs (1), the training samples used (60000), the hidden units (128), the batch (32), the seed (1),
 # Adam's rate (0.001), beta (0.5), the threads a sweep may be split over (1), the fraction of the weights kept (1, no
 # pruning: below 1 a Prune rule (magnitude, cubic schedule) thins the trained system tick by tick), the pace of a tick
-# (0.1), the lessons between ticks (200) and the epochs relearned after (1).
+# (0.1), the lessons between ticks (200), the epochs relearned after (1) and, for a dense run (keep 1), the lessons taught after
+# the epochs (0: a control with as many lessons as a pruned run took).
 
 import "std/io"
 import "std/json"
@@ -42,6 +43,7 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     pace := try number(args, 10, 0.1)
     between := I64(try number(args, 11, 200))
     relearn := I64(try number(args, 12, 1))
+    extra := I64(try number(args, 13, 0))
     data := try mnist.Mnist.Load("data/mnist", mnist.Source)
     part := loader.Labeled(data.Train.Features[:samples * 784], data.Train.Labels[:samples], 784, 10)
 
@@ -66,7 +68,10 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     for e in range 1, epochs + 1 {
         try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "epoch " + $e, 0)
     }
-    if keep >= 1.0: return
+    if keep >= 1.0 {
+        if extra > 0: try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "extra " + $extra, extra)
+        return
+    }
     m := s.Macs()
     try io.Put("dense: " + $m.Once + " multiply-adds once a settle, " + $m.Sweep + " a sweep\n")
     ticks := 0
