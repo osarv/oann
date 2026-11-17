@@ -9,7 +9,9 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	ad/graph.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
-	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang
+	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/store.olang dyn/sleep.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
+	bayes/dense.olang bayes/gauss.olang bayes/quadrature.olang bayes/laplace.olang bayes/state.olang bayes/target.olang bayes/vi.olang \
+	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang
 
 .DEFAULT_GOAL := help
 

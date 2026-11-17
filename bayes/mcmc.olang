@@ -1,0 +1,363 @@
+# bayes/mcmc - Markov chain Monte Carlo: the exact posterior, for checking a fast approximation or where none is good.
+# Random-walk Metropolis over any `Density` (proposals shaped by a Cholesky factor, the scale adapted during burn-in);
+# Hamiltonian Monte Carlo over any target.Differentiable (oann's graph through target.GraphTarget): leapfrog
+# trajectories under a diagonal metric, the step size tuned by dual averaging and the metric by the warm-up's variances,
+# the trajectory length found during warm-up by the no-U-turn criterion and then jittered around it (NUTS-lite: a fixed
+# kernel after warm-up, so the chain is a proper HMC chain). Diagnostics: the effective sample size (Geyer's initial
+# monotone sequence) and split R-hat over several chains.
+#
+#     c := mcmc.Chain.Metropolis(post, start, shape, 20000, 5000, r)
+#     h := mcmc.Chain.Hmc(t, start, 2000, 1000, r)
+#     h.Mean(i), h.Sd(i), mcmc.Ess(h.Column(i)), mcmc.SplitRHat(column of several chains, chains)
+
+import "std/rand"
+import "dense"
+import "target"
+import "gauss"
+import "laplace"
+import "../ad/graph"
+
+# what gives a log density, up to a constant
+type Density trait {
+    LogDensity(z Array<F64>&) F64
+}
+
+# the draws kept, row after row, the share of proposals accepted after warm-up, and HMC's tuned step and length
+type Chain struct(dim I64) {
+    Dim I64 = dim
+    Draws Vec<F64>
+    Accepted F64
+    Step F64
+    Leapfrogs I64
+}
+
+# how many draws were kept
+fn (c Chain&) Len() I64 { return c.Draws.Len() / c.Dim }
+
+# component i over the draws
+fn (c Chain&) Column(i I64) Array<F64> { return Array<F64>[c.Draws.At(k * c.Dim + i) for k in range c.Len()] }
+
+# the mean of component i over the draws
+fn (c Chain&) Mean(i I64) F64 { return mean(c.Column(i)) }
+
+# the standard deviation of component i over the draws
+fn (c Chain&) Sd(i I64) F64 { return variance(c.Column(i)).Sqrt() }
+
+fn mean(x Array<F64>&) F64 {
+    s F64 = 0.0
+    for v in x: s += v
+    return s / F64(x.Len())
+}
+
+fn variance(x Array<F64>&) F64 {
+    m := mean(x)
+    s F64 = 0.0
+    for v in x: s += (v - m) * (v - m)
+    return s / F64(x.Len() - 1)
+}
+
+# ---- random-walk Metropolis ----
+
+# steps draws of d's density after burn more, from start, proposals shaped by the lower-triangular shape (dim by dim);
+# every thin-th draw kept
+fn Chain.Metropolis<D Density>(d D&, start Array<F64>&, shape Array<F64>&, steps I64, burn I64, r mut rand.Rand&, thin I64 = 1) Chain {
+    n := start.Len()
+    c := Chain(n)
+    z := Array<F64>[v for v in start]
+    here := d.LogDensity(z)
+    scale := 2.38 / F64(n).Sqrt()
+    accepted I64 = 0
+    proposal := Array<F64>(n, 0.0)
+    for t in range burn + steps {
+        move := dense.LowerTimes(shape, r.Normals(n), n)
+        for i in range n: proposal[i] = z[i] + scale * move[i]
+        there := d.LogDensity(proposal)
+        took := there - here >= 0.0 or r.Float().Log() < there - here
+        if took {
+            for i in range n: z[i] = proposal[i]
+            here = there
+        }
+        if t < burn {
+            scale *= (0.01 * ((1.0 if took else 0.0) - 0.25)).Exp()
+            continue
+        }
+        if took: accepted++
+        if (t - burn) % thin == 0: c.Draws.PushAll(z)
+    }
+    c.Accepted = F64(accepted) / F64(steps)
+    return c
+}
+
+# ---- Hamiltonian Monte Carlo ----
+
+# a point of phase space: position, momentum, the gradient at the position and the log density there
+type phase struct(n I64) {
+    Z Array<F64> = Array<F64>(n, 0.0)
+    P Array<F64> = Array<F64>(n, 0.0)
+    G Array<F64> = Array<F64>(n, 0.0)
+    LogP F64
+}
+
+# a copy of the point
+fn (a phase&) Copy() phase {
+    out := phase(a.Z.Len())
+    for i in range a.Z.Len() {
+        out.Z[i] = a.Z[i]
+        out.P[i] = a.P[i]
+        out.G[i] = a.G[i]
+    }
+    out.LogP = a.LogP
+    return out
+}
+
+# one leapfrog step of size eps under the diagonal inverse metric minv
+fn leapfrog<D target.Differentiable>(t D&, s mut phase&, eps F64, minv Array<F64>&) {
+    n := s.Z.Len()
+    for i in range n: s.P[i] += 0.5 * eps * s.G[i]
+    for i in range n: s.Z[i] += eps * minv[i] * s.P[i]
+    s.LogP = t.Gradient(s.Z, s.G)
+    for i in range n: s.P[i] += 0.5 * eps * s.G[i]
+}
+
+# the kinetic energy p^T M^-1 p / 2
+fn kinetic(s phase&, minv Array<F64>&) F64 {
+    k F64 = 0.0
+    for i in range s.P.Len(): k += 0.5 * minv[i] * s.P[i] * s.P[i]
+    return k
+}
+
+# whether the trajectory from a to b has turned back: (z_b - z_a) . M^-1 p_b < 0
+fn turned(a phase&, b phase&, minv Array<F64>&) Bool {
+    s F64 = 0.0
+    for i in range a.Z.Len(): s += (b.Z[i] - a.Z[i]) * minv[i] * b.P[i]
+    return s < 0.0
+}
+
+# the dual-averaging step size adaptation (Hoffman and Gelman, section 3.2), toward an acceptance of delta
+type averager struct(eps F64, delta F64) {
+    Mu F64 = (10.0 * eps).Log()
+    Delta F64 = delta
+    Hbar F64 = 0.0
+    LogEps F64 = eps.Log()
+    LogEpsBar F64 = 0.0
+    T I64 = 0
+}
+
+fn (a mut averager&) Learn(accept F64) {
+    a.T++
+    t := F64(a.T)
+    a.Hbar = (1.0 - 1.0 / (t + 10.0)) * a.Hbar + (a.Delta - accept) / (t + 10.0)
+    a.LogEps = a.Mu - t.Sqrt() / 0.05 * a.Hbar
+    w := t.Pow(-0.75)
+    a.LogEpsBar = w * a.LogEps + (1.0 - w) * a.LogEpsBar
+}
+
+# steps draws of t's density after warmup more, from start. During warm-up each trajectory runs until it turns (at most
+# maxLeapfrogs), the step size is tuned toward an acceptance of delta, and at the half the diagonal metric is set to
+# the first half's variances; after it the step is fixed and each trajectory's length drawn uniformly from half to one
+# and a half times the warm-up's median length
+fn Chain.Hmc<D target.Differentiable>(t D&, start Array<F64>&, steps I64, warmup I64, r mut rand.Rand&, step F64 = 0.1, delta F64 = 0.8, maxLeapfrogs I64 = 256) Chain {
+    n := start.Len()
+    c := Chain(n)
+    minv := Array<F64>(n, 1.0)
+    here := phase(n)
+    for i in range n: here.Z[i] = start[i]
+    here.LogP = t.Gradient(here.Z, here.G)
+    avg := averager(step, delta)
+    eps := step
+    half := warmup / 2
+    early := Vec<F64>()                      # the first half's draws, for the metric
+    lengths := Vec<I64>()
+    accepted F64 = 0.0
+    for it in range warmup + steps {
+        if it == half and half > 1 {
+            setMetric(minv, early, n)
+            avg = averager(eps, delta)
+        }
+        if it == warmup: eps = avg.LogEpsBar.Exp()
+        for i in range n: here.P[i] = r.Normal() / minv[i].Sqrt()
+        h0 := kinetic(here, minv) - here.LogP
+        s := here.Copy()
+        length I64 = 0
+        if it < warmup {
+            for _ in range maxLeapfrogs {
+                leapfrog(t, s, eps, minv)
+                length++
+                if turned(here, s, minv): break
+            }
+        } else {
+            length = jitter(lengths, r)
+            for _ in range length: leapfrog(t, s, eps, minv)
+        }
+        h1 := kinetic(s, minv) - s.LogP
+        accept := (h0 - h1).Min(0.0).Exp() if not h1.IsNan() else 0.0
+        if r.Float() < accept: here = s
+        if it < warmup {
+            avg.Learn(accept)
+            eps = avg.LogEps.Exp()
+            if it >= half: lengths.Push(length)
+            if it < half: early.PushAll(here.Z)
+            continue
+        }
+        accepted += accept
+        c.Draws.PushAll(here.Z)
+    }
+    c.Accepted = accepted / F64(steps)
+    c.Step = eps
+    c.Leapfrogs = median(lengths)
+    return c
+}
+
+# the inverse metric: each component's variance over the draws, shrunk toward 1e-3 as Stan's windowed adaptation does
+fn setMetric(minv mut Array<F64>&, draws Vec<F64>&, n I64) {
+    k := draws.Len() / n
+    if k < 3: return
+    for i in range n {
+        v := variance(Array<F64>[draws.At(j * n + i) for j in range k])
+        minv[i] = (F64(k) / (F64(k) + 5.0)) * v + 1e-3 * (5.0 / (F64(k) + 5.0))
+    }
+}
+
+# the median of the lengths, at least 1
+fn median(lengths Vec<I64>&) I64 {
+    if lengths.Len() == 0: return 1
+    s := Array<I64>[v for v in lengths.View()]
+    s.Sort(fn(x, y): return x < y)
+    return s[s.Len() / 2].Max(1)
+}
+
+# a trajectory length drawn uniformly from half to one and a half times the median
+fn jitter(lengths Vec<I64>&, r mut rand.Rand&) I64 {
+    m := median(lengths)
+    lo := (m / 2).Max(1)
+    return lo + r.Below(m + 1)
+}
+
+# ---- diagnostics ----
+
+# the effective sample size of a chain's series: n / tau, tau = 1 + 2 sum of autocorrelations, summed in pairs until a
+# pair goes negative and kept monotone (Geyer's initial monotone sequence)
+fn Ess(x Array<F64>&) F64 {
+    n := x.Len()
+    m := mean(x)
+    c0 := autocov(x, m, 0)
+    if c0 <= 0.0: return F64(n)
+    tau F64 = -1.0
+    last F64 = 1.0e300
+    for k in range n / 2 {
+        pair := (autocov(x, m, 2 * k) + autocov(x, m, 2 * k + 1)) / c0
+        if pair < 0.0: break
+        pair = pair.Min(last)
+        last = pair
+        tau += 2.0 * pair
+    }
+    return F64(n) / tau.Max(1.0 / F64(n).Log10())
+}
+
+fn autocov(x Array<F64>&, m F64, lag I64) F64 {
+    s F64 = 0.0
+    for t in range x.Len() - lag: s += (x[t] - m) * (x[t + lag] - m)
+    return s / F64(x.Len())
+}
+
+# split R-hat (Gelman et al.) of chains series concatenated one after another, each split in two halves: the square root
+# of the pooled variance estimate over the within-chain variance; near 1 when the chains agree
+fn SplitRHat(x Array<F64>&, chains I64) F64 {
+    halves := 2 * chains
+    len := x.Len() / halves
+    means := Array<F64>(halves, 0.0)
+    within F64 = 0.0
+    for h in range halves {
+        part := Array<F64>[x[h * len + k] for k in range len]
+        means[h] = mean(part)
+        within += variance(part) / F64(halves)
+    }
+    between := F64(len) * variance(means)
+    pooled := (F64(len - 1) / F64(len)) * within + between / F64(len)
+    return (pooled / within).Sqrt()
+}
+
+# ---- tests ----
+
+# a correlated normal: N((1, -2), [[1, 1.2], [1.2, 4]]), its density and gradient in closed form
+type normal2 struct() {
+    rho F64 = 0.6
+}
+
+fn (p normal2&) Dim() I64 { return 2 }
+
+fn (p normal2&) LogDensity(z Array<F64>&) F64 {
+    x := z[0] - 1.0
+    y := (z[1] + 2.0) / 2.0
+    return -(x * x - 2.0 * p.rho * x * y + y * y) / (2.0 * (1.0 - p.rho * p.rho))
+}
+
+fn (p normal2&) Gradient(z Array<F64>&, grad mut Array<F64>&) F64 {
+    x := z[0] - 1.0
+    y := (z[1] + 2.0) / 2.0
+    k := 1.0 / (1.0 - p.rho * p.rho)
+    grad[0] = -k * (x - p.rho * y)
+    grad[1] = -k * (y - p.rho * x) / 2.0
+    return p.LogDensity(z)
+}
+
+test "Metropolis on a correlated normal" {
+    r := rand.Rand(7)
+    c := Chain.Metropolis(normal2(), Array<F64>[0.0, 0.0], dense.Identity(2), 60000, 5000, r)
+    assert (c.Mean(0) - 1.0).Abs() < 0.05 and (c.Mean(1) + 2.0).Abs() < 0.1
+    assert (c.Sd(0) - 1.0).Abs() < 0.05 and (c.Sd(1) - 2.0).Abs() < 0.1
+    assert c.Accepted > 0.15 and c.Accepted < 0.4
+}
+
+test "HMC on a correlated normal, with its diagnostics" {
+    r := rand.Rand(11)
+    series := Vec<F64>()
+    for k in range 4 {
+        c := Chain.Hmc(normal2(), Array<F64>[F64(k) - 2.0, 3.0], 2000, 1000, r)
+        assert (c.Mean(0) - 1.0).Abs() < 0.1 and (c.Mean(1) + 2.0).Abs() < 0.2
+        assert (c.Sd(0) - 1.0).Abs() < 0.08 and (c.Sd(1) - 2.0).Abs() < 0.16
+        assert c.Accepted > 0.6 and c.Leapfrogs >= 1
+        # HMC's draws are nearly independent here: far more effective draws than Metropolis' quarter-accepted walk
+        assert Ess(c.Column(0)) > 500.0
+        series.PushAll(c.Column(1))
+    }
+    all := Array<F64>[v for v in series.View()]
+    assert SplitRHat(all, 4) < 1.02
+    # chains that disagree are flagged
+    apart := Array<F64>[all[k] + (3.0 if k >= all.Len() / 2 else 0.0) for k in range all.Len()]
+    assert SplitRHat(apart, 4) > 1.2
+}
+
+test "the effective sample size of an AR(1) series" {
+    # x_t = 0.5 x_(t-1) + e_t: tau = (1 + 0.5) / (1 - 0.5) = 3
+    r := rand.Rand(2)
+    n := 60000
+    x := Array<F64>(n, 0.0)
+    for t in range 1, n: x[t] = 0.5 * x[t - 1] + r.Normal()
+    ess := Ess(x)
+    assert (ess / F64(n) - 1.0 / 3.0).Abs() < 0.03
+}
+
+test "Laplace against HMC and Metropolis on a small logistic regression" {
+    r := rand.Rand(21)
+    n := 60
+    data := target.Data.Logistic(n, Array<F64>[0.3, -1.0, 1.5], r)
+    g := graph.Graph<F64>(1)
+    nodes := target.Logistic.Record(g, n, 3, 4.0)
+    try g.Plan(r)
+    nodes.Set(g, data.X, data.Y)
+    t := target.GraphTarget(g, nodes.Loss)
+    # Laplace: the prior N(0, 4 I), all observations at once
+    lap := gauss.Gaussian.Isotropic(3, 4.0)
+    try laplace.Update(lap, laplace.Rows(data.X, Array<F64>(n, 0.0)), laplace.Likelihood(laplace.Family.Logit), data.Y, Array<F64>(0))
+    h := Chain.Hmc(t, lap.Mean, 8000, 1000, r)
+    m := Chain.Metropolis(t, lap.Mean, try lap.Factor(), 60000, 5000, r)
+    for i in range 3 {
+        sd := h.Sd(i)
+        # at n = 60 the posterior is skewed a little: Laplace's mode sits about a third of a posterior sd from the mean
+        # (0.11, 0.31, 0.26 sd measured), its sds within 10% (6%, 5%, 5% low)
+        assert (lap.Mean[i] - h.Mean(i)).Abs() < 0.4 * sd
+        assert (lap.Sd(i) / sd - 1.0).Abs() < 0.1
+        assert (m.Mean(i) - h.Mean(i)).Abs() < 0.1 * sd and (m.Sd(i) / sd - 1.0).Abs() < 0.1
+    }
+}

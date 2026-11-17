@@ -1,0 +1,133 @@
+# bayes/target - what gradient-based inference (vi's ADVI, mcmc's HMC) asks of a model: the log of its joint density
+# (an unnormalised posterior) over Dim() unconstrained parameters, and its gradient. A model written on oann's
+# recorded graph is one through `GraphTarget`: the graph's parameter region is the point z, its loss node the NEGATED
+# log joint, and its Backward the gradient - so any model the graph can express (a linear predictor, a network) is a
+# target with nothing written by hand. A closed-form density implements `Differentiable` directly.
+#
+#     g := graph.Graph<F64>(1)
+#     z := g.Param(graph.Init.Zeros, false, 1, d)            # the parameters, in the order Params() lays them out
+#     loss := ...                                            # -log p(data, z), a scalar
+#     try g.Plan(r)
+#     t := target.GraphTarget(g, loss)
+#     lp := t.Gradient(point, grad)                         # log p and its gradient at point
+
+import "../ad/graph"
+import "../kernels/mat"
+import "std/rand"
+
+# a log density over Dim() components, up to a constant, and its gradient
+type Differentiable trait {
+    Dim() I64
+    LogDensity(z Array<F64>&) F64
+    Gradient(z Array<F64>&, grad mut Array<F64>&) F64      # the log density, its gradient written into grad
+}
+
+# a target from a planned F64 graph: its parameters the point, loss the negated log density
+type GraphTarget struct(g mut graph.Graph<F64>&, loss graph.Var) {
+    G mut graph.Graph<F64>& = g
+    Loss graph.Var = loss
+}
+
+fn (t GraphTarget&) Dim() I64 { return t.G.ParamCount }
+
+# the point z written into the graph's parameters
+fn (t GraphTarget&) put(z Array<F64>&) {
+    p := t.G.Params().Flat()!
+    for i in range z.Len(): p[i] = z[i]
+}
+
+fn (t GraphTarget&) LogDensity(z Array<F64>&) F64 {
+    t.put(z)
+    t.G.Forward(1)
+    return -t.G.Scalar(t.Loss)
+}
+
+fn (t GraphTarget&) Gradient(z Array<F64>&, grad mut Array<F64>&) F64 {
+    t.put(z)
+    t.G.Forward(1)
+    t.G.Backward(t.Loss)
+    gr := t.G.ParamGrads().Flat()!
+    for i in range z.Len(): grad[i] = -gr[i]
+    return -t.G.Scalar(t.Loss)
+}
+
+# ---- a model on the graph: Bayesian logistic regression ----
+
+# the negated log joint of logistic regression with a N(0, priorVar I) prior, recorded on g: x n by d (row after row),
+# y in {0, 1}; the weights the graph's one parameter. -log p = sum softplus(eta) - sum y eta + |w|^2 / (2 priorVar),
+# eta = x w. Gives the nodes; the data are written after Plan by `Set`
+fn Logistic.Record(g mut graph.Graph<F64>&, n I64, d I64, priorVar F64) Logistic {
+    out := Logistic()
+    w := g.Param(graph.Init.Zeros, false, 1, d)
+    out.X = g.Constant(n, d)
+    out.Y = g.Constant(n, 1)
+    eta := g.Linear(out.X, w)
+    fit := g.Sub(g.Act(eta, mat.Act.Softplus), g.Mul(out.Y, eta))
+    prior := g.Scale(g.Sum(g.Sum(g.Mul(w, w))), 0.5 / priorVar)
+    out.Loss = g.Add(g.Sum(g.Sum(fit)), prior)
+    return out
+}
+
+# the nodes Logistic.Record records: the data's constants and the loss
+type Logistic struct() {
+    X graph.Var
+    Y graph.Var
+    Loss graph.Var
+}
+
+# the data written into a planned Logistic graph
+fn (nodes Logistic&) Set(g graph.Graph<F64>&, x Array<F64>&, y Array<F64>&) {
+    xv := g.Value(nodes.X).Flat()!
+    yv := g.Value(nodes.Y).Flat()!
+    for i in range x.Len(): xv[i] = x[i]
+    for i in range y.Len(): yv[i] = y[i]
+}
+
+# a small logistic data set drawn from weights w: x n by w.Len(), the first column 1 (an intercept)
+type Data struct(n I64, d I64) {
+    X Array<F64> = Array<F64>(n * d, 0.0)
+    Y Array<F64> = Array<F64>(n, 0.0)
+}
+
+fn Data.Logistic(n I64, w Array<F64>&, r mut rand.Rand&) Data {
+    d := w.Len()
+    out := Data(n, d)
+    for i in range n {
+        eta F64 = 0.0
+        for j in range d {
+            out.X[i * d + j] = 1.0 if j == 0 else r.Normal()
+            eta += out.X[i * d + j] * w[j]
+        }
+        out.Y[i] = 1.0 if r.Float() < 1.0 / (1.0 + (-eta).Exp()) else 0.0
+    }
+    return out
+}
+
+test "a graph's gradient is the log joint's" {
+    r := rand.Rand(5)
+    data := Data.Logistic(30, Array<F64>[0.5, -1.0, 2.0], r)
+    g := graph.Graph<F64>(1)
+    nodes := Logistic.Record(g, 30, 3, 4.0)
+    try g.Plan(r)
+    nodes.Set(g, data.X, data.Y)
+    t := GraphTarget(g, nodes.Loss)
+    assert t.Dim() == 3
+    z := Array<F64>[0.2, -0.3, 0.7]
+    grad := Array<F64>(3, 0.0)
+    lp := t.Gradient(z, grad)
+    # the log joint by hand, and its gradient by central differences
+    direct := fn(w Array<F64>&) F64 {
+        s F64 = 0.0
+        for i in range 30 {
+            eta := data.X[i * 3] * w[0] + data.X[i * 3 + 1] * w[1] + data.X[i * 3 + 2] * w[2]
+            s += data.Y[i] * eta - (eta.Abs() + (-eta.Abs()).Exp().Log1p() + (eta.Max(0.0) - eta.Abs()))
+        }
+        return s - (w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) / 8.0
+    }
+    assert (lp - direct(z)).Abs() < 1e-10 and (t.LogDensity(z) - lp).Abs() < 1e-12
+    for i in range 3 {
+        up := Array<F64>[z[j] + (1e-6 if j == i else 0.0) for j in range 3]
+        down := Array<F64>[z[j] - (1e-6 if j == i else 0.0) for j in range 3]
+        assert (grad[i] - (direct(up) - direct(down)) / 2e-6).Abs() < 1e-6
+    }
+}
