@@ -376,10 +376,12 @@ fn (p Product<SC, SA, SB>&) RunBatch(d mut device.Device&, c mut device.DBatch<S
 # output, as kernels/gemm's GemmI8 reads them), summed in I32 by cuBLASLt's integer tensor cores (CUBLAS_COMPUTE_32I,
 # exact), the accumulators kept in c. cuBLAS's INT8 is signed on both sides, so the activations are quantized to I8
 # with the zero point at 0 (the CPU's are U8 with one): the result differs from the CPU's in that rounding only.
-# out is a second product of the same operands summed in F32 (cuBLASLt converts no I32 matrix to F32, and scales no F32
-# result by a vector: its per-row alpha is for I8 results only), then scaled per output (cublasSdgmm) - exact while a
-# sum's magnitude stays under 2^24, within a few units of F32 past it. An element kernel dequantizing c (GP2) would
-# replace the second product. cuBLASLt wants k and the lds multiples of 4 (the padding nn/quant keeps gives that)
+# out: cuBLAS has no way from an I32 matrix to an F32 one - cublasLtMatrixTransform converts no integer type, and
+# cuBLASLt's per-row alpha vector exists for I8 results only - so out is a second product of the same operands summed in
+# F32 (CUBLAS_COMPUTE_32F over I8: no tensor cores, 10x the I32 product's time; exact while a sum stays under 2^24 in
+# magnitude, within a few F32 units past it), then scaled per output (cublasSdgmm). RunI32 gives c alone. An element
+# kernel dequantizing c in one pass (GP2's NVRTC) replaces the second product. cuBLASLt wants k and the lds multiples
+# of 4 (the padding nn/quant keeps gives that)
 type ProductI8 unique struct(dev device.Device&) {
     dev
     exact U64 = 0
@@ -388,6 +390,7 @@ type ProductI8 unique struct(dev device.Device&) {
     m I64 = 0
     Exact Choice = Choice()
     Scaled Choice = Choice()
+    tried mut Array<I64>& = Array<I64>(40)
 } destruct {
     if exact != 0: cu.oann_lt_free(exact)
     if float != 0: cu.oann_lt_free(float)
@@ -410,6 +413,25 @@ fn ProductI8.Plan(d mut device.Device&, c device.DMat<I32>&, a device.DMat<I8>&,
     p.float = h[0]
     p.Scaled = Choice.Of(info)
     return p
+}
+
+# c = a b^T in I32 alone: the integer tensor cores' product
+fn (p ProductI8&) RunI32(d mut device.Device&, c mut device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&) {
+    if p.exact == 0: return
+    cu.oann_lt_run(d.Status(), d.Lt(), p.exact, 1, 0, b.Addr(0, 0), a.Addr(0, 0), c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
+}
+
+# both products tuned, as Product's Tune: c and out overwritten
+fn (p mut ProductI8&) Tune(d mut device.Device&, c mut device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, out mut device.DMat<F32>&, reps I64 = 20) ? device.GpuError {
+    if p.exact == 0: return
+    try d.Sync()
+    info := Array<I64>(9)
+    st := cu.oann_lt_tune(d.Lt(), p.exact, b.Addr(0, 0), a.Addr(0, 0), c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info, p.tried)
+    try tuned(st)
+    p.Exact = Choice.Of(info)
+    st = cu.oann_lt_tune(d.Lt(), p.float, b.Addr(0, 0), a.Addr(0, 0), out.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info, p.tried)
+    try tuned(st)
+    p.Scaled = Choice.Of(info)
 }
 
 # c = a b^T in I32 and out = scale[j] c[i, j] in F32 (scale: n per-output scales, the activations' step times each
@@ -945,6 +967,7 @@ fn i8Case(d mut device.Device&, r mut rand.Rand&, m I64, n I64, k I64) ? device.
     dc := device.DMat<I32>(bc, 0, m, n, n)
     dout := device.DMat<F32>(bo, 0, m, n, n)
     p := try ProductI8.Plan(d, dc, da, db, dout)
+    if m > 4: try p.Tune(d, dc, da, db, dout, 2)
     p.Run(d, dc, da, db, bs, dout)
     gc := Array<I32>(m * n)
     gout := Array<F32>(m * n)

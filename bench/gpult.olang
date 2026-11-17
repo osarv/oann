@@ -257,6 +257,150 @@ if Gpu {
     }
 }
 
+if Gpu {
+    # ns a call of f over reps calls, synced after when sync
+    fn timeIt(dev mut device.Device&, f fn&() ? device.GpuError, reps I64, sync Bool) F64 ? device.GpuError {
+        t0 := time.Now()
+        for _ in range reps: try f()
+        if sync: try dev.Sync()
+        return F64(time.Since(t0)) / F64(reps)
+    }
+
+    # the median over rounds of f's ns a call, f repeated to about 20 ms a round after an untimed round
+    fn medianOf(dev mut device.Device&, f fn&() ? device.GpuError, rounds I64, sync Bool) F64 ? device.GpuError {
+        try timeIt(dev, f, 1, sync)
+        reps I64 = 1
+        for {
+            if try timeIt(dev, f, reps, sync) * F64(reps) > 2e7 or reps >= 1 << 20: break
+            reps = reps * 2
+        }
+        times := Array<F64>(rounds)
+        for round in range rounds {
+            try timeIt(dev, f, reps, sync)
+            times[round] = try timeIt(dev, f, reps, sync)
+        }
+        return median(times)
+    }
+
+    # GemmI8 (G-M5's products): kernels/gemm's on one thread (U8 activations, zero point 128) against the GPU's
+    # ProductI8 (I8 activations: the I32 product and the scaled F32 one), and a BF16 Product of the same shape
+    fn int8Table(dev mut device.Device&, rounds I64) ? io.Error, device.GpuError {
+        try io.Put("\n== INT8: us a product (m x k x n: activations m x k, weights n x k), resident\n")
+        try io.Put("m x k x n | CPU GemmI8 | GPU I32 (c) | GPU I32 and F32 out | GPU BF16 tuned\n")
+        sizes := Array<I64>[1, 784, 128, 32, 784, 128, 128, 784, 128, 512, 784, 128, 1, 768, 3072, 64, 768, 3072, 2048, 2048, 2048]
+        r := rand.Rand(3)
+        for i in range 0, sizes.Len(), 3 {
+            m, k, n := sizes[i], sizes[i + 1], sizes[i + 2]
+            au := Array<U8>(m * k)
+            ai := Array<I8>(m * k)
+            for j in range m * k {
+                q := r.Below(255) - 127
+                au[j] = U8(q + 128)
+                ai[j] = I8(q)
+            }
+            qb := Array<I8>(n * k)
+            for j in range n * k: qb[j] = I8(r.Below(255) - 127)
+            scale := Array<F32>(n)
+            for j in range n: scale[j] = 0.001
+            cc := mat.Mat<I32>(Array<I32>(m * n), 0, m, n, n)
+            cout := mat.Mat<F32>(Array<F32>(m * n), 0, m, n, n)
+            ws := gemm.Workspace<I32>(1)
+            ws.ReserveI8(n, k)
+            am := mat.Mat<U8>(au, 0, m, k, k)
+            bm := mat.Mat<I8>(qb, 0, n, k, k)
+            ba := try device.Buf<I8>.Make(dev, m * k)
+            bb := try device.Buf<I8>.Make(dev, n * k)
+            bc := try device.Buf<I32>.Make(dev, m * n)
+            bo := try device.Buf<F32>.Make(dev, m * n)
+            bs := try device.Buf<F32>.Make(dev, n)
+            ba.UploadAll(ai)
+            bb.UploadAll(qb)
+            bs.UploadAll(scale)
+            da := device.DMat<I8>(ba, 0, m, k, k)
+            db := device.DMat<I8>(bb, 0, n, k, k)
+            dc mut device.DMat<I32>& = device.DMat<I32>(bc, 0, m, n, n)
+            dout mut device.DMat<F32>& = device.DMat<F32>(bo, 0, m, n, n)
+            p := try blas.ProductI8.Plan(dev, dc, da, db, dout)
+            try p.Tune(dev, dc, da, db, dout)
+            h16 := Array<BF16>((m * k).Max(n * k))
+            a16 := try device.Buf<BF16>.Make(dev, m * k)
+            b16 := try device.Buf<BF16>.Make(dev, n * k)
+            c16 := try device.Buf<BF16>.Make(dev, m * n)
+            a16.Upload(h16, 0, 0, m * k)
+            b16.Upload(h16, 0, 0, n * k)
+            da16 := device.DMat<BF16>(a16, 0, m, k, k)
+            db16 := device.DMat<BF16>(b16, 0, n, k, k)
+            dc16 mut device.DMat<BF16>& = device.DMat<BF16>(c16, 0, m, n, n)
+            pb := try blas.Product<BF16, BF16, BF16>.Plan(dev, dc16, da16, false, db16, true)
+            try pb.Tune(dev, dc16, da16, db16)
+            wsr mut gemm.Workspace<I32>& = ws
+            ccr mut mat.Mat<I32>& = cc
+            coutr mut mat.Mat<F32>& = cout
+            cpu := try medianOf(dev, fn() ? device.GpuError { gemm.GemmI8(wsr, ccr, am, bm, scale, coutr, 128) }, rounds, false)
+            g32 := try medianOf(dev, fn() ? device.GpuError { p.RunI32(dev, dc, da, db) }, rounds, true)
+            gpu := try medianOf(dev, fn() ? device.GpuError { p.Run(dev, dc, da, db, bs, dout) }, rounds, true)
+            g16 := try medianOf(dev, fn() ? device.GpuError { pb.Run(dev, dc16, da16, db16) }, rounds, true)
+            try io.Put($m + " x " + $k + " x " + $n + " | " + us(cpu) + " | " + us(g32) + " | " + us(gpu) + " | " + us(g16) + "\n")
+        }
+    }
+
+    # attention's two products (GemmBatch): B sequences of T, width D in heads; the CPU's causal (triangles, half the
+    # work) on one thread against the GPU's full products, F32 and BF16 (exact, tuned)
+    fn attentionTable(dev mut device.Device&, rounds I64) ? io.Error, device.GpuError {
+        try io.Put("\n== attention's GemmBatch (scores Q K^T, then P V): us both, resident\n")
+        try io.Put("B x T, D, heads | CPU F32 causal | GPU F32 full | GPU BF16 full\n")
+        cases := Array<I64>[16, 64, 128, 4, 8, 256, 512, 8, 4, 1024, 768, 12]
+        r := rand.Rand(4)
+        for i in range 0, cases.Len(), 4 {
+            b, t, dm, heads := cases[i], cases[i + 1], cases[i + 2], cases[i + 3]
+            n := b * t
+            rows := n * heads
+            hq := Array<F32>(n * dm)
+            for j in range n * dm: hq[j] = F32(r.Uniform(-1.0, 1.0))
+            hp := Array<F32>(rows * t)
+            hy := Array<F32>(n * dm)
+            ws := gemm.Workspace<F32>(1, t.Max(dm), t * t)
+            qm := mat.Mat<F32>(hq, 0, n, dm, dm)
+            pm := mat.Mat<F32>(hp, 0, rows, t, t)
+            ym := mat.Mat<F32>(hy, 0, n, dm, dm)
+            wsr mut gemm.Workspace<F32>& = ws
+            pr mut gemm.Batch<F32>& = gemm.Batch<F32>.Stacked(pm, t, heads)
+            yr mut gemm.Batch<F32>& = gemm.Batch<F32>.Heads(ym, t, heads)
+            qb := gemm.Batch<F32>.Heads(qm, t, heads)
+            pb := gemm.Batch<F32>.Stacked(pm, t, heads)
+            cpu := try medianOf(dev, fn() ? device.GpuError {
+                gemm.GemmBatch(wsr, pr, qb, false, qb, true, F32(0.125), F32(0), gemm.Triangle.Result(0))
+                gemm.GemmBatch(wsr, yr, pb, false, qb, false, F32(1), F32(0), gemm.Triangle.Left(0))
+            }, rounds, false)
+            g32 := try attentionGpu(dev, hq, b, t, dm, heads, F32(0), rounds)
+            hq16 := Array<BF16>(n * dm)
+            for j in range n * dm: hq16[j] = BF16(hq[j])
+            g16 := try attentionGpu(dev, hq16, b, t, dm, heads, BF16(0), rounds)
+            try io.Put($b + " x " + $t + ", " + $dm + ", " + $heads + " | " + us(cpu) + " | " + us(g32) + " | " + us(g16) + "\n")
+        }
+    }
+
+    fn attentionGpu<S>(dev mut device.Device&, hq Array<S>&, b I64, t I64, dm I64, heads I64, like S, rounds I64) F64 ? device.GpuError {
+        n := b * t
+        rows := n * heads
+        bq := try device.Buf<S>.Make(dev, n * dm)
+        bp := try device.Buf<S>.Make(dev, rows * t)
+        by := try device.Buf<S>.Make(dev, n * dm)
+        bq.UploadAll(hq)
+        dq := device.DBatch<S>.Heads(device.DMat<S>(bq, 0, n, dm, dm), t, heads)
+        dp mut device.DBatch<S>& = device.DBatch<S>.Stacked(device.DMat<S>(bp, 0, rows, t, t), t, heads)
+        dy mut device.DBatch<S>& = device.DBatch<S>.Heads(device.DMat<S>(by, 0, n, dm, dm), t, heads)
+        scores := try blas.Product<S, S, S>.PlanBatch(dev, dp, dq, false, dq, true)
+        try scores.TuneBatch(dev, dp, dq, dq)
+        pv := try blas.Product<S, S, S>.PlanBatch(dev, dy, dp, false, dq, false)
+        try pv.TuneBatch(dev, dy, dp, dq)
+        return try medianOf(dev, fn() ? device.GpuError {
+            scores.RunBatch(dev, dp, dq, dq, 0.125)
+            pv.RunBatch(dev, dy, dp, dq)
+        }, rounds, true)
+    }
+}
+
 fn main() ? io.Error, ParseError {
     args := os.Args()
     rounds := try number(args, 1, 5)
@@ -266,6 +410,8 @@ fn main() ? io.Error, ParseError {
             return
         }
         try table(dev, rounds) catch device.GpuError e: try io.Put("GPU failed: " + $e + "\n")
+        try int8Table(dev, rounds) catch device.GpuError e: try io.Put("GPU failed: " + $e + "\n")
+        try attentionTable(dev, rounds) catch device.GpuError e: try io.Put("GPU failed: " + $e + "\n")
     } else {
         try io.Put("bench/gpult needs -define Gpu=true\n")
     }
