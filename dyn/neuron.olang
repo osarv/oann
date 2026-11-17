@@ -119,11 +119,14 @@ fn SlopeOver(f Rho, lo F64, hi F64) F64 {
 }
 
 # a readout's force over the region where each of its n potentials u[at + j] may move by r (rho their activation), per
-# unit of beta: its coupling between units, as ForceCoupling (in the sup norm, or the Euclidean bound sqrt(|C|_1
-# |C|_inf) where euclid) and its largest self-slope, as ForceSlope, both times rho's slope over the region (SlopeOver).
-# A cross-entropy group's C_ij = p_i p_j rho'_j / T (i != j) has rows at most p_i (1 - p_i) max rho' / T and columns
-# p_j (1 - p_j) rho'_j / T; each p is bounded by the logits' extremes over the region (p_i at most e^hi_i / (e^hi_i +
-# the others' e^lo), at least the reverse) and p (1 - p) by its largest over those bounds
+# unit of beta, as the Jacobian of -F it adds to a sweep (F the force; rho' its slope over the region, SlopeOver): the
+# norm of its part between units, which a sweep at +beta adds (the shortened step absorbing the diagonal), and of the
+# whole, which one at -beta adds - in the sup norm, or the Euclidean where euclid. Squared: no coupling, the whole
+# diag(rho'). Cross-entropy, per group: S D / T with S = diag(p) - p p^T, D = diag(rho'); the part between units has
+# rows at most p_i (1 - p_i) max rho' / T and columns p_j (1 - p_j) rho'_j / T (sup: the rows; Euclidean: at most
+# sqrt(rows cols), and |p p^T - diag(p^2)|_2 <= |p|^2 <= max p), the whole adds the diagonal (sup: rows + columns;
+# Euclidean: also lambda_max(S) <= max p). Each p is bounded by the logits' extremes over the region (p_i at most
+# e^hi_i / (e^hi_i + the others' e^lo), at least the reverse) and p (1 - p) by its largest over those bounds
 fn ForceOver<T Float>(c Cost, f Rho, u Array<T>&, at I64, n I64, r F64, euclid Bool) F64, F64 {
     match c {
         case Cost.Squared {
@@ -133,22 +136,23 @@ fn ForceOver<T Float>(c Cost, f Rho, u Array<T>&, at I64, n I64, r F64, euclid B
         }
         case Cost.CrossEntropy(temperature, groups) {
             w := n / groups
-            coupling, self F64 = 0.0, 0.0
+            coupling, whole F64 = 0.0, 0.0
             for g in range groups {
-                gc, gs := softOver(f, u, at + g * w, w, temperature, r, euclid)
-                coupling, self = coupling.Max(gc), self.Max(gs)
+                gc, gw := softOver(f, u, at + g * w, w, temperature, r, euclid)
+                coupling, whole = coupling.Max(gc), whole.Max(gw)
             }
-            return coupling, self
+            return coupling, whole
         }
     }
 }
 
 fn slopeAt<T Float>(f Rho, u Array<T>&, i I64, r F64) F64 { return SlopeOver(f, F64(u[i]) - r, F64(u[i]) + r) }
 
+# ForceOver for one softmax group of w units at u[at ..], temperature t
 fn softOver<T Float>(f Rho, u Array<T>&, at I64, w I64, t F64, r F64, euclid Bool) F64, F64 {
     top, most F64 = -F64.Max, 0.0
     for j in range w {
-        top = top.Max(F64(Activate(f, F64(u[at + j]) + r)) / t)
+        top = top.Max(logit(f, u, at + j, r, t))
         most = most.Max(slopeAt(f, u, at + j, r))
     }
     low, high F64 = 0.0, 0.0
@@ -156,15 +160,19 @@ fn softOver<T Float>(f Rho, u Array<T>&, at I64, w I64, t F64, r F64, euclid Boo
         low += (logit(f, u, at + j, -r, t) - top).Exp()
         high += (logit(f, u, at + j, r, t) - top).Exp()
     }
-    rows, cols F64 = 0.0, 0.0
+    rows, cols, peak, squares F64 = 0.0, 0.0, 0.0, 0.0
     for j in range w {
         lo := (logit(f, u, at + j, -r, t) - top).Exp()
         hi := (logit(f, u, at + j, r, t) - top).Exp()
-        a := spread(lo / (lo + high - hi), hi / (hi + low - lo))
+        above := (hi / (hi + (low - lo).Max(0.0))).Min(1.0)
+        a := spread(lo / (lo + high - hi).Max(lo), above)
         rows = rows.Max(a * most / t)
         cols = cols.Max(a * slopeAt(f, u, at + j, r) / t)
+        peak, squares = peak.Max(above), squares + above * above
     }
-    return (rows * cols).Sqrt() if euclid else rows, cols
+    if not euclid: return rows, rows + cols
+    coupling := (rows * cols).Sqrt().Min(peak.Min(squares) * most / t)
+    return coupling, (coupling + cols).Min(peak * most / t)
 }
 
 # the logit of unit i with its potential moved by d
