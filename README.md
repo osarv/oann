@@ -20,6 +20,17 @@ fn main() ? tensor.ShapeError {
 }
 ```
 
+Where a plan runs is chosen once, as PyTorch's `torch.set_default_device` does: on a build with the GPU
+(`-define Gpu=true`, which the makefile passes wherever the CUDA toolkit is) and a machine with one, every plan made
+after this line runs there, and on the CPU otherwise - a plan's `on` still decides for that plan (docs/redesign.md 1.10;
+settling systems run on the GPU, `ad`'s graphs not yet):
+
+```
+import "github.com/osarv/oann/kernels/device"
+
+device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backend.Cpu)
+```
+
 Other modules the same way: `github.com/osarv/oann/nn/optim`, `.../ad/graph`, `.../models/gpt`, `.../dyn/system`.
 Run a file by naming it - olang builds it fully optimized into its cache and runs it. The examples work as they are:
 
@@ -40,6 +51,7 @@ It needs the olang compiler beside oann (`../olang/build/olang`, or `OLANG=path`
 ```
 make test                          # every module's tests, takes minutes
 make gputest                       # the GPU backend's tests (CUDA, cuBLAS; -define Gpu=true), skipped without a device
+make gpusettle ARGS="5 10 20 4"    # the settle and a lesson on the GPU against the CPU at batch 32, 128, 512
 make mnist ARGS="10 adamw 1 1"     # an example or benchmark built and run with ARGS (data, cnn, int8, lmbench, board, ...)
 ```
 
@@ -52,7 +64,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | | |
 |---|---|
 | `tensor.olang` | `Tensor<T>`, the N-d strided view (rank up to 6): Slice, Select, Permute, Expand, Reshape, element kernels, conversions between storage types, `@` batched |
-| `kernels/` | GEMM (blocked, batched, from patches, GEMV, INT8), element kernels, attention, scans, sparse and event-driven products, convolution; the GPU backend in `kernels/gpu` (`kernels/README.md`) |
+| `kernels/` | GEMM (blocked, batched, from patches, GEMV, INT8), element kernels, attention, scans, sparse and event-driven products, convolution; the backend a plan runs on (`device.olang`: `SetDefault`, `GpuAvailable`) and the GPU's in `kernels/gpu` (`kernels/README.md`) |
 | `ad/` | reverse-mode autodiff on tensors: `Graph<T>`, the operations and their gradients (`ad/README.md`) |
 | `dyn/` | the dynamical-system core: systems of populations and connections, the settle, equilibrium propagation and the other learning rules, energies, the bridge into `ad` (`dyn/README.md`) |
 | `nn/` | layers, AdamW and Sgd, the training loops, generation, INT8 quantization (`nn/README.md`) |

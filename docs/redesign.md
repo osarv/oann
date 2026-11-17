@@ -937,7 +937,25 @@ type DBatch<S> struct(...) { ... }                                              
 
 **The backend interface.** The GPU entry points mirror the CPU kernels' signatures over `DMat` instead of `Mat`, and
 callers choose once, at `Plan`, never per element (decision 5): `Backend enum { Cpu, Gpu(dev mut Device&) }` held by
-the plan, matched per op.
+the plan, matched per op. *As built (GP4)*: the backend is `kernels/device.olang`'s `Backend enum { Cpu, Gpu }`, a module
+that imports with or without `-define Gpu=true`, and the device is that module's, so a script chooses it the way
+PyTorch's `torch.set_default_device` does, once, and never passes a `Device` around:
+
+```olang
+import "github.com/osarv/oann/kernels/device"
+device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backend.Cpu)
+```
+
+`device.GpuAvailable()` is false in a build without the define and, with it, true only where CUDA finds a device when
+asked (no device, no driver: false, not an error). `System.Plan(r, on)` and `Graph.Plan(r, on)` take `on`, by default
+`device.Backend.Default()` - the backend last set, the CPU until one is - and an explicit `on` still decides for that
+plan. The first plan on the GPU opens the device (ordinal 0) into the module's global `device.Opened`, where it lives as
+long as the program, so every plan's buffers go before it. A plan on the GPU where the build has none is
+`device.DeviceError.Unavailable`; a part with no GPU form is `DeviceError.Unsupported("no GPU form of ...")`, by name;
+the device's failure `DeviceError.Failed` with CUDA's words. A graph has no GPU form until GP6: `Graph.Plan` on the GPU
+is refused (as a `ShapeError`, so its callers' error sets stay as they are). The makefile passes `-define Gpu=true`
+wherever `/usr/include/cuda_runtime_api.h` exists (`GPU=0` leaves it out); `make test` runs the CPU's tests either way,
+since nothing plans on the GPU unless told to.
 
 ```olang
 # kernels/gpu/blas.olang - cuBLAS and cuBLASLt; row-major as the CPU's, so C = op(A) op(B) is cuBLAS's column-major
@@ -1101,6 +1119,32 @@ gets no algorithm), so attention's causal products are full and the softmax kern
 is for I8 results), so out is a second, F32-summed product and `cublasSdgmm` - 13x the I32 product at 2048^3, to be
 replaced by a one-pass kernel on kern.olang. `DBatch` is in device.olang with `Heads`/`Stacked` as gemm's `Batch`.
 GP1's BF16 at 73 us was the bench's calibration (fixed): cuBLAS's BF16 is 8.6 us warm.
+
+**As built (GP4, 2026-11-17).** The backend at `Plan` is above (*the backend interface*). `System.Plan(r, on =
+device.Backend.Gpu)` makes `dyn/mirror.olang`'s `Mirror<T>`: every region the engine lays out on the host (parameters,
+gradients, each population's two buffers of potentials and activities, totals, constants, EP's differences, a low-rank
+connection's middle) is one `Buf<T>` at the same offsets, the batch's inputs one byte buffer staged through pinned
+memory (`cudaHostAlloc`) in one asynchronous copy a settle, the residual words a `Buf<U64>`. A sweep is, per relaxing
+population, one `blas.Gemm` (cublasGemmEx) a carry over all the settle's rows (two for a low-rank one, through its
+middle), the first written with beta 0, and one launch of `settle.cu`'s `oann_settle_step`, which adds the constant,
+the carries and a nudged readout's force (cross-entropy or squared, per row's phase) itself and then is GP2's rate step
+- so a 784-128-10 sweep is 4 launches, not GP2's 7: the constants' copies and the word's zeroing went into the step and
+into one memset a settle. The stop: each step first reads the stop word and the word of the sweep before its own, and
+where that sweep was within the tolerance (its bits at most those of the largest T at most the tolerance, relax's test
+exactly) or not finite, records it and writes nothing, nor does any later sweep; the host enqueues `Check` sweeps (4)
+at a time and reads the words of the batch before back after an event, so it waits only for sweeps already done. A
+Euclidean budget (`Budget.Euclid`, the spectral certificate's) adds `oann_rows_residual`, one launch a sweep. Inputs
+are closed-form by a kernel; constants are `drive + bias` by a kernel then the folded carries. Ownership is kept by
+flags (`HostState`, `HostParams`, `HostCoupling`, `HostGrads`; `Wrote...`): `Activity`, `Predict`, `Loss`, `NudgedRate`
+bring down what they read, `Params`, `Weights`, `Bias`, `ParamGrads`, `State` hand a host view taken as written, the
+stability tools bring down and put back only the recurrent connections' weights. EP's contrast on the device is
+`oann_differ`, the outer products by cuBLAS with beta 1, `oann_bias_sums`; `learn.AdamW` (new: dyn may not import
+nn) steps the region on the system's backend - on the GPU by `kern.AdamW` (elem.cu's `oann_adamw`), bit for bit with
+`nn/optim`'s. Refused at `Plan` by name: spiking and custom populations, Csr, Tiles and Events links, Anderson and
+Gauss-Seidel sweeps (also `Use` of them after a GPU plan); a learner of a GPU plan refuses rules but EP, pruning and
+implicit gradients. Not done: CUDA graphs and cuBLASLt's planned products for the sweep (GP7, as G-M2 says), a
+device fault in a settle ends the program (`System.Settle` has no error), host views kept and written after they were
+taken are not seen by the device (step a GPU plan with `learn.AdamW`, not `nn/optim`'s).
 
 The packages are section 4.4.
 

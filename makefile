@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpugemm gpurate gpult mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpugemm gpurate gpult gpusettle mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -63,6 +63,12 @@ gpurate:
 gpult:
 	$(OLANG) build -define Gpu=true -output build/bench_gpult bench/gpult.olang
 	$(GPUENV) ./build/bench_gpult $(ARGS)
+
+# GP4's first settle and lesson times of the 784-128-10 system, CPU (1 and 4 threads) against GPU at batch 32, 128 and
+# 512, interleaved, medians (bench/gpusettle.olang) - ARGS: rounds, cold settles and lessons a round, Check
+gpusettle:
+	$(OLANG) build -define Gpu=true -output build/bench_gpusettle bench/gpusettle.olang
+	$(GPUENV) ./build/bench_gpusettle $(ARGS)
 
 # M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
 mlpad:

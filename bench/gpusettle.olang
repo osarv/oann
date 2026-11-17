@@ -1,0 +1,165 @@
+# A first measure of the settle on the GPU (GP4, docs/redesign.md 1.10 and 4.4; GP5 does G-M2 in full on MNIST): the
+# 784-128-10 settling system of examples/mnist_learn, planned on the CPU and on the GPU (dyn/mirror), timed at batch 32,
+# 128 and 512 - a cold free settle (Reset, then Settle to the training tolerance), and a lesson (EP's free and nudged
+# settles and contrast, then learn.AdamW's step) - with the sweeps each took. The batches are MNIST-like (sparse pixels
+# in [0, 1], a random class a row; the same on every backend), drawn here, so nothing is downloaded.
+#
+# What is timed: the median over rounds of a round's mean, each round a block of settles and of lessons on each backend
+# in turn (interleaved), after an untimed round; the GPU's times include every transfer a settle and a lesson make
+# (the batch up, the residual words down every Check sweeps, the coupling and the readout's state down for the
+# certificate's budgets). CPU at 1 and at 4 threads (the settle's tasks).
+#
+# Built with -define Gpu=true (without it, the CPU alone). From the repository's root:
+#     make gpusettle ARGS="rounds settles lessons check"   (5 10 20 4)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../dyn/system"
+import "../dyn/neuron"
+import "../dyn/conn"
+import "../dyn/settle"
+import "../dyn/learn"
+import "../kernels/device"
+
+Gpu Bool = false
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+# examples/mnist_learn's system: certified in the sup norm at 0.9
+fn mnistLike(batch I64, threads I64, on device.Backend) system.System<F32> {
+    s := system.System<F32>(batch, threads)
+    pixels := s.Population(s.Root(), "pixels", 784, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    inner := s.Population(s.Root(), "hidden", 128, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    digits := s.Population(s.Root(), "digits", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(pixels, inner, conn.Wiring.Dense)
+    s.Connect(inner, digits, conn.Wiring.Symmetric)
+    s.Plan(rand.Rand(1), on)!
+    s.Bound = system.Norm.Sup
+    s.Certify(0.9)
+    return s
+}
+
+# a batch drawn from r: the same draw gives every backend the same batch
+fn feed(s mut system.System<F32>&, r mut rand.Rand&) {
+    px, dg := s.Pop(system.Pop(0)), s.Pop(system.Pop(2))
+    for i in range px.Drive.Len() {
+        v := r.Uniform(0.0, 1.0)
+        px.Drive[i] = F32(v if v > 0.7 else 0.0)
+    }
+    for i in range dg.Labels.Len(): dg.Labels[i] = I32(r.Uniform(0.0, 10.0).Floor())
+}
+
+# one backend's system and what teaches it
+type Run struct(batch I64, threads I64, on device.Backend, check I64) {
+    S mut system.System<F32>& = mnistLike(batch, threads, on)
+    L mut learn.Learner<F32>& = learn.Learner<F32>(S)!
+    O mut learn.AdamW<F32>& = learn.AdamW<F32>.For(S)!
+    Tol F64 = 0
+    Name String = ("GPU" if on == device.Backend.Gpu else "CPU " + $threads + " thread" + ("s" if threads > 1 else ""))
+}
+
+fn (u mut Run&) ready(check I64) {
+    u.Tol = u.S.LessonTolerance(0.5)
+    if Gpu {
+        if u.S.OnGpu(): u.S.Mirror().Check = check
+    }
+}
+
+# n cold free settles to the training tolerance, each of a fresh batch drawn from a generator seeded by seed: us a
+# settle, sweeps a settle
+fn (u mut Run&) settles(n I64, seed U64) F64, F64 {
+    r := rand.Rand(seed)
+    b := u.S.BudgetFor(u.Tol)
+    sweeps I64 = 0
+    spent I64 = 0
+    for _ in range n {
+        feed(u.S, r)
+        t0 := time.Now()
+        u.S.Reset(settle.Phase.Free)
+        out := u.S.Settle(settle.Phase.Free, b)
+        spent += time.Since(t0)
+        sweeps += out.Sweeps
+    }
+    return F64(spent) * 1e-3 / F64(n), F64(sweeps) / F64(n)
+}
+
+# n lessons (EP and AdamW's step) of fresh batches: us a lesson, sweeps a lesson (free and nudged)
+fn (u mut Run&) lessons(n I64, seed U64) F64, F64 {
+    r := rand.Rand(seed)
+    sweeps I64 = 0
+    spent I64 = 0
+    taught I64 = 0
+    for _ in range n {
+        feed(u.S, r)
+        t0 := time.Now()
+        ok := true
+        lesson := try u.L.Lesson(u.S.Root(), 0.5) catch { ok = false } default learn.Taught()
+        if ok: u.O.Step()
+        spent += time.Since(t0)
+        if not ok: continue
+        sweeps += lesson.Sweeps
+        taught++
+    }
+    return F64(spent) * 1e-3 / F64(n), F64(sweeps) / F64(taught.Max(1))
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try number(args, 1, 5)
+    nSettles := try number(args, 2, 10)
+    nLessons := try number(args, 3, 20)
+    check := try number(args, 4, 4)
+    gpu := device.GpuAvailable()
+    try io.Put("the 784-128-10 settle, CPU against GPU" + ("" if gpu else " (no GPU in this build or machine: the CPU alone)") + ": " + $rounds + " rounds of " + $nSettles + " cold settles and " + $nLessons + " lessons a backend, medians; Check " + $check + "\n")
+    try io.Put("batch | backend | us a cold settle | sweeps | us a lesson | sweeps a lesson | settle / GPU's | lesson / GPU's\n")
+    for batch in Array<I64>[32, 128, 512] {
+        runs := Vec<mut Run&>()
+        runs.Push(Run(batch, 1, device.Backend.Cpu, check))
+        runs.Push(Run(batch, 4, device.Backend.Cpu, check))
+        if gpu: runs.Push(Run(batch, 1, device.Backend.Gpu, check))
+        for u in runs: u.ready(check)
+        n := runs.Len()
+        st := Array<F64>(n * rounds)
+        lt := Array<F64>(n * rounds)
+        ss := Array<F64>(n)
+        ls := Array<F64>(n)
+        for round in range rounds + 1 {
+            for i in range n {
+                seed := U64(1000 * round + 7)
+                a, sa := runs[i].settles(nSettles, seed)
+                b, sb := runs[i].lessons(nLessons, seed + 1)
+                if round == 0: continue
+                st[i * rounds + round - 1] = a
+                lt[i * rounds + round - 1] = b
+                ss[i] += sa / F64(rounds)
+                ls[i] += sb / F64(rounds)
+            }
+        }
+        meds := Array<F64>(2 * n)
+        for i in range n {
+            a := Array<F64>(rounds)
+            b := Array<F64>(rounds)
+            for k in range rounds {
+                a[k] = st[i * rounds + k]
+                b[k] = lt[i * rounds + k]
+            }
+            meds[2 * i] = median(a)
+            meds[2 * i + 1] = median(b)
+        }
+        for i in range n {
+            ratio := ""
+            if gpu: ratio = " | " + $(meds[2 * i] / meds[2 * (n - 1)]).Fixed(2) + " | " + $(meds[2 * i + 1] / meds[2 * (n - 1) + 1]).Fixed(2)
+            try io.Put($batch + " | " + runs[i].Name + " | " + $meds[2 * i].Fixed(0) + " | " + $ss[i].Fixed(1) + " | " + $meds[2 * i + 1].Fixed(0) + " | " + $ls[i].Fixed(1) + ratio + "\n")
+        }
+    }
+}
