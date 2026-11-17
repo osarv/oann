@@ -627,16 +627,18 @@ fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
 # kappa_beta is kappa plus beta times the force's Jacobian within r of the start (neuron.ForceOver): its part between
 # units at +beta (the shortened step absorbs the diagonal), the whole at -beta. r is grown from the start's residual /
 # (1 - kappa) by a quarter until the ball holds; 1 where none does within 100 growths, where the free phase is not
-# certified, and for a spiking model or one without a slope bound
-fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64 {
+# certified, and for a spiking model or one without a slope bound. Gives the rate and the rows it certifies on their own
+fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
     k := s.Kappa()
-    if rateOf(s.E.Dt, k) >= 1.0 or not free.Converged or s.E.Spiking: return 1.0
+    if rateOf(s.E.Dt, k) >= 1.0 or not free.Converged or s.E.Spiking: return 1.0, 0
     worst F64 = 0.0
+    rows := 0
     for row in range s.E.Batch {
-        worst = worst.Max(s.rowRate(row, k, beta.Abs(), free.Residual))
-        if worst >= 1.0: return 1.0
+        q := s.rowRate(row, k, beta.Abs(), free.Residual)
+        worst = worst.Max(q)
+        if q < 1.0: rows++
     }
-    return worst
+    return worst, rows
 }
 
 # NudgedRate's rate of one batch row
@@ -1192,8 +1194,8 @@ test System.NudgedRate "the nudged pair's rate bounded over the region it can re
         assert free.Converged
         for k in range 4 {
             for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((k + i) % 4)
-            q := s.NudgedRate(0.5, free)
-            assert s.Rate(0.5) == 1.0 and q < 1.0, $bound + " labels " + $k + ": rate " + $q
+            q, rows := s.NudgedRate(0.5, free)
+            assert s.Rate(0.5) == 1.0 and q < 1.0 and rows == 2, $bound + " labels " + $k + ": rate " + $q
             assertContracts(s, 0.5, q, s.BudgetAt(tol, q).Sweeps, tol)
         }
     }
@@ -1210,7 +1212,7 @@ test System.NudgedRate "soundness: over random systems, kappas, readout confiden
         free := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
         assert free.Converged
         for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((trial * 7 + i * 3) % 4)
-        q := s.NudgedRate(beta, free)
+        q, _ := s.NudgedRate(beta, free)
         if q >= 1.0 {
             refused++
             continue

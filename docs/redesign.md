@@ -403,6 +403,13 @@ are constant and the evaluator can decide the bound.
     and 1.9 (-) at kappa 0.9, so the worst case certifies neither phase: the free phase's certificate does not suffice
     in general, and the nudged phases get the clamped budget (q 0.95) and are measured instead - a cross-entropy
     system's nudged pair at beta 0.5 settles within it (test `System.Rate`), and no MNIST or XOR lesson is refused;
+    the state-dependent rate (wt-oanncert3, `NudgedRate(beta, free)`, which `Learner.Lesson` uses for the nudged
+    budget) bounds the force's Jacobian over the ball the settle can reach instead: from the free state the start's
+    residual is at most `rest + beta |F(s0)|`, a sweep that is a `q`-contraction on the ball of radius r about it with
+    `rest + beta |F(s0)| <= (1 - kappa_beta(r)) r` keeps the settle inside, and kappa_beta(r) counts the softmax's
+    probabilities and the readouts' slopes bounded over that ball (in the Euclidean norm also `lambda_max(S) <= (1 -
+    p_y) + max_{i != y} p_i`, S the softmax's covariance, and `|p p^T - diag(p^2)|_2 <= |p|^2` for the coupling); it
+    certifies a confident row and refuses an uncertain one, and a batch only where every row is certified;
     (iii) Gauss-Seidel's rate is proven for the sup-norm certificate, not for the Euclidean one (only the fixed
     point's uniqueness carries over); (iv) EP's theorem (Scellier & Bengio 2017) needs symmetry, a stable fixed point
     and converged phases, no norm; (v) the board's range argument (4.2) bounds a potential by the incoming mass, so the

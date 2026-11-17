@@ -125,7 +125,7 @@ fn SlopeOver(f Rho, lo F64, hi F64) F64 {
 # diag(rho'). Cross-entropy, per group: S D / T with S = diag(p) - p p^T, D = diag(rho'); the part between units has
 # rows at most p_i (1 - p_i) max rho' / T and columns p_j (1 - p_j) rho'_j / T (sup: the rows; Euclidean: at most
 # sqrt(rows cols), and |p p^T - diag(p^2)|_2 <= |p|^2 <= max p), the whole adds the diagonal (sup: rows + columns;
-# Euclidean: also lambda_max(S) <= max p). Each p is bounded by the logits' extremes over the region (p_i at most
+# Euclidean: also lambda_max(S) <= max p, and <= (1 - p_y) + max_{i != y} p_i). Each p is bounded by the logits' extremes over the region (p_i at most
 # e^hi_i / (e^hi_i + the others' e^lo), at least the reverse) and p (1 - p) by its largest over those bounds
 fn ForceOver<T Float>(c Cost, f Rho, u Array<T>&, at I64, n I64, r F64, euclid Bool) F64, F64 {
     match c {
@@ -160,19 +160,32 @@ fn softOver<T Float>(f Rho, u Array<T>&, at I64, w I64, t F64, r F64, euclid Boo
         low += (logit(f, u, at + j, -r, t) - top).Exp()
         high += (logit(f, u, at + j, r, t) - top).Exp()
     }
-    rows, cols, peak, squares F64 = 0.0, 0.0, 0.0, 0.0
+    rows, cols, peak, squares, sure F64 = 0.0, 0.0, 0.0, 0.0, 0.0
+    lead := 0
     for j in range w {
         lo := (logit(f, u, at + j, -r, t) - top).Exp()
         hi := (logit(f, u, at + j, r, t) - top).Exp()
         above := (hi / (hi + (low - lo).Max(0.0))).Min(1.0)
-        a := spread(lo / (lo + high - hi).Max(lo), above)
+        below := lo / (lo + high - hi).Max(lo)
+        a := spread(below, above)
         rows = rows.Max(a * most / t)
         cols = cols.Max(a * slopeAt(f, u, at + j, r) / t)
         peak, squares = peak.Max(above), squares + above * above
+        if below > sure: sure, lead = below, j
     }
     if not euclid: return rows, rows + cols
+    # lambda_max(S) <= (1 - p_y) + max_{i != y} p_i for any y: x^T S x is x's variance under p, at most
+    # sum_{i != y} p_i (x_i - x_y)^2, a star's Laplacian with weights p_i, whose largest eigenvalue is at most the
+    # largest sum of an edge's two ends' degrees
+    rival F64 = 0.0
+    for j in range w {
+        if j == lead: continue
+        lo := (logit(f, u, at + j, -r, t) - top).Exp()
+        hi := (logit(f, u, at + j, r, t) - top).Exp()
+        rival = rival.Max((hi / (hi + (low - lo).Max(0.0))).Min(1.0))
+    }
     coupling := (rows * cols).Sqrt().Min(peak.Min(squares) * most / t)
-    return coupling, (coupling + cols).Min(peak * most / t)
+    return coupling, (coupling + cols).Min(peak.Min(1.0 - sure + rival) * most / t)
 }
 
 # the logit of unit i with its potential moved by d

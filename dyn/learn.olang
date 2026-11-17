@@ -58,13 +58,14 @@ type LearnError error {
     Unsupported(what String)
 }
 
-# what a lesson took: the sweeps of its free settle and of its nudged ones (side by side), how each went, and the rate
-# the nudged pair was certified at (System.NudgedRate; 1 where it was not)
-type Taught struct(free settle.Settlement = settle.Settlement(), nudged settle.Settlement = settle.Settlement(), rate F64 = 1) {
+# what a lesson took: the sweeps of its free settle and of its nudged ones (side by side), how each went, the rate the
+# nudged pair was certified at (System.NudgedRate; 1 where it was not) and the batch rows certified on their own
+type Taught struct(free settle.Settlement = settle.Settlement(), nudged settle.Settlement = settle.Settlement(), rate F64 = 1, rows I64 = 0) {
     Free settle.Settlement = free
     Nudged settle.Settlement = nudged
     Sweeps I64 = free.Sweeps + nudged.Sweeps
     Rate F64 = rate
+    Rows I64 = rows
 }
 
 # a three-factor rule's trace: the rule (module, signal, clock) and where its trace is
@@ -189,12 +190,12 @@ fn (l mut Learner<T>&) Lesson(m system.Mod, beta F64, centered Bool = true) Taug
     tol := l.Tol if l.Tol > 0.0 else s.LessonTolerance(beta)
     free := s.Settle(settle.Phase.Free, l.budget(tol, 0.0))
     if not free.Converged: error LearnError.NotSettled("free", free.Sweeps, free.Residual)
-    q := s.NudgedRate(beta, free)
+    q, rows := s.NudgedRate(beta, free)
     nudged := s.Nudged(l.nudgedBudget(tol, beta, q), beta, centered)
     if not nudged.Converged: error LearnError.NotSettled("nudged", nudged.Sweeps, nudged.Residual)
     l.Contrast(m, beta, centered)
     l.Lessons++
-    l.Last = Taught(free, nudged, q)
+    l.Last = Taught(free, nudged, q, rows)
     return l.Last
 }
 
