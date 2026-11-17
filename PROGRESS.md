@@ -183,14 +183,20 @@ place and makes the rank smaller (`Macs` follows; allocation-free; an optimizer 
 stays with the one-weight connections. Test: `Learner.Prune` "a tiled connection loses whole tiles and a low-rank one
 whole ranks".
 
-**Compacting retired units out of the populations (a re-plan): not built**, larger than its worth now. What it needs:
-a `System.Shrunk()` that records a new system from the old one's records (modules, populations at their live sizes,
-signals, rules) and re-plans it; every connection rewired by the map of live units - dense, symmetric and event-driven
-blocks as their live rows and columns, a low-rank one as A's live rows and B's live columns, sparse rows with their old
-pattern restricted (Link has no way to take a pattern from outside `Draw` yet), tiles refused or turned dense (the tile
-grid does not follow units); biases, the kept state fields (LifCell.Kept: thresholds, gains), drives, targets and labels
-copied by the same map; the learner and optimizer made again. It saves the retired units' state and sweep work only,
-which is small next to the weights `Sparsify` already removes.
+**Compacting retired units out of the populations (a re-plan): measured 2026-11-17, not built - it cannot pay on MNIST.** What it
+would need: a `System.Shrunk()` that records a new system from the old one's records (modules, populations at their live sizes,
+signals, rules) and re-plans it; every connection rewired by the map of live units - dense, symmetric and event-driven blocks
+as their live rows and columns, a low-rank one as A's live rows and B's live columns, sparse rows with their old pattern
+restricted (Link has no way to take a pattern from outside `Draw` yet), tiles refused or turned dense; biases, kept state
+fields, drives, targets and labels copied by the same map; the learner and optimizer made again. What it would win, measured
+(`make mnistlearn ARGS="2 60000 128 32 1 0.001 0.5 1 0.2 0.1 200 1"`, 128 hidden units, 20% of the weights kept, accuracy
+97.43%, `silent` in mnist_learn.olang counts the units before `Sparsify`): of 128 hidden units 7 (5.5%) have no live weight
+out, none is without every weight. Magnitude pruning thins each unit's rows evenly; it does not empty units. A unit nothing
+hears costs its pixel row (about 156 of the 20013 multiply-adds once a settle, 0.8% each, at most 5% for the 7) and its share
+of a sweep's elementwise work; a sweep's 628 multiply-adds are live weights only (sparse rows), which compaction does not
+change. Under 5% of a settle at the most, against ~10% needed and a re-plan of the whole system; the retired units' weights are
+better dropped by the prune itself (a unit nobody hears loses its incoming weights) than by shrinking populations. Revisit if a
+pruning schedule that retires whole units (a group score per unit) is built.
 
 **MNIST (`mnist_learn`) pruning:** measured 2026-11-16, see "Measured on the data" below.
 
