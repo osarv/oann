@@ -84,8 +84,8 @@ Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved roun
   1.4-1.5x -> 1.2-1.3x of F32; only 128 x 128 x 10 gained (10.7 -> 8.5 us). Dropping the dot path (everything to the
   outer-product tiles) was 2-3x slower at depth 784 (64 x 784 x 128 74-103 -> 214-221 us). The masked tail is not as fast as
   whole 256-blocks over a long depth.
-- Next here: the packed INT8 micro-kernel (the 64+-row gap) - it waits on `vpdpbusd` or a 16-bit packing that LLVM
-  maps to one `vpdpwssd` per pair; ad/ops' `Scan` is `GatedScan` (the prelude now has a `Scan`).
+- Next here: the packed INT8 micro-kernel - done 2026-11-17 on olang's grouped Sum, see "INT8 on the grouped lane total" below;
+  ad/ops' `Scan` is `GatedScan` (the prelude now has a `Scan`).
 
 ## Pruning at run time (wt-oannmeasure2, 2026-11-16)
 
@@ -231,6 +231,33 @@ Measured one core, AVX-512 VNNI, alternated before/after runs on the shared mach
 
 Batch 1 takes the one-row path, unchanged. The CNN stays at F32's speed or below: its products are 9 and 144 deep
 (100352 x 9 x 16 runs at 4 GOPS, 7x F32's time - not yet profiled), and the rest of its forward is not INT8.
+
+## INT8 on the grouped lane total (wt-int8dots, 2026-11-17)
+
+`GemmI8`/`GemmI8Left` from 4 rows now take `grouped` (kernels/gemm): b packed as [k/4][nr][4] bytes (depth padded to 4 only),
+each row of a copied once, and a tile step is `acc += (a's four bytes * the panel's 64 bytes).Sum<I32>(4)` (olang E39) =
+`vpbroadcastd` + `vpdpbusd`, 6 x 32 (wide) or 12 x 16 (thin) tiles. No horizontal sum, no padding to 256: the dot-product
+path (`dots`, `dotsPay`, `packRowI8`) is removed. Depth up to 32 (`i8Shallow`) keeps the outer-product tiles with their
+shallow micro-kernel (depth 9: grouped pads 9 to 12 and measured no faster). Integer sums, bit for bit the same (the gemm
+test's reference, sizes added at depths 9, 144, 784, 785 and odd shapes). Batch 1 untouched.
+One olang oddity: accumulating `t.v[a:b] += (x * b).Sum<I32>(4)` straight into a `mut` parameter's array made
+`GemmI8.Allocates` true; into a local accumulator copied out at the end (as the old tiles) it does not.
+
+bench/int8 static INT8 microseconds, median (min) of 7 alternated runs, one core, the machine shared (F32 times swung 2x
+between runs, so ratios to F32 are from the same-run pairs only where stated):
+
+| shape | padded dots / old tiles | grouped | INT8 / F32 (grouped, same runs) |
+|---|---|---|---|
+| 64 x 784 x 128 | 89.9 (78.8) | 70.2 (46.1) | 2.3x |
+| 128 x 784 x 128 | 173.9 (153.7) | 120.3 (77.2) | 2.3x |
+| 25088 x 144 x 32 (depth 144) | 5518 (3285) | 2451 (1600) | 4.3x |
+| 100352 x 9 x 16 (depth 9) | unchanged path (noise 1370-4025 vs 2160-3080) | | 0.4x |
+| 128 x 128 x 10 | 14.2 (5.9) | 6.9 (4.7) | 1.3x |
+| 1024 x 128 x 512 / 1024 x 512 x 128 | 3784 / 1043 | 683 / 560 | 1.9x / 2.6x |
+| 512^3 / 1024^3 | 3181 / 38268 | 1060 / 11791 | 4.1x / 5.6x |
+
+bench/int8cnn static at batch 64 / 128 (3 alternated runs): 3.1-3.8 / 9.0-13.9 ms -> 2.1-3.9 / 4.5-9.4 ms (F32 11-19 ms). Depth 9 (the first
+convolution) stays 0.4x of F32 alone: it is the shallow tile, bound by its quantize and dequantize passes.
 
 ## INT8 convolution at depth 9 (wt-oannconv, 2026-11-16)
 

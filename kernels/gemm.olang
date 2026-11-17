@@ -142,9 +142,9 @@ fn (ws mut Workspace<A>&) ReserveLayer<S>(x I64, y I64, z I64, like S, perTask B
 # room for every GemmI8 of at most n outputs (b's rows) and depth k, on up to ws.Threads tasks
 fn (ws mut Workspace<A>&) ReserveI8(n I64, k I64) {
     if ws.corr.Len() < n: ws.corr = Array<I32>(n)
-    kp I64 = roundUp(k, i8Block)
-    nb I64 = (roundUp(n, i8WideCols) * k).Max(n * kp)
-    na I64 = (i8ThinRows * k).Max(i8DotRows * kp) * ws.Threads
+    k4 I64 = roundUp(k, 4)
+    nb I64 = roundUp(n, i8WideCols) * k4
+    na I64 = i8ThinRows * k4 * ws.Threads
     if ws.qb.Len() < nb: ws.qb = Array<I8>(nb)
     if ws.qa.Len() < na: ws.qa = Array<U8>(na)
 }
@@ -1138,9 +1138,7 @@ fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat
         for i in range m: q.rowI8(i)
         return
     }
-    if dotsPay(k, n): q.dots(ws, oa)
-    else if n > i8Lanes: q.blocked(ws, wideI8(), oa)
-    else: q.blocked(ws, thinI8(), oa)
+    q.product(ws, oa)
 }
 
 # GemmI8 whose activations are not a matrix but read by their own type as they are packed - a convolution's patches of
@@ -1156,9 +1154,7 @@ fn GemmI8Left<L>(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a L, m I64, k I64,
     fa, ob, none := foreign<L>(a), operand<I8>.of(b), operand<U8>(noBytes, 0)
     cd, od := c.Data[c.Off:], out.Data[out.Off:]
     q := quant(none, ob, m, n, k, scale, corr, cd, c.Ld, od, out.Ld)
-    if dotsPay(k, n): q.dots(ws, fa)
-    else if n > i8Lanes: q.blocked(ws, wideI8(), fa)
-    else: q.blocked(ws, thinI8(), fa)
+    q.product(ws, fa)
 }
 
 # no row sums given: a constant, so a product given none allocates nothing
@@ -1230,67 +1226,107 @@ fn (q quant&) blocked<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     }
 }
 
-# the packed product by dot products, where dotsPay: every row of a and b copied once, its depth padded with
-# zeros to a whole number of LaneDotBlock (256), so each output is one (x * w).Sum<I32>() of whole blocks - vpdpbusd,
-# 64 products an instruction, with nothing left over lane by lane. The outer-product tiles (blocked) have no four
-# adjacent products a lane and stay on vpdpwssd at 16 (repro/vnnitile). Row tiles of i8DotRows over ws.Threads tasks,
-# each tile against every output, a weight row read from L1 for each of the tile's rows
-fn (q quant&) dots<P>(ws mut Workspace<I32>&, src P) {
+# the packed product on grouped lane totals (E39): b in column panels of nr outputs as [k/4][nr][4] bytes (the depth
+# padded with zeros to a multiple of 4, outputs past n zero), each row of a copied once with its depth padded the same,
+# and a tile's step is, per row and vector of 16 outputs, `acc += (a's four bytes * the panel's 64).Sum<I32>(4)` -
+# vpdpbusd on a target with VNNI, 64 products an instruction, a's four bytes broadcast. No horizontal sum and no
+# padding to 256. Row tiles over ws.Threads tasks, each a tile of rows against every panel
+fn (q quant&) grouped<H, P>(ws mut Workspace<I32>&, sh H, src P) {
+    mr, nr := i8Shape(sh)
     m, n, k := q.m, q.n, q.k
-    kp I64 = roundUp(k, i8Block)
-    qb := ws.bytesB(n * kp)
-    for j in range n: packRowI8(q.b, j, k, kp, qb[j * kp:(j + 1) * kp])
-    tiles I64 = (m + i8DotRows - 1) / i8DotRows
+    kp I64 = roundUp(k, 4)
+    panels I64 = (n + nr - 1) / nr
+    qb := ws.bytesB(panels * kp * nr)
+    for p in range panels: packGroupsI8(q.b, k, kp, p * nr, lesser(nr, n - p * nr), nr, qb, p * kp * nr)
+    tiles I64 = (m + mr - 1) / mr
     tasks I64 = 1 if m * n * k < 2000000 else lesser(ws.Threads, tiles)
     share I64 = (tiles + tasks - 1) / tasks
-    room I64 = i8DotRows * kp
+    room I64 = mr * kp
     qa := ws.bytesA(tasks * room)
     if tasks <= 1 {
-        q.dotTiles(0, tiles, qa, qb, kp, src)
+        q.groupTiles(0, tiles, qa, qb, kp, sh, src)
         return
     }
     join {
         for t in range tasks {
             lo I64 = t * share
             hi I64 = lesser(tiles, lo + share)
-            if lo < hi: spawn q.dotTiles(lo, hi, qa[t * room:(t + 1) * room], qb, kp, src)
+            if lo < hi: spawn q.groupTiles(lo, hi, qa[t * room:(t + 1) * room], qb, kp, sh, src)
         }
     }
 }
 
-# whether the dot products pay for their padding: from a depth of 192 padded by at most half, or 128 padded by at most
-# double where the outputs fit the thin tile, whose 12 rows of one vector each are the slowest outer product (measured on
-# AVX-512 with VNNI, bench/int8: 784 padded to 1024 1.9x the outer-product tiles, 144 to 256 even and 128 to 256 0.7x at
-# 512 outputs, 128 to 256 4.2x at 10)
-fn dotsPay(k I64, n I64) Bool {
-    kp := roundUp(k, i8Block)
-    return k >= 192 and 2 * kp <= 3 * k or n <= i8Lanes and k >= 128 and kp <= 2 * k
-}
-
-i8DotRows I64 = 8
-i8Block I64 = 256          # the lanes olang sums a LaneDot at a time
-
-# row tiles lo .. hi: each tile's rows copied into pa (row i at i kp), then its dot products with every output
-fn (q quant&) dotTiles<P>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, kp I64, src P) {
-    for r in range lo, hi {
-        i0 I64 = r * i8DotRows
-        rows I64 = lesser(i8DotRows, q.m - i0)
-        for i in range rows: src.rowI8(i0 + i, q.k, kp, pa[i * kp:(i + 1) * kp])
-        for j in range q.n: q.dotColumn(i0, rows, j, pa, qb[j * kp:(j + 1) * kp])
+# outputs j0 .. j0 + cols of b into a panel nr wide in groups of four: dst[o + 4 (p4 nr + j) + t] = b[j0 + j, 4 p4 + t],
+# zeros past k and past cols
+fn packGroupsI8(b operand<I8>&, k I64, kp I64, j0 I64, cols I64, nr I64, dst mut Array<I8>&, o I64) {
+    for j in range cols {
+        s I64 = (j0 + j) * b.ld
+        for p in range k: dst[o + (p / 4) * 4 * nr + 4 * j + p % 4] = b.d[s + p]
+        for p in range k, kp: dst[o + (p / 4) * 4 * nr + 4 * j + p % 4] = 0
+    }
+    for j in range cols, nr {
+        for p in range kp: dst[o + (p / 4) * 4 * nr + 4 * j + p % 4] = 0
     }
 }
 
-# output j of rows i0 .. i0 + rows: the padded rows of pa against the padded weight row w
-fn (q quant&) dotColumn(i0 I64, rows I64, j I64, pa Array<U8>&, w Array<I8>&) {
-    kp := w.Len()
-    for i in range rows: q.store1(i0 + i, j, (pa[i * kp:(i + 1) * kp] * w).Sum<I32>())
+fn (q quant&) groupTiles<H, P>(lo I64, hi I64, pa mut Array<U8>&, qb Array<I8>&, kp I64, sh H, src P) {
+    mr, nr := i8Shape(sh)
+    for r in range lo, hi {
+        rows I64 = lesser(mr, q.m - r * mr)
+        for i in range rows: src.rowI8(r * mr + i, q.k, kp, pa[i * kp:(i + 1) * kp])
+        for p in range 0, q.n, nr: q.groupTile(r * mr, rows, p, lesser(nr, q.n - p), pa, qb, kp, sh)
+    }
 }
 
-# row j of b into dst, zeros from k to dst's end
-fn packRowI8(b operand<I8>&, j I64, k I64, kp I64, dst mut Array<I8>&) {
-    s I64 = j * b.ld
-    for p in range k: dst[p] = b.d[s + p]
-    for p in range k, kp: dst[p] = 0
+fn (q quant&) groupTile<H>(i0 I64, rows I64, j0 I64, cols I64, pa Array<U8>&, qb Array<I8>&, kp I64, sh H) {
+    _, nr := i8Shape(sh)
+    t := tile<I32>()
+    match H {
+        case wideI8 { groupWide(kp, pa, qb, j0 * kp, t) }
+        case thinI8 { groupThin(kp, pa, qb, j0 * kp, t) }
+    }
+    for i in range rows {
+        for j in range cols: q.store1(i0 + i, j0 + j, t.v[i * nr + j])
+    }
+}
+
+# the rows of the tile at i kp in pa (pa's rows from i >= rows hold what an earlier tile left: their results are not stored)
+fn groupWide(kp I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
+    acc := tile<I32>()
+    for p in range kp / 4 {
+        o I64 = bo + p * 4 * i8WideCols
+        b0 := qb[o:o + 64]
+        b1 := qb[o + 64:o + 128]
+        comptime for i in range i8WideRows {
+            x := pa[i * kp + 4 * p:i * kp + 4 * p + 4]
+            acc.v[i * 32:i * 32 + 16] += (x * b0).Sum<I32>(4)
+            acc.v[i * 32 + 16:i * 32 + 32] += (x * b1).Sum<I32>(4)
+        }
+    }
+    for i in range i8WideRows * i8WideCols: t.v[i] = acc.v[i]
+}
+
+fn groupThin(kp I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
+    acc := tile<I32>()
+    for p in range kp / 4 {
+        b := qb[bo + p * 64:bo + p * 64 + 64]
+        comptime for i in range i8ThinRows {
+            x := pa[i * kp + 4 * p:i * kp + 4 * p + 4]
+            acc.v[i * 16:i * 16 + 16] += (x * b).Sum<I32>(4)
+        }
+    }
+    for i in range i8ThinRows * i8Lanes: t.v[i] = acc.v[i]
+}
+
+# the packed product: the grouped lane totals (grouped) from a depth past i8Shallow, else the outer-product tiles
+# (blocked), whose shallow micro-kernel runs a thin tile's few steps (the CNN's first convolution, 9 deep) faster
+fn (q quant&) product<P>(ws mut Workspace<I32>&, src P) {
+    if q.k <= i8Shallow {
+        if q.n > i8Lanes: q.blocked(ws, wideI8(), src)
+        else: q.blocked(ws, thinI8(), src)
+    }
+    else if q.n > i8Lanes: q.grouped(ws, wideI8(), src)
+    else: q.grouped(ws, thinI8(), src)
 }
 
 # row i of the activations into dst, zeros from k to dst's end
@@ -2021,7 +2057,7 @@ fn i8Case(m I64, n I64, k I64, zero I32, r mut rand.Rand&) {
 
 test GemmI8 "INT8 products are the integer sums, dequantized per output, wide and thin tiles and padded dot products, any thread count" {
     r := rand.Rand(14)
-    sizes := Array<I64>[1, 10, 300, 3, 70, 5, 7, 16, 41, 64, 128, 784, 300, 70, 300, 13, 40, 9, 37, 20, 520]
+    sizes := Array<I64>[1, 10, 300, 3, 70, 5, 7, 16, 41, 64, 128, 784, 300, 70, 300, 13, 40, 9, 37, 20, 520, 65, 33, 144, 70, 17, 144, 50, 32, 785, 9, 48, 9, 31, 20, 33, 12, 130, 34]
     for s in range sizes.Len() / 3 {
         i8Case(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], 0, r)
         i8Case(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], 128, r)
