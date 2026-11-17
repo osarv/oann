@@ -457,9 +457,99 @@ the ball ignored, 77% would - so at kappa 0.9 an uncertain row's `beta lambda_ma
 outright, and a batch needs all 32 rows. Training is unchanged (no batch certified, so no budget changed; the 0.09
 point accuracy difference is the extra warm power iteration `Kappa` advances, which `Restrain` starts from).
 
+## The GPU route, GP1: bindings and a GEMM through cuBLAS (wt-gp1, 2026-11-17)
+
+docs/redesign.md 1.10 and 4.4's GP1. `kernels/gpu/cuda.c` (the C shim: device addresses and handles as U64, host arrays
+with a byte offset, a status record the Device owns), `kernels/gpu/device.olang` (`Device`, `Buf<S>`, `DMat<S>`,
+`GpuError`, uploads and downloads), `kernels/gpu/blas.olang` (`Gemm` by `cublasGemmEx`), `make gputest` and `make
+gpugemm` (G-M1, `bench/gpugemm.olang`).
+
+- **The CUDA headers import as they are**: `cuda_runtime_api.h`, `cublas_v2.h`, `cublasLt.h` and `nvrtc.h` through the
+  `.c` module, Ubuntu's toolkit 12.0, no declaration refused. OP1 is not needed; OP2 stays worked around by the U64
+  addresses, as planned.
+- **Gated**: the modules assert `-define Gpu=true` at their top level, so an import of them outside `if Gpu { ... }`
+  fails every build saying so, and `make test` translates no CUDA header. `bench/gpugemm` imports them under `if Gpu`
+  and times the CPU alone when built without the define.
+- **Tests** (`make gputest`, 8): `Device.Open` names the device (NVIDIA GeForce RTX 4060, sm_89, 24 SMs, 8187 MiB);
+  upload then download is the identity in F32, BF16, I8 and F64, whole and in ranges at offsets, and an upload is
+  ordered before the next compute-stream download; `Gemm` in F32, BF16 (summed in F32) and F64, every transpose,
+  alpha and beta, offset views with padded rows, odd sizes (1x1x1 to 100x300x1000, the MLP's and settle's shapes)
+  against `kernels/gemm.Gemm` within k eps(A) |alpha| max|a| max|b| + 2 eps(A) |beta| max|c| plus one rounding to S,
+  nothing outside C's view written, run twice identical bit for bit; a 4 TiB `Buf` is `GpuError.Cuda` naming
+  cudaMalloc and the size with CUDA's "out of memory"; a bad leading dimension is the next Sync's
+  `GpuError.Cublas(7, "cublasGemmEx: an unsupported value or parameter was passed to the function")`, and the product
+  after it runs. Without a device each test prints that it is skipped.
+- **cuBLAS rounds split-K partial sums to BF16 by default**: a BF16 product at depth 257 was 3% off the exact sum (0.0613
+  against 0.0597; the CPU 0.0596). The handle is made with `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` (and the
+  default math, so never TF32). Its price is in the table: BF16 128 x 784 x 128 takes 70 us against F32's 15 (no
+  split-K left for a 128 x 128 result); from batch 512 BF16 is 1.5-3.2x F32 again.
+- **This machine** (WSL2): the `nvidia-cuda-dev` package pulled in a native driver's `libcuda.so.1`
+  (libnvidia-compute-580) that shadows WSL's in the loader's cache, and CUDA then sees no device. `make gputest` and
+  `make gpugemm` put `/usr/lib/wsl/lib` first on `LD_LIBRARY_PATH` where it exists (harmless once the system is fixed);
+  run without it, the tests skip.
+
+**G-M1, first table** (`make gpugemm OLANG=olang ARGS="7 1 4"`, 2026-11-17, commit of this section; Ryzen 5 7600 under
+WSL2, 6 cores, load average 0.7-1.0; RTX 4060 8 GB, driver 610, CUDA 12.0's cuBLAS). GFLOPS (us a product), the median of
+7 interleaved rounds of about 20 ms each. *Resident*: operands on the device, products enqueued back to back, one Sync.
+*With transfers*: A and B uploaded from pageable host memory, the product, C downloaded, a Sync - every product; a plan's
+per-batch transfers (inputs up, a few numbers down) lie between the two. Each GPU round follows an untimed one: the
+GPU drops to 210 MHz (P8) within milliseconds of idling, and a cold BF16 round of 2048^3 measured 3.3 ms against 0.59 ms
+warm. Two runs agreed within 10% (BF16's 10 x 128 x 128 within 25%).
+
+F32:
+
+| shape | m x k x n | CPU 1 thread | CPU 4 threads | GPU resident | GPU with transfers |
+|---|---|---|---|---|---|
+| MLP fwd 1 / settle x->h | 128 x 784 x 128 | 104 (246 us) | 53 (482 us) | 1763 (14.6 us) | 135 (190 us) |
+| MLP fwd 2 / settle h->y | 128 x 128 x 10 | 46 (7.2 us) | 46 (7.2 us) | 51 (6.5 us) | 3.1 (105 us) |
+| MLP bwd dh / settle y->h | 128 x 10 x 128 | 51 (6.4 us) | 51 (6.4 us) | 52 (6.3 us) | 3.3 (100 us) |
+| MLP dW2 / EP outer y h | 10 x 128 x 128 | 49 (6.7 us) | 49 (6.7 us) | 42 (7.8 us) | 3.1 (106 us) |
+| MLP dW1 / EP outer h x | 128 x 128 x 784 | 114 (226 us) | 131 (196 us) | 2599 (9.9 us) | 109 (235 us) |
+| fwd 1, batch 32 | 32 x 784 x 128 | 78 (82 us) | 17 (372 us) | 493 (13.0 us) | 40 (160 us) |
+| fwd 1, batch 512 | 512 x 784 x 128 | 114 (906 us) | 144 (714 us) | 4102 (25.1 us) | 276 (373 us) |
+| fwd 1, batch 4096 | 4096 x 784 x 128 | 113 (7278 us) | 346 (2378 us) | 7864 (104 us) | 511 (1609 us) |
+| hidden 1024, batch 128 | 128 x 784 x 1024 | 116 (1778 us) | 181 (1133 us) | 6071 (33.9 us) | 405 (508 us) |
+| square 512 | 512^3 | 134 (2002 us) | 348 (771 us) | 6829 (39.3 us) | 564 (476 us) |
+| square 1024 | 1024^3 | 132 (16297 us) | 451 (4760 us) | 8462 (254 us) | 1476 (1455 us) |
+| square 2048 | 2048^3 | 120 (142685 us) | 435 (39473 us) | 9379 (1832 us) | 2769 (6203 us) |
+
+BF16, every operand stored in BF16, summed in F32:
+
+| shape | m x k x n | CPU 1 thread | CPU 4 threads | GPU resident | GPU with transfers |
+|---|---|---|---|---|---|
+| MLP fwd 1 / settle x->h | 128 x 784 x 128 | 108 (239 us) | 53 (484 us) | 350 (73.4 us) | 175 (147 us) |
+| MLP fwd 2 / settle h->y | 128 x 128 x 10 | 53 (6.2 us) | 53 (6.2 us) | 49 (6.7 us) | 3.0 (108 us) |
+| MLP bwd dh / settle y->h | 128 x 10 x 128 | 55 (6.0 us) | 55 (6.0 us) | 46 (7.2 us) | 2.6 (125 us) |
+| MLP dW2 / EP outer y h | 10 x 128 x 128 | 80 (4.1 us) | 79 (4.1 us) | 33 (10.0 us) | 2.5 (132 us) |
+| MLP dW1 / EP outer h x | 128 x 128 x 784 | 119 (215 us) | 159 (162 us) | 1640 (15.7 us) | 103 (249 us) |
+| fwd 1, batch 32 | 32 x 784 x 128 | 84 (77 us) | 19 (345 us) | 466 (13.8 us) | 36 (178 us) |
+| fwd 1, batch 512 | 512 x 784 x 128 | 110 (938 us) | 145 (707 us) | 6303 (16.3 us) | 404 (254 us) |
+| fwd 1, batch 4096 | 4096 x 784 x 128 | 111 (7431 us) | 345 (2380 us) | 16548 (49.7 us) | 871 (944 us) |
+| hidden 1024, batch 128 | 128 x 784 x 1024 | 117 (1765 us) | 189 (1090 us) | 13512 (15.2 us) | 576 (357 us) |
+| square 512 | 512^3 | 127 (2109 us) | 332 (809 us) | 14249 (18.8 us) | 860 (312 us) |
+| square 1024 | 1024^3 | 129 (16683 us) | 426 (5036 us) | 25374 (84.6 us) | 2627 (817 us) |
+| square 2048 | 2048^3 | 122 (141229 us) | 447 (38438 us) | 29994 (573 us) | 6053 (2838 us) |
+
+What it says:
+- **The settle's 10-wide products stay on the CPU.** 128 x 128 x 10, 128 x 10 x 128 and 10 x 128 x 128 take 4-7 us on
+  one core and 6-10 us on the GPU even resident: a cuBLAS launch on WSL costs about 6 us, whatever the work. Anything
+  under about 1 MFLOP is launch-bound on the GPU.
+- **The 784-wide products go to the GPU once resident**: 128 x 784 x 128 is 15 us against 246 (17x), the EP outer
+  product 128 x 128 x 784 10 us against 196-226 (20-23x), and from there the gap grows with the size (2048^3: 78x one
+  core, 22x four). The settle on the GPU (GP4) is therefore worth building only with its state resident, as 1.10 plans: a
+  sweep is about two big products and launches of about 6 us each.
+- **Transfers dominate at these sizes**: a round trip through pageable memory is about 100 us before any work (the 10-wide
+  rows), so with nothing resident the GPU wins only from about 128 x 784 x 128 (190 us against the CPU's 246), and
+  against four threads by 1.5x at batch 4096 and 6x at 2048^3. Inputs must come up once a batch from pinned staging, as 1.10 says; that is GP2-GP4's.
+- **kernels/gemm's four threads are slower than one at 32 and 128 rows** (128 x 784 x 128: 482 us against 246; 32 x
+  784 x 128: 372 against 82) - the split costs more than it saves at these shapes on this machine. Not a GPU question,
+  but the settle's CPU blocks are exactly these shapes; worth a look in kernels/gemm (where it splits, and the tasks'
+  start-up under WSL).
+
 ## Next
 
-- The open work of docs/redesign.md: the GPU route (question 1).
+- The open work of docs/redesign.md: the GPU route (question 1) - GP1 is done (above); GP2 (NVRTC and the rate step) next.
+- kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).
 - The nudged pair's certificate per batch: `NudgedRate` certifies confident rows only (44% at MNIST's epoch 3, no
   batch of 32). Next levers: a block-weighted norm (readouts apart from hidden units: the hidden-readout coupling
   carries the readouts' small saturated slopes, `beta w < 1 - kappa^2 rho'_y` instead of `1 - kappa`), or a budget

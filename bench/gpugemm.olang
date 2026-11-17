@@ -1,0 +1,234 @@
+# G-M1 (docs/redesign.md 1.10): GEMM GFLOPS of kernels/gemm against cuBLAS (kernels/gpu/blas) on the MLP's and the
+# settle's shapes - the 784-128-10 perceptron at batch B: forward x W1^T (B x 784 x 128) and h W2^T (B x 128 x 10), the
+# backward's dy W2 (B x 10 x 128), dy^T h (10 x B x 128) and dh^T x (128 x B x 784); the settle's carries are the same
+# three products a block of B rows, and EP's update the same two outer products. Then larger batches and squares, for
+# where the GPU starts to pay. F32 and BF16 (every operand stored in BF16, summed in F32).
+#
+# Each shape is timed four ways, interleaved round by round, the median of the rounds: the CPU at each thread count;
+# the GPU with every operand resident (products enqueued back to back, one Sync at the end); and the GPU with nothing
+# resident (A and B uploaded, the product, C downloaded and a Sync, every product) - a plan's per-batch transfers lie
+# between the two. Each round repeats a product until it takes about 20 ms; each GPU round follows an untimed one, so
+# the GPU is timed at its working clocks, as in a loop that keeps it busy, not as it wakes from idling. Arguments: rounds (7), then the CPU's
+# thread counts (1 4).
+#
+# Built without -define Gpu=true it times the CPU alone. From the repository's root: make gpugemm ARGS="7 1 4"
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/gemm"
+import "../kernels/mat"
+
+Gpu Bool = false
+
+if Gpu {
+    import "../kernels/gpu/device"
+    import "../kernels/gpu/blas"
+}
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+# a product's shape: C (m x n) = op(A) op(B) at a depth of k
+type Shape struct(What String, M I64, K I64, N I64, Ta Bool, Tb Bool) {
+    What
+    M
+    K
+    N
+    Ta
+    Tb
+}
+
+fn shapes() Array<Shape> {
+    return Array<Shape>[
+        Shape("MLP fwd 1 / settle x->h", 128, 784, 128, false, true)
+        Shape("MLP fwd 2 / settle h->y", 128, 128, 10, false, true)
+        Shape("MLP bwd dh / settle y->h", 128, 10, 128, false, false)
+        Shape("MLP dW2 / EP outer y h", 10, 128, 128, true, false)
+        Shape("MLP dW1 / EP outer h x", 128, 128, 784, true, false)
+        Shape("fwd 1, batch 32", 32, 784, 128, false, true)
+        Shape("fwd 1, batch 512", 512, 784, 128, false, true)
+        Shape("fwd 1, batch 4096", 4096, 784, 128, false, true)
+        Shape("hidden 1024, batch 128", 128, 784, 1024, false, true)
+        Shape("square 512", 512, 512, 512, false, false)
+        Shape("square 1024", 1024, 1024, 1024, false, false)
+        Shape("square 2048", 2048, 2048, 2048, false, false)
+    ]
+}
+
+fn random<S>(n I64, like S, r mut rand.Rand&) Array<S> {
+    x := Array<S>(n)
+    for i in range n: x[i] = S(r.Uniform(-1.0, 1.0))
+    return x
+}
+
+# a shape's host operands, as Mats, and a workspace for each CPU thread count
+type Host<S> struct(sh Shape, like S, r mut rand.Rand&, threads Array<I64>&) {
+    Sh Shape = sh
+    a mut Array<S>& = random(sh.M * sh.K, like, r)
+    b mut Array<S>& = random(sh.K * sh.N, like, r)
+    c mut Array<S>& = Array<S>(sh.M * sh.N)
+    ar I64 = sh.K if sh.Ta else sh.M
+    ac I64 = sh.M if sh.Ta else sh.K
+    br I64 = sh.N if sh.Tb else sh.K
+    bc I64 = sh.K if sh.Tb else sh.N
+    Am mat.Mat<S> = mat.Mat<S>(a, 0, ar, ac, ac)
+    Bm mat.Mat<S> = mat.Mat<S>(b, 0, br, bc, bc)
+    Cm mat.Mat<S> = mat.Mat<S>(c, 0, sh.M, sh.N, sh.N)
+    wss Vec<gemm.Workspace<F32>> = Vec<gemm.Workspace<F32>>()
+    for t in threads: wss.Push(gemm.Workspace<F32>(t, sh.M.Max(sh.K).Max(sh.N), sh.M * sh.N))
+}
+
+# ns a product on the CPU with the i-th workspace, over reps products
+fn (h mut Host<S>&) cpu(i I64, reps I64) F64 {
+    ws := h.wss[i]
+    t0 := time.Now()
+    for _ in range reps: gemm.Gemm(ws, h.Cm, h.Am, h.Sh.Ta, h.Bm, h.Sh.Tb)
+    return F64(time.Since(t0)) / F64(reps)
+}
+
+# the repetitions of a CPU product that take about 20 ms
+fn (h mut Host<S>&) cpuReps(i I64) I64 {
+    reps I64 = 1
+    for {
+        if h.cpu(i, reps) * F64(reps) > 2e7 or reps >= 1 << 20: return reps
+        reps = reps * 2
+    }
+}
+
+fn gflops(sh Shape&, ns F64) String { return $(2.0 * F64(sh.M) * F64(sh.N) * F64(sh.K) / ns).Fixed(1) }
+
+fn cell(sh Shape&, ns F64) String { return gflops(sh, ns) + " (" + $(ns * 1e-3).Fixed(1) + " us)" }
+
+fn header(threads Array<I64>&, gpu Bool) ? io.Error {
+    line := "shape | m x k x n"
+    for t in threads: line = line + " | CPU " + $t + " thread" + ("s" if t > 1 else "")
+    if gpu: line = line + " | GPU resident | GPU with transfers"
+    try io.Put(line + "\n")
+}
+
+# one storage type's table: a line a shape, GFLOPS (and us a product) for each CPU thread count, then the GPU's two
+fn table<S>(like S, name String&, rounds I64, threads Array<I64>&) ? io.Error {
+    if Gpu {
+        dev := try device.Device.Open() catch e {
+            try io.Put("no GPU (" + $e + "): the CPU alone\n")
+            try cpuTable(like, name, rounds, threads)
+            return
+        }
+        try io.Put("== " + name + " on " + dev.Str() + "\n")
+        try gpuTable(dev, like, rounds, threads) catch device.GpuError e: try io.Put("GPU failed: " + $e + "\n")
+    } else {
+        try io.Put("built without -define Gpu=true: the CPU alone\n")
+        try cpuTable(like, name, rounds, threads)
+    }
+}
+
+fn cpuTable<S>(like S, name String&, rounds I64, threads Array<I64>&) ? io.Error {
+    try io.Put("== " + name + "\n")
+    try header(threads, false)
+    r := rand.Rand(1)
+    for sh in shapes() {
+        h := Host<S>(sh, like, r, threads)
+        n := threads.Len()
+        times := Array<Array<F64>>(n)
+        reps := Array<I64>(n)
+        for i in range n {
+            times[i] = Array<F64>(rounds)
+            reps[i] = h.cpuReps(i)
+        }
+        for round in range rounds {
+            for i in range n: times[i][round] = h.cpu(i, reps[i])
+        }
+        line := sh.What + " | " + $sh.M + " x " + $sh.K + " x " + $sh.N
+        for i in range n: line = line + " | " + cell(sh, median(times[i]))
+        try io.Put(line + "\n")
+    }
+}
+
+if Gpu {
+    # ns a product on the GPU, operands resident: reps products enqueued, then one Sync
+    fn resident<S>(dev mut device.Device&, c mut device.DMat<S>&, a device.DMat<S>&, b device.DMat<S>&, sh Shape&, reps I64) F64 ? device.GpuError {
+        t0 := time.Now()
+        for _ in range reps: blas.Gemm(dev, c, a, sh.Ta, b, sh.Tb, F32(1), F32(0))
+        try dev.Sync()
+        return F64(time.Since(t0)) / F64(reps)
+    }
+
+    # ns a product on the GPU with nothing resident: A and B uploaded, the product, C downloaded and a Sync, each time
+    fn moved<S>(dev mut device.Device&, h mut Host<S>&, c mut device.DMat<S>&, a device.DMat<S>&, b device.DMat<S>&, da mut device.Buf<S>&, db mut device.Buf<S>&, dc device.Buf<S>&, reps I64) F64 ? device.GpuError {
+        t0 := time.Now()
+        for _ in range reps {
+            da.UploadAll(h.a)
+            db.UploadAll(h.b)
+            blas.Gemm(dev, c, a, h.Sh.Ta, b, h.Sh.Tb, F32(1), F32(0))
+            dc.DownloadAll(h.c)
+            try dev.Sync()
+        }
+        return F64(time.Since(t0)) / F64(reps)
+    }
+
+    fn gpuTable<S>(dev mut device.Device&, like S, rounds I64, threads Array<I64>&) ? io.Error, device.GpuError {
+        try header(threads, true)
+        r := rand.Rand(1)
+        for sh in shapes() {
+            h := Host<S>(sh, like, r, threads)
+            da := try device.Buf<S>.Make(dev, h.a.Len())
+            db := try device.Buf<S>.Make(dev, h.b.Len())
+            dc := try device.Buf<S>.Make(dev, h.c.Len())
+            dam := device.DMat<S>(da, 0, h.Am.Rows, h.Am.Cols, h.Am.Ld)
+            dbm := device.DMat<S>(db, 0, h.Bm.Rows, h.Bm.Cols, h.Bm.Ld)
+            dcm := device.DMat<S>(dc, 0, sh.M, sh.N, sh.N)
+            da.UploadAll(h.a)
+            db.UploadAll(h.b)
+            n := threads.Len()
+            times := Array<Array<F64>>(n + 2)
+            reps := Array<I64>(n + 2)
+            for i in range n + 2: times[i] = Array<F64>(rounds)
+            for i in range n: reps[i] = h.cpuReps(i)
+            rr I64 = 1
+            for {
+                if try resident(dev, dcm, dam, dbm, sh, rr) * F64(rr) > 2e7 or rr >= 1 << 20: break
+                rr = rr * 2
+            }
+            rm I64 = 1
+            for {
+                if try moved(dev, h, dcm, dam, dbm, da, db, dc, rm) * F64(rm) > 2e7 or rm >= 1 << 20: break
+                rm = rm * 2
+            }
+            for round in range rounds {
+                for i in range n: times[i][round] = h.cpu(i, reps[i])
+                # the GPU's clocks fall within milliseconds of idling (to 210 MHz, P8) while the CPU's rounds run, and
+                # a cold BF16 round measured 5.6x slower than a warm one: each GPU way runs one round untimed first
+                try resident(dev, dcm, dam, dbm, sh, rr)
+                times[n][round] = try resident(dev, dcm, dam, dbm, sh, rr)
+                try moved(dev, h, dcm, dam, dbm, da, db, dc, rm)
+                times[n + 1][round] = try moved(dev, h, dcm, dam, dbm, da, db, dc, rm)
+            }
+            line := sh.What + " | " + $sh.M + " x " + $sh.K + " x " + $sh.N
+            for i in range n + 2: line = line + " | " + cell(sh, median(times[i]))
+            try io.Put(line + "\n")
+        }
+    }
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try number(args, 1, 7)
+    threads := Vec<I64>()
+    for i in range 2, args.Len(): threads.Push(try args[i].ParseInt())
+    if threads.Len() == 0 {
+        threads.Push(1)
+        threads.Push(4)
+    }
+    ts := threads.ToArray()
+    try table(F32(0), "F32", rounds, ts)
+    try table(BF16(0), "BF16 (every operand), summed in F32", rounds, ts)
+}

@@ -1061,6 +1061,15 @@ written into PROGRESS.md before any further settle work goes to the GPU.
 - **G4. CUDA as an optional dependency.** *Decided:* the GPU is behind `-define Gpu=true`, so oann without CUDA builds
   and tests as today: `make test` CPU only, `make gputest` on machines with the GPU.
 
+**As built (GP1, 2026-11-17).** The four headers import through `kernels/gpu/cuda.c` as they are (OP1 not needed).
+Differences from the sketch above: the builder is `Device.Open(ordinal)` (olang D19a: a function making its module's
+type is that type's builder); `Gemm`'s storage is one `S` for all three operands and it has no epilogue yet (both
+cuBLASLt's, GP3); the compute type follows the storage (F64 for F64, F32 for the rest), `A` types alpha and beta only;
+`Buf` has `UploadAll`/`DownloadAll` beside the ranged forms and `N`, `DMat` an `Addr(r, c)`; `DBatch` waits for
+`GemmBatch` (GP3). The modules assert `-define Gpu=true` at their top level, so an ungated import fails at once. The
+cuBLAS handle disallows reduced-precision reductions: by default cuBLAS rounds split-K parts of a BF16 product to BF16
+(3% at depth 257). G-M1's first table and the rest are in PROGRESS.md.
+
 The packages are section 4.4.
 
 ## 2. Module map

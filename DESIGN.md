@@ -1,7 +1,8 @@
 # oann - design
 
 oann is a neural-network framework written in olang: tensors, kernels, reverse-mode autodiff, a dynamical-system core
-for settling networks, models and their training loops, data, checkpoints. Every kernel is olang; nothing links a BLAS.
+for settling networks, models and their training loops, data, checkpoints. Every kernel is olang; nothing links a BLAS - but the GPU backend (`kernels/gpu`, cuBLAS, built only with
+`-define Gpu=true`).
 This file is the design as it stands (the cut-over, C3, 2026-11-15); the plan and every package's as-built notes are
 `docs/redesign.md`, the model of settling networks is `docs/settling.md`, and the record of how the design got here -
 rounds 1 and 2, before the redesign - is `docs/design-history.md`, the last section below says how to read it.

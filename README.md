@@ -39,6 +39,7 @@ It needs the olang compiler beside oann (`../olang/build/olang`, or `OLANG=path`
 
 ```
 make test                          # every module's tests, takes minutes
+make gputest                       # the GPU backend's tests (CUDA, cuBLAS; -define Gpu=true), skipped without a device
 make mnist ARGS="10 adamw 1 1"     # an example or benchmark built and run with ARGS (data, cnn, int8, lmbench, board, ...)
 ```
 
@@ -51,7 +52,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | | |
 |---|---|
 | `tensor.olang` | `Tensor<T>`, the N-d strided view (rank up to 6): Slice, Select, Permute, Expand, Reshape, element kernels, conversions between storage types, `@` batched |
-| `kernels/` | GEMM (blocked, batched, from patches, GEMV, INT8), element kernels, attention, scans, sparse and event-driven products, convolution (`kernels/README.md`) |
+| `kernels/` | GEMM (blocked, batched, from patches, GEMV, INT8), element kernels, attention, scans, sparse and event-driven products, convolution; the GPU backend in `kernels/gpu` (`kernels/README.md`) |
 | `ad/` | reverse-mode autodiff on tensors: `Graph<T>`, the operations and their gradients (`ad/README.md`) |
 | `dyn/` | the dynamical-system core: systems of populations and connections, the settle, equilibrium propagation and the other learning rules, energies, the bridge into `ad` (`dyn/README.md`) |
 | `nn/` | layers, AdamW and Sgd, the training loops, generation, INT8 quantization (`nn/README.md`) |
