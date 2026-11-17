@@ -1,0 +1,331 @@
+# device - the GPU and where things live on it (docs/redesign.md 1.10): a Device (the CUDA device, a compute stream, a
+# copy stream, the cuBLAS and cuBLASLt handles and cuBLAS's fixed workspace), Buf<S> (n elements of S in device memory),
+# DMat<S> (Mat's numbers over a Buf) and GpuError, every library status as an olang error.
+#
+# Built only when asked: a build that never says -define Gpu=true translates no CUDA header. A CPU module reaches this
+# one only under a top-level `if Gpu { import ... }` (olang B9, B10c), and this module asserts the define, so an import
+# that is not under it fails every build at once, saying so, rather than making `make test` need CUDA.
+#
+# Addresses. Device memory is addressed by U64 (cuda.c, the shim), so a view at an offset is arithmetic here and the
+# libraries are called with whatever address a view names. Host arrays cross whole, with an offset.
+#
+# Errors. Setup - Open, Buf.Make - gives a GpuError back at once, with the call's name and CUDA's or cuBLAS's own text.
+# The hot path (uploads, downloads, products) does not branch per call: the shim records the first status that is not
+# success in the Device's status record, and the next Sync gives it back - which is also where CUDA reports
+# asynchronous faults. A download is read by the host after Sync.
+#
+# Streams. One compute stream: everything is enqueued on it in program order, so nothing races by construction. An
+# upload goes on the copy stream and is ordered before what is enqueued on the compute stream after it by an event.
+#
+# Who frees. Device and Buf are unique with destructors (cudaFree; handles, streams and the event), so device memory
+# lives as long as what holds the Buf. A Buf holds its Device by reference, so it cannot outlive it: buffers go before
+# their device. Close releases a device early.
+
+import cu "cuda.c" link "cudart"
+
+extern link "cublas" { }
+extern link "cublasLt" { }
+
+Gpu Bool = false
+
+assert Gpu, "kernels/gpu needs CUDA and is built only with -define Gpu=true: import it under if Gpu { ... } (docs/redesign.md 1.10)"
+
+# a library's status as an error: no device at all; a CUDA runtime call, a cuBLAS call, an NVRTC compile or a kernel
+# launch that failed - its status and what failed, in the library's own words
+type GpuError error {
+    NoDevice
+    Cuda(code I32, what String)
+    Cublas(code I32, what String)
+    Nvrtc(log String)
+    Launch(code I32, what String)
+}
+
+# cuBLAS's workspace, fixed at Open (cublasSetWorkspace), so no product allocates
+WorkBytes I64 = 32 << 20
+
+# the shim's kinds of status (cuda.c's OANN_CUDA, OANN_CUBLAS)
+statusCuda I32 = 1
+statusCublas I32 = 2
+
+# the text C gives back, "" for none
+fn Text(p CStr?&) String {
+    if p == null: return ""
+    return String.FromC(p, 1024)
+}
+
+# the text up to a NUL C wrote into a buffer
+fn cstring(b Array<U8>&) String {
+    for i in range b.Len() {
+        if b[i] == 0: return String(b[:i])
+    }
+    return String(b)
+}
+
+# CUDA's status, where it is not success, as an error naming the call and saying what CUDA says
+fn CheckCuda(code I32, what String&) ? GpuError {
+    if code != 0: error GpuError.Cuda(code, what + ": " + Text(cu.cudaGetErrorString(code)))
+}
+
+# cuBLAS's status, where it is not success, as an error naming the call and saying what cuBLAS says
+fn CheckCublas(code I32, what String&) ? GpuError {
+    if code != 0: error GpuError.Cublas(code, what + ": " + Text(cu.cublasGetStatusString(code)))
+}
+
+# the device of this ordinal: Name, compute capability Major.Minor, Sms multiprocessors, MiB of memory. Its streams,
+# event and handles are U64s the shim gives; each is 0 until made and after Close, so the destructor releases what
+# was made, also when Open fails part way
+type Device unique struct(ordinal I64) {
+    Ordinal I64 = ordinal
+    Name String = ""
+    Major I64 = 0
+    Minor I64 = 0
+    Sms I64 = 0
+    MiB I64 = 0
+    status U64 = 0      # the shim's status record: the first failure since the last Sync
+    compute U64 = 0     # the stream everything runs on
+    copy U64 = 0        # the stream uploads go on
+    uploaded U64 = 0    # the event ordering an upload before the next compute
+    blas U64 = 0        # the cuBLAS handle, on the compute stream
+    lt U64 = 0          # the cuBLASLt handle
+    work U64 = 0        # cuBLAS's workspace, WorkBytes
+} destruct {
+    release(status, compute, copy, uploaded, blas, lt, work)
+}
+
+# frees what a Device made, whatever was made; statuses are not read (a destructor has no one to give them to)
+fn release(status U64, compute U64, copy U64, uploaded U64, blas U64, lt U64, work U64) {
+    if lt != 0: cu.oann_cublaslt_destroy(lt)
+    if blas != 0: cu.oann_cublas_destroy(blas)
+    if work != 0: cu.oann_free(work)
+    if uploaded != 0: cu.oann_event_destroy(uploaded)
+    if copy != 0: cu.oann_stream_destroy(copy)
+    if compute != 0: cu.oann_stream_destroy(compute)
+    if status != 0: cu.oann_status_free(status)
+}
+
+# the device of this ordinal, opened: GpuError.NoDevice where CUDA finds none, else the failing call's error
+fn Device.Open(ordinal I64 = 0) Device ? GpuError {
+    n := cu.oann_device_count()
+    if n == 0 or n == -cu.cudaErrorNoDevice: error GpuError.NoDevice
+    if n < 0: try CheckCuda(-n, "cudaGetDeviceCount")
+    d := Device(ordinal)
+    name := Array<U8>(256)
+    info := Array<I32>(4)
+    st := cu.oann_device_info(I32(ordinal), name, 256, info)
+    try CheckCuda(st, "cudaGetDeviceProperties(" + $ordinal + ")")
+    d.Name = cstring(name)
+    d.Major, d.Minor, d.Sms, d.MiB = I64(info[0]), I64(info[1]), I64(info[2]), I64(info[3])
+    st = cu.oann_set_device(I32(ordinal))
+    try CheckCuda(st, "cudaSetDevice(" + $ordinal + ")")
+    d.status = cu.oann_status_new()
+    out := Array<U64>(1)
+    st = cu.oann_stream_create(out)
+    try CheckCuda(st, "cudaStreamCreate (compute)")
+    d.compute = out[0]
+    st = cu.oann_stream_create(out)
+    try CheckCuda(st, "cudaStreamCreate (copy)")
+    d.copy = out[0]
+    st = cu.oann_event_create(out)
+    try CheckCuda(st, "cudaEventCreate")
+    d.uploaded = out[0]
+    st = cu.oann_malloc(out, U64(WorkBytes))
+    try CheckCuda(st, "cudaMalloc of cuBLAS's workspace")
+    d.work = out[0]
+    st = cu.oann_cublas_create(out, d.compute, d.work, U64(WorkBytes))
+    d.blas = out[0]
+    try CheckCublas(st, "cublasCreate")
+    st = cu.oann_cublaslt_create(out)
+    d.lt = out[0]
+    try CheckCublas(st, "cublasLtCreate")
+    return d
+}
+
+# "NAME (sm_MAJORMINOR, SMS SMs, MIB MiB)"
+fn (d Device&) Str() String {
+    return d.Name + " (sm_" + $d.Major + $d.Minor + ", " + $d.Sms + " SMs, " + $d.MiB + " MiB)"
+}
+
+# waits for everything enqueued on the compute stream; the first failure since the last Sync - a hot-path call's
+# recorded status, else the stream's own (an asynchronous fault) - as an error, and the record cleared
+fn (d mut Device&) Sync() ? GpuError {
+    st := cu.oann_stream_sync(d.compute)
+    kind := cu.oann_status_kind(d.status)
+    if kind != 0 {
+        code := cu.oann_status_code(d.status)
+        what := Text(cu.oann_status_what(d.status))
+        cu.oann_status_clear(d.status)
+        if kind == statusCublas: try CheckCublas(code, what)
+        try CheckCuda(code, what)
+    }
+    try CheckCuda(st, "cudaStreamSynchronize")
+}
+
+# releases the device's streams, handles and workspace now, not where its holder lets go; nothing may be enqueued after
+fn (d mut Device&) Close() {
+    if d.compute != 0: cu.oann_stream_sync(d.compute)
+    release(d.status, d.compute, d.copy, d.uploaded, d.blas, d.lt, d.work)
+    d.status, d.compute, d.copy, d.uploaded, d.blas, d.lt, d.work = 0, 0, 0, 0, 0, 0, 0
+}
+
+# the stream products run on and the cuBLAS handle on it, for kernels/gpu's other modules
+fn (d Device&) Stream() U64 { return d.compute }
+fn (d Device&) Blas() U64 { return d.blas }
+fn (d Device&) Status() U64 { return d.status }
+
+# ---- device memory ----
+
+# n elements of S in the device's memory, uninitialized; freed (cudaFree) where its holder lets go. It holds its
+# device, so it cannot outlive it
+type Buf<S> unique struct(dev Device&, n I64, base U64) {
+    dev
+    N I64 = n
+    base
+} destruct {
+    if base != 0: cu.oann_free(base)
+}
+
+# n elements of S on the device: GpuError.Cuda naming cudaMalloc and the size where there is not the room
+fn Buf<S>.Make(dev mut Device&, n I64) Buf<S> ? GpuError {
+    out := Array<U64>(1)
+    bytes := U64(n.Max(1)) * U64(S.Size)
+    st := cu.oann_malloc(out, bytes)
+    try CheckCuda(st, "cudaMalloc of " + $bytes + " bytes")
+    return Buf<S>(dev, n, out[0])
+}
+
+# the device address of element i
+fn (b Buf<S>&) Addr(i I64) U64 { return b.base + U64(i) * U64(S.Size) }
+
+# n elements of host from host[from] to the buffer from element to, on the copy stream, ordered before whatever is
+# enqueued on the compute stream after it. host may be written again as soon as this returns (pageable memory is
+# staged before the call returns). Unchecked: the ranges are the caller's
+fn (b mut Buf<S>&) Upload(host Array<S>&, from I64, to I64, n I64) {
+    d := b.dev
+    sz := U64(S.Size)
+    cu.oann_upload(d.status, b.Addr(to), host, U64(from) * sz, U64(n) * sz, d.copy, d.uploaded, d.compute)
+}
+
+# n elements of the buffer from element from to host[to], on the compute stream after everything enqueued on it; the
+# host reads them after the device's Sync. Unchecked: the ranges are the caller's
+fn (b Buf<S>&) Download(host mut Array<S>&, from I64, to I64, n I64) {
+    d := b.dev
+    sz := U64(S.Size)
+    cu.oann_download(d.status, host, U64(to) * sz, b.Addr(from), U64(n) * sz, d.compute)
+}
+
+# the whole of host (as many elements as the buffer holds) up, and back
+fn (b mut Buf<S>&) UploadAll(host Array<S>&) { b.Upload(host, 0, 0, b.N) }
+fn (b Buf<S>&) DownloadAll(host mut Array<S>&) { b.Download(host, 0, 0, b.N) }
+
+# Rows x Cols elements of a device buffer from element Off, rows Ld apart: kernels/mat's Mat over device memory, the
+# same numbers, so a host view Mat(data, off, rows, cols, ld) is the device view DMat(buf, off, rows, cols, ld). A view;
+# it checks nothing
+type DMat<S> struct(Data Buf<S>&, Off I64, Rows I64, Cols I64, Ld I64) {
+    Data
+    Off
+    Rows
+    Cols
+    Ld
+}
+
+# the device address of element (r, c)
+fn (m DMat<S>&) Addr(r I64, c I64) U64 { return m.Data.Addr(m.Off + r * m.Ld + c) }
+
+# ---- tests ----
+
+# the line a test without a device prints
+fn Skip(what String&) { Println("no CUDA device: " + what + " skipped") }
+
+test Device.Open "names the device" {
+    d := try Device.Open() catch GpuError.NoDevice {
+        Skip("Open")
+        return
+    }
+    Println("device: " + d.Str())
+    assert d.Name.Len() > 0 and d.Major >= 3 and d.Sms > 0 and d.MiB > 0
+    try d.Sync()
+    d.Close()
+    d.Close()
+}
+
+test Buf "upload then download is the identity, whole and in ranges at offsets, F32, BF16, I8 and F64" {
+    d := try Device.Open() catch GpuError.NoDevice {
+        Skip("Buf")
+        return
+    }
+    n I64 = 1000
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(i) * 0.37 - 11.0
+    b := try Buf<F32>.Make(d, n)
+    b.UploadAll(x)
+    y := Array<F32>(n)
+    b.DownloadAll(y)
+    try d.Sync()
+    for i in range n: assert y[i] == x[i]
+    # a range: x[100 .. 400) to the buffer's [500 .. 800), then the buffer's [450 .. 850) to z[7 ..)
+    b.Upload(x, 100, 500, 300)
+    z := Array<F32>(n)
+    b.Download(z, 450, 7, 400)
+    try d.Sync()
+    for i in range 400 {
+        j := 450 + i
+        want := x[j - 400] if j >= 500 and j < 800 else x[j]
+        assert z[7 + i] == want, "element " + $j
+    }
+    assert z[6] == 0.0 and z[407] == 0.0
+    h := Array<BF16>(n)
+    for i in range n: h[i] = BF16(F32(i) * 0.125 - 3.0)
+    bh := try Buf<BF16>.Make(d, n)
+    bh.UploadAll(h)
+    h2 := Array<BF16>(n)
+    bh.DownloadAll(h2)
+    q := Array<I8>(n)
+    for i in range n: q[i] = I8(i % 256 - 128)
+    bq := try Buf<I8>.Make(d, n)
+    bq.UploadAll(q)
+    q2 := Array<I8>(n)
+    bq.Download(q2, 1, 0, n - 1)
+    w := Array<F64>(n)
+    for i in range n: w[i] = 1.0 / F64(i + 1)
+    bw := try Buf<F64>.Make(d, n)
+    bw.UploadAll(w)
+    w2 := Array<F64>(n)
+    bw.DownloadAll(w2)
+    try d.Sync()
+    for i in range n: assert h2[i] == h[i] and w2[i] == w[i]
+    for i in range n - 1: assert q2[i] == q[i + 1]
+}
+
+test Buf "an upload is ordered before the next download on the compute stream, round after round" {
+    d := try Device.Open() catch GpuError.NoDevice {
+        Skip("Buf ordering")
+        return
+    }
+    n I64 = 1 << 20
+    x := Array<F32>(n)
+    y := Array<F32>(n)
+    b := try Buf<F32>.Make(d, n)
+    for round in range 8 {
+        for i in range 0, n, 4093: x[i] = F32(round * 7 + i)
+        b.UploadAll(x)
+        b.DownloadAll(y)
+        try d.Sync()
+        for i in range 0, n, 4093: assert y[i] == F32(round * 7 + i)
+    }
+}
+
+test GpuError "an allocation past the device's memory is cudaMalloc's error, named, with CUDA's text" {
+    d := try Device.Open() catch GpuError.NoDevice {
+        Skip("GpuError")
+        return
+    }
+    failed := false
+    try Buf<F32>.Make(d, 1 << 40) catch GpuError.Cuda e {
+        Println("as expected: " + e.what)
+        assert e.code == cu.cudaErrorMemoryAllocation
+        assert e.what.Contains("cudaMalloc of 4398046511104 bytes") and e.what.Contains("out of memory"), e.what
+        failed = true
+    }
+    assert failed, "allocated 4 TiB"
+    try d.Sync()
+}

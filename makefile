@@ -13,9 +13,17 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	bayes/dense.olang bayes/gauss.olang bayes/quadrature.olang bayes/laplace.olang bayes/state.olang bayes/target.olang bayes/vi.olang \
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang
 
+# the GPU backend's modules (docs/redesign.md 1.10): built only with -define Gpu=true, so never by make test
+GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang
+
+# where WSL keeps its libcuda.so.1, put first on the loader's path for the GPU targets: a native Linux driver package
+# installed beside the toolkit (libnvidia-compute) can shadow WSL's in the loader's cache, and CUDA then finds no
+# device. Harmless where the system is right or is not WSL (no such directory, nothing set)
+GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if $(LD_LIBRARY_PATH),:$(LD_LIBRARY_PATH)),)
+
 .DEFAULT_GOAL := help
 
-.PHONY: help test mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpugemm mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -26,6 +34,17 @@ help:
 # every module's tests (takes minutes) - OLANG=path names another compiler
 test:
 	$(OLANG) test $(TESTS)
+
+# the GPU backend's tests, CUDA and cuBLAS against the CPU kernels (-define Gpu=true; each test says it is skipped where
+# CUDA finds no device) - needs the CUDA toolkit's headers and libraries (cudart, cublas, cublasLt) and an NVIDIA GPU
+gputest:
+	$(GPUENV) $(OLANG) test -define Gpu=true $(GPUTESTS)
+
+# G-M1: GEMM GFLOPS of kernels/gemm (1 and 4 threads) against cuBLAS on the MLP's and the settle's shapes, F32 and BF16,
+# interleaved, medians (bench/gpugemm.olang) - ARGS: rounds, and the CPU's thread counts after it
+gpugemm:
+	$(OLANG) build -define Gpu=true -output build/bench_gpugemm bench/gpugemm.olang
+	$(GPUENV) ./build/bench_gpugemm $(ARGS)
 
 # M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
 mlpad:

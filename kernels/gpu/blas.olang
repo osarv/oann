@@ -1,0 +1,220 @@
+# blas - products on the GPU through cuBLAS (docs/redesign.md 1.10, GP1): Gemm by cublasGemmEx over DMat views,
+# the CPU's kernels/gemm.Gemm over Mat views given the same numbers.
+#
+# Row-major, as the CPU's. cuBLAS is column-major, and a row-major m x n matrix with rows ld apart is, read column-major,
+# its n x m transpose with columns ld apart. So C = alpha op(A) op(B) + beta C is computed as cuBLAS's
+# C^T = alpha op(B)^T op(A)^T + beta C^T: the operands exchanged, m and n exchanged, the transposes and the lds as they
+# are. Nothing is transposed in memory.
+#
+# Storage and accumulation: F32 x F32 summed in F32 (CUBLAS_COMPUTE_32F, never TF32: TF32 changes results beyond the
+# CPU oracle's tolerance), BF16 and F16 storage summed in F32 and rounded to C's type once, F64 in F64. cuBLAS sums in
+# its own order, so a product agrees with the CPU's within k eps(A) max|a| max|b| per element (and a rounding of the
+# storage), not bit for bit (decision G1); run twice on one device it is the same, bit for bit (a test).
+#
+# A product is enqueued on the device's compute stream and returns at once; a failure is recorded and given back by
+# the next Sync (device.olang). Shapes are the caller's, as in kernels/gemm: nothing here checks one.
+#
+# The epilogue (bias, activation), per-operand storage, GemmBatch and GemmI8 are cuBLASLt's, in GP3.
+
+import cu "cuda.c"
+import "device"
+import "../gemm"
+import "../mat"
+import "std/rand"
+
+# cuBLAS's data type for storage S (cudaDataType)
+fn dataType<S>(z S) I32 {
+    return match S {
+        case F32: cu.CUDA_R_32F
+        case F64: cu.CUDA_R_64F
+        case F16: cu.CUDA_R_16F
+        case BF16: cu.CUDA_R_16BF
+        case _: -1
+    }
+}
+
+# cuBLAS's compute type for storage S: F64 for F64, F32 for everything else (never TF32)
+fn computeType<S>(z S) I32 {
+    return match S {
+        case F64: cu.CUBLAS_COMPUTE_64F
+        case _: cu.CUBLAS_COMPUTE_32F
+    }
+}
+
+# c = alpha op(a) op(b) + beta c, op(x) x or its transpose where its flag is set, read where x is; S is the storage
+# of all three, summed in F32 (F64 for F64), alpha and beta given in A. beta = 0 never reads c (BLAS's rule); c
+# must not overlap a or b. Enqueued on d's compute stream; its failure is the next Sync's error
+fn Gemm<S, A>(d mut device.Device&, c mut device.DMat<S>&, a device.DMat<S>&, ta Bool, b device.DMat<S>&, tb Bool, alpha A = 1, beta A = 0) {
+    m, n := c.Rows, c.Cols
+    k I64 = a.Rows if ta else a.Cols
+    if m == 0 or n == 0: return
+    z S
+    t := dataType(z)
+    cu.oann_gemm(d.Status(), d.Blas(), tb, ta, I32(n), I32(m), I32(k), F64(alpha), b.Addr(0, 0), t, I32(b.Ld), a.Addr(0, 0), t, I32(a.Ld), F64(beta), c.Addr(0, 0), t, I32(c.Ld), computeType(z))
+}
+
+# ---- tests: kernels/gemm is the oracle ----
+
+# a host array of n elements of S, uniform in [-1, 1)
+fn randoms<S>(n I64, like S, r mut rand.Rand&) Array<S> {
+    x := Array<S>(n)
+    for i in range n: x[i] = S(r.Uniform(-1.0, 1.0))
+    return x
+}
+
+# the largest |x| over a view's elements, in F64
+fn maxAbs<S>(x Array<S>&, off I64, rows I64, cols I64, ld I64) F64 {
+    big F64 = 0
+    for i in range rows {
+        for j in range cols: big = big.Max(F64(x[off + i * ld + j]).Abs())
+    }
+    return big
+}
+
+# the relative spacing of S's numbers at 1 (a unit in the last place there): one rounding to S is within it
+fn ulp<S>(z S) F64 {
+    return match S {
+        case F64: 2.220446049250313e-16
+        case F32: 1.1920928955078125e-07
+        case F16: 0.0009765625
+        case BF16: 0.0078125
+        case _: 1.0
+    }
+}
+
+# element (row, col) of alpha op(a) op(b) + c0 summed in F64 from the stored operands: which side is off, where they differ
+fn exactAt<S>(ha Array<S>&, oa I64, lda I64, ta Bool, hb Array<S>&, ob I64, ldb I64, tb Bool, k I64, row I64, col I64, alpha F64, c0 F64) F64 {
+    s F64 = 0
+    for p in range k {
+        av := F64(ha[oa + p * lda + row]) if ta else F64(ha[oa + row * lda + p])
+        bv := F64(hb[ob + col * ldb + p]) if tb else F64(hb[ob + p * ldb + col])
+        s += av * bv
+    }
+    return alpha * s + c0
+}
+
+# one product of m x n from a depth of k, C on the GPU against kernels/gemm on the same arrays: views at offsets with
+# rows padded (ld past the columns), every element of C's view within k eps(A) |alpha| max|a| max|b| + 2 eps(A) |beta|
+# max|c| and a rounding of S, every element outside the view untouched, and the product run again identical bit for bit
+fn compare<S, A>(d mut device.Device&, ws mut gemm.Workspace<A>&, r mut rand.Rand&, m I64, n I64, k I64, ta Bool, tb Bool, alpha A, beta A, like S) ? device.GpuError {
+    ar, ac := m, k
+    if ta: ar, ac = k, m
+    br, bc := k, n
+    if tb: br, bc = n, k
+    oa, ob, oc := 3, 5, 7
+    lda, ldb, ldc := ac + 2, bc + 1, n + 3
+    ha := randoms(oa + ar * lda + 4, like, r)
+    hb := randoms(ob + br * ldb + 4, like, r)
+    hc := randoms(oc + m * ldc + 4, like, r)
+    want := hc.Copy()
+    cm := mat.Mat<S>(want, oc, m, n, ldc)
+    gemm.Gemm(ws, cm, mat.Mat<S>(ha, oa, ar, ac, lda), ta, mat.Mat<S>(hb, ob, br, bc, ldb), tb, alpha, beta)
+    ba := try device.Buf<S>.Make(d, ha.Len())
+    bb := try device.Buf<S>.Make(d, hb.Len())
+    bc1 := try device.Buf<S>.Make(d, hc.Len())
+    bc2 := try device.Buf<S>.Make(d, hc.Len())
+    ba.UploadAll(ha)
+    bb.UploadAll(hb)
+    bc1.UploadAll(hc)
+    bc2.UploadAll(hc)
+    da := device.DMat<S>(ba, oa, ar, ac, lda)
+    db := device.DMat<S>(bb, ob, br, bc, ldb)
+    dc1 := device.DMat<S>(bc1, oc, m, n, ldc)
+    dc2 := device.DMat<S>(bc2, oc, m, n, ldc)
+    Gemm(d, dc1, da, ta, db, tb, alpha, beta)
+    Gemm(d, dc2, da, ta, db, tb, alpha, beta)
+    got := Array<S>(hc.Len())
+    again := Array<S>(hc.Len())
+    bc1.DownloadAll(got)
+    bc2.DownloadAll(again)
+    try d.Sync()
+    z A
+    zs S
+    eps := ulp(z)
+    bound := eps * (F64(k) * F64(alpha).Abs() * maxAbs(ha, oa, ar, ac, lda) * maxAbs(hb, ob, br, bc, ldb) +
+        2.0 * F64(beta).Abs() * maxAbs(hc, oc, m, n, ldc))
+    shape := $m + "x" + $n + "x" + $k + " ta " + $ta + " tb " + $tb + " alpha " + $alpha + " beta " + $beta
+    for i in range hc.Len() {
+        assert got[i] == again[i], "run twice, element " + $i + " differs: " + shape
+        row, col := (i - oc) / ldc, (i - oc) % ldc
+        if i >= oc and row < m and col < n {
+            w := F64(want[i])
+            assert (F64(got[i]) - w).Abs() <= bound + ulp(zs) * w.Abs(), "C[" + $row + ", " + $col + "] " + $got[i] + " against the CPU's " + $want[i] + " (bound " + $bound + ", the exact sum " + $exactAt(ha, oa, lda, ta, hb, ob, ldb, tb, k, row, col, F64(alpha), F64(beta) * F64(hc[i])) + "): " + shape
+        } else {
+            assert got[i] == hc[i], "element " + $i + " outside C's view written: " + shape
+        }
+    }
+}
+
+# every transpose, alpha and beta, at odd sizes, the MLP's and the settle's shapes, across cuBLAS's tile sizes
+fn compareAll<S, A>(d mut device.Device&, like S, acc A) ? device.GpuError {
+    r := rand.Rand(7)
+    ws := gemm.Workspace<A>(2, 1024, 1024 * 1024)
+    sizes := Array<I64>[1, 1, 1, 7, 5, 3, 1, 33, 17, 33, 17, 65, 129, 65, 257, 128, 10, 128, 128, 128, 784, 100, 300, 1000]
+    for i in range 0, sizes.Len(), 3 {
+        for t in range 4 {
+            ta, tb := t % 2 == 1, t / 2 == 1
+            try compare(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, A(1), A(0), like)
+            try compare(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, A(-0.75), A(0.5), like)
+        }
+    }
+}
+
+test Gemm "F32 against kernels/gemm: every transpose, alpha and beta, offset views, odd sizes; run twice identical" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Gemm F32")
+        return
+    }
+    try compareAll(d, F32(0), F32(0))
+}
+
+test Gemm "BF16 storage summed in F32 against kernels/gemm: every transpose, alpha and beta, offset views, odd sizes; run twice identical" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Gemm BF16")
+        return
+    }
+    try compareAll(d, BF16(0), F32(0))
+}
+
+test Gemm "F64 against kernels/gemm" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Gemm F64")
+        return
+    }
+    try compareAll(d, F64(0), F64(0))
+}
+
+test Gemm "a bad call is the next Sync's error, cublasGemmEx's status with cuBLAS's text; the product after it runs" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Gemm's error")
+        return
+    }
+    x := Array<F32>(64)
+    for i in range 64: x[i] = F32(i)
+    b := try device.Buf<F32>.Make(d, 64)
+    out := try device.Buf<F32>.Make(d, 64)
+    b.UploadAll(x)
+    # a's rows 2 apart while it has 4 columns: cuBLAS refuses the leading dimension
+    c := device.DMat<F32>(out, 0, 4, 4, 4)
+    Gemm(d, c, device.DMat<F32>(b, 0, 4, 4, 2), false, device.DMat<F32>(b, 0, 4, 4, 4), false)
+    failed := false
+    try d.Sync() catch device.GpuError.Cublas e {
+        Println("as expected: " + e.what)
+        assert e.code == cu.CUBLAS_STATUS_INVALID_VALUE and e.what.StartsWith("cublasGemmEx: ")
+        assert e.what == "cublasGemmEx: " + device.Text(cu.cublasGetStatusString(e.code)) and e.what.Len() > 14
+        failed = true
+    }
+    assert failed, "a leading dimension of 2 for 4 columns was taken"
+    # the record is cleared: the next product is fine, and right (x as a 4 x 4 matrix of 0 .. 15, squared)
+    Gemm(d, c, device.DMat<F32>(b, 0, 4, 4, 4), false, device.DMat<F32>(b, 0, 4, 4, 4), false)
+    y := Array<F32>(64)
+    out.Download(y, 0, 0, 16)
+    try d.Sync()
+    for i in range 4 {
+        for j in range 4 {
+            s F32 = 0
+            for p in range 4: s += F32(4 * i + p) * F32(4 * p + j)
+            assert y[4 * i + j] == s
+        }
+    }
+}
