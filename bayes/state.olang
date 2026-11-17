@@ -1,0 +1,223 @@
+# bayes/state - beliefs that move in time. A component's drift between two events dt apart: a Gaussian random walk
+# (variance q dt added) or an AR(1) / Ornstein-Uhlenbeck pull toward a mean (scaled by phi = exp(-dt / tau), the
+# innovation's variance s^2 (1 - phi^2) added, s^2 the stationary variance) - the variance growing with the time
+# elapsed. The Kalman filter and the Rauch-Tung-Striebel smoother for linear-Gaussian state-space models,
+#   x_t = F x_(t-1) + w_t,  w_t ~ N(0, dt_t Q),     y_t = H x_t + v_t,  v_t ~ N(0, R),
+# with the data's log likelihood (what empirical Bayes maximises). A nonlinear filter is laplace's update after Drift.
+#
+#     walk := state.Drift.RandomWalk(0.01)
+#     walk.Apply(g, i, dt)                       # component i of a gauss.Gaussian moved by dt (ApplyDiag for a Diag)
+#     m := state.Model(2, 1)                     # state of 2, observations of 1: set m.F, m.Q, m.H, m.R
+#     t := try m.Filter(prior, ys, dts)    # t.Filtered[k], t.Predicted[k], t.LogLik
+#     try m.Smooth(t)                 # t.Smoothed[k]
+
+import "dense"
+import "gauss"
+
+# ---- drift ----
+
+# how a component moves between events
+type DriftKind enum {
+    RandomWalk      # variance Rate per unit time added
+    AR1             # pulled toward Mean with time constant Tau, stationary variance Rate
+}
+
+# one component's drift
+type Drift struct(kind DriftKind) {
+    Kind DriftKind = kind
+    Rate F64 = 0.0
+    Tau F64 = 1.0
+    Mean F64 = 0.0
+}
+
+# a random walk adding variance q per unit time
+fn Drift.RandomWalk(q F64) Drift {
+    d := Drift(DriftKind.RandomWalk)
+    d.Rate = q
+    return d
+}
+
+# an AR(1) pull toward mean with time constant tau and stationary variance s2
+fn Drift.AR1(tau F64, s2 F64, mean F64 = 0.0) Drift {
+    d := Drift(DriftKind.AR1)
+    d.Tau = tau
+    d.Rate = s2
+    d.Mean = mean
+    return d
+}
+
+# the factor a component's deviation from Mean is multiplied by over dt
+fn (d Drift&) Factor(dt F64) F64 {
+    if d.Kind == DriftKind.RandomWalk: return 1.0
+    return (-dt / d.Tau).Exp()
+}
+
+# the variance added over dt
+fn (d Drift&) Noise(dt F64) F64 {
+    if d.Kind == DriftKind.RandomWalk: return d.Rate * dt
+    return d.Rate * -(-2.0 * dt / d.Tau).Expm1()
+}
+
+# component i of g moved by dt
+fn (d Drift&) Apply(g mut gauss.Gaussian&, i I64, dt F64) {
+    g.Mean[i] -= d.Mean
+    g.Scale(i, d.Factor(dt))
+    g.Mean[i] += d.Mean
+    g.Diffuse(i, d.Noise(dt))
+}
+
+# component i of a diagonal belief moved by dt
+fn (d Drift&) ApplyDiag(b mut gauss.Diag&, i I64, dt F64) {
+    f := d.Factor(dt)
+    b.Mean[i] = d.Mean + f * (b.Mean[i] - d.Mean)
+    b.Var[i] = f * f * b.Var[i] + d.Noise(dt)
+}
+
+# ---- the Kalman filter ----
+
+# a linear-Gaussian state-space model: a state of d, observations of n; F and Q d by d, H n by d, R n by n
+type Model struct(d I64, n I64) {
+    D I64 = d
+    N I64 = n
+    F Array<F64> = dense.Identity(d)
+    Q Array<F64> = Array<F64>(d * d, 0.0)
+    H Array<F64> = Array<F64>(n * d, 0.0)
+    R Array<F64> = dense.Identity(n)
+}
+
+# what a filter leaves: the belief before and after each step's observation, the smoothed ones once Smooth has run,
+# and the data's log likelihood
+type Track struct() {
+    Predicted Vec<gauss.Gaussian>
+    Filtered Vec<gauss.Gaussian>
+    Smoothed Vec<gauss.Gaussian>
+    LogLik F64
+}
+
+# g moved one step of m, with dt times Q added
+fn (m Model&) Predict(g gauss.Gaussian&, dt F64) gauss.Gaussian {
+    d := m.D
+    out := gauss.Gaussian(d)
+    out.Mean = dense.Times(m.F, g.Mean, d, d)
+    fp := dense.MatMul(m.F, g.Cov, d, d, d)
+    cov := dense.MatMul(fp, m.F, d, d, d, tb = true)
+    for i in range d * d: out.Cov[i] = cov[i] + dt * m.Q[i]
+    return out
+}
+
+# the filter over ys (T observations of N, one after another): the prior is x_0's before the first observation, and
+# each later step moves by dts[t] (an empty array is 1 each) before its observation
+fn (m Model&) Filter(prior gauss.Gaussian&, ys Array<F64>&, dts Array<F64>&) Track ? dense.Error {
+    steps := ys.Len() / m.N
+    out := Track()
+    g := gauss.Gaussian.Of(prior.Mean, prior.Cov)
+    for t in range steps {
+        if t > 0: g = m.Predict(g, dts[t] if dts.Len() > 0 else 1.0)
+        out.Predicted.Push(gauss.Gaussian.Of(g.Mean, g.Cov))
+        y := Array<F64>[ys[t * m.N + k] for k in range m.N]
+        out.LogLik += try g.Observe(m.H, y, m.R)
+        out.Filtered.Push(gauss.Gaussian.Of(g.Mean, g.Cov))
+    }
+    return out
+}
+
+# the Rauch-Tung-Striebel smoother over a filter's track: Smoothed[t] the belief about x_t given every observation
+fn (m Model&) Smooth(t mut Track&) ? dense.Error {
+    d := m.D
+    steps := t.Filtered.Len()
+    t.Smoothed = Vec<gauss.Gaussian>()
+    for k in range steps: t.Smoothed.Push(gauss.Gaussian.Of(t.Filtered.At(k).Mean, t.Filtered.At(k).Cov))
+    for c in range steps - 1 {
+        k := steps - 2 - c
+        f := t.Filtered.At(k)
+        p := t.Predicted.At(k + 1)
+        s := t.Smoothed.At(k + 1)
+        # the gain C = P_f F^T P_p^-1, through P_p's factor: C^T = P_p^-1 F P_f
+        l := try p.Factor()
+        fpf := dense.MatMul(m.F, f.Cov, d, d, d)
+        ct := Array<F64>(d * d, 0.0)
+        col := Array<F64>(d, 0.0)
+        for j in range d {
+            for i in range d: col[i] = fpf[i * d + j]
+            x := dense.SolveCholesky(l, col, d)
+            for i in range d: ct[i * d + j] = x[i]
+        }
+        cg := dense.Transpose(ct, d, d)
+        out := gauss.Gaussian.Of(f.Mean, f.Cov)
+        dm := dense.Times(cg, Array<F64>[s.Mean[i] - p.Mean[i] for i in range d], d, d)
+        for i in range d: out.Mean[i] += dm[i]
+        dc := dense.MatMul(dense.MatMul(cg, Array<F64>[s.Cov[i] - p.Cov[i] for i in range d * d], d, d, d), ct, d, d, d)
+        for i in range d * d: out.Cov[i] += dc[i]
+        t.Smoothed[k] = out
+    }
+}
+
+# ---- tests ----
+
+# a local linear trend: level and slope, the level observed in noise
+fn Model.trend() Model {
+    m := Model(2, 1)
+    m.F = Array<F64>[1.0, 1.0, 0.0, 1.0]
+    m.Q = Array<F64>[0.05, 0.0, 0.0, 0.01]
+    m.H = Array<F64>[1.0, 0.0]
+    m.R = Array<F64>[0.3]
+    return m
+}
+
+test "drift: random walk and AR(1)" {
+    g := gauss.Gaussian.Isotropic(2, 1.0)
+    g.Mean[1] = 3.0
+    Drift.RandomWalk(0.1).Apply(g, 0, 2.5)
+    assert (g.Var(0) - 1.25).Abs() < 1e-12
+    ar := Drift.AR1(2.0, 0.5, mean = 1.0)
+    ar.Apply(g, 1, 1.0)
+    phi := (-0.5).Exp()
+    assert (g.Mean[1] - (1.0 + 2.0 * phi)).Abs() < 1e-12 and (g.Var(1) - (phi * phi + 0.5 * (1.0 - phi * phi))).Abs() < 1e-12
+    # far in time, an AR(1) forgets: its stationary distribution
+    b := gauss.Diag.Isotropic(1, 9.0)
+    ar.ApplyDiag(b, 0, 100.0)
+    assert (b.Mean[0] - 1.0).Abs() < 1e-12 and (b.Var[0] - 0.5).Abs() < 1e-12
+}
+
+test "the Kalman filter and the RTS smoother agree with the batch Gaussian posterior" {
+    m := Model.trend()
+    steps := 12
+    ys := Array<F64>[(0.4 * F64(t)).Sin() + 0.1 * F64(t) for t in range steps]
+    dts := Array<F64>[1.0 + 0.25 * F64(t % 3) for t in range steps]
+    prior := gauss.Gaussian.Of(Array<F64>[0.0, 0.0], Array<F64>[2.0, 0.0, 0.0, 0.5])
+    t := try m.Filter(prior, ys, dts)
+    try m.Smooth(t)
+    # the joint over every state, built by the recursion, then every observation at once
+    d := 2
+    big := steps * d
+    joint := gauss.Gaussian(big)
+    joint.Put(0, prior)
+    for k in range 1, steps {
+        for s in range k {
+            # Cov(x_k, x_s) = F Cov(x_(k-1), x_s)
+            for i in range d {
+                for j in range d {
+                    c F64 = 0.0
+                    for l in range d: c += m.F[i * d + l] * joint.Cov[((k - 1) * d + l) * big + s * d + j]
+                    joint.Cov[(k * d + i) * big + s * d + j] = c
+                    joint.Cov[(s * d + j) * big + k * d + i] = c
+                }
+            }
+        }
+        joint.Put(k * d, m.Predict(joint.Take((k - 1) * d, d), dts[k]))
+    }
+    h := Array<F64>(steps * big, 0.0)
+    for k in range steps: h[k * big + k * d] = 1.0
+    ll := try joint.Observe(h, ys, dense.Identity(steps, 0.3), jitter = 0.0)
+    assert (ll - t.LogLik).Abs() < 1e-9
+    last := joint.Take((steps - 1) * d, d)
+    for i in range d: assert (last.Mean[i] - t.Filtered.At(steps - 1).Mean[i]).Abs() < 1e-9
+    worst F64 = 0.0
+    for k in range steps {
+        b := joint.Take(k * d, d)
+        s := t.Smoothed.At(k)
+        for i in range d: worst = worst.Max((b.Mean[i] - s.Mean[i]).Abs())
+        for i in range d * d: worst = worst.Max((b.Cov[i] - s.Cov[i]).Abs())
+    }
+    assert worst < 1e-9
+}
