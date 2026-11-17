@@ -78,6 +78,12 @@ Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved roun
   1 x 1024 x 1024 54-81 -> 24-27 us (2.2-3.3x; 2.1-2.9x -> 5.0-6.3x of F32); 1 x 128 x 512 and 1 x 128 x 128 unchanged
   (they take the plain path). The packed micro-kernel (an outer product, one broadcast byte times a vector of weights) has no
   four-adjacent-products shape and is unchanged; `vdpbf16ps` stays unreachable (olang does not use it: it reorders a float sum).
+- Padding in GemmI8's dot products (`dots`, `dotsPay`; 2026-11-17, olang 5f85a388's masked-tail LaneDot, two alternated runs of
+  bench/int8 and bench/int8cnn, another build running): kept. Unpadded (depth k as is, `dotsPay` from k >= 64) made 64 x 784 x
+  128 static 104 -> 126 us and 128 x 784 x 128 217 -> 245 us (slower), 25088 x 144 x 32 4.8 -> 5.8 ms, the CNN at batch 64-128
+  1.4-1.5x -> 1.2-1.3x of F32; only 128 x 128 x 10 gained (10.7 -> 8.5 us). Dropping the dot path (everything to the
+  outer-product tiles) was 2-3x slower at depth 784 (64 x 784 x 128 74-103 -> 214-221 us). The masked tail is not as fast as
+  whole 256-blocks over a long depth.
 - Next here: the packed INT8 micro-kernel (the 64+-row gap) - it waits on `vpdpbusd` or a 16-bit packing that LLVM
   maps to one `vpdpwssd` per pair; ad/ops' `Scan` is `GatedScan` (the prelude now has a `Scan`).
 
