@@ -110,6 +110,100 @@ fn ForceCoupling(c Cost) F64 {
     }
 }
 
+# the largest slope of rho over the potentials lo .. hi: tanh's 1 - tanh(m)^2 at the m nearest 0, Slope for the rest
+fn SlopeOver(f Rho, lo F64, hi F64) F64 {
+    return match f {
+        case Rho.Tanh: 1.0 if lo <= 0.0 and hi >= 0.0 else 1.0 - lo.Abs().Min(hi.Abs()).Tanh().Pow(2.0)
+        case _: Slope(Neuron.Rate(f))
+    }
+}
+
+# a readout's force over the region where each of its n potentials u[at + j] may move by r (rho their activation), per
+# unit of beta: its coupling between units, as ForceCoupling (in the sup norm, or the Euclidean bound sqrt(|C|_1
+# |C|_inf) where euclid) and its largest self-slope, as ForceSlope, both times rho's slope over the region (SlopeOver).
+# A cross-entropy group's C_ij = p_i p_j rho'_j / T (i != j) has rows at most p_i (1 - p_i) max rho' / T and columns
+# p_j (1 - p_j) rho'_j / T; each p is bounded by the logits' extremes over the region (p_i at most e^hi_i / (e^hi_i +
+# the others' e^lo), at least the reverse) and p (1 - p) by its largest over those bounds
+fn ForceOver<T Float>(c Cost, f Rho, u Array<T>&, at I64, n I64, r F64, euclid Bool) F64, F64 {
+    match c {
+        case Cost.Squared {
+            worst F64 = 0.0
+            for j in range n: worst = worst.Max(slopeAt(f, u, at + j, r))
+            return 0.0, worst
+        }
+        case Cost.CrossEntropy(temperature, groups) {
+            w := n / groups
+            coupling, self F64 = 0.0, 0.0
+            for g in range groups {
+                gc, gs := softOver(f, u, at + g * w, w, temperature, r, euclid)
+                coupling, self = coupling.Max(gc), self.Max(gs)
+            }
+            return coupling, self
+        }
+    }
+}
+
+fn slopeAt<T Float>(f Rho, u Array<T>&, i I64, r F64) F64 { return SlopeOver(f, F64(u[i]) - r, F64(u[i]) + r) }
+
+fn softOver<T Float>(f Rho, u Array<T>&, at I64, w I64, t F64, r F64, euclid Bool) F64, F64 {
+    top, most F64 = -F64.Max, 0.0
+    for j in range w {
+        top = top.Max(F64(Activate(f, F64(u[at + j]) + r)) / t)
+        most = most.Max(slopeAt(f, u, at + j, r))
+    }
+    low, high F64 = 0.0, 0.0
+    for j in range w {
+        low += (logit(f, u, at + j, -r, t) - top).Exp()
+        high += (logit(f, u, at + j, r, t) - top).Exp()
+    }
+    rows, cols F64 = 0.0, 0.0
+    for j in range w {
+        lo := (logit(f, u, at + j, -r, t) - top).Exp()
+        hi := (logit(f, u, at + j, r, t) - top).Exp()
+        a := spread(lo / (lo + high - hi), hi / (hi + low - lo))
+        rows = rows.Max(a * most / t)
+        cols = cols.Max(a * slopeAt(f, u, at + j, r) / t)
+    }
+    return (rows * cols).Sqrt() if euclid else rows, cols
+}
+
+# the logit of unit i with its potential moved by d
+fn logit<T Float>(f Rho, u Array<T>&, i I64, d F64, t F64) F64 { return F64(Activate(f, F64(u[i]) + d)) / t }
+
+# the largest p (1 - p) for p in lo .. hi
+fn spread(lo F64, hi F64) F64 {
+    if lo <= 0.5 and hi >= 0.5: return 0.25
+    return (lo * (1.0 - lo)).Max(hi * (1.0 - hi))
+}
+
+# the size of a readout's force at its activities s[at ..] for n units, one row, per unit of beta (as AddForce): the
+# sum of its squares, or its largest unit where not euclid
+fn ForceSize<T Float>(c Cost, s Array<T>&, at I64, n I64, labels Array<I32>&, lat I64, target Array<T>&, tat I64, euclid Bool) F64 {
+    total F64 = 0.0
+    match c {
+        case Cost.Squared {
+            for j in range n: total = gather(total, F64(target[tat + j] - s[at + j]), euclid)
+        }
+        case Cost.CrossEntropy(temperature, groups) {
+            w := n / groups
+            for g in range groups {
+                y := I64(labels[lat + g])
+                top := F64(s[at + g * w])
+                for j in range 1, w: top = top.Max(F64(s[at + g * w + j]))
+                sum F64 = 0.0
+                for j in range w: sum += ((F64(s[at + g * w + j]) - top) / temperature).Exp()
+                for j in range w {
+                    p := ((F64(s[at + g * w + j]) - top) / temperature).Exp() / sum
+                    total = gather(total, (1.0 if j == y else 0.0) - p, euclid)
+                }
+            }
+        }
+    }
+    return total
+}
+
+fn gather(total F64, x F64, euclid Bool) F64 { return total + x * x if euclid else total.Max(x.Abs()) }
+
 # the steady firing rate, in spikes per step, of a Lif neuron (leak, threshold) under the constant current x: the time
 # to climb from 0 to the threshold, tau ln(x / (x - threshold)) steps with tau = -1 / ln(1 - leak), at most one a step
 fn LifRateOf(x F64, leak F64, threshold F64) F64 {
