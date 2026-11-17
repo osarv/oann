@@ -1,0 +1,189 @@
+# bayes/empirical - empirical Bayes: hyperparameters (a drift's rate, a prior's variance, a likelihood's noise) chosen
+# by maximising the data's sequential predictive log likelihood - the prequential log score, the sum over events of the
+# log predictive density of each before it updates the belief (Dawid). For a linear-Gaussian model that is the exact
+# marginal likelihood (state.Model's Filter gives it as LogLik); for any other `Prequential` runs the assumed-density
+# filter of laplace and state over a sequence of events. Maximisers: golden-section search on one hyperparameter, and
+# coordinate ascent over several, on log scales where a hyperparameter is a scale.
+#
+#     ev := empirical.Events()
+#     ev.Add(time, idx, coef, offset, y)                 # an event: eta = coef . x[idx] + offset observed as y
+#     score := try empirical.Prequential(ev, prior, drift, lik)
+#     q := empirical.Golden(fn(lq): return empirical.Prequential(ev, prior, state.Drift.RandomWalk(lq.Exp()), lik)!, -10.0, 0.0).Exp()
+
+import "std/rand"
+import "dense"
+import "gauss"
+import "laplace"
+import "state"
+
+# a sequence of events, each a linear predictor over a few components observed once, kept flat
+type Events struct() {
+    Times Vec<F64>
+    Starts Vec<I64>          # event k's components are Idx[Starts[k] ... Starts[k + 1]], with Coef alike
+    Idx Vec<I64>
+    Coef Vec<F64>
+    Offsets Vec<F64>
+    Ys Vec<F64>
+    Trials Vec<F64>
+}
+
+# how many events there are
+fn (e Events&) Len() I64 { return e.Times.Len() }
+
+# an event at time: the predictor coef . x[idx] + offset observed as y (of trials, for the binomial)
+fn (e mut Events&) Add(time F64, idx Array<I64>&, coef Array<F64>&, offset F64, y F64, trials F64 = 1.0) {
+    if e.Starts.Len() == 0: e.Starts.Push(0)
+    e.Times.Push(time)
+    for i in range idx.Len() {
+        e.Idx.Push(idx[i])
+        e.Coef.Push(coef[i])
+    }
+    e.Starts.Push(e.Idx.Len())
+    e.Offsets.Push(offset)
+    e.Ys.Push(y)
+    e.Trials.Push(trials)
+}
+
+# the prequential log score of the events under the assumed-density filter: from prior, each component moved by drift
+# over the time since it last took part, each event scored by its log predictive density and then taken in by
+# laplace's update. The filtered belief is left in belief
+fn Prequential(e Events&, prior gauss.Diag&, drift state.Drift&, lik laplace.Likelihood&, belief mut gauss.Diag& = gauss.Diag(0)) F64 ? dense.Error {
+    b := gauss.Diag(prior.Dim())
+    for i in range prior.Dim(): b.Set(i, prior.Mean[i], prior.Var[i])
+    seen := Array<F64>(prior.Dim(), -1.0e300)
+    score F64 = 0.0
+    for k in range e.Len() {
+        lo := e.Starts.At(k)
+        hi := e.Starts.At(k + 1)
+        idx := Array<I64>[e.Idx.At(j) for j in range lo, hi]
+        coef := Array<F64>[e.Coef.At(j) for j in range lo, hi]
+        t := e.Times.At(k)
+        for i in idx {
+            if seen[i] > -1.0e300: drift.ApplyDiag(b, i, t - seen[i])
+            seen[i] = t
+        }
+        score += try laplace.UpdateDiag(b, idx, coef, e.Offsets.At(k), lik, e.Ys.At(k), e.Trials.At(k))
+    }
+    if belief.Dim() == b.Dim() {
+        for i in range b.Dim(): belief.Set(i, b.Mean[i], b.Var[i])
+    }
+    return score
+}
+
+# the x in [lo, hi] maximising f, by golden-section search to a bracket of tolerance (f unimodal there)
+fn Golden(f fn&(x F64) F64, lo F64, hi F64, tolerance F64 = 1e-4) F64 {
+    k := (5.0.Sqrt() - 1.0) / 2.0
+    a := lo
+    b := hi
+    c := b - k * (b - a)
+    d := a + k * (b - a)
+    fc := f(c)
+    fd := f(d)
+    for _ in range 200 {
+        if (b - a).Abs() <= tolerance: break
+        if fc >= fd {
+            b = d
+            d = c
+            fd = fc
+            c = b - k * (b - a)
+            fc = f(c)
+            continue
+        }
+        a = c
+        c = d
+        fc = fd
+        d = a + k * (b - a)
+        fd = f(d)
+    }
+    return (a + b) / 2.0
+}
+
+# the point maximising f over the box lo ... hi, by rounds of golden-section search along each coordinate in turn, from
+# start
+fn Coordinate(f fn&(x Array<F64>&) F64, start Array<F64>&, lo Array<F64>&, hi Array<F64>&, rounds I64 = 4, tolerance F64 = 1e-4) Array<F64> {
+    x := Array<F64>[v for v in start]
+    for _ in range rounds {
+        for i in range x.Len() {
+            along := fn(v F64) F64 {
+                y := Array<F64>[w for w in x]
+                y[i] = v
+                return f(y)
+            }
+            x[i] = Golden(along, lo[i], hi[i], tolerance)
+        }
+    }
+    return x
+}
+
+# a random walk of one component observed in noise: y_t = x_t + v, x_t = x_(t-1) + w (variance q dt)
+fn walkData(steps I64, q F64, noise F64, seed U64) Array<F64> {
+    r := rand.Rand(seed)
+    x F64 = 0.0
+    out := Array<F64>(steps, 0.0)
+    for t in range steps {
+        x += (q).Sqrt() * r.Normal()
+        out[t] = x + noise.Sqrt() * r.Normal()
+    }
+    return out
+}
+
+test "the prequential score of a normal filter is the Kalman filter's log likelihood" {
+    ys := walkData(200, 0.05, 0.5, 3)
+    ev := Events()
+    for t in range ys.Len(): ev.Add(F64(t), Array<I64>[0], Array<F64>[1.0], 0.0, ys[t])
+    prior := gauss.Diag.Isotropic(1, 1.0)
+    pre := try Prequential(ev, prior, state.Drift.RandomWalk(0.05), laplace.Likelihood.Normal(0.5))
+    m := state.Model(1, 1)
+    m.Q = Array<F64>[0.05]
+    m.H = Array<F64>[1.0]
+    m.R = Array<F64>[0.5]
+    t := try m.Filter(prior.Full(), ys, Array<F64>(0))
+    assert (pre - t.LogLik).Abs() < 1e-9
+}
+
+test "empirical Bayes finds the drift that made the data" {
+    ys := walkData(3000, 0.05, 0.5, 8)
+    m := state.Model(1, 1)
+    m.H = Array<F64>[1.0]
+    m.R = Array<F64>[0.5]
+    prior := gauss.Gaussian.Isotropic(1, 1.0)
+    score := fn(lq F64) F64 {
+        k := state.Model(1, 1)
+        k.Q = Array<F64>[lq.Exp()]
+        k.H = Array<F64>[1.0]
+        k.R = Array<F64>[0.5]
+        return (try k.Filter(prior, ys, Array<F64>(0)) catch default state.Track()).LogLik
+    }
+    q := Golden(score, -8.0, 1.0).Exp()
+    assert q > 0.05 / 1.5 and q < 0.05 * 1.5
+    # both the drift and the noise at once, on log scales
+    both := fn(h Array<F64>&) F64 {
+        k := state.Model(1, 1)
+        k.Q = Array<F64>[h[0].Exp()]
+        k.H = Array<F64>[1.0]
+        k.R = Array<F64>[h[1].Exp()]
+        return (try k.Filter(prior, ys, Array<F64>(0)) catch default state.Track()).LogLik
+    }
+    h := Coordinate(both, Array<F64>[-1.0, -1.0], Array<F64>[-8.0, -8.0], Array<F64>[1.0, 1.0])
+    assert h[0].Exp() > 0.05 / 1.6 and h[0].Exp() < 0.05 * 1.6 and h[1].Exp() > 0.5 / 1.2 and h[1].Exp() < 0.5 * 1.2
+}
+
+test "a rating filter's prequential score peaks near the true drift" {
+    # eight players whose skills walk (q = 0.02 a day), a probit comparison of two each day
+    r := rand.Rand(5)
+    skill := Array<F64>(8, 0.0)
+    ev := Events()
+    for day in range 3000 {
+        for i in range 8: skill[i] += 0.02.Sqrt() * r.Normal()
+        a := r.Below(8)
+        b := (a + 1 + r.Below(7)) % 8
+        won := 1.0 if r.Float() < gauss.NormalCdf(skill[a] - skill[b]) else 0.0
+        ev.Add(F64(day), Array<I64>[a, b], Array<F64>[1.0, -1.0], 0.0, won)
+    }
+    prior := gauss.Diag.Isotropic(8, 1.0)
+    lik := laplace.Likelihood(laplace.Family.Probit)
+    at := fn(q F64) F64: return try Prequential(ev, prior, state.Drift.RandomWalk(q), lik) catch default -1.0e300
+    best := Golden(fn(lq): return at(lq.Exp()), -10.0, 0.0, 1e-2).Exp()
+    assert at(0.02) > at(0.0002) and at(0.02) > at(2.0)
+    assert best > 0.02 / 5.0 and best < 0.02 * 5.0
+}

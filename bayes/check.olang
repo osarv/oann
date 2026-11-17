@@ -1,0 +1,111 @@
+# bayes/check - model checking: how well a model's predictive distributions fit what then happened. Each outcome is
+# added with its predictive distribution's probability integral transform (PIT, the predictive cdf at the outcome:
+# uniform when the model is calibrated) and its log predictive density; from them come the coverage of the central 50%
+# and 90% predictive intervals, the PIT histogram and its chi-square distance from flat, and the mean log score. Binary
+# forecasts add the Brier score.
+#
+#     c := check.Calibration()
+#     c.AddNormal(mean, var, y)          # a Gaussian predictive
+#     c.AddBinary(p, y)                  # a probability of y = 1
+#     c.AddDiscrete(below, at, logp, r)  # an integer outcome: P(Y < y), P(Y <= y), its log probability
+#     c.Coverage(0.9), c.Pit(), c.PitChi2(), c.LogScore(), c.Brier()
+
+import "std/rand"
+import "gauss"
+
+# what the outcomes so far say about the forecasts
+type Calibration struct(bins I64 = 10) {
+    N I64 = 0
+    in50 I64 = 0
+    in90 I64 = 0
+    counts Array<I64> = Array<I64>(bins, 0)
+    logScore F64 = 0.0
+    brier F64 = 0.0
+    binary I64 = 0
+}
+
+# an outcome whose predictive cdf there is u, with log predictive density logp
+fn (c mut Calibration&) Add(u F64, logp F64) {
+    c.N++
+    if (u - 0.5).Abs() <= 0.25: c.in50++
+    if (u - 0.5).Abs() <= 0.45: c.in90++
+    bins := c.counts.Len()
+    c.counts[I64(u * F64(bins)).Clamp(0, bins - 1)]++
+    c.logScore += logp
+}
+
+# an outcome y of the predictive N(mean, var)
+fn (c mut Calibration&) AddNormal(mean F64, var F64, y F64) {
+    sd := var.Sqrt()
+    z := (y - mean) / sd
+    c.Add(gauss.NormalCdf(z), -0.5 * (z * z + gauss.Log2Pi) - sd.Log())
+}
+
+# an integer outcome y with P(Y < y) = below and P(Y <= y) = at: the randomised PIT, uniform between them
+fn (c mut Calibration&) AddDiscrete(below F64, at F64, logp F64, r mut rand.Rand&) {
+    c.Add(below + r.Float() * (at - below), logp)
+}
+
+# a binary outcome y (0 or 1) forecast with P(y = 1) = p
+fn (c mut Calibration&) AddBinary(p F64, y F64, r mut rand.Rand&) {
+    q := p.Clamp(1e-15, 1.0 - 1e-15)
+    below := 0.0 if y == 0.0 else 1.0 - q
+    at := 1.0 - q if y == 0.0 else 1.0
+    c.AddDiscrete(below, at, (q if y == 1.0 else 1.0 - q).Log(), r)
+    c.brier += (p - y) * (p - y)
+    c.binary++
+}
+
+# the share of outcomes inside the central predictive interval of level 0.5 or 0.9
+fn (c Calibration&) Coverage(level F64) F64 {
+    if level == 0.5: return F64(c.in50) / F64(c.N)
+    if level == 0.9: return F64(c.in90) / F64(c.N)
+    unreachable "bayes/check: coverage is kept at the levels 0.5 and 0.9"
+}
+
+# the PIT histogram: each bin's share of the outcomes (1 / bins each when calibrated)
+fn (c Calibration&) Pit() Array<F64> { return Array<F64>[F64(k) / F64(c.N) for k in c.counts] }
+
+# the PIT histogram's chi-square statistic against flat: about bins - 1 when calibrated, far more when not
+fn (c Calibration&) PitChi2() F64 {
+    want := F64(c.N) / F64(c.counts.Len())
+    s F64 = 0.0
+    for k in c.counts: s += (F64(k) - want) * (F64(k) - want) / want
+    return s
+}
+
+# the mean log predictive density (higher is better)
+fn (c Calibration&) LogScore() F64 { return c.logScore / F64(c.N) }
+
+# the mean Brier score of the binary forecasts (lower is better; 0.25 for always 1/2)
+fn (c Calibration&) Brier() F64 { return c.brier / F64(c.binary) }
+
+test "calibrated and overconfident Gaussian forecasts" {
+    r := rand.Rand(9)
+    good := Calibration()
+    sharp := Calibration()
+    for _ in range 20000 {
+        m := r.Normal()
+        y := m + r.Normal()
+        good.AddNormal(m, 1.0, y)
+        sharp.AddNormal(m, 0.25, y)
+    }
+    assert (good.Coverage(0.5) - 0.5).Abs() < 0.015 and (good.Coverage(0.9) - 0.9).Abs() < 0.01
+    assert good.PitChi2() < 30.0 and sharp.PitChi2() > 1000.0
+    assert sharp.Coverage(0.9) < 0.7
+    # the expected log score of a calibrated N(m, 1) is -(1 + log 2 pi) / 2
+    assert (good.LogScore() + 0.5 * (1.0 + gauss.Log2Pi)).Abs() < 0.02 and sharp.LogScore() < good.LogScore()
+    for share in good.Pit(): assert (share - 0.1).Abs() < 0.01
+}
+
+test "binary forecasts: Brier, log score and the randomised PIT" {
+    r := rand.Rand(1)
+    c := Calibration()
+    for _ in range 20000 {
+        p := 0.1 + 0.8 * r.Float()
+        c.AddBinary(p, 1.0 if r.Float() < p else 0.0, r)
+    }
+    # E[(p - y)^2] = E[p (1 - p)] for p uniform on (0.1, 0.9): 0.5 - (0.1^2 + 0.1 * 0.9 + 0.9^2) / 3 = 0.19
+    assert (c.Brier() - 0.19).Abs() < 0.01
+    assert c.PitChi2() < 30.0 and (c.Coverage(0.9) - 0.9).Abs() < 0.01
+}
