@@ -187,6 +187,8 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     fresh mut Array<Bool>& = Array<Bool>(0)         # Gauss-Seidel: whether population i was swept in this sweep
     seidel Bool = false                             # the running settle's sweeps are Gauss-Seidel
     acc mut History<T>& = History<T>(0, 0)        # Anderson's history
+    spec mut Vec<mut Array<T>&>& = Vec<mut Array<T>&>()    # Spectral's vector (zero until drawn), kept to warm-start the next call
+    specW mut Vec<mut Array<T>&>& = Vec<mut Array<T>&>()   # its product with the coupling
 }
 
 # Anderson's history: the state a sweep read (X) and the step it made (F), gathered over the rows settled, the last ones
@@ -257,6 +259,10 @@ fn (e mut Engine<T>&) Ready() {
     e.sweepOrder()
     e.groups = Array<I64>(e.Pops.Len() + 1)
     e.fresh = Array<Bool>(e.Pops.Len())
+    for p in e.Pops {
+        e.spec.Push(Array<T>(p.Size))
+        e.specW.Push(Array<T>(p.Size))
+    }
 }
 
 # the populations in sweep order: each after every population a one-way connection carries into it from (a
@@ -830,18 +836,13 @@ fn (e mut Engine<T>&) spikes(b Budget) Settlement {
 # ---- the coupling's spectral norm ----
 
 # the largest singular value of W, the coupling between relaxing units (every connection not folded, a reciprocal one
-# both ways), by power iteration on W^T W from a fixed start: sigma = |W v| for the unit v, v <- W^T W v normalized,
-# until sigma moves by at most tol relative or after iterations; 0 where nothing couples. Allocates its vectors
+# both ways), by power iteration on W^T W: sigma = |W v| for the unit v, v <- W^T W v normalized, until sigma moves by
+# at most tol relative or after iterations; 0 where nothing couples. Warm-started: v is kept in the engine and the next
+# call starts from it, so after a small change of the weights (a lesson's step) a few iterations do. Each iterate is a
+# lower bound (|W v| <= sigma for a unit v). Its vectors are laid out by Ready: it allocates nothing
 fn (e mut Engine<T>&) Spectral(iterations I64, tol F64) F64 {
-    v := Vec<mut Array<T>&>()
-    w := Vec<mut Array<T>&>()
-    r := rand.Rand(1)
-    for p in e.Pops {
-        a := Array<T>(p.Size)
-        if p.Role != neuron.Role.Input { for j in range p.Size: a[j] = T(r.Uniform(-1.0, 1.0)) }
-        v.Push(a)
-        w.Push(Array<T>(p.Size))
-    }
+    if norm(e.spec) == 0.0: e.specDraw()
+    v, w := e.spec, e.specW
     sigma := 0.0
     for _ in range iterations {
         if norm(v) == 0.0: return 0.0
@@ -854,6 +855,16 @@ fn (e mut Engine<T>&) Spectral(iterations I64, tol F64) F64 {
         if moved <= tol * sigma: break
     }
     return sigma
+}
+
+# Spectral's vector drawn afresh (seeded: the same start for the same structure), zero on the inputs
+fn (e mut Engine<T>&) specDraw() {
+    r := rand.Rand(1)
+    for i in range e.spec.Len() {
+        a := e.spec[i]
+        if e.Pops[i].Role == neuron.Role.Input: continue
+        for j in range a.Len(): a[j] = T(r.Uniform(-1.0, 1.0))
+    }
 }
 
 # to = W from (trans: W^T from), every population's vector

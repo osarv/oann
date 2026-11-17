@@ -15,10 +15,12 @@
 # thinned as sparse rows, so their products skip what was pruned: the one step that allocates, run where the caller
 # chooses. Macs counts what a settle's products cost as the structure now stands.
 #
-# The stability tools: Gain (kappa, the largest incoming absolute weight sum of a relaxing unit times its activation's
-# largest slope), Certify (every recurrent connection scaled so that kappa is a target, 0.9 by default), Restrain (each
-# scaled back into the certified set where it left it), Rate (the certified contraction q = 1 - dt (1 - kappa)) and the
-# budgets that follow (settling.md 1.2, 1.4, 1.10).
+# The stability tools: Gain (the sup-norm bound, the largest incoming absolute weight sum of a relaxing unit times its
+# activation's largest slope), Contraction (the spectral bound, the coupling's largest singular value times that slope),
+# the norm the certificate holds (Bound: Norm.Sup or Norm.Spectral) and its kappa (Kappa), Certify (every recurrent
+# connection scaled so that kappa is a target, 0.9 by default), Restrain (scaled back into the certified set where they
+# left it), Rate (the certified contraction q = 1 - dt (1 - kappa)) and the budgets that follow (settling.md 1.2, 1.4,
+# 1.10; the spectral certificate, docs/redesign.md 4.3).
 
 import "std/os"
 import "std/rand"
@@ -35,6 +37,11 @@ type Sig I64
 
 # the clocks rules run on: inside a settle, per sample or moment, per episode, in sleep
 type Clock enum { Sweep, Step, Episode, Sleep }
+
+# the norm a certificate holds the coupling in: Sup, the gain (Gain: incoming mass times slope; a sweep contracts in the
+# sup norm), or Spectral, the coupling's largest singular value times the slope (Contraction; a sweep contracts in the
+# Euclidean norm). Both make the fixed point unique; the spectral bound is never above the gain for a symmetric coupling
+type Norm enum { Sup, Spectral }
 
 # learning and adaptation as rules on a module (run by dyn/learn's Learner)
 type Rule enum {
@@ -75,6 +82,7 @@ type System<T> struct(batch I64, threads I64 = 1, phases I64 = 3) {
     E mut settle.Engine<T>& = settle.Engine<T>(batch, phases, threads)
     Planned Bool = false
     Scheme settle.Sweeping = settle.Sweeping()          # the sweeps of the budgets it gives (BudgetFor)
+    Bound Norm = Norm.Sup                               # the norm Certify, Restrain, Rate and the tolerances hold kappa in
     mods mut Vec<modRec>& = Vec<modRec>[modRec(-1, "root")]
     pops mut Vec<popRec>& = Vec<popRec>()
     sigs mut Vec<sigRec>& = Vec<sigRec>()
@@ -514,19 +522,41 @@ fn (s mut System<T>&) Gain() F64 {
     return 0.0 if most == 0.0 else most * s.slope()
 }
 
-# every recurrent connection scaled by one factor so that the gain is target (which keeps a reciprocal block
-# symmetric); nothing for a system with no recurrent weights or no bounded slope
+# kappa in the norm the certificate holds (Bound): the gain, or the spectral bound by the warm power iteration (a few
+# iterations a lesson; to a relative 1e-6 in at most 200 - an estimate from below, as every iterate is)
+fn (s mut System<T>&) Kappa() F64 { return s.kappaTo(200, 1e-6) }
+
+fn (s mut System<T>&) kappaTo(iterations I64, tol F64) F64 {
+    if s.Bound == Norm.Sup: return s.Gain()
+    slope := s.slope()
+    if not (slope <= F64.Max): return slope
+    return s.E.Spectral(iterations, tol) * slope
+}
+
+# every recurrent connection scaled by one factor so that kappa (in the norm of Bound; the spectral bound found to a
+# relative 1e-9 here, once) is target (which keeps a reciprocal block symmetric); nothing for a system with no recurrent
+# weights or no bounded slope
 fn (s mut System<T>&) Certify(target F64 = 0.9) {
-    k := s.Gain()
+    k := s.kappaTo(1000, 1e-9)
     if k == 0.0 or not (k <= F64.Max): return
+    s.scale(target / k)
+}
+
+fn (s mut System<T>&) scale(f F64) {
     for l in s.E.Links {
-        if not l.Folded: l.Scale(s.E.Params, target / k)
+        if not l.Folded: l.Scale(s.E.Params, f)
     }
 }
 
-# the weights projected back into the certified set: each recurrent connection whose units' gain exceeds target scaled
-# by the factor the worst of them needs (all factors found before any is applied)
+# the weights projected back into the certified set. Sup: each recurrent connection whose units' gain exceeds target
+# scaled by the factor the worst of them needs (all factors found before any is applied). Spectral: every recurrent
+# connection by the one factor that brings the spectral bound to target (the norm is not a per-unit quantity)
 fn (s mut System<T>&) Restrain(target F64 = 0.9) {
+    if s.Bound == Norm.Spectral {
+        k := s.Kappa()
+        if k > target and k <= F64.Max: s.scale(target / k)
+        return
+    }
     s.masses()
     l := s.slope()
     if not (l <= F64.Max): return
@@ -555,27 +585,40 @@ fn (s System<T>&) worstFactor(p settle.Population<T>&, slope F64, target F64) F6
 # the spectral bound of the coupling: the activations' largest slope times the largest singular value of the recurrent
 # weights between relaxing units (power iteration, Engine.Spectral, to a relative 1e-9 in at most iterations). Below 1
 # a sweep at dt = 1 is a contraction in the Euclidean norm by this factor - at most Gain() where the coupling is
-# symmetric (|W|_2 <= |W|_inf), often far below it; infinite for spiking and custom populations. Allocates
+# symmetric (|W|_2 <= |W|_inf), often far below it; infinite for spiking and custom populations
 fn (s mut System<T>&) Contraction(iterations I64 = 1000) F64 {
     slope := s.slope()
     sigma := s.E.Spectral(iterations, 1e-9)
     return 0.0 if sigma == 0.0 else sigma * slope
 }
 
-# the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual - of a free phase, or one nudged
-# with beta at its step - or 1 where nothing is certified
+# the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual (in the norm of Bound) - of a free
+# phase, or one nudged with beta at its step - or 1 where nothing is certified
 fn (s mut System<T>&) Rate(beta F64 = 0) F64 {
-    k := s.Gain()
+    k := s.Kappa()
     dt := s.E.Dt if beta <= 0.0 else s.E.Dt / (1.0 + beta * s.E.ForceSlope())
     return 1.0 if k >= 1.0 else 1.0 - dt * (1.0 - k)
 }
 
 # the training tolerance (settling.md 1.4): phases solved to it add an error no larger than the contrast's O(beta^2)
-# bias - max(beta^3 (1 - kappa) / 10, 100 u), kappa held at most 0.9. A spiking system's: two spikes a window
+# bias - max(beta^3 (1 - kappa) / 10, 100 u), kappa held at most 0.9. Under the spectral certificate the residual is
+# still tested unit by unit (sup norm) but the distance bound is Euclidean: |v - v*|_inf <= |v - v*|_2 <=
+# sqrt(n) tau / (1 - kappa) for n relaxing units a row, so the tolerance is divided by sqrt(n). A spiking system's: two
+# spikes a window
 fn (s mut System<T>&) LessonTolerance(beta F64) F64 {
     if s.E.Spiking: return 2.0 / F64(s.E.Window)
-    kappa := s.Gain().Min(0.9)
-    return (beta * beta * beta * (1.0 - kappa) / 10.0).Max(100.0 * roundoff<T>())
+    kappa := s.Kappa().Min(0.9)
+    each := 1.0 if s.Bound == Norm.Sup else F64(s.relaxing()).Sqrt()
+    return (beta * beta * beta * (1.0 - kappa) / (10.0 * each)).Max(100.0 * roundoff<T>())
+}
+
+# the relaxing units of a row (every population but the inputs)
+fn (s System<T>&) relaxing() I64 {
+    n I64 = 0
+    for p in s.E.Pops {
+        if p.Role != neuron.Role.Input: n += p.Size
+    }
+    return n.Max(1)
 }
 
 # a budget for a settle to tol, free or nudged with beta: twice the sweeps the certificate says a cold start needs
@@ -887,16 +930,7 @@ test System.Contraction "the spectral bound: kappa exactly where the coupling is
     small(s, neuron.Rho.Tanh, conn.Wiring.Dense, r)
     s.Certify(0.8)
     # W_eff over h (0 .. 5) and y (5 .. 7), as the linear test reads it; its largest singular value by power iteration
-    a := Array<F64>(49)
-    wy := s.Weights(Conn(1))
-    wl := s.Weights(Conn(2))
-    for i in range 5 {
-        for j in range 5: a[i * 7 + j] = wl.Get(i, j) + wl.Get(j, i)
-        for k in range 2 {
-            a[i * 7 + 5 + k] = wy.Get(k, i)
-            a[(5 + k) * 7 + i] = wy.Get(k, i)
-        }
-    }
+    a := coupling(s)
     v := Array<F64>(7, 1.0)
     sigma := 0.0
     for _ in range 5000 {
@@ -911,6 +945,136 @@ test System.Contraction "the spectral bound: kappa exactly where the coupling is
     # every wiring, F32: at most the gain (the coupling is not symmetric, the bound still well below)
     m := System<F32>.mixed(4, 1)
     assert m.Contraction() > 0.0 and m.Contraction() < m.Gain(), $m.Contraction() + " against the gain " + $m.Gain()
+}
+
+# small's coupling between relaxing units, dense: W_eff over h (0 .. 5) and y (5 .. 7), 7 x 7
+fn coupling(s System<F64>&) Array<F64> {
+    a := Array<F64>(49)
+    wy := s.Weights(Conn(1))
+    wl := s.Weights(Conn(2))
+    for i in range 5 {
+        for j in range 5: a[i * 7 + j] = wl.Get(i, j) + wl.Get(j, i)
+        for k in range 2 {
+            a[i * 7 + 5 + k] = wy.Get(k, i)
+            a[(5 + k) * 7 + i] = wy.Get(k, i)
+        }
+    }
+    return a
+}
+
+# the largest singular value of a (n x n) by a dense method: the largest eigenvalue of a^T a by cyclic Jacobi
+# rotations (until the off-diagonal is below 1e-30), its square root
+fn singular(a Array<F64>&, n I64) F64 {
+    b := Array<F64>(n * n)
+    for i in range n {
+        for j in range n: b[i * n + j] = dot(a, i, j, n)
+    }
+    for _ in range 100 {
+        if offDiagonal(b, n) < 1e-30: break
+        for p in range n {
+            for q in range p + 1, n: rotate(b, n, p, q)
+        }
+    }
+    most := 0.0
+    for i in range n: most = most.Max(b[i * n + i])
+    return most.Sqrt()
+}
+
+# (a^T a)[i, j]: column i of a against column j
+fn dot(a Array<F64>&, i I64, j I64, n I64) F64 {
+    t := 0.0
+    for k in range n: t += a[k * n + i] * a[k * n + j]
+    return t
+}
+
+fn offDiagonal(b Array<F64>&, n I64) F64 {
+    t := 0.0
+    for p in range n {
+        for q in range p + 1, n: t += b[p * n + q] * b[p * n + q]
+    }
+    return t
+}
+
+# b <- J^T b J for the Jacobi rotation in the plane (p, q) that zeroes b[p, q]
+fn rotate(b mut Array<F64>&, n I64, p I64, q I64) {
+    if b[p * n + q] == 0.0: return
+    theta := (b[q * n + q] - b[p * n + p]) / (2.0 * b[p * n + q])
+    sign := 1.0 if theta >= 0.0 else -1.0
+    t := sign / (theta.Abs() + (theta * theta + 1.0).Sqrt())
+    c := 1.0 / (t * t + 1.0).Sqrt()
+    sn := t * c
+    for k in range n {
+        bp, bq := b[k * n + p], b[k * n + q]
+        b[k * n + p] = c * bp - sn * bq
+        b[k * n + q] = sn * bp + c * bq
+    }
+    for k in range n {
+        bp, bq := b[p * n + k], b[q * n + k]
+        b[p * n + k] = c * bp - sn * bq
+        b[q * n + k] = sn * bp + c * bq
+    }
+}
+
+test System.Contraction "the spectral bound against a dense SVD of the coupling, four random systems; certified and restrained in the spectral norm it is the target, and the warm power iteration (Kappa) follows a step of the weights" {
+    for seed in range 2, 6 {
+        r := rand.Rand(U64(seed))
+        s := System<F64>(2, 1, 1)
+        small(s, neuron.Rho.Tanh, conn.Wiring.Dense, r)
+        sigma := singular(coupling(s), 7)
+        assert (s.Contraction() - sigma).Abs() < 1e-8 * sigma, "seed " + $seed + ": " + $s.Contraction() + " against " + $sigma
+        s.Bound = Norm.Spectral
+        s.Certify(0.8)
+        assert (singular(coupling(s), 7) - 0.8).Abs() < 1e-6, "certified: " + $singular(coupling(s), 7)
+        # a step of the weights (every recurrent one doubled): Kappa, warm from the last vector, sees it; Restrain brings it back
+        s.scale(2.0)
+        assert (s.Kappa() - 1.6).Abs() < 1e-5, "after the step: " + $s.Kappa()
+        s.Restrain(0.8)
+        assert (singular(coupling(s), 7) - 0.8).Abs() < 1e-5, "restrained: " + $singular(coupling(s), 7)
+        # inside the set already: left as it is
+        s.Restrain(0.9)
+        assert (singular(coupling(s), 7) - 0.8).Abs() < 1e-5
+    }
+}
+
+# x (3 inputs) -> h (24 tanh units, a dense lateral block both ways) <-> y (4): a coupling whose spectral bound is far
+# below its gain
+fn System<T>.wide(seed U64) System<T> {
+    r := rand.Rand(seed)
+    s := System<T>(2, 1, 1)
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 24, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 4, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for i in range 6: s.Pop(x).Drive[i] = T(r.Uniform(-1.0, 1.0))
+    return s
+}
+
+test System.Certify "certified in the spectral norm (the gain above 1, outside the sup-norm certificate) a settle converges within the budget, and a cold and a warm start reach one fixed point" {
+    s := System<F64>.wide(4)
+    s.Bound = Norm.Spectral
+    s.Certify(0.9)
+    assert (s.Contraction() - 0.9).Abs() < 1e-7, $s.Contraction()
+    assert s.Gain() > 1.0, "the gain " + $s.Gain()
+    tol := 1e-10
+    cold := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
+    assert cold.Converged, $cold.Sweeps + " sweeps, residual " + $cold.Residual
+    first := Array<F64>[s.Activity(settle.Phase.Free, Pop(1)).Get(k / 24, k % 24) for k in range 48]
+    # another drive settled, then the first again from there
+    x := s.Pop(Pop(0))
+    for i in range 6: x.Drive[i] = -x.Drive[i]
+    assert s.Settle(settle.Phase.Free, s.BudgetFor(tol)).Converged
+    for i in range 6: x.Drive[i] = -x.Drive[i]
+    warm := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
+    assert warm.Converged
+    # each within sqrt(n) tol / (1 - kappa) of the fixed point (n = 28 relaxing units), tanh's slope 1
+    h := s.Activity(settle.Phase.Free, Pop(1))
+    for b in range 2 {
+        for i in range 24: assert (h.Get(b, i) - first[b * 24 + i]).Abs() < 2.0 * 28.0.Sqrt() * tol / 0.1
+    }
 }
 
 # a v (n x n, trans: a^T v)
