@@ -764,34 +764,46 @@ fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
 
 # the certified rate of the nudged pair settled with beta from the free phase's committed state (free the settlement
 # that left it there, its residual measured in the norm of Bound): Rate(beta) with the readouts' force bounded over the
-# region the settle can reach instead of at its worst. Row by row: the start's residual (the step over dt) is at most
-# rest + beta |F(s0)|, rest the free settle's residual (the state it kept is the one it measured) and F(s0) the force
-# there (neuron.ForceSize). Where a sweep's Jacobian has norm at most q = 1 - dt (1 - kappa_beta) on the ball of radius
-# r about the start, and rest + beta |F(s0)| <= (1 - kappa_beta) r, the sweep maps the ball into itself (|G(u) - u0|
-# <= q r + dt (1 - kappa_beta) r = r), so the settle stays in it and shrinks the residual by q every sweep.
-# kappa_beta is kappa plus beta times the force's Jacobian within r of the start (neuron.ForceOver): its part between
-# units at +beta (the shortened step absorbs the diagonal), the whole at -beta. r is grown from the start's residual /
-# (1 - kappa) by a quarter until the ball holds; 1 where none does within 100 growths or kappa_beta reaches 1 (it only
-# grows with r), where the free phase is not certified, and for a spiking model or one without a slope bound. Gives
-# the rate and the rows it certifies on their own
+# region the settle can reach instead of at its worst, row by row, in the better of two norms (rowRate). Gives the
+# worst row's rate (1 where a row is not certified, the free phase did not converge, or the model is spiking) and the
+# rows certified on their own
 fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
+    if not free.Converged or s.E.Spiking: return 1.0, 0
     k := s.Kappa()
-    if rateOf(s.E.Dt, k) >= 1.0 or not free.Converged or s.E.Spiking: return 1.0, 0
     for i in range s.E.Pops.Len() {
         if s.E.Pops[i].Role == neuron.Role.Readout: s.hostState(i)
     }
+    blocks := s.blocks(k)
     worst F64 = 0.0
     rows := 0
     for row in range s.E.Batch {
-        q := s.rowRate(row, k, beta.Abs(), free.Residual)
+        q, _ := s.rowRate(row, k, blocks, beta.Abs(), free.Residual)
         worst = worst.Max(q)
         if q < 1.0: rows++
     }
     return worst, rows
 }
 
-# NudgedRate's rate of one batch row
-fn (s System<T>&) rowRate(row I64, k F64, b F64, rest F64) F64 {
+# NudgedRate's rate of one row and the norm it holds in: t = 0 for the certificate's own (plainRate), t > 0 for the
+# block norm max(|x_h|, |x_y| / t) (blockRate) - whichever certifies the lower rate
+fn (s System<T>&) rowRate(row I64, k F64, blocks Array<F64>&, b F64, rest F64) F64, F64 {
+    plain := s.plainRate(row, k, b, rest)
+    q, t := s.blockRate(row, blocks, b, rest)
+    if plain <= q: return plain, 0.0
+    return q, t
+}
+
+# the rate in the certificate's own norm: the start's residual (the step over dt) is at most rest + beta |F(s0)|, rest
+# the free settle's residual (the state it kept is the one it measured) and F(s0) the force there (neuron.ForceSize).
+# Where a sweep's Jacobian has norm at most q = 1 - dt (1 - kappa_beta) on the ball of radius r about the start, and
+# rest + beta |F(s0)| <= (1 - kappa_beta) r, the sweep maps the ball into itself (|G(u) - u0| <= q r + dt (1 -
+# kappa_beta) r = r), so the settle stays in it and shrinks the residual by q every sweep. kappa_beta is kappa plus
+# beta times the force's Jacobian within r of the start (neuron.ForceOver): its part between units at +beta (the
+# shortened step absorbs the diagonal), the whole at -beta. r is grown from the start's residual / (1 - kappa) by a
+# quarter until the ball holds; 1 where none does within 100 growths, kappa_beta reaches 1 (it only grows with r), the
+# free phase is not certified (kappa >= 1), or a readout has no slope bound
+fn (s System<T>&) plainRate(row I64, k F64, b F64, rest F64) F64 {
+    if rateOf(s.E.Dt, k) >= 1.0: return 1.0
     euclid := s.Bound == Norm.Spectral
     start := rest + b * s.forceSize(row, euclid)
     r := start / (1.0 - k)
@@ -803,6 +815,101 @@ fn (s System<T>&) rowRate(row I64, k F64, b F64, rest F64) F64 {
         r *= 1.25
     }
     return 1.0
+}
+
+# what blockRate reads of the coupling, once a call: [sigma_hh, sigma_hy, sigma_yy, s_h] - the norm (Bound's) bounding
+# the recurrent weights within the hidden units (every relaxing unit not a readout), between them and the readouts, and
+# within the readouts, each sigma = kappa / the largest slope (a block's norm is at most the whole's) or 0 where no
+# connection joins those units, and the hidden units' largest slope
+fn (s System<T>&) blocks(k F64) Array<F64> {
+    out := Array<F64>(4, 0.0)
+    slope := s.slope()
+    if not (slope > 0.0 and slope <= F64.Max): return out
+    sigma := k / slope
+    e := s.E
+    for l in e.Links {
+        if l.Folded: continue
+        pre, post := e.Pops[l.Pre].Role == neuron.Role.Readout, e.Pops[l.Post].Role == neuron.Role.Readout
+        out[0 if not pre and not post else 2 if pre and post else 1] = sigma
+    }
+    for p in e.Pops {
+        if p.Role != neuron.Role.Input and p.Role != neuron.Role.Readout: out[3] = out[3].Max(neuron.Slope(p.Model))
+    }
+    return out
+}
+
+# the rate in the block norm |x|_t = max(|x_h|, |x_y| / t) (h the hidden units, y the readouts, each part in Bound's
+# norm): a sweep's Jacobian (1 - dt) + dt (W D + beta J_F) has blocks bounded by the matrix M = [a b; c d] - a =
+# sigma_hh s_h, b = sigma_hy s_y, c = sigma_hy s_h, d = sigma_yy s_y + beta f, s_y the readouts' largest slope over the
+# ball (neuron.SlopeOver) and f the force's Jacobian over it (neuron.ForceOver: between units at +beta, whole at -beta)
+# - so its norm in |.|_t is at most (1 - dt) + dt kappa_t, kappa_t = max(a + b t, c / t + d), least at M's Perron
+# vector (1, t) where it is M's spectral radius. Saturated readouts (s_y small) leave the hidden-readout coupling
+# little: with no lateral blocks the condition is beta f < 1 - kappa^2 s_y / s_h instead of beta f < 1 - kappa. The ball
+# argument is plainRate's in |.|_t: the start's residual is at most max(rest, (rest + beta |F|) / t) (the force is the
+# readouts'), the y-ball's radius r t. t is taken from M at the previous radius (the free state's first) and r grown
+# by a quarter until the ball holds at that t; 1 where M's spectral radius reaches 1 or nothing holds in 100 growths
+fn (s System<T>&) blockRate(row I64, blocks Array<F64>&, b F64, rest F64) F64, F64 {
+    if blocks[1] == 0.0: return 1.0, 0.0
+    euclid := s.Bound == Norm.Spectral
+    size := b * s.forceSize(row, euclid)
+    m := s.blockMatrix(row, blocks, b, 0.0)
+    t := perron(m)
+    if t == 0.0: return 1.0, 0.0
+    r := rest.Max((rest + size) / t) / (1.0 - kappaAt(m, t))
+    for _ in range 100 {
+        m = s.blockMatrix(row, blocks, b, r * t)
+        start := rest.Max((rest + size) / t)
+        minus := kappaAt(m, t)
+        if minus < 1.0 and (1.0 - minus) * r >= start {
+            plus := (m[0] + m[1] * t).Max(m[2] / t + m[4])
+            return rateOf(s.E.Dt / (1.0 + b * s.E.ForceSlope()), plus).Max(rateOf(s.E.Dt, minus)), t
+        }
+        t = perron(m)
+        if t == 0.0: return 1.0, 0.0
+        r *= 1.25
+    }
+    return 1.0, 0.0
+}
+
+# blockRate's M within radius ry of row's readouts: [a, b, c, d at -beta, d at +beta]
+fn (s System<T>&) blockMatrix(row I64, blocks Array<F64>&, b F64, ry F64) Array<F64> {
+    euclid := s.Bound == Norm.Spectral
+    sy := s.readoutSlope(row, ry)
+    c, w := s.forceOver(row, ry, euclid)
+    sh := blocks[3]
+    m := Array<F64>(5, 0.0)
+    m[0], m[1], m[2] = blocks[0] * sh, blocks[1] * sy, blocks[1] * sh
+    m[3], m[4] = blocks[2] * sy + b * w, blocks[2] * sy + b * c
+    return m
+}
+
+# kappa_t of M at -beta: max(a + b t, c / t + d)
+fn kappaAt(m Array<F64>&, t F64) F64 { return (m[0] + m[1] * t).Max(m[2] / t + m[3]) }
+
+# the weight t of M's Perron vector (1, t) at -beta, where kappa_t is M's spectral radius (b t^2 + (a - d) t - c = 0);
+# 0 where that radius is 1 or more (nothing certified) or the blocks do not couple
+fn perron(m Array<F64>&) F64 {
+    a, b, c, d := m[0], m[1], m[2], m[3]
+    radius := (a + d) / 2.0 + (((a - d) / 2.0).Pow(2.0) + b * c).Sqrt()
+    if not (radius < 1.0) or b <= 0.0 or c <= 0.0: return 0.0
+    return (radius - a) / b
+}
+
+# the readouts' largest slope with each potential of row moved by at most r (neuron.SlopeOver); infinite for a readout
+# not a rate population
+fn (s System<T>&) readoutSlope(row I64, r F64) F64 {
+    worst F64 = 0.0
+    for p in s.E.Pops {
+        if p.Role != neuron.Role.Readout: continue
+        model := p.Model
+        if model != neuron.Neuron.Rate: return Inf
+        rho := model.rho
+        for j in range p.Size {
+            u := F64(p.R0.U[row * p.Size + j])
+            worst = worst.Max(neuron.SlopeOver(rho, u - r, u + r))
+        }
+    }
+    return worst
 }
 
 # the size of the readouts' force in row of the free phase, per unit of beta, in the certificate's norm
@@ -1346,7 +1453,7 @@ test System.NudgedRate "the nudged pair's rate bounded over the region it can re
             for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((k + i) % 4)
             q, rows := s.NudgedRate(0.5, free)
             assert s.Rate(0.5) == 1.0 and q < 1.0 and rows == 2, $bound + " labels " + $k + ": rate " + $q
-            assertContracts(s, 0.5, q, s.BudgetAt(tol, q).Sweeps, tol)
+            assertContracts(s, 0.5, free, s.BudgetAt(tol, q).Sweeps, tol)
         }
     }
 }
@@ -1368,27 +1475,113 @@ test System.NudgedRate "soundness: over random systems, kappas, readout confiden
             continue
         }
         certified++
-        tightest = tightest.Max(assertContracts(s, beta, q, s.BudgetAt(tol, q).Sweeps, tol) / q)
+        tightest = tightest.Max(assertContracts(s, beta, free, s.BudgetAt(tol, q).Sweeps, tol))
     }
     assert certified >= 24 and refused >= 12, $certified + " certified, " + $refused + " refused"
     assert tightest > 0.5, "the measured contraction at most " + $tightest + " of the certified rate"
 }
 
-# the nudged pair at beta settled sweep by sweep from the free state: each residual at most q times the last (the
-# sweep's contraction measured between consecutive states), and within tol before sweeps; gives the largest ratio seen
-fn assertContracts(s mut System<F64>&, beta F64, q F64, sweeps I64, tol F64) F64 {
+test System.NudgedRate "the block norm: on a layered system (no lateral blocks) with saturated readouts it certifies rows the certificate's own norm refuses, and every row it certifies contracts at its rate in it, both phases, both norms" {
+    plainRows, blockRows, gained, refused := 0, 0, 0, 0
+    tightest F64 = 0.0
+    for trial in range 36 {
+        bound := Norm.Spectral if trial % 2 == 0 else Norm.Sup
+        s := System<F64>.layered(U64(200 + trial), [1.0, 2.0, 4.0][trial / 2 % 3], bound)
+        beta := [0.1, 0.5, 1.0][trial / 12]
+        tol := s.LessonTolerance(beta)
+        free := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
+        assert free.Converged
+        for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((trial * 7 + i * 3) % 10)
+        k := s.Kappa()
+        blocks := s.blocks(k)
+        for row in range s.E.Batch {
+            plain := s.plainRate(row, k, beta, free.Residual)
+            q, t := s.blockRate(row, blocks, beta, free.Residual)
+            if plain < 1.0: plainRows++
+            if q < 1.0: blockRows++
+            if q < 1.0 and plain >= 1.0: gained++
+            if q >= 1.0 and plain >= 1.0: refused++
+            assert q >= 1.0 or t > 0.0
+        }
+        q, _ := s.NudgedRate(beta, free)
+        tightest = tightest.Max(assertContracts(s, beta, free, s.BudgetAt(tol, q.Min(0.95)).Sweeps, tol))
+    }
+    assert gained >= 12 and refused >= 12, $plainRows + " rows certified in the plain norm, " + $blockRows + " in the block norm, " + $gained + " by it alone, " + $refused + " by neither"
+    assert tightest > 0.5, "the measured contraction at most " + $tightest + " of the certified rate"
+}
+
+# the nudged pair at beta settled sweep by sweep from the free state (free its settlement): in each row the rate
+# certifies (rowRate), every step between consecutive states at most q times the last, measured in the norm the row's
+# rate holds in (stepNorm), in both phases; the settle within tol before sweeps. Gives the largest step ratio over q
+fn assertContracts(s mut System<F64>&, beta F64, free settle.Settlement, sweeps I64, tol F64) F64 {
+    n := s.E.Batch
+    k := s.Kappa()
+    blocks := s.blocks(k)
+    qs, ts := Array<F64>(n, 1.0), Array<F64>(n, 0.0)
+    for row in range n {
+        q, t := s.rowRate(row, k, blocks, beta, free.Residual)
+        qs[row] = q
+        ts[row] = t
+    }
     one := settle.Budget(1, 0.0, 0.0, s.Scheme, s.Bound == Norm.Spectral)
-    last := s.Nudged(one, beta).Residual
+    s.Nudged(one, beta)
+    before := s.potentials()
+    last := Array<F64>(2 * n, 0.0)
     worst F64 = 0.0
-    for n in range 1, sweeps {
-        now := s.E.Settle(1, 3, one, false).Residual
-        assert now <= q * last * (1.0 + 1e-9), "sweep " + $n + ": " + $now + " after " + $last + ", rate " + $q
-        if now <= tol.Max(1e-11): return worst
-        worst = worst.Max(now / last)
-        last = now
+    for sweep in range 1, sweeps {
+        out := s.E.Settle(1, 3, one, false)
+        now := s.potentials()
+        for pr in range 2 * n {
+            q := qs[pr % n]
+            step := s.stepNorm(before, now, n + pr, ts[pr % n])
+            if q < 1.0 and last[pr] > 1e-10 {
+                assert step <= q * last[pr] * (1.0 + 1e-9), "sweep " + $sweep + ", row " + $pr + ": step " + $step + " after " + $last[pr] + ", rate " + $q + ", t " + $ts[pr % n]
+                worst = worst.Max(step / last[pr] / q)
+            }
+            last[pr] = step
+        }
+        before = now
+        if out.Residual <= tol.Max(1e-11): return worst
     }
     assert false, "not within " + $tol + " in " + $sweeps + " sweeps"
     return worst
+}
+
+# every relaxing population's potentials, all rows, one after another
+fn (s System<F64>&) potentials() Array<F64> {
+    total := 0
+    for p in s.E.Pops {
+        if p.Role != neuron.Role.Input: total += p.R0.U.Len()
+    }
+    out := Array<F64>(total, 0.0)
+    at := 0
+    for p in s.E.Pops {
+        if p.Role == neuron.Role.Input: continue
+        for i in range p.R0.U.Len(): out[at + i] = p.R0.U[i]
+        at += p.R0.U.Len()
+    }
+    return out
+}
+
+# the norm of row's step from a to b (potentials()): Bound's over every relaxing unit where t is 0, else the block norm
+# max(|x_h|, |x_y| / t) of blockRate
+fn (s System<F64>&) stepNorm(a Array<F64>&, b Array<F64>&, row I64, t F64) F64 {
+    euclid := s.Bound == Norm.Spectral
+    h, y F64 = 0.0, 0.0
+    at := 0
+    for p in s.E.Pops {
+        if p.Role == neuron.Role.Input: continue
+        readout := p.Role == neuron.Role.Readout
+        for j in range p.Size {
+            d := (b[at + row * p.Size + j] - a[at + row * p.Size + j]).Abs()
+            part := d * d if euclid else d
+            if readout { y = y + part if euclid else y.Max(part) } else { h = h + part if euclid else h.Max(part) }
+        }
+        at += p.R0.U.Len()
+    }
+    if euclid: h, y = h.Sqrt(), y.Sqrt()
+    if t > 0.0: return h.Max(y / t)
+    return (h * h + y * y).Sqrt() if euclid else h.Max(y)
 }
 
 # wideClasses certified at kappa in the norm bound, its readout confident: unit 0's bias +b, the others' -b
@@ -1398,6 +1591,26 @@ fn System<T>.confident(seed U64, b F64, kappa F64, bound Norm) System<T> {
     s.Certify(kappa)
     y := s.Bias(Pop(2))
     for j in range 4: y.Set(T(b if j == 0 else -b), j)
+    return s
+}
+
+# x (8 inputs) -> h (32 tanh) <-> y (10 tanh classes, T = 0.25), MNIST's shape: no lateral block, certified at 0.9
+# in the norm bound, its readout confident (unit 0's bias +b, the others' -b)
+fn System<T>.layered(seed U64, b F64, bound Norm) System<T> {
+    r := rand.Rand(seed)
+    s := System<T>(2, 1, 3)
+    root := s.Root()
+    x := s.Population(root, "x", 8, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 32, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for i in range 16: s.Pop(x).Drive[i] = T(r.Uniform(-1.0, 1.0))
+    s.Bound = bound
+    s.Certify(0.9)
+    yb := s.Bias(Pop(2))
+    for j in range 10: yb.Set(T(b if j == 0 else -b), j)
     return s
 }
 

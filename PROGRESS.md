@@ -457,6 +457,42 @@ the ball ignored, 77% would - so at kappa 0.9 an uncertain row's `beta lambda_ma
 outright, and a batch needs all 32 rows. Training is unchanged (no batch certified, so no budget changed; the 0.09
 point accuracy difference is the extra warm power iteration `Kappa` advances, which `Restrain` starts from).
 
+## The nudged pair certified in a block norm (wt-cert, 2026-11-17)
+
+`NudgedRate` now takes, row by row, the better of two certificates: the one above (`plainRate`, the certificate's own
+norm) and one in the block norm `|x|_t = max(|x_h|, |x_y| / t)` (`blockRate`; h the hidden units, y the readouts, each
+part in Bound's norm). A sweep's Jacobian `(1 - dt) + dt (W D + beta J_F)` has its blocks bounded by `M = [a b; c d]`:
+`a = sigma_hh s_h`, `b = sigma_hy s_y`, `c = sigma_hy s_h`, `d = sigma_yy s_y + beta f`, each sigma kappa over the
+largest slope (a block's norm is at most the whole's) or 0 where no connection joins those units, `s_y` the readouts'
+largest slope over the ball and `f` the force's Jacobian over it (`neuron.ForceOver`, between units at +beta, whole at
+-beta). In `|.|_t` the sweep contracts by `1 - dt (1 - kappa_t)`, `kappa_t = max(a + b t, c / t + d)`, least at M's
+Perron vector `(1, t)`. With no lateral blocks (MNIST's 784-128-10) the condition is `beta f < 1 - kappa^2 s_y / s_h`
+instead of `beta f < 1 - kappa`: saturated readouts leave the hidden-readout loop little gain. The ball argument is
+the plain one's in `|.|_t` (start residual at most `max(rest, (rest + beta |F|) / t)`, the y-ball's radius `r t`); t is
+taken from M at the previous radius and r grown by a quarter until the ball holds. A batch row is certified when either
+norm certifies it; the rate says nothing of which norm (the budget only reads q). Tests (`dyn/system.olang`): the old
+two pass unchanged, their contraction now measured per row in the norm its rate holds in; a new one on 36 layered
+systems (8 -> 32 <-> 10 classes, no lateral block, kappa 0.9, readout bias 1/2/4, beta 0.1/0.5/1, both norms): 13 of
+72 rows certified in the plain norm, 34 in the block norm, 21 by it alone, 38 by neither, and every certified row's
+step between consecutive states shrinks by at most its rate in its norm, both phases (largest measured ratio 0.88 q;
+the test fails if the readouts' slope over the ball is under-counted by 0.3x).
+
+Measured on MNIST (fetched into data/mnist here), `3 60000 128 32 1 0.001 0.5 1 1 0.1 200 1 0 plain spectral`, master
+against the branch alternated, 4 runs each, load 15-18 on 4 cores (logs/ in the worktree, not committed):
+
+| MNIST, spectral | rows certified (epochs 1 / 2 / 3) | nudged batches certified | us a lesson, epoch 3 | accuracy |
+|---|---|---|---|---|
+| master (plain only) | 22.6 / 37.1 / 43.8% | 0 | 1926 / 1934 / 2175 / 2037 | 97.07% |
+| block norm too | 35.2 / 53.1 / 60.2% | 0 | 2310 / 2218 / 2360 / 2365 | 97.07% |
+
+Reading: the block norm certifies 16 more points of the rows by epoch 3 (60% against 44%), still no batch of 32 (a
+batch needs every row), so no budget changed and training is identical. The bound costs about 10-15% a lesson here
+(two row loops of up to 100 growths each, measured under heavy load). The rows left are the uncertain ones: an
+unsaturated readout (`s_y` near 1) with a force of size `beta |onehot - p|` near 1 pushes the ball's radius past
+where the softmax bounds hold. What is left to try: a budget per row (rows certified given their rate, the rest the
+clamped budget - needs a per-row stop in dyn/settle), or a tighter `c` (the hidden slopes weighted by the readouts'
+weights, a per-row power iteration).
+
 ## The GPU route, GP1: bindings and a GEMM through cuBLAS (wt-gp1, 2026-11-17)
 
 docs/redesign.md 1.10 and 4.4's GP1. `kernels/gpu/cuda.c` (the C shim: device addresses and handles as U64, host arrays
@@ -851,10 +887,9 @@ What it says, first (GP5 measures it on MNIST, with `Check` 1, 4, 16 and hidden 
 - INT8 on the GPU: a one-pass kernel dequantizing GemmI8's I32 product (kern.olang) instead of the second, F32-summed
   product (GP3: 192 against 2466 us at 2048^3); then G-M5.
 - kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).
-- The nudged pair's certificate per batch: `NudgedRate` certifies confident rows only (44% at MNIST's epoch 3, no
-  batch of 32). Next levers: a block-weighted norm (readouts apart from hidden units: the hidden-readout coupling
-  carries the readouts' small saturated slopes, `beta w < 1 - kappa^2 rho'_y` instead of `1 - kappa`), or a budget
-  per row.
+- The nudged pair's certificate per batch: `NudgedRate` with the block norm certifies 60% of MNIST's rows at epoch 3
+  (44% before; above), no batch of 32. Next lever: a budget per row (a per-row stop in dyn/settle), or a tighter
+  hidden-to-readout block.
 - Compacting retired units (above, if it pays).
 - INT8: shallow products (the CNN's depth 9 and 144) and the per-lane `vpdpbusd`
   lowering (repro/vnnitile).
