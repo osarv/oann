@@ -58,11 +58,14 @@ type LearnError error {
     Unsupported(what String)
 }
 
-# what a lesson took: the sweeps of its free settle and of its nudged ones (side by side), and how each went
-type Taught struct(free settle.Settlement = settle.Settlement(), nudged settle.Settlement = settle.Settlement()) {
+# what a lesson took: the sweeps of its free settle and of its nudged ones (side by side), how each went, the rate the
+# nudged pair was certified at (System.NudgedRate; 1 where it was not) and the batch rows certified on their own
+type Taught struct(free settle.Settlement = settle.Settlement(), nudged settle.Settlement = settle.Settlement(), rate F64 = 1, rows I64 = 0) {
     Free settle.Settlement = free
     Nudged settle.Settlement = nudged
     Sweeps I64 = free.Sweeps + nudged.Sweeps
+    Rate F64 = rate
+    Rows I64 = rows
 }
 
 # a three-factor rule's trace: the rule (module, signal, clock) and where its trace is
@@ -180,23 +183,31 @@ fn (l mut Learner<T>&) custom(r mut any system.Update&) {
 
 # one lesson for the connections and biases of module m (the root: all): the free phase settled from its committed
 # state, the nudged phases from it side by side (+beta and, centered, -beta), and the contrast into ParamGrads. Refused
-# (NotSettled, the gradients left as they were) where a phase does not settle within the budget
+# (NotSettled, the gradients left as they were) where a phase does not settle within the budget - the nudged pair's
+# that of the rate System.NudgedRate certifies from the free state, where it certifies one
 fn (l mut Learner<T>&) Lesson(m system.Mod, beta F64, centered Bool = true) Taught ? LearnError {
     s := l.S
     tol := l.Tol if l.Tol > 0.0 else s.LessonTolerance(beta)
     free := s.Settle(settle.Phase.Free, l.budget(tol, 0.0))
     if not free.Converged: error LearnError.NotSettled("free", free.Sweeps, free.Residual)
-    nudged := s.Nudged(l.budget(tol, beta), beta, centered)
+    q, rows := s.NudgedRate(beta, free)
+    nudged := s.Nudged(l.nudgedBudget(tol, beta, q), beta, centered)
     if not nudged.Converged: error LearnError.NotSettled("nudged", nudged.Sweeps, nudged.Residual)
     l.Contrast(m, beta, centered)
     l.Lessons++
-    l.Last = Taught(free, nudged)
+    l.Last = Taught(free, nudged, q, rows)
     return l.Last
 }
 
 fn (l mut Learner<T>&) budget(tol F64, beta F64) settle.Budget {
     if l.Sweeps > 0: return settle.Budget(l.Sweeps, tol, 0.0, l.S.Scheme, l.S.Bound == system.Norm.Spectral)
     return l.S.BudgetFor(tol, beta)
+}
+
+# the nudged pair's budget: at its certified rate q (System.NudgedRate) where q < 1, else as budget
+fn (l mut Learner<T>&) nudgedBudget(tol F64, beta F64, q F64) settle.Budget {
+    if l.Sweeps > 0 or q >= 1.0: return l.budget(tol, beta)
+    return l.S.BudgetAt(tol, q)
 }
 
 # the contrast of the phases as last settled (plus against minus, or against the free phase uncentered) into ParamGrads

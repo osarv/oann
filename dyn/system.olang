@@ -617,6 +617,71 @@ fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
     return s.Kappa() + beta.Abs() * extra
 }
 
+# the certified rate of the nudged pair settled with beta from the free phase's committed state (free the settlement
+# that left it there, its residual measured in the norm of Bound): Rate(beta) with the readouts' force bounded over the
+# region the settle can reach instead of at its worst. Row by row: the start's residual (the step over dt) is at most
+# rest + beta |F(s0)|, rest the free settle's residual (the state it kept is the one it measured) and F(s0) the force
+# there (neuron.ForceSize). Where a sweep's Jacobian has norm at most q = 1 - dt (1 - kappa_beta) on the ball of radius
+# r about the start, and rest + beta |F(s0)| <= (1 - kappa_beta) r, the sweep maps the ball into itself (|G(u) - u0|
+# <= q r + dt (1 - kappa_beta) r = r), so the settle stays in it and shrinks the residual by q every sweep.
+# kappa_beta is kappa plus beta times the force's Jacobian within r of the start (neuron.ForceOver): its part between
+# units at +beta (the shortened step absorbs the diagonal), the whole at -beta. r is grown from the start's residual /
+# (1 - kappa) by a quarter until the ball holds; 1 where none does within 100 growths or kappa_beta reaches 1 (it only
+# grows with r), where the free phase is not certified, and for a spiking model or one without a slope bound. Gives
+# the rate and the rows it certifies on their own
+fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
+    k := s.Kappa()
+    if rateOf(s.E.Dt, k) >= 1.0 or not free.Converged or s.E.Spiking: return 1.0, 0
+    worst F64 = 0.0
+    rows := 0
+    for row in range s.E.Batch {
+        q := s.rowRate(row, k, beta.Abs(), free.Residual)
+        worst = worst.Max(q)
+        if q < 1.0: rows++
+    }
+    return worst, rows
+}
+
+# NudgedRate's rate of one batch row
+fn (s System<T>&) rowRate(row I64, k F64, b F64, rest F64) F64 {
+    euclid := s.Bound == Norm.Spectral
+    start := rest + b * s.forceSize(row, euclid)
+    r := start / (1.0 - k)
+    for _ in range 100 {
+        c, w := s.forceOver(row, r, euclid)
+        minus := k + b * w
+        if minus >= 1.0: return 1.0
+        if (1.0 - minus) * r >= start: return rateOf(s.E.Dt / (1.0 + b * s.E.ForceSlope()), k + b * c).Max(rateOf(s.E.Dt, minus))
+        r *= 1.25
+    }
+    return 1.0
+}
+
+# the size of the readouts' force in row of the free phase, per unit of beta, in the certificate's norm
+fn (s System<T>&) forceSize(row I64, euclid Bool) F64 {
+    total F64 = 0.0
+    for p in s.E.Pops {
+        role := p.Role
+        if role != neuron.Role.Readout: continue
+        size := neuron.ForceSize(role.cost, p.R0.S, row * p.Size, p.Size, p.Labels, row * settle.GroupsOf(role), p.Target, row * p.Size, euclid)
+        total = total + size if euclid else total.Max(size)
+    }
+    return total.Sqrt() if euclid else total
+}
+
+# the readouts' largest force Jacobian within r of row's free state, between units and whole (neuron.ForceOver)
+fn (s System<T>&) forceOver(row I64, r F64, euclid Bool) F64, F64 {
+    most, whole F64 = 0.0, 0.0
+    for p in s.E.Pops {
+        role := p.Role
+        if role != neuron.Role.Readout: continue
+        if p.Model != neuron.Neuron.Rate: return Inf, Inf
+        c, w := neuron.ForceOver(role.cost, p.Model.rho, p.R0.U, row * p.Size, p.Size, r, euclid)
+        most, whole = most.Max(c), whole.Max(w)
+    }
+    return most, whole
+}
+
 # the training tolerance (settling.md 1.4): phases solved to it add an error no larger than the contrast's O(beta^2)
 # bias - max(beta^3 (1 - kappa) / 10, 100 u), kappa held at most 0.9. The residual is tested in the certificate's own
 # norm (BudgetFor: unit by unit under Sup, each row's Euclidean norm under Spectral), so the distance bound
@@ -633,7 +698,12 @@ fn (s mut System<T>&) LessonTolerance(beta F64) F64 {
 # spiking system's 32 windows
 fn (s mut System<T>&) BudgetFor(tol F64, beta F64 = 0) settle.Budget {
     if s.E.Spiking: return settle.Budget(32 * s.E.Window, tol, 0.0, s.Scheme)
-    q := s.Rate(beta).Min(0.95)
+    return s.BudgetAt(tol, s.Rate(beta).Min(0.95))
+}
+
+# a budget for a settle to tol at the certified rate q: twice the sweeps q says a cold start needs, at least 128,
+# tested in the certificate's norm
+fn (s System<T>&) BudgetAt(tol F64, q F64) settle.Budget {
     return settle.Budget(I64((2.0 * tol.Log() / q.Log()).Ceil().Max(128.0)), tol, 0.0, s.Scheme, s.Bound == Norm.Spectral)
 }
 
@@ -1116,6 +1186,71 @@ test System.Rate "a nudged phase counts the cross-entropy force's coupling: kapp
         out := s.Nudged(s.BudgetFor(tol, 0.5), 0.5)
         assert out.Converged, "labels " + $k + ": " + $out.Sweeps + " sweeps, residual " + $out.Residual
     }
+}
+
+test System.NudgedRate "the nudged pair's rate bounded over the region it can reach certifies beta 0.5 for a confident readout, which the worst case does not, and every sweep shrinks the residual by at most that rate" {
+    for bound in [Norm.Spectral, Norm.Sup] {
+        s := System<F64>.confident(6, 3.0, 0.5, bound)
+        tol := s.LessonTolerance(0.5)
+        free := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
+        assert free.Converged
+        for k in range 4 {
+            for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((k + i) % 4)
+            q, rows := s.NudgedRate(0.5, free)
+            assert s.Rate(0.5) == 1.0 and q < 1.0 and rows == 2, $bound + " labels " + $k + ": rate " + $q
+            assertContracts(s, 0.5, q, s.BudgetAt(tol, q).Sweeps, tol)
+        }
+    }
+}
+
+test System.NudgedRate "soundness: over random systems, kappas, readout confidences, betas, labels and both norms, every settle the rate certifies shrinks its residual by at most that rate every sweep - the contraction measured between consecutive states - and the bound is no looser than needed to certify some and refuse others" {
+    certified, refused := 0, 0
+    tightest F64 = 0.0
+    for trial in range 96 {
+        bound := Norm.Spectral if trial % 2 == 0 else Norm.Sup
+        s := System<F64>.confident(U64(100 + trial), [0.0, 1.0, 2.0, 4.0][trial / 2 % 4], [0.2, 0.5, 0.8][trial / 8 % 3], bound)
+        beta := [0.1, 0.25, 0.5, 1.0][trial / 24]
+        tol := s.LessonTolerance(beta)
+        free := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
+        assert free.Converged
+        for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((trial * 7 + i * 3) % 4)
+        q, _ := s.NudgedRate(beta, free)
+        if q >= 1.0 {
+            refused++
+            continue
+        }
+        certified++
+        tightest = tightest.Max(assertContracts(s, beta, q, s.BudgetAt(tol, q).Sweeps, tol) / q)
+    }
+    assert certified >= 24 and refused >= 12, $certified + " certified, " + $refused + " refused"
+    assert tightest > 0.5, "the measured contraction at most " + $tightest + " of the certified rate"
+}
+
+# the nudged pair at beta settled sweep by sweep from the free state: each residual at most q times the last (the
+# sweep's contraction measured between consecutive states), and within tol before sweeps; gives the largest ratio seen
+fn assertContracts(s mut System<F64>&, beta F64, q F64, sweeps I64, tol F64) F64 {
+    one := settle.Budget(1, 0.0, 0.0, s.Scheme, s.Bound == Norm.Spectral)
+    last := s.Nudged(one, beta).Residual
+    worst F64 = 0.0
+    for n in range 1, sweeps {
+        now := s.E.Settle(1, 3, one, false).Residual
+        assert now <= q * last * (1.0 + 1e-9), "sweep " + $n + ": " + $now + " after " + $last + ", rate " + $q
+        if now <= tol.Max(1e-11): return worst
+        worst = worst.Max(now / last)
+        last = now
+    }
+    assert false, "not within " + $tol + " in " + $sweeps + " sweeps"
+    return worst
+}
+
+# wideClasses certified at kappa in the norm bound, its readout confident: unit 0's bias +b, the others' -b
+fn System<T>.confident(seed U64, b F64, kappa F64, bound Norm) System<T> {
+    s := System<T>.wideClasses(seed)
+    s.Bound = bound
+    s.Certify(kappa)
+    y := s.Bias(Pop(2))
+    for j in range 4: y.Set(T(b if j == 0 else -b), j)
+    return s
 }
 
 # wide's system with a cross-entropy readout (Classes: 4 classes, T = 0.25)
