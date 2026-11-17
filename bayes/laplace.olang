@@ -1,0 +1,388 @@
+# bayes/laplace - the Gaussian update of a Gaussian belief by observations of a linear (or any smooth) predictor:
+# the posterior's mode found by Newton's method on the joint parameters the observations touch (the iterated extended
+# Kalman filter: each step a Kalman update by the pseudo-observation the likelihood's quadratic expansion gives), and
+# its covariance by Laplace's approximation at the mode. Projecting the posterior back onto a Gaussian after every
+# event is assumed-density filtering: the sequential path of rating models (TrueSkill, Glicko-style filters), with
+# state.Drift moving the beliefs between events.
+#
+# Likelihoods (`Likelihood`, of a scalar predictor eta per observation):
+#   Normal(v)      y ~ N(eta, v)
+#   Logit          y in {0, 1}, P(y = 1) = sigmoid(eta)
+#   Probit         y in {0, 1}, P(y = 1) = Phi(eta)
+#   Binomial       y successes of `trials`, logit link
+#   Poisson        y counts, log link (an exposure is an offset)
+#   Ordered(cuts)  y in {0 ... K}, P(y <= k) = sigmoid(cuts[k] - eta), the cut points increasing
+#
+#     lik := laplace.Likelihood.Ordered(Array<F64>[-1.0, 1.0])
+#     try laplace.Update(g, laplace.Rows(a, offsets), lik, y, trials)   # g the prior on entry, the posterior after
+#     try laplace.UpdateDiag(b, idx, coef, 0.0, lik, y)                 # one event touching components idx of a Diag
+
+import "dense"
+import "gauss"
+import "quadrature"
+
+# ---- likelihoods ----
+
+# the likelihood families
+type Family enum {
+    Normal
+    Logit
+    Probit
+    Binomial
+    Poisson
+    Ordered
+}
+
+# a likelihood of a scalar predictor: its family and parameters (the normal's variance, the ordered model's cut points)
+type Likelihood struct(family Family, cuts I64 = 0) {
+    Kind Family = family
+    Var F64 = 1.0
+    Cuts Array<F64> = Array<F64>(cuts, 0.0)
+}
+
+# y ~ N(eta, v)
+fn Likelihood.Normal(v F64) Likelihood {
+    l := Likelihood(Family.Normal)
+    l.Var = v
+    return l
+}
+
+# the ordered logistic model with these increasing cut points: y in {0 ... cuts.Len()}
+fn Likelihood.Ordered(cuts Array<F64>&) Likelihood {
+    l := Likelihood(Family.Ordered, cuts.Len())
+    for i in range cuts.Len(): l.Cuts[i] = cuts[i]
+    return l
+}
+
+# a likelihood's log density at a predictor, and its first derivative and negated second derivative there (the
+# curvature, positive for every family here: each is log-concave in eta)
+type Local struct() {
+    LogP F64
+    Slope F64
+    Curv F64
+}
+
+# log p(y | eta) and its derivatives in eta; trials counts the binomial's trials, ignored by the others
+fn (l Likelihood&) At(eta F64, y F64, trials F64 = 1.0) Local {
+    out := Local()
+    match l.Kind {
+        case Family.Normal {
+            e := y - eta
+            out.LogP = -0.5 * (e * e / l.Var + l.Var.Log() + gauss.Log2Pi)
+            out.Slope = e / l.Var
+            out.Curv = 1.0 / l.Var
+        }
+        case Family.Logit: return Local.binomial(eta, y, 1.0)
+        case Family.Binomial {
+            out = Local.binomial(eta, y, trials)
+            out.LogP += LogChoose(trials, y)
+        }
+        case Family.Probit {
+            s := 2.0 * y - 1.0
+            r := gauss.Mills(s * eta)
+            out.LogP = gauss.LogNormalCdf(s * eta)
+            out.Slope = s * r
+            out.Curv = r * (s * eta + r)
+        }
+        case Family.Poisson {
+            rate := eta.Exp()
+            out.LogP = y * eta - rate - LogGamma(y + 1.0)
+            out.Slope = y - rate
+            out.Curv = rate
+        }
+        case Family.Ordered: return l.ordered(eta, I64(y))
+    }
+    return out
+}
+
+# successes y of trials at logit eta, without the binomial coefficient
+fn Local.binomial(eta F64, y F64, trials F64) Local {
+    q := Sigmoid(eta)
+    out := Local()
+    out.LogP = y * LogSigmoid(eta) + (trials - y) * LogSigmoid(-eta)
+    out.Slope = y - trials * q
+    out.Curv = trials * q * (1.0 - q)
+    return out
+}
+
+# category k of the ordered model: p = F_k - F_(k-1), F_j = sigmoid(c_j - eta), F_-1 = 0, F_K = 1
+fn (l Likelihood&) ordered(eta F64, k I64) Local {
+    hi := cut.edge(l.Cuts, k, eta)
+    lo := cut.edge(l.Cuts, k - 1, eta)
+    p := (hi.Value - lo.Value).Max(1e-300)
+    d1 := -(hi.Density - lo.Density) / p                              # p' / p
+    d2 := (hi.Density * (1.0 - 2.0 * hi.Value) - lo.Density * (1.0 - 2.0 * lo.Value)) / p    # p'' / p
+    out := Local()
+    out.LogP = p.Log()
+    out.Slope = d1
+    out.Curv = d1 * d1 - d2
+    return out
+}
+
+# F_j and its density f_j = F_j (1 - F_j) at the ordered model's cut j (0 and 1 past either end)
+type cut struct() {
+    Value F64
+    Density F64
+}
+
+fn cut.edge(cuts Array<F64>&, j I64, eta F64) cut {
+    out := cut()
+    if j < 0: return out
+    if j >= cuts.Len() {
+        out.Value = 1.0
+        return out
+    }
+    f := Sigmoid(cuts[j] - eta)
+    out.Value = f
+    out.Density = f * (1.0 - f)
+    return out
+}
+
+# the logistic function
+fn Sigmoid(z F64) F64 {
+    if z >= 0.0: return 1.0 / (1.0 + (-z).Exp())
+    e := z.Exp()
+    return e / (1.0 + e)
+}
+
+# log sigmoid(z), without overflow either way
+fn LogSigmoid(z F64) F64 {
+    if z >= 0.0: return -(-z).Exp().Log1p()
+    return z - z.Exp().Log1p()
+}
+
+# log Gamma(x) for x > 0: Lanczos' approximation (g = 7, nine terms), the reflection taken below 1/2
+fn LogGamma(x F64) F64 {
+    if x < 0.5: return (3.141592653589793 / (3.141592653589793 * x).Sin()).Log() - LogGamma(1.0 - x)
+    c := Array<F64>[0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7]
+    z := x - 1.0
+    a := c[0]
+    for i in range 1, 9: a += c[i] / (z + F64(i))
+    t := z + 7.5
+    return 0.5 * (2.0 * 3.141592653589793).Log() + (z + 0.5) * t.Log() - t + a.Log()
+}
+
+# log (n choose k)
+fn LogChoose(n F64, k F64) F64 { return LogGamma(n + 1.0) - LogGamma(k + 1.0) - LogGamma(n - k + 1.0) }
+
+# ---- predictors ----
+
+# what writes the observations' predictors and their gradients at a state z: eta[k] for observation k, jac[k * d + i]
+# its derivative by component i. A linear predictor is `Rows`; a bilinear or any smooth one is the caller's
+type Predictor trait {
+    Linearize(z Array<F64>&, eta mut Array<F64>&, jac mut Array<F64>&)
+}
+
+# the linear predictor eta = A z + offset: A n by d, row after row
+type Rows struct(a Array<F64>, offset Array<F64>) {
+    A Array<F64> = a
+    Offset Array<F64> = offset
+}
+
+fn (l Rows&) Linearize(z Array<F64>&, eta mut Array<F64>&, jac mut Array<F64>&) {
+    d := z.Len()
+    for k in range eta.Len() {
+        eta[k] = l.Offset[k]
+        for i in range d {
+            eta[k] += l.A[k * d + i] * z[i]
+            jac[k * d + i] = l.A[k * d + i]
+        }
+    }
+}
+
+# ---- the update ----
+
+# g moved from the prior to the Laplace approximation of the posterior after observations y (with trials, for the
+# binomial; an empty array is one trial each) of the predictor p under lik. Newton steps until no component moves by
+# more than tolerance, or iterations; a step that lowers the log posterior is halved until it does not. Gives the
+# steps taken.
+fn Update<P Predictor>(g mut gauss.Gaussian&, p P&, lik Likelihood&, y Array<F64>&, trials Array<F64>&, iterations I64 = 50, tolerance F64 = 1e-10) I64 ? dense.Error {
+    d := g.Dim()
+    n := y.Len()
+    w := Array<F64>[(trials[k] if trials.Len() > 0 else 1.0) for k in range n]
+    prior := try dense.Inverse(g.Cov, d)                 # for the log posterior a halved step is judged by
+    z := Array<F64>[m for m in g.Mean]
+    eta := Array<F64>(n, 0.0)
+    jac := Array<F64>(n * d, 0.0)
+    steps I64 = 0
+    for _ in range iterations {
+        p.Linearize(z, eta, jac)
+        before := logPosterior(g, prior, z, lik, eta, y, w)
+        next := try kalman(g, z, eta, jac, lik, y, w, false)
+        steps++
+        moved := damped(g, prior, p, lik, y, w, z, next, before)
+        if moved <= tolerance: break
+    }
+    p.Linearize(z, eta, jac)
+    try kalman(g, z, eta, jac, lik, y, w, true)
+    for i in range d: g.Mean[i] = z[i]
+    return steps
+}
+
+# z moved toward next, the step halved while it lowers the log posterior (at most 30 times); gives the largest move
+fn damped<P Predictor>(g gauss.Gaussian&, prior Array<F64>&, p P&, lik Likelihood&, y Array<F64>&, w Array<F64>&, z mut Array<F64>&, next Array<F64>&, before F64) F64 {
+    d := z.Len()
+    n := y.Len()
+    eta := Array<F64>(n, 0.0)
+    jac := Array<F64>(n * d, 0.0)
+    try1 := Array<F64>(d, 0.0)
+    f F64 = 1.0
+    for _ in range 30 {
+        for i in range d: try1[i] = z[i] + f * (next[i] - z[i])
+        p.Linearize(try1, eta, jac)
+        if logPosterior(g, prior, try1, lik, eta, y, w) >= before - 1e-12 * before.Abs(): break
+        f *= 0.5
+    }
+    moved F64 = 0.0
+    for i in range d {
+        moved = moved.Max((try1[i] - z[i]).Abs())
+        z[i] = try1[i]
+    }
+    return moved
+}
+
+# the log posterior at z, up to a constant: the observations' log likelihood less half the prior's quadratic form
+fn logPosterior(g gauss.Gaussian&, prior Array<F64>&, z Array<F64>&, lik Likelihood&, eta Array<F64>&, y Array<F64>&, w Array<F64>&) F64 {
+    d := z.Len()
+    s F64 = 0.0
+    for k in range y.Len(): s += lik.At(eta[k], y[k], w[k]).LogP
+    for i in range d {
+        for j in range d: s -= 0.5 * (z[i] - g.Mean[i]) * prior[i * d + j] * (z[j] - g.Mean[j])
+    }
+    return s
+}
+
+# one Kalman update of the prior g by the pseudo-observations linearized at z: the new mean, and when last, g's
+# covariance replaced by the posterior's
+fn kalman(g mut gauss.Gaussian&, z Array<F64>&, eta Array<F64>&, jac Array<F64>&, lik Likelihood&, y Array<F64>&, w Array<F64>&, last Bool) Array<F64> ? dense.Error {
+    d := g.Dim()
+    n := eta.Len()
+    pj := dense.MatMul(g.Cov, jac, d, d, n, tb = true)   # P J^T, d by n
+    s := dense.MatMul(jac, pj, n, d, n)                  # J P J^T + R
+    innov := Array<F64>(n, 0.0)                          # the pseudo-observation less J m: slope / curv + J (z - m)
+    for k in range n {
+        at := lik.At(eta[k], y[k], w[k])
+        c := at.Curv.Max(1e-12)
+        s[k * n + k] += 1.0 / c
+        innov[k] = at.Slope / c
+        for i in range d: innov[k] += jac[k * d + i] * (z[i] - g.Mean[i])
+    }
+    l := try dense.Cholesky(s, n)
+    a := dense.SolveCholesky(l, innov, n)
+    next := Array<F64>(d, 0.0)
+    for i in range d {
+        next[i] = g.Mean[i]
+        for k in range n: next[i] += pj[i * n + k] * a[k]
+    }
+    if last: g.Shrink(pj, l, n)
+    return next
+}
+
+# one event of a factorised belief: the predictor eta = sum coef[j] x[idx[j]] + offset observed as y under lik. The
+# components idx are joined into one Gaussian, updated together, and their marginals written back (their correlations
+# dropped: assumed-density filtering). Gives the event's log predictive density before the update, by `Predictive`
+fn UpdateDiag(b mut gauss.Diag&, idx Array<I64>&, coef Array<F64>&, offset F64, lik Likelihood&, y F64, trials F64 = 1.0) F64 ? dense.Error {
+    j := b.Marginal(idx)
+    m := j.Linear(coef)
+    score := Predictive(lik, m.Mean + offset, m.Var, y, trials)
+    try Update(j, Rows(coef, Array<F64>[offset]), lik, Array<F64>[y], Array<F64>[trials])
+    b.PutMarginals(idx, j)
+    return score
+}
+
+# the log predictive density of y when eta ~ N(mean, var): exact for the normal, else by 32-point Gauss-Hermite
+fn Predictive(lik Likelihood&, mean F64, var F64, y F64, trials F64 = 1.0) F64 {
+    if lik.Kind == Family.Normal: return Likelihood.Normal(lik.Var + var).At(mean, y).LogP
+    sd := var.Max(0.0).Sqrt()
+    r := predictiveRule
+    # log sum_k w_k p(y | mean + sd x_k), the largest term factored out
+    logs := Array<F64>[lik.At(mean + sd * r.Nodes[k], y, trials).LogP + r.Weights[k].Log() for k in range r.Len()]
+    top F64 = -1.0e300
+    for v in logs: top = top.Max(v)
+    s F64 = 0.0
+    for v in logs: s += (v - top).Exp()
+    return top + s.Log()
+}
+
+# the rule Predictive integrates by
+predictiveRule := quadrature.Rule.Hermite(32)
+
+# every family the tests check, with an observation each can take
+fn families() Array<Likelihood> {
+    return Array<Likelihood>[Likelihood.Normal(0.7), Likelihood(Family.Logit), Likelihood(Family.Probit), Likelihood(Family.Binomial), Likelihood(Family.Poisson), Likelihood.Ordered(Array<F64>[-1.0, 0.5, 2.0])]
+}
+
+test "likelihoods: derivatives and normalisation" {
+    h := 1e-5
+    for lik in families() {
+        for eta in Array<F64>[-2.3, -0.4, 0.0, 0.9, 2.5] {
+            for y in Array<F64>[0.0, 1.0] {
+                at := lik.At(eta, y, 3.0)
+                up := lik.At(eta + h, y, 3.0)
+                down := lik.At(eta - h, y, 3.0)
+                assert (at.Slope - (up.LogP - down.LogP) / (2.0 * h)).Abs() < 1e-6 * (1.0 + at.Slope.Abs())
+                assert (at.Curv - (2.0 * at.LogP - up.LogP - down.LogP) / (h * h)).Abs() < 1e-3 * (1.0 + at.Curv.Abs())
+                assert at.Curv > 0.0
+            }
+        }
+    }
+    # the discrete families sum to one over their outcomes
+    total := fn(lik Likelihood, ys I64, trials F64): return [lik.At(0.7, F64(y), trials).LogP.Exp() for y in range ys].Sum()
+    assert (total(Likelihood(Family.Logit), 2, 1.0) - 1.0).Abs() < 1e-12
+    assert (total(Likelihood(Family.Probit), 2, 1.0) - 1.0).Abs() < 1e-12
+    assert (total(Likelihood(Family.Binomial), 6, 5.0) - 1.0).Abs() < 1e-12
+    assert (total(Likelihood(Family.Poisson), 60, 1.0) - 1.0).Abs() < 1e-12
+    assert (total(Likelihood.Ordered(Array<F64>[-1.0, 0.5, 2.0]), 4, 1.0) - 1.0).Abs() < 1e-12
+    assert (LogGamma(5.0) - 24.0.Log()).Abs() < 1e-12 and (LogGamma(0.5) - 3.141592653589793.Sqrt().Log()).Abs() < 1e-12
+}
+
+test "the normal likelihood is conjugate: one step is the exact posterior" {
+    g := gauss.Gaussian.Of(Array<F64>[0.5, -0.2], Array<F64>[1.0, 0.3, 0.3, 2.0])
+    exact := gauss.Gaussian.Of(g.Mean, g.Cov)
+    a := Array<F64>[1.0, 2.0, -1.0, 0.5, 0.3, 0.3]
+    y := Array<F64>[1.2, -0.4, 0.8]
+    off := Array<F64>[0.1, 0.0, -0.2]
+    try Update(g, Rows(a, off), Likelihood.Normal(0.4), y, Array<F64>(0))
+    try exact.Observe(a, Array<F64>[y[k] - off[k] for k in range 3], dense.Identity(3, 0.4), jitter = 0.0)
+    for i in range 2: assert (g.Mean[i] - exact.Mean[i]).Abs() < 1e-12
+    for i in range 4: assert (g.Cov[i] - exact.Cov[i]).Abs() < 1e-12
+}
+
+test "every family: the mode and the curvature of the Laplace approximation" {
+    a := Array<F64>[1.0, -1.0, 0.5, 1.0, 1.0, 0.0]
+    off := Array<F64>[0.0, 0.2, -0.1]
+    for lik in families() {
+        g := gauss.Gaussian.Of(Array<F64>[0.3, -0.1], Array<F64>[0.8, 0.2, 0.2, 0.5])
+        prior := try dense.Inverse(g.Cov, 2)
+        m0 := Array<F64>[0.3, -0.1]
+        y := Array<F64>[1.0, 0.0, 2.0] if lik.Kind != Family.Logit and lik.Kind != Family.Probit else Array<F64>[1.0, 0.0, 1.0]
+        trials := Array<F64>[3.0, 3.0, 3.0]
+        try Update(g, Rows(a, off), lik, y, trials)
+        # the gradient of the log posterior is zero at the mode, its negated Hessian the posterior's precision
+        grad := Array<F64>[-(prior[i * 2] * (g.Mean[0] - m0[0]) + prior[i * 2 + 1] * (g.Mean[1] - m0[1])) for i in range 2]
+        prec := Array<F64>[p for p in prior]
+        for k in range 3 {
+            eta := a[k * 2] * g.Mean[0] + a[k * 2 + 1] * g.Mean[1] + off[k]
+            at := lik.At(eta, y[k], trials[k])
+            for i in range 2 {
+                grad[i] += at.Slope * a[k * 2 + i]
+                for j in range 2: prec[i * 2 + j] += at.Curv * a[k * 2 + i] * a[k * 2 + j]
+            }
+        }
+        post := try dense.Inverse(g.Cov, 2)
+        for i in range 2: assert grad[i].Abs() < 1e-8
+        for i in range 4: assert (post[i] - prec[i]).Abs() < 1e-8
+    }
+}
+
+test "one event of a factorised belief, and the predictive density" {
+    # two players' skills, the first won a probit comparison (TrueSkill's shape): the winner up, the loser down, both
+    # less uncertain, and the predictive probability Phi((m0 - m1) / sqrt(1 + v0 + v1))
+    b := gauss.Diag.Isotropic(3, 1.0)
+    b.Mean[2] = 0.5
+    lp := try UpdateDiag(b, Array<I64>[0, 2], Array<F64>[1.0, -1.0], 0.0, Likelihood(Family.Probit), 1.0)
+    assert (lp - gauss.NormalCdf(-0.5 / 3.0.Sqrt()).Log()).Abs() < 1e-10
+    assert b.Mean[0] > 0.0 and b.Mean[2] < 0.5 and b.Var[0] < 1.0 and b.Var[2] < 1.0 and b.Var[1] == 1.0
+    # the logit predictive at no variance is the likelihood itself
+    assert (Predictive(Likelihood(Family.Logit), 0.4, 0.0, 1.0) - LogSigmoid(0.4)).Abs() < 1e-12
+}

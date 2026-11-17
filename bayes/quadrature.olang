@@ -1,0 +1,206 @@
+# bayes/quadrature - expectations of nonlinear functions under a Gaussian. Gauss-Hermite rules: E[f(Z)], Z ~ N(0, 1),
+# as the weighted sum of f at n nodes, exact for polynomials of degree up to 2n - 1; over d dimensions the tensor
+# product of a rule (n^d nodes) taken through the covariance's Cholesky factor. The unscented transform is the cheap
+# alternative: 2d + 1 sigma points, exact for quadratics.
+#
+#     r := quadrature.Rule.Hermite(10)
+#     e := r.Expect(m, v, fn(x): return x.Exp())                   # E[exp X], X ~ N(m, v)
+#     e2 := try quadrature.Expect(g, r, fn(x): return x[0] * x[1]) # under a gauss.Gaussian, n^d nodes
+#     u := try quadrature.Unscented(g, fn(x): return x[0] * x[1])  # 2d + 1 nodes
+
+import "dense"
+import "gauss"
+
+# a rule's nodes and weights, for the standard normal; the weights sum to 1
+type Rule struct(n I64) {
+    Nodes Array<F64> = Array<F64>(n, 0.0)
+    Weights Array<F64> = Array<F64>(n, 0.0)
+}
+
+# how many nodes the rule has
+fn (r Rule&) Len() I64 { return r.Nodes.Len() }
+
+# the n-point Gauss-Hermite rule for N(0, 1): the roots of the Hermite polynomial H_n found by Newton's method from the
+# usual asymptotic guesses, then scaled from the weight exp(-x^2) to the normal density
+fn Rule.Hermite(n I64) Rule {
+    r := Rule(n)
+    x := Array<F64>(n, 0.0)
+    w := Array<F64>(n, 0.0)
+    for i in range (n + 1) / 2 {
+        z := guess(x, n, i)
+        h := poly.Of(n, z)
+        for _ in range 100 {
+            step := h.Value / h.Slope
+            z -= step
+            h = poly.Of(n, z)
+            if step.Abs() <= 1e-15 * z.Abs().Max(1.0): break
+        }
+        x[i] = z
+        x[n - 1 - i] = -z
+        w[i] = 2.0 / (h.Slope * h.Slope)
+        w[n - 1 - i] = w[i]
+    }
+    sqrtPi := 3.141592653589793.Sqrt()
+    for k in range n {
+        r.Nodes[k] = x[n - 1 - k] * 2.0.Sqrt()
+        r.Weights[k] = w[n - 1 - k] / sqrtPi
+    }
+    return r
+}
+
+# E[f(X)], X ~ N(mean, var)
+fn (r Rule&) Expect(mean F64, var F64, f fn&(x F64) F64) F64 {
+    sd := var.Max(0.0).Sqrt()
+    s F64 = 0.0
+    for k in range r.Len(): s += r.Weights[k] * f(mean + sd * r.Nodes[k])
+    return s
+}
+
+# the starting point for root i (largest first) of H_n, from the roots found before it
+fn guess(x Array<F64>&, n I64, i I64) F64 {
+    nf := F64(n)
+    if i == 0: return (2.0 * nf + 1.0).Sqrt() - 1.85575 * (2.0 * nf + 1.0).Pow(-0.16667)
+    if i == 1: return x[0] - 1.14 * nf.Pow(0.426) / x[0]
+    if i == 2: return 1.86 * x[1] - 0.86 * x[0]
+    if i == 3: return 1.91 * x[2] - 0.91 * x[1]
+    return 2.0 * x[i - 1] - x[i - 2]
+}
+
+# the orthonormal Hermite polynomial of degree n at z and its derivative
+type poly struct() {
+    Value F64
+    Slope F64
+}
+
+# H_n at z by the three-term recurrence, normalised so that the weights come out as 2 / slope^2
+fn poly.Of(n I64, z F64) poly {
+    p1 := 0.7511255444649425        # pi^(-1/4)
+    p2 F64 = 0.0
+    for j in range 1, n + 1 {
+        p3 := p2
+        p2 = p1
+        p1 = z * (2.0 / F64(j)).Sqrt() * p2 - (F64(j - 1) / F64(j)).Sqrt() * p3
+    }
+    out := poly()
+    out.Value = p1
+    out.Slope = (2.0 * F64(n)).Sqrt() * p2
+    return out
+}
+
+# one node of a rule over a pair: where it is and its weight
+type Point struct() {
+    X F64
+    Y F64
+    Weight F64
+}
+
+# the product rule's n^2 nodes for (X, Y) jointly normal with means mx, my, variances vx, vy and covariance cxy
+fn Pairs(r Rule&, mx F64, my F64, vx F64, vy F64, cxy F64) Vec<Point> {
+    out := Vec<Point>()
+    a := vx.Max(0.0).Sqrt()
+    b F64 = cxy / a if a > 0.0 else 0.0
+    c := (vy - b * b).Max(0.0).Sqrt()
+    for i in range r.Len() {
+        for j in range r.Len() {
+            p := Point()
+            p.X = mx + a * r.Nodes[i]
+            p.Y = my + b * r.Nodes[i] + c * r.Nodes[j]
+            p.Weight = r.Weights[i] * r.Weights[j]
+            out.Push(p)
+        }
+    }
+    return out
+}
+
+# E[f(X)], X ~ g, by the tensor product of r over g's d dimensions: r.Len()^d evaluations, x = mean + L u for each
+# grid point u, L g's Cholesky factor
+fn Expect(g gauss.Gaussian&, r Rule&, f fn&(x Array<F64>&) F64) F64 ? dense.Error {
+    d := g.Dim()
+    n := r.Len()
+    l := try g.Factor()
+    at := Array<I64>(d, 0)                   # the grid point, an odometer over the nodes
+    u := Array<F64>(d, 0.0)
+    s F64 = 0.0
+    total I64 = 1
+    for _ in range d: total *= n
+    for _ in range total {
+        w F64 = 1.0
+        for i in range d {
+            u[i] = r.Nodes[at[i]]
+            w *= r.Weights[at[i]]
+        }
+        x := dense.LowerTimes(l, u, d)
+        for i in range d: x[i] += g.Mean[i]
+        s += w * f(x)
+        advance(at, n)
+    }
+    return s
+}
+
+# the odometer moved on by one
+fn advance(at mut Array<I64>&, n I64) {
+    for i in range at.Len() {
+        at[i]++
+        if at[i] < n: return
+        at[i] = 0
+    }
+}
+
+# E[f(X)], X ~ g, by the unscented transform: the 2d + 1 sigma points mean and mean +- sqrt(d + kappa) L e_i, weights
+# kappa / (d + kappa) and 1 / (2 (d + kappa)) - exact for polynomials of degree 3, kappa = 3 - d matching the fourth
+# moment of a 1-d normal (Julier and Uhlmann); d + kappa must be positive
+fn Unscented(g gauss.Gaussian&, f fn&(x Array<F64>&) F64, kappa F64 = 0.5) F64 ? dense.Error {
+    d := g.Dim()
+    l := try g.Factor()
+    span := F64(d) + kappa
+    c := span.Sqrt()
+    s := kappa / span * f(g.Mean)
+    x := Array<F64>(d, 0.0)
+    for j in range d {
+        for sign in Array<F64>[1.0, -1.0] {
+            for i in range d: x[i] = g.Mean[i] + sign * c * l[i * d + j]
+            s += f(x) / (2.0 * span)
+        }
+    }
+    return s
+}
+
+test "moments of the normal" {
+    for n in Array<I64>[1, 2, 5, 10, 20, 32] {
+        r := Rule.Hermite(n)
+        m0 F64 = 0.0
+        m2 F64 = 0.0
+        m4 F64 = 0.0
+        for k in range n {
+            m0 += r.Weights[k]
+            m2 += r.Weights[k] * r.Nodes[k] * r.Nodes[k]
+            m4 += r.Weights[k] * r.Nodes[k].Pow(4.0)
+        }
+        assert (m0 - 1.0).Abs() < 1e-12
+        if n >= 2: assert (m2 - 1.0).Abs() < 1e-12
+        if n >= 3: assert (m4 - 3.0).Abs() < 1e-10
+    }
+    r := Rule.Hermite(8)
+    cov F64 = 0.0
+    for p in Pairs(r, 1.0, 2.0, 4.0, 1.0, 1.5).View(): cov += p.Weight * (p.X - 1.0) * (p.Y - 2.0)
+    assert (cov - 1.5).Abs() < 1e-12
+    # E[exp X] = exp(m + v / 2)
+    assert (Rule.Hermite(20).Expect(0.3, 0.5, fn(x): return x.Exp()) - (0.3 + 0.25).Exp()).Abs() < 1e-12
+}
+
+test "products and sigma points under a correlated Gaussian" {
+    g := gauss.Gaussian.Of(Array<F64>[1.0, -1.0, 0.5], Array<F64>[2.0, 0.6, 0.1, 0.6, 1.0, -0.3, 0.1, -0.3, 0.5])
+    r := Rule.Hermite(6)
+    # E[x0 x1] = c01 + m0 m1; E[exp(x0 + x2)] = exp(m + v / 2) of the sum
+    e := try Expect(g, r, fn(x): return x[0] * x[1])
+    assert (e - (0.6 - 1.0)).Abs() < 1e-12
+    v := 2.0 + 0.5 + 2.0 * 0.1
+    ex := try Expect(g, Rule.Hermite(16), fn(x): return (x[0] + x[2]).Exp())
+    assert (ex - (1.5 + v / 2.0).Exp()).Abs() < 1e-9 * ex
+    # the unscented transform: exact for quadratics, close for a smooth nonlinearity
+    u := try Unscented(g, fn(x): return x[0] * x[1] + x[2] * x[2])
+    assert (u - (0.6 - 1.0 + 0.5 + 0.25)).Abs() < 1e-12
+    us := try Unscented(g, fn(x): return (0.3 * x[1]).Sin())
+    qs := try Expect(g, Rule.Hermite(16), fn(x): return (0.3 * x[1]).Sin())
+    assert (us - qs).Abs() < 1e-3
+}
