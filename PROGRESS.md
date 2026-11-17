@@ -768,10 +768,83 @@ What it says:
 - **Attention's two products** on the GPU are 8-90x the CPU's one thread even computing the full squares the CPU's
   triangles skip; BF16 halves F32's time from T = 256.
 
+## The GPU route, GP4: the settle on the GPU (wt-gp4, 2026-11-17)
+
+docs/redesign.md 1.10 and 4.4's GP4. `kernels/device.olang` (the backend, chosen once: `Backend`, `SetDefault`,
+`GpuAvailable`, `DeviceError`; the program's device), `dyn/mirror.olang` (a planned system's regions on the device, the
+settle, EP's contrast and AdamW's step there), `kernels/gpu/src/settle.cu` (the fused step with the constant, the carries
+and the readout's nudge; the stop; the rows' Euclidean residual; closed forms, constants, EP's differences and bias
+sums), elem.cu's `oann_adamw` and `kern.AdamW`, the shim's pinned staging (its own block in `cuda.c`), `System.Plan`'s
+and `Graph.Plan`'s `on`, `learn.AdamW`, `dyn/gpu_test.olang`'s GP4 tests, `make gpusettle` (`bench/gpusettle.olang`).
+
+- **The backend, chosen once.** A script writes
+  `device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backend.Cpu)` (module `kernels/device`,
+  imported with or without the define) and every plan after it takes that backend unless its `on` says otherwise; the
+  device is the module's global, opened by the first GPU plan. `Graph.Plan` on the GPU is refused, saying so (GP6). The
+  makefile passes `-define Gpu=true` wherever `/usr/include/cuda_runtime_api.h` exists (`GPU=0` leaves it out), so `make
+  test` here builds every module with the GPU and still runs only the CPU's tests: **362 passed, 0 failed**.
+- **A sweep is 4 launches** for 784-128-10 (GP2's G-M3 sweep was 7): per relaxing population one cuBLAS product a carry
+  over all the settle's rows and one fused step that adds the constant (no copy), the carries and the nudge itself; the
+  words are zeroed once a settle. The host enqueues `Check` sweeps (4) and reads the previous batch's words after an
+  event into pinned memory, so it never waits for a sweep it has not passed; the step of the sweep after a converged one
+  records it in the stop word and writes nothing, nor does any after it, so the state kept is relax's.
+- **Tests** (`make gputest`, **34 passed**; GP4's 8 in `dyn/gpu_test.olang`): 784-128-10 lessons (free settle, nudged
+  pair, contrast) CPU against GPU from the same parameters and state, batch 32 (6 lessons) and 128 (4), `Check` 4, 1
+  and 16, F32: the same sweeps every settle, the same certified rate and rows, the fixed points at most 9e-7 apart
+  (asserted within tol / 50, tol 1.25e-3: a sweep past the converged one would move them by about tol), EP's estimate at
+  most 4.5e-8 apart; F64 the same, 1.1e-15 apart. Dense, Symmetric and LowRank (lateral and folded) connections,
+  retired units, a Euclidean budget, F32 and F64: the same sweeps, the states within the tolerance. EP's contrast on the
+  same states: 3e-8 from the CPU's (largest 0.07). AdamW on the GPU is nn/optim's **bit for bit** (and `learn.AdamW` on the
+  CPU too), F32 and F64, with decay, the rate changed between steps. Refused at `Plan` by name: spiking populations,
+  Csr, Tiles, Events links, Anderson, Gauss-Seidel. The default backend: `SetDefault(Gpu)` makes `Plan`'s default the
+  GPU, an explicit `on` still decides. Allocation: pinned while compiling - `System<F32>.Settle` and `Nudged` (now
+  through the GPU path too), the mirror's settle, contrast, AdamW step, Reset and Warm, `learn.AdamW.Step`,
+  `Learner.Contrast` - and the address space unchanged (VmPeak) over 300 GPU lessons with AdamW's steps.
+- **dyn/system's flaky growth check** ("a lesson allocates nothing", the resident set over 400 settles) failed on every
+  run here, base included (70 pages), while the GP3 agent's builds shared RAM: transparent huge pages are `always`.
+  It now measures VmPeak, as olang's growth checks do: 0 KB over the 400 settles, asserted 0.
+- **olang**: a function returning a reference to a module's global (`return opened!`, the device) called from
+  `System<T>.Plan` gave `error[O10c]: the callee needs one argument's scope to outlive another's` at every builder that
+  plans a system it returns (`System<T>.tight`, `.mixed`) - for a callee with no arguments. Small programs of the same
+  shape (generic receiver, global under `if Gpu`, unique type with a destructor, try/catch converting the error) compile;
+  not reduced to a repro. Worked around: `device.Open()` fills the public global `device.Opened`, read by `Plan`.
+  And by design (S8a): in a build without the define a `GpuAvailable()` returning the literal `false` made a script's
+  `if device.GpuAvailable()` a branch the build decided, refused as dead code; it returns a global never set instead,
+  so the script line compiles in both builds (checked: a program with the line and an `if` on it, built both ways).
+
+**First timings** (`make gpusettle OLANG=olang ARGS="5 10 20 4"`, 2026-11-17, commit of this section; Ryzen 5 7600 under
+WSL2, load average 1.3-1.6, RTX 4060). The 784-128-10 system of mnist_learn on MNIST-like batches drawn in the bench
+(sparse pixels, random classes - not MNIST, so its settles are short: 4-5 sweeps cold, 8 a lesson); a cold free settle
+(Reset, Settle to the lesson tolerance 1.25e-3) and a lesson (EP's free and nudged settles and contrast, AdamW's step),
+the median of 5 interleaved rounds of 10 settles and 20 lessons each, after an untimed round; the GPU's include every
+transfer. Two runs agreed within 5%.
+
+| batch | backend | us a cold settle | sweeps | us a lesson | sweeps a lesson | settle / GPU | lesson / GPU |
+|---|---|---|---|---|---|---|---|
+| 32 | CPU 1 thread | 125 | 4.4 | 351 | 8.4 | 0.23 | 0.30 |
+| 32 | CPU 4 threads | 449 | 4.4 | 668 | 8.4 | 0.81 | 0.57 |
+| 32 | GPU | 552 | 4.4 | 1168 | 8.4 | 1 | 1 |
+| 128 | CPU 1 thread | 410 | 4.7 | 1146 | 7.9 | 0.80 | 1.04 |
+| 128 | CPU 4 threads | 644 | 4.7 | 1347 | 7.9 | 1.26 | 1.23 |
+| 128 | GPU | 510 | 4.7 | 1099 | 7.9 | 1 | 1 |
+| 512 | CPU 1 thread | 1498 | 4.0 | 4513 | 7.9 | 2.21 | 3.31 |
+| 512 | CPU 4 threads | 1424 | 4.0 | 3969 | 7.9 | 2.11 | 2.91 |
+| 512 | GPU | 676 | 4.0 | 1362 | 7.9 | 1 | 1 |
+
+What it says, first (GP5 measures it on MNIST, with `Check` 1, 4, 16 and hidden 1024):
+- **The GPU's settle is flat in the batch** (510-680 us from 32 to 512 rows) and the CPU's linear: the CPU wins at 32
+  (one thread 4.4x faster), they meet at 128, and at 512 the GPU is 2.1-2.3x faster a settle and 2.9-3.4x a lesson.
+- **At these sweep counts the GPU's time is its fixed cost**, not its sweeps: 4-5 sweeps of 4 launches (6 us each, G-M3)
+  are about 120 us of a 550 us settle; the rest is the batch's staged upload, the closed form and the constant's
+  product, the readbacks (at least two event waits a settle) and the commit. A lesson adds the nudged settle, the host's
+  certificate (the coupling and the readout's state down, `Kappa`, `NudgedRate`) and the contrast. MNIST's longer settles
+  will weigh the sweeps more; CUDA graphs or fewer readbacks are GP7's if G-M2 says so.
+- kernels/gemm's four threads are again slower than one below batch 512 (G-M1's finding).
+
 ## Next
 
-- The open work of docs/redesign.md: the GPU route (question 1) - GP1, GP2 and GP3 are done (above); GP4 (the settle
-  on the GPU) next. G-M3 says a sweep's launches are its time: GP4 should enqueue as few as it can.
+- The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP4 are done (above); GP5 (G-M2, the verdict
+  on MNIST: where the settle runs, from which batch; `Check`) next, then GP6 (`ad` on the GPU).
 - INT8 on the GPU: a one-pass kernel dequantizing GemmI8's I32 product (kern.olang) instead of the second, F32-summed
   product (GP3: 192 against 2466 us at 2048^3); then G-M5.
 - kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).
