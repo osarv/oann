@@ -482,7 +482,9 @@ gpugemm` (G-M1, `bench/gpugemm.olang`).
 - **cuBLAS rounds split-K partial sums to BF16 by default**: a BF16 product at depth 257 was 3% off the exact sum (0.0613
   against 0.0597; the CPU 0.0596). The handle is made with `CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION` (and the
   default math, so never TF32). Its price is in the table: BF16 128 x 784 x 128 takes 70 us against F32's 15 (no
-  split-K left for a 128 x 128 result); from batch 512 BF16 is 1.5-3.2x F32 again.
+  split-K left for a 128 x 128 result); from batch 512 BF16 is 1.5-3.2x F32 again. *Corrected by GP3*: the 70 us was
+  the bench timing one product and its Sync (its calibration counted cuBLAS's first, kernel-choosing call); warmed,
+  it is 8.6 us (GP3's section).
 - **This machine** (WSL2): the `nvidia-cuda-dev` package pulled in a native driver's `libcuda.so.1`
   (libnvidia-compute-580) that shadows WSL's in the loader's cache, and CUDA then sees no device. `make gputest` and
   `make gpugemm` put `/usr/lib/wsl/lib` first on `LD_LIBRARY_PATH` where it exists (harmless once the system is fixed);
@@ -639,10 +641,139 @@ What it says:
   GPU-side 6 us a node on WSL2 is to be measured there; on this machine 37.6 us a sweep is the GPU's floor at batch
   128 until then, against the CPU's sweep in G-M2 (GP5).
 
+## The GPU route, GP3: products through cuBLASLt (wt-gp3, 2026-11-17)
+
+docs/redesign.md 1.10 and 4.4's GP3. `kernels/gpu/blas.olang` (`Product<SC, SA, SB>` with `Plan`, `PlanBatch`, `Run`,
+`RunBatch`, `Tune`; `Epilogue<S>`, `Sums`, `Choice`; `ProductI8` with `Plan`, `Run`, `RunI32`, `Tune`), `DBatch<S>`
+(`Heads`, `Stacked`, `At`) and the `Lt`/`Work` accessors in `device.olang`, the shim's cuBLASLt block in `cuda.c`
+(plans, runs, tuning, widening by `cublasLtMatrixTransform`, `cublasSdgmm`, stream capture), `make gpult` (G-M1 on
+cuBLASLt, INT8 and attention, `bench/gpult.olang`).
+
+- **Plans.** A `Product` is cuBLASLt's matmul descriptor, three layouts and the algorithm its heuristic offered first,
+  all made at `Plan` from views at the addresses they will run on: the plan keeps the alignment the addresses share
+  (up to 256 bytes) and tells the heuristic, and a run on an address less aligned is refused into the status record
+  (the next `Sync`'s `GpuError.Cublas(15, "cublasLtMatmul: an address less aligned than its plan's ...")`), never run.
+  `Tune` times every algorithm offered on the plan's views (events, 20 products each) and keeps the fastest; `Tried`
+  keeps what it measured. Run is two C calls; `assert not Product<F32, F32, F32>.Run.Allocates` (and RunBatch's,
+  ProductI8.Run's) holds while compiling, and on the device two plans' runs captured into a CUDA graph (thread-local
+  capture mode: an allocation would fail it) replay to the same bits. The workspace is the Device's 32 MiB, shared with
+  the cuBLAS handle.
+- **Sums, a plan-time choice.** `Exact` (the default): `CUBLASLT_REDUCTION_SCHEME_NONE`, so no split-K, every element
+  one F32 sum rounded once, and a product run twice is the same bit for bit (tested). `Fast`: any reduction allowed,
+  for BF16 the parts possibly added in BF16. `FastBF16`/`FastTF32` for F32 storage: `CUBLAS_COMPUTE_32F_FAST_16BF`/
+  `_TF32`. Each has a stated bound in the tests (Exact eps(F32) k max|a||b| + C's rounding; Fast adds SplitK roundings
+  of C's type; FastBF16 adds eps(BF16), FastTF32 2^-9 per unit of k max|a||b|), checked with the fast plans tuned.
+- **Epilogues**: `Bias` and `BiasAct` with Relu and GeluTanh are cuBLASLt's `BIAS`, `RELU(_BIAS)`, `GELU(_BIAS)`;
+  cuBLASLt's GELU is the tanh form (5e-6 from it on [-4, 4], 5e-4 from the exact one), so `Gelu`, `Silu`, `Sigmoid`,
+  `Tanh` and `Softplus` are refused at `Plan` naming the act (`GpuError.Cuda(0, "no GPU form of the epilogue's ...")`).
+  The bias is stored in C's type (cuBLASLt takes no other), and for a BF16 C the sum is rounded to BF16 before the bias
+  is added (found: 5 units off where the bias cancels the sum; the test's bound says so).
+- **Per-operand storage**: cuBLASLt multiplies BF16 x BF16 and F16 x F16 into their own type or F32, and no mixed
+  pair (F32 x BF16, BF16 x F16: no algorithm, FP8 aside). A mixed plan widens the narrower operand into a buffer of its
+  own by `cublasLtMatrixTransform` (BF16 and F16 to F32, exact) each run, then multiplies in F32 - tested against
+  `kernels/gemm.Gemm<F32, F32, BF16, F32>` and the other pairs. Its cost is a second launch (below): weights that do not
+  change between runs are better kept widened, or the activations narrowed to BF16 (`Product<F32, BF16, BF16>`).
+- **GemmBatch** (`PlanBatch`/`RunBatch` over `DBatch`): one call over every matrix where each operand's two strides fold
+  into one (attention's stacked scores), else one call per member or group with the other as cuBLASLt's batch
+  (attention's `Heads`, whose two strides do not fold). cuBLASLt has no triangular product - its `FILL_MODE` is
+  accepted and then no algorithm is offered for LOWER or UPPER - so a causal product is the full one: the scores'
+  upper triangle is computed and the softmax that reads them masks it, and P V multiplies P's zeros. That mask is
+  GP2/GP6's softmax kernel's, not a kernel of its own. Tested on attention's shapes (16 x 64, width 128, 4 heads; 2 x
+  33, 96, 3; 3 x 17, 40, 1; 1 x 128, 256, 8) in F32 and BF16 against `GemmBatch` (Full for the scores, `Left(0)` for P
+  V with P causal), run twice identical.
+- **INT8** (`ProductI8`): c = a b^T by cuBLASLt's integer tensor cores (`CUBLAS_COMPUTE_32I`, I8 x I8 -> I32), exact
+  (equal to the integer sums in the test). out = scale[j] c needs I32 -> F32, and cuBLAS has no such conversion:
+  `cublasLtMatrixTransform` refuses every integer type (status 15), and the per-row alpha vector exists only for I8
+  results. So out is a second product summed in F32 (`COMPUTE_32F` over I8, which runs without tensor cores) and a
+  `cublasSdgmm`. Tested against `kernels/gemm.GemmI8` (U8 activations, zero point 128) within a quantization step:
+  |out_gpu - out_cpu| <= s sw[j] sum_p |q[j, p]|, at 1 to 2048 rows, depths 12 to 2048 (multiples of 4). A one-pass
+  dequantization kernel (now possible with GP2's kern.olang) replaces the second product.
+- **GP1's BF16 number was a measurement artifact**, not cuBLAS: bench/gpugemm calibrated its repetitions on the shape's
+  first product, which includes cuBLAS choosing its kernel (over 20 ms), so a round was one product with its `Sync`'s
+  round trip. Warmed first (fixed), cuBLAS's own BF16 128 x 784 x 128 with `DISALLOW_REDUCED_PRECISION_REDUCTION` takes
+  8.6 us against F32's 16.6 (`make gpugemm OLANG=olang ARGS="5 1 4"`, rerun): GP1's `Gemm` stays as it is.
+
+**G-M1 on cuBLASLt** (`make gpult OLANG=olang ARGS=5`, 2026-11-17, commit of this section; the machine as GP1's table,
+load average 1.1-3.0). us a product, every operand resident, the median of 5 interleaved rounds of about 20 ms each
+after an untimed one. CPU: kernels/gemm, one thread, F32. cuBLAS: GP1's `Gemm`. The rest are `Product`s: F32 and BF16
+Exact by the heuristic's algorithm and tuned; BF16 fast (`Sums.Fast`, tuned); BF16>F32 (BF16 operands, C in F32, Exact,
+tuned); F32 via BF16 and TF32 (`FastBF16`, `FastTF32`, tuned); F32 x BF16 W (BF16 weights widened each run, tuned).
+
+| shape | m x k x n | CPU | cuBLAS F32 | cuBLAS BF16 | F32 | F32 tuned | BF16 | BF16 tuned | BF16 fast | BF16>F32 | F32 via BF16 | F32 via TF32 | F32 x BF16 W |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| MLP fwd 1 / settle x->h | 128 x 784 x 128 | 251 | 14.5 | 8.6 | 14.9 | 14.9 | 8.7 | 8.6 | 8.6 | 8.7 | 9.7 | 12.8 | 19.3 |
+| MLP fwd 2 / settle h->y | 128 x 128 x 10 | 7.3 | 6.6 | 5.7 | 6.7 | 6.7 | 5.7 | 5.6 | 5.8 | 5.8 | 6.7 | 6.6 | 13.0 |
+| MLP bwd dh / settle y->h | 128 x 10 x 128 | 6.0 | 6.1 | 5.5 | 6.2 | 6.1 | 5.5 | 5.5 | 5.5 | 5.4 | 6.1 | 6.1 | 11.5 |
+| MLP dW2 / EP outer y h | 10 x 128 x 128 | 6.8 | 6.8 | 6.2 | 6.7 | 6.8 | 6.2 | 6.2 | 6.3 | 6.4 | 6.9 | 6.7 | 13.2 |
+| MLP dW1 / EP outer h x | 128 x 128 x 784 | 228 | 9.6 | 8.4 | 9.6 | 9.8 | 8.4 | 7.5 | 7.5 | 7.8 | 9.7 | 8.8 | 17.3 |
+| fwd 1, batch 32 | 32 x 784 x 128 | 83 | 12.9 | 11.4 | 14.8 | 14.7 | 14.8 | 9.0 | 11.3 | 9.1 | 9.1 | 12.4 | 19.1 |
+| fwd 1, batch 512 | 512 x 784 x 128 | 959 | 26.7 | 15.3 | 28.3 | 28.1 | 15.5 | 9.2 | 9.1 | 9.4 | 15.6 | 18.2 | 33.3 |
+| fwd 1, batch 4096 | 4096 x 784 x 128 | 7636 | 122 | 58.8 | 151 | 116 | 54.5 | 46.6 | 47.0 | 48.7 | 52.9 | 87.7 | 118 |
+| hidden 1024, batch 128 | 128 x 784 x 1024 | 1795 | 36.4 | 15.3 | 46.8 | 48.0 | 15.2 | 14.9 | 14.9 | 15.0 | 21.8 | 25.3 | 58.7 |
+| square 512 | 512^3 | 2116 | 38.6 | 20.5 | 47.8 | 51.0 | 20.5 | 17.4 | 17.2 | 17.8 | 20.3 | 28.9 | 52.0 |
+| square 1024 | 1024^3 | 18452 | 263 | 102 | 289 | 274 | 94.0 | 88.8 | 85.8 | 85.9 | 103 | 175 | 293 |
+| square 2048 | 2048^3 | 156210 | 1965 | 670 | 2013 | 2128 | 689 | 625 | 597 | 595 | 693 | 1311 | 1973 |
+
+The error of each way against the exact product (F64, kernels/gemm) of the numbers it was given - operands uniform in
+[-1, 1), F32 for the F32 ways, rounded to BF16 for the BF16 ways: max|err| / max|exact|, then max|err| / (k eps(BF16)
+max|a| max|b|), eps(BF16) = 2^-7. Rows: 128 x 784 x 128, 512 x 784 x 128, 2048^3 (the bench prints all twelve; the
+others are alike):
+
+| way | 128 x 784 x 128 | 512 x 784 x 128 | 2048^3 |
+|---|---|---|---|
+| F32 (Exact; tuned alike; cuBLAS within 2x) | 3.7e-7 / 2.5e-6 | 4.0e-7 / 2.4e-6 | 1.9e-6 / 9.7e-6 |
+| BF16 (Exact, tuned, Fast, cuBLAS's: all alike) | 2.8e-3 / 1.9e-2 | 3.3e-3 / 2.0e-2 | 3.0e-3 / 1.5e-2 |
+| BF16>F32 | 1.5e-6 / 1.0e-5 | 1.1e-6 / 6.5e-6 | 3.5e-6 / 1.8e-5 |
+| F32 via BF16 | 1.8e-3 / 1.2e-2 | 2.3e-3 / 1.4e-2 | 2.1e-3 / 1.1e-2 |
+| F32 via TF32 | 2.6e-4 / 1.7e-3 | 2.9e-4 / 1.7e-3 | 2.6e-4 / 1.3e-3 |
+| F32 x BF16 W | 3.6e-7 / 2.4e-6 | 4.0e-7 / 2.4e-6 | 2.0e-6 / 1.0e-5 |
+
+INT8 and attention (same run; us, resident):
+
+| GemmI8 m x k x n | CPU GemmI8 (1 thread) | GPU c only (I32) | GPU c and out (F32) | GPU BF16 tuned |
+|---|---|---|---|---|
+| 1 x 784 x 128 | 3.1 | 5.8 | 17.8 | 5.7 |
+| 32 x 784 x 128 | 33.5 | 6.5 | 22.6 | 9.5 |
+| 128 x 784 x 128 | 75.4 | 7.3 | 23.9 | 9.5 |
+| 512 x 784 x 128 | 264 | 10.6 | 40.6 | 8.9 |
+| 1 x 768 x 3072 | 65.4 | 7.9 | 20.9 | 9.4 |
+| 64 x 768 x 3072 | 1121 | 8.7 | 60.9 | 15.2 |
+| 2048^3 | 37986 | 192 | 2466 | 586 |
+
+| attention, B x T, width, heads | CPU F32 causal (1 thread, triangles) | GPU F32 (full) | GPU BF16 (full) |
+|---|---|---|---|
+| 16 x 64, 128, 4 (the character transformer) | 463 | 58.3 | 44.6 |
+| 8 x 256, 512, 8 | 7445 | 279 | 131 |
+| 4 x 1024, 768, 12 | 89930 | 2125 | 996 |
+
+What it says:
+- **BF16 is faster than F32 at every shape, at full accuracy.** Exact BF16 (F32 sums, no split-K, no BF16-rounded
+  partial sums) tuned against F32 tuned: 1.7x at 128 x 784 x 128 (8.6 against 14.9 us), 1.6x at batch 32, 3.1x at
+  batch 512, 2.5x at batch 4096, 3.2x at hidden 1024, 2.9x at 512^3, 3.1x at 1024^3, 3.4x at 2048^3; the 10-wide
+  products are launch-bound (5.5-6.2 against 6.1-6.8 us) and still a little ahead. Its only error beyond F32's is C's
+  rounding to BF16 (2-3e-3 relative, half a unit of BF16); with C in F32 (BF16>F32) it is as fast and 1e-6 off.
+- **Fast buys nothing here**: tuned, it is the exact plan's time within noise at every shape (2048^3: 597 against 625,
+  the same algorithm, no split-K, chosen by both), and at batch 32 Tune's pick (split-K 12) ran slower in the table
+  than the exact plan (11.3 against 9.0). cuBLASLt's split-K helps only where the output is small and k long, which
+  these shapes are not. Recommendation: **`Sums.Exact` stays the default**; GP6 can confirm training is unaffected.
+- **Tuning pays where the heuristic guesses wrong**: BF16 at batch 512, 15.5 -> 9.2 us; F32 at batch 4096, 151 -> 116.
+  A plan should be tuned once where its operands exist.
+- **F32 through BF16 tensor cores is a worse BF16**: as slow as BF16 storage or slower and as inaccurate (the operands'
+  rounding, 2e-3). Through TF32: 1.2-1.9x F32's speed at 2.6e-4. Neither is worth a default.
+- **BF16 weights under F32 activations** cost a widening launch each run (+5-6 us, and a pass over the weights): slower
+  than F32. Better: keep such weights widened (they are constant in inference) or narrow the activations (BF16>F32).
+- **INT8's I32 product is the fastest product here** (2048^3: 192 us, 3x BF16, 10x F32), but its F32 out, without a
+  conversion in cuBLAS, costs a second product that runs without tensor cores (2466 us). G-M5 waits for a one-pass
+  dequantization kernel on GP2's kern.olang.
+- **Attention's two products** on the GPU are 8-90x the CPU's one thread even computing the full squares the CPU's
+  triangles skip; BF16 halves F32's time from T = 256.
+
 ## Next
 
-- The open work of docs/redesign.md: the GPU route (question 1) - GP1 and GP2 are done (above); GP3 (cuBLASLt) and
-  GP4 (the settle on the GPU) next. G-M3 says a sweep's launches are its time: GP4 should enqueue as few as it can.
+- The open work of docs/redesign.md: the GPU route (question 1) - GP1, GP2 and GP3 are done (above); GP4 (the settle
+  on the GPU) next. G-M3 says a sweep's launches are its time: GP4 should enqueue as few as it can.
+- INT8 on the GPU: a one-pass kernel dequantizing GemmI8's I32 product (kern.olang) instead of the second, F32-summed
+  product (GP3: 192 against 2466 us at 2048^3); then G-M5.
 - kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).
 - The nudged pair's certificate per batch: `NudgedRate` certifies confident rows only (44% at MNIST's epoch 3, no
   batch of 32). Next levers: a block-weighted norm (readouts apart from hidden units: the hidden-readout coupling

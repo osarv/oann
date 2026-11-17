@@ -1085,6 +1085,23 @@ against `neuron.RateStep` lives there. G-M3 (PROGRESS.md): on this machine a lau
 GPU whatever it does, so a sweep of the 784-128-10 settle at batch 128 is its launches (7 fused, 37.6 us; 11 unfused,
 54.6 us) and fusion and CUDA graphs are worth GP7.
 
+**As built (GP3, 2026-11-17).** The products planned at `Plan` are `blas.Product<SC, SA, SB>` (`Product.Plan(dev, c,
+a, ta, b, tb, epi, sums)`, `PlanBatch` over `DBatch`, `Run`, `RunBatch`, `Tune`) and `ProductI8` (`Plan`, `Run`,
+`RunI32`, `Tune`) - the sketch's `Gemm`/`GemmBatch`/`GemmI8` as a plan and its run; GP1's `Gemm` (cublasGemmEx) stays as
+the unplanned form. A plan is made from the views it will run on, takes the alignment their addresses share, and a run
+less aligned is refused into the status record; alpha and beta are F64. Precision is a plan-time `Sums`: `Exact`
+(REDUCTION_SCHEME_NONE, the default, chosen by G-M1 on cuBLASLt: exact BF16 is 1.6-3.4x F32 at every shape over 1 MFLOP
+and `Fast`'s split-K never beat it), `Fast` (any reduction, BF16 parts possibly added in BF16), `FastBF16`/`FastTF32`
+for F32 storage. `Epilogue<S>` holds the bias as a device view in C's type (cuBLASLt's only bias type; a BF16 C is
+rounded before the bias is added); Relu and GeluTanh are cuBLASLt's, the other acts are refused at `Plan` for an element
+kernel. Mixed storage: cuBLASLt multiplies no mixed pair, so the narrower operand is widened by
+`cublasLtMatrixTransform` into the plan's buffer each run. cuBLASLt has no triangular product (FILL_MODE LOWER/UPPER
+gets no algorithm), so attention's causal products are full and the softmax kernel masks (GP6). INT8: c by
+`CUBLAS_COMPUTE_32I` exactly; cuBLAS converts no I32 matrix to F32 (MatrixTransform refuses integers, the alpha vector
+is for I8 results), so out is a second, F32-summed product and `cublasSdgmm` - 13x the I32 product at 2048^3, to be
+replaced by a one-pass kernel on kern.olang. `DBatch` is in device.olang with `Heads`/`Stacked` as gemm's `Batch`.
+GP1's BF16 at 73 us was the bench's calibration (fixed): cuBLAS's BF16 is 8.6 us warm.
+
 The packages are section 4.4.
 
 ## 2. Module map
