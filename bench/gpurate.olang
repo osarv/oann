@@ -1,0 +1,353 @@
+# G-M3 (docs/redesign.md 1.10): the settle's rate step on the GPU fused (kernels/gpu/kern's Rate, one launch) against
+# the same step in three launches (rate.cu's residual, move and act), and a whole sweep of the 784-128-10 settle on the
+# GPU as GP4 will enqueue it - the residual word zeroed, then for each relaxing population (hidden 128 tanh, readout 10
+# tanh) its constant copied into its totals (one copy a phase), its carry by cuBLAS with beta 1 over all its rows, and
+# its rate step - to count the launches a sweep makes and the share of the sweep they take.
+#
+# What is timed, the median of the rounds, each round after an untimed one (the GPU's clocks fall while idle), each
+# two ways: back to back (events around reps of it, enqueued as fast as the host goes - the GPU may wait for the host)
+# and queued ahead (the same enqueued behind 19 ms of other GPU work, the Blocker, so every launch is in the queue
+# before the first runs and the events time the GPU alone); and the host's time to enqueue one:
+#   - the step alone, fused and unfused, at the settle's sizes and large ones;
+#   - each launch group of a sweep alone, whole sweeps, and the floor - as many launches of a kernel doing almost
+#     nothing (an Axpy of one element) - so the launches' share of the sweep is the floor over the sweep;
+#   - a sweep that also reads its residual word back and waits (the host waiting every sweep, Check = 1).
+#
+# F32, batch 128: the free phase (128 rows) and EP's two nudged phases side by side (256 rows). Also the compile: NVRTC
+# on a text never seen (first in the process and after), and the cache's read.
+#
+# Built with -define Gpu=true only. From the repository's root: make gpurate ARGS="rounds" (7)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/gpu/device"
+import "../kernels/gpu/blas"
+import "../kernels/gpu/kern"
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn us(x F64) String { return $x.Fixed(2) }
+
+# a population as the settle holds it on the device: its rows' state (u, s), the next buffer's (u2, s2), totals,
+# its constant (one row a batch row), the dt of each phase
+type Pop unique struct(dev mut device.Device&, size I64, batch I64, phases I64) {
+    Size I64 = size
+    Rows I64 = batch * phases
+    Batch I64 = batch
+    Phases I64 = phases
+    U device.Buf<F32> = device.Buf<F32>.Make(dev, Rows * size)!
+    S device.Buf<F32> = device.Buf<F32>.Make(dev, Rows * size)!
+    Un device.Buf<F32> = device.Buf<F32>.Make(dev, Rows * size)!
+    Sn device.Buf<F32> = device.Buf<F32>.Make(dev, Rows * size)!
+    Total device.Buf<F32> = device.Buf<F32>.Make(dev, Rows * size)!
+    R device.Buf<F32> = device.Buf<F32>.Make(dev, Rows * size)!
+    Const device.Buf<F32> = device.Buf<F32>.Make(dev, batch * size)!
+    Dts device.Buf<F32> = device.Buf<F32>.Make(dev, phases)!
+}
+
+fn fill(b mut device.Buf<F32>&, lo F64, hi F64, r mut rand.Rand&) {
+    x := Array<F32>(b.N)
+    for i in range b.N: x[i] = F32(r.Uniform(lo, hi))
+    b.UploadAll(x)
+}
+
+fn (p mut Pop&) init(r mut rand.Rand&) {
+    fill(p.U, -1.0, 1.0, r)
+    fill(p.S, -1.0, 1.0, r)
+    fill(p.Total, -1.0, 1.0, r)
+    fill(p.Const, -1.0, 1.0, r)
+    fill(p.Dts, 0.4, 0.5, r)
+}
+
+# the kernels: the fused step, its three unfused parts, and a launch that does nothing (a failure ends the bench)
+type Kernels unique struct(dev mut device.Device&) {
+    Text String = kern.RateSource(kern.Rho.Tanh, F32(0))
+    Fused kern.Rate<F32> = kern.Rate<F32>.Make(dev, kern.Rho.Tanh)!
+    Residual kern.Kernel = kern.Kernel.Compile(dev, Text, "oann_rate_residual")!
+    Move kern.Kernel = kern.Kernel.Compile(dev, Text, "oann_rate_move")!
+    Act kern.Kernel = kern.Kernel.Compile(dev, Text, "oann_rate_act")!
+    Empty kern.Kernel = kern.Kernel.Axpy(dev, F32(0))!
+}
+
+# p's rate step, fused or in three launches, into the word at out
+fn step(d mut device.Device&, k Kernels&, p mut Pop&, fused Bool, out U64) {
+    n := p.Rows * p.Size
+    per := p.Batch * p.Size
+    if fused {
+        k.Fused.Step(d, p.U, p.Total, p.Un, p.Sn, 0, n, p.Dts.Addr(0), per, null, p.Size, out)
+        return
+    }
+    g := kern.Blocks(n)
+    b := kern.Block
+    m := kern.Arg(U32(n))
+    sz := kern.Arg(U32(p.Size))
+    kern.Launch(d, k.Residual, g, b, p.U.Addr(0), p.Total.Addr(0), p.R.Addr(0), 0, sz, m, out)
+    kern.Launch(d, k.Move, g, b, p.U.Addr(0), p.R.Addr(0), p.Un.Addr(0), p.Dts.Addr(0), kern.Arg(U32(per)), 0, sz, m)
+    kern.Launch(d, k.Act, g, b, p.Un.Addr(0), p.Sn.Addr(0), m)
+}
+
+# the settle of 784-128-10 at a batch: the hidden and readout populations, the weights between them (10 x 128, the
+# readout's rows), the residual words
+type Sweep unique struct(dev mut device.Device&, batch I64, phases I64, r mut rand.Rand&) {
+    H Pop = Pop(dev, 128, batch, phases)
+    Y Pop = Pop(dev, 10, batch, phases)
+    W device.Buf<F32> = device.Buf<F32>.Make(dev, 10 * 128)!
+    Word device.Buf<U32> = device.Buf<U32>.Make(dev, 1)!
+    H.init(r)
+    Y.init(r)
+    fill(W, -0.1, 0.1, r)
+}
+
+# the launch groups of a sweep, in order: 0 the word zeroed; 1 the hidden totals' constant; 2 its carry from the
+# readout (rows x 10 x 128); 3 its step; 4 the readout's constant; 5 its carry from the hidden (rows x 128 x 10); 6 its step
+Groups I64 = 7
+
+fn groupName(g I64) String {
+    return Array<String>["zero the residual word", "hidden: constant into totals", "hidden: carry (cuBLAS, rows x 10 x 128)", "hidden: rate step", "readout: constant into totals", "readout: carry (cuBLAS, rows x 128 x 10)", "readout: rate step"][g]
+}
+
+# the launches group g makes
+fn (s Sweep&) launches(g I64, fused Bool) I64 {
+    return match g {
+        case 0: 1
+        case 1, 4: s.H.Phases
+        case 2, 5: 1
+        case _: 1 if fused else 3
+    }
+}
+
+fn copyConst(d mut device.Device&, p mut Pop&) {
+    for ph in range p.Phases: kern.Copy(d, p.Total.Addr(ph * p.Batch * p.Size), p.Const.Addr(0), p.Batch * p.Size * 4)
+}
+
+fn (s mut Sweep&) group(d mut device.Device&, k Kernels&, g I64, fused Bool) {
+    match g {
+        case 0 { kern.Zero(d, s.Word.Addr(0), 4) }
+        case 1 { copyConst(d, s.H) }
+        case 2 {
+            c := device.DMat<F32>(s.H.Total, 0, s.H.Rows, 128, 128)
+            blas.Gemm(d, c, device.DMat<F32>(s.Y.S, 0, s.Y.Rows, 10, 10), false, device.DMat<F32>(s.W, 0, 10, 128, 128), false, F32(1), F32(1))
+        }
+        case 3 { step(d, k, s.H, fused, s.Word.Addr(0)) }
+        case 4 { copyConst(d, s.Y) }
+        case 5 {
+            c := device.DMat<F32>(s.Y.Total, 0, s.Y.Rows, 10, 10)
+            blas.Gemm(d, c, device.DMat<F32>(s.H.S, 0, s.H.Rows, 128, 128), false, device.DMat<F32>(s.W, 0, 10, 128, 128), true, F32(1), F32(1))
+        }
+        case _ { step(d, k, s.Y, fused, s.Word.Addr(0)) }
+    }
+}
+
+fn (s mut Sweep&) sweep(d mut device.Device&, k Kernels&, fused Bool) {
+    for g in range Groups: s.group(d, k, g, fused)
+}
+
+# a long piece of work put on the stream before a measure "queued ahead": the measure's launches are then all enqueued
+# while the GPU is still busy with it, so they run back to back on the GPU with no wait for the host between them, and
+# the events time the GPU's own work (the host's enqueueing hidden). Axpys over 2^25 elements (128 MiB a buffer)
+type Blocker unique struct(dev mut device.Device&) {
+    X device.Buf<F32> = device.Buf<F32>.Make(dev, 1 << 25)!
+    Y device.Buf<F32> = device.Buf<F32>.Make(dev, 1 << 25)!
+    Ms F64 = 0
+}
+
+# the axpys a blocker enqueues
+BlockerAxpys I64 = 12
+
+fn (b mut Blocker&) hold(d mut device.Device&, k Kernels&) {
+    for _ in range BlockerAxpys: kern.Axpy(d, k.Empty, b.Y, 0, F32(0.5), b.X, 0, 1 << 25)
+}
+
+# the most launches a measure queued ahead enqueues: their enqueueing (about 5 us each here) must end while the blocker runs
+QueuedLaunches I64 = 600
+
+# the GPU time the blocker takes, and the most host time a queued measure may take to stay behind it
+fn (b mut Blocker&) measure(d mut device.Device&, k Kernels&, t kern.Timer&) ? device.GpuError {
+    b.hold(d, k)
+    t.Start(d)
+    b.hold(d, k)
+    t.Stop(d)
+    b.Ms = try t.Ms()
+    try d.Sync()
+}
+
+# a measure's GPU microseconds and the host's to enqueue, a rep
+type Time struct(Dev F64, Host F64) { Dev, Host }
+
+# what is timed: group g of the sweep (g < Groups), the whole sweep (Groups), the sweep reading its word back and
+# waiting each time (Groups + 1), n launches of the empty kernel (Groups + 2 + n)
+fn (s mut Sweep&) time(d mut device.Device&, k Kernels&, t kern.Timer&, what I64, fused Bool, reps I64, b mut Blocker&, queued Bool) Time ? device.GpuError {
+    w := Array<U32>(1)
+    if queued: b.hold(d, k)
+    t.Start(d)
+    t0 := time.Now()
+    for _ in range reps {
+        if what < Groups {
+            s.group(d, k, what, fused)
+        } else if what == Groups {
+            s.sweep(d, k, fused)
+        } else if what == Groups + 1 {
+            s.sweep(d, k, fused)
+            s.Word.DownloadAll(w)
+            try d.Sync()
+        } else {
+            for _ in range what - Groups - 2: kern.Axpy(d, k.Empty, s.W, 0, F32(0), s.W, 0, 1)
+        }
+    }
+    host := F64(time.Since(t0)) * 1e-3 / F64(reps)
+    t.Stop(d)
+    ms := try t.Ms()
+    try d.Sync()
+    assert not queued or host * F64(reps) < 0.8e3 * b.Ms, "a queued measure's enqueueing outlasted the blocker"
+    return Time(ms * 1e3 / F64(reps), host)
+}
+
+# the step alone on a population of size units, rows rows: GPU us and host us a step
+fn (p mut Pop&) stepTime(d mut device.Device&, k Kernels&, t kern.Timer&, word device.Buf<U32>&, fused Bool, reps I64, b mut Blocker&, queued Bool) Time ? device.GpuError {
+    if queued: b.hold(d, k)
+    t.Start(d)
+    t0 := time.Now()
+    for _ in range reps: step(d, k, p, fused, word.Addr(0))
+    host := F64(time.Since(t0)) * 1e-3 / F64(reps)
+    t.Stop(d)
+    ms := try t.Ms()
+    try d.Sync()
+    assert not queued or host * F64(reps) < 0.8e3 * b.Ms, "a queued measure's enqueueing outlasted the blocker"
+    return Time(ms * 1e3 / F64(reps), host)
+}
+
+# the medians of rounds of f's times, each round after an untimed one
+type Med struct(rounds I64) {
+    gpu mut Array<F64>& = Array<F64>(rounds)
+    host mut Array<F64>& = Array<F64>(rounds)
+}
+
+fn (m mut Med&) put(i I64, t Time) {
+    m.gpu[i] = t.Dev
+    m.host[i] = t.Host
+}
+
+fn (m mut Med&) Dev() F64 { return median(m.gpu) }
+fn (m mut Med&) Host() F64 { return median(m.host) }
+
+# queued ahead / back to back / the host's
+fn cell(q mut Med&, a mut Med&) String { return us(q.Dev()) + " / " + us(a.Dev()) + " / " + us(a.Host()) }
+
+fn steps(d mut device.Device&, k Kernels&, t kern.Timer&, b mut Blocker&, rounds I64) ? io.Error, device.GpuError {
+    try io.Put("\n== the rate step alone (Tanh, F32), us a step: the GPU's queued ahead | the GPU's back to back | the host's to enqueue\n")
+    try io.Put("population | elements | fused, 1 launch | unfused, 3 launches | unfused / fused, queued ahead\n")
+    r := rand.Rand(2)
+    word := try device.Buf<U32>.Make(d, 1)
+    sizes := Array<I64>[10, 128, 10, 128, 128, 1024, 1024, 4096]
+    rows := Array<I64>[128, 128, 256, 256, 512, 512, 4096, 8192]
+    for c in range sizes.Len() {
+        p := Pop(d, sizes[c], rows[c], 1)
+        p.init(r)
+        n := p.Rows * p.Size
+        reps I64 = (1 << 22) / n.Max(1)
+        reps = reps.Clamp(20, 5000)
+        rq := reps.Min(QueuedLaunches / 3)
+        meds := Vec<Med>()
+        for _ in range 4: meds.Push(Med(rounds))
+        for i in range rounds {
+            for j in range 4 {
+                fused := j % 2 == 0
+                queued := j >= 2
+                try p.stepTime(d, k, t, word, fused, rq if queued else reps, b, queued)
+                meds[j].put(i, try p.stepTime(d, k, t, word, fused, rq if queued else reps, b, queued))
+            }
+        }
+        try io.Put($p.Size + " x " + $p.Rows + " rows | " + $n + " | " + cell(meds[2], meds[0]) + " | " + cell(meds[3], meds[1]) + " | " + $(meds[3].Dev() / meds[2].Dev()).Fixed(2) + "\n")
+    }
+}
+
+fn sweeps(d mut device.Device&, k Kernels&, t kern.Timer&, b mut Blocker&, rounds I64, batch I64, phases I64) ? io.Error, device.GpuError {
+    r := rand.Rand(3)
+    s := Sweep(d, batch, phases, r)
+    reps I64 = 2000
+    for fused in Array<Bool>[true, false] {
+        try io.Put("\n== a sweep of the 784-128-10 settle, batch " + $batch + ", " + $phases + " phase" + ("s" if phases > 1 else "") + " (" + $(batch * phases) + " rows), the rate step " + ("fused" if fused else "unfused") + "\n")
+        try io.Put("launch group | launches | GPU us queued ahead | GPU us back to back | host us to enqueue\n")
+        total I64 = 0
+        for g in range Groups: total += s.launches(g, fused)
+        # back to back: the groups, the sweep, the sweep waited for, the empty launches; then the same queued ahead
+        meds := Vec<Med>()
+        for _ in range 2 * (Groups + 3): meds.Push(Med(rounds))
+        for i in range rounds {
+            for q in range 2 {
+                queued := q == 1
+                for g in range Groups + 3 {
+                    if queued and g == Groups + 1: continue
+                    what := Groups + 2 + total if g == Groups + 2 else g
+                    per := total if g >= Groups else s.launches(g, fused)
+                    rr := (QueuedLaunches / per).Max(1) if queued else reps
+                    try s.time(d, k, t, what, fused, rr, b, queued)
+                    meds[q * (Groups + 3) + g].put(i, try s.time(d, k, t, what, fused, rr, b, queued))
+                }
+            }
+        }
+        q0 := Groups + 3
+        sum F64 = 0
+        sumq F64 = 0
+        for g in range Groups {
+            sum += meds[g].Dev()
+            sumq += meds[q0 + g].Dev()
+            try io.Put(groupName(g) + " | " + $s.launches(g, fused) + " | " + us(meds[q0 + g].Dev()) + " | " + us(meds[g].Dev()) + " | " + us(meds[g].Host()) + "\n")
+        }
+        sw := meds[Groups].Dev()
+        swq := meds[q0 + Groups].Dev()
+        try io.Put("the groups' sum | " + $total + " | " + us(sumq) + " | " + us(sum) + " |\n")
+        try io.Put("a sweep, sweeps one after another | " + $total + " | " + us(swq) + " | " + us(sw) + " | " + us(meds[Groups].Host()) + "\n")
+        try io.Put("a sweep with its word read back and waited for | " + $(total + 1) + " | | " + us(meds[Groups + 1].Dev()) + " | " + us(meds[Groups + 1].Host()) + " (wall)\n")
+        try io.Put($total + " launches of a kernel doing nothing | " + $total + " | " + us(meds[q0 + Groups + 2].Dev()) + " | " + us(meds[Groups + 2].Dev()) + " | " + us(meds[Groups + 2].Host()) + "\n")
+        try io.Put("the floor, as many launches doing nothing, is " + $(100.0 * meds[Groups + 2].Dev() / sw).Fixed(0) + "% of a sweep back to back (" + $(100.0 * meds[q0 + Groups + 2].Dev() / swq).Fixed(0) + "% queued ahead); the rate steps are " + $(100.0 * (meds[3].Dev() + meds[6].Dev()) / sum).Fixed(0) + "% of the groups' sum back to back (" + $(100.0 * (meds[q0 + 3].Dev() + meds[q0 + 6].Dev()) / sumq).Fixed(0) + "% queued ahead)\n")
+    }
+}
+
+# NVRTC's compile time: a text never compiled, the first in this process (NVRTC's own start included) and a second;
+# then the same text from the cache (its PTX read and loaded)
+fn compiles(d mut device.Device&) ? io.Error, device.GpuError {
+    try io.Put("== compiling the rate step (Tanh, F32) at a plan\n")
+    base := kern.RateSource(kern.Rho.Tanh, F32(0))
+    for i in range 2 {
+        text := base + "// gpurate " + $time.Wall() + " " + $i + "\n"
+        t0 := time.Now()
+        k := try kern.Kernel.Compile(d, text, "oann_rate_step")
+        ms1 := F64(time.Since(t0)) * 1e-6
+        t1 := time.Now()
+        k2 := try kern.Kernel.Compile(d, text, "oann_rate_step")
+        ms2 := F64(time.Since(t1)) * 1e-6
+        assert not k.Cached and k2.Cached
+        try io.Put(("first" if i == 0 else "second") + " text in the process: NVRTC and load " + $ms1.Fixed(1) + " ms; from the cache " + $ms2.Fixed(2) + " ms\n")
+        try os.Remove(k.Path) catch os.Error { }
+    }
+}
+
+fn run(d mut device.Device&, rounds I64) ? io.Error, device.GpuError {
+    try compiles(d)
+    t := try kern.Timer.Make(d)
+    k := Kernels(d)
+    b := Blocker(d)
+    try b.measure(d, k, t)
+    try io.Put("the blocker before a measure queued ahead: " + $b.Ms.Fixed(1) + " ms of GPU work\n")
+    try steps(d, k, t, b, rounds)
+    try sweeps(d, k, t, b, rounds, 128, 1)
+    try sweeps(d, k, t, b, rounds, 128, 2)
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds I64 = 7
+    if args.Len() > 1: rounds = try args[1].ParseInt()
+    d := try device.Device.Open() catch e {
+        try io.Put("no GPU: " + $e + "\n")
+        return
+    }
+    try io.Put("G-M3 on " + d.Str() + ", " + $rounds + " rounds, medians\n")
+    try run(d, rounds) catch device.GpuError e: try io.Put("GPU failed: " + $e + "\n")
+}

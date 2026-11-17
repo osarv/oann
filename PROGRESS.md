@@ -546,9 +546,103 @@ What it says:
   but the settle's CPU blocks are exactly these shapes; worth a look in kernels/gemm (where it splits, and the tasks'
   start-up under WSL).
 
+## The GPU route, GP2: our own kernels by NVRTC, the fused rate step (wt-gp2, 2026-11-17)
+
+docs/redesign.md 1.10 and 4.4's GP2. `kernels/gpu/kern.olang` (`Kernel.Compile`, `Launch`, `Arg`, `Zero`, `Copy`,
+`Timer`; `Axpy`; `Rho` and `Rate<T>`, the settle's fused rate step), `kernels/gpu/src/elem.cu` (FastExp, FastTanh, the
+activations, Axpy) and `src/rate.cu` (the fused step, and the same step in three launches for G-M3), the shim's NVRTC,
+driver-API, memset/copy and timing-event functions in `cuda.c`, `dyn/gpu_test.olang`, `make gpurate` (G-M3,
+`bench/gpurate.olang`).
+
+- **NVRTC at plan time, the PTX cached by hash.** The `.cu` files are embedded while compiling (`embed`) and
+  specialized as text: kern.olang writes kernels/elem's FastExp constants and `elem.ExpTaylor` (now public) as their
+  bits, then the state's type, the residual word's type and the activation as `#define`s. The PTX is kept at
+  `$OLANG_CACHE/oann-ptx/SHA256(NVRTC version, options, text).ptx` (written beside, then renamed); the next compile of
+  the same text reads it (`Kernel.Cached`). Measured: NVRTC and the module load 80-106 ms a text (the first compile on a
+  cold machine took 1.2 s once), from the cache 0.5-0.8 ms.
+- **The driver API through `cudaGetDriverEntryPoint`** (cuModuleLoadData, cuModuleGetFunction, cuModuleUnload,
+  cuLaunchKernel, cuGetErrorString), its table owned by each `Kernel`, so the shim keeps no state and nothing links
+  libcuda; `cuda.h` is not imported (the five signatures are written in the shim by shape). The PTX is for
+  compute_MAJORMINOR of the device and is made sm_89 code by the driver's JIT when loaded.
+- **`--fmad=false`**: olang does not contract `a * b + c` (checked: compiled with an `fma` in the step, the test fails
+  on Linear's u2 at the first block), so our kernels do not either, and FastTanh on the GPU is kernels/elem's **bit for
+  bit** at 2,000,001 points over [-12, 12] plus NaN and the infinities.
+- **Launch** packs each argument in a 64-bit slot (an address, or a number's bits; the driver reads a parameter's width
+  from the slot's start): tested on Axpy - addresses at offsets, F32 and F64 alphas, a 64-bit count, sizes 1 to
+  1,048,579 - bit for bit with kernels/elem's `Axpy`.
+- **Errors**: a text that does not compile is `GpuError.Nvrtc` with NVRTC's status and log
+  (`NVRTC_ERROR_COMPILATION / oann.cu(1): error: identifier "undeclared_thing" is undefined ...`); a kernel the module
+  lacks is `GpuError.Launch` (`cuModuleGetFunction(oann_nothing): named symbol not found`); a launch the driver refuses
+  (a block of 2048 threads) is recorded in the status record (a new kind, the driver's text kept) and given back by the
+  next `Sync` as `GpuError.Launch("cuLaunchKernel: invalid argument")`; the launch after it runs.
+- **The rate step** (`Rate<T>.Make(dev, rho)`, `Step`): r = total - u, the residual's |r| bits into a device word by
+  one `atomicMax` a block (warp shuffles first), u2 = u + dt r with dt per phase (an array, the rows phase-major),
+  s2 = rho(u2), retired units (a byte mask per unit) put at 0 - dyn/settle's rest-then-retire, fused. Against
+  `neuron.RateStep` with the settle's retired-unit handling (`dyn/gpu_test.olang`, F32 and F64, every Rho, the settle's
+  shapes, odd sizes, a 1024 x 512 x 2 block, offsets, retired units, special values: +-0, +-1e30, +-1e-30, +-Inf):
+  u2 and s2 bit for bit for Linear, Relu, HardSigmoid - and for Tanh too (asserted within FastTanh's 2.0e-7, measured
+  bit for bit at every element); LifRate bit for bit in F32, in F64 at all but 449 of 1,048,576 in the largest case (the GPU's `log`
+  against the C library's; within the test's 2 ulp); the residual word the CPU's sup norm bit for bit, and a NaN wherever the
+  CPU's is one (a NaN in u or in the totals, at block edges, beside a residual of 1e30); two launches into one word give
+  the one launch's maximum; run twice identical.
+- **Not done here** (GP4's): the converged word that stops later sweeps' steps, the readout's force kernel, device
+  mirrors of a plan's state.
+
+**G-M3** (`make gpurate OLANG=olang ARGS=7`, 2026-11-17, commit of this section; RTX 4060 under WSL2, Ryzen 5 7600). The
+median of 7 rounds, each after an untimed one. *Back to back*: CUDA events around many reps enqueued as fast as the host
+goes. *Queued ahead*: the same behind 20 ms of other GPU work, so every launch is queued before the first runs and the
+events see the GPU alone (checked: the enqueueing ended within the blocker every time). *Host*: the host's time to
+enqueue one. Tanh, F32.
+
+The step alone, us a step - queued ahead / back to back / host:
+
+| population | elements | fused, 1 launch | unfused, 3 launches | unfused / fused (queued) |
+|---|---|---|---|---|
+| 10 x 128 rows | 1280 | 6.53 / 5.30 / 4.84 | 17.78 / 16.40 / 16.42 | 2.72 |
+| 128 x 128 rows | 16384 | 6.43 / 5.78 / 3.76 | 17.44 / 15.36 / 11.38 | 2.71 |
+| 10 x 256 rows | 2560 | 5.91 / 5.15 / 4.08 | 16.74 / 15.69 / 15.91 | 2.83 |
+| 128 x 256 rows | 32768 | 6.13 / 5.62 / 3.91 | 17.33 / 16.26 / 11.29 | 2.83 |
+| 128 x 512 rows | 65536 | 6.35 / 5.89 / 3.83 | 22.00 / 16.94 / 11.25 | 3.46 |
+| 1024 x 512 rows | 524288 | 14.49 / 13.26 / 4.01 | 28.01 / 26.63 / 11.70 | 1.93 |
+| 1024 x 4096 rows | 4194304 | 269.93 / 273.24 / 3.99 | 527.97 / 528.95 / 12.84 | 1.96 |
+| 4096 x 8192 rows | 33554432 | 2200.88 / 2183.57 / 3.97 | 4338.64 / 4333.62 / 13.36 | 1.97 |
+
+A sweep of the 784-128-10 settle at batch 128 as GP4 would enqueue it (the residual word zeroed; per population its
+constant copied into its totals, one copy a phase, its carry by cuBLAS with beta 1, its rate step), GPU us a sweep:
+
+| | launches | queued ahead | back to back | host to enqueue | with the word read back and waited for (wall) | the floor: as many launches of a one-element Axpy, back to back |
+|---|---|---|---|---|---|---|
+| free phase (128 rows), fused | 7 | 43.3 | 37.6 | 37.9 | 87.5 | 36.6 |
+| free phase, unfused | 11 | 70.3 | 54.6 | 57.3 | 108.2 | 52.4 |
+| nudged pair (256 rows), fused | 9 | 61.3 | 47.2 | 49.5 | 105.1 | 46.2 |
+| nudged pair, unfused | 13 | 77.6 | 73.0 | 73.6 | 151.9 | 68.6 |
+
+Per launch group (free phase, fused, back to back): the word's zeroing 5.0 us, a constant's copy 5.0-5.3, the carries
+6.4 and 6.6 (cuBLAS), the rate steps 5.3 and 5.1. The rate steps are 27% of the sweep fused (2 of 7 launches), 52%
+unfused (6 of 11).
+
+What it says:
+- **A launch costs 5-7 us on this machine whatever it does**, on the host (4-5 us to enqueue) and on the GPU alike: queued
+  ahead, with no host in the way, a launch of a one-element kernel still takes 6 us of GPU time (WSL2's submission
+  path, presumably; not measured on a native Linux driver). At the settle's sizes the work itself does not show: a sweep is
+  94-98% its floor of empty launches, so **the number of launches is the sweep's time**.
+- **Fusing the step pays exactly its launches**: 2.7-3.5x for the step alone at the settle's sizes (one launch for
+  three), a sweep 1.45x faster fused (37.6 us against 54.6, 47.2 against 73.0). From half a million elements, where
+  the memory decides, fused is 1.93-1.97x (five arrays read or written against eight, and a pass more).
+- **Waiting for the residual each sweep doubles a sweep** (87.5 us wall against 37.6): the residual check every `Check`
+  sweeps (1.10) is needed, as planned.
+- **CUDA graphs and further fusion are worth a package (GP7)**: a fused sweep is 7 launches (9 with two phases), at
+  least 4 of them avoidable by fusion alone - the constants' copies folded into the step (the step reads the constant
+  and the carry, the product written with beta 0) or into cuBLASLt's C != D (GP3), and the word's zeroing into the
+  previous sweep's check - leaving 2 products and 2 steps (at the 5-6.6 us a launch measured above, 20-26 us a sweep,
+  derived, not measured). Whether a graph's replay lowers the
+  GPU-side 6 us a node on WSL2 is to be measured there; on this machine 37.6 us a sweep is the GPU's floor at batch
+  128 until then, against the CPU's sweep in G-M2 (GP5).
+
 ## Next
 
-- The open work of docs/redesign.md: the GPU route (question 1) - GP1 is done (above); GP2 (NVRTC and the rate step) next.
+- The open work of docs/redesign.md: the GPU route (question 1) - GP1 and GP2 are done (above); GP3 (cuBLASLt) and
+  GP4 (the settle on the GPU) next. G-M3 says a sweep's launches are its time: GP4 should enqueue as few as it can.
 - kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).
 - The nudged pair's certificate per batch: `NudgedRate` certifies confident rows only (44% at MNIST's epoch 3, no
   batch of 32). Next levers: a block-weighted norm (readouts apart from hidden units: the hidden-readout coupling

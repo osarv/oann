@@ -8,9 +8,13 @@
  *   - host arrays cross as arrays (X3, X22: an olang Array passes as its storage's address), with an offset in bytes.
  *
  * The shim owns no state. A Device (device.olang) owns a status record, made here (oann_status_new) and freed by the
- * Device's destructor: the calls on the hot path (copies, products) return nothing and record the first status that
- * is not success in it, with the call's name, so an olang caller does not branch per call; Device.Sync gives that
- * first error back as a GpuError and clears the record. Setup calls (Open, Buf.Make) return their status directly.
+ * Device's destructor: the calls on the hot path (copies, products, launches) return nothing and record the first
+ * status that is not success in it, with the call's name, so an olang caller does not branch per call; Device.Sync
+ * gives that first error back as a GpuError and clears the record. Setup calls (Open, Buf.Make, a compile) return
+ * their status directly.
+ *
+ * Our own kernels (kernels/gpu/kern.olang): NVRTC compiles CUDA C text to PTX; the driver API loads and launches it,
+ * reached through cudaGetDriverEntryPoint into a table the caller owns (oann_driver_new), so nothing links libcuda.
  */
 #include <stdbool.h>
 #include <stdint.h>

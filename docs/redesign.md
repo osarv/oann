@@ -1070,6 +1070,21 @@ cuBLASLt's, GP3); the compute type follows the storage (F64 for F64, F32 for the
 cuBLAS handle disallows reduced-precision reductions: by default cuBLAS rounds split-K parts of a BF16 product to BF16
 (3% at depth 257). G-M1's first table and the rest are in PROGRESS.md.
 
+**As built (GP2, 2026-11-17).** `Kernel.Compile(dev, text, name)` and `Launch(d, k, grid, block, args ...U64)` as
+sketched; the `.cu` texts are embedded while compiling and specialized by `#define`s kern.olang writes before them
+(kernels/elem's FastExp constants and `elem.ExpTaylor` as their bits, the state's type, the activation). The PTX cache
+key is SHA-256 of NVRTC's version, the options and the text. The driver's entry points are a table each `Kernel` owns
+(the shim keeps no state, `cuda.h` is not imported); a launch's failure is a new kind in the status record, given back
+by `Sync` as `GpuError.Launch` with the driver's text. NVRTC compiles with `--fmad=false`, as olang compiles the CPU's
+(no contraction): FastTanh on the GPU is the CPU's bit for bit, and so is the rate step for every Rho but LifRate in F64
+(the GPU's `log`). The rate step (`kern.Rate<T>`) takes dt per phase from a device array (the rows phase-major), the
+retired units as a byte mask, and keeps the residual as a maximum into a word the caller zeroes once a sweep, so a
+sweep's populations may share it; it does not read the converged word yet (GP4). kernels may not import dyn, so
+`kern.Rho` repeats `neuron.Rho`'s cases and `dyn/gpu_test.olang`'s `GpuRho` maps one to the other; the rate step's test
+against `neuron.RateStep` lives there. G-M3 (PROGRESS.md): on this machine a launch costs 5-7 us on the host and on the
+GPU whatever it does, so a sweep of the 784-128-10 settle at batch 128 is its launches (7 fused, 37.6 us; 11 unfused,
+54.6 us) and fusion and CUDA graphs are worth GP7.
+
 The packages are section 4.4.
 
 ## 2. Module map

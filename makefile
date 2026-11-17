@@ -23,7 +23,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpugemm mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpugemm gpurate mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -45,6 +45,12 @@ gputest:
 gpugemm:
 	$(OLANG) build -define Gpu=true -output build/bench_gpugemm bench/gpugemm.olang
 	$(GPUENV) ./build/bench_gpugemm $(ARGS)
+
+# G-M3: the settle's rate step fused (one launch) against unfused (three), and a sweep of the 784-128-10 settle on the
+# GPU - its launches and their share of it, NVRTC's compile and the PTX cache (bench/gpurate.olang) - ARGS: rounds
+gpurate:
+	$(OLANG) build -define Gpu=true -output build/bench_gpurate bench/gpurate.olang
+	$(GPUENV) ./build/bench_gpurate $(ARGS)
 
 # M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
 mlpad:
