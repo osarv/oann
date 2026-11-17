@@ -53,6 +53,7 @@ import "../kernels/mat"
 import "../kernels/gemm"
 import "../kernels/scan"
 import "../kernels/conv"
+import "../kernels/device"
 import "../io/checkpoint"
 import "ops"
 import "std/rand"
@@ -1011,8 +1012,11 @@ fn (g Graph<T>&) accLen() I64 {
 
 # lays the arena out, allocates it, and draws the parameters' starting values from r - after which the graph runs. A
 # shape the caller gave that does not fit is reported here. An eager graph is planned before anything is recorded: r
-# is kept to draw each parameter as it is made, in the order a captured graph draws them
-fn (g mut Graph<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError {
+# is kept to draw each parameter as it is made, in the order a captured graph draws them. on is where it runs, by
+# default kernels/device's default backend (device.SetDefault; the CPU until set): a graph has no GPU form yet
+# (docs/redesign.md 4.4, GP6), so the GPU is refused here, saying so, never run on the CPU instead
+fn (g mut Graph<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.Default()) ? tensor.ShapeError {
+    try onCpu(on)
     try g.Check()
     if g.planned: unreachable "oann: a graph is planned once"
     if g.Eager {
@@ -1024,10 +1028,16 @@ fn (g mut Graph<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError {
     g.arrange(l, r)
 }
 
+# a graph's backend: the CPU, or the refusal of the GPU (a ShapeError, so Plan's callers handle it as they do a shape)
+fn onCpu(on device.Backend) ? tensor.ShapeError {
+    if on == device.Backend.Gpu: error tensor.ShapeError.Mismatch("no GPU form of ad's graphs yet (docs/redesign.md 4.4, GP6): plan this graph on device.Backend.Cpu")
+}
+
 # Plan with the layout computed beforehand - baked while compiling, `PlanBaked(r, comptime layoutOf())` - or taken from
 # another graph recorded the same way: nothing is laid out here. A layout that does not fit the graph (another node
 # count, another size) is an error of the program
-fn (g mut Graph<T>&) PlanBaked(r mut rand.Rand&, l Layout&) ? tensor.ShapeError {
+fn (g mut Graph<T>&) PlanBaked(r mut rand.Rand&, l Layout&, on device.Backend = device.Backend.Default()) ? tensor.ShapeError {
+    try onCpu(on)
     try g.Check()
     if g.planned: unreachable "oann: a graph is planned once"
     if g.Eager: unreachable "oann: an eager graph has no layout"
@@ -2609,6 +2619,23 @@ test Graph.Plan "a shape that does not fit is reported by Plan, naming it, and n
     failed := false
     try e.Check() catch tensor.ShapeError { failed = true }
     assert failed
+}
+
+test Graph.Plan "on the GPU, the default backend or named, a graph is refused saying it has no GPU form yet; on the CPU it plans" {
+    for named in Array<Bool>[true, false] {
+        g := Graph<F32>(4)
+        g.Act(g.Linear(g.Input(3), g.Param(Init.Zeros, true, 2, 3)), mat.Act.Relu)
+        said := ""
+        if named {
+            try g.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+        } else {
+            device.SetDefault(device.Backend.Gpu)
+            try g.Plan(rand.Rand(1)) catch tensor.ShapeError e { said = $e }
+            device.SetDefault(device.Backend.Cpu)
+        }
+        assert said.Contains("no GPU form of ad's graphs"), said
+        try g.Plan(rand.Rand(1), device.Backend.Cpu)
+    }
 }
 
 # x squared, element by element: a Custom operation for the test below
