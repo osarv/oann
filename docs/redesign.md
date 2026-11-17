@@ -1039,20 +1039,20 @@ The 784-128-10 settle is small for a GPU (a sweep at batch 128 is about 30 MFLOP
 batch 128 and the GPU ahead from 512 or at hidden sizes of 1024 and up - the benchmark sweeps both, and the answer is
 written into PROGRESS.md before any further settle work goes to the GPU.
 
-**Questions for the user (GPU).**
+**GPU decisions (2026-11-17).**
 
 - **G1. GPU results are not bit-identical to the CPU's.** Decision 4 makes results identical for every thread count;
   cuBLAS sums in its own order, so a GPU run agrees with the CPU within stated tolerances and is identical run to run on
-  one GPU, not bit for bit with the CPU. *Recommendation:* accept that, as stated above, and keep the CPU as the
-  reference implementation that defines the numbers.
-- **G2. The compile route for our kernels** (question 1 left it to the first kernel). *Recommendation:* NVRTC from
-  CUDA C templates (route a); an NVPTX target in olang only if our kernels outgrow templates.
+  one GPU, not bit for bit with the CPU. *Decided:* so; the CPU stays the reference implementation that defines the
+  numbers.
+- **G2. The compile route for our kernels** (question 1 left it to the first kernel). *Decided:* NVRTC from CUDA C
+  templates (route a); an NVPTX target in olang only if our kernels outgrow templates.
 - **G3. Ubuntu's CUDA 12.0 or NVIDIA's newer toolkit.** 12.0 is enough for everything above but FP8 products on sm_89
   (cuBLASLt's FP8 on Ada came after 12.0 - to be confirmed on install) and CUDA graphs' conditional nodes (12.3+, which
-  would let a whole settle run without the host). *Recommendation:* start on 12.0; install NVIDIA's toolkit when F8 on
-  the GPU or a host-free settle is the next step.
-- **G4. CUDA as an optional dependency.** The GPU is behind `-define Gpu=true`, so oann without CUDA builds and tests
-  as today. *Recommendation:* keep it optional, `make test` CPU only, `make gputest` on machines with the GPU.
+  would let a whole settle run without the host). *Decided:* start on 12.0; NVIDIA's toolkit is a third-party source,
+  so it goes to the user when F8 on the GPU or a host-free settle is the next step.
+- **G4. CUDA as an optional dependency.** *Decided:* the GPU is behind `-define Gpu=true`, so oann without CUDA builds
+  and tests as today: `make test` CPU only, `make gputest` on machines with the GPU.
 
 The packages are section 4.4.
 
