@@ -366,28 +366,43 @@ are constant and the evaluator can decide the bound.
     `Contraction()`: the activations' largest slope times the coupling's largest singular value (power iteration on
     W^T W through the connections' own products, `Engine.Spectral`): the Euclidean-norm kappa, read directly; at most
     `Gain()` for a symmetric coupling.
-    **The certificate's norm** (wt-oanncert, 2026-11-17): `System.Bound` is `Norm.Sup` (the default: the gain) or
-    `Norm.Spectral`, and `Certify`, `Restrain`, `Rate`, `LessonTolerance` and `BudgetFor` hold kappa (`Kappa()`) in it.
+    **The certificate's norm** (wt-oanncert, 2026-11-17): `System.Bound` is `Norm.Sup` (the gain) or
+    `Norm.Spectral` (the default since wt-oanncert2), and `Certify`, `Restrain`, `Rate`, `LessonTolerance` and `BudgetFor`
+    hold kappa (`Kappa()`) in it.
     Spectral: `Certify` scales every recurrent connection by one factor to the bound (found to 1e-9 relative),
     `Restrain` by the one factor that brings it back (the norm is not a per-unit quantity, so not per connection), and
     the power iteration is warm-started from the vector the engine keeps (laid out by `Ready`; nothing allocates).
     Against settling.md 1.2: with a 1-Lipschitz `rho`, `|T(u) - T(v)|_2 <= L |W|_2 |u - v|_2`, so `kappa_2 = L |W|_2 < 1`
     makes the map a contraction in the Euclidean norm - one fixed point, whatever sweeps reach it. What depends on the
     norm, precisely: (i) the step rate, the residual's decay and the distance bound `|v - v*| <= |r| / (1 - kappa)` hold
-    in the norm of the certificate; the qualifying test stays unit by unit (`max |r_i| <= tau`, the refusal test needs
-    no certificate at all), so under the spectral certificate a qualified state is only within
-    `sqrt(n) tau / (1 - kappa)` of `v*` per unit (n relaxing units a row) - `LessonTolerance` divides by `sqrt(n)` to
-    keep 1.4's bound, and the cold sweep count gains `ln sqrt(n) / ln(1 / q)` (the budgets' factor 2 covers it);
-    (ii) the nudged step `dt_beta` is norm-free for the squared error (a diagonal matrix has norm `max |d_i|` in both),
-    and for the cross-entropy the softmax force's off-diagonal terms are uncovered in either norm (1.2's caveat) -
-    where the spectral certificate allows large single weights they decide; (iii) Gauss-Seidel's rate is proven for
-    the sup-norm certificate, not for the Euclidean one (only the fixed point's uniqueness carries over); (iv) EP's
-    theorem (Scellier & Bengio 2017) needs symmetry, a stable fixed point and converged phases, no norm; (v) the board's
-    range argument (4.2) bounds a potential by the incoming mass, so the board stays on the sup norm (`|W[e]| <= |W|_2`
-    still bounds every single weight). **The default stays `Norm.Sup`** (PROGRESS.md, "The certificate's norm"): with
-    the tolerance divided by `sqrt(n)` the spectral certificate's nudged phases are refused (7 lessons over 2 seeds) and
-    lessons take 42-66 sweeps against 32; at the sup-norm tolerance it would beat the uncertified run (0 refused, 29
-    sweeps a lesson, 9.6 an answer, accuracy level), but that drops the per-unit distance bound.
+    in the norm of the certificate, and so does the qualifying test (wt-oanncert2): under `Norm.Spectral` a settle
+    stops on each row's Euclidean residual (`Budget.Euclid`, the largest row's `|r|_2` over its relaxing units), so
+    `|v - v*|_2 <= tau / (1 - kappa)` holds row by row and per unit (`|x|_inf <= |x|_2`) at 1.4's tolerance, with no
+    `sqrt(n)` (the refusal test needs no certificate at all); (ii) the nudged phase, counted (wt-oanncert2): a sweep's
+    Jacobian at +beta is `(1 - dt) I - dt beta F D_r + dt (W D + beta C D_r)`, F the force's self-slopes (diagonal,
+    at most `f`) and C its coupling between distinct units. For the squared error C = 0; for the cross-entropy the
+    softmax's off-diagonal `p_i p_j / T` has rows summing to `p_i (1 - p_i) / T <= 1 / (4 T) = c`, its sup norm, and
+    being symmetric its Euclidean norm too (`|A|_2 <= sqrt(|A|_1 |A|_inf)`). The diagonal part is in `[1 - Dt, 1 - dt]`
+    at the shortened step `dt = Dt / (1 + beta f)`, so in either norm the Jacobian is at most `1 - dt (1 - kappa_beta)`
+    with `kappa_beta = kappa + beta c L_r` (L_r the readout's largest slope); at -beta the step is `Dt` and the
+    self-slope feeds back, `kappa_beta = kappa + beta (f + c) L_r` (for the Euclidean norm with equal slopes this is
+    exact: the softmax Jacobian is positive semidefinite with largest eigenvalue at most `1 / (2 T) = f + c`).
+    `Rate(beta)` is the worse of the pair and `NudgedKappa(beta)` gives each. The bound is worst-case: with equal
+    readout slopes the coupling cancels the diagonal row by row in the sup norm (settling.md 1.2) and, in the Euclidean
+    norm, `(1 - dt) I - dt beta J` (J the PSD softmax Jacobian) has eigenvalues in `[1 - Dt (1 + 2 beta f) / (1 + beta
+    f), 1 - dt]`, of modulus at most `1 - dt` for `Dt <= 1` - the nudge then costs nothing; only the spread of the
+    slopes, `beta (max rho' - min rho') / (4 T)`, is left. Training's beta 0.5 at T 0.25 gives `kappa_beta` 1.4 (+)
+    and 1.9 (-) at kappa 0.9, so the worst case certifies neither phase: the free phase's certificate does not suffice
+    in general, and the nudged phases get the clamped budget (q 0.95) and are measured instead - a cross-entropy
+    system's nudged pair at beta 0.5 settles within it (test `System.Rate`), and no MNIST or XOR lesson is refused;
+    (iii) Gauss-Seidel's rate is proven for the sup-norm certificate, not for the Euclidean one (only the fixed
+    point's uniqueness carries over); (iv) EP's theorem (Scellier & Bengio 2017) needs symmetry, a stable fixed point
+    and converged phases, no norm; (v) the board's range argument (4.2) bounds a potential by the incoming mass, so the
+    board stays on the sup norm (`Lower` refuses a spectral system; `|W[e]| <= |W|_2` still bounds every single
+    weight). **The default is `Norm.Spectral`** (PROGRESS.md, "The stop test in the certificate's norm"): kept
+    rigorous it refuses nothing on MNIST and XOR, its lessons take the uncertified run's sweeps (31.8 against 32.4),
+    its answers 26% fewer, at the uncertified run's accuracy (96.94% against 96.91%, the sup certificate's 90.94%).
+    Last round's unit-by-unit test at `tau / sqrt(n)` refused 7 lessons in 2 seeds and took 42 sweeps a lesson.
 
 11. **Allocation-free, pinned while compiling** (top-level `assert not f.Allocates`, S17a/G42): every population's
     step (rate, spiking), a readout's force, the window's end, cold and warm starts, committing a settle, a settle's

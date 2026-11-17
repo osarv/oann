@@ -334,11 +334,53 @@ rows: the per-unit distance bound not kept) it is better than the uncertified ru
 default is a qualifying test in its own norm - each row's Euclidean residual against `tau`, which keeps 1.4's bound
 without the `sqrt(n)` - and a certificate of the nudged phase that counts the cross-entropy force's coupling.
 
+## The stop test in the certificate's norm; the spectral certificate the default (wt-oanncert2, 2026-11-17)
+
+A settle under the spectral certificate now stops on each row's Euclidean residual: `settle.Budget.Euclid` (set by
+`BudgetFor` and a learner's budget when `Bound` is `Norm.Spectral`) replaces the unit-by-unit test with the largest
+row's `|r|_2` over its relaxing units, read from the sweep's step `(u' - u) / dt` after each sweep (one pass over the
+state, beside the products; retired units left out; a spiking or custom system keeps the unit test). The distance bound
+`|v - v*|_2 <= tau / (1 - kappa)` is then rigorous in the norm kappa holds, and per unit as well (`|x|_inf <= |x|_2`),
+so `LessonTolerance` lost its `sqrt(n)`. The nudged phases' rate (`Rate(beta)`, `NudgedKappa`) now counts the
+cross-entropy force's coupling: `kappa + beta c` at +beta (the shortened step absorbs the self-slope), `kappa + beta
+(f + c)` at -beta (`c = f = 1 / (4 T)` per unit of the readout's slope, `neuron.ForceCoupling`; argument in
+docs/redesign.md 1.4 item 10); at MNIST's beta 0.5, T 0.25 neither phase is certified by it (1.4 and 1.9), so the
+nudged budget is the clamped one (q 0.95: 261 sweeps), and the phases are measured to converge instead (below; test
+`System.Rate` at beta 0.5). `System.Bound` defaults to `Norm.Spectral`; the board refuses a spectral system
+(`LowerError`: its ranges need the sup norm) and its tests and `mnist_board` set `Norm.Sup`; `mnist_learn` and
+`xor_settle`'s `none` and `sup` keep the sup norm, so their rows below are last round's runs. Tests: a settlement's
+residual under `Euclid` lies between the largest unit's and `sqrt(n)` times it; a certified system's cold and warm
+settles agree to `2 tau / (1 - kappa)` over a row; a cross-entropy system's nudged pair at beta 0.5 settles in budget.
+
+Measured as last round (`3 60000 128 32 SEED 0.001 0.5 1 1 0.1 200 1 0 plain CERT`, epoch 3, seeds 1 / 2, load ~11 on
+4 cores; logs/ in the worktree, not committed). none and sup were run again at this load for the times:
+
+| MNIST dense | sweeps a lesson | sweeps an answer | us a lesson | refused (epochs 1-3) | accuracy |
+|---|---|---|---|---|---|
+| none | 32.4 / 32.0 | 14.7 / 14.2 | 1495 / 1514 | 0 / 0 | 96.71 / 97.10% |
+| sup | 13.1 / 13.0 | 3.9 / 3.7 | 1120 / 914 | 0 / 0 | 91.05 / 90.83% |
+| spectral, row-Euclidean stop (now) | 31.8 / 31.9 | 10.6 / 10.9 | 1798 / 1773 | 0 / 0 | 96.98 / 96.90% |
+| spectral, unit stop at tau / sqrt(n) (last round) | 42.2 / 43.0 | 12.8 / 13.1 | 1548 / 1801 | 7 / 7 | 96.97 / 96.70% |
+| spectral, unit stop at tau (last round, not rigorous) | 28.7 / 29.0 | 9.5 / 9.7 | 1383 / 1327 | 0 / 0 | 96.86 / 96.93% |
+
+| XOR (8 hidden, 300 lessons) | sweeps a lesson | us a lesson (3 runs) | refused | loss, right |
+|---|---|---|---|---|
+| none | 9.1 | 17.1 / 12.1 / 16.7 | 0 | 0.0001, 4/4 |
+| sup | 6.4 | 14.2 / 14.8 / 10.6 | 0 | 0.0108, 4/4 |
+| spectral, row-Euclidean stop | 8.5 | 14.9 / 14.6 / 14.4 | 0 | 0.0022, 4/4 |
+
+Reading: kept rigorous, the spectral certificate now refuses nothing, its lessons cost what the uncertified run's do
+(31.8 against 32.4 sweeps; 3 more than the non-rigorous unit stop at tau, the row norm being the stricter test), its
+answers 25% fewer sweeps (10.7 against 14.5), and its accuracy is the uncertified run's (96.94% mean against 96.91%) and
+5.9 points above the sup certificate's. The time a lesson is 1.2x the uncertified run's at equal sweeps: the four warm
+power iterations a lesson and `Restrain`, and the row-norm pass. XOR: lower loss than the sup certificate (0.0022
+against 0.0108), 2 more sweeps a lesson. **`Norm.Spectral` is the default.**
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
-- The spectral certificate as the default: a per-row Euclidean residual test under it, and a nudged-phase certificate
-  counting the cross-entropy force's coupling (above, "The certificate's norm").
+- A nudged-phase certificate tight enough for training's beta: the coupling bound is worst-case (`beta / (4 T)` per
+  unit of slope); the readouts' slopes at the state would tighten it (docs/redesign.md 1.4 item 10).
 - Compacting retired units (above, if it pays).
 - INT8: shallow products (the CNN's depth 9 and 144) and the per-lane `vpdpbusd`
   lowering (repro/vnnitile).
