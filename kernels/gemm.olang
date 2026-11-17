@@ -726,6 +726,11 @@ fn emptyProduct<A, S>(m I64, n I64, be A, c mut Array<S>&, ldc I64, ep Epilogue,
     finish(c, ldc, 0, m, 0, n, ep, be)
 }
 
+# the multiply-adds a task must have to itself to be worth starting: a spawn and join cost on the order of 100 us a
+# block of the product, so a product splits into at most one task for each madds of its work (m n k), and below two
+# runs on the calling thread
+madds I64 = 16000000
+
 # the packed product: op(B)'s one panel and op(A)'s one per task from ws - a product large enough split over up to
 # ws.Threads tasks by rows of the result, a multiple of the tile's rows each. Thin and exchanged as tiling.choose says
 fn product<SA, SB, S, A>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al A, be A, c mut Array<S>&, ldc I64, ws mut Workspace<A>&, ep Epilogue, mayExchange Bool) {
@@ -751,7 +756,8 @@ fn packedProduct<SA, SB, A, S>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bo
     nr I64 = vectorLanes(al) if thin else tileCols(al)
     depthMax I64 = lesser(k, kc)
     bp := ws.panelsB(depthMax * lesser((n + nr - 1) / nr * nr, blockCols(al)))
-    tasks I64 = 1 if m * n * k < 2000000 else lesser(ws.Threads, (m + microRows - 1) / microRows)
+    tasks I64 = lesser(lesser(ws.Threads, (m + microRows - 1) / microRows), m * n * k / madds)
+    tasks = tasks.Max(1)
     share I64 = ((m + tasks - 1) / tasks + microRows - 1) / microRows * microRows
     panel I64 = lesser(blockRows(al), share) * depthMax
     ap := ws.panelsA(tasks * panel)

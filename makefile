@@ -2,7 +2,7 @@
 # builds under build/, and MNIST is cached under data/ (both ignored by git).
 
 # the compiler: olang's build/olang (its makefile's "make"), olang checked out beside oann by default
-OLANG ?= ../olang/build/olang
+OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
 TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang \

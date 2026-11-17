@@ -543,10 +543,13 @@ What it says:
 - **Transfers dominate at these sizes**: a round trip through pageable memory is about 100 us before any work (the 10-wide
   rows), so with nothing resident the GPU wins only from about 128 x 784 x 128 (190 us against the CPU's 246), and
   against four threads by 1.5x at batch 4096 and 6x at 2048^3. Inputs must come up once a batch from pinned staging, as 1.10 says; that is GP2-GP4's.
-- **kernels/gemm's four threads are slower than one at 32 and 128 rows** (128 x 784 x 128: 482 us against 246; 32 x
-  784 x 128: 372 against 82) - the split costs more than it saves at these shapes on this machine. Not a GPU question,
-  but the settle's CPU blocks are exactly these shapes; worth a look in kernels/gemm (where it splits, and the tasks'
-  start-up under WSL).
+- **kernels/gemm's four threads were slower than one at 32 and 128 rows - fixed (wt-gemmthreads, 2026-11-17)**: the
+  split cost about 300-500 us a product (a spawn and join per block of the product, on this machine's threads), and the
+  old rule split anything over 2 M multiply-adds (128 x 784 x 128 is 12.8 M). A product now splits into at most one
+  task per 16 M multiply-adds (`madds` in kernels/gemm), none below two. Four threads, bench/storage, best of 3 runs:
+  64 x 784 x 128 580 -> 149 us (one thread 146), 128 x 784 x 128 495 -> 252 us (one thread 246); 1024 x 128 x 512
+  840 -> 795-1000 and 512^3 and 1024^3 unchanged within the machine's noise (1.5-2.0 ms, 11.5-14 ms), one thread
+  unchanged. GemmBatch keeps its own 2 M rule.
 
 ## The GPU route, GP2: our own kernels by NVRTC, the fused rate step (wt-gp2, 2026-11-17)
 
