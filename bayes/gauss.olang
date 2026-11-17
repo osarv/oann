@@ -1,0 +1,449 @@
+# bayes/gauss - Gaussian beliefs: a mean and a covariance, full (`Gaussian`) or diagonal (`Diag`, for models with many
+# components, each a belief of its own). What a filter does to them between observations (variance added by a random
+# walk, a component decayed toward zero), joint states assembled from blocks and blocks taken back out, conditioning on
+# observed components or on a linear observation, sampling, densities, entropy and KL divergence - every one through a
+# Cholesky factor, never an explicit inverse - and the normal distribution's cdf, density, quantile and Mills ratio.
+#
+#     g := gauss.Gaussian(3)                     # mean 0, covariance 0
+#     g.Set(0, 0.0, 1.0)                         # component 0's prior
+#     g.Diffuse(0, 0.04)                         # a random walk's variance added to component 0
+#     post := try g.Condition(Array<I64>[2], Array<F64>[1.5])   # the other components given component 2 = 1.5
+#     x := try g.Sample(r)
+#     kl := try gauss.KL(p, q)
+
+import "std/rand"
+import "dense"
+
+# a Gaussian over Dim() components: Mean, and Cov row after row
+type Gaussian struct(dim I64) {
+    Mean Array<F64> = Array<F64>(dim, 0.0)
+    Cov Array<F64> = Array<F64>(dim * dim, 0.0)
+}
+
+# a Gaussian of this mean and covariance (copied)
+fn Gaussian.Of(mean Array<F64>&, cov Array<F64>&) Gaussian {
+    d := mean.Len()
+    g := Gaussian(d)
+    for i in range d: g.Mean[i] = mean[i]
+    for i in range d * d: g.Cov[i] = cov[i]
+    return g
+}
+
+# N(0, v I) over d components
+fn Gaussian.Isotropic(d I64, v F64) Gaussian {
+    g := Gaussian(d)
+    for i in range d: g.Cov[i * d + i] = v
+    return g
+}
+
+# how many components it has
+fn (g Gaussian&) Dim() I64 { return g.Mean.Len() }
+
+# component i's variance
+fn (g Gaussian&) Var(i I64) F64 { return g.Cov[i * g.Dim() + i] }
+
+# component i's standard deviation
+fn (g Gaussian&) Sd(i I64) F64 { return g.Var(i).Max(0.0).Sqrt() }
+
+# the covariance of components i and j
+fn (g Gaussian&) At(i I64, j I64) F64 { return g.Cov[i * g.Dim() + j] }
+
+# v added to component i's variance: a random walk's step, or a prior widened
+fn (g mut Gaussian&) Diffuse(i I64, v F64) { g.Cov[i * g.Dim() + i] += v }
+
+# component i's prior set: mean m, variance v, uncorrelated with the rest
+fn (g mut Gaussian&) Set(i I64, m F64, v F64) {
+    d := g.Dim()
+    g.Mean[i] = m
+    for k in range d {
+        g.Cov[i * d + k] = 0.0
+        g.Cov[k * d + i] = 0.0
+    }
+    g.Cov[i * d + i] = v
+}
+
+# component i multiplied by f: its mean, its variance by f squared and its covariances by f (an AR(1) or
+# Ornstein-Uhlenbeck decay is Scale by phi then Diffuse by the innovation's variance - state.Drift)
+fn (g mut Gaussian&) Scale(i I64, f F64) {
+    d := g.Dim()
+    g.Mean[i] *= f
+    for k in range d {
+        g.Cov[i * d + k] *= f
+        g.Cov[k * d + i] *= f
+    }
+}
+
+# b's mean and covariance written into the block starting at offset, its covariance with the rest left as it was
+fn (g mut Gaussian&) Put(offset I64, b Gaussian&) {
+    d := g.Dim()
+    n := b.Dim()
+    for i in range n {
+        g.Mean[offset + i] = b.Mean[i]
+        for j in range n: g.Cov[(offset + i) * d + offset + j] = b.Cov[i * n + j]
+    }
+}
+
+# the marginal of the n components starting at offset
+fn (g Gaussian&) Take(offset I64, n I64) Gaussian {
+    return g.Marginal(Array<I64>[offset + i for i in range n])
+}
+
+# the marginal of the components idx, in that order
+fn (g Gaussian&) Marginal(idx Array<I64>&) Gaussian {
+    d := g.Dim()
+    n := idx.Len()
+    out := Gaussian(n)
+    for i in range n {
+        out.Mean[i] = g.Mean[idx[i]]
+        for j in range n: out.Cov[i * n + j] = g.Cov[idx[i] * d + idx[j]]
+    }
+    return out
+}
+
+# the mean and variance of the linear combination a . x
+fn (g Gaussian&) Linear(a Array<F64>&) Moments {
+    d := g.Dim()
+    out := Moments()
+    for i in range d {
+        if a[i] == 0.0: continue
+        out.Mean += a[i] * g.Mean[i]
+        for j in range d: out.Var += a[i] * g.Cov[i * d + j] * a[j]
+    }
+    return out
+}
+
+# a scalar's mean and variance
+type Moments struct() {
+    Mean F64
+    Var F64
+}
+
+# whether x lies in component i's central interval holding level (0.5, 0.9) of its probability
+fn (g Gaussian&) Covers(i I64, x F64, level F64) Bool {
+    return (x - g.Mean[i]).Abs() <= NormalQuantile(0.5 + level / 2.0) * g.Sd(i)
+}
+
+# the covariance's Cholesky factor
+fn (g Gaussian&) Factor() Array<F64> ? dense.Error { return try dense.Cholesky(g.Cov, g.Dim()) }
+
+# the other components given the components idx observed at x: mean m_a + S_ab S_bb^-1 (x - m_b), covariance
+# S_aa - S_ab S_bb^-1 S_ba, the components kept in their order
+fn (g Gaussian&) Condition(idx Array<I64>&, x Array<F64>&) Gaussian ? dense.Error {
+    d := g.Dim()
+    n := idx.Len()
+    seen := Array<Bool>(d, false)
+    for i in idx: seen[i] = true
+    rest := Array<I64>[i for i in range d if not seen[i]]
+    h := Array<F64>(n * d, 0.0)          # the observation picks components idx, exactly
+    for k in range n: h[k * d + idx[k]] = 1.0
+    post := g.Marginal(Array<I64>[i for i in range d])
+    try post.Observe(h, x, Array<F64>(n * n, 0.0), jitter = 0.0)
+    return post.Marginal(rest)
+}
+
+# g updated by the linear observation y = H x + v, v ~ N(0, R): H n by d, R n by n - the Kalman update. Gives the
+# observation's log predictive density, log N(y; H m, H S H^T + R). Jitter is added to the innovation covariance's
+# diagonal, so that an exact observation (R = 0) of a degenerate direction still factors
+fn (g mut Gaussian&) Observe(h Array<F64>&, y Array<F64>&, r Array<F64>&, jitter F64 = 1e-12) F64 ? dense.Error {
+    d := g.Dim()
+    n := y.Len()
+    ph := dense.MatMul(g.Cov, h, d, d, n, tb = true)          # S H^T, d by n
+    s := dense.MatMul(h, ph, n, d, n)                        # H S H^T
+    for i in range n * n: s[i] += r[i]
+    for i in range n: s[i * n + i] += jitter
+    l := try dense.Cholesky(s, n)
+    hm := dense.Times(h, g.Mean, n, d)
+    innov := Array<F64>[y[k] - hm[k] for k in range n]
+    a := dense.SolveCholesky(l, innov, n)
+    u := dense.SolveLower(l, innov, n)
+    quad F64 = 0.0
+    for k in range n: quad += u[k] * u[k]
+    for i in range d {
+        for k in range n: g.Mean[i] += ph[i * n + k] * a[k]
+    }
+    shrink(g, ph, l, n)
+    return -0.5 * (quad + dense.LogDet(l, n) + F64(n) * Log2Pi)
+}
+
+# the covariance S - (S H^T) T^-1 (H S), T = l l^T, symmetrised
+fn shrink(g mut Gaussian&, ph Array<F64>&, l Array<F64>&, n I64) {
+    d := g.Dim()
+    sol := Array<F64>(d * n, 0.0)            # T^-1 (H S), column i at sol[i * n ...]
+    col := Array<F64>(n, 0.0)
+    for i in range d {
+        for k in range n: col[k] = ph[i * n + k]
+        x := dense.SolveCholesky(l, col, n)
+        for k in range n: sol[i * n + k] = x[k]
+    }
+    for i in range d {
+        for j in range i + 1 {
+            c F64 = 0.0
+            for k in range n: c += ph[i * n + k] * sol[j * n + k]
+            v := 0.5 * (g.Cov[i * d + j] + g.Cov[j * d + i]) - c
+            g.Cov[i * d + j] = v
+            g.Cov[j * d + i] = v
+        }
+    }
+}
+
+# a draw from g
+fn (g Gaussian&) Sample(r mut rand.Rand&) Array<F64> ? dense.Error {
+    d := g.Dim()
+    l := try g.Factor()
+    x := dense.LowerTimes(l, r.Normals(d), d)
+    for i in range d: x[i] += g.Mean[i]
+    return x
+}
+
+# log N(x; mean, cov)
+fn (g Gaussian&) LogPdf(x Array<F64>&) F64 ? dense.Error {
+    d := g.Dim()
+    l := try g.Factor()
+    u := dense.SolveLower(l, Array<F64>[x[i] - g.Mean[i] for i in range d], d)
+    quad F64 = 0.0
+    for k in range d: quad += u[k] * u[k]
+    return -0.5 * (quad + dense.LogDet(l, d) + F64(d) * Log2Pi)
+}
+
+# the differential entropy, in nats: (d (1 + log 2 pi) + log det S) / 2
+fn (g Gaussian&) Entropy() F64 ? dense.Error {
+    d := g.Dim()
+    return 0.5 * (F64(d) * (1.0 + Log2Pi) + dense.LogDet(try g.Factor(), d))
+}
+
+# KL(p || q) = (tr(Sq^-1 Sp) + (mq - mp)^T Sq^-1 (mq - mp) - d + log det Sq - log det Sp) / 2
+fn KL(p Gaussian&, q Gaussian&) F64 ? dense.Error {
+    d := p.Dim()
+    lq := try q.Factor()
+    lp := try p.Factor()
+    tr F64 = 0.0
+    col := Array<F64>(d, 0.0)
+    for j in range d {
+        for i in range d: col[i] = p.Cov[i * d + j]
+        x := dense.SolveCholesky(lq, col, d)
+        tr += x[j]
+    }
+    u := dense.SolveLower(lq, Array<F64>[q.Mean[i] - p.Mean[i] for i in range d], d)
+    quad F64 = 0.0
+    for k in range d: quad += u[k] * u[k]
+    return 0.5 * (tr + quad - F64(d) + dense.LogDet(lq, d) - dense.LogDet(lp, d))
+}
+
+# ---- diagonal beliefs ----
+
+# independent Gaussians over Dim() components: the belief of a model too large for a full covariance, or a factorised
+# posterior (each entity's component a belief of its own, the correlations an update makes dropped after it)
+type Diag struct(dim I64) {
+    Mean Array<F64> = Array<F64>(dim, 0.0)
+    Var Array<F64> = Array<F64>(dim, 0.0)
+}
+
+# N(0, v I) over d components
+fn Diag.Isotropic(d I64, v F64) Diag {
+    g := Diag(d)
+    for i in range d: g.Var[i] = v
+    return g
+}
+
+# how many components it has
+fn (g Diag&) Dim() I64 { return g.Mean.Len() }
+
+# component i's standard deviation
+fn (g Diag&) Sd(i I64) F64 { return g.Var[i].Max(0.0).Sqrt() }
+
+# v added to component i's variance
+fn (g mut Diag&) Diffuse(i I64, v F64) { g.Var[i] += v }
+
+# component i's mean and variance set
+fn (g mut Diag&) Set(i I64, m F64, v F64) {
+    g.Mean[i] = m
+    g.Var[i] = v
+}
+
+# component i multiplied by f
+fn (g mut Diag&) Scale(i I64, f F64) {
+    g.Mean[i] *= f
+    g.Var[i] *= f * f
+}
+
+# the components idx as one full Gaussian (uncorrelated): the joint an update of them works on
+fn (g Diag&) Marginal(idx Array<I64>&) Gaussian {
+    n := idx.Len()
+    out := Gaussian(n)
+    for i in range n {
+        out.Mean[i] = g.Mean[idx[i]]
+        out.Cov[i * n + i] = g.Var[idx[i]]
+    }
+    return out
+}
+
+# the joint b's marginals written back into the components idx, its correlations dropped
+fn (g mut Diag&) PutMarginals(idx Array<I64>&, b Gaussian&) {
+    for i in range idx.Len() {
+        g.Mean[idx[i]] = b.Mean[i]
+        g.Var[idx[i]] = b.Var(i)
+    }
+}
+
+# the full Gaussian with this diagonal
+fn (g Diag&) Full() Gaussian { return g.Marginal(Array<I64>[i for i in range g.Dim()]) }
+
+# a draw from g
+fn (g Diag&) Sample(r mut rand.Rand&) Array<F64> {
+    return Array<F64>[g.Mean[i] + g.Sd(i) * r.Normal() for i in range g.Dim()]
+}
+
+# log N(x; mean, diag var)
+fn (g Diag&) LogPdf(x Array<F64>&) F64 {
+    s F64 = 0.0
+    for i in range g.Dim() {
+        e := x[i] - g.Mean[i]
+        s -= 0.5 * (e * e / g.Var[i] + g.Var[i].Log() + Log2Pi)
+    }
+    return s
+}
+
+# the differential entropy, in nats
+fn (g Diag&) Entropy() F64 {
+    s F64 = 0.0
+    for i in range g.Dim(): s += 0.5 * (1.0 + Log2Pi + g.Var[i].Log())
+    return s
+}
+
+# KL(p || q) between diagonal Gaussians
+fn KLDiag(p Diag&, q Diag&) F64 {
+    s F64 = 0.0
+    for i in range p.Dim() {
+        e := q.Mean[i] - p.Mean[i]
+        s += 0.5 * ((p.Var[i] + e * e) / q.Var[i] - 1.0 + (q.Var[i] / p.Var[i]).Log())
+    }
+    return s
+}
+
+# ---- the normal distribution ----
+
+# log(2 pi)
+Log2Pi := 1.8378770664093453
+
+# the standard normal distribution's cdf
+fn NormalCdf(x F64) F64 { return 0.5 * (-x / 2.0.Sqrt()).Erfc() }
+
+# the standard normal distribution's density
+fn NormalPdf(x F64) F64 { return (-0.5 * x * x).Exp() / (2.0 * 3.141592653589793).Sqrt() }
+
+# log of the standard normal cdf, accurate far into the lower tail
+fn LogNormalCdf(x F64) F64 {
+    if x > -30.0: return NormalCdf(x).Log()
+    return -0.5 * x * x - 0.5 * Log2Pi - (-x).Log() + (1.0 - 1.0 / (x * x) + 3.0 / (x * x * x * x)).Log()
+}
+
+# the inverse Mills ratio pdf(x) / cdf(x), accurate far into the lower tail (where it tends to -x)
+fn Mills(x F64) F64 {
+    if x > -30.0: return NormalPdf(x) / NormalCdf(x)
+    return -x / (1.0 - 1.0 / (x * x) + 3.0 / (x * x * x * x))
+}
+
+# the standard normal quantile of p in (0, 1): Acklam's rational approximation, polished by one Halley step
+fn NormalQuantile(p F64) F64 {
+    lowTail := 0.02425
+    x F64 = 0.0
+    if p < lowTail: x = tail((-2.0 * p.Log()).Sqrt())
+    else if p > 1.0 - lowTail: x = -tail((-2.0 * (1.0 - p).Log()).Sqrt())
+    else: x = central(p - 0.5)
+    e := NormalCdf(x) - p
+    u := e * (2.0 * 3.141592653589793).Sqrt() * (x * x / 2.0).Exp()
+    return x - u / (1.0 + x * u / 2.0)
+}
+
+# Acklam's lower-tail approximation at q = sqrt(-2 log p)
+fn tail(q F64) F64 {
+    c := Array<F64>[-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d := Array<F64>[7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00]
+    num := ((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]
+    return num / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0)
+}
+
+# Acklam's central approximation at q = p - 1/2
+fn central(q F64) F64 {
+    a := Array<F64>[-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b := Array<F64>[-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01]
+    r := q * q
+    num := (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q
+    return num / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0)
+}
+
+test "states, blocks and quantiles" {
+    g := Gaussian(2)
+    g.Set(0, 1.0, 4.0)
+    g.Set(1, -1.0, 1.0)
+    g.Cov[1] = 0.5
+    g.Cov[2] = 0.5
+    g.Scale(0, 0.5)
+    assert g.Mean[0] == 0.5 and g.Var(0) == 1.0 and g.At(0, 1) == 0.25
+    m := g.Linear(Array<F64>[1.0, 1.0])
+    assert m.Mean == -0.5 and m.Var == 2.5
+    j := Gaussian(4)
+    j.Put(2, g)
+    b := j.Take(2, 2)
+    assert b.Mean[1] == -1.0 and b.At(0, 1) == 0.25 and j.Var(0) == 0.0
+    assert (NormalQuantile(0.975) - 1.959963984540054).Abs() < 1e-12
+    assert (NormalQuantile(0.75) - 0.6744897501960817).Abs() < 1e-12
+    assert (NormalQuantile(1e-6) + 4.753424308822899).Abs() < 1e-9
+    assert (NormalCdf(1.0) - 0.8413447460685429).Abs() < 1e-12
+    assert g.Covers(1, -1.0 + 0.67, 0.5) and not g.Covers(1, -1.0 + 0.68, 0.5)
+    # the tails' asymptotic forms meet the direct ones
+    assert (LogNormalCdf(-29.99) - NormalCdf(-29.99).Log()).Abs() < 1e-6
+    assert (Mills(-29.99) - NormalPdf(-29.99) / NormalCdf(-29.99)).Abs() < 1e-4
+}
+
+test "conditioning, observing, entropy and KL" {
+    # a bivariate normal: x1 | x0 = a is N(m1 + c / v0 (a - m0), v1 - c^2 / v0)
+    g := Gaussian.Of(Array<F64>[1.0, 2.0], Array<F64>[2.0, 0.8, 0.8, 1.0])
+    c := try g.Condition(Array<I64>[0], Array<F64>[2.0])
+    assert c.Dim() == 1
+    assert (c.Mean[0] - (2.0 + 0.4 * 1.0)).Abs() < 1e-9 and (c.Var(0) - (1.0 - 0.32)).Abs() < 1e-9
+    # a noisy observation of x0 - x1: the posterior's precision is the prior's plus h^T h / r
+    o := Gaussian.Of(g.Mean, g.Cov)
+    lp := try o.Observe(Array<F64>[1.0, -1.0], Array<F64>[0.5], Array<F64>[0.3])
+    pv := 2.0 + 1.0 - 1.6 + 0.3
+    assert (lp - (-0.5 * ((0.5 + 1.0) * (0.5 + 1.0) / pv + pv.Log() + Log2Pi))).Abs() < 1e-12
+    prec := try dense.Inverse(g.Cov, 2)
+    post := try dense.Inverse(o.Cov, 2)
+    hh := Array<F64>[1.0, -1.0, -1.0, 1.0]
+    for i in range 4: assert (post[i] - prec[i] - hh[i] / 0.3).Abs() < 1e-9
+    # entropy and KL against their closed forms in one dimension
+    p := Gaussian.Of(Array<F64>[0.0], Array<F64>[1.0])
+    q := Gaussian.Of(Array<F64>[1.0], Array<F64>[4.0])
+    assert ((try p.Entropy()) - 0.5 * (1.0 + Log2Pi)).Abs() < 1e-12
+    kl := try KL(p, q)
+    assert (kl - (4.0.Log() / 2.0 + (1.0 + 1.0) / 8.0 - 0.5)).Abs() < 1e-12
+    assert (try KL(g, g)).Abs() < 1e-12
+    dp := Diag(1)
+    dp.Set(0, 0.0, 1.0)
+    dq := Diag(1)
+    dq.Set(0, 1.0, 4.0)
+    assert (KLDiag(dp, dq) - kl).Abs() < 1e-12 and (dp.Entropy() - (try p.Entropy())).Abs() < 1e-12
+    assert ((try g.LogPdf(Array<F64>[1.0, 2.0])) - (-0.5 * (1.36.Log() + 2.0 * Log2Pi))).Abs() < 1e-12
+}
+
+test "sampling matches the moments" {
+    r := rand.Rand(3)
+    g := Gaussian.Of(Array<F64>[1.0, -2.0], Array<F64>[2.0, -0.9, -0.9, 1.0])
+    n := 40000
+    s0 F64 = 0.0
+    s1 F64 = 0.0
+    s01 F64 = 0.0
+    for _ in range n {
+        x := try g.Sample(r)
+        s0 += x[0]
+        s1 += x[1]
+        s01 += (x[0] - 1.0) * (x[1] + 2.0)
+    }
+    assert (s0 / F64(n) - 1.0).Abs() < 0.03 and (s1 / F64(n) + 2.0).Abs() < 0.03
+    assert (s01 / F64(n) + 0.9).Abs() < 0.04
+    d := Diag.Isotropic(3, 4.0)
+    j := d.Marginal(Array<I64>[2, 0])
+    j.Mean[0] = 5.0
+    d.PutMarginals(Array<I64>[2, 0], j)
+    assert d.Mean[2] == 5.0 and d.Full().Var(1) == 4.0 and d.Sample(r).Len() == 3
+}

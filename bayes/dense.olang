@@ -1,0 +1,142 @@
+# bayes/dense - the small dense matrices Gaussian inference needs: an r by c matrix is an Array<F64> of r * c numbers,
+# row after row. Cholesky factors, triangular solves, products and the inverse of a symmetric positive-definite matrix;
+# sizes are tens to hundreds, so the loops are plain.
+#
+#     l := try dense.Cholesky(a, d)              # a = l l^T, l lower triangular
+#     x := dense.SolveCholesky(l, b, d)          # a x = b
+#     dense.LogDet(l, d)                         # log det a, from its factor
+
+# why a factorization failed
+type Error error {
+    NotPositive    # the matrix is not symmetric positive definite: a pivot came out at or below zero
+}
+
+# the lower-triangular factor l of the symmetric positive-definite d by d matrix a, a = l l^T
+fn Cholesky(a Array<F64>&, d I64) Array<F64> ? Error {
+    l := Array<F64>(d * d, 0.0)
+    for i in range d {
+        for j in range i + 1 {
+            s := a[i * d + j]
+            for k in range j: s -= l[i * d + k] * l[j * d + k]
+            if i != j {
+                l[i * d + j] = s / l[j * d + j]
+                continue
+            }
+            if not (s > 0.0): error Error.NotPositive
+            l[i * d + i] = s.Sqrt()
+        }
+    }
+    return l
+}
+
+# y solving l y = b, l lower triangular
+fn SolveLower(l Array<F64>&, b Array<F64>&, d I64) Array<F64> {
+    y := Array<F64>(d, 0.0)
+    for i in range d {
+        s := b[i]
+        for k in range i: s -= l[i * d + k] * y[k]
+        y[i] = s / l[i * d + i]
+    }
+    return y
+}
+
+# x solving l^T x = y, l lower triangular
+fn SolveUpper(l Array<F64>&, y Array<F64>&, d I64) Array<F64> {
+    x := Array<F64>(d, 0.0)
+    for c in range d {
+        i := d - 1 - c
+        s := y[i]
+        for k in range i + 1, d: s -= l[k * d + i] * x[k]
+        x[i] = s / l[i * d + i]
+    }
+    return x
+}
+
+# x solving l l^T x = b, l a Cholesky factor
+fn SolveCholesky(l Array<F64>&, b Array<F64>&, d I64) Array<F64> { return SolveUpper(l, SolveLower(l, b, d), d) }
+
+# the inverse of the symmetric positive-definite d by d matrix a
+fn Inverse(a Array<F64>&, d I64) Array<F64> ? Error {
+    l := try Cholesky(a, d)
+    out := Array<F64>(d * d, 0.0)
+    e := Array<F64>(d, 0.0)
+    for j in range d {
+        for i in range d: e[i] = 1.0 if i == j else 0.0
+        x := SolveCholesky(l, e, d)
+        for i in range d: out[i * d + j] = x[i]
+    }
+    return out
+}
+
+# log det(l l^T) from the Cholesky factor l
+fn LogDet(l Array<F64>&, d I64) F64 {
+    s F64 = 0.0
+    for i in range d: s += l[i * d + i].Log()
+    return 2.0 * s
+}
+
+# l times x, l a lower-triangular factor: a draw of N(0, l l^T) from a draw x of N(0, I)
+fn LowerTimes(l Array<F64>&, x Array<F64>&, d I64) Array<F64> {
+    out := Array<F64>(d, 0.0)
+    for i in range d {
+        for k in range i + 1: out[i] += l[i * d + k] * x[k]
+    }
+    return out
+}
+
+# a (r by c) times x (c)
+fn Times(a Array<F64>&, x Array<F64>&, r I64, c I64) Array<F64> {
+    out := Array<F64>(r, 0.0)
+    for i in range r {
+        for k in range c: out[i] += a[i * c + k] * x[k]
+    }
+    return out
+}
+
+# a (r by k) times b (k by c), with b read transposed (c by k) where tb
+fn MatMul(a Array<F64>&, b Array<F64>&, r I64, k I64, c I64, tb Bool = false) Array<F64> {
+    out := Array<F64>(r * c, 0.0)
+    for i in range r {
+        for j in range c {
+            s F64 = 0.0
+            for m in range k: s += a[i * k + m] * (b[j * k + m] if tb else b[m * c + j])
+            out[i * c + j] = s
+        }
+    }
+    return out
+}
+
+# a (r by c) transposed
+fn Transpose(a Array<F64>&, r I64, c I64) Array<F64> {
+    out := Array<F64>(r * c, 0.0)
+    for i in range r {
+        for j in range c: out[j * r + i] = a[i * c + j]
+    }
+    return out
+}
+
+# the d by d identity times v
+fn Identity(d I64, v F64 = 1.0) Array<F64> {
+    out := Array<F64>(d * d, 0.0)
+    for i in range d: out[i * d + i] = v
+    return out
+}
+
+test "factor, solve, invert and log det" {
+    a := Array<F64>[4.0, 2.0, 0.6, 2.0, 5.0, 1.0, 0.6, 1.0, 3.0]
+    l := try Cholesky(a, 3)
+    back := MatMul(l, l, 3, 3, 3, tb = true)
+    for i in range 9: assert (back[i] - a[i]).Abs() < 1e-12
+    x := SolveCholesky(l, Array<F64>[1.0, 2.0, 3.0], 3)
+    ax := Times(a, x, 3, 3)
+    for i in range 3: assert (ax[i] - F64(i + 1)).Abs() < 1e-12
+    inv := try Inverse(a, 3)
+    eye := MatMul(a, inv, 3, 3, 3)
+    for i in range 9: assert (eye[i] - Identity(3)[i]).Abs() < 1e-12
+    # det a = 4 (15 - 1) - 2 (6 - 0.6) + 0.6 (2 - 3) = 44.6
+    assert (LogDet(l, 3) - 44.6.Log()).Abs() < 1e-12
+    t := Transpose(Array<F64>[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3)
+    assert t[1] == 4.0 and t[4] == 3.0
+    bad := try Cholesky(Array<F64>[1.0, 2.0, 2.0, 1.0], 2) catch default Array<F64>(0)
+    assert bad.Len() == 0
+}
