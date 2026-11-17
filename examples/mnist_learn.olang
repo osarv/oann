@@ -8,7 +8,9 @@
 # pruning: below 1 a Prune rule (magnitude, cubic schedule) thins the trained system tick by tick), the pace of a tick
 # (0.1), the lessons between ticks (200), the epochs relearned after (1) and, for a dense run (keep 1), the lessons taught after
 # the epochs (0: a control with as many lessons as a pruned run took), and the sweeps: plain (Jacobi, the default), anderson
-# (Anderson's acceleration, depth 5; andersonN for depth N), seidel (Gauss-Seidel) or both (Gauss-Seidel, Anderson depth 5).
+# (Anderson's acceleration, depth 5; andersonN for depth N), seidel (Gauss-Seidel) or both (Gauss-Seidel, Anderson depth 5),
+# and the certificate: none (certified in the sup norm when made, then free; the default), sup or spectral (certified in
+# that norm and restrained into it after every step, System.Restrain).
 
 import "std/io"
 import "std/json"
@@ -68,7 +70,10 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     if keep < 1.0: s.Attach(s.Root(), system.Rule.Prune(conn.Score.Magnitude, keep, pace, 0.0, conn.Schedule.Cubic), system.Clock.Episode)
     s.Plan(rand.Rand(seed))!
     s.Use(sweepsOf(args, 14))
+    cert := args[15] if 15 < args.Len() else "none"
+    if cert == "spectral": s.Bound = system.Norm.Spectral
     s.Certify(0.9)
+    restrain := cert == "sup" or cert == "spectral"
     l := learn.Learner<F32>(s)!
     opt := optim.AdamW(s.Params(), s.ParamGrads(), rate = rate)
     tol := s.LessonTolerance(beta)
@@ -80,10 +85,10 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     testSet := loader.Loader(data.Test, batch, seed, false)
     labels := Array<I32>(batch)
     for e in range 1, epochs + 1 {
-        try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "epoch " + $e, 0)
+        try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "epoch " + $e, 0, restrain)
     }
     if keep >= 1.0 {
-        if extra > 0: try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "extra " + $extra, extra)
+        if extra > 0: try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "extra " + $extra, extra, restrain)
         return
     }
     m := s.Macs()
@@ -95,10 +100,10 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
         s.Settle(settle.Phase.Free, settle.Budget())
         try l.Tick(system.Clock.Episode)
         ticks++
-        try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "tick " + $ticks, between)
+        try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "tick " + $ticks, between, restrain)
     }
     for e in range 1, relearn + 1 {
-        try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "relearn " + $e, 0)
+        try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "relearn " + $e, 0, restrain)
     }
     converted := s.Sparsify(0.5)
     try show(s, testSet, pixels, digits, tol, labels, "sparse rows (" + $converted + " connections): ")
@@ -117,7 +122,7 @@ fn thinned(s system.System<F32>&, keep F64) Bool {
 
 # one pass of lessons (the first "lessons" batches, or the whole epoch at 0), each with an optimizer step and the masks
 # held, then the test set: prints the accuracy, the sweeps an answer and the multiply-adds a settle
-fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.AdamW<F32, F32>&, trainSet mut loader.Loader<D>&, testSet mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, beta F64, labels mut Array<I32>&, name String&, lessons I64) ? io.Error {
+fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.AdamW<F32, F32>&, trainSet mut loader.Loader<D>&, testSet mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, beta F64, labels mut Array<I32>&, name String&, lessons I64, restrain Bool) ? io.Error {
     t0 := time.Now()
     trainSet.Epoch()
     sweeps, taught, refused := 0, 0, 0
@@ -136,10 +141,11 @@ fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.
         loss += s.Loss(settle.Phase.Free)
         opt.Step()
         s.Hold()
+        if restrain: s.Restrain(0.9)
     }
     spent := F64(time.Since(t0)) * 1e-9
     try io.Put($name + ": train loss " + $(loss / F64(taught)).Fixed(4) + ", " + $(F64(sweeps) / F64(taught)).Fixed(1) +
-        " sweeps a lesson, " + $refused + " refused, " + $spent.Fixed(1) + " s; ")
+        " sweeps a lesson, " + $refused + " refused, " + $spent.Fixed(1) + " s, " + $(spent * 1e6 / F64(taught.Max(1))).Fixed(0) + " us a lesson; ")
     try show(s, testSet, pixels, digits, tol, labels, "")
 }
 
