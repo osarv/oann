@@ -28,8 +28,8 @@ Seven layers, each importing only the ones above it in this list:
 | checkpoint and IO | `io/*.olang` | safetensors, run records |
 | tools | `tools/*.olang`, `bench/` | gradient checks, profiles, counters |
 
-`board/` (the fixed-point engine for the FPGA) is a backend of `dyn`, not a layer. The GPU is a later backend of
-`kernels` (question 1).
+`board/` (the fixed-point engine for the FPGA) is a backend of `dyn`, not a layer. The GPU is a backend of
+`kernels` (question 1, section 1.10).
 
 ### 1.1 Storage: `tensor.olang`
 
@@ -861,6 +861,201 @@ fn main() ? {
 }
 ```
 
+### 1.10 The GPU backend: `kernels/gpu/*.olang`
+
+A backend of `kernels` (question 1): NVIDIA's libraries do the products, a few kernels of our own do what fuses, and
+the CPU kernels stay the oracle every GPU result is tested against. The machine it is built for first: an RTX 4060
+(8 GB, sm_89) under WSL2, the driver at CUDA 13.x, the toolkit Ubuntu's `nvidia-cuda-dev` 12.0 (headers in
+`/usr/include`, `libcudart`, `libcublas`, `libcublasLt`, `libnvrtc` in `/usr/lib/x86_64-linux-gnu`); `libcuda.so.1` is
+WSL's (`/usr/lib/wsl/lib`, on the loader's path through `/etc/ld.so.conf.d/ld.wsl.conf`). No nvcc.
+
+**Built only when asked.** A build that never says `-define Gpu=true` translates no CUDA header: the GPU modules are
+imported under a top-level `if Gpu { import ... }` (olang B9, B10c: each module that branches declares `Gpu Bool = false`,
+and every such declaration takes the define), so `make test` and every CPU program build on a machine without CUDA as today. `make gputest`
+and the GPU benches pass the define.
+
+**The binding.** `kernels/gpu/cuda.c`, a C source imported by olang (X17, X20: compiled into the program by the same
+clang), is the one place C types meet olang's. It includes `cuda_runtime_api.h`, `cublas_v2.h`, `cublasLt.h` and
+`nvrtc.h` and exports a small set of functions over plain numbers: **device addresses are `U64`** everywhere in olang
+(as the driver API's `CUdeviceptr` already is), so a view at an offset is arithmetic in olang, and the shim casts to the
+`void *`/`float *` the libraries take - olang's C import gives a `float *` parameter only an olang array and has no
+pointer arithmetic on a `CVoid?&` (X18, X22), so binding cuBLAS directly would allow whole buffers only. Host arrays
+cross as arrays (X3, X22: an `Array<T>` passes as its storage's address). Opaque handles (`cublasHandle_t`, streams,
+events, `CUfunction`) cross as `U64` too; the shim owns no state. Libraries are linked by name (`link "cudart"`,
+`"cublas"`, `"cublasLt"`, `"nvrtc"`, X9). The driver API (loading our PTX, launching it) is reached through
+`cudaGetDriverEntryPoint` inside the shim, so nothing links `libcuda` by a machine-specific path. Kernel arguments are
+packed by the shim (`void *args[]` pointing at an array of `U64` slots: device addresses, and numbers as their bits).
+
+**The device and where things live.**
+
+```olang
+type GpuError error { NoDevice, Cuda(code I32, what String), Cublas(code I32, what String), Nvrtc(log String), Launch(code I32, what String) }
+
+type Device unique struct(ordinal I64) { ... }      # context, one compute stream, one copy stream, cuBLAS and cuBLASLt handles, their workspaces
+fn Open(ordinal I64 = 0) Device ? GpuError
+fn (d mut Device&) Sync() ? GpuError                 # waits for the compute stream; the first error since the last Sync
+fn (d mut Device&) Close()
+
+type Buf<S> unique struct(dev Device&, n I64) { ... }     # n elements of S in device memory; cudaFree in its destructor
+fn Buf<S>.Make(dev mut Device&, n I64) Buf<S> ? GpuError
+fn (b Buf<S>&) Addr(i I64) U64                             # the address of element i
+fn (b mut Buf<S>&) Upload(host Array<S>&, from I64, to I64, n I64)     # asynchronous on the copy stream, then ordered before the next compute
+fn (b Buf<S>&) Download(host mut Array<S>&, from I64, to I64, n I64)   # on the compute stream; the host reads it after Sync
+
+type DMat<S> struct(Buf Buf<S>&, Off I64, Rows I64, Cols I64, Ld I64) { ... }   # Mat's numbers over a device buffer
+type DBatch<S> struct(...) { ... }                                                # gemm's Batch over a device buffer
+```
+
+- **Residency is the plan's.** `Tensor<T>` stays host storage (section 1.1); nothing in `tensor.olang` knows the device.
+  A plan made for the GPU (`Graph.Plan`, `System.Plan` with `on = Backend.Gpu(dev)`) lays out every region it lays out
+  on the host (decision 2: the parameter region, the activation region, the populations' columns, the workspaces) a
+  second time as a `Buf` of the same length, so a host view `Mat(data, off, rows, cols, ld)` is the device view
+  `DMat(buf, off, rows, cols, ld)` with the same numbers. All of it is allocated at `Plan` (and at a compaction,
+  question 3), none in a step, a sweep or a settle - decision 2 holds on the device: cuBLAS and cuBLASLt get a fixed
+  workspace at `Open` (`cublasSetWorkspace`), our kernels are compiled at `Plan`, pinned host staging for inputs and
+  scalars is allocated there too.
+- **One side owns each region at a time.** While the loop runs, the device owns what the loop writes (parameters,
+  optimizer moments, gradients, population state, activations); the host copy is stale. Crossing is explicit and only
+  at the plan's entry points: inputs (`Clamp`, `Target`, a batch's tokens) upload per batch from pinned staging;
+  `Params()` uploads after `Lay`, a checkpoint load or a host-side edit (pruning's masks, `Compact`), which mark the
+  region device-stale; anything that reads host state (`System.Value`, `g.Scalar`, a checkpoint save, a `Settlement`)
+  downloads first and syncs. The plan keeps one stale flag per region and side, so a read is never silently old.
+- **Who frees.** olang frees nothing by hand (olang docs/memory.md: everything lives in a scope and goes when it
+  closes; a destructor runs then). `Buf` and `Device` are `unique` with destructors (`cudaFree`; streams, handles and
+  the context), so device memory lives exactly as long as the plan holding the buffers, and `Close()` releases early
+  where a program wants it (decision 6 named this: "`unique` with destructors for ... device buffers"). The device is
+  opened in an outer scope than the plans using it, so buffers go before their context.
+- **Budget.** 8 GB: a 300M-parameter model with AdamW in F32 is 3.6 GB before activations; the plan states its device
+  bytes and refuses (`GpuError.Cuda` from the allocation, named) rather than spilling.
+
+**The backend interface.** The GPU entry points mirror the CPU kernels' signatures over `DMat` instead of `Mat`, and
+callers choose once, at `Plan`, never per element (decision 5): `Backend enum { Cpu, Gpu(dev mut Device&) }` held by
+the plan, matched per op.
+
+```olang
+# kernels/gpu/blas.olang - cuBLAS and cuBLASLt; row-major as the CPU's, so C = op(A) op(B) is cuBLAS's column-major
+# C^T = op(B)^T op(A)^T: the operands exchanged, m and n exchanged, the lds as they are
+fn Gemm<S, A>(d mut Device&, c mut DMat<S>&, a DMat<S>&, ta Bool, b DMat<S>&, tb Bool, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None)
+fn GemmBatch<S, A>(d mut Device&, c mut DBatch<S>&, a DBatch<S>&, ta Bool, b DBatch<S>&, tb Bool, alpha A = 1, beta A = 0)
+fn GemmI8(d mut Device&, c mut DMat<I32>&, a DMat<I8>&, b DMat<I8>&, scale Buf<F32>&, out mut DMat<F32>&)
+```
+
+- **GEMM** through `cublasLtMatmul` (one descriptor per product shape, made at `Plan` with its heuristic's algorithm
+  chosen then; `cublasGemmEx` for the first package): F32 with F32 compute (TF32 only where a plan asks: it changes
+  results beyond the CPU oracle's tolerance), BF16 and F16 storage with F32 compute, the result stored in C's type.
+  `Epilogue.Bias`/`BiasAct` map to cuBLASLt's `EPILOGUE_BIAS`, `RELU_BIAS`, `GELU_BIAS`; an act cuBLASLt lacks runs as
+  our element kernel after it. Mixed storage per operand (section 4.1's follow-ups, item 4) is cuBLASLt's per-matrix
+  types where it supports the pair, else the narrow operand is widened into a planned buffer first.
+- **INT8** through cuBLASLt (`CUBLAS_COMPUTE_32I`, `CUDA_R_8I` operands, I32 or F32 out with the per-column scale as
+  an alpha vector). cuBLAS's INT8 is signed on both sides; the CPU's `GemmI8` takes U8 activations with a zero point,
+  so the GPU quantizes activations to I8 (the zero point at 0) and the result differs from the CPU's in that rounding
+  only - tested against `GemmI8` on the dequantized products within one quantization step. cuBLAS wants k and the lds
+  multiples of 4: the padding `nn/quant` keeps already gives that (PROGRESS.md, "unpadded INT8 dot products").
+- **F8** waits: cuBLASLt's FP8 products on sm_89 need a toolkit newer than 12.0 (question G3 below).
+- **Element-wise and reductions**: `Act`, `ActGrad`, `RowSoftmax`, `RowLogSumExp`, `RowNormStats`/`RowNormApply`,
+  `RowMaxAbs`, `ColumnSums`, `Axpy`, AdamW's step - our kernels, one per op first, then fused chains (below). Their
+  approximations are the CPU's: `FastTanh`, `FastExp`, `FastGeluTanh` are emitted into the kernel text from the same
+  coefficients `kernels/elem` computes with `comptime`, so the GPU's error bound is the stated one.
+- **Attention** first as two `GemmBatch` and a softmax kernel (what the CPU does); cuDNN's fused attention or our own
+  is a later package, taken only if M6's numbers on the GPU say the unfused form is the bottleneck.
+- **Sparse, scan, conv** stay CPU-only until a model needs them on the GPU (cuSPARSE and cuDNN then); a plan with an
+  op the GPU lacks says so at `Plan` (`GpuError.Cuda(0, "no GPU form of ...")`), it never mixes devices silently.
+
+**The settle on the GPU.** `dyn`'s `Engine` keeps its structure (section 1.4): per sweep, each relaxing population's
+totals are its constant plus every connection's carry, then the rate step writes the other buffer and gives the
+residual. On the GPU a population's carries are one cuBLAS product each over **all** its rows (phases x batch at once:
+the CPU's chunks exist for its threads, the GPU wants the whole block), accumulating into `Total` with beta 1 after the
+constant is copied in, and the rate step is our first kernel (below). The residual's sup norm is kept as bits, as
+`neuron.RateStep` keeps it (an `atomicMax` on the unsigned pattern of `|r|`: exact, order-free, NaN above everything),
+into one device word per sweep. **The host does not wait each sweep**: it enqueues sweeps ahead and reads the residual
+words back every `Check` sweeps (pinned memory and an event, 4 by default, measured). Each sweep's step kernel first
+reads a device word holding the sweep that converged (or diverged); once it is set, later sweeps' steps do nothing, so
+the state is the one the CPU's `relax` keeps - the first within tolerance - and the host derives the buffer it is in from
+that sweep's parity. At most `Check - 1` sweeps' products are wasted. Anderson acceleration, Gauss-Seidel and spiking
+populations stay on the CPU in the first build (a plan asking for them on the GPU is refused at `Plan`); the learning
+rules' products (`Learner`'s EP estimate is two outer products a connection: `Gemm` with beta 1) and the optimizer
+step run on the device, so a lesson moves only the batch's inputs and labels up and its counts down.
+
+**Streams and synchronisation.** One compute stream per `Device`: everything a plan does is enqueued in program order
+on it, so no two of our kernels race by construction and no host-side join is needed. A second stream carries uploads
+of the next batch, ordered before its first use by an event, so a batch's transfer hides behind the last one's
+compute. The host waits only where it reads: `Sync`, a download, a residual check, the end of an epoch. CUDA graphs
+(capturing a sweep or a training step once and replaying it) are a later package, taken if launch overhead shows in
+M7/M1's profiles at batch 128 - a 784-128-10 settle's sweep is a handful of launches of a few microseconds each.
+
+**Errors.** Every library call's status is an olang error, `GpuError`, never a flag the caller checks: setup (`Open`,
+`Buf.Make`, compiling a kernel, `Plan`) gives it back at once (`? GpuError`, with the call's name and cuBLAS's or
+CUDA's own text from `cudaGetErrorString`, NVRTC's log for a compile). The hot path does not branch per call: the shim
+records the first non-success status in the `Device` and the next `Sync` (or download, or residual check) gives it
+back as the error, which is also where CUDA reports asynchronous faults. A program's `Plan(...)` and its loop's reads
+are where `try` meets them, as with shape errors (decision 1).
+
+**Our own kernels, and how they are compiled.** Three routes were weighed for the first one:
+
+| | route | for | against |
+|---|---|---|---|
+| a | **NVRTC**: CUDA C text in oann, compiled at `Plan` to PTX, loaded with `cuModuleLoadData` | in the package coming; compiled for the device present (sm_89) by NVIDIA's own front end; the text can be **specialized at `Plan`** - a fused chain of the plan's element ops, its sizes and act baked in as constants - which is exactly what our kernels are for; `cuda_fp16.h`/`cuda_bf16.h` types | the kernels are C, not olang (no generics, no `comptime` but our text generation); a compile at `Plan` (tens of ms each: cached on disk by the text's hash) |
+| b | **NVPTX from olang** (an olang target emitting `nvptx64-nvidia-cuda` IR, `llc-20` or the driver's JIT for PTX) | kernels in olang, generic over storage like the CPU's | olang builds for x86_64 and aarch64 only (`compiler/target.olang`: `Archs`, a target resolved by a clang probe and the runtime compiled for it); it needs kernel entry points, address spaces, thread-index intrinsics, shared memory, barriers, and a runtime-free subset - a compiler project of weeks before the first kernel runs |
+| c | **llc on a `.ll`** (hand-written or clang `-x cuda --cuda-device-only` output, PTX made at build time) | no runtime compiler | IR by hand is unreviewable; clang's CUDA mode wants a CUDA installation layout and libdevice the Ubuntu package may not lay out as clang expects; fixed at build time, so no plan-time fusion |
+
+**Recommended: (a) NVRTC.** What our kernels must do - fuse the element work a plan has, at its sizes and types - is
+text generation at `Plan`, which NVRTC compiles and nothing else here does without a compiler project. Kernel sources
+live in `kernels/gpu/src/*.cu` as text templates read by `kernels/gpu/kern.olang` (`Kernel.Compile(dev, text, name)
+Kernel ? GpuError`, `Launch(d, k, grid, block, args ...U64)`), the PTX cached under `$OLANG_CACHE/oann-ptx/HASH.ptx`.
+(b) is revisited if our own kernels grow past a handful of templates or want olang's generics; (c) is the fallback
+if NVRTC fails on this machine.
+
+**The first own kernel: the settle's rate step**, `RateStep` fused: for every element of a population's rows,
+`r = total - u`, the residual's bits into the sweep's word, `u2 = u + dt r`, `s2 = rho(u2)` (Linear, Tanh by `FastTanh`'s
+coefficients, HardSigmoid, Relu, LifRate), retired units held at rest (the population's retired mask, uploaded with the plan) - one read of
+three arrays and one write of two, where the unfused form would launch three kernels and read `u2` twice. It is the
+first because the settle is oann's own (cuDNN has nothing for it), the benchmark that decides the GPU's worth for
+settling (mnistlearn) runs it every sweep, and it is small enough to be checked bit for bit against `neuron.RateStep`
+for Linear, Relu and HardSigmoid and within `FastTanh`'s stated error for Tanh. The element kernels for `ad` (act,
+softmax, norms, AdamW) follow from the same template machinery.
+
+**Testing: the CPU kernels are the oracle.** Every GPU entry point has a test that runs the CPU kernel and the GPU one
+on the same inputs (random, seeded; the shapes of the CPU tests plus odd sizes and offset views) and compares:
+products within `k * eps(A) * max|a||b|` per element (cuBLAS sums in another order), element kernels within their
+approximation's stated error (exact for the exact ones), the settle's sweeps to tolerance equal and its fixed point
+within the tolerance. Each GPU result is also run twice and must be identical (one stream, no split-K atomics in the
+algorithms chosen: cuBLASLt's preference `REDUCTION_SCHEME_NONE`), so a GPU run is reproducible on one GPU. The tests
+live in `kernels/gpu/*.olang`, `dyn/gpu_test.olang`, `ad/gpu_test.olang`, run by `make gputest` (`-define Gpu=true`),
+and skip with a line saying so when `Open` finds no device. Allocation pins (`assert not ... .Allocates`) cover the GPU
+step and sweep as they cover the CPU's.
+
+**What decides what pays** (each measured CPU against GPU on this machine, interleaved, medians, a run record; GPU
+times include the per-batch transfers):
+
+| | measure | decides |
+|---|---|---|
+| G-M1 | GEMM GFLOPS, F32/BF16/INT8, the MLP's, the settle's (128-row blocks of 784x128, 128x10) and the transformer's shapes, CPU `kernels/gemm` against cuBLAS | the size below which a product stays on the CPU (a plan places per op family, not per call) |
+| G-M2 | `mnistlearn` (`make mnistlearn ARGS="1 60000 128 32 1"`): epoch time, sweeps a lesson, test accuracy, CPU 4 threads against GPU, batch 32, 128 and 512 | whether the settle runs on the GPU, and at what batch; `Check` (sweeps between residual reads) |
+| G-M3 | the rate-step kernel fused against three unfused launches; launches per sweep and their share of the sweep | whether CUDA graphs and further fusion are worth a package |
+| G-M4 | `mlpad` (M1) and the character transformer's step (M2) on the GPU | whether `ad` gets the GPU's element kernels and attention next |
+| G-M5 | INT8 cached decoding (M12's `bench/int8decode`) on cuBLASLt | whether `nn/quant` gets a GPU path |
+
+The 784-128-10 settle is small for a GPU (a sweep at batch 128 is about 30 MFLOP): G-M2 may well show the CPU ahead at
+batch 128 and the GPU ahead from 512 or at hidden sizes of 1024 and up - the benchmark sweeps both, and the answer is
+written into PROGRESS.md before any further settle work goes to the GPU.
+
+**Questions for the user (GPU).**
+
+- **G1. GPU results are not bit-identical to the CPU's.** Decision 4 makes results identical for every thread count;
+  cuBLAS sums in its own order, so a GPU run agrees with the CPU within stated tolerances and is identical run to run on
+  one GPU, not bit for bit with the CPU. *Recommendation:* accept that, as stated above, and keep the CPU as the
+  reference implementation that defines the numbers.
+- **G2. The compile route for our kernels** (question 1 left it to the first kernel). *Recommendation:* NVRTC from
+  CUDA C templates (route a); an NVPTX target in olang only if our kernels outgrow templates.
+- **G3. Ubuntu's CUDA 12.0 or NVIDIA's newer toolkit.** 12.0 is enough for everything above but FP8 products on sm_89
+  (cuBLASLt's FP8 on Ada came after 12.0 - to be confirmed on install) and CUDA graphs' conditional nodes (12.3+, which
+  would let a whole settle run without the host). *Recommendation:* start on 12.0; install NVIDIA's toolkit when F8 on
+  the GPU or a host-free settle is the next step.
+- **G4. CUDA as an optional dependency.** The GPU is behind `-define Gpu=true`, so oann without CUDA builds and tests
+  as today. *Recommendation:* keep it optional, `make test` CPU only, `make gputest` on machines with the GPU.
+
+The packages are section 4.4.
+
 ## 2. Module map
 
 | now | verdict | becomes |
@@ -920,7 +1115,8 @@ fn main() ? {
    only when we gain something from it is the way").** NVIDIA's libraries (cuBLAS, cuDNN) through C imports are the
    base; a kernel of our own is written only where it measurably gains (fused element work, the settle's small blocks,
    attention variants cuDNN lacks). How our own GPU kernels are compiled (an NVPTX target in olang, or CUDA C through a
-   C import) is decided when the first one is needed, by what that kernel needs. Meanwhile CPU only.
+   C import) is decided when the first one is needed, by what that kernel needs. How it works: section 1.10; the packages:
+   section 4.4.
 2. **Where research models live - decided (the user, 2026-11-15: "you can have the amendments to settling networks ...
    in oann ... what I want in oagent is the bootstrapping AGI model that we are building, basically, make the framework
    public, hide the weights (and similarly)").** oann is the public framework, everything general in it: tensors,
@@ -1147,3 +1343,27 @@ and 22 and docs/settling.md 5) on the same machine and load, interleaved, median
 | M13 | 10M GPT and SSM on TinyStories: tokens per second, loss at a fixed token budget | new |
 | M14 | sweeps to tolerance with and without an amortizer | new (C2: section 1.4, "As built (C2)") |
 | M15 | build time of `make test` and of one model | round 2's |
+
+### 4.4 The GPU packages (section 1.10)
+
+Each one agent, in order; each needs the one before it unless it says otherwise. All build with `-define Gpu=true` and
+test with `make gputest`; `make test` stays CPU only and green.
+
+| | package | files | acceptance | size |
+|---|---|---|---|---|
+| GP1 | **bindings + a GEMM through cuBLAS checked against kernels/gemm** | `kernels/gpu/cuda.c`, `kernels/gpu/device.olang` (`Device`, `Buf`, `DMat`, `GpuError`, uploads and downloads), `kernels/gpu/blas.olang` (`Gemm` by `cublasGemmEx`), makefile's `gputest` | the CUDA headers import through the `.c` module (or the olang package OP1 is filed with the failing declaration); `Open` names the device; upload then download is identity; `Gemm` F32 and BF16 x every transpose x offset views x odd sizes against `kernels/gemm.Gemm` within `k eps max|a||b|`, run twice identical; a `GpuError` from a bad call carries cuBLAS's text; G-M1's first table (CPU against cuBLAS on the MLP's and settle's shapes) | S |
+| GP2 | our kernels | `kernels/gpu/kern.olang`, `kernels/gpu/src/rate.cu`, `kernels/gpu/src/elem.cu` | NVRTC compiles at plan time, PTX cached by hash and reused; a launch's argument packing tested on `Axpy`; **the rate step** against `neuron.RateStep` on every `Rho`: bit for bit for Linear, Relu, HardSigmoid, within `FastTanh`'s stated error for Tanh; the residual word equals the CPU's sup norm (NaN included); a compile error gives NVRTC's log as `GpuError.Nvrtc`; G-M3 | M |
+| GP3 | cuBLASLt | `kernels/gpu/blas.olang` | descriptors and algorithms chosen at plan time, `REDUCTION_SCHEME_NONE`; `Epilogue.Bias`/`BiasAct`; per-operand storage (BF16/F16 weights under F32) against `kernels/gemm`; `GemmBatch` (attention's shapes, causal by a mask kernel if cuBLASLt has none); `GemmI8` with signed activations against `kernels/gemm.GemmI8` within a quantization step; workspace fixed at `Open`, nothing allocated per call | M |
+| GP4 | the settle on the GPU | `dyn/settle.olang`, `dyn/system.olang`, `dyn/learn.olang` (a `Backend` at `Plan`), `dyn/gpu_test.olang` | needs GP2 (GP3 for low-rank or INT8 links only). Dense, Symmetric and LowRank connections; device mirrors of params and columns; sweeps enqueued ahead with the converged word; `Settle` and `Nudged` against the CPU engine on the 784-128-10 system: the same sweeps to tolerance, the fixed point within the tolerance; EP's update and AdamW on the device against the CPU's; refuses Anderson, Gauss-Seidel, spiking and sparse links at `Plan` by name; allocation pins on a GPU sweep and lesson | L |
+| GP5 | the measure that decides | `examples/mnist_learn.olang` (a `gpu` argument), `bench/`, PROGRESS.md | G-M2: epoch time, sweeps a lesson and accuracy, CPU 4 threads against GPU at batch 32, 128, 512 and hidden 128 and 1024; `Check` 1, 4, 16; the verdict (where the settle runs, from which batch) written down | S |
+| GP6 | `ad` on the GPU | `ad/graph.olang`, `ad/ops.olang`, `nn/optim.olang`, `kernels/gpu/src/elem.cu`, `ad/gpu_test.olang` | needs GP2, GP3. Element kernels (act and its gradient, softmax, log-sum-exp, norms, AdamW) against `kernels/elem`; `Graph.Plan` on the GPU, forward and backward of the MLP and the character transformer against the CPU's within tolerance; G-M4 (M1's MLP epoch, M2's transformer step) | L |
+| GP7 | what the measures ask for | as the measure names | only where G-M2 to G-M5 show the gain: CUDA graphs for a sweep or step, fused element chains generated at `Plan`, cuDNN or our attention, INT8 decoding (G-M5) | - |
+
+**olang packages for this.** None blocks GP1 as far as can be seen before the headers are installed; each is filed
+only with the failing case as its evidence.
+
+| | package | evidence | needed by |
+|---|---|---|---|
+| OP1 | C imports of the CUDA headers: whatever X18 cannot translate in `cuda_runtime_api.h`, `cublas_v2.h`, `cublasLt.h`, `nvrtc.h` must be left out (X18: "a declaration of no form above ... left out"), not an error | not yet tried: the headers arrive with the package; GP1's first step is a `.c` module including them | GP1, only if it fails |
+| OP2 | a `CVoid?&` from an address and an offset (or a `float *` parameter taking a `CVoid?&`) | X18 makes `const float *` an `Array<F32>` and X22 lets a `CVoid?&` stand only for struct pointers; there is no arithmetic on a `CVoid?&` - so a device view at an offset cannot reach `cublasSgemm` directly | nothing: the shim's `U64` addresses work around it; worth doing only if more of oann binds C over device memory |
+| OP3 | an NVPTX target (kernels written in olang) | `compiler/target.olang`: `Archs` is `x86_64` and `aarch64`, the target resolved by a clang probe for a Linux triple and the runtime compiled for it; no kernel entry points, address spaces or thread intrinsics | only if G2 is answered "olang kernels", or our kernels outgrow NVRTC templates |
