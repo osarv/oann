@@ -366,6 +366,28 @@ are constant and the evaluator can decide the bound.
     `Contraction()`: the activations' largest slope times the coupling's largest singular value (power iteration on
     W^T W through the connections' own products, `Engine.Spectral`): the Euclidean-norm kappa, read directly; at most
     `Gain()` for a symmetric coupling.
+    **The certificate's norm** (wt-oanncert, 2026-11-17): `System.Bound` is `Norm.Sup` (the default: the gain) or
+    `Norm.Spectral`, and `Certify`, `Restrain`, `Rate`, `LessonTolerance` and `BudgetFor` hold kappa (`Kappa()`) in it.
+    Spectral: `Certify` scales every recurrent connection by one factor to the bound (found to 1e-9 relative),
+    `Restrain` by the one factor that brings it back (the norm is not a per-unit quantity, so not per connection), and
+    the power iteration is warm-started from the vector the engine keeps (laid out by `Ready`; nothing allocates).
+    Against settling.md 1.2: with a 1-Lipschitz `rho`, `|T(u) - T(v)|_2 <= L |W|_2 |u - v|_2`, so `kappa_2 = L |W|_2 < 1`
+    makes the map a contraction in the Euclidean norm - one fixed point, whatever sweeps reach it. What depends on the
+    norm, precisely: (i) the step rate, the residual's decay and the distance bound `|v - v*| <= |r| / (1 - kappa)` hold
+    in the norm of the certificate; the qualifying test stays unit by unit (`max |r_i| <= tau`, the refusal test needs
+    no certificate at all), so under the spectral certificate a qualified state is only within
+    `sqrt(n) tau / (1 - kappa)` of `v*` per unit (n relaxing units a row) - `LessonTolerance` divides by `sqrt(n)` to
+    keep 1.4's bound, and the cold sweep count gains `ln sqrt(n) / ln(1 / q)` (the budgets' factor 2 covers it);
+    (ii) the nudged step `dt_beta` is norm-free for the squared error (a diagonal matrix has norm `max |d_i|` in both),
+    and for the cross-entropy the softmax force's off-diagonal terms are uncovered in either norm (1.2's caveat) -
+    where the spectral certificate allows large single weights they decide; (iii) Gauss-Seidel's rate is proven for
+    the sup-norm certificate, not for the Euclidean one (only the fixed point's uniqueness carries over); (iv) EP's
+    theorem (Scellier & Bengio 2017) needs symmetry, a stable fixed point and converged phases, no norm; (v) the board's
+    range argument (4.2) bounds a potential by the incoming mass, so the board stays on the sup norm (`|W[e]| <= |W|_2`
+    still bounds every single weight). **The default stays `Norm.Sup`** (PROGRESS.md, "The certificate's norm"): with
+    the tolerance divided by `sqrt(n)` the spectral certificate's nudged phases are refused (7 lessons over 2 seeds) and
+    lessons take 42-66 sweeps against 32; at the sup-norm tolerance it would beat the uncertified run (0 refused, 29
+    sweeps a lesson, 9.6 an answer, accuracy level), but that drops the per-unit distance bound.
 
 11. **Allocation-free, pinned while compiling** (top-level `assert not f.Allocates`, S17a/G42): every population's
     step (rate, spiking), a readout's force, the window's end, cold and warm starts, committing a settle, a settle's
