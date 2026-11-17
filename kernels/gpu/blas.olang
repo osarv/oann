@@ -53,6 +53,361 @@ fn Gemm<S, A>(d mut device.Device&, c mut device.DMat<S>&, a device.DMat<S>&, ta
     cu.oann_gemm(d.Status(), d.Blas(), tb, ta, I32(n), I32(m), I32(k), F64(alpha), b.Addr(0, 0), t, I32(b.Ld), a.Addr(0, 0), t, I32(a.Ld), F64(beta), c.Addr(0, 0), t, I32(c.Ld), computeType(z))
 }
 
+# ---- cuBLASLt: products planned once, run many times (GP3) ----
+#
+# A Product is one product's shape and storage fixed at plan time: cuBLASLt's matmul descriptor, the three layouts and
+# the algorithm its heuristic chose for them, never one with a split-K reduction (REDUCTION_SCHEME_NONE: every element
+# one sum in one order, so run twice it is the same bit for bit and no partial sum is rounded to a narrow C). Run makes
+# nothing and allocates nothing: the descriptors are the plan's, the workspace the Device's (WorkBytes, fixed at Open).
+# A plan is made from views at the addresses it will run on - it is chosen for the alignment they share - and Run is
+# given views of the same shapes and lds (unchecked, as kernels/gemm checks nothing); a run on an address less aligned
+# than the plan's is refused and is the next Sync's error.
+
+# what a planned product does to each element of C once it is summed, as kernels/gemm's Epilogue does: nothing; a bias
+# added, one value a column of C (b: a 1 x n view, stored in C's type, which is cuBLASLt's bias type); a bias added and
+# an activation applied (b with no columns adds none). cuBLASLt has Relu and GeluTanh (its GELU is the tanh form: 5e-6
+# from it on [-4, 4], 5e-4 from the exact one); a plan asking for another act is refused, naming it - those are the
+# element kernels' (GP2)
+type Epilogue<S> enum {
+    None
+    Bias(b device.DMat<S>)
+    BiasAct(b device.DMat<S>, act mat.Act)
+}
+
+# how a plan sums, chosen at plan time. Exact: in the storage's own precision (F32 for BF16, F16 and F32; F64 for F64),
+# no split-K, so every element is one sum in F32 rounded once to C's type and a run is the same bit for bit. Fast:
+# split-K with any of cuBLASLt's reductions allowed - for BF16 or F16 storage the parts may be added in C's type
+# (cuBLAS's default reduced-precision reduction), and a run need not repeat bit for bit. FastBF16 and FastTF32, for F32
+# storage: the operands rounded to BF16 or TF32 on their way into the tensor cores, summed in F32
+# (CUBLAS_COMPUTE_32F_FAST_16BF, _TF32), split-K allowed as for Fast. The fast ones are beyond the CPU oracle's
+# tolerance by their roundings; each has its own stated bound (tests)
+type Sums enum {
+    Exact
+    Fast
+    FastBF16
+    FastTF32
+}
+
+# cuBLASLt's mask of the split-K reductions a plan summing so allows
+fn reductionOf(sums Sums) I32 {
+    return match sums {
+        case Sums.Exact: cu.CUBLASLT_REDUCTION_SCHEME_NONE
+        case _: cu.CUBLASLT_REDUCTION_SCHEME_MASK
+    }
+}
+
+# what a plan chose, in cuBLASLt's words: the algorithm's id and tile, its split-K parts and reduction scheme (1 and 0:
+# none), the workspace it takes, how many algorithms the heuristic offered, the alignment (bytes) it chose for, which
+# of the offered it is (0: the heuristic's first) and the ns a product took where Tune timed them (else 0)
+type Choice struct() {
+    Algo I64 = 0
+    Tile I64 = 0
+    SplitK I64 = 0
+    Reduction I64 = 0
+    Work I64 = 0
+    Offered I64 = 0
+    Align I64 = 0
+    Ns I64 = 0
+    Index I64 = 0
+}
+
+fn Choice.Of(info Array<I64>&) Choice {
+    ch := Choice()
+    ch.Algo, ch.Tile, ch.SplitK, ch.Reduction = info[0], info[1], info[2], info[3]
+    ch.Work, ch.Offered, ch.Align, ch.Ns, ch.Index = info[4], info[5], info[6], info[7], info[8]
+    return ch
+}
+
+# "algorithm A, tile T, split-K S, reduction R, W bytes of workspace, 1 of N offered, aligned to B"
+fn (ch Choice&) Str() String {
+    return "algorithm " + $ch.Algo + ", tile " + $ch.Tile + ", split-K " + $ch.SplitK + ", reduction " + $ch.Reduction +
+        ", " + $ch.Work + " bytes of workspace, number " + $(ch.Index + 1) + " of " + $ch.Offered + " offered, aligned to " + $ch.Align
+}
+
+# cuBLAS's data type for storage S, the integers' included
+fn ltType<S>(z S) I32 {
+    return match S {
+        case I8: cu.CUDA_R_8I
+        case I32: cu.CUDA_R_32I
+        case _: dataType(z)
+    }
+}
+
+# cuBLASLt's epilogue for e and its bias's address (0 none); an act cuBLASLt has no form of is an error naming it
+fn epilogueOf<S>(e Epilogue<S>&) I32, U64 ? device.GpuError {
+    match e {
+        case Epilogue.None: return cu.CUBLASLT_EPILOGUE_DEFAULT, U64(0)
+        case Epilogue.Bias(b) {
+            if b.Cols == 0: return cu.CUBLASLT_EPILOGUE_DEFAULT, U64(0)
+            return cu.CUBLASLT_EPILOGUE_BIAS, b.Addr(0, 0)
+        }
+        case Epilogue.BiasAct(b, act) {
+            some := b.Cols > 0
+            bias U64 = b.Addr(0, 0) if some else 0
+            code I32 = match act {
+                case mat.Act.Relu: cu.CUBLASLT_EPILOGUE_RELU_BIAS if some else cu.CUBLASLT_EPILOGUE_RELU
+                case mat.Act.GeluTanh: cu.CUBLASLT_EPILOGUE_GELU_BIAS if some else cu.CUBLASLT_EPILOGUE_GELU
+                case _: -1
+            }
+            if code < 0: error device.GpuError.Cuda(0, "no GPU form of the epilogue's " + $act + ": cuBLASLt has Relu and GeluTanh, the rest are element kernels (GP2)")
+            return code, bias
+        }
+    }
+}
+
+# a matrix's widening into F32 where its storage is narrower than the product's: rows x cols of the row-major view, in a
+# planned buffer of its own (contiguous), by cublasLtMatrixTransform - BF16 and F16 to F32 exactly
+type widening struct() {
+    plan U64 = 0
+    buf U64 = 0
+}
+
+fn widen<S>(w mut widening&, m device.DMat<S>&) ? device.GpuError {
+    z S
+    out := Array<U64>(1)
+    st := cu.oann_widen_plan(out, dataType(z), I32(m.Cols), I32(m.Rows), m.Ld, cu.CUDA_R_32F)
+    w.plan = out[0]
+    try device.CheckCublas(st, "cublasLtMatrixTransformDescCreate (widening)")
+    bytes := U64((m.Rows * m.Cols).Max(1) * 4)
+    st = cu.oann_malloc(out, bytes)
+    try device.CheckCuda(st, "cudaMalloc of " + $bytes + " bytes (a widened operand)")
+    w.buf = out[0]
+}
+
+fn (w widening&) free() {
+    if w.plan != 0: cu.oann_widen_free(w.plan)
+    if w.buf != 0: cu.oann_free(w.buf)
+}
+
+# the address a run reads an operand at: its widened copy, made now, where the plan widens it
+fn (w widening&) at(d mut device.Device&, addr U64) U64 {
+    if w.plan == 0: return addr
+    cu.oann_widen_run(d.Status(), d.Lt(), w.plan, addr, w.buf, d.Stream())
+    return w.buf
+}
+
+# C (SC) = alpha op(A) (SA) op(B) (SB) + beta C, then the epilogue, planned once. Storage: F32, BF16, F16 or F64, per
+# operand. Where a and b agree, cuBLASLt multiplies them as stored (BF16 or F16 summed in F32, C in its own type or F32);
+# where they differ, the narrower is widened into F32 first, into a buffer of the plan's (cuBLASLt multiplies no mixed
+# pair but FP8's), every run - BF16 or F16 weights under F32 activations cost one pass over the weights. Batched (one
+# plan for every matrix of a DBatch): count matrices a call, and where the batch's two strides do not fold into one,
+# one call for each group (or member)
+type Product<SC, SA, SB> unique struct(dev device.Device&) {
+    dev
+    lt U64 = 0
+    wa widening = widening()
+    wb widening = widening()
+    outer I64 = 1      # calls a run makes, and the strides (bytes) between them
+    oa I64 = 0
+    ob I64 = 0
+    oc I64 = 0
+    Chosen Choice = Choice()
+} destruct {
+    if lt != 0: cu.oann_lt_free(lt)
+    wa.free()
+    wb.free()
+}
+
+# the compute type and the scalars' type of a product of S storage summed as asked
+fn computeOf<S>(z S, sums Sums) I32, I32 {
+    match S {
+        case F64: return cu.CUBLAS_COMPUTE_64F, cu.CUDA_R_64F
+        case F32 {
+            if sums == Sums.FastBF16: return cu.CUBLAS_COMPUTE_32F_FAST_16BF, cu.CUDA_R_32F
+            if sums == Sums.FastTF32: return cu.CUBLAS_COMPUTE_32F_FAST_TF32, cu.CUDA_R_32F
+            return cu.CUBLAS_COMPUTE_32F, cu.CUDA_R_32F
+        }
+        case _: return cu.CUBLAS_COMPUTE_32F, cu.CUDA_R_32F
+    }
+}
+
+# the plan of c = alpha op(a) op(b) + beta c then epi, for views of these shapes at these addresses: the algorithm
+# chosen now. GpuError.Cublas(15, "cublasLtMatmulAlgoGetHeuristic ...") where cuBLASLt has none for the shapes, types
+# and alignment; GpuError.Cuda(0, ...) for an epilogue it has no form of
+fn Product<SC, SA, SB>.Plan(d mut device.Device&, c device.DMat<SC>&, a device.DMat<SA>&, ta Bool, b device.DMat<SB>&, tb Bool, epi Epilogue<SC> = Epilogue<SC>.None, sums Sums = Sums.Exact) Product<SC, SA, SB> ? device.GpuError {
+    p := Product<SC, SA, SB>(d)
+    m, n := c.Rows, c.Cols
+    k I64 = a.Rows if ta else a.Cols
+    if m == 0 or n == 0: return p
+    code, bias := try epilogueOf(epi)
+    zc SC
+    za SA
+    zb SB
+    at, bt := dataType(za), dataType(zb)
+    aa, ab := a.Addr(0, 0), b.Addr(0, 0)
+    lda, ldb := a.Ld, b.Ld
+    if at != bt {
+        if at != cu.CUDA_R_32F {
+            try widen(p.wa, a)
+            aa, lda, at = p.wa.buf, a.Cols, cu.CUDA_R_32F
+        }
+        if bt != cu.CUDA_R_32F {
+            try widen(p.wb, b)
+            ab, ldb, bt = p.wb.buf, b.Cols, cu.CUDA_R_32F
+        }
+    }
+    compute, scale := computeOf(zc, sums)
+    if at == cu.CUDA_R_32F and bt == cu.CUDA_R_32F: compute, scale = computeOf(F32(0), sums)
+    info := Array<I64>(9)
+    out := Array<U64>(1)
+    # cuBLASLt is column-major: C^T = op(B)^T op(A)^T, the operands and m, n exchanged (as Gemm above)
+    st := cu.oann_lt_plan(out, d.Lt(), compute, scale, tb, ta, I32(n), I32(m), I32(k), bt, ldb, 0, ab, at, lda, 0, aa, dataType(zc), c.Ld, 0, c.Addr(0, 0), 1, reductionOf(sums), code, bias, 0, U64(device.WorkBytes), info)
+    try device.CheckCublas(st, "cublasLtMatmulAlgoGetHeuristic for " + $m + "x" + $n + "x" + $k + " ta " + $ta + " tb " + $tb)
+    p.lt = out[0]
+    p.Chosen = Choice.Of(info)
+    return p
+}
+
+# how a batch's matrices are reached: count of them a call at stride (elements) apart, outer calls at ostride (elements)
+fn foldOf<S>(x device.DBatch<S>&, groupsInner Bool) I64, I64 {
+    if groupsInner: return x.GroupStride, x.MemberStride
+    return x.MemberStride, x.GroupStride
+}
+
+# whether the batch's matrices are count matrices one stride apart with members inner (groupsInner false) or groups
+fn folds<S>(x device.DBatch<S>&, groupsInner Bool) Bool {
+    if groupsInner: return x.Members == 1 or x.MemberStride == x.Groups * x.GroupStride
+    return x.Groups == 1 or x.GroupStride == x.Members * x.MemberStride
+}
+
+# the plan of c[g, m] = alpha op(a[g, m]) op(b[g, m]) + beta c[g, m] for every matrix of the batches (one Groups and
+# Members): kernels/gemm's GemmBatch, Triangle.Full - cuBLASLt has no triangular product (its FILL_MODE is refused), so a
+# causal product is the full one: the scores' upper triangle computed and masked by the softmax that reads them, and a
+# causal P V multiplies P's zeros (GP2/GP6's softmax kernel writes them). a and b in one storage
+fn Product<SC, SA, SB>.PlanBatch(d mut device.Device&, c device.DBatch<SC>&, a device.DBatch<SA>&, ta Bool, b device.DBatch<SB>&, tb Bool, sums Sums = Sums.Exact) Product<SC, SA, SB> ? device.GpuError {
+    p := Product<SC, SA, SB>(d)
+    m, n := c.Rows, c.Cols
+    k I64 = a.Rows if ta else a.Cols
+    count I64 = c.Groups * c.Members
+    if m == 0 or n == 0 or count == 0: return p
+    zc SC
+    za SA
+    zb SB
+    if dataType(za) != dataType(zb): error device.GpuError.Cuda(0, "no GPU form of a batched product of two storages: widen one first")
+    # the matrices a call takes: all of them where every operand's two strides fold into one, else the larger of the
+    # groups and the members, a call for each of the other
+    inner, outer := count, I64(1)
+    groupsInner := c.Members == 1
+    if folds(c, false) and folds(a, false) and folds(b, false) { groupsInner = false }
+    else if folds(c, true) and folds(a, true) and folds(b, true) { groupsInner = true }
+    else {
+        groupsInner = c.Groups >= c.Members
+        if groupsInner { inner, outer = c.Groups, c.Members }
+        else { inner, outer = c.Members, c.Groups }
+    }
+    sa, oa := foldOf(a, groupsInner)
+    sb, ob := foldOf(b, groupsInner)
+    sc, oc := foldOf(c, groupsInner)
+    p.outer = outer
+    p.oa, p.ob, p.oc = oa * SA.Size, ob * SB.Size, oc * SC.Size
+    strides U64 = U64(sa * SA.Size) | U64(sb * SB.Size) | U64(sc * SC.Size)
+    if outer > 1: strides = strides | U64(p.oa) | U64(p.ob) | U64(p.oc)
+    compute, scale := computeOf(zc, sums)
+    info := Array<I64>(9)
+    out := Array<U64>(1)
+    st := cu.oann_lt_plan(out, d.Lt(), compute, scale, tb, ta, I32(n), I32(m), I32(k), dataType(zb), b.Ld, sb, b.Data.Addr(b.Off), dataType(za), a.Ld, sa, a.Data.Addr(a.Off), dataType(zc), c.Ld, sc, c.Data.Addr(c.Off), I32(inner), reductionOf(sums), cu.CUBLASLT_EPILOGUE_DEFAULT, 0, strides, U64(device.WorkBytes), info)
+    try device.CheckCublas(st, "cublasLtMatmulAlgoGetHeuristic for a batch of " + $count + " " + $m + "x" + $n + "x" + $k)
+    p.lt = out[0]
+    p.Chosen = Choice.Of(info)
+    return p
+}
+
+# c = alpha op(a) op(b) + beta c then the plan's epilogue, on views of the plan's shapes: enqueued on d's compute stream,
+# its failure the next Sync's error. beta = 0 never reads c
+fn (p Product<SC, SA, SB>&) Run(d mut device.Device&, c mut device.DMat<SC>&, a device.DMat<SA>&, b device.DMat<SB>&, alpha F64 = 1, beta F64 = 0) {
+    if p.lt == 0: return
+    aa := p.wa.at(d, a.Addr(0, 0))
+    ab := p.wb.at(d, b.Addr(0, 0))
+    cu.oann_lt_run(d.Status(), d.Lt(), p.lt, alpha, beta, ab, aa, c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
+}
+
+# times every algorithm the heuristic offered for the plan on these views, reps products each, and keeps the fastest
+# (Chosen says which, and its ns): a plan's tuning, once, where its operands are at hand. c is overwritten (alpha 1,
+# beta 0); widened operands are widened once first
+fn (p mut Product<SC, SA, SB>&) Tune(d mut device.Device&, c mut device.DMat<SC>&, a device.DMat<SA>&, b device.DMat<SB>&, reps I64 = 20) ? device.GpuError {
+    if p.lt == 0: return
+    aa := p.wa.at(d, a.Addr(0, 0))
+    ab := p.wb.at(d, b.Addr(0, 0))
+    try d.Sync()
+    info := Array<I64>(9)
+    st := cu.oann_lt_tune(d.Lt(), p.lt, ab, aa, c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info)
+    try tuned(st)
+    p.Chosen = Choice.Of(info)
+}
+
+# the batched plan's Tune
+fn (p mut Product<SC, SA, SB>&) TuneBatch(d mut device.Device&, c mut device.DBatch<SC>&, a device.DBatch<SA>&, b device.DBatch<SB>&, reps I64 = 20) ? device.GpuError {
+    if p.lt == 0: return
+    try d.Sync()
+    info := Array<I64>(9)
+    st := cu.oann_lt_tune(d.Lt(), p.lt, b.Data.Addr(b.Off), a.Data.Addr(a.Off), c.Data.Addr(c.Off), I32(p.outer), p.ob, p.oa, p.oc, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info)
+    try tuned(st)
+    p.Chosen = Choice.Of(info)
+}
+
+# oann_lt_tune's status: CUDA's negated, else cuBLAS's
+fn tuned(st I32) ? device.GpuError {
+    if st < 0: try device.CheckCuda(-st, "tuning a cuBLASLt plan")
+    try device.CheckCublas(st, "tuning a cuBLASLt plan")
+}
+
+# every matrix of the batches, as PlanBatch planned: GemmBatch on the device
+fn (p Product<SC, SA, SB>&) RunBatch(d mut device.Device&, c mut device.DBatch<SC>&, a device.DBatch<SA>&, b device.DBatch<SB>&, alpha F64 = 1, beta F64 = 0) {
+    if p.lt == 0: return
+    cu.oann_lt_run(d.Status(), d.Lt(), p.lt, alpha, beta, b.Data.Addr(b.Off), a.Data.Addr(a.Off), c.Data.Addr(c.Off), I32(p.outer), p.ob, p.oa, p.oc, d.Work(), U64(device.WorkBytes), d.Stream())
+}
+
+# ---- INT8 ----
+
+# out = scale[j] c, c = a b^T, planned once: signed activations a (m x k) times signed weights b (n x k, a row per
+# output, as kernels/gemm's GemmI8 reads them), summed in I32 by cuBLASLt's integer tensor cores (CUBLAS_COMPUTE_32I,
+# exact), the accumulators kept in c. cuBLAS's INT8 is signed on both sides, so the activations are quantized to I8
+# with the zero point at 0 (the CPU's are U8 with one): the result differs from the CPU's in that rounding only.
+# out is a second product of the same operands summed in F32 (cuBLASLt converts no I32 matrix to F32, and scales no F32
+# result by a vector: its per-row alpha is for I8 results only), then scaled per output (cublasSdgmm) - exact while a
+# sum's magnitude stays under 2^24, within a few units of F32 past it. An element kernel dequantizing c (GP2) would
+# replace the second product. cuBLASLt wants k and the lds multiples of 4 (the padding nn/quant keeps gives that)
+type ProductI8 unique struct(dev device.Device&) {
+    dev
+    exact U64 = 0
+    float U64 = 0
+    n I64 = 0
+    m I64 = 0
+    Exact Choice = Choice()
+    Scaled Choice = Choice()
+} destruct {
+    if exact != 0: cu.oann_lt_free(exact)
+    if float != 0: cu.oann_lt_free(float)
+}
+
+fn ProductI8.Plan(d mut device.Device&, c device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, out device.DMat<F32>&) ProductI8 ? device.GpuError {
+    p := ProductI8(d)
+    m, n, k := a.Rows, b.Rows, a.Cols
+    if m == 0 or n == 0: return p
+    p.m, p.n = m, n
+    info := Array<I64>(9)
+    h := Array<U64>(1)
+    shape := $m + "x" + $n + "x" + $k
+    st := cu.oann_lt_plan(h, d.Lt(), cu.CUBLAS_COMPUTE_32I, cu.CUDA_R_32I, true, false, I32(n), I32(m), I32(k), cu.CUDA_R_8I, b.Ld, 0, b.Addr(0, 0), cu.CUDA_R_8I, a.Ld, 0, a.Addr(0, 0), cu.CUDA_R_32I, c.Ld, 0, c.Addr(0, 0), 1, cu.CUBLASLT_REDUCTION_SCHEME_NONE, cu.CUBLASLT_EPILOGUE_DEFAULT, 0, 0, U64(device.WorkBytes), info)
+    try device.CheckCublas(st, "cublasLtMatmulAlgoGetHeuristic for INT8 " + shape + " in I32")
+    p.exact = h[0]
+    p.Exact = Choice.Of(info)
+    st = cu.oann_lt_plan(h, d.Lt(), cu.CUBLAS_COMPUTE_32F, cu.CUDA_R_32F, true, false, I32(n), I32(m), I32(k), cu.CUDA_R_8I, b.Ld, 0, b.Addr(0, 0), cu.CUDA_R_8I, a.Ld, 0, a.Addr(0, 0), cu.CUDA_R_32F, out.Ld, 0, out.Addr(0, 0), 1, cu.CUBLASLT_REDUCTION_SCHEME_NONE, cu.CUBLASLT_EPILOGUE_DEFAULT, 0, 0, U64(device.WorkBytes), info)
+    try device.CheckCublas(st, "cublasLtMatmulAlgoGetHeuristic for INT8 " + shape + " in F32")
+    p.float = h[0]
+    p.Scaled = Choice.Of(info)
+    return p
+}
+
+# c = a b^T in I32 and out = scale[j] c[i, j] in F32 (scale: n per-output scales, the activations' step times each
+# weight row's): GemmI8 on the device, enqueued on d's compute stream
+fn (p ProductI8&) Run(d mut device.Device&, c mut device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, scale device.Buf<F32>&, out mut device.DMat<F32>&) {
+    if p.exact == 0: return
+    cu.oann_lt_run(d.Status(), d.Lt(), p.exact, 1, 0, b.Addr(0, 0), a.Addr(0, 0), c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
+    cu.oann_lt_run(d.Status(), d.Lt(), p.float, 1, 0, b.Addr(0, 0), a.Addr(0, 0), out.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
+    cu.oann_scale_rows(d.Status(), d.Blas(), I32(p.n), I32(p.m), out.Addr(0, 0), out.Ld, scale.Addr(0))
+}
+
 # ---- tests: kernels/gemm is the oracle ----
 
 # a host array of n elements of S, uniform in [-1, 1)
@@ -217,4 +572,454 @@ test Gemm "a bad call is the next Sync's error, cublasGemmEx's status with cuBLA
             assert y[4 * i + j] == s
         }
     }
+}
+
+# ---- tests of the planned products (cuBLASLt): kernels/gemm is the oracle ----
+
+# what a test's epilogue is: none, a bias, a bias and Relu, a bias and GeluTanh, Relu with no bias
+fn Epilogue<S>.testOf(kind I64, b device.DMat<S>) Epilogue<S> {
+    return match kind {
+        case 1: Epilogue<S>.Bias(b)
+        case 2: Epilogue<S>.BiasAct(b, mat.Act.Relu)
+        case 3: Epilogue<S>.BiasAct(b, mat.Act.GeluTanh)
+        case 4: Epilogue<S>.BiasAct(b, mat.Act.Relu)
+        case _: Epilogue<S>.None
+    }
+}
+
+fn cpuEpi(kind I64, b Array<F32>&) gemm.Epilogue {
+    return match kind {
+        case 1: gemm.Epilogue.Bias(b)
+        case 2: gemm.Epilogue.BiasAct(b, mat.Act.Relu)
+        case 3: gemm.Epilogue.BiasAct(b, mat.Act.GeluTanh)
+        case 4: gemm.Epilogue.BiasAct(b, mat.Act.Relu)
+        case _: gemm.Epilogue.None
+    }
+}
+
+# the bound a planned product is held to against kernels/gemm, per unit of k |alpha| max|a| max|b| (the sums') and of
+# |beta| max|c|: Exact sums in F32, rounded once; Fast may round up to SplitK partial sums to C's type; FastBF16 and
+# FastTF32 round each operand to BF16 or TF32 (a product's relative error up to twice the rounding's)
+fn sumsBound<SC>(sums Sums, ch Choice&, like SC) F64 {
+    eps := ulp(F32(0))
+    return match sums {
+        case Sums.Exact: eps
+        case Sums.Fast: eps + F64(ch.SplitK) * ulp(like)
+        case Sums.FastBF16: eps + ulp(BF16(0))
+        case Sums.FastTF32: eps + 2.0 * 0.0009765625
+    }
+}
+
+# one planned product of m x n from a depth of k against kernels/gemm on the same arrays (A its accumulator): views
+# at offsets with rows padded, every element of C's view within the plan's bound and a rounding of SC (and the act's
+# 1e-5 where it is cuBLASLt's GELU), nothing outside C's view written, and - Exact - run again identical bit for bit
+fn compareLt<SC, SA, SB, A>(d mut device.Device&, ws mut gemm.Workspace<A>&, r mut rand.Rand&, m I64, n I64, k I64, ta Bool, tb Bool, alpha F64, beta F64, sums Sums, epi I64, likeC SC, likeA SA, likeB SB, offset Bool = true) ? device.GpuError {
+    ar, ac := m, k
+    if ta: ar, ac = k, m
+    br, bc := k, n
+    if tb: br, bc = n, k
+    oa, ob, oc := 3, 5, 7
+    lda, ldb, ldc := ac + 2, bc + 1, n + 3
+    if not offset: oa, ob, oc, lda, ldb, ldc = 0, 0, 0, ac, bc, n
+    ha := randoms(oa + ar * lda + 4, likeA, r)
+    hb := randoms(ob + br * ldb + 4, likeB, r)
+    hc := randoms(oc + m * ldc + 4, likeC, r)
+    hbias := randoms(n + 1, likeC, r)
+    fbias := Array<F32>(n)
+    for j in range n: fbias[j] = F32(hbias[j + 1])
+    if epi == 4: fbias = Array<F32>(0)
+    want := hc.Copy()
+    cm := mat.Mat<SC>(want, oc, m, n, ldc)
+    gemm.Gemm(ws, cm, mat.Mat<SA>(ha, oa, ar, ac, lda), ta, mat.Mat<SB>(hb, ob, br, bc, ldb), tb, A(alpha), A(beta), cpuEpi(epi, fbias))
+    ba := try device.Buf<SA>.Make(d, ha.Len())
+    bb := try device.Buf<SB>.Make(d, hb.Len())
+    bc1 := try device.Buf<SC>.Make(d, hc.Len())
+    bc2 := try device.Buf<SC>.Make(d, hc.Len())
+    bbias := try device.Buf<SC>.Make(d, n + 1)
+    ba.UploadAll(ha)
+    bb.UploadAll(hb)
+    bc1.UploadAll(hc)
+    bc2.UploadAll(hc)
+    bbias.UploadAll(hbias)
+    da := device.DMat<SA>(ba, oa, ar, ac, lda)
+    db := device.DMat<SB>(bb, ob, br, bc, ldb)
+    dc1 := device.DMat<SC>(bc1, oc, m, n, ldc)
+    dc2 := device.DMat<SC>(bc2, oc, m, n, ldc)
+    biasView := device.DMat<SC>(bbias, 1, 1, 0 if epi == 4 else n, n)
+    p := try Product<SC, SA, SB>.Plan(d, dc1, da, ta, db, tb, Epilogue<SC>.testOf(epi, biasView), sums)
+    if sums != Sums.Exact {
+        # the fast plans as a program would make them: tuned, the fastest of what the heuristic offers (split-K ones too)
+        try p.Tune(d, dc1, da, db, 2)
+        bc1.UploadAll(hc)
+    }
+    p.Run(d, dc1, da, db, alpha, beta)
+    p.Run(d, dc2, da, db, alpha, beta)
+    got := Array<SC>(hc.Len())
+    again := Array<SC>(hc.Len())
+    bc1.DownloadAll(got)
+    bc2.DownloadAll(again)
+    try d.Sync()
+    shape := $m + "x" + $n + "x" + $k + " ta " + $ta + " tb " + $tb + " alpha " + $alpha + " beta " + $beta + " " + $sums + " epilogue " + $epi + " (" + p.Chosen.Str() + ")"
+    if sums == Sums.Exact: assert p.Chosen.Reduction == 0 and p.Chosen.SplitK <= 1, "split-K in an exact plan: " + shape
+    sumsMax := F64(k) * alpha.Abs() * maxAbs(ha, oa, ar, ac, lda) * maxAbs(hb, ob, br, bc, ldb)
+    bound := sumsBound(sums, p.Chosen, likeC) * (sumsMax + 2.0 * beta.Abs() * maxAbs(hc, oc, m, n, ldc))
+    # a C narrower than F32 has its sum rounded to C's type before the bias is added (measured: a BF16 C is 5 units off
+    # where the bias cancels most of the sum), so one more rounding of the sum's and the bias's size
+    if epi > 0 and ulp(likeC) > ulp(F32(0)): bound += ulp(likeC) * (sumsMax + beta.Abs() * maxAbs(hc, oc, m, n, ldc) + maxAbs(hbias, 1, 1, n, n))
+    if epi == 3: bound = 1.2 * bound + 1e-5
+    for i in range hc.Len() {
+        if sums == Sums.Exact: assert got[i] == again[i], "run twice, element " + $i + " differs: " + shape
+        row, col := (i - oc) / ldc, (i - oc) % ldc
+        if i >= oc and row < m and col < n {
+            w := F64(want[i])
+            assert (F64(got[i]) - w).Abs() <= bound + ulp(likeC) * w.Abs(), "C[" + $row + ", " + $col + "] " + $got[i] + " against the CPU's " + $want[i] + " (bound " + $bound + "): " + shape
+        } else {
+            assert got[i] == hc[i], "element " + $i + " outside C's view written: " + shape
+        }
+    }
+}
+
+# every transpose, alpha and beta, at odd sizes, the MLP's and the settle's shapes
+fn compareLtAll<SC, SA, SB, A>(d mut device.Device&, sums Sums, likeC SC, likeA SA, likeB SB, acc A) ? device.GpuError {
+    r := rand.Rand(11)
+    ws := gemm.Workspace<A>(2, 1024, 1024 * 1024)
+    sizes := Array<I64>[1, 1, 1, 7, 5, 3, 1, 33, 17, 33, 17, 65, 129, 65, 257, 128, 10, 128, 128, 128, 784, 100, 300, 1000]
+    for i in range 0, sizes.Len(), 3 {
+        for t in range 4 {
+            ta, tb := t % 2 == 1, t / 2 == 1
+            try compareLt(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, 1.0, 0.0, sums, 0, likeC, likeA, likeB)
+            try compareLt(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, -0.75, 0.5, sums, 0, likeC, likeA, likeB)
+        }
+    }
+    # the MLP's and settle's shapes at aligned addresses (a plan's regions are), where the fast algorithms are
+    shapes := Array<I64>[128, 128, 784, 128, 784, 128, 512, 128, 784, 128, 10, 128, 256, 256, 256]
+    for i in range 0, shapes.Len(), 3 {
+        try compareLt(d, ws, r, shapes[i], shapes[i + 1], shapes[i + 2], false, true, 1.0, 0.0, sums, 0, likeC, likeA, likeB, false)
+        try compareLt(d, ws, r, shapes[i], shapes[i + 1], shapes[i + 2], true, false, 1.0, 1.0, sums, 0, likeC, likeA, likeB, false)
+    }
+}
+
+test Product "F32, BF16, F16 and F64 planned exact against kernels/gemm: every transpose, alpha and beta, offset views, odd sizes; no split-K, run twice identical" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product")
+        return
+    }
+    try compareLtAll(d, Sums.Exact, F32(0), F32(0), F32(0), F32(0))
+    try compareLtAll(d, Sums.Exact, BF16(0), BF16(0), BF16(0), F32(0))
+    try compareLtAll(d, Sums.Exact, F32(0), BF16(0), BF16(0), F32(0))
+    try compareLtAll(d, Sums.Exact, F16(0), F16(0), F16(0), F32(0))
+    try compareLtAll(d, Sums.Exact, F64(0), F64(0), F64(0), F64(0))
+}
+
+test Product "per-operand storage: BF16 and F16 weights under F32 activations (and the reverse) against kernels/gemm" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product per operand")
+        return
+    }
+    try compareLtAll(d, Sums.Exact, F32(0), F32(0), BF16(0), F32(0))
+    try compareLtAll(d, Sums.Exact, F32(0), BF16(0), F32(0), F32(0))
+    try compareLtAll(d, Sums.Exact, F32(0), F32(0), F16(0), F32(0))
+    try compareLtAll(d, Sums.Exact, F32(0), BF16(0), F16(0), F32(0))
+}
+
+test Product "the fast sums within their stated bounds: BF16 with split-K reductions in BF16, F32 through BF16 and TF32 tensor cores" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product fast")
+        return
+    }
+    try compareLtAll(d, Sums.Fast, BF16(0), BF16(0), BF16(0), F32(0))
+    try compareLtAll(d, Sums.Fast, F32(0), BF16(0), BF16(0), F32(0))
+    try compareLtAll(d, Sums.Fast, F32(0), F32(0), F32(0), F32(0))
+    try compareLtAll(d, Sums.FastBF16, F32(0), F32(0), F32(0), F32(0))
+    try compareLtAll(d, Sums.FastTF32, F32(0), F32(0), F32(0), F32(0))
+}
+
+test Product "Epilogue.Bias and BiasAct (Relu, GeluTanh, Relu without a bias) against kernels/gemm's, F32 and BF16" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product's epilogue")
+        return
+    }
+    r := rand.Rand(12)
+    ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
+    sizes := Array<I64>[1, 1, 1, 7, 5, 3, 33, 17, 65, 128, 128, 784, 128, 10, 128, 100, 300, 1000]
+    for epi in range 1, 5 {
+        for i in range 0, sizes.Len(), 3 {
+            try compareLt(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], false, true, 1.0, 0.0, Sums.Exact, epi, F32(0), F32(0), F32(0))
+            try compareLt(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], false, false, 0.5, 1.0, Sums.Exact, epi, F32(0), F32(0), F32(0))
+            try compareLt(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], true, true, 1.0, 0.0, Sums.Exact, epi, BF16(0), BF16(0), BF16(0), false)
+            try compareLt(d, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], false, true, 1.0, 0.0, Sums.Exact, epi, F32(0), F32(0), BF16(0))
+        }
+    }
+}
+
+test Product "an act cuBLASLt has no form of is refused at Plan, naming it" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product's refusal")
+        return
+    }
+    b := try device.Buf<F32>.Make(d, 64)
+    v := device.DMat<F32>(b, 0, 4, 4, 4)
+    for act in Array<mat.Act>[mat.Act.Silu, mat.Act.Gelu, mat.Act.Tanh] {
+        failed := false
+        try Product<F32, F32, F32>.Plan(d, v, v, false, v, false, Epilogue<F32>.BiasAct(device.DMat<F32>(b, 0, 1, 4, 4), act)) catch device.GpuError.Cuda e {
+            assert e.code == 0 and e.what.Contains($act) and e.what.Contains("no GPU form"), e.what
+            failed = true
+        }
+        assert failed, $act + " planned"
+    }
+}
+
+test Product "a run on an address less aligned than its plan's is the next Sync's error, and nothing is written" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product's alignment")
+        return
+    }
+    x := Array<F32>(1024)
+    for i in range 1024: x[i] = 1.0
+    b := try device.Buf<F32>.Make(d, 1024)
+    out := try device.Buf<F32>.Make(d, 1024)
+    b.UploadAll(x)
+    zero := Array<F32>(1024)
+    out.UploadAll(zero)
+    c := device.DMat<F32>(out, 0, 16, 16, 16)
+    p := try Product<F32, F32, F32>.Plan(d, c, device.DMat<F32>(b, 0, 16, 16, 16), false, device.DMat<F32>(b, 256, 16, 16, 16), false)
+    assert p.Chosen.Align == 256, p.Chosen.Str()
+    shifted := device.DMat<F32>(out, 1, 16, 16, 16)
+    p.Run(d, shifted, device.DMat<F32>(b, 0, 16, 16, 16), device.DMat<F32>(b, 256, 16, 16, 16))
+    failed := false
+    try d.Sync() catch device.GpuError.Cublas e {
+        Println("as expected: " + e.what)
+        assert e.code == cu.CUBLAS_STATUS_NOT_SUPPORTED and e.what.StartsWith("cublasLtMatmul: an address less aligned"), e.what
+        failed = true
+    }
+    assert failed, "a run 4 bytes off its plan's alignment was taken"
+    y := Array<F32>(1024)
+    out.DownloadAll(y)
+    p.Run(d, c, device.DMat<F32>(b, 0, 16, 16, 16), device.DMat<F32>(b, 256, 16, 16, 16))
+    out.Download(y, 300, 300, 1)
+    try d.Sync()
+    assert y[1] == 0.0 and y[300] == 0.0
+    out.DownloadAll(y)
+    try d.Sync()
+    assert y[0] == 16.0 and y[255] == 16.0
+}
+
+# attention's two products for B sequences of T positions, heads of D / heads columns: scores = scale Q K^T into a
+# stacked T x T per sequence and head, then Y = P V with P lower-triangular (causal: zeros above the diagonal, as the
+# softmax writes them) - the GPU's full products against kernels/gemm's GemmBatch (Triangle.Full for the scores'
+# lower triangle, Left(0) for P V), run twice identical
+fn attentionCase<S>(d mut device.Device&, r mut rand.Rand&, b I64, t I64, dm I64, heads I64, like S) ? device.GpuError {
+    n := b * t
+    hq := randoms(n * dm, like, r)
+    hk := randoms(n * dm, like, r)
+    hv := randoms(n * dm, like, r)
+    rows := n * heads
+    hp := Array<S>(rows * t)
+    hy := Array<S>(n * dm)
+    ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
+    scale := 1.0 / F64(dm / heads).Sqrt()
+    pm := mat.Mat<S>(hp, 0, rows, t, t)
+    gemm.GemmBatch(ws, gemm.Batch<S>.Stacked(pm, t, heads), gemm.Batch<S>.Heads(mat.Mat<S>(hq, 0, n, dm, dm), t, heads), false, gemm.Batch<S>.Heads(mat.Mat<S>(hk, 0, n, dm, dm), t, heads), true, F32(scale), F32(0))
+    bq := try device.Buf<S>.Make(d, n * dm)
+    bk := try device.Buf<S>.Make(d, n * dm)
+    bv := try device.Buf<S>.Make(d, n * dm)
+    bp := try device.Buf<S>.Make(d, rows * t)
+    by := try device.Buf<S>.Make(d, n * dm)
+    by2 := try device.Buf<S>.Make(d, n * dm)
+    bq.UploadAll(hq)
+    bk.UploadAll(hk)
+    bv.UploadAll(hv)
+    dp := device.DBatch<S>.Stacked(device.DMat<S>(bp, 0, rows, t, t), t, heads)
+    dq := device.DBatch<S>.Heads(device.DMat<S>(bq, 0, n, dm, dm), t, heads)
+    dk := device.DBatch<S>.Heads(device.DMat<S>(bk, 0, n, dm, dm), t, heads)
+    scores := try Product<S, S, S>.PlanBatch(d, dp, dq, false, dk, true)
+    scores.RunBatch(d, dp, dq, dk, scale)
+    gp := Array<S>(rows * t)
+    bp.DownloadAll(gp)
+    try d.Sync()
+    w := dm / heads
+    what := "attention " + $b + " x " + $t + ", width " + $dm + ", " + $heads + " heads"
+    bound := (ulp(F32(0)) * F64(w) * scale + ulp(like)) * 1.0
+    for i in range rows * t: assert (F64(gp[i]) - F64(hp[i])).Abs() <= bound * 1.01 + ulp(like) * F64(hp[i]).Abs(), what + ": score " + $i + " " + $gp[i] + " against " + $hp[i] + " (" + scores.Chosen.Str() + ")"
+    # causal weights: the CPU's scores masked to the lower triangle; P V on both sides from them
+    for e in range rows {
+        for j in range t {
+            if j > e % t: hp[e * t + j] = S(0)
+        }
+    }
+    bp.UploadAll(hp)
+    ym := mat.Mat<S>(hy, 0, n, dm, dm)
+    gemm.GemmBatch(ws, gemm.Batch<S>.Heads(ym, t, heads), gemm.Batch<S>.Stacked(pm, t, heads), false, gemm.Batch<S>.Heads(mat.Mat<S>(hv, 0, n, dm, dm), t, heads), false, F32(1), F32(0), gemm.Triangle.Left(0))
+    dy := device.DBatch<S>.Heads(device.DMat<S>(by, 0, n, dm, dm), t, heads)
+    dy2 := device.DBatch<S>.Heads(device.DMat<S>(by2, 0, n, dm, dm), t, heads)
+    dv := device.DBatch<S>.Heads(device.DMat<S>(bv, 0, n, dm, dm), t, heads)
+    pv := try Product<S, S, S>.PlanBatch(d, dy, dp, false, dv, false)
+    pv.RunBatch(d, dy, dp, dv)
+    pv.RunBatch(d, dy2, dp, dv)
+    gy := Array<S>(n * dm)
+    gy2 := Array<S>(n * dm)
+    by.DownloadAll(gy)
+    by2.DownloadAll(gy2)
+    try d.Sync()
+    big := maxAbs(hp, 0, rows, t, t)
+    ybound := ulp(F32(0)) * F64(t) * big
+    for i in range n * dm {
+        assert gy[i] == gy2[i], what + ": P V run twice differs at " + $i
+        assert (F64(gy[i]) - F64(hy[i])).Abs() <= ybound + ulp(like) * F64(hy[i]).Abs(), what + ": y " + $i + " " + $gy[i] + " against " + $hy[i] + " (" + pv.Chosen.Str() + ")"
+    }
+}
+
+test Product "GemmBatch on attention's shapes against kernels/gemm.GemmBatch: the scores, and P V with P causal, F32 and BF16" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("GemmBatch")
+        return
+    }
+    r := rand.Rand(13)
+    try attentionCase(d, r, 16, 64, 128, 4, F32(0))
+    try attentionCase(d, r, 16, 64, 128, 4, BF16(0))
+    try attentionCase(d, r, 2, 33, 96, 3, F32(0))
+    try attentionCase(d, r, 3, 17, 40, 1, BF16(0))
+    try attentionCase(d, r, 1, 128, 256, 8, F32(0))
+}
+
+# GemmI8 with signed activations against kernels/gemm.GemmI8's unsigned ones with a zero point: x (m x k, with
+# negatives) quantized per tensor both ways - the CPU's U8 with zero point 128, the GPU's I8 with 0, one step s =
+# max|x| / 127 - and weights per output row (q in -127 .. 127, scale sw); c on the GPU is exactly the I8 sums, out is
+# s sw c, and both outs are the true product within one quantization step's reach: |out_gpu - out_cpu| <= s sw[j]
+# sum_p |q[j, p]| (each activation rounded within half a step on each side)
+fn i8Case(d mut device.Device&, r mut rand.Rand&, m I64, n I64, k I64) ? device.GpuError {
+    x := Array<F32>(m * k)
+    for i in range m * k: x[i] = F32(r.Uniform(-1.0, 1.0))
+    big F32 = 0
+    for v in x: big = big.Max(v.Abs())
+    step F32 = big / 127.0
+    au := Array<U8>(m * k)
+    ai := Array<I8>(m * k)
+    for i in range m * k {
+        q := (x[i] / step).RoundEven()
+        au[i] = U8(q + 128.0)
+        ai[i] = I8(q)
+    }
+    qb := Array<I8>(n * k)
+    sw := Array<F32>(n)
+    scale := Array<F32>(n)
+    for j in range n {
+        row := Array<F32>(k)
+        wmax F32 = 0
+        for p in range k {
+            row[p] = F32(r.Uniform(-0.5, 0.5))
+            wmax = wmax.Max(row[p].Abs())
+        }
+        sw[j] = wmax / 127.0
+        for p in range k: qb[j * k + p] = I8((row[p] / sw[j]).RoundEven())
+        scale[j] = step * sw[j]
+    }
+    cc := mat.Mat<I32>(Array<I32>(m * n), 0, m, n, n)
+    cout := mat.Mat<F32>(Array<F32>(m * n), 0, m, n, n)
+    ws := gemm.Workspace<I32>(1)
+    ws.ReserveI8(n, k)
+    gemm.GemmI8(ws, cc, mat.Mat<U8>(au, 0, m, k, k), mat.Mat<I8>(qb, 0, n, k, k), scale, cout, 128)
+    ba := try device.Buf<I8>.Make(d, m * k)
+    bb := try device.Buf<I8>.Make(d, n * k)
+    bc := try device.Buf<I32>.Make(d, m * n)
+    bo := try device.Buf<F32>.Make(d, m * n)
+    bs := try device.Buf<F32>.Make(d, n)
+    ba.UploadAll(ai)
+    bb.UploadAll(qb)
+    bs.UploadAll(scale)
+    da := device.DMat<I8>(ba, 0, m, k, k)
+    db := device.DMat<I8>(bb, 0, n, k, k)
+    dc := device.DMat<I32>(bc, 0, m, n, n)
+    dout := device.DMat<F32>(bo, 0, m, n, n)
+    p := try ProductI8.Plan(d, dc, da, db, dout)
+    p.Run(d, dc, da, db, bs, dout)
+    gc := Array<I32>(m * n)
+    gout := Array<F32>(m * n)
+    bc.DownloadAll(gc)
+    bo.DownloadAll(gout)
+    try d.Sync()
+    what := "INT8 " + $m + "x" + $n + "x" + $k + " (" + p.Exact.Str() + "; " + p.Scaled.Str() + ")"
+    for i in range m {
+        for j in range n {
+            s I32 = 0
+            reach F64 = 0
+            for q in range k {
+                s = s + I32(ai[i * k + q]) * I32(qb[j * k + q])
+                reach += F64(I32(qb[j * k + q])).Abs()
+            }
+            assert gc[i * n + j] == s, what + ": c[" + $i + ", " + $j + "] " + $gc[i * n + j] + " against " + $s
+            want := F64(s) * F64(scale[j])
+            assert (F64(gout[i * n + j]) - want).Abs() <= 2e-6 * want.Abs() + 1e-30, what + ": out[" + $i + ", " + $j + "] " + $gout[i * n + j] + " against s sw c " + $want
+            assert (F64(gout[i * n + j]) - F64(cout.At(i, j))).Abs() <= F64(scale[j]) * reach + 1e-6, what + ": out[" + $i + ", " + $j + "] " + $gout[i * n + j] + " against the CPU's " + $cout.At(i, j)
+        }
+    }
+}
+
+test ProductI8 "GemmI8 with signed activations against kernels/gemm.GemmI8 within a quantization step; c the exact I32 sums" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("GemmI8")
+        return
+    }
+    r := rand.Rand(14)
+    sizes := Array<I64>[1, 128, 784, 4, 128, 784, 128, 128, 784, 128, 10, 128, 33, 65, 64, 1, 512, 2048, 7, 20, 12]
+    for i in range 0, sizes.Len(), 3: try i8Case(d, r, sizes[i], sizes[i + 1], sizes[i + 2])
+}
+
+# a run allocates nothing on the host (read while compiling, olang G42) ...
+assert not Product<F32, F32, F32>.Run.Allocates, "a planned product's run allocates"
+assert not Product<F32, BF16, BF16>.RunBatch.Allocates, "a planned batch's run allocates"
+assert not ProductI8.Run.Allocates, "a planned INT8 product's run allocates"
+
+test Product "... nor on the device: runs captured into a CUDA graph (an allocation would fail the capture) replay to the same result" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Product's capture")
+        return
+    }
+    r := rand.Rand(15)
+    m, n, k := 128, 128, 784
+    ha := randoms(m * k, BF16(0), r)
+    hb := randoms(n * k, BF16(0), r)
+    ba := try device.Buf<BF16>.Make(d, m * k)
+    bb := try device.Buf<BF16>.Make(d, n * k)
+    bc := try device.Buf<BF16>.Make(d, m * n)
+    bw := try device.Buf<F32>.Make(d, m * k)
+    bo := try device.Buf<F32>.Make(d, m * n)
+    ba.UploadAll(ha)
+    bb.UploadAll(hb)
+    hw := randoms(m * k, F32(0), r)
+    bw.UploadAll(hw)
+    da := device.DMat<BF16>(ba, 0, m, k, k)
+    db := device.DMat<BF16>(bb, 0, n, k, k)
+    dc := device.DMat<BF16>(bc, 0, m, n, n)
+    dw := device.DMat<F32>(bw, 0, m, k, k)
+    dout := device.DMat<F32>(bo, 0, m, n, n)
+    p := try Product<BF16, BF16, BF16>.Plan(d, dc, da, false, db, true)
+    mixed := try Product<F32, F32, BF16>.Plan(d, dout, dw, false, db, true)
+    p.Run(d, dc, da, db)
+    mixed.Run(d, dout, dw, db)
+    want := Array<BF16>(m * n)
+    wantMixed := Array<F32>(m * n)
+    bc.DownloadAll(want)
+    bo.DownloadAll(wantMixed)
+    try d.Sync()
+    zero := Array<BF16>(m * n)
+    bc.UploadAll(zero)
+    bo.UploadAll(Array<F32>(m * n))
+    try d.Sync()
+    try device.CheckCuda(cu.oann_capture_begin(d.Stream()), "cudaStreamBeginCapture")
+    for _ in range 3 {
+        p.Run(d, dc, da, db)
+        mixed.Run(d, dout, dw, db)
+    }
+    nodes := Array<I32>(1)
+    try device.CheckCuda(cu.oann_capture_end(d.Stream(), 2, nodes), "cudaStreamEndCapture and the graph's replay")
+    try d.Sync()
+    Println("captured " + $nodes[0] + " nodes")
+    assert nodes[0] >= 9, "a graph of " + $nodes[0] + " nodes"
+    got := Array<BF16>(m * n)
+    gotMixed := Array<F32>(m * n)
+    bc.DownloadAll(got)
+    bo.DownloadAll(gotMixed)
+    try d.Sync()
+    for i in range m * n: assert got[i] == want[i] and gotMixed[i] == wantMixed[i], "the replay differs at " + $i
 }

@@ -176,6 +176,10 @@ fn (d Device&) Stream() U64 { return d.compute }
 fn (d Device&) Blas() U64 { return d.blas }
 fn (d Device&) Status() U64 { return d.status }
 
+# the cuBLASLt handle and the workspace (WorkBytes) cuBLAS and cuBLASLt share: one stream, so never both at once
+fn (d Device&) Lt() U64 { return d.lt }
+fn (d Device&) Work() U64 { return d.work }
+
 # ---- device memory ----
 
 # n elements of S in the device's memory, uninitialized; freed (cudaFree) where its holder lets go. It holds its
@@ -234,6 +238,39 @@ type DMat<S> struct(Data Buf<S>&, Off I64, Rows I64, Cols I64, Ld I64) {
 
 # the device address of element (r, c)
 fn (m DMat<S>&) Addr(r I64, c I64) U64 { return m.Data.Addr(m.Off + r * m.Ld + c) }
+
+# Groups x Members matrices of one shape over a device buffer: matrix (g, m) is Rows x Cols, rows Ld apart, its first
+# element at Off + g GroupStride + m MemberStride - kernels/gemm's Batch over device memory, the same numbers (every
+# sequence's every head of attention). A view; it checks nothing
+type DBatch<S> struct(Data Buf<S>&, Off I64, Rows I64, Cols I64, Ld I64, Groups I64, GroupStride I64, Members I64, MemberStride I64) {
+    Data
+    Off
+    Rows
+    Cols
+    Ld
+    Groups
+    GroupStride
+    Members
+    MemberStride
+}
+
+# matrix (g, m), a view
+fn (b DBatch<S>&) At(g I64, m I64) DMat<S> {
+    return DMat<S>(b.Data, b.Off + g * b.GroupStride + m * b.MemberStride, b.Rows, b.Cols, b.Ld)
+}
+
+# m's rows in runs of rows (the groups: sequences) and its columns in heads equal blocks (the members), as gemm's
+# Batch.Heads: attention's queries, keys, values and outputs. Unchecked: rows divides m.Rows and heads m.Cols
+fn DBatch<S>.Heads(m DMat<S>&, rows I64, heads I64) DBatch<S> {
+    w I64 = m.Cols / heads
+    return DBatch<S>(m.Data, m.Off, rows, w, m.Ld, m.Rows / rows, rows * m.Ld, heads, w)
+}
+
+# m's rows in runs of rows, run r being matrix (r / members, r % members), as gemm's Batch.Stacked: attention's T x T
+# matrices of every sequence and head, stacked. Unchecked: rows members divides m.Rows
+fn DBatch<S>.Stacked(m DMat<S>&, rows I64, members I64 = 1) DBatch<S> {
+    return DBatch<S>(m.Data, m.Off, rows, m.Cols, m.Ld, m.Rows / (rows * members), rows * members * m.Ld, members, rows * m.Ld)
+}
 
 # ---- tests ----
 

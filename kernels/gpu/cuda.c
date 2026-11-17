@@ -358,3 +358,291 @@ void oann_launch(uint64_t st, uint64_t drv, uint64_t f, uint32_t gx, uint32_t gy
         s->text = oann_driver_error(drv, r);
     }
 }
+
+/* ==== cuBLASLt (GP3): products planned once and run many times ====
+ *
+ * A plan is a matmul descriptor, the three matrices' layouts and the algorithm cuBLASLt's heuristic chose for them,
+ * made once (blas.olang's Product.Plan) and run as often as wanted: a run makes nothing and allocates nothing - its
+ * workspace is the Device's, fixed at Open and shared with the cuBLAS handle (one stream, so never at once). Only
+ * algorithms without a split-K reduction are taken (CUBLASLT_REDUCTION_SCHEME_NONE): every element is one sum in one
+ * order, so a product run twice is the same bit for bit and no partial sum is rounded to a narrow output type.
+ *
+ * An algorithm is chosen for the alignment of the addresses it will read and write, which the heuristic cannot see:
+ * the plan takes the addresses it is made with, keeps the alignment they share (at most 256 bytes) and tells the
+ * heuristic so; a run whose addresses are less aligned than that is refused and recorded, never run. */
+
+typedef struct {
+    cublasLtMatmulDesc_t op;
+    cublasLtMatrixLayout_t a, b, c;
+    cublasLtMatmulAlgo_t algo;
+    cublasLtMatmulHeuristicResult_t offered[8];  /* the heuristic's, best first: what Tune times */
+    int32_t found;
+    int32_t compute;  /* cublasComputeType_t: the scalars' type */
+    uint64_t align;   /* bytes every address of a run must be a multiple of */
+    uint64_t work;    /* the workspace bytes the algorithm takes */
+} oann_lt;
+
+/* the largest power of two dividing x, at most 256 (x = 0: 256) */
+static uint64_t lowbit(uint64_t x) {
+    uint64_t b = x & (~x + 1);
+    return b == 0 || b > 256 ? 256 : b;
+}
+
+static void lt_free(oann_lt *p) {
+    if (!p) return;
+    if (p->c) cublasLtMatrixLayoutDestroy(p->c);
+    if (p->b) cublasLtMatrixLayoutDestroy(p->b);
+    if (p->a) cublasLtMatrixLayoutDestroy(p->a);
+    if (p->op) cublasLtMatmulDescDestroy(p->op);
+    free(p);
+}
+
+void oann_lt_free(uint64_t plan) { lt_free((oann_lt *)(uintptr_t)plan); }
+
+/* takes the heuristic's i-th algorithm and says what it is in info: its id, tile, split-K parts, reduction scheme, the
+ * workspace it takes, how many were offered, the alignment, the ns a product took (0: not timed) and which it is */
+static void choose(oann_lt *p, int i, int64_t *info, int64_t ns) {
+    p->algo = p->offered[i].algo;
+    p->work = p->offered[i].workspaceSize;
+    int32_t v[4] = {0, 0, 0, 0};
+    size_t got = 0;
+    cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_ID, &v[0], sizeof v[0], &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &v[1], sizeof v[1], &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &v[2], sizeof v[2], &got);
+    cublasLtMatmulAlgoConfigGetAttribute(&p->algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &v[3], sizeof v[3], &got);
+    for (int j = 0; j < 4; j++) info[j] = v[j];
+    info[4] = (int64_t)p->work;
+    info[5] = p->found;
+    info[6] = (int64_t)p->align;
+    info[7] = ns;
+    info[8] = i;
+}
+
+static cublasStatus_t layout(cublasLtMatrixLayout_t *l, int32_t type, int32_t rows, int32_t cols, int64_t ld,
+                             int32_t count, int64_t stride) {
+    cublasStatus_t s = cublasLtMatrixLayoutCreate(l, (cudaDataType)type, (uint64_t)rows, (uint64_t)cols, ld);
+    if (s != CUBLAS_STATUS_SUCCESS || count <= 1) return s;
+    s = cublasLtMatrixLayoutSetAttribute(*l, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count, sizeof count);
+    if (s != CUBLAS_STATUS_SUCCESS) return s;
+    return cublasLtMatrixLayoutSetAttribute(*l, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride, sizeof stride);
+}
+
+/* a plan for D = alpha op(A) op(B) + beta C in cuBLASLt's column-major terms, D in C's place (m x n from a depth of k),
+ * each matrix with its cudaDataType and ld; count > 1 makes it count products, matrix i of each at i times its stride
+ * (elements). reduction is the mask of split-K reduction schemes allowed (CUBLASLT_REDUCTION_SCHEME_NONE: none, so no
+ * split-K; CUBLASLT_REDUCTION_SCHEME_MASK: any, partial sums possibly rounded to C's type). epilogue is a cublasLtEpilogue_t, bias its vector's address (0 none: then it must not need one). a, b,
+ * c and bias are the addresses the plan is made with, align0 the alignment (bytes) some other address of a run must
+ * share (an outer stride, 0 none): the algorithm is chosen for the alignment they all share. info gives what was
+ * chosen: the algorithm's id, tile, split-K parts, reduction scheme, the workspace it takes, how many algorithms the
+ * heuristic offered and the alignment. CUBLAS_STATUS_NOT_SUPPORTED where none fits */
+int32_t oann_lt_plan(uint64_t *out, uint64_t lt, int32_t compute, int32_t scale, bool ta, bool tb, int32_t m,
+                     int32_t n, int32_t k, int32_t atype, int64_t lda, int64_t sa, uint64_t a, int32_t btype,
+                     int64_t ldb, int64_t sb, uint64_t b, int32_t ctype, int64_t ldc, int64_t sc, uint64_t c,
+                     int32_t count, int32_t reduction, int32_t epilogue, uint64_t bias, uint64_t align0,
+                     uint64_t workBytes, int64_t *info) {
+    *out = 0;
+    oann_lt *p = (oann_lt *)calloc(1, sizeof(oann_lt));
+    if (!p) return CUBLAS_STATUS_ALLOC_FAILED;
+    p->compute = compute;
+    cublasStatus_t s = cublasLtMatmulDescCreate(&p->op, (cublasComputeType_t)compute, (cudaDataType)scale);
+    cublasOperation_t oa = ta ? CUBLAS_OP_T : CUBLAS_OP_N, ob = tb ? CUBLAS_OP_T : CUBLAS_OP_N;
+    uint32_t epi = (uint32_t)epilogue;
+    if (s == CUBLAS_STATUS_SUCCESS) s = cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_TRANSA, &oa, sizeof oa);
+    if (s == CUBLAS_STATUS_SUCCESS) s = cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_TRANSB, &ob, sizeof ob);
+    if (s == CUBLAS_STATUS_SUCCESS) s = cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_EPILOGUE, &epi, sizeof epi);
+    if (s == CUBLAS_STATUS_SUCCESS && bias != 0) {
+        const void *pb = (const void *)(uintptr_t)bias;
+        s = cublasLtMatmulDescSetAttribute(p->op, CUBLASLT_MATMUL_DESC_BIAS_POINTER, &pb, sizeof pb);
+    }
+    if (s == CUBLAS_STATUS_SUCCESS)
+        s = layout(&p->a, atype, ta ? k : m, ta ? m : k, lda, count, sa);
+    if (s == CUBLAS_STATUS_SUCCESS)
+        s = layout(&p->b, btype, tb ? n : k, tb ? k : n, ldb, count, sb);
+    if (s == CUBLAS_STATUS_SUCCESS) s = layout(&p->c, ctype, m, n, ldc, count, sc);
+    uint64_t al = lowbit(a) < lowbit(b) ? lowbit(a) : lowbit(b);
+    if (lowbit(c) < al) al = lowbit(c);
+    if (bias != 0 && lowbit(bias) < al) al = lowbit(bias);
+    if (align0 != 0 && lowbit(align0) < al) al = lowbit(align0);
+    p->align = al;
+    cublasLtMatmulPreference_t pref = 0;
+    if (s == CUBLAS_STATUS_SUCCESS) s = cublasLtMatmulPreferenceCreate(&pref);
+    uint32_t red = (uint32_t)reduction;
+    uint32_t al32 = (uint32_t)al;
+    if (s == CUBLAS_STATUS_SUCCESS)
+        s = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workBytes, sizeof workBytes);
+    if (s == CUBLAS_STATUS_SUCCESS)
+        s = cublasLtMatmulPreferenceSetAttribute(pref, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, &red, sizeof red);
+    cublasLtMatmulPreferenceAttributes_t aligns[4] = {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
+                                                      CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES};
+    for (int i = 0; i < 4 && s == CUBLAS_STATUS_SUCCESS; i++)
+        s = cublasLtMatmulPreferenceSetAttribute(pref, aligns[i], &al32, sizeof al32);
+    cublasLtMatmulHeuristicResult_t *h = p->offered;
+    int found = 0;
+    if (s == CUBLAS_STATUS_SUCCESS)
+        s = cublasLtMatmulAlgoGetHeuristic((cublasLtHandle_t)(uintptr_t)lt, p->op, p->a, p->b, p->c, p->c, pref, 8, h, &found);
+    p->found = found;
+    if (pref) cublasLtMatmulPreferenceDestroy(pref);
+    if (s == CUBLAS_STATUS_SUCCESS && found == 0) s = CUBLAS_STATUS_NOT_SUPPORTED;
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        lt_free(p);
+        return s;
+    }
+    *out = (uint64_t)(uintptr_t)p;
+    choose(p, 0, info, 0);
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+/* runs a plan on these addresses, outer times: run i at a + i oa, b + i ob, c + i oc (bytes) - a batch whose matrices
+ * take two strides is outer runs of the plan's count. alpha and beta as the plan's scalars (float for 32F compute,
+ * double for 64F, int32_t for 32I). An address less aligned than the plan's is recorded and nothing runs */
+void oann_lt_run(uint64_t st, uint64_t lt, uint64_t plan, double alpha, double beta, uint64_t a, uint64_t b, uint64_t c,
+                 int32_t outer, int64_t oa, int64_t ob, int64_t oc, uint64_t work, uint64_t workBytes, uint64_t stream) {
+    oann_lt *p = (oann_lt *)(uintptr_t)plan;
+    uint64_t mask = p->align - 1;
+    if (((a | b | c) & mask) != 0 || (outer > 1 && (((uint64_t)oa | (uint64_t)ob | (uint64_t)oc) & mask) != 0)) {
+        note(st, OANN_CUBLAS, CUBLAS_STATUS_NOT_SUPPORTED, "cublasLtMatmul: an address less aligned than its plan's");
+        return;
+    }
+    float a32 = (float)alpha, b32 = (float)beta;
+    int32_t ai = (int32_t)alpha, bi = (int32_t)beta;
+    int wide = p->compute == CUBLAS_COMPUTE_64F || p->compute == CUBLAS_COMPUTE_64F_PEDANTIC;
+    int integer = p->compute == CUBLAS_COMPUTE_32I || p->compute == CUBLAS_COMPUTE_32I_PEDANTIC;
+    const void *pa = wide ? (const void *)&alpha : integer ? (const void *)&ai : (const void *)&a32;
+    const void *pb = wide ? (const void *)&beta : integer ? (const void *)&bi : (const void *)&b32;
+    for (int32_t i = 0; i < outer; i++) {
+        void *ci = (void *)(uintptr_t)(c + (uint64_t)(i * oc));
+        note(st, OANN_CUBLAS,
+             cublasLtMatmul((cublasLtHandle_t)(uintptr_t)lt, p->op, pa, (const void *)(uintptr_t)(a + (uint64_t)(i * oa)), p->a,
+                            (const void *)(uintptr_t)(b + (uint64_t)(i * ob)), p->b, pb, ci, p->c, ci, p->c, &p->algo,
+                            (void *)(uintptr_t)work, (size_t)workBytes, (cudaStream_t)(uintptr_t)stream),
+             "cublasLtMatmul");
+    }
+}
+
+/* times every algorithm the heuristic offered on these addresses (as a run's, alpha 1, beta 0: c is overwritten), reps
+ * products each after as many untimed, by events on the stream, and keeps the fastest; info as the plan's. The
+ * status: the first failure, cuBLAS's or CUDA's (negated) */
+int32_t oann_lt_tune(uint64_t lt, uint64_t plan, uint64_t a, uint64_t b, uint64_t c, int32_t outer, int64_t oa,
+                     int64_t ob, int64_t oc, uint64_t work, uint64_t workBytes, uint64_t stream, int32_t reps,
+                     int64_t *info) {
+    oann_lt *p = (oann_lt *)(uintptr_t)plan;
+    cudaStream_t s = (cudaStream_t)(uintptr_t)stream;
+    cudaEvent_t e0 = 0, e1 = 0;
+    cudaError_t ce = cudaEventCreate(&e0);
+    if (ce == cudaSuccess) ce = cudaEventCreate(&e1);
+    float one = 1, zero = 0;
+    double one64 = 1, zero64 = 0;
+    int32_t onei = 1, zeroi = 0;
+    int wide = p->compute == CUBLAS_COMPUTE_64F || p->compute == CUBLAS_COMPUTE_64F_PEDANTIC;
+    int integer = p->compute == CUBLAS_COMPUTE_32I || p->compute == CUBLAS_COMPUTE_32I_PEDANTIC;
+    const void *pa = wide ? (const void *)&one64 : integer ? (const void *)&onei : (const void *)&one;
+    const void *pz = wide ? (const void *)&zero64 : integer ? (const void *)&zeroi : (const void *)&zero;
+    int best = -1;
+    float bestMs = 0;
+    cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    for (int i = 0; i < p->found && ce == cudaSuccess; i++) {
+        if (p->offered[i].workspaceSize > workBytes) continue;
+        cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
+        for (int pass = 0; pass < 2 && st == CUBLAS_STATUS_SUCCESS; pass++) {
+            if (pass == 1) cudaEventRecord(e0, s);
+            for (int r = 0; r < reps && st == CUBLAS_STATUS_SUCCESS; r++)
+                for (int32_t j = 0; j < outer && st == CUBLAS_STATUS_SUCCESS; j++) {
+                    void *cj = (void *)(uintptr_t)(c + (uint64_t)(j * oc));
+                    st = cublasLtMatmul((cublasLtHandle_t)(uintptr_t)lt, p->op, pa, (const void *)(uintptr_t)(a + (uint64_t)(j * oa)),
+                                        p->a, (const void *)(uintptr_t)(b + (uint64_t)(j * ob)), p->b, pz, cj, p->c, cj, p->c,
+                                        &p->offered[i].algo, (void *)(uintptr_t)work, (size_t)workBytes, s);
+                }
+        }
+        cudaEventRecord(e1, s);
+        ce = cudaEventSynchronize(e1);
+        if (st != CUBLAS_STATUS_SUCCESS) {
+            if (status == CUBLAS_STATUS_SUCCESS) status = st;
+            continue;
+        }
+        float ms = 0;
+        cudaEventElapsedTime(&ms, e0, e1);
+        if (best < 0 || ms < bestMs) {
+            best = i;
+            bestMs = ms;
+        }
+    }
+    if (e0) cudaEventDestroy(e0);
+    if (e1) cudaEventDestroy(e1);
+    if (ce != cudaSuccess) return -(int32_t)ce;
+    if (best < 0) return status != CUBLAS_STATUS_SUCCESS ? (int32_t)status : CUBLAS_STATUS_NOT_SUPPORTED;
+    choose(p, best, info, (int64_t)((double)bestMs * 1e6 / reps));
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+/* a widening: a matrix of rows x cols (column-major, ld) of type from into a contiguous one (ld rows) of type to, by
+ * cublasLtMatrixTransform - BF16 and F16 to F32 exactly */
+typedef struct {
+    cublasLtMatrixTransformDesc_t t;
+    cublasLtMatrixLayout_t from, to;
+} oann_widen;
+
+static void widen_free(oann_widen *w) {
+    if (!w) return;
+    if (w->to) cublasLtMatrixLayoutDestroy(w->to);
+    if (w->from) cublasLtMatrixLayoutDestroy(w->from);
+    if (w->t) cublasLtMatrixTransformDescDestroy(w->t);
+    free(w);
+}
+
+void oann_widen_free(uint64_t w) { widen_free((oann_widen *)(uintptr_t)w); }
+
+int32_t oann_widen_plan(uint64_t *out, int32_t from, int32_t rows, int32_t cols, int64_t ld, int32_t to) {
+    *out = 0;
+    oann_widen *w = (oann_widen *)calloc(1, sizeof(oann_widen));
+    if (!w) return CUBLAS_STATUS_ALLOC_FAILED;
+    cublasStatus_t s = cublasLtMatrixTransformDescCreate(&w->t, CUDA_R_32F);
+    if (s == CUBLAS_STATUS_SUCCESS) s = cublasLtMatrixLayoutCreate(&w->from, (cudaDataType)from, (uint64_t)rows, (uint64_t)cols, ld);
+    if (s == CUBLAS_STATUS_SUCCESS) s = cublasLtMatrixLayoutCreate(&w->to, (cudaDataType)to, (uint64_t)rows, (uint64_t)cols, rows);
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        widen_free(w);
+        return s;
+    }
+    *out = (uint64_t)(uintptr_t)w;
+    return CUBLAS_STATUS_SUCCESS;
+}
+
+void oann_widen_run(uint64_t st, uint64_t lt, uint64_t plan, uint64_t src, uint64_t dst, uint64_t stream) {
+    oann_widen *w = (oann_widen *)(uintptr_t)plan;
+    float one = 1, zero = 0;
+    note(st, OANN_CUBLAS,
+         cublasLtMatrixTransform((cublasLtHandle_t)(uintptr_t)lt, w->t, &one, (const void *)(uintptr_t)src, w->from, &zero,
+                                 NULL, NULL, (void *)(uintptr_t)dst, w->to, (cudaStream_t)(uintptr_t)stream),
+         "cublasLtMatrixTransform (widening)");
+}
+
+/* C = diag(x) C, column-major rows x cols (ld): row i scaled by x[i] - an INT8 product's per-output scale - in place */
+void oann_scale_rows(uint64_t st, uint64_t h, int32_t rows, int32_t cols, uint64_t c, int64_t ldc, uint64_t x) {
+    float *pc = (float *)(uintptr_t)c;
+    note(st, OANN_CUBLAS,
+         cublasSdgmm((cublasHandle_t)(uintptr_t)h, CUBLAS_SIDE_LEFT, rows, cols, pc, (int)ldc, (const float *)(uintptr_t)x, 1, pc, (int)ldc),
+         "cublasSdgmm (INT8 scale)");
+}
+
+/* stream capture, for the tests: what is enqueued between begin and end is recorded into a CUDA graph rather than run
+ * (thread-local mode: an allocation or another call unsafe in a capture fails it); end replays the graph `launches`
+ * times on the stream and frees it, giving the graph's node count in nodes[0]. Each returns its cudaError_t */
+int32_t oann_capture_begin(uint64_t stream) {
+    return cudaStreamBeginCapture((cudaStream_t)(uintptr_t)stream, cudaStreamCaptureModeThreadLocal);
+}
+
+int32_t oann_capture_end(uint64_t stream, int32_t launches, int32_t *nodes) {
+    cudaStream_t s = (cudaStream_t)(uintptr_t)stream;
+    cudaGraph_t g = 0;
+    cudaGraphExec_t x = 0;
+    cudaError_t e = cudaStreamEndCapture(s, &g);
+    if (e != cudaSuccess) return e;
+    size_t count = 0;
+    e = cudaGraphGetNodes(g, NULL, &count);
+    nodes[0] = (int32_t)count;
+    if (e == cudaSuccess) e = cudaGraphInstantiate(&x, g, 0);
+    for (int32_t i = 0; i < launches && e == cudaSuccess; i++) e = cudaGraphLaunch(x, s);
+    if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+    if (x) cudaGraphExecDestroy(x);
+    cudaGraphDestroy(g);
+    return e;
+}
