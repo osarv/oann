@@ -6,21 +6,23 @@
 # take one reduction per output instead, its horizontal sum costing about as much as the four vpdpbusd it closes, and
 # below a depth of ~192 the padding does not pay). Expected: a lane form per output vector - a `Sum<I32>` over groups of
 # four lanes, or LaneDot keeping a vector accumulator - that is vpdpbusd acc, broadcast(a), b on a target with VNNI.
-# Status: reproduces (new). Measured 2026-11-16, olang 872fa987, AVX-512 VNNI. Build from the repository's root:
-#   olang build -output build/vnnitile repro/vnnitile.olang && objdump -d build/vnnitile | grep -c vpdpbusd   # 0
+# Status: fixed by olang's grouped lane total, E39's Sum<A>(n) (2026-11-17, branch wt-vnnitile): the row is written
+# `t.v[i * 16:i * 16 + 16] += (pa[o:o + 4] * b).Sum<I32>(4)`, a's four bytes one group's, shared by every group, and
+# builds to vpbroadcastd + vpdpbusd on AVX-512 VNNI. Build from the repository's root:
+#   olang build -output build/vnnitile repro/vnnitile.olang && objdump -d build/vnnitile | grep -c vpdpbusd   # 4
 
 type tile struct() {
     v Array<I32> = Array<I32>(96)
 }
 
-# rows of 6 by 16 outputs: t[i, j] += sum over t < 4 of pa[p, i, t] qb[p, j, t]
+# rows of 6 by 16 outputs: t[i, j] += sum over t < 4 of pa[p, i, t] qb[p, j, t] - E39's grouped total, a's four bytes
+# one group's, shared by every group (vpdpbusd acc, broadcast(a), b)
 fn micro(depth I64, pa Array<U8>&, qb Array<I8>&, t mut tile&) {
     for p in range depth {
-        b I64 = p * 64
+        b := qb[p * 64:p * 64 + 64]
         comptime for i in range 6 {
             o I64 = p * 24 + 4 * i
-            a0, a1, a2, a3 := I32(pa[o]), I32(pa[o + 1]), I32(pa[o + 2]), I32(pa[o + 3])
-            for j in range 16: t.v[i * 16 + j] = t.v[i * 16 + j] + a0 * I32(qb[b + 4 * j]) + a1 * I32(qb[b + 4 * j + 1]) + a2 * I32(qb[b + 4 * j + 2]) + a3 * I32(qb[b + 4 * j + 3])
+            t.v[i * 16:i * 16 + 16] += (pa[o:o + 4] * b).Sum<I32>(4)
         }
     }
 }
