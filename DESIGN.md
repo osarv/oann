@@ -47,7 +47,7 @@ table a packed struct) lowered from a `System`, the simulated FPGA; its golden v
    set; per-element work is never behind a dispatch.
 6. **Language features where they fit:** `Columns` for state, lane operators for element kernels, reflection for
    energies and checkpoint names, `comptime` for approximation coefficients and baked plans, typed attributes
-   (`@dyn.Keep`, `@checkpoint.Name`), `unique` with destructors for open files, packed structs for the board's tables.
+   (key enums: `LifCell.Kept`, `Attn.Names`), `unique` with destructors for open files, packed structs for the board's tables.
 
 ## Tests and measures
 

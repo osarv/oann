@@ -222,11 +222,11 @@ fn (w mut Writer&) encode<T>(name String&, elements Array<T>&, dims tensor.Shape
 type Name struct(Value String&) { Value }
 
 # the tensors held by the fields of r, named by the path to each: a field "q" of a field "attn" of PREFIX is
-# "PREFIX.attn.q" (the name an @checkpoint.Name("c_attn") on a field replaces), an element i of an array of records
+# "PREFIX.attn.q" (a field's name is replaced by the one its type's Names enum gives it), an element i of an array of records
 # or tensors is ".i". Fields that hold no tensor - sizes, flags, a seed - are not written. The dtype is each tensor's
 # own type's
 fn (w mut Writer&) AddFields<R>(prefix String&, r R&) ? SafetensorsError {
-    for f in R.Fields: try w.AddValue(dotted(prefix, fieldName(f)), f.Of(r))
+    for f in R.Fields: try w.AddValue(dotted(prefix, fieldName<R>(f.Name)), f.Of(r))
 }
 
 # v as "name": a tensor is added, a record's fields and an array's elements follow it, anything else is passed over
@@ -251,9 +251,12 @@ fn dotted(prefix String&, name String&) String {
 }
 
 # a field's name in a file
-fn fieldName<F>(f F) String& {
-    if f.HasAttr<Name>(): return (f.Attr<Name>()!).Value
-    return f.Name
+fn fieldName<T>(name String&) String& {
+    if not T.HasMember("Names"): return name
+    for c in T.Names.Cases {
+        if c.Name == name: return c.Value
+    }
+    return name
 }
 
 # the file: header, padded, then the data
@@ -398,7 +401,7 @@ fn (f File&) Get<T>(name String&) tensor.Tensor<T> ? SafetensorsError {
 # (a tensor is a view: reading writes the record's own elements), each of the stored shape - strict as PyTorch's
 # load_state_dict is: a name missing from the file is Missing, a shape that differs a ShapeError
 fn (f File&) ReadFields<R>(prefix String&, r R&) ? SafetensorsError, tensor.ShapeError {
-    for g in R.Fields: try f.ReadValue(dotted(prefix, fieldName(g)), g.Of(r))
+    for g in R.Fields: try f.ReadValue(dotted(prefix, fieldName<R, typeof(f)>(g)), g.Of(r))
 }
 
 fn (f File&) ReadValue<V>(name String&, v V) ? SafetensorsError, tensor.ShapeError {
@@ -652,7 +655,12 @@ test File "numpy reads what is written here bit for bit, and what numpy writes r
 }
 
 # a model's parts, as a record of tensors: the names come from the fields
-type Attn struct(q tensor.Tensor<F32>, k tensor.Tensor<F32>, @Name("c_proj") out tensor.Tensor<F32>) { q, k, out }
+type Attn struct(q tensor.Tensor<F32>, k tensor.Tensor<F32>, out tensor.Tensor<F32>) { q, k, out }
+
+# a field's name in the file where it differs from its own
+type Attn.Names enum {
+    out = "c_proj"
+}
 
 type Block struct(attn Attn, bias tensor.Tensor<F32>, heads I64) { attn, bias, heads }
 

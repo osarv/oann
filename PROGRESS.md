@@ -182,7 +182,7 @@ a `System.Shrunk()` that records a new system from the old one's records (module
 signals, rules) and re-plans it; every connection rewired by the map of live units - dense, symmetric and event-driven
 blocks as their live rows and columns, a low-rank one as A's live rows and B's live columns, sparse rows with their old
 pattern restricted (Link has no way to take a pattern from outside `Draw` yet), tiles refused or turned dense (the tile
-grid does not follow units); biases, the kept state fields (@Keep: thresholds, gains), drives, targets and labels
+grid does not follow units); biases, the kept state fields (LifCell.Kept: thresholds, gains), drives, targets and labels
 copied by the same map; the learner and optimizer made again. It saves the retired units' state and sweep work only,
 which is small next to the weights `Sparsify` already removes.
 
