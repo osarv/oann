@@ -626,8 +626,9 @@ fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
 # <= q r + dt (1 - kappa_beta) r = r), so the settle stays in it and shrinks the residual by q every sweep.
 # kappa_beta is kappa plus beta times the force's Jacobian within r of the start (neuron.ForceOver): its part between
 # units at +beta (the shortened step absorbs the diagonal), the whole at -beta. r is grown from the start's residual /
-# (1 - kappa) by a quarter until the ball holds; 1 where none does within 100 growths, where the free phase is not
-# certified, and for a spiking model or one without a slope bound. Gives the rate and the rows it certifies on their own
+# (1 - kappa) by a quarter until the ball holds; 1 where none does within 100 growths or kappa_beta reaches 1 (it only
+# grows with r), where the free phase is not certified, and for a spiking model or one without a slope bound. Gives
+# the rate and the rows it certifies on their own
 fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
     k := s.Kappa()
     if rateOf(s.E.Dt, k) >= 1.0 or not free.Converged or s.E.Spiking: return 1.0, 0
@@ -649,7 +650,8 @@ fn (s System<T>&) rowRate(row I64, k F64, b F64, rest F64) F64 {
     for _ in range 100 {
         c, w := s.forceOver(row, r, euclid)
         minus := k + b * w
-        if minus < 1.0 and (1.0 - minus) * r >= start: return rateOf(s.E.Dt / (1.0 + b * s.E.ForceSlope()), k + b * c).Max(rateOf(s.E.Dt, minus))
+        if minus >= 1.0: return 1.0
+        if (1.0 - minus) * r >= start: return rateOf(s.E.Dt / (1.0 + b * s.E.ForceSlope()), k + b * c).Max(rateOf(s.E.Dt, minus))
         r *= 1.25
     }
     return 1.0

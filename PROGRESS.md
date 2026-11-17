@@ -388,11 +388,45 @@ answers 25% fewer sweeps (10.7 against 14.5), and its accuracy is the uncertifie
 power iterations a lesson and `Restrain`, and the row-norm pass. XOR: lower loss than the sup certificate (0.0022
 against 0.0108), 2 more sweeps a lesson. **`Norm.Spectral` is the default.**
 
+## The nudged pair certified from the free state (wt-oanncert3, 2026-11-17)
+
+`System.NudgedRate(beta, free)` replaces the worst-case coupling (`beta / (4 T)` per unit of slope) by the readouts'
+force bounded over the ball the nudged settle can reach, row by row: the start's residual is at most the free
+residual plus `beta |F(s0)|`; a sweep that contracts by q on the ball of radius r with that residual at most
+`(1 - kappa_beta(r)) r` keeps the settle in it, and `kappa_beta(r)` counts the softmax's probabilities and the
+readouts' tanh slopes bounded over the ball (`neuron.ForceOver`: sup rows/columns, or in the Euclidean norm also
+`lambda_max(S) <= (1 - p_y) + max_{i != y} p_i` for the whole Jacobian and `|p|^2` for the coupling;
+docs/redesign.md 1.4 item 10). `Learner.Lesson` gives the nudged pair the budget of that rate where it certifies the
+batch (`BudgetAt`), the clamped one otherwise; `Taught.Rate` and `Taught.Rows` (rows certified on their own) report
+it. Tests: a confident readout's pair at beta 0.5 certified in both norms where `Rate(0.5)` is 1, every sweep
+shrinking the residual by at most the rate; soundness over 96 random settles (seeds, kappa 0.2/0.5/0.8, readout
+bias 0-4, beta 0.1-1, both norms; 45 certified, 51 refused): every certified settle's measured contraction between
+consecutive states is at most q (the largest measured ratio 0.90 q), and the test fails if the force term is dropped.
+
+Measured `3 60000 128 32 1` (default `none`: sup norm, free) and the same with `plain spectral` (kappa 0.9 held),
+master against the branch alternated, 3 runs each, load 16-25 on 6 cores (logs/ in the worktree):
+
+| MNIST, epoch 3 | nudged batches certified | rows certified (epochs 1 / 2 / 3) | sweeps a lesson | accuracy | wall, 3 epochs |
+|---|---|---|---|---|---|
+| none, master | 0 | - | 32.4 | 96.71% | 14.2 / 12.2 / 12.0 s |
+| none, NudgedRate | 0 | 0 / 0 / 0% | 32.4 | 96.71% | 10.7 / 15.1 / 11.0 s |
+| spectral, master | 0 | - | 31.8 | 96.98% | 10.3 / 9.4 / 7.5 s |
+| spectral, NudgedRate | 0 | 22.6 / 37.1 / 43.8% | 31.8 | 97.07% | 8.2 / 9.0 / 9.8 s |
+
+Reading: the bound is sound and costs nothing measurable (a row that cannot certify leaves as soon as kappa_beta
+reaches 1), but it certifies no batch of 32. Under `none` the sup gain grows past 1 (4.5 after an epoch) and nothing
+is certified at all. Under the spectral certificate 44% of the rows certify by epoch 3; at the free state alone,
+the ball ignored, 77% would - so at kappa 0.9 an uncertain row's `beta lambda_max(S) rho' / T` exceeds `1 - kappa`
+outright, and a batch needs all 32 rows. Training is unchanged (no batch certified, so no budget changed; the 0.09
+point accuracy difference is the extra warm power iteration `Kappa` advances, which `Restrain` starts from).
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1).
-- A nudged-phase certificate tight enough for training's beta: the coupling bound is worst-case (`beta / (4 T)` per
-  unit of slope); the readouts' slopes at the state would tighten it (docs/redesign.md 1.4 item 10).
+- The nudged pair's certificate per batch: `NudgedRate` certifies confident rows only (44% at MNIST's epoch 3, no
+  batch of 32). Next levers: a block-weighted norm (readouts apart from hidden units: the hidden-readout coupling
+  carries the readouts' small saturated slopes, `beta w < 1 - kappa^2 rho'_y` instead of `1 - kappa`), or a budget
+  per row.
 - Compacting retired units (above, if it pays).
 - INT8: shallow products (the CNN's depth 9 and 144) and the per-lane `vpdpbusd`
   lowering (repro/vnnitile).
