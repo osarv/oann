@@ -1158,7 +1158,8 @@ interleaved, medians (tables and reproduction in PROGRESS.md, "GP5"). On MNIST, 
   3.4x at 512 x 128, 2.8x at 32 x 1024, 6.1x at 128 x 1024, 8.9x at 512 x 1024 (0.85 s an epoch against 7.57 at four
   threads, 21.36 at one). The GPU's settle costs about 1 ms whatever its size: its fixed cost, not its sweeps, sets the
   crossover (GP7: CUDA graphs, fewer readbacks). `system.SettleOn(batch, width)` is this rule, measured for
-  mnist_learn's 784-H-10 system on this machine; `Plan`'s default stays the CPU.
+  mnist_learn's 784-H-10 system on this machine; `Plan`'s default stays the CPU. Re-measured after master's NudgedRate
+  and gemm changes (f151566): the same crossover, the GPU's lead at 16384 1.04-1.16x, the CPU's at 8192 1.6-1.7x.
 - **`Check` 4** stays the default: fastest in every cell; 1 costs 1.2-1.5x, 16 1.1-1.25x.
 - **The accuracy is the CPU's**: the same to the digit at batch 128 and 512 for nearly every seed; at batch 32 the runs
   drift apart by rounding and the medians over 15 seeds agree (97.12 / 97.12% at hidden 128, 96.11 / 96.04% at 1024; the

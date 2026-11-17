@@ -895,7 +895,8 @@ takes the medians. MNIST lives in `/home/oscar/claude/data/mnist`, linked as `da
   32 x 256) the CPU is 1.5-1.7x faster, at 4096 (32 x 128) 3.0x. Above it the GPU's lead grows with the work: 2.2x at
   64 x 512, 2.8x at 32 x 1024, 3.4x at 512 x 128, 6.1x at 128 x 1024, 8.9x at 512 x 1024. So for mnist_learn's default
   (batch 32, hidden 128) the CPU stays; at hidden 1024 the GPU wins from batch 32. `system.SettleOn(batch, width)` is
-  this rule in one line (and `mnist_learn ... auto`); `Plan`'s default stays the CPU.
+  this rule in one line (and `mnist_learn ... auto`); `Plan`'s default stays the CPU. It holds on the rebased tree
+  (below), at 16384 by 1.04-1.16x.
 - **`Check` 4**, the default, is the fastest in every cell: `Check` 1 (a host wait every sweep) costs 1.2-1.5x, `Check`
   16 (up to 15 wasted sweeps a settle, at 26-55 sweeps a lesson) 1.1-1.25x. Sweeps a lesson are the same for all three.
 - **On the CPU one thread** wherever the GPU loses: 4 threads are slower in every cell below 16384 (1.2-1.5x; GP4's and
@@ -965,6 +966,21 @@ The crossover, between the grid's cells (`make gpulearn OLANG=olang ARGS="3 3 12
 Accuracy, 15 seeds at batch 32 (`make gpulearn OLANG=olang ARGS="15 3 128,1024 32 1,gpu4"`): hidden 128 CPU 97.12%
 (96.47-97.39), GPU 97.12% (96.47-97.30), 1.28 against 3.90 s an epoch; hidden 1024 CPU 96.11% (94.99-96.56), GPU 96.04%
 (94.78-96.74), 11.53 against 4.07 s.
+
+**After the rebase onto f151566** (master's NudgedRate per row in two norms, and gemm splitting a product over tasks
+only per 16M multiply-adds; measured on the rebased tree, `make gpulearn OLANG=olang ARGS="3 3 128,256,512 32,64,128
+1,4,gpu4"`, s an epoch, CPU 1 thread / 4 threads / GPU Check 4): every backend is 8-12% slower an epoch (the host's
+certificate each lesson), and four threads now equal one thread below batch x hidden 16384 (the split no longer pays
+for what it costs there). The crossover stays at 16384, narrower:
+
+| hidden x batch | 128 x 32 | 128 x 64 | 256 x 32 | 128 x 128 | 256 x 64 | 512 x 32 | 256 x 128 | 512 x 64 | 512 x 128 |
+|---|---|---|---|---|---|---|---|---|---|
+| batch x hidden | 4096 | 8192 | 8192 | 16384 | 16384 | 16384 | 32768 | 32768 | 65536 |
+| CPU 1 / 4 threads | 1.42 / 1.40 | 1.63 / 1.53 | 2.25 / 2.23 | 1.68 / 1.63 | 2.35 / 2.35 | 4.52 / 4.58 | 2.53 / 2.57 | 4.91 / 4.84 | 5.18 / 4.41 |
+| GPU, Check 4 | 4.10 | 2.42 | 3.88 | 1.40 | 2.26 | 4.16 | 1.41 | 2.43 | 1.38 |
+| faster | CPU 2.92x | CPU 1.58x | CPU 1.74x | GPU 1.16x | GPU 1.04x | GPU 1.09x | GPU 1.80x | GPU 1.99x | GPU 3.19x |
+
+The sweeps a lesson are unchanged; the accuracies the same within the seeds (CPU and GPU still equal at batch 128).
 
 Reproduce: `make data OLANG=olang` once, then the commands above; one run alone is
 `make mnistlearn OLANG=olang ARGS="3 60000 1024 128 1 0.001 0.5 gpu"` (`gpu1`, `gpu16`, a thread count, or `auto`).
