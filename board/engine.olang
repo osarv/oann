@@ -221,6 +221,7 @@ fn tableOf(f neuron.Rho) I64 {
 # sigmoid (an input may be linear), or Lif neurons (a spiking system, its inputs rate neurons as always)
 fn Engine.Lower<T>(s system.System<T>&) mut Engine& ? LowerError {
     if not s.Planned: error LowerError.Unsupported("a system lowered before Plan")
+    if s.Bound != system.Norm.Sup: error LowerError.Unsupported("a system certified in the spectral norm: the board's ranges (settling.md 4.2) need the sup-norm certificate - set Bound = Norm.Sup before Certify")
     pops := s.E.Pops
     links := s.E.Links
     sizes := Array<I64>(pops.Len())                             # the units each population keeps
@@ -1400,6 +1401,7 @@ import "std/rand"
 # a system of one tanh population, h, of n units with a lateral block read both ways
 fn lateral(batch I64, n I64, r mut rand.Rand&) system.System<F64> {
     s := system.System<F64>(batch)
+    s.Bound = system.Norm.Sup
     h := s.Population(s.Root(), "h", n, neuron.Neuron.Rate(neuron.Rho.Tanh))
     s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
     s.Plan(r)!
@@ -1469,6 +1471,7 @@ fn exact(s mut system.System<F64>&) {
 # targets), every recurrent block read both ways, certified at kappa, with biases, drives and classes drawn from r
 fn fixture(batch I64, r mut rand.Rand&, kappa F64, tanhIn Bool, squared Bool) system.System<F64> {
     s := system.System<F64>(batch)
+    s.Bound = system.Norm.Sup
     root := s.Root()
     x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Tanh if tanhIn else neuron.Rho.Linear), neuron.Role.Input)
     h := s.Population(root, "h", 5, neuron.Neuron.Rate(neuron.Rho.Tanh))
@@ -1667,6 +1670,7 @@ import "std/json"
 # board.olang's spiking tests: every relaxing neuron biased above its threshold
 fn lifFixture(batch I64, model neuron.Neuron, r mut rand.Rand&) system.System<F64> {
     s := system.System<F64>(batch)
+    s.Bound = system.Norm.Sup
     root := s.Root()
     x := s.Population(root, "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
     h := s.Population(root, "h", 5, model)
@@ -1700,6 +1704,7 @@ fn alike(a Engine&, b Engine&) {
 # biases, drives, classes and targets
 fn twinDense(a system.System<F64>&) system.System<F64> {
     b := system.System<F64>(a.Batch)
+    b.Bound = system.Norm.Sup
     for p in a.E.Pops: b.Population(b.Root(), "p", p.Size, p.Model, p.Role)
     for l in a.E.Links: b.Connect(system.Pop(l.Pre), system.Pop(l.Post), conn.Wiring.Dense, false, l.Both)
     r := rand.Rand(1)
@@ -1724,6 +1729,7 @@ fn twinDense(a system.System<F64>&) system.System<F64> {
 # drives and targets drawn from r
 fn wired(w conn.Wiring, both Bool, r mut rand.Rand&) system.System<F64> {
     s := system.System<F64>(3)
+    s.Bound = system.Norm.Sup
     root := s.Root()
     x := s.Population(root, "x", 4, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
     h := s.Population(root, "h", 6, neuron.Neuron.Rate(neuron.Rho.Tanh))
@@ -1781,6 +1787,7 @@ test "every wiring lowers to the dense block it stands for - as built, pruned, t
 test "retired units are dropped: the engine of a system with units retired is the engine of one built without them" {
     r := rand.Rand(13)
     a := system.System<F64>(3)
+    a.Bound = system.Norm.Sup
     root := a.Root()
     x := a.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
     h := a.Population(root, "h", 6, neuron.Neuron.Rate(neuron.Rho.Tanh))
@@ -1803,6 +1810,7 @@ test "retired units are dropped: the engine of a system with units retired is th
     # the same system built with four hidden units: those of a that are alive
     alive := Array<I64>[0, 2, 3, 5]
     b := system.System<F64>(3)
+    b.Bound = system.Norm.Sup
     bx := b.Population(b.Root(), "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
     bh := b.Population(b.Root(), "h", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
     bo := b.Population(b.Root(), "o", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
@@ -1845,6 +1853,7 @@ test "retired units are dropped: the engine of a system with units retired is th
     assert pv <= bound and ps <= bound + ea.ActError
     # a readout's retired unit is no board system
     a2 := system.System<F64>(1)
+    a2.Bound = system.Norm.Sup
     p := a2.Population(a2.Root(), "o", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes(0.25)))
     a2.Connect(p, p, conn.Wiring.Dense, reciprocal = true)
     r2 := rand.Rand(1)
@@ -1869,6 +1878,7 @@ test "a Lif neuron on the board fires at the analytic rate of its quantized driv
     window I64 = 4000
     r := rand.Rand(14)
     s := system.System<F64>(6)
+    s.Bound = system.Norm.Sup
     h := s.Population(s.Root(), "h", 1, neuron.Neuron.Lif(0.05, 1.0, 1.0, window))
     s.Plan(r)!
     drives := Array<F64>[0.5, 0.98, 1.05, 1.5, 2.5, 6.0]
@@ -2015,6 +2025,7 @@ test "what the board cannot run is refused when lowering, saying why" {
     r := rand.Rand(3)
     # a rectifier has no table
     s := system.System<F64>(1)
+    s.Bound = system.Norm.Sup
     s.Population(s.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Relu))
     s.Plan(r)!
     refused Bool = false
@@ -2022,6 +2033,7 @@ test "what the board cannot run is refused when lowering, saying why" {
     assert refused
     # a linear neuron that is not an input
     t := system.System<F64>(1)
+    t.Bound = system.Norm.Sup
     t.Population(t.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Linear))
     t.Plan(r)!
     refused = false
@@ -2029,12 +2041,14 @@ test "what the board cannot run is refused when lowering, saying why" {
     assert refused
     # a system not yet planned
     u := system.System<F64>(1)
+    u.Bound = system.Norm.Sup
     u.Population(u.Root(), "h", 2, neuron.Neuron.Rate(neuron.Rho.Tanh))
     refused = false
     try Engine.Lower(u) catch LowerError { refused = true }
     assert refused
     # a neuron with more than 2^16 synapses reaching it: its sum would overflow the accumulator
     v := system.System<F64>(1)
+    v.Bound = system.Norm.Sup
     h := v.Population(v.Root(), "h", 70000, neuron.Neuron.Rate(neuron.Rho.Tanh))
     g := v.Population(v.Root(), "g", 1, neuron.Neuron.Rate(neuron.Rho.Tanh))
     v.Connect(h, g, conn.Wiring.Dense, reciprocal = true)
@@ -2097,6 +2111,7 @@ test "MNIST through the board (M11): a certified 784-128-10 taught at T = 0.25, 
     # the system the board runs, taught by dyn's equilibrium propagation (learn.Learner: Adam 1e-3, beta 0.5, held in the
     # certified set after every step, as docs/settling.md 5.9 ran it), and the engine lowered from it
     s := system.System<F32>(batch)
+    s.Bound = system.Norm.Sup
     x := s.Population(s.Root(), "pixels", 784, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
     h := s.Population(s.Root(), "hidden", 128, neuron.Neuron.Rate(neuron.Rho.Tanh))
     y := s.Population(s.Root(), "digits", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes(0.25)))
