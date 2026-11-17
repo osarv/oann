@@ -23,7 +23,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpugemm gpurate mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpugemm gpurate gpult mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -51,6 +51,12 @@ gpugemm:
 gpurate:
 	$(OLANG) build -define Gpu=true -output build/bench_gpurate bench/gpurate.olang
 	$(GPUENV) ./build/bench_gpurate $(ARGS)
+
+# G-M1 on cuBLASLt (GP3): planned products F32, BF16 exact and fast, F32 through BF16 and TF32, BF16 weights under F32,
+# against GP1's cuBLAS Gemm and kernels/gemm, resident, with each way's error (bench/gpult.olang) - ARGS: rounds
+gpult:
+	$(OLANG) build -define Gpu=true -output build/bench_gpult bench/gpult.olang
+	$(GPUENV) ./build/bench_gpult $(ARGS)
 
 # M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
 mlpad:

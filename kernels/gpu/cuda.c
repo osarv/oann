@@ -520,11 +520,12 @@ void oann_lt_run(uint64_t st, uint64_t lt, uint64_t plan, double alpha, double b
 }
 
 /* times every algorithm the heuristic offered on these addresses (as a run's, alpha 1, beta 0: c is overwritten), reps
- * products each after as many untimed, by events on the stream, and keeps the fastest; info as the plan's. The
- * status: the first failure, cuBLAS's or CUDA's (negated) */
+ * products each after as many untimed, by events on the stream, and keeps the fastest; info as the plan's, and in
+ * tried five numbers for each offered (8 at most): the ns a product took (-1: it failed or wants more workspace), its
+ * algorithm's id, tile, split-K parts and reduction scheme. The status: the first failure, cuBLAS's or CUDA's (negated) */
 int32_t oann_lt_tune(uint64_t lt, uint64_t plan, uint64_t a, uint64_t b, uint64_t c, int32_t outer, int64_t oa,
                      int64_t ob, int64_t oc, uint64_t work, uint64_t workBytes, uint64_t stream, int32_t reps,
-                     int64_t *info) {
+                     int64_t *info, int64_t *tried) {
     oann_lt *p = (oann_lt *)(uintptr_t)plan;
     cudaStream_t s = (cudaStream_t)(uintptr_t)stream;
     cudaEvent_t e0 = 0, e1 = 0;
@@ -540,6 +541,19 @@ int32_t oann_lt_tune(uint64_t lt, uint64_t plan, uint64_t a, uint64_t b, uint64_
     int best = -1;
     float bestMs = 0;
     cublasStatus_t status = CUBLAS_STATUS_SUCCESS;
+    for (int i = 0; i < 8; i++) {
+        int64_t *t = tried + 5 * i;
+        t[0] = -1;
+        t[1] = t[2] = t[3] = t[4] = 0;
+        if (i >= p->found) continue;
+        int32_t v[4] = {0, 0, 0, 0};
+        size_t got = 0;
+        cublasLtMatmulAlgoConfigGetAttribute(&p->offered[i].algo, CUBLASLT_ALGO_CONFIG_ID, &v[0], sizeof v[0], &got);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->offered[i].algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &v[1], sizeof v[1], &got);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->offered[i].algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &v[2], sizeof v[2], &got);
+        cublasLtMatmulAlgoConfigGetAttribute(&p->offered[i].algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &v[3], sizeof v[3], &got);
+        for (int j = 0; j < 4; j++) t[j + 1] = v[j];
+    }
     for (int i = 0; i < p->found && ce == cudaSuccess; i++) {
         if (p->offered[i].workspaceSize > workBytes) continue;
         cublasStatus_t st = CUBLAS_STATUS_SUCCESS;
@@ -561,6 +575,7 @@ int32_t oann_lt_tune(uint64_t lt, uint64_t plan, uint64_t a, uint64_t b, uint64_
         }
         float ms = 0;
         cudaEventElapsedTime(&ms, e0, e1);
+        tried[5 * i] = (int64_t)((double)ms * 1e6 / reps);
         if (best < 0 || ms < bestMs) {
             best = i;
             bestMs = ms;

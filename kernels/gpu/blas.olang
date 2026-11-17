@@ -202,6 +202,7 @@ type Product<SC, SA, SB> unique struct(dev device.Device&) {
     ob I64 = 0
     oc I64 = 0
     Chosen Choice = Choice()
+    Tried mut Array<I64>& = Array<I64>(40)   # Tune's: for each algorithm offered, ns a product (-1 failed), id, tile, split-K, reduction
 } destruct {
     if lt != 0: cu.oann_lt_free(lt)
     wa.free()
@@ -330,7 +331,7 @@ fn (p mut Product<SC, SA, SB>&) Tune(d mut device.Device&, c mut device.DMat<SC>
     ab := p.wb.at(d, b.Addr(0, 0))
     try d.Sync()
     info := Array<I64>(9)
-    st := cu.oann_lt_tune(d.Lt(), p.lt, ab, aa, c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info)
+    st := cu.oann_lt_tune(d.Lt(), p.lt, ab, aa, c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info, p.Tried)
     try tuned(st)
     p.Chosen = Choice.Of(info)
 }
@@ -340,9 +341,21 @@ fn (p mut Product<SC, SA, SB>&) TuneBatch(d mut device.Device&, c mut device.DBa
     if p.lt == 0: return
     try d.Sync()
     info := Array<I64>(9)
-    st := cu.oann_lt_tune(d.Lt(), p.lt, b.Data.Addr(b.Off), a.Data.Addr(a.Off), c.Data.Addr(c.Off), I32(p.outer), p.ob, p.oa, p.oc, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info)
+    st := cu.oann_lt_tune(d.Lt(), p.lt, b.Data.Addr(b.Off), a.Data.Addr(a.Off), c.Data.Addr(c.Off), I32(p.outer), p.ob, p.oa, p.oc, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info, p.Tried)
     try tuned(st)
     p.Chosen = Choice.Of(info)
+}
+
+# what Tune timed: "id/tile/split-K/reduction: us" for each algorithm offered
+fn (p Product<SC, SA, SB>&) TriedStr() String {
+    out := ""
+    for i in range 8 {
+        t := p.Tried[5 * i:5 * i + 5]
+        if t[1] == 0 and t[0] < 0: continue
+        if out.Len() > 0: out = out + ", "
+        out = out + $t[1] + "/" + $t[2] + "/" + $t[3] + "/" + $t[4] + ": " + ("failed" if t[0] < 0 else $(F64(t[0]) * 1e-3).Fixed(1) + " us")
+    }
+    return out
 }
 
 # oann_lt_tune's status: CUDA's negated, else cuBLAS's
