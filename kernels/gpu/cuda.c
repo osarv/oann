@@ -661,3 +661,51 @@ int32_t oann_capture_end(uint64_t stream, int32_t launches, int32_t *nodes) {
     cudaGraphDestroy(g);
     return e;
 }
+
+/* ---- GP4 (dyn/mirror.olang, the settle on the GPU): pinned host staging, copies through it, events waited on ----
+ *
+ * A plan stages a batch's inputs (drives, labels, targets, the phases' steps) into pinned memory it allocated at Plan
+ * and uploads them in one asynchronous copy; the settle's residual words come down into pinned memory too, after an
+ * event, so the host reads them while the device runs the sweeps queued after them. Pinned memory is addressed by U64
+ * like device memory; the host reads and writes it only through these functions. */
+
+int32_t oann_pinned_alloc(uint64_t *out, uint64_t bytes) {
+    void *p = 0;
+    cudaError_t e = cudaHostAlloc(&p, (size_t)(bytes > 0 ? bytes : 1), cudaHostAllocDefault);
+    *out = (uint64_t)(uintptr_t)p;
+    return e;
+}
+
+int32_t oann_pinned_free(uint64_t p) { return cudaFreeHost((void *)(uintptr_t)p); }
+
+/* bytes of host from host + from (bytes) into pinned memory at pinned + at */
+void oann_stage(uint64_t pinned, uint64_t at, const void *host, uint64_t from, uint64_t bytes) {
+    memcpy((char *)(uintptr_t)pinned + at, (const char *)host + from, (size_t)bytes);
+}
+
+/* the 64-bit word i of pinned memory */
+uint64_t oann_pinned_word(uint64_t pinned, uint64_t i) { return ((const volatile uint64_t *)(uintptr_t)pinned)[i]; }
+
+/* bytes from pinned memory at src to the device address dst on the copy stream, ordered before what is enqueued next
+ * on the compute stream by the event (as oann_upload, but asynchronous to the host: src must not be written until the
+ * compute stream has passed it) */
+void oann_upload_pinned(uint64_t st, uint64_t dst, uint64_t src, uint64_t bytes, uint64_t copy, uint64_t event,
+                        uint64_t compute) {
+    cudaStream_t cs = (cudaStream_t)(uintptr_t)copy;
+    note(st, OANN_CUDA, cudaMemcpyAsync((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)bytes,
+                                        cudaMemcpyHostToDevice, cs), "cudaMemcpyAsync (staged upload)");
+    note(st, OANN_CUDA, cudaEventRecord((cudaEvent_t)(uintptr_t)event, cs), "cudaEventRecord (staged upload)");
+    note(st, OANN_CUDA, cudaStreamWaitEvent((cudaStream_t)(uintptr_t)compute, (cudaEvent_t)(uintptr_t)event, 0),
+         "cudaStreamWaitEvent (staged upload)");
+}
+
+/* bytes from the device address src to pinned memory at dst, on the compute stream, then the event recorded there */
+void oann_download_pinned(uint64_t st, uint64_t dst, uint64_t src, uint64_t bytes, uint64_t compute, uint64_t event) {
+    cudaStream_t cs = (cudaStream_t)(uintptr_t)compute;
+    note(st, OANN_CUDA, cudaMemcpyAsync((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)bytes,
+                                        cudaMemcpyDeviceToHost, cs), "cudaMemcpyAsync (pinned download)");
+    note(st, OANN_CUDA, cudaEventRecord((cudaEvent_t)(uintptr_t)event, cs), "cudaEventRecord (pinned download)");
+}
+
+/* waits for the event; its status (an asynchronous fault shows here) */
+int32_t oann_event_sync(uint64_t ev) { return cudaEventSynchronize((cudaEvent_t)(uintptr_t)ev); }

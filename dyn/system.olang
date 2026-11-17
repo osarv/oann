@@ -21,13 +21,35 @@
 # connection scaled so that kappa is a target, 0.9 by default), Restrain (scaled back into the certified set where they
 # left it), Rate (the certified contraction q = 1 - dt (1 - kappa)) and the budgets that follow (settling.md 1.2, 1.4,
 # 1.10; the spectral certificate, docs/redesign.md 4.3).
+#
+# The backend (docs/redesign.md 1.10). Plan takes `on`, a kernels/device Backend - by default the one device.SetDefault
+# chose, the CPU until then. On the GPU (a build with -define Gpu=true) Plan lays every region out a second time on the
+# device (dyn/mirror) and Settle, Nudged, Reset and Warm run there; EP's contrast (dyn/learn) and learn.AdamW's step
+# too. What reads host state - Activity, Predict, Loss, State, Params, Weights, Bias, ParamGrads, the stability tools -
+# brings it down first, and what writes it marks the device's copy stale, so a read is never silently old. What the GPU
+# cannot run is refused at Plan by name (DeviceError.Unsupported): spiking and custom populations, sparse and
+# event-driven connections, Anderson and Gauss-Seidel sweeps.
 
 import "std/os"
 import "std/rand"
 import "../tensor"
+import "../kernels/device"
 import "neuron"
 import "conn"
 import "settle"
+
+Gpu Bool = false
+
+if Gpu {
+    import "mirror"
+
+    # the system's mirror on the GPU, where it was planned there
+    type onGpu<T> struct(n I64) {
+        M mut mirror.Mirror<T>?& = null
+    }
+} else {
+    type onGpu<T> struct(n I64) { }
+}
 
 # handles: a population, a connection, a module, a signal - numbered in the order they were made
 type Pop I64
@@ -90,6 +112,7 @@ type System<T> struct(batch I64, threads I64 = 1, phases I64 = 3) {
     sigs mut Vec<sigRec>& = Vec<sigRec>()
     rules mut Vec<ruleRec>& = Vec<ruleRec>()
     signals mut Array<T>& = Array<T>(0)
+    gpu mut onGpu<T>& = onGpu<T>(0)
 }
 
 # ---- recording ----
@@ -146,12 +169,22 @@ fn (s System<T>&) AttachedAt(i I64) Attached {
 
 # ---- the plan ----
 
-# lays everything out and draws the weights from r (Glorot-uniform; biases zero). Refuses a structure the settle cannot
-# run: a connection into an input, an event-driven one that is reciprocal, spiking populations beside rate ones or as
-# inputs, spiking populations of different windows, a custom model outside a System<F32>
-fn (s mut System<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError, conn.WiringError {
+# lays everything out and draws the weights from r (Glorot-uniform; biases zero), on the backend on (the default one,
+# device.SetDefault's; the CPU until set). Refuses a structure the settle cannot run: a connection into an input, an
+# event-driven one that is reciprocal, spiking populations beside rate ones or as inputs, spiking populations of
+# different windows, a custom model outside a System<F32> - and on the GPU (DeviceError) what has no GPU form, by name,
+# a build without the GPU, or the device's failure
+fn (s mut System<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.Default()) ? tensor.ShapeError, conn.WiringError, device.DeviceError {
     if s.Planned: error tensor.ShapeError.Mismatch("Plan twice")
     try s.check()
+    if on == device.Backend.Gpu {
+        if Gpu {
+            why := mirror.Refusal(s.E, s.Scheme)
+            if why != "": error device.DeviceError.Unsupported("no GPU form of " + why + ": plan this system on device.Backend.Cpu")
+        } else {
+            try device.NotBuilt()
+        }
+    }
     e := s.E
     count I64 = 0
     for l in e.Links {
@@ -182,12 +215,72 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&) ? tensor.ShapeError, conn.WiringErr
     s.signals = Array<T>(width)
     e.Ready()
     e.Reserve(s.Scheme.Anderson)
+    if Gpu {
+        if on == device.Backend.Gpu {
+            try device.Open()
+            s.gpu.M = try mirror.Mirror<T>.Make(device.Opened!, e, s.Scheme)
+        }
+    }
     s.Planned = true
+}
+
+# whether it was planned on the GPU
+fn (s System<T>&) OnGpu() Bool {
+    if Gpu {
+        return s.gpu.M != null
+    } else {
+        return false
+    }
+}
+
+if Gpu {
+    # its mirror on the GPU (planned there)
+    fn (s System<T>&) Mirror() mut mirror.Mirror<T>& { return s.gpu.M! }
+}
+
+# host and device kept current (dyn/mirror): population i's state, the recurrent weights, every parameter, the
+# gradients brought down where the device's are newer; and after the host writes them, the device's marked stale.
+# Nothing on the CPU
+fn (s System<T>&) hostState(i I64) {
+    if Gpu {
+        if s.gpu.M != null: s.gpu.M!.HostState(s.E, i)
+    }
+}
+
+fn (s System<T>&) hostCoupling() {
+    if Gpu {
+        if s.gpu.M != null: s.gpu.M!.HostCoupling(s.E)
+    }
+}
+
+fn (s System<T>&) wroteCoupling() {
+    if Gpu {
+        if s.gpu.M != null: s.gpu.M!.WroteCoupling(s.E)
+    }
+}
+
+fn (s System<T>&) wroteParams() {
+    if Gpu {
+        if s.gpu.M != null: s.gpu.M!.WroteParams(s.E)
+    }
+}
+
+fn (s System<T>&) wroteGrads() {
+    if Gpu {
+        if s.gpu.M != null: s.gpu.M!.WroteGrads(s.E)
+    }
+}
+
+fn (s System<T>&) wroteState(i I64) {
+    if Gpu {
+        if s.gpu.M != null: s.gpu.M!.WroteState(s.E, i)
+    }
 }
 
 # how its settles sweep from now on, in the budgets it gives (BudgetFor, a Learner's): Anderson's room reserved where
 # planned (allocates, once)
 fn (s mut System<T>&) Use(scheme settle.Sweeping) {
+    if s.OnGpu() and (scheme.Anderson > 0 or scheme.GaussSeidel): unreachable "a system planned on the GPU sweeps by Jacobi: Anderson acceleration and Gauss-Seidel sweeps stay on the CPU"
     s.Scheme = scheme
     if s.Planned: s.E.Reserve(scheme.Anderson)
 }
@@ -319,6 +412,9 @@ fn (s mut System<T>&) Settle(phase settle.Phase, b settle.Budget) settle.Settlem
     ph := phase.Index()
     if ph >= s.Phases: unreachable "a system of " + $s.Phases + " phases has no " + $phase
     s.E.Beta[ph] = 0.0 if phase == settle.Phase.Free else s.E.Beta[ph]
+    if Gpu {
+        if s.gpu.M != null: return s.gpu.M!.Settle(s.E, ph, ph + 1, b, true)
+    }
     return s.E.Settle(ph, ph + 1, b, true)
 }
 
@@ -329,15 +425,37 @@ fn (s mut System<T>&) Nudged(b settle.Budget, beta F64 = 0.5, centered Bool = tr
     if s.Phases < hi: unreachable "a system of " + $s.Phases + " phases cannot hold these nudged phases"
     s.E.Beta[1] = beta
     if centered: s.E.Beta[2] = -beta
+    if Gpu {
+        if s.gpu.M != null {
+            for ph in range 1, hi: s.gpu.M!.Warm(s.E, ph, 0)
+            return s.gpu.M!.Settle(s.E, 1, hi, b, false)
+        }
+    }
     for ph in range 1, hi: s.E.Warm(ph, 0)
     return s.E.Settle(1, hi, b, false)
 }
 
 # phase's state at rest: every field but the kept ones (LifCell.Kept) zero
-fn (s mut System<T>&) Reset(phase settle.Phase) { s.E.Reset(phase.Index()) }
+fn (s mut System<T>&) Reset(phase settle.Phase) {
+    if Gpu {
+        if s.gpu.M != null {
+            s.gpu.M!.Reset(s.E, phase.Index())
+            return
+        }
+    }
+    s.E.Reset(phase.Index())
+}
 
 # phase's state set to from's
-fn (s mut System<T>&) Warm(phase settle.Phase, from settle.Phase) { s.E.Warm(phase.Index(), from.Index()) }
+fn (s mut System<T>&) Warm(phase settle.Phase, from settle.Phase) {
+    if Gpu {
+        if s.gpu.M != null {
+            s.gpu.M!.Warm(s.E, phase.Index(), from.Index())
+            return
+        }
+    }
+    s.E.Warm(phase.Index(), from.Index())
+}
 
 # the nudge phase was last settled with (0 for the free phase)
 fn (s System<T>&) NudgeOf(phase settle.Phase) F64 { return s.E.Beta[phase.Index()] }
@@ -350,6 +468,7 @@ fn (s mut System<T>&) Step(dt F64) { s.E.Dt = dt }
 # p's named state, every phase's rows (phases x batch x size, a phase's batch rows after another's): its cells' Columns
 # - RateCell<T> for rate and custom populations, LifCell<T> for spiking ones. Writing it writes the state
 fn (s System<T>&) State<C>(p Pop) mut Columns<C>& {
+    s.wroteState(I64(p))
     pop := s.E.Pops[I64(p)]
     match C {
         case neuron.RateCell<T> { return pop.R0 }
@@ -359,6 +478,7 @@ fn (s System<T>&) State<C>(p Pop) mut Columns<C>& {
 
 # p's activities in phase, [batch, size], a view
 fn (s System<T>&) Activity(phase settle.Phase, p Pop) tensor.Tensor<T> {
+    s.hostState(I64(p))
     pop := s.E.Pops[I64(p)]
     n := s.Batch * pop.Size
     return tensor.Tensor<T>.Over(pop.Activity(0), phase.Index() * n, s.Batch, pop.Size)!
@@ -367,6 +487,7 @@ fn (s System<T>&) Activity(phase settle.Phase, p Pop) tensor.Tensor<T> {
 # the class each row answers on a readout in phase: its most active unit (of each group, numbered within it), [batch,
 # groups] into out
 fn (s System<T>&) Predict(phase settle.Phase, p Pop, out mut Array<I32>&) {
+    s.hostState(I64(p))
     pop := s.E.Pops[I64(p)]
     groups := settle.GroupsOf(pop.Role).Max(1)
     a := pop.Activity(0)
@@ -385,9 +506,11 @@ fn (s System<T>&) Predict(phase settle.Phase, p Pop, out mut Array<I32>&) {
 # the readouts' cost in phase, averaged over the batch rows
 fn (s System<T>&) Loss(phase settle.Phase) F64 {
     total F64 = 0.0
-    for pop in s.E.Pops {
+    for i in range s.E.Pops.Len() {
+        pop := s.E.Pops[i]
         role := pop.Role
         if role != neuron.Role.Readout: continue
+        s.hostState(i)
         a := pop.Activity(0)
         for b in range s.Batch {
             at := (phase.Index() * s.Batch + b) * pop.Size
@@ -400,6 +523,7 @@ fn (s System<T>&) Loss(phase settle.Phase) F64 {
 # connection c's weights, a view of the parameter region: [post, pre] for the dense forms, [pre, post] for an
 # event-driven one, A ([post, rank]) for a low-rank one (B follows it), the stored values for a sparse one ([Count])
 fn (s System<T>&) Weights(c Conn) tensor.Tensor<T> {
+    s.wroteParams()
     l := s.E.Links[I64(c)]
     return match l.Kind {
         case conn.Wiring.Dense, conn.Wiring.Symmetric: tensor.Tensor<T>.Over(s.E.Params, l.Off, l.PostSize, l.PreSize)!
@@ -417,15 +541,24 @@ fn (s System<T>&) Pop(p Pop) mut settle.Population<T>& { return s.E.Pops[I64(p)]
 
 # p's biases, a view of the parameter region
 fn (s System<T>&) Bias(p Pop) tensor.Tensor<T> {
+    s.wroteParams()
     pop := s.E.Pops[I64(p)]
     return tensor.Tensor<T>.Over(s.E.Params, pop.Bias, pop.Size)!
 }
 
-# every parameter, flat, as the graph's: what optimizers, clipping and checkpoints step in one pass
-fn (s System<T>&) Params() tensor.Tensor<T> { return tensor.Tensor<T>.Over(s.E.Params, 0, s.E.Params.Len())! }
+# every parameter, flat, as the graph's: what optimizers, clipping and checkpoints step in one pass. On the GPU a view
+# of the host's copy, brought current and taken as written (the device's copy goes up before it is next read): a view
+# kept and written later is not seen there - step a GPU plan with learn.AdamW
+fn (s System<T>&) Params() tensor.Tensor<T> {
+    s.wroteParams()
+    return tensor.Tensor<T>.Over(s.E.Params, 0, s.E.Params.Len())!
+}
 
-# their gradients, in the same layout
-fn (s System<T>&) ParamGrads() tensor.Tensor<T> { return tensor.Tensor<T>.Over(s.E.Grads, 0, s.E.Grads.Len())! }
+# their gradients, in the same layout (on the GPU as Params)
+fn (s System<T>&) ParamGrads() tensor.Tensor<T> {
+    s.wroteGrads()
+    return tensor.Tensor<T>.Over(s.E.Grads, 0, s.E.Grads.Len())!
+}
 
 # the counts so far: sweeps (time steps) of every settle, and the last settle's
 fn (s System<T>&) Sweeps() I64 { return s.E.Sweeps }
@@ -436,6 +569,8 @@ fn (s System<T>&) Last() settle.Settlement { return s.E.Last }
 
 # connection c's parameters (a Tiles' stored tiles) whose keep is false masked in place: zeroed, their gradient too
 fn (s mut System<T>&) Prune(c Conn, keep Array<Bool>&) {
+    s.wroteParams()
+    s.wroteGrads()
     s.E.Links[I64(c)].Prune(keep, s.E.Params, s.E.Grads)
 }
 
@@ -449,6 +584,8 @@ fn (s mut System<T>&) Retire(p Pop, j I64) {
 
 # every sparse connection's masked entries dropped in place: products cheaper from now on. Gives the entries removed
 fn (s mut System<T>&) Compact() I64 {
+    s.wroteParams()
+    s.wroteGrads()
     removed I64 = 0
     for l in s.E.Links: removed += l.Compact(s.E.Params, s.E.Grads)
     return removed
@@ -456,6 +593,7 @@ fn (s mut System<T>&) Compact() I64 {
 
 # every masked weight zero again: after an optimizer's step, whose momentum moves a weight whose gradient is held at zero
 fn (s mut System<T>&) Hold() {
+    s.wroteParams()
     for l in s.E.Links: l.Hold(s.E.Params)
 }
 
@@ -463,6 +601,7 @@ fn (s mut System<T>&) Hold() {
 # its region (Link.Sparsify): what it computes is unchanged, its products cost its live weights. Allocates the patterns;
 # an optimizer made before is made again (the parameters moved). Gives the connections converted
 fn (s mut System<T>&) Sparsify(below F64 = 0.5) I64 {
+    if s.OnGpu(): unreachable "a system planned on the GPU has no sparse rows: Sparsify stays on the CPU"
     n I64 = 0
     for l in s.E.Links {
         if l.Kind != conn.Wiring.Dense and l.Kind != conn.Wiring.Symmetric: continue
@@ -496,6 +635,7 @@ fn (s System<T>&) Macs() Macs {
 
 # every unit's incoming mass over the recurrent connections (a folded one's source is constant and does not count)
 fn (s mut System<T>&) masses() {
+    s.hostCoupling()
     e := s.E
     for i in range e.Mass.Len(): e.Mass[i] = 0.0
     for l in e.Links {
@@ -529,6 +669,7 @@ fn (s mut System<T>&) Gain() F64 {
 fn (s mut System<T>&) Kappa() F64 { return s.kappaTo(200, 1e-6) }
 
 fn (s mut System<T>&) kappaTo(iterations I64, tol F64) F64 {
+    s.hostCoupling()
     if s.Bound == Norm.Sup: return s.Gain()
     slope := s.slope()
     if not (slope <= F64.Max): return slope
@@ -545,6 +686,7 @@ fn (s mut System<T>&) Certify(target F64 = 0.9) {
 }
 
 fn (s mut System<T>&) scale(f F64) {
+    s.wroteCoupling()
     for l in s.E.Links {
         if not l.Folded: l.Scale(s.E.Params, f)
     }
@@ -554,6 +696,7 @@ fn (s mut System<T>&) scale(f F64) {
 # scaled by the factor the worst of them needs (all factors found before any is applied). Spectral: every recurrent
 # connection by the one factor that brings the spectral bound to target (the norm is not a per-unit quantity)
 fn (s mut System<T>&) Restrain(target F64 = 0.9) {
+    s.hostCoupling()
     if s.Bound == Norm.Spectral {
         k := s.Kappa()
         if k > target and k <= F64.Max: s.scale(target / k)
@@ -570,6 +713,7 @@ fn (s mut System<T>&) Restrain(target F64 = 0.9) {
         factors[i] = s.worstFactor(e.Pops[c.Post], l, target)
         if c.Both: factors[i] = factors[i].Min(s.worstFactor(e.Pops[c.Pre], l, target))
     }
+    s.wroteCoupling()
     for i in range e.Links.Len() {
         if factors[i] < 1.0: e.Links[i].Scale(e.Params, factors[i])
     }
@@ -589,6 +733,7 @@ fn (s System<T>&) worstFactor(p settle.Population<T>&, slope F64, target F64) F6
 # a sweep at dt = 1 is a contraction in the Euclidean norm by this factor - at most Gain() where the coupling is
 # symmetric (|W|_2 <= |W|_inf), often far below it; infinite for spiking and custom populations
 fn (s mut System<T>&) Contraction(iterations I64 = 1000) F64 {
+    s.hostCoupling()
     slope := s.slope()
     sigma := s.E.Spectral(iterations, 1e-9)
     return 0.0 if sigma == 0.0 else sigma * slope
@@ -632,6 +777,9 @@ fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
 fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
     k := s.Kappa()
     if rateOf(s.E.Dt, k) >= 1.0 or not free.Converged or s.E.Spiking: return 1.0, 0
+    for i in range s.E.Pops.Len() {
+        if s.E.Pops[i].Role == neuron.Role.Readout: s.hostState(i)
+    }
     worst F64 = 0.0
     rows := 0
     for row in range s.E.Batch {
@@ -1492,13 +1640,19 @@ test System.Read "a module reads its own signal first, then its parent's" {
     assert s.Value(late).Get(0) == 5.0 and s.Read(child, "arousal")!.Get(1) == 4.0 and s.Value(mine).Get(0) == 1.0
 }
 
-# the resident set, in pages, from /proc
-fn resident() I64 {
-    stat := try os.ReadFile("/proc/self/statm") catch { unreachable }
-    return try stat.Split(" ")[1].ParseInt(10) catch { unreachable }
+# the peak address space, in KB (VmPeak, /proc): what the program took from the system. Not the resident set, which
+# transparent huge pages (enabled "always" on some machines) grow by whole 2 MB pages a fault, whatever was allocated -
+# olang's own growth checks moved to VmPeak for this (the failure seen here: 70 pages while other builds shared RAM).
+# olang's allocator maps 128 KB and up a chunk at a time, so 400 lessons allocating anything at all show here
+fn peak() I64 {
+    st := try os.ReadFile("/proc/self/status") catch default ""
+    for line in st.Lines() {
+        if line.StartsWith("VmPeak:"): return try line[7:line.Len() - 3].Trim().ParseInt(10) catch default 0
+    }
+    return 0
 }
 
-test System.Settle "a lesson allocates nothing: resident memory does not grow over hundreds of free and nudged settles" {
+test System.Settle "a lesson allocates nothing: the address space does not grow over hundreds of free and nudged settles" {
     r := rand.Rand(17)
     s := System<F32>(32, 2)
     x := s.Population(s.Root(), "x", 100, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
@@ -1516,14 +1670,14 @@ test System.Settle "a lesson allocates nothing: resident memory does not grow ov
         s.Settle(settle.Phase.Free, b)
         s.Nudged(b)
     }
-    before := resident()
+    before := peak()
     for _ in range 400 {
         s.Reset(settle.Phase.Free)
         s.Settle(settle.Phase.Free, b)
         s.Nudged(b)
     }
-    grown := resident() - before
-    assert grown <= 16, "resident memory grew by " + $grown + " pages"
+    grown := peak() - before
+    assert grown == 0, "the address space grew by " + $grown + " KB"
 }
 
 # two inputs, five hidden units and two squared-error readouts of model, hidden and readout reciprocal, every relaxing

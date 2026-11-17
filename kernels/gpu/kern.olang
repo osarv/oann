@@ -290,6 +290,56 @@ fn Residual<T>(bits U64, like T) T {
     }
 }
 
+# ---- GP4: what dyn's settle on the GPU specializes its kernels with (dyn/mirror.olang), and AdamW ----
+
+# rho as C's expression of a real x, C's name of T, and a T as C text of its bits: the pieces of a specialization
+fn RhoText(rho Rho) String { return rhoText(rho) }
+
+fn RealName<T>(z T) String { return cReal(z) }
+
+fn RealText<T>(x T) String {
+    return match T {
+        case F64: f64(x)
+        case _: f32(F32(x))
+    }
+}
+
+# AdamW on the device over n parameters of T (F32 or F64), nn/optim's AdamW step for step and bit for bit (elem.cu's
+# oann_adamw: the same operations in the same order, no contraction, IEEE square roots): its moments M and V on the
+# device, every parameter decayed (decay 0 by default, as nn/optim's with no spans). Rate may change between steps
+type AdamW<T> unique struct(k Kernel, m device.Buf<T>, v device.Buf<T>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
+    k
+    M device.Buf<T> = m
+    V device.Buf<T> = v
+    Lr F64 = rate
+    Beta1 F64 = beta1
+    Beta2 F64 = beta2
+    Eps F64 = eps
+    Decay F64 = decay
+    Steps I64 = 0
+}
+
+# AdamW over n parameters, its moments zero, compiled now (at a plan)
+fn AdamW<T>.Make(d mut device.Device&, n I64, rate F64 = 0.001, beta1 F64 = 0.9, beta2 F64 = 0.999, eps F64 = 1e-8, decay F64 = 0.0) AdamW<T> ? device.GpuError {
+    z T
+    k := try Kernel.Compile(d, ElemSource(), "oann_adamw_f64" if cReal(z) == "double" else "oann_adamw_f32")
+    m := try device.Buf<T>.Make(d, n)
+    v := try device.Buf<T>.Make(d, n)
+    Zero(d, m.Addr(0), n * T.Size)
+    Zero(d, v.Addr(0), n * T.Size)
+    return AdamW<T>(k, m, v, rate, beta1, beta2, eps, decay)
+}
+
+# one step of the parameters at the device address p from the gradients at g (as many as the moments), enqueued
+fn (o mut AdamW<T>&) Step(d mut device.Device&, p U64, g U64) {
+    o.Steps++
+    corr1 F64 = 1.0 - o.Beta1.Pow(F64(o.Steps))
+    corr2 F64 = 1.0 - o.Beta2.Pow(F64(o.Steps))
+    n := o.M.N
+    Launch(d, o.k, Blocks(n), Block, p, g, o.M.Addr(0), o.V.Addr(0), Arg(n), Arg(T(o.Beta1)), Arg(T(o.Beta2))
+        Arg(T(1.0 - o.Beta1)), Arg(T(1.0 - o.Beta2)), Arg(T(1.0 - o.Lr * o.Decay)), Arg(T(o.Lr / corr1)), Arg(T(1.0 / corr2.Sqrt())), Arg(T(o.Eps)))
+}
+
 # ---- timing on the device (the benches) ----
 
 # two events that record time on the compute stream: Start, Stop, then Ms waits for Stop and gives the time between

@@ -1,0 +1,744 @@
+# dyn/mirror - a planned system on the GPU (docs/redesign.md 1.10, "The settle on the GPU"; GP4): the device mirror of
+# a settle.Engine's regions - the parameter region and its gradients, every population's columns (both buffers), its
+# totals and constants, EP's differences, a low-rank connection's middle - laid out once, when System.Plan is given the
+# GPU, and the settle, EP's contrast and AdamW's step run there. Built only with -define Gpu=true (kernels/gpu asserts
+# it); dyn/system imports it under `if Gpu`.
+#
+# A sweep. The engine's structure stays: every relaxing population's totals are its constant plus each connection's
+# carry, then its step writes the other buffer and gives the residual. On the GPU a population's carries are one cuBLAS
+# product each over all the rows the settle has (phases x batch at once; the CPU's chunks are for its threads), the
+# first written (beta 0) and the rest added; the step (kernels/gpu/src/settle.cu) adds the constant, the carries and a
+# nudged readout's force itself, so a sweep of the 784-128-10 system is four launches - two products, two steps.
+#
+# The stop. Each sweep has a residual word; the host enqueues sweeps ahead and reads the words back every Check sweeps
+# (into pinned memory, after an event, while the sweeps queued after them run). Every step first reads the word of the
+# sweep before its own: once a sweep is within the tolerance (or diverged) the next sweep records it in the stop word
+# and nothing after writes the state, so the state kept is the one dyn/settle's relax keeps - the first within the
+# tolerance - in the buffer that sweep's parity says. At most about 2 Check sweeps' products are wasted.
+#
+# Who owns what. While a system runs on the GPU the device owns what the loop writes: the parameters after AdamW's
+# step, the gradients after a contrast, every population's state after a settle. The host copies are then stale and
+# are brought down where the host reads them (System's Activity, Predict, Loss, Params, Weights, its stability
+# tools: HostState, HostParams, HostCoupling, HostGrads); a host-side write (Certify, Restrain, a Params view written,
+# State) marks the device copy stale (WroteParams, WroteCoupling, WroteGrads, WroteState) and it goes up before the
+# device next reads it. Inputs - every population's drive, a readout's labels and targets, the phases' steps and
+# nudges, the live units - go up once a settle, staged in pinned memory in one copy.
+#
+# What has no GPU form here is refused when the plan is made (Make), by name: spiking and custom populations, sparse
+# connections (Csr, Tiles, Events), Anderson acceleration and Gauss-Seidel sweeps. A device fault while a settle runs
+# ends the program with CUDA's words: System.Settle has no error to give it back as.
+
+import cu "../kernels/gpu/cuda.c"
+import gdev "../kernels/gpu/device"
+import "../kernels/gpu/kern"
+import "../kernels/gpu/blas"
+import "../kernels/device"
+import "neuron"
+import "conn"
+import "settle"
+
+Gpu Bool = false
+
+assert Gpu, "dyn/mirror is the GPU's and is built only with -define Gpu=true: import it under if Gpu { ... }"
+
+# settle.cu's text, read while compiling
+SettleText := String(embed "../kernels/gpu/src/settle.cu")
+
+# the most sweeps a settle on the GPU takes (its residual words, laid out at Plan)
+MaxSweeps I64 = 1 << 16
+
+# memory addressed by U64 on the host side, pinned (cudaHostAlloc): staging for uploads, the words' readback
+type Pinned unique struct(Addr U64, Bytes I64) {
+    Addr
+    Bytes
+} destruct {
+    if Addr != 0: cu.oann_pinned_free(Addr)
+}
+
+fn Pinned.Make(bytes I64) Pinned ? gdev.GpuError {
+    out := Array<U64>(1)
+    try gdev.CheckCuda(cu.oann_pinned_alloc(out, U64(bytes)), "cudaHostAlloc of " + $bytes + " bytes")
+    return Pinned(out[0], bytes)
+}
+
+# an event ordering the host after the compute stream
+type Event unique struct(Ev U64) {
+    Ev
+} destruct {
+    if Ev != 0: cu.oann_event_destroy(Ev)
+}
+
+fn Event.Make() Event ? gdev.GpuError {
+    out := Array<U64>(1)
+    try gdev.CheckCuda(cu.oann_event_create(out), "cudaEventCreate")
+    return Event(out[0])
+}
+
+# the GPU's activation for a population's model (kernels does not import dyn: kern.Rho repeats neuron.Rho)
+fn rhoOf(n neuron.Neuron) kern.Rho {
+    f := neuron.Rho.Linear
+    if n == neuron.Neuron.Rate: f = n.rho
+    return match f {
+        case neuron.Rho.Linear: kern.Rho.Linear
+        case neuron.Rho.Tanh: kern.Rho.Tanh
+        case neuron.Rho.HardSigmoid: kern.Rho.HardSigmoid
+        case neuron.Rho.Relu: kern.Rho.Relu
+        case neuron.Rho.LifRate(leak, threshold): kern.Rho.LifRate(leak, threshold)
+    }
+}
+
+# settle.cu specialized for state of type T, one activation and one readout's force: elem.cu first (its prelude), then
+# the #defines settle.cu reads
+fn source<T>(rho kern.Rho, role neuron.Role, like T) String {
+    force I64 = 0
+    inv := like
+    if role == neuron.Role.Readout {
+        match role.cost {
+            case neuron.Cost.Squared { force = 1 }
+            case neuron.Cost.CrossEntropy(temperature, _) {
+                force = 2
+                inv = T(1.0 / temperature)
+            }
+        }
+    }
+    spec := "typedef " + kern.RealName(like) + " real;\n#define OANN_RHO(x) " + kern.RhoText(rho) + "\n#define OANN_FORCE " + $force + "\n#define OANN_INV " + kern.RealText(inv) + "\n"
+    return kern.ElemSource() + "\n// dyn/mirror.olang: the specialization\n" + spec + SettleText
+}
+
+# T's word for a residual of T: the float's bits (widened to 64)
+fn bitsOf<T>(x T) U64 {
+    return match T {
+        case F64: x.Bits()
+        case _: U64(F32(x).Bits())
+    }
+}
+
+fn valueOf<T>(w U64, like T) F64 {
+    return match T {
+        case F64: F64.FromBits(w)
+        case _: F64(F32.FromBits(U32(w)))
+    }
+}
+
+# the largest T at most tol, as its word: a residual's word is at most it exactly where the residual, widened to F64,
+# is at most tol (relax's test)
+fn tolBits<T>(tol F64, like T) U64 {
+    match T {
+        case F64 { return tol.Bits() }
+        case _ {
+            t := F32(tol)
+            if F64(t) > tol and t > F32(0): t = F32.FromBits(t.Bits() - 1)
+            return U64(t.Bits())
+        }
+    }
+}
+
+fn infBits<T>(like T) U64 {
+    return match T {
+        case F64: F64(Inf).Bits()
+        case _: U64(F32(Inf).Bits())
+    }
+}
+
+# the bytes a run of n elements of size bytes takes in the input region, rounded up to 16
+fn span(n I64, size I64) I64 { return (n * size + 15) / 16 * 16 }
+
+# a planned engine's mirror on dev. Its regions of T are one buffer (State) at these element offsets: the parameters
+# (P) and gradients (G), laid out as the host's; each population's columns at Unit x Rows in U0, S0 (buffer 0, the
+# committed state), U1, S1 (buffer 1) and Total, its constant at Unit x Batch in Cst and EP's differences in Diff; each
+# low-rank connection's middle (Rows x rank) in Mid at midAt. In holds a settle's inputs (bytes: each population's
+# drive at drive, a readout's labels and targets at labels and target, every population's live units at alive, the
+# phases' steps, nudges and steps' inverses at dts, betas and invs), Words the residual words (sweep k's at k, its sup
+# norm under a Euclidean budget at MaxSweeps + k), the stop word and the rows kernel's tables
+type Mirror<T> unique struct(dev mut gdev.Device&, e settle.Engine<T>&, state gdev.Buf<T>, inputs gdev.Buf<U8>, words gdev.Buf<U64>, stage Pinned, back Pinned, ev0 Event, ev1 Event) {
+    dev
+    State gdev.Buf<T> = state
+    In gdev.Buf<U8> = inputs
+    Words gdev.Buf<U64> = words
+    stage
+    back
+    ev0
+    ev1
+    Batch I64 = e.Batch
+    Check I64 = 4                       # sweeps between the host's reads of the residual words
+    Wasted I64 = 0                      # sweeps enqueued past the one that stopped, over every settle
+    Reads I64 = 0                       # the host's reads of the words, over every settle
+    Steps mut Vec<kern.Kernel>& = Vec<kern.Kernel>()     # each population's step (relaxing) or closed form (input)
+    Common mut Vec<kern.Kernel>& = Vec<kern.Kernel>()    # constant, differ, bias sums, rows residual
+    P I64 = 0
+    G I64 = 0
+    Pot0 I64 = 0
+    Act0 I64 = 0
+    Pot1 I64 = 0
+    Act1 I64 = 0
+    Tot I64 = 0
+    Cst I64 = 0
+    Diff I64 = 0
+    Mid I64 = 0
+    midAt mut Array<I64>& = Array<I64>(e.Links.Len())
+    drive mut Array<I64>& = Array<I64>(e.Pops.Len())
+    labels mut Array<I64>& = Array<I64>(e.Pops.Len())
+    target mut Array<I64>& = Array<I64>(e.Pops.Len())
+    alive I64 = 0
+    dts I64 = 0
+    betas I64 = 0
+    invs I64 = 0
+    inBytes I64 = 0
+    hostDts mut Array<T>& = Array<T>(e.Phases)
+    hostBetas mut Array<T>& = Array<T>(e.Phases)
+    hostInvs mut Array<F64>& = Array<F64>(e.Phases)
+    aliveBytes mut Array<U8>& = Array<U8>(e.Units)
+    table mut Array<U64>& = Array<U64>(10 * e.Pops.Len())
+    relaxing I64 = 0
+    pend mut Array<I64>& = Array<I64>(4)    # the words read back and not yet scanned: from, to of each of two events
+    # which side holds the current copy: the parameters (whole, and the recurrent connections alone), the gradients,
+    # each population's state
+    pDev Bool = false
+    pHost Bool = true
+    cDev Bool = true
+    cHost Bool = true
+    gDev Bool = false
+    gHost Bool = true
+    sDev mut Array<Bool>& = Array<Bool>(e.Pops.Len(), false)
+    sHost mut Array<Bool>& = Array<Bool>(e.Pops.Len(), true)
+}
+
+# ---- the plan ----
+
+# what of the engine has no GPU form: its name, or "" for none
+fn Refusal<T>(e settle.Engine<T>&, scheme settle.Sweeping) String {
+    match T {
+        case F32, F64 { }
+        case _ { return "a system of other than F32 or F64 state" }
+    }
+    for p in e.Pops {
+        model := p.Model
+        if model == neuron.Neuron.Lif: return "spiking populations (Lif)"
+        if model == neuron.Neuron.Custom: return "custom neuron models"
+    }
+    for l in e.Links {
+        match l.Kind {
+            case conn.Wiring.Csr: return "sparse links (Csr)"
+            case conn.Wiring.Tiles: return "sparse links (Tiles)"
+            case conn.Wiring.Events: return "event-driven links (Events)"
+            case _ { }
+        }
+    }
+    if scheme.Anderson > 0: return "Anderson acceleration"
+    if scheme.GaussSeidel: return "Gauss-Seidel sweeps"
+    return ""
+}
+
+# the engine's mirror on dev, its regions laid out and its kernels compiled: refused by name (DeviceError.Unsupported)
+# where the engine has what the GPU cannot run, DeviceError.Failed with CUDA's words where the device fails
+fn Mirror<T>.Make(dev mut gdev.Device&, e mut settle.Engine<T>&, scheme settle.Sweeping) Mirror<T> ? device.DeviceError {
+    why := Refusal(e, scheme)
+    if why != "": error device.DeviceError.Unsupported("no GPU form of " + why + ": plan this system on device.Backend.Cpu")
+    return try Mirror<T>.build(dev, e) catch gdev.GpuError err { error device.DeviceError.Failed("the GPU plan: " + $err) }
+}
+
+fn Mirror<T>.build(dev mut gdev.Device&, e mut settle.Engine<T>&) Mirror<T> ? gdev.GpuError {
+    rows, batch, units := e.Rows, e.Batch, e.Units
+    count := e.Params.Len()
+    mid I64 = 0
+    for l in e.Links {
+        kind := l.Kind
+        if kind == conn.Wiring.LowRank: mid += rows * kind.rank
+    }
+    total := 2 * count + 5 * units * rows + 2 * units * batch + mid
+    # the input region's layout
+    z T
+    at I64 = 0
+    offsets := Array<I64>(3 * e.Pops.Len())
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        offsets[3 * i] = at
+        at += span(batch * p.Size, T.Size)
+        offsets[3 * i + 1] = at
+        at += span(p.Labels.Len(), 4)
+        offsets[3 * i + 2] = at
+        at += span(p.Target.Len(), T.Size)
+    }
+    alive := at
+    at += span(units, 1)
+    dts := at
+    at += span(e.Phases, T.Size)
+    betas := at
+    at += span(e.Phases, T.Size)
+    invs := at
+    at += span(e.Phases, 8)
+    m := Mirror<T>(dev, e, try gdev.Buf<T>.Make(dev, total), try gdev.Buf<U8>.Make(dev, at), try gdev.Buf<U64>.Make(dev, 2 * MaxSweeps + 1 + 10 * e.Pops.Len()), try Pinned.Make(at), try Pinned.Make(8 * (MaxSweeps + 1)), try Event.Make(), try Event.Make())
+    m.G = count
+    m.Pot0 = 2 * count
+    m.Act0 = m.Pot0 + units * rows
+    m.Pot1 = m.Act0 + units * rows
+    m.Act1 = m.Pot1 + units * rows
+    m.Tot = m.Act1 + units * rows
+    m.Cst = m.Tot + units * rows
+    m.Diff = m.Cst + units * batch
+    m.Mid = m.Diff + units * batch
+    mat := m.Mid
+    for i in range e.Links.Len() {
+        kind := e.Links[i].Kind
+        m.midAt[i] = mat
+        if kind == conn.Wiring.LowRank: mat += rows * kind.rank
+    }
+    for i in range e.Pops.Len() {
+        m.drive[i], m.labels[i], m.target[i] = offsets[3 * i], offsets[3 * i + 1], offsets[3 * i + 2]
+    }
+    m.alive, m.dts, m.betas, m.invs, m.inBytes = alive, dts, betas, invs, at
+    for p in e.Pops {
+        text := source(rhoOf(p.Model), p.Role, z)
+        name := "oann_closed_form" if p.Role == neuron.Role.Input else "oann_settle_step"
+        m.Steps.Push(try kern.Kernel.Compile(dev, text, name))
+        if p.Role != neuron.Role.Input: m.relaxing++
+    }
+    common := source(kern.Rho.Linear, neuron.Role.Hidden, z)
+    for name in Array<String>["oann_constant", "oann_differ", "oann_bias_sums", "oann_rows_residual"]: m.Common.Push(try kern.Kernel.Compile(dev, common, name))
+    # the rows kernel's tables, one a parity: u (the buffer read), u2 (the buffer written), units, live units, offset
+    for parity in range 2 {
+        q I64 = 0
+        for p in e.Pops {
+            if p.Role == neuron.Role.Input: continue
+            base := p.Unit * rows
+            from := m.Pot0 if parity == 0 else m.Pot1
+            to := m.Pot1 if parity == 0 else m.Pot0
+            t := parity * 5 * e.Pops.Len() + 5 * q
+            m.table[t] = m.at(from + base)
+            m.table[t + 1] = m.at(to + base)
+            m.table[t + 2] = U64(p.Size)
+            m.table[t + 3] = m.In.Addr(alive + p.Unit)
+            q++
+        }
+    }
+    m.Words.Upload(m.table, 0, 2 * MaxSweeps + 1, m.table.Len())
+    try dev.Sync()
+    return m
+}
+
+# ---- what crosses between host and device ----
+
+# the address of element at of the state region
+fn (m Mirror<T>&) at(i I64) U64 { return m.State.Addr(i) }
+
+# a device fault, which a settle has no error to give back as: the program ends with CUDA's words
+fn (m mut Mirror<T>&) fault() {
+    if cu.oann_status_kind(m.dev.Status()) == 0: return
+    try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+}
+
+fn (m mut Mirror<T>&) sync() {
+    try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+}
+
+# everything the device reads brought up where the host's copy is newer: the parameters (or the recurrent
+# connections'), the gradients, each population's state
+fn (m mut Mirror<T>&) push(e mut settle.Engine<T>&) {
+    if not m.pDev {
+        m.State.Upload(e.Params, 0, m.P, e.Params.Len())
+        m.pDev, m.cDev = true, true
+    }
+    if not m.cDev {
+        for l in e.Links {
+            if not l.Folded: m.State.Upload(e.Params, l.Off, m.P + l.Off, l.Count)
+        }
+        m.cDev = true
+    }
+    if not m.gDev {
+        m.State.Upload(e.Grads, 0, m.G, e.Grads.Len())
+        m.gDev = true
+    }
+    for i in range e.Pops.Len() {
+        if m.sDev[i]: continue
+        p := e.Pops[i]
+        n := e.Rows * p.Size
+        m.State.Upload(p.R0.U, 0, m.Pot0 + p.Unit * e.Rows, n)
+        m.State.Upload(p.R0.S, 0, m.Act0 + p.Unit * e.Rows, n)
+        m.sDev[i] = true
+    }
+}
+
+# population i's committed state (buffer 0, every row) on the host, brought down where the device's is newer
+fn (m mut Mirror<T>&) HostState(e mut settle.Engine<T>&, i I64) {
+    if m.sHost[i]: return
+    p := e.Pops[i]
+    n := e.Rows * p.Size
+    m.State.Download(p.R0.U, m.Pot0 + p.Unit * e.Rows, 0, n)
+    m.State.Download(p.R0.S, m.Act0 + p.Unit * e.Rows, 0, n)
+    m.sync()
+    m.sHost[i] = true
+}
+
+# every population's state on the host
+fn (m mut Mirror<T>&) HostStates(e mut settle.Engine<T>&) {
+    for i in range e.Pops.Len(): m.HostState(e, i)
+}
+
+# the parameters on the host, brought down where the device's are newer
+fn (m mut Mirror<T>&) HostParams(e mut settle.Engine<T>&) {
+    if m.pHost: return
+    m.State.Download(e.Params, m.P, 0, e.Params.Len())
+    m.sync()
+    m.pHost, m.cHost = true, true
+}
+
+# the recurrent connections' weights on the host (the coupling the stability tools read), brought down where newer
+fn (m mut Mirror<T>&) HostCoupling(e mut settle.Engine<T>&) {
+    if m.cHost or m.pHost: return
+    for l in e.Links {
+        if not l.Folded: m.State.Download(e.Params, m.P + l.Off, l.Off, l.Count)
+    }
+    m.sync()
+    m.cHost = true
+}
+
+# the gradients on the host, brought down where the device's are newer
+fn (m mut Mirror<T>&) HostGrads(e mut settle.Engine<T>&) {
+    if m.gHost: return
+    m.State.Download(e.Grads, m.G, 0, e.Grads.Len())
+    m.sync()
+    m.gHost = true
+}
+
+# the host wrote (or may write) the parameters, the recurrent connections' weights, the gradients, population i's state:
+# the host's copy is brought current first, then the device's is stale until it next reads it
+fn (m mut Mirror<T>&) WroteParams(e mut settle.Engine<T>&) {
+    m.HostParams(e)
+    m.pDev = false
+}
+
+fn (m mut Mirror<T>&) WroteCoupling(e mut settle.Engine<T>&) {
+    m.HostCoupling(e)
+    m.cDev = false
+}
+
+fn (m mut Mirror<T>&) WroteGrads(e mut settle.Engine<T>&) {
+    m.HostGrads(e)
+    m.gDev = false
+}
+
+fn (m mut Mirror<T>&) WroteState(e mut settle.Engine<T>&, i I64) {
+    m.HostState(e, i)
+    m.sDev[i] = false
+}
+
+# a settle's inputs into the staging region and up in one copy: every population's drive, a readout's labels and
+# targets, the live units, the phases' steps, nudges and the steps' inverses (damping as given)
+fn (m mut Mirror<T>&) inputs(e mut settle.Engine<T>&, damping F64) {
+    s := m.stage.Addr
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        cu.oann_stage(s, U64(m.drive[i]), p.Drive, 0, U64(e.Batch * p.Size * T.Size))
+        if p.Labels.Len() > 0: cu.oann_stage(s, U64(m.labels[i]), p.Labels, 0, U64(p.Labels.Len() * 4))
+        if p.Target.Len() > 0: cu.oann_stage(s, U64(m.target[i]), p.Target, 0, U64(p.Target.Len() * T.Size))
+        for j in range p.Size: m.aliveBytes[p.Unit + j] = U8(1) if p.Alive[j] else U8(0)
+    }
+    for ph in range e.Phases {
+        dt := e.PhaseStep(ph, damping)
+        m.hostDts[ph] = T(dt)
+        m.hostBetas[ph] = T(e.Beta[ph])
+        m.hostInvs[ph] = 1.0 / dt
+    }
+    cu.oann_stage(s, U64(m.alive), m.aliveBytes, 0, U64(e.Units))
+    cu.oann_stage(s, U64(m.dts), m.hostDts, 0, U64(e.Phases * T.Size))
+    cu.oann_stage(s, U64(m.betas), m.hostBetas, 0, U64(e.Phases * T.Size))
+    cu.oann_stage(s, U64(m.invs), m.hostInvs, 0, U64(e.Phases * 8))
+    d := m.dev
+    cu.oann_upload_pinned(d.Status(), m.In.Addr(0), s, U64(m.inBytes), d.CopyStream(), d.Uploaded(), d.Stream())
+}
+
+# ---- products ----
+
+# c (n rows) = alpha a op(b) + beta c over views of the state region: a and c n rows of their widths, b w's view
+fn (m mut Mirror<T>&) product(c I64, cw I64, a I64, aw I64, ta Bool, n I64, b I64, br I64, bc I64, tb Bool, beta T) {
+    cm := gdev.DMat<T>(m.State, c, n, cw, cw)
+    am := gdev.DMat<T>(m.State, a, aw if ta else n, n if ta else aw, n if ta else aw)
+    bm := gdev.DMat<T>(m.State, b, br, bc, bc)
+    blas.Gemm(m.dev, cm, am, ta, bm, tb, T(1), beta)
+}
+
+# total[n rows, post] (+)= s[n rows, pre] W^T through link i (its weights in the parameters at P): Forward, or
+# total[n rows, pre] (+)= s[n rows, post] W: Backward
+fn (m mut Mirror<T>&) carry(l conn.Link<T>&, i I64, to I64, from I64, n I64, back Bool, beta T) {
+    post, pre := l.PostSize, l.PreSize
+    w := m.P + l.Off
+    match l.Kind {
+        case conn.Wiring.LowRank(rank) {
+            mid := m.midAt[i]
+            b := w + post * rank
+            if back {
+                m.product(mid, rank, from, post, false, n, w, post, rank, false, T(0))
+                m.product(to, pre, mid, rank, false, n, b, rank, pre, false, beta)
+            } else {
+                m.product(mid, rank, from, pre, false, n, b, rank, pre, true, T(0))
+                m.product(to, post, mid, rank, false, n, w, post, rank, true, beta)
+            }
+        }
+        case _ {
+            if back {
+                m.product(to, pre, from, post, false, n, w, post, pre, false, beta)
+            } else {
+                m.product(to, post, from, pre, false, n, w, post, pre, true, beta)
+            }
+        }
+    }
+}
+
+# ---- the settle ----
+
+# phases lo .. hi settled together from their committed state within the budget, as settle.Engine.Settle does: the
+# inputs up, the inputs' closed form and (fold) the constants made, sweeps enqueued Check at a time and their words read
+# back one batch behind, the state kept committed into buffer 0
+fn (m mut Mirror<T>&) Settle(e mut settle.Engine<T>&, lo I64, hi I64, b settle.Budget, fold Bool) settle.Settlement {
+    if b.Scheme.GaussSeidel: unreachable "a system planned on the GPU sweeps by Jacobi: Gauss-Seidel sweeps stay on the CPU"
+    if b.Sweeps >= MaxSweeps: unreachable "a settle on the GPU takes at most " + $(MaxSweeps - 1) + " sweeps"
+    m.push(e)
+    m.inputs(e, b.Damping)
+    m.prepare(e, lo, hi, fold)
+    d := m.dev
+    euclid := b.Euclid
+    z T
+    tol := tolBits(b.Tol, z) if not euclid else b.Tol.Bits()
+    inf := infBits(z) if not euclid else F64(Inf).Bits()
+    stop := m.Words.Addr(2 * MaxSweeps)
+    kern.Zero(d, m.Words.Addr(0), (b.Sweeps + 1) * 8)
+    if euclid: kern.Zero(d, m.Words.Addr(MaxSweeps), (b.Sweeps + 1) * 8)
+    cu.oann_memset(d.Status(), stop, 255, 8, d.Stream())
+    last := b.Sweeps
+    enq, covered I64 = 0, 0
+    slot I64 = 0
+    pend := m.pend
+    for i in range 4: pend[i] = 0
+    found I64 = -1
+    for found < 0 {
+        upto := (enq + m.Check.Max(1)).Min(last + 1)
+        for k in range enq, upto: m.sweep(e, k, lo, hi, euclid, tol, inf, stop)
+        enq = upto
+        ev := m.ev0.Ev if slot == 0 else m.ev1.Ev
+        cu.oann_download_pinned(d.Status(), m.back.Addr + U64(8 * covered), m.Words.Addr(covered), U64(8 * (enq - covered)), d.Stream(), ev)
+        pend[2 * slot], pend[2 * slot + 1] = covered, enq
+        covered = enq
+        other := 1 - slot
+        if pend[2 * other + 1] > pend[2 * other] {
+            found = m.scan(m.ev0.Ev if other == 0 else m.ev1.Ev, pend[2 * other], pend[2 * other + 1], tol, inf)
+            pend[2 * other + 1] = pend[2 * other]
+        }
+        if found < 0 and enq > last {
+            found = m.scan(ev, pend[2 * slot], pend[2 * slot + 1], tol, inf)
+            if found < 0: found = last
+        }
+        slot = other
+    }
+    m.Wasted += enq - found - 1
+    w := cu.oann_pinned_word(m.back.Addr, U64(found))
+    residual := F64.FromBits(w) if euclid else valueOf(w, z)
+    out := settle.Settlement(found, residual, w <= tol)
+    if found % 2 == 1: m.commit(e, lo, hi)
+    for i in range e.Pops.Len(): m.sHost[i] = false
+    e.Sweeps += out.Sweeps
+    e.Last = out
+    return out
+}
+
+# the words of sweeps lo .. hi, once the event is passed: the first that stopped (within tol, or diverged), else -1
+fn (m mut Mirror<T>&) scan(ev U64, lo I64, hi I64, tol U64, inf U64) I64 {
+    st := cu.oann_event_sync(ev)
+    m.Reads++
+    m.fault()
+    if st != 0: unreachable "the GPU failed: " + gdev.Text(cu.cudaGetErrorString(st))
+    for k in range lo, hi {
+        w := cu.oann_pinned_word(m.back.Addr, U64(k))
+        if w <= tol or w >= inf: return k
+    }
+    return -1
+}
+
+# the start of a settle of phases lo .. hi: every input's state from its drive in closed form (buffer 0); with fold,
+# every relaxing population's constant - drive + bias, then each folded connection's carry of its input's free rows
+fn (m mut Mirror<T>&) prepare(e mut settle.Engine<T>&, lo I64, hi I64, fold Bool) {
+    rows, batch := e.Rows, e.Batch
+    d := m.dev
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        if p.Role != neuron.Role.Input: continue
+        per := batch * p.Size
+        n := (hi - lo) * per
+        base := p.Unit * rows + lo * per
+        kern.Launch(d, m.Steps[i], kern.Blocks(n), kern.Block, m.at(m.Pot0 + base), m.at(m.Act0 + base), m.In.Addr(m.drive[i]), kern.Arg(U32(per)), kern.Arg(U32(n)))
+    }
+    if not fold: return
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        if p.Role == neuron.Role.Input: continue
+        n := batch * p.Size
+        cst := m.Cst + p.Unit * batch
+        kern.Launch(d, m.Common[0], kern.Blocks(n), kern.Block, m.at(cst), m.In.Addr(m.drive[i]), m.at(m.P + p.Bias), kern.Arg(U32(p.Size)), kern.Arg(U32(n)))
+        for li in p.Folds {
+            l := e.Links[li]
+            pre := e.Pops[l.Pre]
+            m.carry(l, li, cst, m.Act0 + pre.Unit * rows, batch, false, T(1))
+        }
+    }
+}
+
+# sweep k of rows lo .. hi (phases): each relaxing population's carries into its totals over all its rows, then its
+# step from buffer k % 2 into the other, the residual into word k (its sup-norm word under a Euclidean budget, then
+# the rows' residual into word k)
+fn (m mut Mirror<T>&) sweep(e mut settle.Engine<T>&, k I64, lo I64, hi I64, euclid Bool, tol U64, inf U64, stop U64) {
+    rows, batch := e.Rows, e.Batch
+    d := m.dev
+    cur := k % 2
+    u, s := m.Pot0 if cur == 0 else m.Pot1, m.Act0 if cur == 0 else m.Act1
+    u2, s2 := m.Pot1 if cur == 0 else m.Pot0, m.Act1 if cur == 0 else m.Act0
+    r0 := lo * batch
+    n := (hi - lo) * batch
+    prev U64 = 0 if k == 0 else m.Words.Addr(k - 1)
+    out := m.Words.Addr(MaxSweeps + k) if euclid else m.Words.Addr(k)
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        if p.Role == neuron.Role.Input: continue
+        base := p.Unit * rows + r0 * p.Size
+        carried := false
+        for li in p.In {
+            l := e.Links[li]
+            pre := e.Pops[l.Pre]
+            m.carry(l, li, m.Tot + base, s + pre.Unit * rows + r0 * pre.Size, n, false, T(1) if carried else T(0))
+            carried = true
+        }
+        for li in p.Back {
+            l := e.Links[li]
+            post := e.Pops[l.Post]
+            m.carry(l, li, m.Tot + base, s + post.Unit * rows + r0 * post.Size, n, true, T(1) if carried else T(0))
+            carried = true
+        }
+        per := batch * p.Size
+        total U64 = m.at(m.Tot + base) if carried else 0
+        alive U64 = m.In.Addr(m.alive + p.Unit) if p.Retired > 0 else 0
+        labels U64 = m.In.Addr(m.labels[i]) if p.Labels.Len() > 0 else 0
+        target U64 = m.In.Addr(m.target[i]) if p.Target.Len() > 0 else 0
+        groups := settle.GroupsOf(p.Role).Max(1)
+        kern.Launch(d, m.Steps[i], kern.Blocks(n * p.Size), kern.Block, m.at(u + base), total, m.at(m.Cst + p.Unit * batch), m.at(u2 + base), m.at(s2 + base)
+            m.In.Addr(m.dts + lo * T.Size), kern.Arg(U32(per)), alive, kern.Arg(U32(p.Size)), kern.Arg(U32(n * p.Size)), out, stop, prev, kern.Arg(U32(k)), tol, inf
+            m.at(s + base), labels, target, m.In.Addr(m.betas + lo * T.Size), kern.Arg(U32(groups)))
+    }
+    if not euclid: return
+    z T
+    tab := m.Words.Addr(2 * MaxSweeps + 1 + cur * 5 * e.Pops.Len())
+    kern.Launch(d, m.Common[3], kern.Blocks(n), kern.Block, tab, kern.Arg(U32(m.relaxing)), kern.Arg(U32(n)), kern.Arg(U32(batch)), m.In.Addr(m.invs + lo * 8)
+        m.Words.Addr(MaxSweeps + k), infBits(z), m.Words.Addr(k), stop, kern.Arg(U32(r0)))
+}
+
+# rows lo .. hi (phases) of buffer 1 copied into buffer 0, every relaxing population: where a settle that ended on
+# buffer 1 commits
+fn (m mut Mirror<T>&) commit(e mut settle.Engine<T>&, lo I64, hi I64) {
+    d := m.dev
+    for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
+        base := p.Unit * e.Rows + lo * e.Batch * p.Size
+        bytes := (hi - lo) * e.Batch * p.Size * T.Size
+        kern.Copy(d, m.at(m.Pot0 + base), m.at(m.Pot1 + base), bytes)
+        kern.Copy(d, m.at(m.Act0 + base), m.at(m.Act1 + base), bytes)
+    }
+}
+
+# phase ph's state at rest (every relaxing population's buffer 0 rows zero), on the device
+fn (m mut Mirror<T>&) Reset(e mut settle.Engine<T>&, ph I64) {
+    m.push(e)
+    d := m.dev
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        if p.Role == neuron.Role.Input: continue
+        base := p.Unit * e.Rows + ph * e.Batch * p.Size
+        bytes := e.Batch * p.Size * T.Size
+        kern.Zero(d, m.at(m.Pot0 + base), bytes)
+        kern.Zero(d, m.at(m.Act0 + base), bytes)
+        m.sHost[i] = false
+    }
+}
+
+# phase to's state set to phase from's, every relaxing population, on the device
+fn (m mut Mirror<T>&) Warm(e mut settle.Engine<T>&, to I64, from I64) {
+    if to == from: return
+    m.push(e)
+    d := m.dev
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        if p.Role == neuron.Role.Input: continue
+        n := e.Batch * p.Size
+        base := p.Unit * e.Rows
+        kern.Copy(d, m.at(m.Pot0 + base + to * n), m.at(m.Pot0 + base + from * n), n * T.Size)
+        kern.Copy(d, m.at(m.Act0 + base + to * n), m.at(m.Act0 + base + from * n), n * T.Size)
+        m.sHost[i] = false
+    }
+}
+
+# ---- learning ----
+
+# EP's estimate on the device, as dyn/learn's contrast: dS = S(plus) - S(minus) for every population, then for each
+# connection marked in links its gradient k sum (dS_post s+_pre + s-_post dS_pre) (the second where its pre side
+# relaxes; zero where it is frozen) and for each population marked in pops its bias's k sum(dS) (0 for an input), into
+# the gradient region
+fn (m mut Mirror<T>&) Contrast(e mut settle.Engine<T>&, links Array<Bool>&, pops Array<Bool>&, plus I64, minus I64, k T) {
+    m.push(e)
+    d := m.dev
+    n := e.Batch
+    rows := e.Rows
+    for p in e.Pops {
+        c := n * p.Size
+        at := m.Act0 + p.Unit * rows
+        kern.Launch(d, m.Common[1], kern.Blocks(c), kern.Block, m.at(m.Diff + p.Unit * n), m.at(at + plus * c), m.at(at + minus * c), kern.Arg(U32(c)))
+    }
+    for i in range e.Links.Len() {
+        if not links[i]: continue
+        l := e.Links[i]
+        kern.Zero(d, m.at(m.G + l.Off), l.Count * T.Size)
+        if l.Frozen: continue
+        post, pre := e.Pops[l.Post], e.Pops[l.Pre]
+        m.pair(l, i, m.Diff + post.Unit * n, m.Act0 + pre.Unit * rows + plus * n * pre.Size, k)
+        if pre.Role != neuron.Role.Input: m.pair(l, i, m.Act0 + post.Unit * rows + minus * n * post.Size, m.Diff + pre.Unit * n, k)
+    }
+    for i in range e.Pops.Len() {
+        if not pops[i]: continue
+        p := e.Pops[i]
+        kk := k if p.Role != neuron.Role.Input else T(0)
+        kern.Launch(d, m.Common[2], kern.Blocks(p.Size), kern.Block, m.at(m.G + p.Bias), m.at(m.Diff + p.Unit * n), kern.Arg(U32(n)), kern.Arg(U32(p.Size)), kern.Arg(kk))
+    }
+    m.gHost = false
+}
+
+# the gradient of link i += k sum over the batch rows of the derivative of the coupling a_post^T W b_pre: a [batch, post]
+# at a, b [batch, pre] at b (state offsets), as dyn/learn's pair
+fn (m mut Mirror<T>&) pair(l conn.Link<T>&, i I64, a I64, b I64, k T) {
+    n := m.Batch
+    post, pre := l.PostSize, l.PreSize
+    g := m.G + l.Off
+    match l.Kind {
+        case conn.Wiring.LowRank(rank) {
+            mid := m.midAt[i]
+            w := m.P + l.Off
+            m.product(mid, rank, b, pre, false, n, w + post * rank, rank, pre, true, T(0))
+            m.outer(g, post, rank, a, mid, n, k)
+            m.product(mid, rank, a, post, false, n, w, post, rank, false, T(0))
+            m.outer(g + post * rank, rank, pre, mid, b, n, k)
+        }
+        case _ { m.outer(g, post, pre, a, b, n, k) }
+    }
+}
+
+# g[r x c] += k a^T b, a [n, r] and b [n, c] (state offsets)
+fn (m mut Mirror<T>&) outer(g I64, r I64, c I64, a I64, b I64, n I64, k T) {
+    gm := gdev.DMat<T>(m.State, g, r, c, c)
+    am := gdev.DMat<T>(m.State, a, n, r, r)
+    bm := gdev.DMat<T>(m.State, b, n, c, c)
+    blas.Gemm(m.dev, gm, am, true, bm, false, k, T(1))
+}
+
+# AdamW's step of the parameters from the gradients, on the device (kern.AdamW)
+fn (m mut Mirror<T>&) Adam(e mut settle.Engine<T>&, o mut kern.AdamW<T>&) {
+    m.push(e)
+    o.Step(m.dev, m.at(m.P), m.at(m.G))
+    m.pHost, m.cHost = false, false
+}
+
+# waits for everything enqueued: a device fault ends the program with CUDA's words
+fn (m mut Mirror<T>&) Sync() { m.sync() }

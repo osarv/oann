@@ -112,3 +112,21 @@ extern "C" __global__ void oann_tanh_f32(float *y, const float *x, long long n) 
     for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (long long)gridDim.x * blockDim.x)
         y[i] = oann_tanh(x[i]);
 }
+
+// AdamW's step over n parameters, nn/optim's adamRun operation for operation (so bit for bit, with IEEE square roots
+// and division and no contraction): m = b1 m + c1 g, v = b2 v + c2 g g, p = keep p - step m / (sqrt(v) root + eps)
+#define OANN_ADAMW(name, T, SQRT)                                                                                     \
+    extern "C" __global__ void name(T *p, const T *g, T *m, T *v, long long n, T b1, T b2, T c1, T c2, T keep,     \
+                                    T step, T root, T eps) {                                                        \
+        for (long long k = (long long)blockIdx.x * blockDim.x + threadIdx.x; k < n;                                  \
+             k += (long long)gridDim.x * blockDim.x) {                                                               \
+            T gk = g[k];                                                                                             \
+            T mk = b1 * m[k] + c1 * gk;                                                                              \
+            T vk = b2 * v[k] + c2 * gk * gk;                                                                         \
+            m[k] = mk;                                                                                               \
+            v[k] = vk;                                                                                               \
+            p[k] = keep * p[k] - step * mk / (SQRT(vk) * root + eps);                                                \
+        }                                                                                                            \
+    }
+OANN_ADAMW(oann_adamw_f32, float, sqrtf)
+OANN_ADAMW(oann_adamw_f64, double, sqrt)

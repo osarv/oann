@@ -1,0 +1,71 @@
+# device - where a plan runs, chosen once for a whole program (docs/redesign.md 1.10, "The backend interface"): the CPU,
+# or the GPU when the build has it and the machine has one. This module imports with or without -define Gpu=true, so a
+# script names the device the way PyTorch's torch.set_default_device does, once, and every plan after it follows:
+#
+#     import "github.com/osarv/oann/kernels/device"
+#     device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backend.Cpu)
+#
+# A plan (dyn's System.Plan, ad's Graph.Plan) takes `on`, by default Backend.Default() - the backend last set, the CPU
+# until one is set - so an explicit `on` still decides for that plan. The choice is made at Plan, never per operation.
+#
+# The device itself is this module's: the first plan on the GPU opens it (ordinal 0) and it lives as long as the program,
+# held by a global, so a script never passes a Device around and every plan's buffers go before it (kernels/gpu/device:
+# a Buf holds its Device). GpuAvailable() is false in a build without the define, and with it true only where CUDA finds
+# a device when it is asked (no device, no driver: false, not an error).
+
+Gpu Bool = false
+
+if Gpu {
+    import cu "gpu/cuda.c"
+    import gdev "gpu/device"
+}
+
+# where a plan runs: the CPU's kernels, or the GPU's (cuBLAS and our kernels, kernels/gpu)
+type Backend enum { Cpu, Gpu }
+
+# what a plan on a backend refuses: a GPU where the build or the machine has none, a part of a plan with no GPU form
+# (named), or the device's own failure (CUDA's words)
+type DeviceError error {
+    Unavailable(what String)
+    Unsupported(what String)
+    Failed(what String)
+}
+
+# the backend plans take when they are not told one
+chosen mut Backend = Backend.Cpu
+
+# every plan made after this, unless it says otherwise, runs on b
+fn SetDefault(b Backend) { chosen = b }
+
+# the backend last set by SetDefault (the CPU until then): what Plan's `on` is by default
+fn Backend.Default() Backend { return chosen }
+
+if Gpu {
+    # the program's device, opened by the first plan on the GPU (Open): null until then
+    Opened mut gdev.Device?& = null
+
+    # whether the build has the GPU and CUDA finds a device now
+    fn GpuAvailable() Bool { return cu.oann_device_count() > 0 }
+
+    # the device plans on the GPU run on opened (ordinal 0), the first time it is asked for, into Opened, where it stays
+    # for the program
+    fn Open() ? DeviceError {
+        if Opened == null: Opened = try gdev.Device.Open() catch e { error DeviceError.Unavailable("no CUDA device: " + $e) }
+    }
+} else {
+    # whether the build has the GPU and CUDA finds a device now: a build without -define Gpu=true has none
+    fn GpuAvailable() Bool { return false }
+}
+
+# a plan on the GPU where the build cannot have one: refused
+fn NotBuilt() ? DeviceError {
+    error DeviceError.Unavailable("built without -define Gpu=true: plan on device.Backend.Cpu, or build with the define")
+}
+
+test Backend "the CPU until set; SetDefault decides what plans take; GpuAvailable is false without the define" {
+    assert Backend.Default() == Backend.Cpu
+    SetDefault(Backend.Gpu if GpuAvailable() else Backend.Cpu)
+    if not Gpu: assert not GpuAvailable() and Backend.Default() == Backend.Cpu
+    SetDefault(Backend.Cpu)
+    assert Backend.Default() == Backend.Cpu
+}
