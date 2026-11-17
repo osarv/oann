@@ -67,15 +67,19 @@ type Sweeping struct(Anderson I64 = 0, GaussSeidel Bool = false) {
 }
 
 # what a settle may take: at most Sweeps sweeps (time steps, spiking), stopping when every residual is at most Tol; a
-# step shortened by the factor 1 - Damping; the sweeps of Scheme
-type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Scheme Sweeping = Sweeping()) {
+# step shortened by the factor 1 - Damping; the sweeps of Scheme. Euclid: the residual tested is each row's Euclidean
+# norm over its relaxing units (the norm of the spectral certificate), not each unit's; a rate system of built-in
+# models only (a spiking or custom one is tested unit by unit)
+type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Scheme Sweeping = Sweeping(), Euclid Bool = false) {
     Sweeps
     Tol
     Damping
     Scheme
+    Euclid
 }
 
-# how a settle went: the sweeps it took, the residual's sup norm at the end (NaN or infinite where it diverged), and
+# how a settle went: the sweeps it took, the residual's norm at the end (the sup norm, or the largest row's Euclidean
+# norm under Budget.Euclid) (NaN or infinite where it diverged), and
 # whether it is within the tolerance
 type Settlement struct(Sweeps I64 = 0, Residual F64 = 0, Converged Bool = false) {
     Sweeps
@@ -528,6 +532,17 @@ fn (e Engine<T>&) ForceSlope() F64 {
     return worst
 }
 
+# the largest coupling of a readout's force between its units, per unit of beta, through its activation (in the sup
+# and the Euclidean norm alike; neuron.ForceCoupling)
+fn (e Engine<T>&) ForceCoupling() F64 {
+    worst F64 = 0.0
+    for p in e.Pops {
+        role := p.Role
+        if role == neuron.Role.Readout: worst = worst.Max(neuron.ForceCoupling(role.cost) * neuron.Slope(p.Model))
+    }
+    return worst
+}
+
 # rows r0 .. r1 of a rate (or custom) population stepped from buffer cur into the other; gives their residual
 fn (e mut Engine<T>&) rateStep(p mut Population<T>&, r0 I64, r1 I64) T {
     model := p.Model
@@ -644,9 +659,11 @@ fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
 # state k measured as the step to k + 1 is made; the first state within the tolerance is the one kept (Gauss-Seidel:
 # the state its sweep wrote)
 fn (e mut Engine<T>&) relax(b Budget, r0 I64, r1 I64, m I64) Settlement {
+    rows := b.Euclid and e.builtIn()
     for k in range b.Sweeps + 1 {
         e.sweep = k
         worst := F64(e.sweepOnce())
+        if rows and worst == worst: worst = e.rowsResidual(r0, r1)
         out := Settlement(k, worst, worst <= b.Tol)
         if out.Converged and e.seidel: e.cur = 1 - e.cur
         if out.Converged or out.Diverged() or k == b.Sweeps: return out
@@ -654,6 +671,44 @@ fn (e mut Engine<T>&) relax(b Budget, r0 I64, r1 I64, m I64) Settlement {
         e.cur = 1 - e.cur
     }
     unreachable
+}
+
+# whether every relaxing population is a built-in rate model (its residual readable from its two buffers)
+fn (e Engine<T>&) builtIn() Bool {
+    for p in e.Pops {
+        model := p.Model
+        if p.Role != neuron.Role.Input and model != neuron.Neuron.Rate: return false
+    }
+    return true
+}
+
+# the largest Euclidean norm, over rows r0 .. r1, of a row's residual r = total - u over its relaxing units, read from
+# the sweep's step (u' - u) / dt; retired units are at rest and left out (NaN where a residual is)
+fn (e mut Engine<T>&) rowsResidual(r0 I64, r1 I64) F64 {
+    worst F64 = 0.0
+    for r in range r0, r1 {
+        inv := 1.0 / e.step(r / e.Batch, e.damping)
+        sum F64 = 0.0
+        for p in e.Pops {
+            if p.Role != neuron.Role.Input: sum += rowSquares(p, e.cur, r, inv)
+        }
+        worst = neuron.Worse(worst, sum.Sqrt())
+    }
+    return worst
+}
+
+# the sum over p's live units in row r of ((u' - u) inv)^2, u read from buffer cur and u' from the other
+fn rowSquares<T>(p mut Population<T>&, cur I64, r I64, inv F64) F64 {
+    a := p.rate(cur)
+    b := p.rate(1 - cur)
+    n := p.Size
+    sum F64 = 0.0
+    for j in range n {
+        if p.Retired > 0 and not p.Alive[j]: continue
+        d := F64(b.U[r * n + j] - a.U[r * n + j]) * inv
+        sum += d * d
+    }
+    return sum
 }
 
 # the Anderson depth a settle runs at: the budget's, at most the depth reserved; none where a population is spiking

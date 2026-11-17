@@ -40,7 +40,9 @@ type Clock enum { Sweep, Step, Episode, Sleep }
 
 # the norm a certificate holds the coupling in: Sup, the gain (Gain: incoming mass times slope; a sweep contracts in the
 # sup norm), or Spectral, the coupling's largest singular value times the slope (Contraction; a sweep contracts in the
-# Euclidean norm). Both make the fixed point unique; the spectral bound is never above the gain for a symmetric coupling
+# Euclidean norm; the default: it lets a trained system keep its accuracy, PROGRESS.md "The stop test in the
+# certificate's norm"). Both make the fixed point unique; the spectral bound is never above the gain for a symmetric
+# coupling. The board needs Sup (its ranges, settling.md 4.2)
 type Norm enum { Sup, Spectral }
 
 # learning and adaptation as rules on a module (run by dyn/learn's Learner)
@@ -82,7 +84,7 @@ type System<T> struct(batch I64, threads I64 = 1, phases I64 = 3) {
     E mut settle.Engine<T>& = settle.Engine<T>(batch, phases, threads)
     Planned Bool = false
     Scheme settle.Sweeping = settle.Sweeping()          # the sweeps of the budgets it gives (BudgetFor)
-    Bound Norm = Norm.Sup                               # the norm Certify, Restrain, Rate and the tolerances hold kappa in
+    Bound Norm = Norm.Spectral                          # the norm Certify, Restrain, Rate and the tolerances hold kappa in
     mods mut Vec<modRec>& = Vec<modRec>[modRec(-1, "root")]
     pops mut Vec<popRec>& = Vec<popRec>()
     sigs mut Vec<sigRec>& = Vec<sigRec>()
@@ -592,41 +594,47 @@ fn (s mut System<T>&) Contraction(iterations I64 = 1000) F64 {
     return 0.0 if sigma == 0.0 else sigma * slope
 }
 
-# the certified rate q = 1 - dt (1 - kappa) at which a sweep shrinks the residual (in the norm of Bound) - of a free
-# phase, or one nudged with beta at its step - or 1 where nothing is certified
+# the certified rate q at which a sweep shrinks the residual (in the norm of Bound) - of a free phase, or of the nudged
+# pair settled with beta (+beta and -beta) - or 1 where nothing is certified. A sweep's Jacobian is a diagonal part
+# (1 - dt) - dt beta f_i (f_i the force's self-slope) plus dt (W D + beta C), C the force's coupling between units
+# (neuron.ForceCoupling); in any operator norm it is at most |diagonal| + dt kappa_beta. At +beta the shortened step
+# keeps the diagonal within 1 - dt and kappa_beta = kappa + beta c; at -beta the step is not shortened, the self-slope
+# adds instead and kappa_beta = kappa + beta (f + c). q = 1 - dt (1 - kappa_beta), the worse of the two
 fn (s mut System<T>&) Rate(beta F64 = 0) F64 {
     k := s.Kappa()
-    dt := s.E.Dt if beta <= 0.0 else s.E.Dt / (1.0 + beta * s.E.ForceSlope())
-    return 1.0 if k >= 1.0 else 1.0 - dt * (1.0 - k)
+    if beta == 0.0: return rateOf(s.E.Dt, k)
+    b := beta.Abs()
+    plus := rateOf(s.E.Dt / (1.0 + b * s.E.ForceSlope()), k + b * s.E.ForceCoupling())
+    minus := rateOf(s.E.Dt, k + b * (s.E.ForceSlope() + s.E.ForceCoupling()))
+    return plus.Max(minus)
+}
+
+fn rateOf(dt F64, kappa F64) F64 { return 1.0 if kappa >= 1.0 else 1.0 - dt * (1.0 - kappa) }
+
+# kappa of a phase nudged with beta (Rate): the free kappa plus the force's coupling, and its self-slope at -beta
+fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
+    extra := s.E.ForceCoupling() + (s.E.ForceSlope() if beta < 0.0 else 0.0)
+    return s.Kappa() + beta.Abs() * extra
 }
 
 # the training tolerance (settling.md 1.4): phases solved to it add an error no larger than the contrast's O(beta^2)
-# bias - max(beta^3 (1 - kappa) / 10, 100 u), kappa held at most 0.9. Under the spectral certificate the residual is
-# still tested unit by unit (sup norm) but the distance bound is Euclidean: |v - v*|_inf <= |v - v*|_2 <=
-# sqrt(n) tau / (1 - kappa) for n relaxing units a row, so the tolerance is divided by sqrt(n). A spiking system's: two
-# spikes a window
+# bias - max(beta^3 (1 - kappa) / 10, 100 u), kappa held at most 0.9. The residual is tested in the certificate's own
+# norm (BudgetFor: unit by unit under Sup, each row's Euclidean norm under Spectral), so the distance bound
+# |v - v*| <= tau / (1 - kappa) holds in that norm, and per unit under either (|x|_inf <= |x|_2). A spiking system's:
+# two spikes a window
 fn (s mut System<T>&) LessonTolerance(beta F64) F64 {
     if s.E.Spiking: return 2.0 / F64(s.E.Window)
     kappa := s.Kappa().Min(0.9)
-    each := 1.0 if s.Bound == Norm.Sup else F64(s.relaxing()).Sqrt()
-    return (beta * beta * beta * (1.0 - kappa) / (10.0 * each)).Max(100.0 * roundoff<T>())
-}
-
-# the relaxing units of a row (every population but the inputs)
-fn (s System<T>&) relaxing() I64 {
-    n I64 = 0
-    for p in s.E.Pops {
-        if p.Role != neuron.Role.Input: n += p.Size
-    }
-    return n.Max(1)
+    return (beta * beta * beta * (1.0 - kappa) / 10.0).Max(100.0 * roundoff<T>())
 }
 
 # a budget for a settle to tol, free or nudged with beta: twice the sweeps the certificate says a cold start needs
-# (ln tol / ln q, q held at most 0.95), at least 128; a spiking system's 32 windows
+# (ln tol / ln q, q held at most 0.95), at least 128, tested in the certificate's norm (Euclid under Spectral); a
+# spiking system's 32 windows
 fn (s mut System<T>&) BudgetFor(tol F64, beta F64 = 0) settle.Budget {
     if s.E.Spiking: return settle.Budget(32 * s.E.Window, tol, 0.0, s.Scheme)
     q := s.Rate(beta).Min(0.95)
-    return settle.Budget(I64((2.0 * tol.Log() / q.Log()).Ceil().Max(128.0)), tol, 0.0, s.Scheme)
+    return settle.Budget(I64((2.0 * tol.Log() / q.Log()).Ceil().Max(128.0)), tol, 0.0, s.Scheme, s.Bound == Norm.Spectral)
 }
 
 # the unit roundoff of T
@@ -1070,11 +1078,59 @@ test System.Certify "certified in the spectral norm (the gain above 1, outside t
     for i in range 6: x.Drive[i] = -x.Drive[i]
     warm := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
     assert warm.Converged
-    # each within sqrt(n) tol / (1 - kappa) of the fixed point (n = 28 relaxing units), tanh's slope 1
+    # each row within tol / (1 - kappa) of the fixed point in the Euclidean norm (the residual tested row by row),
+    # tanh's slope 1: per unit, and over the row
     h := s.Activity(settle.Phase.Free, Pop(1))
     for b in range 2 {
-        for i in range 24: assert (h.Get(b, i) - first[b * 24 + i]).Abs() < 2.0 * 28.0.Sqrt() * tol / 0.1
+        d := 0.0
+        for i in range 24: d += (h.Get(b, i) - first[b * 24 + i]) * (h.Get(b, i) - first[b * 24 + i])
+        assert d.Sqrt() < 2.0 * tol / 0.1, "row " + $b + ": " + $d.Sqrt()
     }
+}
+
+test System.BudgetFor "under the spectral certificate the residual is tested row by row in the Euclidean norm: the settlement's residual is a row's norm, at least its largest unit's and at most sqrt(n) times it" {
+    s := System<F64>.wide(5)
+    s.Bound = Norm.Spectral
+    s.Certify(0.9)
+    b := s.BudgetFor(1e-6)
+    assert b.Euclid
+    rows := s.Settle(settle.Phase.Free, settle.Budget(3, 0.0, 0.0, settle.Sweeping(), true))
+    s.Reset(settle.Phase.Free)
+    units := s.Settle(settle.Phase.Free, settle.Budget(3, 0.0))
+    assert rows.Residual >= units.Residual and rows.Residual <= 28.0.Sqrt() * units.Residual, $rows.Residual + " against " + $units.Residual
+    assert s.Settle(settle.Phase.Free, b).Converged
+}
+
+test System.Rate "a nudged phase counts the cross-entropy force's coupling: kappa + beta c at +beta, kappa + beta (f + c) at -beta; the nudged pair at beta 0.5 settles within its budget though the bound certifies neither phase" {
+    s := System<F64>.wideClasses(6)
+    s.Bound = Norm.Spectral
+    s.Certify(0.9)
+    # Classes(): T = 0.25, so the self-slope f and the coupling c are 1 each, tanh's slope 1
+    assert (s.NudgedKappa(0.05) - 0.95).Abs() < 1e-6 and (s.NudgedKappa(-0.05) - 1.0).Abs() < 1e-6
+    assert s.Rate(0.04) < 1.0 and s.Rate(0.5) == 1.0
+    tol := s.LessonTolerance(0.5)
+    assert s.Settle(settle.Phase.Free, s.BudgetFor(tol)).Converged
+    for k in range 4 {
+        for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((k + i) % 4)
+        out := s.Nudged(s.BudgetFor(tol, 0.5), 0.5)
+        assert out.Converged, "labels " + $k + ": " + $out.Sweeps + " sweeps, residual " + $out.Residual
+    }
+}
+
+# wide's system with a cross-entropy readout (Classes: 4 classes, T = 0.25)
+fn System<T>.wideClasses(seed U64) System<T> {
+    r := rand.Rand(seed)
+    s := System<T>(2, 1, 3)
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 24, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 4, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for i in range 6: s.Pop(x).Drive[i] = T(r.Uniform(-1.0, 1.0))
+    return s
 }
 
 # a v (n x n, trans: a^T v)
