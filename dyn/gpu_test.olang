@@ -1,0 +1,240 @@
+# dyn/gpu_test - dyn on the GPU against dyn on the CPU (docs/redesign.md 1.10, "Testing: the CPU kernels are the
+# oracle"). Built only with -define Gpu=true (make gputest): kernels/gpu asserts it.
+#
+# GP2: the settle's fused rate step (kernels/gpu/kern's Rate, rate.cu) against neuron.RateStep with the settle's
+# retired units (dyn/settle's rest and retire), on every Rho: u2 and s2 bit for bit for Linear, Relu and HardSigmoid,
+# s2 within FastTanh's stated error (2.0e-7 in F32) for Tanh, LifRate's within its F64 log's rounding; the residual word
+# the CPU's sup norm bit for bit, a NaN where the CPU's is one.
+
+import "neuron"
+import "../kernels/gpu/device"
+import "../kernels/gpu/kern"
+import "std/rand"
+
+# neuron's activation as the kernel's (kernels does not import dyn)
+fn GpuRho(f neuron.Rho) kern.Rho {
+    return match f {
+        case neuron.Rho.Linear: kern.Rho.Linear
+        case neuron.Rho.Tanh: kern.Rho.Tanh
+        case neuron.Rho.HardSigmoid: kern.Rho.HardSigmoid
+        case neuron.Rho.Relu: kern.Rho.Relu
+        case neuron.Rho.LifRate(leak, threshold): kern.Rho.LifRate(leak, threshold)
+    }
+}
+
+# the bits of a float, as U64
+fn bitsOf<T>(x T) U64 {
+    return match T {
+        case F64: x.Bits()
+        case _: U64(F32(x).Bits())
+    }
+}
+
+# whether a and b are one value: the same bits, or both NaN (a NaN's payload is the hardware's: x86 keeps an operand's,
+# the GPU makes its own)
+fn same<T>(a T, b T) Bool { return bitsOf(a) == bitsOf(b) or (a != a and b != b) }
+
+# the CPU's step of rows of size units, phases blocks of batch rows, one dt a phase, as the settle takes it: the retired
+# units' totals set to their potentials, RateStep a phase at a time, the retired units then put at rest. The sup norm
+fn cpuStep<T>(f neuron.Rho, u Array<T>&, total mut Array<T>&, u2 mut Array<T>&, s2 mut Array<T>&, lo I64, size I64, batch I64, dts Array<T>&, alive Array<Bool>&, retired Bool) T {
+    phases := dts.Len()
+    worst := T(0)
+    for p in range phases {
+        a := lo + p * batch * size
+        b := a + batch * size
+        if retired {
+            for i in range a, b {
+                if not alive[(i - lo) % size]: total[i] = u[i]
+            }
+        }
+        worst = neuron.Worse(worst, neuron.RateStep(f, u, total, u2, s2, a, b, dts[p]))
+        if retired {
+            for i in range a, b {
+                if not alive[(i - lo) % size] {
+                    u2[i] = T(0)
+                    s2[i] = T(0)
+                }
+            }
+        }
+    }
+    return worst
+}
+
+# one case: rows phases x batch of size units at element lo of arrays of len, u and total random in [-spread, spread]
+# (and special values where special), some units retired where retired; the GPU's step, twice, against the CPU's
+fn rateCase<T>(d mut device.Device&, rate kern.Rate<T>&, f neuron.Rho, size I64, batch I64, phases I64, retired Bool, special Bool, spread F64, r mut rand.Rand&) ? device.GpuError {
+    lo I64 = 5 * size
+    len := lo + phases * batch * size + 3
+    u := Array<T>(len)
+    total := Array<T>(len)
+    for i in range len {
+        u[i] = T(r.Uniform(-spread, spread))
+        total[i] = T(r.Uniform(-spread, spread))
+    }
+    if special {
+        sp := Array<F64>[0.0, -0.0, 1.0, -1.0, 0.5, 1.0e-30, -1.0e-30, 1.0e30, -1.0e30, Inf, -Inf]
+        for j in range sp.Len() {
+            u[lo + 3 * j] = T(sp[j])
+            total[lo + 3 * j + 1] = T(sp[j])
+            u[lo + 3 * j + 2] = T(sp[j])
+            total[lo + 3 * j + 2] = T(0.0)
+        }
+    }
+    alive := Array<Bool>(size, true)
+    aliveBytes := Array<U8>(size)
+    for j in range size {
+        if retired and j % 3 == 1: alive[j] = false
+        aliveBytes[j] = U8(1) if alive[j] else U8(0)
+    }
+    dts := Array<T>(phases)
+    for p in range phases: dts[p] = T(0.5) / T(1 + p) if p > 0 else T(0.3)
+    # the GPU's, from the arrays as they are (before the CPU's sets the retired units' totals)
+    bu := try device.Buf<T>.Make(d, len)
+    bt := try device.Buf<T>.Make(d, len)
+    bu2 := try device.Buf<T>.Make(d, len)
+    bs2 := try device.Buf<T>.Make(d, len)
+    bdt := try device.Buf<T>.Make(d, phases)
+    balive := try device.Buf<U8>.Make(d, size)
+    words := try device.Buf<U64>.Make(d, 2)
+    bu.UploadAll(u)
+    bt.UploadAll(total)
+    bdt.UploadAll(dts)
+    balive.UploadAll(aliveBytes)
+    kern.Zero(d, words.Addr(0), 16)
+    kern.Zero(d, bu2.Addr(0), len * T.Size)
+    kern.Zero(d, bs2.Addr(0), len * T.Size)
+    hi := lo + phases * batch * size
+    rate.Step(d, bu, bt, bu2, bs2, lo, hi, bdt.Addr(0), batch * size, balive if retired else null, size, words.Addr(0))
+    gu2 := Array<T>(len)
+    gs2 := Array<T>(len)
+    bu2.DownloadAll(gu2)
+    bs2.DownloadAll(gs2)
+    # again, into the second word, in two launches: the first phase alone, then the rest - one word, their maximum
+    rate.Step(d, bu, bt, bu2, bs2, lo, lo + batch * size, bdt.Addr(0), batch * size, balive if retired else null, size, words.Addr(1))
+    rate.Step(d, bu, bt, bu2, bs2, lo + batch * size, hi, bdt.Addr(1), batch * size, balive if retired else null, size, words.Addr(1))
+    w := Array<U64>(2)
+    words.DownloadAll(w)
+    again := Array<T>(len)
+    bs2.DownloadAll(again)
+    try d.Sync()
+    # the CPU's
+    cu2 := Array<T>(len)
+    cs2 := Array<T>(len)
+    worst := cpuStep(f, u, total, cu2, cs2, lo, size, batch, dts, alive, retired)
+    got := kern.Residual(w[0], T(0))
+    what := $f + " " + $size + " x " + $batch + " x " + $phases + (" retired" if retired else "") + (" special" if special else "") + " spread " + $spread
+    assert same(got, worst), "residual " + $got + ", the CPU's " + $worst + ": " + what
+    if worst == worst: assert w[0] == bitsOf(worst), "the residual's bits: " + what
+    # outside lo .. hi nothing is written
+    ident I64 = 0
+    for i in range len {
+        if i < lo or i >= hi {
+            assert gu2[i] == T(0) and gs2[i] == T(0), "element " + $i + " outside the rows written: " + what
+            continue
+        }
+        ident += 1 if same(gs2[i], cs2[i]) else 0
+        assert same(gu2[i], cu2[i]), "u2[" + $i + "] " + $gu2[i] + ", the CPU's " + $cu2[i] + ": " + what
+        match f {
+            case neuron.Rho.Tanh {
+                assert (F64(gs2[i]) - F64(cs2[i])).Abs() <= 2.0e-7 or same(gs2[i], cs2[i]), "s2[" + $i + "] " + $gs2[i] + ", the CPU's " + $cs2[i] + ": " + what
+            }
+            case neuron.Rho.LifRate {
+                assert (F64(gs2[i]) - F64(cs2[i])).Abs() <= 4.0e-15 + 2.0 * ulp(T(0)) * F64(cs2[i]).Abs() or same(gs2[i], cs2[i]), "s2[" + $i + "] " + $gs2[i] + ", the CPU's " + $cs2[i] + ": " + what
+            }
+            case _ {
+                assert same(gs2[i], cs2[i]), "s2[" + $i + "] " + $gs2[i] + ", the CPU's " + $cs2[i] + ": " + what
+            }
+        }
+    }
+    if (f == neuron.Rho.Tanh or f == neuron.Rho.LifRate) and hi - lo >= 1 << 20: Println(what + ": s2 bit for bit with the CPU's at " + $ident + " of " + $(hi - lo))
+    # the second run: the same state, the same residual whether the rows went in one launch or two
+    for i in range len: assert bitsOf(again[i]) == bitsOf(gs2[i]), "run twice, s2[" + $i + "] differs: " + what
+    assert w[1] == w[0], "the residual in two launches " + $kern.Residual(w[1], T(0)) + ", in one " + $got + ": " + what
+}
+
+# a unit in the last place at 1
+fn ulp<T>(z T) F64 {
+    return match T {
+        case F64: 2.220446049250313e-16
+        case _: 1.1920928955078125e-07
+    }
+}
+
+fn rhos() Array<neuron.Rho> {
+    return Array<neuron.Rho>[neuron.Rho.Linear, neuron.Rho.Tanh, neuron.Rho.HardSigmoid, neuron.Rho.Relu, neuron.Rho.LifRate(0.1, 1.0)]
+}
+
+fn rateAll<T>(d mut device.Device&, like T) ? device.GpuError {
+    r := rand.Rand(11)
+    for f in rhos() {
+        rate := try kern.Rate<T>.Make(d, GpuRho(f))
+        # the settle's shapes (784-128-10 at batch 128, two phases), odd sizes, one unit, a large block
+        try rateCase(d, rate, f, 128, 128, 2, false, false, 2.0, r)
+        try rateCase(d, rate, f, 10, 128, 2, true, false, 2.0, r)
+        try rateCase(d, rate, f, 37, 13, 3, true, true, 3.0, r)
+        try rateCase(d, rate, f, 1, 1, 1, false, false, 1.0, r)
+        try rateCase(d, rate, f, 33, 1, 2, true, true, 1.0e3, r)
+        try rateCase(d, rate, f, 1024, 512, 2, true, false, 4.0, r)
+    }
+}
+
+test GpuRho "the rate step on the GPU against neuron.RateStep, F32: every Rho, retired units, offsets, special values" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("the rate step (F32)")
+        return
+    }
+    try rateAll(d, F32(0))
+}
+
+test GpuRho "the rate step on the GPU against neuron.RateStep, F64" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("the rate step (F64)")
+        return
+    }
+    try rateAll(d, F64(0))
+}
+
+test GpuRho "a NaN anywhere is the residual word's NaN, as the CPU's sup norm" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("the rate step's NaN")
+        return
+    }
+    rate := try kern.Rate<F32>.Make(d, kern.Rho.Tanh)
+    n I64 = 3000
+    for at in Array<I64>[0, 1, 255, 256, 1777, 2999] {
+        for inTotal in Array<Bool>[false, true] {
+            u := Array<F32>(n)
+            total := Array<F32>(n)
+            for i in range n {
+                u[i] = F32(i % 17) * 0.1
+                total[i] = F32(i % 13) * 0.2
+            }
+            total[17] = F32(1.0e30)              # a large residual too: the NaN must still be the maximum
+            if inTotal {
+                total[at] = F32.NaN
+            } else {
+                u[at] = F32.NaN
+            }
+            u2 := Array<F32>(n)
+            s2 := Array<F32>(n)
+            worst := neuron.RateStep(neuron.Rho.Tanh, u, total, u2, s2, 0, n, 0.5)
+            assert worst != worst
+            bu := try device.Buf<F32>.Make(d, n)
+            bt := try device.Buf<F32>.Make(d, n)
+            bu2 := try device.Buf<F32>.Make(d, n)
+            bs2 := try device.Buf<F32>.Make(d, n)
+            bdt := try device.Buf<F32>.Make(d, 1)
+            word := try device.Buf<U32>.Make(d, 1)
+            bu.UploadAll(u)
+            bt.UploadAll(total)
+            bdt.UploadAll(Array<F32>[0.5])
+            kern.Zero(d, word.Addr(0), 4)
+            rate.Step(d, bu, bt, bu2, bs2, 0, n, bdt.Addr(0), n, null, n, word.Addr(0))
+            w := Array<U32>(1)
+            word.DownloadAll(w)
+            try d.Sync()
+            got := kern.Residual(U64(w[0]), F32(0))
+            assert got != got, "a NaN at " + $at + (" in the totals" if inTotal else " in u") + ": the residual is " + $got
+        }
+    }
+}

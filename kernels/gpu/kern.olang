@@ -271,16 +271,17 @@ fn Rate<T>.Make(d mut device.Device&, rho Rho) Rate<T> ? device.GpuError {
 
 # one sweep's step of elements lo .. hi of a population's state, dyn/neuron's RateStep fused with the settle's retired
 # units: r = total - u, the residual's sup norm as bits into the word at the address out (a U32 for F32, a U64 for
-# F64: the maximum with what it holds - zero it first, Zero, once a sweep), u2 = u + dt r, s2 = rho(u2); dt is
-# dts[(i - lo) / per] (per the elements of a phase's rows: one dt per phase); where alive is given (size bytes, 0 for
-# a retired unit), unit (i - lo) % size of a row is retired: its r, u2 and s2 are 0 - so lo is a row's start. Enqueued;
-# nothing is checked but the count
-fn (r Rate<T>&) Step(d mut device.Device&, u device.Buf<T>&, total device.Buf<T>&, u2 mut device.Buf<T>&, s2 mut device.Buf<T>&, lo I64, hi I64, dts device.Buf<T>&, per I64, alive device.Buf<U8>?&, size I64, out U64) {
+# F64: the maximum with what it holds - zero it first, Zero, once a sweep), u2 = u + dt r, s2 = rho(u2). The rows are
+# phase-major, per elements a phase: element i's dt is the T at the address dt + ((i - lo) / per) - dt the address of
+# the dt of the phase lo is in (dts.Addr(p)). Where alive is given (size bytes, 0 for a retired unit), unit
+# (i - lo) % size of a row is retired - so lo is a row's start - and its r, u2 and s2 are 0. Enqueued; nothing is
+# checked but the count
+fn (r Rate<T>&) Step(d mut device.Device&, u device.Buf<T>&, total device.Buf<T>&, u2 mut device.Buf<T>&, s2 mut device.Buf<T>&, lo I64, hi I64, dt U64, per I64, alive device.Buf<U8>?&, size I64, out U64) {
     n := hi - lo
     if n <= 0: return
     assert n <= MaxElems, "a rate step of more than 2^31 - 1 elements"
     mask U64 = 0 if alive == null else alive.Addr(0)
-    Launch(d, r.k, Blocks(n), Block, u.Addr(lo), total.Addr(lo), u2.Addr(lo), s2.Addr(lo), dts.Addr(0), Arg(U32(per)), mask, Arg(U32(size)), Arg(U32(n)), out)
+    Launch(d, r.k, Blocks(n), Block, u.Addr(lo), total.Addr(lo), u2.Addr(lo), s2.Addr(lo), dt, Arg(U32(per)), mask, Arg(U32(size)), Arg(U32(n)), out)
 }
 
 # the residual a word holds, as the CPU's RateStep gives it: the bits read as T

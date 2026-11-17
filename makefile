@@ -14,7 +14,7 @@ TESTS = tensor.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang ker
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang
 
 # the GPU backend's modules (docs/redesign.md 1.10): built only with -define Gpu=true, so never by make test
-GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang
+GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang
 
 # where WSL keeps its libcuda.so.1, put first on the loader's path for the GPU targets: a native Linux driver package
 # installed beside the toolkit (libnvidia-compute) can shadow WSL's in the loader's cache, and CUDA then finds no
