@@ -1,0 +1,89 @@
+# bench/laplace - the cost of one sequential Laplace update (bayes/laplace.Update) of a full Gaussian belief: the shape
+# of a rating filter's event, two entities of `parts` components each joined with `shared` global coefficients
+# (38 components by default), observed twice as binomial counts through a link with a bilinear term, so Newton takes a
+# few steps. Each round restores the prior and updates it; the time per update is the best of several runs of `rounds`
+# rounds. Arguments, all optional: rounds (20000), runs (5), parts (12), shared (14). Build and run from the
+# repository's root:
+#   olang build -output build/bench_laplace bench/laplace.olang && build/bench_laplace
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../bayes/dense"
+import "../bayes/gauss"
+import "../bayes/laplace"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+# observation 0 is entity a's first part against entity b's second, observation 1 the reverse, each with the shared
+# coefficients' sum and a bilinear term between the two entities' last parts
+type link struct(parts I64, shared I64) {
+    parts
+    shared
+}
+
+fn (l link&) Linearize(z Array<F64>&, eta mut Array<F64>&, jac mut Array<F64>&) {
+    d := z.Len()
+    for k in range jac.Len(): jac[k] = 0.0
+    for row in range 2 {
+        o := row * d
+        a := row * l.parts
+        b := (1 - row) * l.parts
+        e := z[a] - z[b + 1]
+        jac[o + a] = 1.0
+        jac[o + b + 1] = -1.0
+        for h in range l.shared {
+            e += z[2 * l.parts + h]
+            jac[o + 2 * l.parts + h] = 1.0
+        }
+        u := a + l.parts - 1
+        v := b + l.parts - 1
+        e += z[u] * z[v]
+        jac[o + u] += z[v]
+        jac[o + v] += z[u]
+        eta[row] = e
+    }
+}
+
+fn main() ? io.Error, ParseError, dense.Error {
+    args := os.Args()
+    rounds := try number(args, 1, 20000)
+    runs := try number(args, 2, 5)
+    parts := try number(args, 3, 12)
+    shared := try number(args, 4, 14)
+    d := 2 * parts + shared
+    r := rand.Rand(1)
+    # a correlated prior: a random factor's covariance plus a diagonal
+    f := r.Normals(d * 4, 0.0, 0.1)
+    prior := gauss.Gaussian.Isotropic(d, 0.2)
+    for i in range d {
+        prior.Mean[i] = 0.1 * r.Normal()
+        for j in range d {
+            for k in range 4: prior.Cov[i * d + j] += f[i * 4 + k] * f[j * 4 + k]
+        }
+    }
+    g := gauss.Gaussian.Of(prior.Mean, prior.Cov)
+    l := link(parts, shared)
+    lik := laplace.Likelihood(laplace.Family.Binomial)
+    y := Array<F64>[52.0, 41.0]
+    trials := Array<F64>[80.0, 70.0]
+    times := Array<I64>(runs)
+    steps I64 = 0
+    for k in range runs {
+        t0 := time.Now()
+        for _ in range rounds {
+            for i in range d: g.Mean[i] = prior.Mean[i]
+            for i in range d * d: g.Cov[i] = prior.Cov[i]
+            steps += try laplace.Update(g, l, lik, y, trials)
+        }
+        times[k] = time.Since(t0)
+    }
+    best := times[0]
+    for t in times: best = t if t < best else best
+    us := F64(best) / F64(rounds) / 1000.0
+    try io.Put($d + " components, " + $(F64(steps) / F64(rounds * runs)).Fixed(2) + " Newton steps, " + $us.Fixed(2) + " us an update (best of " + $runs + "); mean[0] " + $g.Mean[0].Fixed(6) + ", var[0] " + $g.Var(0).Fixed(6) + "\n")
+}

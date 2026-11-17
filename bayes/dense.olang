@@ -55,6 +55,21 @@ fn SolveUpper(l Array<F64>&, y Array<F64>&, d I64) Array<F64> {
 # x solving l l^T x = b, l a Cholesky factor
 fn SolveCholesky(l Array<F64>&, b Array<F64>&, d I64) Array<F64> { return SolveUpper(l, SolveLower(l, b, d), d) }
 
+# b overwritten by x solving l l^T x = b, l a Cholesky factor, with nothing allocated
+fn SolveCholeskyInPlace(l Array<F64>&, b mut Array<F64>&, d I64, at I64 = 0) {
+    for i in range d {
+        s := b[at + i]
+        for k in range i: s -= l[i * d + k] * b[at + k]
+        b[at + i] = s / l[i * d + i]
+    }
+    for c in range d {
+        i := d - 1 - c
+        s := b[at + i]
+        for k in range i + 1, d: s -= l[k * d + i] * b[at + k]
+        b[at + i] = s / l[i * d + i]
+    }
+}
+
 # the inverse of the symmetric positive-definite d by d matrix a
 fn Inverse(a Array<F64>&, d I64) Array<F64> ? Error {
     l := try Cholesky(a, d)
@@ -130,6 +145,9 @@ test "factor, solve, invert and log det" {
     x := SolveCholesky(l, Array<F64>[1.0, 2.0, 3.0], 3)
     ax := Times(a, x, 3, 3)
     for i in range 3: assert (ax[i] - F64(i + 1)).Abs() < 1e-12
+    inplace := Array<F64>[9.0, 1.0, 2.0, 3.0]
+    SolveCholeskyInPlace(l, inplace, 3, at = 1)
+    for i in range 3: assert inplace[i + 1] == x[i]
     inv := try Inverse(a, 3)
     eye := MatMul(a, inv, 3, 3, 3)
     for i in range 9: assert (eye[i] - Identity(3)[i]).Abs() < 1e-12
