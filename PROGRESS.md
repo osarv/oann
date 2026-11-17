@@ -880,10 +880,101 @@ What it says, first (GP5 measures it on MNIST, with `Check` 1, 4, 16 and hidden 
   will weigh the sweeps more; CUDA graphs or fewer readbacks are GP7's if G-M2 says so.
 - kernels/gemm's four threads are again slower than one below batch 512 (G-M1's finding).
 
+## The GPU route, GP5: G-M2, where the settle runs (wt-gp5, 2026-11-17)
+
+docs/redesign.md 1.10's G-M2 and 4.4's GP5. `examples/mnist_learn.olang` takes the backend as its 8th argument: a thread
+count (the CPU), `gpu` (the GPU, set with `device.SetDefault`, residual words read every 4 sweeps), `gpuN` (every N:
+the mirror's `Check`) or `auto` (the rule below); it now steps `learn.AdamW` (nn/optim's step for step: the CPU's
+output is unchanged to the digit). `System.Hold` with nothing masked does nothing - on the GPU it had brought every
+parameter down and up again each lesson. `bench/gpulearn.olang` (`make gpulearn`) runs the program over the grid and
+takes the medians. MNIST lives in `/home/oscar/claude/data/mnist`, linked as `data/mnist` (`.gitignore` takes the link).
+
+**Verdict.**
+- **The settle runs on the GPU where batch x hidden is at least 16384, else on the CPU at one thread.** Measured: at
+  16384 (128 x 128, 64 x 256, 32 x 512) the GPU is 1.12-1.24x faster an epoch than the best CPU; at 8192 (64 x 128,
+  32 x 256) the CPU is 1.5-1.7x faster, at 4096 (32 x 128) 3.0x. Above it the GPU's lead grows with the work: 2.2x at
+  64 x 512, 2.8x at 32 x 1024, 3.4x at 512 x 128, 6.1x at 128 x 1024, 8.9x at 512 x 1024. So for mnist_learn's default
+  (batch 32, hidden 128) the CPU stays; at hidden 1024 the GPU wins from batch 32. `system.SettleOn(batch, width)` is
+  this rule in one line (and `mnist_learn ... auto`); `Plan`'s default stays the CPU.
+- **`Check` 4**, the default, is the fastest in every cell: `Check` 1 (a host wait every sweep) costs 1.2-1.5x, `Check`
+  16 (up to 15 wasted sweeps a settle, at 26-55 sweeps a lesson) 1.1-1.25x. Sweeps a lesson are the same for all three.
+- **On the CPU one thread** wherever the GPU loses: 4 threads are slower in every cell below 16384 (1.2-1.5x; GP4's and
+  G-M1's finding); without a GPU, 4 threads win from 512 x 128 (1.26x) and at hidden 1024 from batch 128 (1.7-2.8x).
+- **Accuracy matches.** CPU and GPU start from the same parameters; at batch 128 and 512 the test accuracy is the same
+  to the digit for nearly every seed. At batch 32 (1875 lessons an epoch) the runs drift apart by rounding and land on
+  different but equally good points: over 15 seeds the medians are 97.12% (CPU) and 97.12% (GPU) at hidden 128, 96.11%
+  and 96.04% at hidden 1024; the mean GPU - CPU difference per seed -0.06 and -0.03 points, against seed ranges of
+  96.47-97.39% and 94.78-96.74%. The GPU is reproducible: seeds 1-5 gave the same accuracies in both sessions.
+  `Check` changes nothing (1, 4, 16: the same accuracy, the same sweeps).
+- **What an epoch costs** (60000 samples, the lessons only; median, s): hidden 128 - CPU 1.28 / 1.55 / 1.96 at batch
+  32 / 128 / 512 (one thread), GPU 3.87 / 1.25 / 0.45; hidden 1024 - CPU 11.67 / 14.16 / 21.36 (one thread), 12.27 /
+  8.49 / 7.57 (four), GPU 4.20 / 1.39 / 0.85. The GPU's free settle of a test batch is about 0.9-1.5 ms at every size
+  (the CPU's 0.19 ms at 32 x 128, 24 ms at 512 x 1024): its fixed cost a settle, not its sweeps, sets the crossover -
+  GP7's CUDA graphs and fewer readbacks would move it down.
+
+**The table** (`make gpulearn OLANG=olang ARGS="5 3"`, commit 7416042: 3 epochs a run, 5 interleaved rounds a cell -
+each backend once a round, the order rotated, seed = the round - the medians over rounds of a run's mean epoch; the
+accuracy after epoch 3, median and the 5 seeds' range; a test settle is the free settle of one test batch. Ryzen 5 7600
+(6 cores) under WSL2, RTX 4060; load average 1.0-1.5 while running (0.5 idle before), nothing else built or run. Logs
+in `logs/gm2*.log`, not in git):
+
+| hidden | batch | backend | s an epoch | sweeps a lesson | test accuracy % (seeds) | us a test settle | / the cell's fastest |
+|---|---|---|---|---|---|---|---|
+| 128 | 32 | CPU 1 thread | **1.28** | 31.3 | 96.87 (96.47-97.13) | 194 | 1.00 |
+| 128 | 32 | CPU 4 threads | 1.89 | 31.3 | 96.87 (96.47-97.13) | 511 | 1.48 |
+| 128 | 32 | GPU, Check 1 | 6.00 | 31.3 | 96.71 (96.47-96.91) | 1585 | 4.67 |
+| 128 | 32 | GPU, Check 4 | 3.87 | 31.3 | 96.71 (96.47-96.91) | 898 | 3.02 |
+| 128 | 32 | GPU, Check 16 | 4.73 | 31.3 | 96.71 (96.47-96.91) | 1165 | 3.69 |
+| 128 | 128 | CPU 1 thread | 1.55 | 45.3 | 96.60 (96.57-96.79) | 650 | 1.24 |
+| 128 | 128 | CPU 4 threads | 1.73 | 45.3 | 96.60 (96.57-96.79) | 912 | 1.38 |
+| 128 | 128 | GPU, Check 1 | 1.89 | 45.3 | 96.60 (96.56-96.79) | 1305 | 1.51 |
+| 128 | 128 | GPU, Check 4 | **1.25** | 45.3 | 96.60 (96.56-96.79) | 946 | 1.00 |
+| 128 | 128 | GPU, Check 16 | 1.41 | 45.3 | 96.60 (96.56-96.79) | 1174 | 1.13 |
+| 128 | 512 | CPU 1 thread | 1.96 | 54.4 | 95.27 (95.15-95.38) | 2395 | 4.35 |
+| 128 | 512 | CPU 4 threads | 1.55 | 54.4 | 95.27 (95.15-95.38) | 2285 | 3.44 |
+| 128 | 512 | GPU, Check 1 | 0.68 | 54.4 | 95.27 (95.15-95.38) | 1420 | 1.50 |
+| 128 | 512 | GPU, Check 4 | **0.45** | 54.4 | 95.27 (95.15-95.38) | 1105 | 1.00 |
+| 128 | 512 | GPU, Check 16 | 0.53 | 54.4 | 95.27 (95.15-95.38) | 1314 | 1.17 |
+| 1024 | 32 | CPU 1 thread | 11.67 | 26.2 | 96.19 (96.00-96.38) | 2229 | 2.78 |
+| 1024 | 32 | CPU 4 threads | 12.27 | 26.2 | 96.19 (96.00-96.38) | 2458 | 2.92 |
+| 1024 | 32 | GPU, Check 1 | 5.95 | 26.2 | 95.76 (95.55-96.49) | 1585 | 1.42 |
+| 1024 | 32 | GPU, Check 4 | **4.20** | 26.2 | 95.76 (95.55-96.49) | 1043 | 1.00 |
+| 1024 | 32 | GPU, Check 16 | 5.14 | 26.2 | 95.76 (95.55-96.49) | 1298 | 1.22 |
+| 1024 | 128 | CPU 1 thread | 14.16 | 34.7 | 96.37 (96.32-96.62) | 6692 | 10.21 |
+| 1024 | 128 | CPU 4 threads | 8.49 | 34.7 | 96.37 (96.32-96.62) | 5466 | 6.12 |
+| 1024 | 128 | GPU, Check 1 | 1.98 | 35.0 | 96.32 (96.24-96.62) | 1388 | 1.43 |
+| 1024 | 128 | GPU, Check 4 | **1.39** | 35.0 | 96.32 (96.24-96.62) | 1068 | 1.00 |
+| 1024 | 128 | GPU, Check 16 | 1.74 | 35.0 | 96.32 (96.24-96.62) | 1341 | 1.25 |
+| 1024 | 512 | CPU 1 thread | 21.36 | 52.3 | 95.42 (95.18-95.53) | 23970 | 25.23 |
+| 1024 | 512 | CPU 4 threads | 7.57 | 52.3 | 95.42 (95.18-95.53) | 8994 | 8.94 |
+| 1024 | 512 | GPU, Check 1 | 1.01 | 52.2 | 95.42 (95.18-95.52) | 1836 | 1.20 |
+| 1024 | 512 | GPU, Check 4 | **0.85** | 52.2 | 95.42 (95.18-95.52) | 1529 | 1.00 |
+| 1024 | 512 | GPU, Check 16 | 0.94 | 52.2 | 95.42 (95.18-95.52) | 2047 | 1.11 |
+
+The crossover, between the grid's cells (`make gpulearn OLANG=olang ARGS="3 3 128 64 1,4,gpu4"` and `ARGS="3 3 256,512
+32,64 1,4,gpu4"`, 3 rounds):
+
+| hidden | batch | batch x hidden | CPU 1 thread | CPU 4 threads | GPU, Check 4 | faster |
+|---|---|---|---|---|---|---|
+| 128 | 64 | 8192 | **1.39** | 1.69 | 2.10 | CPU 1.51x |
+| 256 | 32 | 8192 | **2.08** | 2.56 | 3.51 | CPU 1.69x |
+| 256 | 64 | 16384 | 2.24 | 2.53 | **2.00** | GPU 1.12x |
+| 512 | 32 | 16384 | 4.32 | 4.91 | **3.73** | GPU 1.16x |
+| 512 | 64 | 32768 | 4.70 | 4.91 | **2.19** | GPU 2.15x |
+
+Accuracy, 15 seeds at batch 32 (`make gpulearn OLANG=olang ARGS="15 3 128,1024 32 1,gpu4"`): hidden 128 CPU 97.12%
+(96.47-97.39), GPU 97.12% (96.47-97.30), 1.28 against 3.90 s an epoch; hidden 1024 CPU 96.11% (94.99-96.56), GPU 96.04%
+(94.78-96.74), 11.53 against 4.07 s.
+
+Reproduce: `make data OLANG=olang` once, then the commands above; one run alone is
+`make mnistlearn OLANG=olang ARGS="3 60000 1024 128 1 0.001 0.5 gpu"` (`gpu1`, `gpu16`, a thread count, or `auto`).
+
 ## Next
 
-- The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP4 are done (above); GP5 (G-M2, the verdict
-  on MNIST: where the settle runs, from which batch; `Check`) next, then GP6 (`ad` on the GPU).
+- The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP5 are done (above; G-M2's verdict: the
+  settle on the GPU from batch x hidden 16384, `Check` 4); GP6 (`ad` on the GPU) next. For GP7 G-M2 says the GPU's
+  fixed cost a settle (about 1 ms whatever its size) sets the crossover: CUDA graphs or fewer readbacks would move it
+  below 16384.
 - INT8 on the GPU: a one-pass kernel dequantizing GemmI8's I32 product (kern.olang) instead of the second, F32-summed
   product (GP3: 192 against 2466 us at 2048^3); then G-M5.
 - kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).

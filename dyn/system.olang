@@ -224,6 +224,12 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.
     s.Planned = true
 }
 
+# where a settle of batch rows over a hidden population of width units runs fastest, as G-M2 measured it on the machine
+# GP5 ran on (PROGRESS.md, "GP5"; Ryzen 5 7600, RTX 4060): on the GPU where there is one and batch x width is at least
+# 16384 (from 1.1x there to 9x at 512 x 1024), else on the CPU (at one thread: 1.5-3x the GPU below it). A measured
+# rule for mnist_learn's 784-H-10 system, not a model of every system: Plan's default stays the CPU
+fn SettleOn(batch I64, width I64) device.Backend { return device.Backend.Gpu if device.GpuAvailable() and batch * width >= 16384 else device.Backend.Cpu }
+
 # whether it was planned on the GPU
 fn (s System<T>&) OnGpu() Bool {
     if Gpu {
@@ -1033,6 +1039,12 @@ fn solve(a mut Array<F64>&, b mut Array<F64>&, n I64) {
         for k in range c + 1, n: b[c] -= a[c * n + k] * b[k]
         b[c] /= a[c * n + c]
     }
+}
+
+test SettleOn "G-M2's rule: the CPU below batch x width 16384, the GPU from it where there is one" {
+    assert SettleOn(32, 128) == device.Backend.Cpu and SettleOn(64, 128) == device.Backend.Cpu and SettleOn(32, 256) == device.Backend.Cpu
+    big := device.Backend.Gpu if device.GpuAvailable() else device.Backend.Cpu
+    assert SettleOn(128, 128) == big and SettleOn(32, 512) == big and SettleOn(512, 1024) == big
 }
 
 test System.Settle "linear neurons settle to the solution of (I - W_eff) v = c, c the bias and the folded input" {

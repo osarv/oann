@@ -1062,7 +1062,9 @@ times include the per-batch transfers):
 
 The 784-128-10 settle is small for a GPU (a sweep at batch 128 is about 30 MFLOP): G-M2 may well show the CPU ahead at
 batch 128 and the GPU ahead from 512 or at hidden sizes of 1024 and up - the benchmark sweeps both, and the answer is
-written into PROGRESS.md before any further settle work goes to the GPU.
+written into PROGRESS.md before any further settle work goes to the GPU. *Measured (GP5): the GPU leads from batch x hidden
+16384 - already at 128 x 128 (1.24x), and at hidden 1024 from batch 32 - below it the CPU at one thread; `Check` 4
+(As built, GP5, below).*
 
 **GPU decisions (2026-11-17).**
 
@@ -1145,6 +1147,23 @@ Gauss-Seidel sweeps (also `Use` of them after a GPU plan); a learner of a GPU pl
 implicit gradients. Not done: CUDA graphs and cuBLASLt's planned products for the sweep (GP7, as G-M2 says), a
 device fault in a settle ends the program (`System.Settle` has no error), host views kept and written after they were
 taken are not seen by the device (step a GPU plan with `learn.AdamW`, not `nn/optim`'s).
+
+
+**As built (GP5, 2026-11-17): G-M2's verdict.** `examples/mnist_learn` takes `gpu`, `gpuN` (`Check` N) or `auto` as its
+backend argument, through `device.SetDefault`; `make gpulearn` (`bench/gpulearn.olang`) runs it over the grid,
+interleaved, medians (tables and reproduction in PROGRESS.md, "GP5"). On MNIST, 3 epochs a run, 5 seeds a cell:
+- **Where the settle runs: on the GPU where batch x hidden is at least 16384, else on the CPU at one thread.** At 16384
+  (128 x 128, 64 x 256, 32 x 512) the GPU is 1.12-1.24x faster an epoch than the best CPU; at 8192 the CPU is 1.5-1.7x
+  faster and at 32 x 128 (mnist_learn's default) 3.0x (1.28 s an epoch against 3.87). Above it the GPU's lead grows:
+  3.4x at 512 x 128, 2.8x at 32 x 1024, 6.1x at 128 x 1024, 8.9x at 512 x 1024 (0.85 s an epoch against 7.57 at four
+  threads, 21.36 at one). The GPU's settle costs about 1 ms whatever its size: its fixed cost, not its sweeps, sets the
+  crossover (GP7: CUDA graphs, fewer readbacks). `system.SettleOn(batch, width)` is this rule, measured for
+  mnist_learn's 784-H-10 system on this machine; `Plan`'s default stays the CPU.
+- **`Check` 4** stays the default: fastest in every cell; 1 costs 1.2-1.5x, 16 1.1-1.25x.
+- **The accuracy is the CPU's**: the same to the digit at batch 128 and 512 for nearly every seed; at batch 32 the runs
+  drift apart by rounding and the medians over 15 seeds agree (97.12 / 97.12% at hidden 128, 96.11 / 96.04% at 1024; the
+  mean difference a seed -0.06 and -0.03 points against seed ranges of 0.9 and 2 points).
+- `System.Hold` with nothing masked no longer brings the parameters down and up each lesson on the GPU.
 
 The packages are section 4.4.
 
