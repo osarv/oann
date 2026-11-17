@@ -59,6 +59,47 @@ fn Epoch<T, D, O>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader<D>&,
     return total / F64(seen)
 }
 
+# the next batch of a classifier's epoch, filled on a task while the current one trains: the staging buffers a task writes
+# into (the graph's input storage is read by the step meanwhile) and, after the step, copied into it. Made once, with the
+# graph's batch and the dataset's width; an epoch with it allocates nothing and gives the same losses as `Epoch`
+type Ahead<T> struct(xs Array<T>, ys Array<I32>) {
+    xs
+    ys
+}
+
+fn Ahead<T>.For(g graph.Graph<T>&, c Classifier&) Ahead<T> {
+    return Ahead<T>(Array<T>(g.Data(c.X).Flat()!.Len()), Array<I32>(g.Ints(c.Y).Flat()!.Len()))
+}
+
+# `Epoch` with the next batch filled on a task during each step (a `join` of one task a step): the same batches in the same
+# order, so the same losses, parameters and accuracy bit for bit. It gains only where a core is free
+fn EpochAhead<T, D, O>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader<D>&, o mut O&, a mut Ahead<T>&) F64 {
+    l.Epoch()
+    xs := g.Data(c.X).Flat()!
+    ys := g.Ints(c.Y).Flat()!
+    total F64 = 0.0
+    seen I64 = 0
+    last := l.Batches() - 1
+    n := l.Fill(0, xs, ys)
+    for b in range l.Batches() {
+        join {
+            if b < last: spawn l.Fill(b + 1, a.xs, a.ys)
+            g.Forward(n)
+            g.Backward(c.Loss)
+            o.Step()
+            g.SyncParams()
+        }
+        total += g.Scalar(c.Loss) * F64(n)
+        seen += n
+        if b < last {
+            n = l.Rows(b + 1)
+            for i in range xs.Len(): xs[i] = a.xs[i]
+            for i in range ys.Len(): ys[i] = a.ys[i]
+        }
+    }
+    return total / F64(seen)
+}
+
 # the mean loss and the fraction classified right over every sample of l, forward only
 fn Evaluate<T, D>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader<D>&) F64, F64 {
     l.Epoch()
@@ -127,6 +168,56 @@ fn LmStep<E, S, O>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, o mut O&
     return g.Scalar(m.Loss), norm
 }
 
+# the next language-model batch, filled on a task while the current one trains (see Ahead): the staging rows and whether
+# the first batch is drawn yet
+type LmAhead struct(tokens Array<I32>, targets Array<I32>, primed Bool = false, failure String = "") {
+    tokens
+    targets
+    primed
+    failure
+}
+
+type TrainError error {
+    Draw    # the batch source failed in the task drawing the next batch (LmAhead.failure says how)
+}
+
+fn LmAhead.For<E>(g graph.Graph<E>&, m LanguageModel&) LmAhead {
+    return LmAhead(Array<I32>(g.Ints(m.Tokens).Flat()!.Len()), Array<I32>(g.Ints(m.Targets).Flat()!.Len()))
+}
+
+# the batch a task draws: src's Random, which may fail (a file's) or not; a failure is kept on the staging buffer, for the
+# step to report once its task has joined
+fn draw<S>(src mut S&, a mut LmAhead&, batch I64) {
+    try src.Random(a.tokens, a.targets, batch) catch e { a.failure = $e }
+}
+
+# `LmStep` with the batch after this one drawn on a task during the step: src draws the same batches in the same order, so
+# the same losses (one batch further at the end of a run)
+fn LmStepAhead<E, S, O>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, o mut O&, rate F64, clip F64
+        a mut LmAhead&) F64, F64 ? {
+    g.Training = true
+    if not a.primed {
+        try src.Random(a.tokens, a.targets, g.Batch)
+        a.primed = true
+    }
+    ids := g.Ints(m.Tokens).Flat()!
+    targets := g.Ints(m.Targets).Flat()!
+    for i in range ids.Len(): ids[i] = a.tokens[i]
+    for i in range targets.Len(): targets[i] = a.targets[i]
+    norm F64 = 0.0
+    join {
+        spawn draw(src, a, g.Batch)
+        g.Forward(g.Batch)
+        g.Backward(m.Loss)
+        norm = optim.ClipNorm(g.ParamGrads(), clip) if clip > 0.0 else 0.0
+        o.SetRate(rate)
+        o.Step()
+        g.SyncParams()
+    }
+    if a.failure != "": error TrainError.Draw
+    return g.Scalar(m.Loss), norm
+}
+
 # the mean loss over the first "batches" batches of src's ordered pass (all of it when it is shorter), dropout off - the
 # same windows every time, so two evaluations compare
 fn LmEvaluate<E, S>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, batches I64) F64 ? {
@@ -153,7 +244,7 @@ fn LmEvaluate<E, S>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, batches
 # and seed for its record, and the record's file (none when ""). From is the step it starts at: a resumed run's
 type Config struct(Steps I64, Rate fn&(step I64) F64, Clip F64 = 1.0, Every I64 = 50, EvalEvery I64 = 250
         EvalBatches I64 = 10, Checkpoint String = "", CheckpointEvery I64 = 0, Name String = "lm", Seed I64 = 1
-        Log String = "", From I64 = 0) {
+        Log String = "", From I64 = 0, Overlap Bool = false) {
     Steps
     Rate
     Clip
@@ -166,6 +257,7 @@ type Config struct(Steps I64, Rate fn&(step I64) F64, Clip F64 = 1.0, Every I64 
     Seed
     Log
     From
+    Overlap
 }
 
 # the settings a run's record starts with: the config's numbers (a schedule is a function, and is not written)
@@ -198,13 +290,14 @@ fn Fit<E, S, V, O>(g mut graph.Graph<E>&, m LanguageModel&, train mut S&, valid 
         on fn&(p Progress&)) Progress ? {
     log := try runlog.Log.Open(cfg.Log if cfg.Log != "" else "/dev/null", cfg.Name, cfg.Seed
         Settings(cfg.Steps, cfg.Clip, cfg.Every, cfg.EvalEvery, cfg.EvalBatches, cfg.From, g.Batch))
+    ahead := LmAhead.For(g, m)
     spent I64 = 0
     window F64 = 0.0
     last := Progress(cfg.From, 0.0, 0.0, 0.0, 0.0, F64.NaN)
     for step in range cfg.From, cfg.Steps {
         t0 := time.Now()
         rate := cfg.Rate(step)
-        loss, norm := try LmStep(g, m, train, o, rate, cfg.Clip)
+        loss, norm := try stepOf(g, m, train, o, rate, cfg, ahead)
         spent += time.Since(t0)
         window += loss
         due := (step + 1) % cfg.Every == 0 or step + 1 == cfg.Steps
@@ -221,6 +314,12 @@ fn Fit<E, S, V, O>(g mut graph.Graph<E>&, m LanguageModel&, train mut S&, valid 
     }
     if cfg.Checkpoint != "": try Save(cfg.Checkpoint, g, o, cfg.Steps)
     return last
+}
+
+# one training step, with the next batch drawn ahead when cfg asks
+fn stepOf<E, S, O>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, o mut O&, rate F64, cfg Config&, a mut LmAhead&) F64, F64 ? {
+    if cfg.Overlap: return try LmStepAhead(g, m, src, o, rate, cfg.Clip, a)
+    return try LmStep(g, m, src, o, rate, cfg.Clip)
 }
 
 # the line of a report
@@ -501,4 +600,44 @@ test LmStep "a training step allocates nothing: the resident memory does not gro
     # a step's own allocations would show as kilobytes a step; the pages that move once (the arena chunk pool, the
     # reading's own buffers) are within four
     assert resident() <= before + 24, "grew by " + $(resident() - before) + " kB"
+}
+
+test EpochAhead "an epoch with the next batch filled on a task gives the same losses and parameters as Epoch, and allocates nothing" {
+    sets := lit(60, 1)
+    g1, c1 := small()
+    g2, c2 := small()
+    o1 := optim.AdamW(g1.Params(), g1.ParamGrads(), rate = 0.02)
+    o2 := optim.AdamW(g2.Params(), g2.ParamGrads(), rate = 0.02)
+    l1 := loader.Loader(sets, 8, 5)
+    l2 := loader.Loader(sets, 8, 5)
+    a := Ahead.For(g2, c2)
+    before I64 = 0
+    for e in range 100 {
+        if e == 70: before = resident()
+        assert Epoch(g1, c1, l1, o1) == EpochAhead(g2, c2, l2, o2, a)
+    }
+    p1 := g1.Params().Flat()!
+    p2 := g2.Params().Flat()!
+    for i in range p1.Len(): assert p1[i] == p2[i]
+    # the tasks' memory settles after ~60 epochs, then flat apart from what a join keeps (olang, repro/spawnleak.olang)
+    assert resident() <= before + 24 + 30 * 8 / 4, "grew by " + $(resident() - before) + " kB"
+}
+
+test LmStepAhead "a step with the next batch drawn on a task gives the same losses as LmStep, and allocates nothing" {
+    g1, m := lm<F32>(5)
+    g2, _ := lm<F32>(5)
+    s1 := cycle(8, 1)
+    s2 := cycle(8, 1)
+    o1 := optim.AdamW(g1.Params(), g1.ParamGrads(), spans = optim.Spans(g1))
+    o2 := optim.AdamW(g2.Params(), g2.ParamGrads(), spans = optim.Spans(g2))
+    a := LmAhead.For(g2, m)
+    before I64 = 0
+    for step in range 130 {
+        if step == 30: before = resident()
+        l1, n1 := LmStep(g1, m, s1, o1, 1e-3, 1.0)
+        l2, n2 := try LmStepAhead(g2, m, s2, o2, 1e-3, 1.0, a)
+        assert l1 == l2 and n1 == n2
+    }
+    # one join a step keeps ~1 kB (repro/spawnleak.olang): 100 steps
+    assert resident() <= before + 24 + 100, "grew by " + $(resident() - before) + " kB"
 }

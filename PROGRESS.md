@@ -458,3 +458,44 @@ given the same lessons (`mnist_learn`'s 13th argument: `3 60000 128 32 SEED 0.00
 
 So most of the earlier gain was the extra lessons. Pruned to 20% is level with the equal-lesson dense run (+0.11 / +0.09 points, inside what two
 seeds can show) with 4.3x fewer multiply-adds a settle: pruning costs no accuracy here, it does not add any measurable.
+
+## Ahead and the settle options under the spectral default (wt-oannahead, 2026-11-17)
+
+**`Ahead`.** The next batch is filled on a task while the step trains: `train.EpochAhead` (a classifier; `train.Ahead.For(g, c)`
+holds the staging buffers) and `Config.Overlap` in `Fit` (`train.LmStepAhead`, `train.LmAhead.For(g, m)`); the task writes the
+stage, the step reads the graph's input, the stage is copied over after the `join`. `Loader.Rows(b)` gives a batch's size.
+`examples/mnist_mlp` and `charlm` take the word `ahead`. Tests (nn/train): the same losses and parameters as `Epoch` / `LmStep`
+bit for bit over 100 epochs / 130 steps, and resident memory flat after the tasks settle (60 epochs). A failing batch source
+is `TrainError.Draw`. Measured on a loaded machine (load 10-15 on 4 cores), alternated runs, one thread:
+`mnist_mlp 3 adamw 1 1`, mean epoch plain / ahead: 0.389 / 0.410, 0.381 / 0.393, 0.354 / 0.439 s (losses identical); `charlm 300 1 1`,
+ms a step plain / ahead: 93.1 / 93.1, 94.2 / 87.3, 92.5 / 91.6 (a step is 90 ms, a batch's fill microseconds). Nothing gained:
+MNIST's fill is 8% of an epoch and the task competes for a core under load (as in design-history.md); a language model's is nothing.
+Worth turning on only with a core to spare and a dear fill. olang: a join keeps ~110 bytes (repro/spawnleak.olang; joinleak.olang's
+case now reads 2 B a join, this one 113 B), and the tests allow for it.
+
+**Settle options under `Norm.Spectral` with the Euclidean stop test.** `mnist_learn 3 60000 128 32 SEED 0.001 0.5 1 1 0.1 200 1 0 WAY
+spectral` (dense, seeds 1 / 2, epoch 3) and `xor_settle 300 8 1 0.05 0.5 WAY spectral` (3 runs), run in turn on a loaded machine
+(load 10-15), so times carry the load; sweeps, refused and accuracy do not:
+
+| MNIST dense | sweeps a lesson | sweeps an answer | us a lesson | us a settle | refused (epochs 1-3) | accuracy |
+|---|---|---|---|---|---|---|
+| plain | 31.8 / 31.9 | 10.6 / 10.9 | 1694 / 1767 | 244 / 295 | 0 / 0 | 96.98 / 96.90% |
+| Gauss-Seidel | 23.2 / 23.5 | 5.7 / 5.8 | 1603 / 1436 | 211 / 270 | 0 / 0 | 96.90 / 96.89% |
+| Anderson 5 | 21.6 / 22.4 | 8.8 / 8.9 | 2094 / 2282 | 394 / 546 | 1 / 2 | 96.83 / 96.82% |
+| both | 16.3 / 16.9 | 4.9 / 5.0 | 1890 / 1859 | 321 / 331 | 1 / 2 | 96.86 / 96.83% |
+
+| XOR (8 hidden) | sweeps a lesson | us a lesson (3 runs) | refused | loss at 300, right |
+|---|---|---|---|---|
+| plain | 8.5 | 14.6-16.1 | 0 | 0.0022, 4/4 |
+| Gauss-Seidel | 6.5 | 16.9-30.7 | 0 | 0.0021, 4/4 |
+| Anderson 5 | 7.0 | 13.6-13.8 | 0 | 0.0022, 4/4 |
+| both | 5.5 | 15.0-17.6 | 0 | 0.0021, 4/4 |
+
+Reading: under the spectral certificate the system sits at kappa 0.9 throughout (gain 6.8-7.6), so plain sweeps already settle in
+32 a lesson (against 42 last round's sup-tolerance run), nothing is refused with plain or Gauss-Seidel, and the options' effects are
+as before: Gauss-Seidel saves 27% of a lesson's sweeps and half an answer's, is as fast or faster on MNIST, and level or slower on
+XOR (its wall time is noise-dominated there); it costs 0.01-0.08 points. Anderson saves 30% of a lesson's sweeps but each costs more
+(a settle 1.6-1.9x slower), and refuses 1-2 lessons in epoch 1 (it no longer stalls: the certified system is within its safeguard).
+Both together: fewest sweeps (16 a lesson, 5 an answer) but slower than plain per lesson. **The default stays plain Jacobi**: no
+option is faster on every case with unchanged accuracy (Gauss-Seidel is the near miss: -0.08 points on seed 1, XOR time level or worse).
+Logs in the worktree's logs/ (not committed).

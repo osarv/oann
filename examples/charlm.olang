@@ -6,7 +6,8 @@
 # (charlm-bf16.ckpt for BF16) and a sample is generated through the key-value cache; the run's record is
 # build/charlm.jsonl. examples/charlm_sample.olang and charlm_int8.olang read the checkpoint.
 # Arguments, all optional: the steps (2000), the seed (1), the threads (1), the dropout (0), the characters to generate
-# (500), and "bf16" last for mixed precision (BF16 values and gradients, F32 masters). Build and run from the repository's
+# (500), then the words "bf16" for mixed precision (BF16 values and gradients, F32 masters) and "ahead" for drawing each
+# step's next batch on a task while the step trains (same losses; faster only with a core to spare), in either order. Build and run from the repository's
 # root: olang build -output build/examples_charlm examples/charlm.olang && build/examples_charlm 2000 1 1
 
 import "std/io"
@@ -31,8 +32,15 @@ fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
 
 fn main() ? {
     all := os.Args()
-    bf16 Bool = all.Len() > 1 and all[all.Len() - 1] == "bf16"
-    args := all[:all.Len() - 1] if bf16 else all
+    bf16 Bool = false
+    ahead Bool = false
+    n := all.Len()
+    for n > 1 and (all[n - 1] == "bf16" or all[n - 1] == "ahead") {
+        if all[n - 1] == "bf16": bf16 = true
+        else: ahead = true
+        n--
+    }
+    args := all[:n]
     try os.MkDirAll("data/shakespeare")
     try text.Fetch("data/shakespeare/input.txt", text.Shakespeare)
     c := try text.Corpus.Load("data/shakespeare/input.txt")
@@ -43,7 +51,7 @@ fn main() ? {
         lm := m.Lm(g)
         try g.Plan(rand.Rand(U64(try number(args, 2, 1))))
         o := optim.AdamW(g.Masters(), g.ParamGrads(), beta2 = 0.99, decay = 0.1, spans = optim.Spans(g))
-        try run(g, cfg, lm, o, c, args, "data/shakespeare/charlm-bf16.ckpt")
+        try run(g, cfg, lm, o, c, args, ahead, "data/shakespeare/charlm-bf16.ckpt")
     } else {
         g := graph.Graph<F32>(sequences, try number(args, 3, 1))
         cfg := gpt.GptConfig.Char(c.Size(), try dropout(args))
@@ -51,7 +59,7 @@ fn main() ? {
         lm := m.Lm(g)
         try g.Plan(rand.Rand(U64(try number(args, 2, 1))))
         o := optim.AdamW(g.Params(), g.ParamGrads(), beta2 = 0.99, decay = 0.1, spans = optim.Spans(g))
-        try run(g, cfg, lm, o, c, args, "data/shakespeare/charlm.ckpt")
+        try run(g, cfg, lm, o, c, args, ahead, "data/shakespeare/charlm.ckpt")
     }
 }
 
@@ -60,7 +68,7 @@ fn dropout(args Array<String&>&) F64 ? json.Error {
     return try json.Json.Parse(args[4]).AsNum()
 }
 
-fn run<T, O>(g mut graph.Graph<T>&, cfg gpt.GptConfig&, m train.LanguageModel&, o mut O&, c text.Corpus&, args Array<String&>&, checkpointPath String&) ? {
+fn run<T, O>(g mut graph.Graph<T>&, cfg gpt.GptConfig&, m train.LanguageModel&, o mut O&, c text.Corpus&, args Array<String&>&, ahead Bool, checkpointPath String&) ? {
     steps := try number(args, 1, 2000)
     seed := try number(args, 2, 1)
     count := try number(args, 5, 500)
@@ -72,7 +80,7 @@ fn run<T, O>(g mut graph.Graph<T>&, cfg gpt.GptConfig&, m train.LanguageModel&, 
         $(F64(g.ArenaBytes()) / 1048576.0).Fixed(1) + " MB\n"))
     try io.Put("step 0: validation loss " + $(try train.LmEvaluate(g, m, valSet, 10)).Fixed(4) + "\n")
     tcfg := train.Config(steps, optim.WarmupCosine(1e-3, 100, steps, 1e-4), Name = "charlm" + $("-bf16" if g.HasMasters() else "")
-        Seed = seed, Checkpoint = checkpointPath, Log = "build/charlm.jsonl")
+        Seed = seed, Checkpoint = checkpointPath, Log = "build/charlm.jsonl", Overlap = ahead)
     last := try train.Fit(g, m, trainSet, valSet, o, tcfg, fn(p) {
         io.Put(("step " + $p.Step + ": train loss " + $p.Loss.Fixed(4) + ", gradient norm " + $p.Norm.Fixed(3) + ", rate " + $p.Rate.Fixed(6) +
             ", " + $(p.Seconds * 1e3 / F64(p.Step)).Fixed(1) + " ms a step" +

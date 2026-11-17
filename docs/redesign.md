@@ -189,11 +189,19 @@ made, an input filled before what reads it is recorded; an eager graph's paramet
 `Save`/`Load` (safetensors), `QuantizeLinear`/`Int8`, `Scalar`, `Profiling`/`Times`, `Reuse = false` (every buffer
 apart, for M9). `DeltaRule` takes its heads from `beta`'s last axis; `Conv2d` and `MaxPool2d` take images `[n, H, W, C]`.
 An operation whose kernel needs rows gets a `Contiguous` copy of a view that is not, recorded for it. The scans run their
-sequential forms (the chunked ones agree to rounding only). Not built: `Ahead` (an input's next batch filled on a task
-during the step). A step allocates nothing (resident memory flat, tested); it was
+sequential forms (the chunked ones agree to rounding only). `Ahead` (an input's next batch filled on a task
+during the step) is built for the loops, not the graph: see "As built (Ahead)" below. A step allocates nothing (resident memory flat, tested); it was
 not pinned with `assert not ....Allocates`, as function facts read too coarsely then (repro/allocfacts.olang,
 repro/methodfacts.olang, both fixed since). A `Custom` operation's tensors, given to an `any`, were built where the graph
 lives at each call. Since the kernel follow-ups (section 4.1, the end) both are pinned: see there.
+
+**As built (Ahead, 2026-11-17).** The next batch is filled on a task while the step trains, into staging buffers beside the
+graph's input storage (double-buffered: the task writes the stage, the step reads the graph's input, and the stage is copied
+over after the `join`), so nothing about the graph's plan changes. `train.EpochAhead(g, c, loader, o, stage)` with
+`train.Ahead.For(g, c)` for a classifier; `Config.Overlap` (`Fit`) and `train.LmStepAhead` with `train.LmAhead.For(g, m)` for a
+language model. Batches come in the same order, so losses and parameters match `Epoch`/`LmStep` bit for bit (tested), and
+the step allocates nothing beyond what a `join` keeps (olang repro/spawnleak.olang). A source whose `Random` can fail reports
+`TrainError.Draw`. `examples/mnist_mlp` and `charlm` take the word `ahead`. Measured in PROGRESS.md: no gain here.
 
 **As built (C4, 2026-11-15).** What `Plan` decides is plain data, `Layout` (per node a `Placed` of its six offsets, `needs`,
 `ParamCount`, `ActivationSize`, and the sizes of the arena, the I32 region and the accumulator): `g.Lay()` computes it with
