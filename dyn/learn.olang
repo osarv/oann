@@ -42,14 +42,34 @@
 #
 # Nothing a lesson, a tick or a gradient needs is allocated after the Learner is made: its room is laid out for the
 # planned system once.
+#
+# On the GPU (a system planned there, dyn/system's Plan with on = device.Backend.Gpu): a lesson settles there, EP's
+# contrast is computed there (dyn/mirror's Contrast: the differences and bias sums by our kernels, the outer products
+# by cuBLAS), and AdamW (this module's, over the system's region on whichever backend it was planned on) steps there,
+# so a lesson moves only the batch's inputs and labels up and its residual words down. The other rules, pruning and
+# implicit gradients stay on the CPU: a learner of a GPU plan refuses them (Unsupported).
 
 import "../tensor"
 import "../kernels/mat"
 import "../kernels/gemm"
+import "../kernels/device"
 import "neuron"
 import "conn"
 import "settle"
 import "system"
+
+Gpu Bool = false
+
+if Gpu {
+    import "../kernels/gpu/kern"
+
+    # an optimizer's state on the GPU, where its system was planned there
+    type adamOn<T> struct(n I64) {
+        K mut kern.AdamW<T>?& = null
+    }
+} else {
+    type adamOn<T> struct(n I64) { }
+}
 
 # what a learner refuses: a phase that did not settle within its budget (the gradient region is left as it was), and
 # what it cannot do
@@ -105,6 +125,8 @@ type Learner<T> struct(s mut system.System<T>&, pruning Bool = false) ? LearnErr
     keep mut Array<Bool>& = Array<Bool>(pruneRoom(s, pruning, true), true)   # which of a connection's weights stay
     mean mut Array<F64>& = Array<F64>(s.E.Units)                     # each unit's mean |activity|
     live mut Array<I64>& = Array<I64>(s.E.Units)                     # each unit's live weights
+    inLinks mut Array<Bool>& = Array<Bool>(s.E.Links.Len())          # a contrast's connections and populations (GPU)
+    inPops mut Array<Bool>& = Array<Bool>(s.E.Pops.Len())
 }
 
 # a pruning rule's room - the parameters (score, pick) and the largest connection's weights (keep) - where the learner
@@ -160,6 +182,7 @@ fn (l mut Learner<T>&) Tick(c system.Clock) ? LearnError {
 
 fn (l mut Learner<T>&) apply(a system.Attached, c system.Clock) ? LearnError {
     what := a.What
+    if l.S.OnGpu() and what != system.Rule.Ep: error LearnError.Unsupported("a rule but EP on a system planned on the GPU")
     match what {
         case system.Rule.Ep(beta, centered) { try l.Lesson(a.Where, beta, centered) }
         case system.Rule.ThreeFactor(signal, decay, rate) { l.threeFactor(a.Where, signal, decay, rate, c) }
@@ -187,6 +210,11 @@ fn (l mut Learner<T>&) custom(r mut any system.Update&) {
 # that of the rate System.NudgedRate certifies from the free state, where it certifies one
 fn (l mut Learner<T>&) Lesson(m system.Mod, beta F64, centered Bool = true) Taught ? LearnError {
     s := l.S
+    if s.OnGpu() {
+        for lk in s.E.Links {
+            if lk.Pruned > 0: error LearnError.Unsupported("a lesson of a pruned system planned on the GPU")
+        }
+    }
     tol := l.Tol if l.Tol > 0.0 else s.LessonTolerance(beta)
     free := s.Settle(settle.Phase.Free, l.budget(tol, 0.0))
     if not free.Converged: error LearnError.NotSettled("free", free.Sweeps, free.Residual)
@@ -214,6 +242,15 @@ fn (l mut Learner<T>&) nudgedBudget(tol F64, beta F64, q F64) settle.Budget {
 # as G = -contrast, for module m's connections (those into its populations) and biases
 fn (l mut Learner<T>&) Contrast(m system.Mod, beta F64, centered Bool = true) {
     k := T(-1.0 / ((2.0 * beta if centered else beta) * F64(l.n)))
+    if Gpu {
+        s := l.S
+        if s.OnGpu() {
+            for i in range s.E.Links.Len(): l.inLinks[i] = s.Within(system.Pop(s.E.Links[i].Post), m)
+            for i in range s.E.Pops.Len(): l.inPops[i] = s.Within(system.Pop(i), m)
+            s.Mirror().Contrast(s.E, l.inLinks, l.inPops, 1, 2 if centered else 0, k)
+            return
+        }
+    }
     l.contrast(l.S.E.Grads, m, 1, 2 if centered else 0, k)
 }
 
@@ -310,6 +347,68 @@ fn (l mut Learner<T>&) sampledPair(lk conn.Link<T>&, out mut Array<T>&, a Array<
 fn features<T>(a Array<T>&, at I64, f mut Array<T>&, n I64, width I64) {
     for r in range n {
         for j in range width: f[j * n + r] = a[at + r * width + j]
+    }
+}
+
+# ---- AdamW ----
+
+# AdamW over a planned system's parameter region, on the backend it was planned on: nn/optim's AdamW step for step
+# (every parameter decayed, decay 0 by default) - on the CPU over the host's region, on the GPU over the device's
+# (kern.AdamW, bit for bit with the CPU's), so a training loop is the same on both. Made by For; Rate may change
+# between steps (a schedule)
+type AdamW<T> struct(s mut system.System<T>&, rate F64 = 0.001, beta1 F64 = 0.9, beta2 F64 = 0.999, eps F64 = 1e-8, decay F64 = 0.0) {
+    S mut system.System<T>& = s
+    Rate F64 = rate
+    Beta1 F64 = beta1
+    Beta2 F64 = beta2
+    Eps F64 = eps
+    Decay F64 = decay
+    Steps I64 = 0
+    M mut Array<T>& = Array<T>(0 if s.OnGpu() else s.E.Params.Len())
+    V mut Array<T>& = Array<T>(0 if s.OnGpu() else s.E.Params.Len())
+    dev mut adamOn<T>& = adamOn<T>(0)
+}
+
+# AdamW for s, its moments zero where s runs: on the GPU laid out there now (DeviceError.Failed where they do not fit)
+fn AdamW<T>.For(s mut system.System<T>&, rate F64 = 0.001, beta1 F64 = 0.9, beta2 F64 = 0.999, eps F64 = 1e-8, decay F64 = 0.0) AdamW<T> ? device.DeviceError {
+    o := AdamW<T>(s, rate, beta1, beta2, eps, decay)
+    if Gpu {
+        if s.OnGpu(): o.dev.K = try s.Mirror().AdamW(rate, beta1, beta2, eps, decay)
+    }
+    return o
+}
+
+# one step from the gradients the last lesson left
+fn (o mut AdamW<T>&) Step() {
+    o.Steps++
+    if Gpu {
+        if o.dev.K != null {
+            k := o.dev.K!
+            k.Lr = o.Rate
+            o.S.Mirror().Adam(o.S.E, k)
+            return
+        }
+    }
+    corr1 F64 = 1.0 - o.Beta1.Pow(F64(o.Steps))
+    corr2 F64 = 1.0 - o.Beta2.Pow(F64(o.Steps))
+    b1, b2 := T(o.Beta1), T(o.Beta2)
+    c1, c2 := T(1.0 - o.Beta1), T(1.0 - o.Beta2)
+    keep := T(1.0 - o.Rate * o.Decay)
+    lr := T(o.Rate / corr1)
+    root := T(1.0 / corr2.Sqrt())
+    eps := T(o.Eps)
+    adamRun(o.S.E.Params, o.S.E.Grads, o.M, o.V, b1, b2, c1, c2, keep, lr, root, eps)
+}
+
+# nn/optim's adamRun over the whole region
+fn adamRun<T>(p mut Array<T>&, gr Array<T>&, m mut Array<T>&, v mut Array<T>&, b1 T, b2 T, c1 T, c2 T, keep T, lr T, root T, eps T) {
+    for k in range p.Len() {
+        gk := gr[k]
+        mk := b1 * m[k] + c1 * gk
+        vk := b2 * v[k] + c2 * gk * gk
+        m[k] = mk
+        v[k] = vk
+        p[k] = keep * p[k] - lr * mk / (vk.Sqrt() * root + eps)
     }
 }
 
@@ -477,6 +576,7 @@ fn masked<T>(lk conn.Link<T>&, params mut Array<T>&) {
 fn (l mut Learner<T>&) Prune(m system.Mod, by conn.Score, target F64, pace F64, regrow F64 = 0, schedule conn.Schedule = conn.Schedule.Cubic) ? LearnError {
     s := l.S
     e := s.E
+    if s.OnGpu(): error LearnError.Unsupported("pruning a system planned on the GPU")
     if l.keep.Len() == 0: error LearnError.Unsupported("pruning by a learner made without room for it (pruning = true)")
     for p in e.Pops: absMeans(p.Activity(0), l.n, p.Size, l.mean, p.Unit)
     full, live, held, n := 0, 0, 0, 0
@@ -785,6 +885,7 @@ fn (l mut Learner<T>&) ImplicitGrad(out system.Pop, dz tensor.Tensor<T>&, how sy
     s := l.S
     try l.shaped(out, dz)
     try l.shaped(inp, dx)
+    if s.OnGpu(): error LearnError.Unsupported("implicit gradients of a system planned on the GPU")
     if s.E.Spiking: error LearnError.Unsupported("implicit gradients of a spiking system")
     for p in s.E.Pops {
         if p.Model == neuron.Neuron.Custom: error LearnError.Unsupported("implicit gradients through a custom model")
@@ -1771,3 +1872,9 @@ test Learner.Lesson "lessons, ticks and implicit gradients allocate nothing: res
     assert grown <= 16, "resident memory grew by " + $grown + " pages"
 }
 
+
+fn adamStepOf(o mut AdamW<F32>&) { o.Step() }
+fn contrastOf(l mut Learner<F32>&, m system.Mod) { l.Contrast(m, 0.5) }
+
+assert not adamStepOf.Allocates, "a step of AdamW allocates (on the GPU too, a build with it)"
+assert not contrastOf.Allocates, "EP's contrast allocates (on the GPU too, a build with it)"

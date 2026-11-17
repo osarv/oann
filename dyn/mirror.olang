@@ -321,14 +321,22 @@ fn Mirror<T>.build(dev mut gdev.Device&, e mut settle.Engine<T>&) Mirror<T> ? gd
 # the address of element at of the state region
 fn (m Mirror<T>&) at(i I64) U64 { return m.State.Addr(i) }
 
-# a device fault, which a settle has no error to give back as: the program ends with CUDA's words
+# a device fault, which a settle has no error to give back as: the program ends with CUDA's words (Device.Sync's,
+# called only where something failed, so the way that runs on asks for no storage)
 fn (m mut Mirror<T>&) fault() {
-    if cu.oann_status_kind(m.dev.Status()) == 0: return
-    try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+    if cu.oann_status_kind(m.dev.Status()) != 0 {
+        try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+        unreachable "the GPU failed"
+    }
 }
 
+# waits for everything enqueued; a fault ends the program as above
 fn (m mut Mirror<T>&) sync() {
-    try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+    st := cu.oann_stream_sync(m.dev.Stream())
+    if st != 0 or cu.oann_status_kind(m.dev.Status()) != 0 {
+        try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+        unreachable "the GPU failed: " + gdev.Text(cu.cudaGetErrorString(st))
+    }
 }
 
 # everything the device reads brought up where the host's copy is newer: the parameters (or the recurrent
@@ -733,6 +741,11 @@ fn (m mut Mirror<T>&) outer(g I64, r I64, c I64, a I64, b I64, n I64, k T) {
     blas.Gemm(m.dev, gm, am, true, bm, false, k, T(1))
 }
 
+# AdamW's state for the parameter region, on the device (learn.AdamW)
+fn (m mut Mirror<T>&) AdamW(rate F64, beta1 F64, beta2 F64, eps F64, decay F64) kern.AdamW<T> ? device.DeviceError {
+    return try kern.AdamW<T>.Make(m.dev, m.G - m.P, rate, beta1, beta2, eps, decay) catch gdev.GpuError err { error device.DeviceError.Failed("AdamW's moments: " + $err) }
+}
+
 # AdamW's step of the parameters from the gradients, on the device (kern.AdamW)
 fn (m mut Mirror<T>&) Adam(e mut settle.Engine<T>&, o mut kern.AdamW<T>&) {
     m.push(e)
@@ -742,3 +755,19 @@ fn (m mut Mirror<T>&) Adam(e mut settle.Engine<T>&, o mut kern.AdamW<T>&) {
 
 # waits for everything enqueued: a device fault ends the program with CUDA's words
 fn (m mut Mirror<T>&) Sync() { m.sync() }
+
+# ---- what must not allocate, decided while compiling (S17a, G42): a settle on the GPU - its inputs staged and up, the
+# sweeps enqueued, the words read back - and EP's contrast and AdamW's step there; the moves of state between phases ----
+
+fn settleOf(m mut Mirror<F32>&, e mut settle.Engine<F32>&, b settle.Budget) F64 { return m.Settle(e, 0, 1, b, true).Residual }
+fn contrastOf(m mut Mirror<F32>&, e mut settle.Engine<F32>&, a Array<Bool>&) { m.Contrast(e, a, a, 1, 2, 0.5) }
+fn adamOf(m mut Mirror<F32>&, e mut settle.Engine<F32>&, o mut kern.AdamW<F32>&) { m.Adam(e, o) }
+fn movesOf(m mut Mirror<F32>&, e mut settle.Engine<F32>&) {
+    m.Reset(e, 0)
+    m.Warm(e, 1, 0)
+}
+
+assert not settleOf.Allocates, "a settle on the GPU allocates"
+assert not contrastOf.Allocates, "EP's contrast on the GPU allocates"
+assert not adamOf.Allocates, "AdamW's step on the GPU allocates"
+assert not movesOf.Allocates, "a cold or warm start on the GPU allocates"

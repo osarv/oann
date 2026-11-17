@@ -1,14 +1,27 @@
 # dyn/gpu_test - dyn on the GPU against dyn on the CPU (docs/redesign.md 1.10, "Testing: the CPU kernels are the
 # oracle"). Built only with -define Gpu=true (make gputest): kernels/gpu asserts it.
 #
+# GP4: a system planned on the GPU (dyn/mirror) against the same system on the CPU - the 784-128-10 settle, free and
+# nudged, and whole lessons: the same sweeps to the tolerance, the fixed point within it; EP's contrast on the same
+# states within cuBLAS's summation order; AdamW bit for bit with nn/optim's; Dense, Symmetric and LowRank connections,
+# retired units, a Euclidean budget, F32 and F64; what has no GPU form refused at Plan by name; nothing allocated over
+# many lessons.
+#
 # GP2: the settle's fused rate step (kernels/gpu/kern's Rate, rate.cu) against neuron.RateStep with the settle's
 # retired units (dyn/settle's rest and retire), on every Rho: u2 and s2 bit for bit for Linear, Relu and HardSigmoid,
 # s2 within FastTanh's stated error (2.0e-7 in F32) for Tanh, LifRate's within its F64 log's rounding; the residual word
 # the CPU's sup norm bit for bit, a NaN where the CPU's is one.
 
 import "neuron"
+import "conn"
+import "settle"
+import "system"
+import "learn"
+import backend "../kernels/device"
 import "../kernels/gpu/device"
 import "../kernels/gpu/kern"
+import "../nn/optim"
+import "std/os"
 import "std/rand"
 
 # neuron's activation as the kernel's (kernels does not import dyn)
@@ -237,4 +250,336 @@ test GpuRho "a NaN anywhere is the residual word's NaN, as the CPU's sup norm" {
             assert got != got, "a NaN at " + $at + (" in the totals" if inTotal else " in u") + ": the residual is " + $got
         }
     }
+}
+
+# ---- GP4: a system planned on the GPU against the CPU ----
+
+# the 784-128-10 settling system of examples/mnist_learn on a backend: 784 linear inputs folded into 128 tanh units,
+# ten tanh readouts (cross-entropy at T = 0.25) read symmetrically, certified in the sup norm at kappa 0.9
+fn mnistLike<T>(batch I64, on backend.Backend, hidden I64 = 128) system.System<T> {
+    s := system.System<T>(batch, 1)
+    pixels := s.Population(s.Root(), "pixels", 784, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    inner := s.Population(s.Root(), "hidden", hidden, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    digits := s.Population(s.Root(), "digits", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(pixels, inner, conn.Wiring.Dense)
+    s.Connect(inner, digits, conn.Wiring.Symmetric)
+    s.Plan(rand.Rand(1), on)!
+    s.Bound = system.Norm.Sup
+    s.Certify(0.9)
+    return s
+}
+
+# a batch like MNIST's into both systems: sparse pixels in [0, 1], a class a row
+fn feed<T>(c mut system.System<T>&, g mut system.System<T>&, r mut rand.Rand&) {
+    px, dg := c.Pop(system.Pop(0)), c.Pop(system.Pop(2))
+    for i in range px.Drive.Len() {
+        v := r.Uniform(0.0, 1.0)
+        px.Drive[i] = T(v if v > 0.7 else 0.0)
+    }
+    for i in range dg.Labels.Len(): dg.Labels[i] = I32(r.Uniform(0.0, 10.0).Floor())
+    for i in range px.Drive.Len(): g.Pop(system.Pop(0)).Drive[i] = px.Drive[i]
+    for i in range dg.Labels.Len(): g.Pop(system.Pop(2)).Labels[i] = dg.Labels[i]
+}
+
+# the largest difference between two systems' committed states (every population, every phase, potentials and
+# activities), the GPU's brought down
+fn stateApart<T>(c mut system.System<T>&, g mut system.System<T>&) F64 {
+    g.Mirror().HostStates(g.E)
+    worst F64 = 0
+    for i in range c.E.Pops.Len() {
+        a, b := c.E.Pops[i], g.E.Pops[i]
+        for j in range a.R0.U.Len() {
+            worst = worst.Max((F64(a.R0.U[j]) - F64(b.R0.U[j])).Abs()).Max((F64(a.R0.S[j]) - F64(b.R0.S[j])).Abs())
+            if a.R0.U[j] != a.R0.U[j] or b.R0.U[j] != b.R0.U[j]: return F64(Inf)
+        }
+    }
+    return worst
+}
+
+# the CPU's parameters and committed state copied into the GPU's system (through its host copy, marked written)
+fn align<T>(c mut system.System<T>&, g mut system.System<T>&) {
+    p := g.Params().Flat()!
+    for i in range p.Len(): p[i] = c.E.Params[i]
+    for i in range c.E.Pops.Len() {
+        st := g.State<neuron.RateCell<T>>(system.Pop(i))
+        for j in range st.U.Len() {
+            st.U[j] = c.E.Pops[i].R0.U[j]
+            st.S[j] = c.E.Pops[i].R0.S[j]
+        }
+    }
+}
+
+# the largest difference between two gradient (or parameter) regions, and the largest magnitude in the CPU's
+fn apartArrays<T>(a Array<T>&, b Array<T>&) F64, F64 {
+    worst, big F64 = 0, 0
+    for i in range a.Len() {
+        worst = worst.Max((F64(a[i]) - F64(b[i])).Abs())
+        big = big.Max(F64(a[i]).Abs())
+        if b[i] != b[i]: return F64(Inf), big
+    }
+    return worst, big
+}
+
+fn skipped(what String&) Bool {
+    if backend.GpuAvailable(): return false
+    device.Skip(what)
+    return true
+}
+
+# rounds of lessons of the 784-128-10 system at batch, CPU and GPU from the same parameters and state each round: the
+# free and nudged settles take the same sweeps and converge alike, the fixed points are within the tolerance of each
+# other, EP's estimate within what that difference allows
+fn lessons<T>(batch I64, rounds I64, like T) {
+    c := mnistLike<T>(batch, backend.Backend.Cpu)
+    g := mnistLike<T>(batch, backend.Backend.Gpu)
+    assert g.OnGpu() and not c.OnGpu()
+    lc := learn.Learner<T>(c)!
+    lg := learn.Learner<T>(g)!
+    r := rand.Rand(5)
+    beta := 0.5
+    tol := c.LessonTolerance(beta)
+    sweeps I64 = 0
+    worstState, worstGrad F64 = 0, 0
+    for round in range rounds {
+        feed(c, g, r)
+        align(c, g)
+        g.Mirror().Check = Array<I64>[4, 1, 16][round % 3]
+        tc := lc.Lesson(c.Root(), beta)!
+        tg := lg.Lesson(g.Root(), beta)!
+        what := "batch " + $batch + ", round " + $round
+        assert tc.Free.Converged and tg.Free.Converged and tc.Nudged.Converged and tg.Nudged.Converged, what
+        assert tc.Free.Sweeps == tg.Free.Sweeps, "free sweeps: CPU " + $tc.Free.Sweeps + ", GPU " + $tg.Free.Sweeps + " (residuals " + $tc.Free.Residual + ", " + $tg.Free.Residual + ", tol " + $tol + "), " + what
+        assert tc.Nudged.Sweeps == tg.Nudged.Sweeps, "nudged sweeps: CPU " + $tc.Nudged.Sweeps + ", GPU " + $tg.Nudged.Sweeps + ", " + what
+        assert (tc.Free.Residual - tg.Free.Residual).Abs() <= 1e-3 * tol and tc.Rate == tg.Rate and tc.Rows == tg.Rows, what
+        apart := stateApart(c, g)
+        # within the tolerance, and far within it: a sweep past the one that converged would move the state by about
+        # the residual, near the tolerance
+        assert apart <= tol / 50.0, "the fixed points " + $apart + " apart, the tolerance " + $tol + ", " + what
+        gg := g.ParamGrads().Flat()!
+        dg, big := apartArrays(c.E.Grads, gg)
+        # dS is off by at most twice the states' difference; over the batch's mean, each of the two terms of a weight's
+        # estimate by that over 2 beta times the largest activity (1), a bias's by it over 2 beta
+        assert dg <= 2.0 * apart / beta + 1e-5 * big, "EP's estimate " + $dg + " apart (largest " + $big + "), states " + $apart + ", " + what
+        sweeps += tc.Sweeps
+        worstState = worstState.Max(apart)
+        worstGrad = worstGrad.Max(dg)
+    }
+    m := g.Mirror()
+    Println("784-128-10 at batch " + $batch + ": " + $rounds + " lessons, " + $sweeps + " sweeps alike on both; fixed points at most " + $worstState + " apart (tolerance " + $tol + "), EP's estimate at most " + $worstGrad + "; the GPU read its words " + $m.Reads + " times and enqueued " + $m.Wasted + " sweeps past a stop (Check 4, 1, 16)")
+}
+
+test lessons "the 784-128-10 settle on the GPU against the CPU: lessons (free and nudged settles, EP's estimate) take the same sweeps, the fixed points within the tolerance, batch 32 and 128, F32" {
+    if skipped("the 784-128-10 lessons"): return
+    lessons(32, 6, F32(0))
+    lessons(128, 4, F32(0))
+}
+
+test lessons "the 784-128-10 settle on the GPU against the CPU in F64" {
+    if skipped("the 784-128-10 lessons in F64"): return
+    lessons(32, 3, F64(0))
+}
+
+# x (3 linear inputs) -> h (6 tanh) <-> y (4 tanh, squared readout); h <-> h through link (lateral, reciprocal); x
+# -> y folded too: a small system of every wiring the GPU runs
+fn wired<T>(lateral conn.Wiring, on backend.Backend, batch I64) system.System<T> {
+    s := system.System<T>(batch, 1)
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 6, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 4, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(x, y, conn.Wiring.LowRank(2))
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Connect(h, h, lateral, reciprocal = true)
+    s.Plan(rand.Rand(9), on)!
+    r := rand.Rand(10)
+    for b in range batch {
+        for j in range 3: s.Pop(x).Drive[b * 3 + j] = T(r.Uniform(-1.0, 1.0))
+        for j in range 4: s.Pop(y).Target[b * 4 + j] = T(r.Uniform(-0.5, 0.5))
+    }
+    for j in range 10: s.E.Params[s.Pop(h).Bias + j] = T(r.Uniform(-0.2, 0.2))
+    s.Certify(0.8)
+    return s
+}
+
+# a small system of every wiring settled free and nudged and taught, CPU against GPU: the same sweeps, the states and
+# EP's estimate alike within the tolerance; with a retired unit, under a Euclidean budget
+fn wiredCase<T>(lateral conn.Wiring, retire Bool, euclid Bool, like T) {
+    c := wired<T>(lateral, backend.Backend.Cpu, 5)
+    g := wired<T>(lateral, backend.Backend.Gpu, 5)
+    if retire {
+        c.Retire(system.Pop(1), 2)
+        g.Retire(system.Pop(1), 2)
+    }
+    if not euclid {
+        c.Bound = system.Norm.Sup
+        g.Bound = system.Norm.Sup
+    }
+    tol := 1e-5
+    b := c.BudgetFor(tol, 0.5)
+    assert b.Euclid == euclid
+    lc := learn.Learner<T>(c)!
+    lg := learn.Learner<T>(g)!
+    lc.Tol, lg.Tol = tol, tol
+    what := $lateral + (" retired" if retire else "") + (" euclid" if euclid else "") + (" F64" if T.Size == 8 else " F32")
+    for _ in range 3 {
+        tc := lc.Lesson(c.Root(), 0.5)!
+        tg := lg.Lesson(g.Root(), 0.5)!
+        assert tc.Free.Sweeps == tg.Free.Sweeps and tc.Nudged.Sweeps == tg.Nudged.Sweeps, "sweeps: CPU " + $tc.Free.Sweeps + "/" + $tc.Nudged.Sweeps + ", GPU " + $tg.Free.Sweeps + "/" + $tg.Nudged.Sweeps + ": " + what
+        apart := stateApart(c, g)
+        assert apart <= tol, "the fixed points " + $apart + " apart: " + what
+        dg, big := apartArrays(c.E.Grads, g.ParamGrads().Flat()!)
+        assert dg <= 4.0 * apart / 0.5 + 1e-5 * big, "EP's estimate " + $dg + " apart: " + what
+        if retire {
+            g.Mirror().HostStates(g.E)
+            for row in range g.E.Rows: assert g.E.Pops[1].R0.U[row * 6 + 2] == T(0) and g.E.Pops[1].R0.S[row * 6 + 2] == T(0)
+        }
+        # the next round from the CPU's parameters moved a little: a new fixed point, both warm from their own
+        for i in range c.E.Params.Len(): c.E.Params[i] = c.E.Params[i] - T(0.01) * c.E.Grads[i]
+        align(c, g)
+    }
+}
+
+test wiredCase "Dense, Symmetric and LowRank connections on the GPU against the CPU: settles, nudges and EP's estimate, retired units, a Euclidean budget, F32 and F64" {
+    if skipped("every wiring"): return
+    for lateral in Array<conn.Wiring>[conn.Wiring.Symmetric, conn.Wiring.LowRank(3), conn.Wiring.Dense] {
+        wiredCase(lateral, false, false, F64(0))
+        wiredCase(lateral, true, false, F64(0))
+        wiredCase(lateral, false, true, F64(0))
+        wiredCase(lateral, true, true, F32(0))
+    }
+}
+
+test align "EP's contrast on the GPU against the CPU's on the same states: within cuBLAS's order of summation" {
+    if skipped("the contrast"): return
+    c := mnistLike<F32>(64, backend.Backend.Cpu)
+    g := mnistLike<F32>(64, backend.Backend.Gpu)
+    lc := learn.Learner<F32>(c)!
+    lg := learn.Learner<F32>(g)!
+    r := rand.Rand(8)
+    feed(c, g, r)
+    lc.Lesson(c.Root(), 0.5)!
+    align(c, g)
+    for centered in Array<Bool>[true, false] {
+        lc.Contrast(c.Root(), 0.5, centered)
+        lg.Contrast(g.Root(), 0.5, centered)
+        dg, big := apartArrays(c.E.Grads, g.ParamGrads().Flat()!)
+        # k sums of 64 products of activities at most 1: each within 64 eps |k| (cuBLAS's order) and a rounding
+        bound := 2.0 * 64.0 * 1.2e-7 / (2.0 * 0.5 * 64.0) + 1e-6 * big
+        assert dg <= bound, "the contrast " + $dg + " apart, bound " + $bound + (" centered" if centered else "")
+        Println("EP's contrast on the GPU" + (" (centered)" if centered else "") + ": at most " + $dg + " from the CPU's, the largest " + $big)
+    }
+}
+
+test adamCase "AdamW on the GPU is nn/optim's AdamW bit for bit, and learn.AdamW on the CPU too: F32 and F64, with decay, the rate changed between steps" {
+    if skipped("AdamW"): return
+    adamCase(F32(0))
+    adamCase(F64(0))
+}
+
+fn adamCase<T>(like T) {
+    c := mnistLike<T>(8, backend.Backend.Cpu, 16)
+    g := mnistLike<T>(8, backend.Backend.Gpu, 16)
+    ref := mnistLike<T>(8, backend.Backend.Cpu, 16)
+    oc := learn.AdamW<T>.For(c, rate = 0.01, decay = 0.1)!
+    og := learn.AdamW<T>.For(g, rate = 0.01, decay = 0.1)!
+    on := optim.AdamW(ref.Params(), ref.ParamGrads(), rate = 0.01, decay = 0.1)
+    r := rand.Rand(4)
+    gp := g.Params().Flat()!
+    for i in range c.E.Params.Len() {
+        assert gp[i] == c.E.Params[i] and ref.E.Params[i] == c.E.Params[i]
+    }
+    for step in range 4 {
+        gg := g.ParamGrads().Flat()!
+        for i in range c.E.Grads.Len() {
+            v := T(r.Uniform(-1.0, 1.0) * (10.0 if i % 7 == 0 else 1e-3))
+            c.E.Grads[i], gg[i], ref.E.Grads[i] = v, v, v
+        }
+        if step == 2 {
+            oc.Rate, og.Rate = 0.003, 0.003
+            on.SetRate(0.003)
+        }
+        oc.Step()
+        og.Step()
+        on.Step()
+        p := g.Params().Flat()!
+        for i in range c.E.Params.Len() {
+            assert c.E.Params[i] == ref.E.Params[i], "learn.AdamW on the CPU, parameter " + $i + ", step " + $step
+            assert p[i] == c.E.Params[i], "AdamW on the GPU, parameter " + $i + " is " + $p[i] + ", the CPU's " + $c.E.Params[i] + ", step " + $step
+        }
+    }
+}
+
+test skipped "Plan refuses on the GPU, by name, what has no GPU form there: spiking and custom populations, sparse and event-driven links, Anderson and Gauss-Seidel sweeps" {
+    if skipped("the refusals"): return
+    for k in range 6 {
+        s := system.System<F32>(4, 1)
+        x := s.Population(s.Root(), "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+        h := s.Population(s.Root(), "h", 8, neuron.Neuron.Spiking() if k == 0 else neuron.Neuron.Rate(neuron.Rho.Tanh))
+        s.Connect(x, h, conn.Wiring.Dense)
+        match k {
+            case 1 { s.Connect(h, h, conn.Wiring.Csr(0.5), reciprocal = true) }
+            case 2 { s.Connect(h, h, conn.Wiring.Tiles(2, 0.5), reciprocal = true) }
+            case 3 { s.Connect(h, h, conn.Wiring.Events(0.01)) }
+            case 4 { s.Use(settle.Sweeping(5)) }
+            case 5 { s.Use(settle.Sweeping(0, true)) }
+            case _ { }
+        }
+        wants := Array<String>["spiking populations", "sparse links (Csr)", "sparse links (Tiles)", "event-driven links (Events)", "Anderson acceleration", "Gauss-Seidel sweeps"]
+        refused := false
+        try s.Plan(rand.Rand(1), backend.Backend.Gpu) catch backend.DeviceError.Unsupported e {
+            assert e.what.Contains(wants[k]) and e.what.Contains("no GPU form of"), e.what
+            refused = true
+        } catch { assert false, "another error" }
+        assert refused, "planned on the GPU: " + wants[k]
+        if k == 0: Println("as expected: " + $wants[k])
+        # the same system plans on the CPU
+        s.Plan(rand.Rand(1), backend.Backend.Cpu)!
+    }
+}
+
+test mnistLike "the default backend: SetDefault(Gpu) makes Plan's default the GPU, an explicit on still decides, Cpu again after" {
+    if skipped("the default backend"): return
+    backend.SetDefault(backend.Backend.Gpu if backend.GpuAvailable() else backend.Backend.Cpu)
+    a := system.System<F32>(2, 1)
+    x := a.Population(a.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    a.Connect(x, a.Population(a.Root(), "h", 3, neuron.Neuron.Rate(neuron.Rho.Tanh)), conn.Wiring.Dense)
+    a.Plan(rand.Rand(1))!
+    b := system.System<F32>(2, 1)
+    y := b.Population(b.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    b.Connect(y, b.Population(b.Root(), "h", 3, neuron.Neuron.Rate(neuron.Rho.Tanh)), conn.Wiring.Dense)
+    b.Plan(rand.Rand(1), backend.Backend.Cpu)!
+    backend.SetDefault(backend.Backend.Cpu)
+    assert a.OnGpu() and not b.OnGpu()
+    assert a.Settle(settle.Phase.Free, settle.Budget()).Converged
+}
+
+# the peak address space in KB (VmPeak): what the program took from the system
+fn peak() I64 {
+    st := try os.ReadFile("/proc/self/status") catch default ""
+    for line in st.Lines() {
+        if line.StartsWith("VmPeak:"): return try line[7:line.Len() - 3].Trim().ParseInt(10) catch default 0
+    }
+    return 0
+}
+
+test peak "a lesson and AdamW's step on the GPU allocate nothing: the address space does not grow over 300 lessons" {
+    if skipped("the lessons' memory"): return
+    s := mnistLike<F32>(32, backend.Backend.Gpu)
+    l := learn.Learner<F32>(s)!
+    o := learn.AdamW<F32>.For(s)!
+    r := rand.Rand(2)
+    dummy := mnistLike<F32>(32, backend.Backend.Cpu)
+    feed(dummy, s, r)
+    for _ in range 20 {
+        l.Lesson(s.Root(), 0.5)!
+        o.Step()
+    }
+    before := peak()
+    for _ in range 300 {
+        l.Lesson(s.Root(), 0.5)!
+        o.Step()
+    }
+    grown := peak() - before
+    assert grown == 0, "the address space grew by " + $grown + " KB"
 }
