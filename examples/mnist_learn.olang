@@ -2,15 +2,19 @@
 # folded into a constant once a settle), a population of tanh units, ten readouts (cross-entropy at T = 0.25), the
 # hidden and readout units connected symmetrically - taught by equilibrium propagation (learn.Learner.Lesson: a free
 # settle, the nudged phases at +beta and -beta side by side, their contrast) and Adam, then measured on the test set,
-# where an answer is a free settle. The optimizer is nn/optim's AdamW over the system's flat parameter region. Arguments, all
-# optional: the epochs (1), the training samples used (60000), the hidden units (128), the batch (32), the seed (1),
-# Adam's rate (0.001), beta (0.5), the threads a sweep may be split over (1), the fraction of the weights kept (1, no
+# where an answer is a free settle. The optimizer is learn.AdamW over the system's flat parameter region (nn/optim's
+# AdamW step for step, on whichever backend the system runs). Arguments, all optional: the epochs (1), the training
+# samples used (60000), the hidden units (128), the batch (32), the seed (1), Adam's rate (0.001), beta (0.5), where the
+# settle runs: the CPU's threads a sweep may be split over (1), or gpu - the GPU, set as the default device
+# (kernels/device; a build with -define Gpu=true, as the makefile's), its residual read every 4 sweeps, gpuN every N
+# (the mirror's Check) - the fraction of the weights kept (1, no
 # pruning: below 1 a Prune rule (magnitude, cubic schedule) thins the trained system tick by tick), the pace of a tick
 # (0.1), the lessons between ticks (200), the epochs relearned after (1) and, for a dense run (keep 1), the lessons taught after
 # the epochs (0: a control with as many lessons as a pruned run took), and the sweeps: plain (Jacobi, the default), anderson
 # (Anderson's acceleration, depth 5; andersonN for depth N), seidel (Gauss-Seidel) or both (Gauss-Seidel, Anderson depth 5),
 # and the certificate: none (certified in the sup norm when made, then free; the default), sup or spectral (certified in
-# that norm and restrained into it after every step, System.Restrain).
+# that norm and restrained into it after every step, System.Restrain). On the GPU the sweeps are plain and nothing is
+# pruned (dyn/mirror refuses both).
 
 import "std/io"
 import "std/json"
@@ -22,10 +26,12 @@ import "../dyn/neuron"
 import "../dyn/conn"
 import "../dyn/settle"
 import "../dyn/learn"
-import "../nn/optim"
+import "../kernels/device"
 import "../data/idx"
 import "../data/loader"
 import "../data/mnist"
+
+Gpu Bool = false
 
 fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
     if i >= args.Len(): return fallback
@@ -52,12 +58,26 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     seed := U64(try number(args, 5, 1))
     rate := try number(args, 6, 0.001)
     beta := try number(args, 7, 0.5)
-    threads := I64(try number(args, 8, 1))
+    on := args[8] if 8 < args.Len() else "1"
+    gpu := on.StartsWith("gpu")
+    threads := 1 if gpu else I64(try number(args, 8, 1))
+    check := (4 if on.Len() == 3 else I64(on[3:].ParseInt()!)) if gpu else 0
     keep := try number(args, 9, 1.0)
     pace := try number(args, 10, 0.1)
     between := I64(try number(args, 11, 200))
     relearn := I64(try number(args, 12, 1))
     extra := I64(try number(args, 13, 0))
+    if gpu {
+        if not device.GpuAvailable() {
+            try io.Put("no GPU: this build has none (-define Gpu=true) or CUDA finds no device\n")
+            return
+        }
+        if keep < 1.0 {
+            try io.Put("no pruning on the GPU (a lesson of a pruned system is refused there): keep 1 with gpu\n")
+            return
+        }
+        device.SetDefault(device.Backend.Gpu)
+    }
     data := try mnist.Mnist.Load("data/mnist", mnist.Source)
     part := loader.Labeled(data.Train.Features[:samples * 784], data.Train.Labels[:samples], 784, 10)
 
@@ -69,16 +89,19 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     s.Connect(inner, digits, conn.Wiring.Symmetric)
     if keep < 1.0: s.Attach(s.Root(), system.Rule.Prune(conn.Score.Magnitude, keep, pace, 0.0, conn.Schedule.Cubic), system.Clock.Episode)
     s.Plan(rand.Rand(seed))!
+    if Gpu {
+        if s.OnGpu(): s.Mirror().Check = check
+    }
     s.Use(sweepsOf(args, 14))
     cert := args[15] if 15 < args.Len() else "none"
     if cert != "spectral": s.Bound = system.Norm.Sup
     s.Certify(0.9)
     restrain := cert == "sup" or cert == "spectral"
     l := learn.Learner<F32>(s)!
-    opt := optim.AdamW(s.Params(), s.ParamGrads(), rate = rate)
+    opt := learn.AdamW<F32>.For(s, rate = rate)!
     tol := s.LessonTolerance(beta)
     try io.Put(("784-" + $hidden + "-10 settling system (dyn), " + $s.Params().Count() + " parameters, " + $samples + " training samples, batches of " +
-        $batch + ", beta " + $beta + ", lesson tolerance " + $tol + ", budget " + $s.BudgetFor(tol, beta).Sweeps + " sweeps, " + $threads + " threads, " +
+        $batch + ", beta " + $beta + ", lesson tolerance " + $tol + ", budget " + $s.BudgetFor(tol, beta).Sweeps + " sweeps, " + ("GPU, Check " + $check if gpu else $threads + " threads") + ", " +
         $s.Scheme + ", gain " + $s.Gain().Fixed(3) + ", spectral bound " + $s.Contraction().Fixed(3) + "\n"))
 
     trainSet := loader.Loader(part, batch, seed)
@@ -122,7 +145,7 @@ fn thinned(s system.System<F32>&, keep F64) Bool {
 
 # one pass of lessons (the first "lessons" batches, or the whole epoch at 0), each with an optimizer step and the masks
 # held, then the test set: prints the accuracy, the sweeps an answer and the multiply-adds a settle
-fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.AdamW<F32, F32>&, trainSet mut loader.Loader<D>&, testSet mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, beta F64, labels mut Array<I32>&, name String&, lessons I64, restrain Bool) ? io.Error {
+fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut learn.AdamW<F32>&, trainSet mut loader.Loader<D>&, testSet mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, beta F64, labels mut Array<I32>&, name String&, lessons I64, restrain Bool) ? io.Error {
     t0 := time.Now()
     trainSet.Epoch()
     sweeps, taught, refused, certified, rows := 0, 0, 0, 0, 0
@@ -147,7 +170,7 @@ fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut optim.
     }
     spent := F64(time.Since(t0)) * 1e-9
     try io.Put($name + ": train loss " + $(loss / F64(taught)).Fixed(4) + ", " + $(F64(sweeps) / F64(taught)).Fixed(1) +
-        " sweeps a lesson, " + $refused + " refused, nudged pairs certified " + $certified + " (rows " + $(100.0 * F64(rows) / F64((taught * s.E.Batch).Max(1))).Fixed(1) + "%), " + $spent.Fixed(1) + " s, " + $(spent * 1e6 / F64(taught.Max(1))).Fixed(0) + " us a lesson; ")
+        " sweeps a lesson, " + $refused + " refused, nudged pairs certified " + $certified + " (rows " + $(100.0 * F64(rows) / F64((taught * s.E.Batch).Max(1))).Fixed(1) + "%), " + $spent.Fixed(2) + " s, " + $(spent * 1e6 / F64(taught.Max(1))).Fixed(0) + " us a lesson; ")
     try show(s, testSet, pixels, digits, tol, labels, "")
 }
 

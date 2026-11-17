@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpugemm gpurate gpult gpusettle mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -69,6 +69,14 @@ gpult:
 gpusettle:
 	$(OLANG) build -define Gpu=true -output build/bench_gpusettle bench/gpusettle.olang
 	$(GPUENV) ./build/bench_gpusettle $(ARGS)
+
+# G-M2: examples/mnist_learn on MNIST, the settle on the CPU (1 and 4 threads) against the GPU (Check 1, 4 and 16) at
+# batch 32, 128, 512 and hidden 128, 1024 - epoch time, sweeps a lesson, test accuracy; interleaved, medians
+# (bench/gpulearn.olang; MNIST from make data) - ARGS: rounds, epochs, then hidden sizes, batches and backends as lists
+gpulearn:
+	$(OLANG) build -define Gpu=true -output build/examples_mnist_learn examples/mnist_learn.olang
+	$(OLANG) build -define Gpu=true -output build/bench_gpulearn bench/gpulearn.olang
+	$(GPUENV) ./build/bench_gpulearn $(ARGS)
 
 # M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
 mlpad:
