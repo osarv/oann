@@ -1,0 +1,487 @@
+# kern - our own kernels on the GPU (docs/redesign.md 1.10, "Our own kernels, and how they are compiled"; GP2): CUDA C
+# text in kernels/gpu/src (embedded here while compiling), specialized and compiled by NVRTC to PTX when a plan is made,
+# the PTX cached on disk by its text's hash, loaded and launched through the driver API. Then the kernels themselves:
+# Axpy, the settle's fused rate step (Rate), and FastTanh over an array.
+#
+# Compiling. Kernel.Compile(dev, text, name) is setup: it gives a GpuError back at once - NVRTC's log as
+# GpuError.Nvrtc where the text does not compile, the driver's status as GpuError.Launch where the PTX does not load.
+# The PTX is kept under $OLANG_CACHE/oann-ptx (~/.cache/olang/oann-ptx by default) as SHA-256(NVRTC's version, the
+# options, the text).ptx: a second compile of the same text for the same device reads it instead of running NVRTC
+# (Kernel.Cached says which happened). The cache is best effort: one that cannot be written leaves the compile working.
+#
+# The options. compute_MAJORMINOR of the device (the driver makes it the device's code when it loads the PTX), and
+# --fmad=false: olang does not contract a * b + c into a fused multiply-add, so neither do our kernels, and an element
+# kernel written as the CPU's is the CPU's bit for bit (division and square roots are IEEE's, NVRTC's default).
+#
+# Launching. Launch(d, k, grid, block, args ...U64) enqueues k on the device's compute stream and returns at once; a
+# failure is recorded and the next Sync gives it back (GpuError.Launch, the driver's text), as for a product. Every
+# argument is one 64-bit slot: a device address (Buf.Addr) as it is, a number as its bits (Arg) - the driver reads a
+# parameter's own width from the start of its slot.
+#
+# Built only with -define Gpu=true (device.olang asserts it).
+
+import cu "cuda.c"
+import "device"
+
+extern link "nvrtc" { }
+import "../elem"
+import "std/os"
+import "std/sha256"
+import "std/time"
+
+# the text of our kernels (src/*.cu), read while compiling
+ElemText := String(embed "src/elem.cu")
+RateText := String(embed "src/rate.cu")
+
+# threads a block for the element kernels, and the most blocks a launch takes (each thread then loops over the rest)
+Block I64 = 256
+MaxBlocks I64 = 4096
+
+# the most elements a rate step takes: its indices are 32-bit
+MaxElems I64 = (1 << 31) - 1
+
+# ---- compiling and the cache ----
+
+# where the PTX is cached: $OLANG_CACHE/oann-ptx, OLANG_CACHE being ~/.cache/olang where it is not set (as olang's)
+fn PtxDir() String {
+    c := try os.Env("OLANG_CACHE") catch default ""
+    if c != "": return $c + "/oann-ptx"
+    home := try os.Env("HOME") catch default "."
+    return $home + "/.cache/olang/oann-ptx"
+}
+
+# NVRTC's options for the device, one a line
+fn options(d device.Device&) String {
+    return "--gpu-architecture=compute_" + $d.Major + $d.Minor + "\n--fmad=false"
+}
+
+# a module made from CUDA C text and the one kernel of it named name, loaded on a device. Path is the PTX's place in the
+# cache, Cached whether it was read from there (else NVRTC compiled it now). It holds its device, so it cannot outlive
+# it; the module is unloaded where its holder lets go
+type Kernel unique struct(dev device.Device&, name String&) {
+    dev
+    Name String = $name
+    Path String = ""
+    Cached Bool = false
+    drv U64 = 0        # the driver's entry points (cuda.c's oann_driver)
+    module U64 = 0
+    fun U64 = 0
+} destruct {
+    if module != 0: cu.oann_module_unload(drv, module)
+    if drv != 0: cu.oann_driver_free(drv)
+}
+
+# the driver's status, where it is not success, as an error naming the call and saying what the driver says
+fn checkDriver(drv U64, code I32, what String&) ? device.GpuError {
+    if code != 0: error device.GpuError.Launch(code, what + ": " + device.Text(cu.oann_driver_error(drv, code)))
+}
+
+# text compiled for dev and its kernel name loaded, the PTX from the cache where it is there: GpuError.Nvrtc with
+# NVRTC's log where the text does not compile, GpuError.Launch where the PTX does not load or has no such kernel
+fn Kernel.Compile(dev mut device.Device&, text String&, name String&) Kernel ? device.GpuError {
+    k := Kernel(dev, name)
+    out := Array<U64>(1)
+    try device.CheckCuda(cu.oann_driver_new(out), "cudaGetDriverEntryPoint")
+    k.drv = out[0]
+    opts := options(dev)
+    key := sha256.Hex(("nvrtc " + $cu.oann_nvrtc_version() + "\n" + opts + "\n" + text).Bytes())
+    k.Path = PtxDir() + "/" + key + ".ptx"
+    if os.Exists(k.Path) {
+        ptx := try os.ReadFile(k.Path) catch default ""
+        if ptx.Len() > 0 and cu.oann_module_load(k.drv, ptx.ToC(), out) == 0 {
+            k.module = out[0]
+            k.Cached = true
+        }
+    }
+    if k.module == 0 {
+        ptx := try nvrtc(text, opts)
+        store(k.Path, ptx)
+        st := cu.oann_module_load(k.drv, ptx, out)
+        try checkDriver(k.drv, st, "cuModuleLoadData")
+        k.module = out[0]
+    }
+    st := cu.oann_module_function(k.drv, k.module, name.ToC(), out)
+    try checkDriver(k.drv, st, "cuModuleGetFunction(" + name + ")")
+    k.fun = out[0]
+    return k
+}
+
+# the PTX NVRTC makes of text (NUL-ended): GpuError.Nvrtc with its log where it does not compile
+fn nvrtc(text String&, opts String&) Array<U8> ? device.GpuError {
+    out := Array<U64>(1)
+    st := cu.oann_nvrtc_compile(text.ToC(), opts.ToC(), out)
+    prog := out[0]
+    if st != 0 {
+        log := Array<U8>(I64(cu.oann_nvrtc_log_size(prog)).Max(1))
+        if prog != 0: cu.oann_nvrtc_log(prog, log)
+        cu.oann_nvrtc_destroy(prog)
+        error device.GpuError.Nvrtc(device.Text(cu.nvrtcGetErrorString(st)) + "\n" + cstring(log))
+    }
+    ptx := Array<U8>(I64(cu.oann_nvrtc_ptx_size(prog)).Max(1))
+    st = cu.oann_nvrtc_ptx(prog, ptx)
+    cu.oann_nvrtc_destroy(prog)
+    if st != 0: error device.GpuError.Nvrtc(device.Text(cu.nvrtcGetErrorString(st)) + " (nvrtcGetPTX)")
+    return ptx
+}
+
+# the text up to a NUL C wrote into a buffer
+fn cstring(b Array<U8>&) String {
+    for i in range b.Len() {
+        if b[i] == 0: return String(b[:i])
+    }
+    return String(b)
+}
+
+# ptx (NUL-ended) written to path - a file beside it first, then renamed, so a reader never sees half of one; nothing
+# where the directory cannot be made or written
+fn store(path String&, ptx Array<U8>&) {
+    n := ptx.Len()
+    if n > 0 and ptx[n - 1] == 0: n = n - 1
+    try os.MkDirAll(PtxDir()) catch os.Error { return }
+    tmp := path + "." + $time.Now() + ".tmp"
+    try os.WriteFile(tmp, ptx[:n]) catch os.Error { return }
+    try os.Rename(tmp, path) catch os.Error { try os.Remove(tmp) catch os.Error { } }
+}
+
+# ---- launching ----
+
+# a number as its kernel argument's bits: a float's pattern, an integer's two's complement (a 32-bit parameter reads the
+# slot's low half)
+fn Arg<T>(x T) U64 {
+    return match T {
+        case F32: U64(x.Bits())
+        case F64: x.Bits()
+        case I32: U64(U32(x))
+        case U32: U64(x)
+        case I64: U64(x)
+        case U64: x
+        case _: 0
+    }
+}
+
+# k enqueued on d's compute stream over grid blocks of block threads, with these arguments (at most 32, each a device
+# address or Arg's bits); returns at once, a failure is the next Sync's GpuError.Launch
+fn Launch(d mut device.Device&, k Kernel&, grid I64, block I64, args ...U64) {
+    assert args.Len() <= 32, "a kernel takes at most 32 arguments here"
+    cu.oann_launch(d.Status(), k.drv, k.fun, U32(grid), 1, 1, U32(block), 1, 1, 0, d.Stream(), args, I32(args.Len()))
+}
+
+# the blocks of Block threads for n elements, at most MaxBlocks (at least 1)
+fn Blocks(n I64) I64 { return ((n + Block - 1) / Block).Clamp(1, MaxBlocks) }
+
+# bytes of device memory from the address at set to zero, in order on the compute stream
+fn Zero(d mut device.Device&, at U64, bytes I64) { cu.oann_memset(d.Status(), at, 0, U64(bytes), d.Stream()) }
+
+# bytes copied from one device address to another, in order on the compute stream
+fn Copy(d mut device.Device&, to U64, from U64, bytes I64) { cu.oann_copy(d.Status(), to, from, U64(bytes), d.Stream()) }
+
+# ---- the text a kernel is compiled from ----
+
+# the #defines elem.cu reads: kernels/elem's FastExp constants (its literals typed as fastExp32 and fastExp64 type
+# them) and Taylor coefficients (elem.ExpTaylor, rounded to F32 for the F32 one), each written as its bits
+fn Prelude() String {
+    t := "// kernels/gpu/kern.olang: kernels/elem's FastExp, as bits\n"
+    e32 := Array<F32>[-87.33654, 88.72283, 1.44269504, 12582912.0, 0.693145751953125, 1.428606765330187e-06]
+    e64 := Array<F64>[-708.3964185322641, 709.782712893384, 1.4426950408889634, 6755399441055744.0, 0.6931471803691238, 1.9082149292705877e-10]
+    names := Array<String>["LO", "HI", "LOG2E", "SHIFT", "LN2HI", "LN2LO"]
+    for i in range 6 {
+        t = t + "#define OANN_E32_" + names[i] + " " + f32(e32[i]) + "\n"
+        t = t + "#define OANN_E64_" + names[i] + " " + f64(e64[i]) + "\n"
+    }
+    for i in range 7: t = t + "#define OANN_E32_C" + $i + " " + f32(F32(elem.ExpTaylor[i])) + "\n"
+    for i in range 13: t = t + "#define OANN_E64_C" + $i + " " + f64(elem.ExpTaylor[i]) + "\n"
+    return t
+}
+
+# a float as C text of its exact bits
+fn f32(x F32) String { return "__int_as_float(0x" + x.Bits().Format(16) + ")" }
+fn f64(x F64) String { return "__longlong_as_double(0x" + x.Bits().Format(16) + "ll)" }
+
+# C's name for T, and the unsigned integer of its width
+fn cReal<T>(z T) String {
+    return match T {
+        case F64: "double"
+        case _: "float"
+    }
+}
+
+fn cWord<T>(z T) String {
+    return match T {
+        case F64: "unsigned long long"
+        case _: "unsigned"
+    }
+}
+
+# elem.cu's text with its prelude: Axpy and FastTanh
+fn ElemSource() String { return Prelude() + ElemText }
+
+# ---- Axpy ----
+
+# the Axpy kernel for T (F32 or F64), compiled now
+fn Kernel.Axpy<T>(d mut device.Device&, like T) Kernel ? device.GpuError {
+    return try Kernel.Compile(d, ElemSource(), "oann_axpy_f64" if cReal(like) == "double" else "oann_axpy_f32")
+}
+
+# y[yf + i] += alpha x[xf + i] for i < n: kernels/elem's Axpy on the device, by k (Kernel.Axpy of T). Enqueued
+fn Axpy<T>(d mut device.Device&, k Kernel&, y mut device.Buf<T>&, yf I64, alpha T, x device.Buf<T>&, xf I64, n I64) {
+    if n <= 0: return
+    Launch(d, k, Blocks(n), Block, y.Addr(yf), Arg(alpha), x.Addr(xf), Arg(n))
+}
+
+# ---- the settle's rate step ----
+
+# the activations a rate step applies: dyn/neuron's Rho (which kernels, a layer above dyn, does not import), case for
+# case - FastTanh for Tanh, LifRate's rate computed in F64
+type Rho enum {
+    Linear
+    Tanh
+    HardSigmoid
+    Relu
+    LifRate(leak F64, threshold F64)
+}
+
+# rho as C's expression of a real x
+fn rhoText(rho Rho) String {
+    return match rho {
+        case Rho.Linear: "(x)"
+        case Rho.Tanh: "oann_tanh(x)"
+        case Rho.HardSigmoid: "oann_clip(x)"
+        case Rho.Relu: "oann_relu(x)"
+        # tau as dyn/neuron's LifRateOf computes it, by the host's log, written as its bits
+        case Rho.LifRate(leak, threshold): "(real)oann_lif_rate((double)(x), " + f64(threshold) + ", " + f64(-1.0 / (1.0 - leak).Log()) + ")"
+    }
+}
+
+# the rate step's text for T and rho: the prelude, elem.cu, the specialization, rate.cu
+fn RateSource<T>(rho Rho, like T) String {
+    spec := "typedef " + cReal(like) + " real;\ntypedef " + cWord(like) + " word;\n#define OANN_RHO(x) " + rhoText(rho) + "\n"
+    return ElemSource() + "\n// kernels/gpu/kern.olang: the rate step's specialization\n" + spec + RateText
+}
+
+# the settle's rate step for state of type T (F32 or F64) and one activation, compiled when made (at a plan)
+type Rate<T> unique struct(k Kernel, rho Rho) {
+    k
+    Act Rho = rho
+}
+
+fn Rate<T>.Make(d mut device.Device&, rho Rho) Rate<T> ? device.GpuError {
+    z T
+    return Rate<T>(try Kernel.Compile(d, RateSource(rho, z), "oann_rate_step"), rho)
+}
+
+# one sweep's step of elements lo .. hi of a population's state, dyn/neuron's RateStep fused with the settle's retired
+# units: r = total - u, the residual's sup norm as bits into the word at the address out (a U32 for F32, a U64 for
+# F64: the maximum with what it holds - zero it first, Zero, once a sweep), u2 = u + dt r, s2 = rho(u2); dt is
+# dts[(i - lo) / per] (per the elements of a phase's rows: one dt per phase); where alive is given (size bytes, 0 for
+# a retired unit), unit (i - lo) % size of a row is retired: its r, u2 and s2 are 0 - so lo is a row's start. Enqueued;
+# nothing is checked but the count
+fn (r Rate<T>&) Step(d mut device.Device&, u device.Buf<T>&, total device.Buf<T>&, u2 mut device.Buf<T>&, s2 mut device.Buf<T>&, lo I64, hi I64, dts device.Buf<T>&, per I64, alive device.Buf<U8>?&, size I64, out U64) {
+    n := hi - lo
+    if n <= 0: return
+    assert n <= MaxElems, "a rate step of more than 2^31 - 1 elements"
+    mask U64 = 0 if alive == null else alive.Addr(0)
+    Launch(d, r.k, Blocks(n), Block, u.Addr(lo), total.Addr(lo), u2.Addr(lo), s2.Addr(lo), dts.Addr(0), Arg(U32(per)), mask, Arg(U32(size)), Arg(U32(n)), out)
+}
+
+# the residual a word holds, as the CPU's RateStep gives it: the bits read as T
+fn Residual<T>(bits U64, like T) T {
+    return match T {
+        case F64: F64.FromBits(bits)
+        case _: T(F32.FromBits(U32(bits)))
+    }
+}
+
+# ---- timing on the device (the benches) ----
+
+# two events that record time on the compute stream: Start, Stop, then Ms waits for Stop and gives the time between
+type Timer unique struct(dev device.Device&) {
+    dev
+    a U64 = 0
+    b U64 = 0
+} destruct {
+    if a != 0: cu.oann_event_destroy(a)
+    if b != 0: cu.oann_event_destroy(b)
+}
+
+fn Timer.Make(d mut device.Device&) Timer ? device.GpuError {
+    t := Timer(d)
+    out := Array<U64>(1)
+    try device.CheckCuda(cu.oann_timer_create(out), "cudaEventCreate")
+    t.a = out[0]
+    try device.CheckCuda(cu.oann_timer_create(out), "cudaEventCreate")
+    t.b = out[0]
+    return t
+}
+
+fn (t Timer&) Start(d mut device.Device&) { cu.oann_event_record(d.Status(), t.a, d.Stream()) }
+fn (t Timer&) Stop(d mut device.Device&) { cu.oann_event_record(d.Status(), t.b, d.Stream()) }
+
+# the milliseconds from Start to Stop, after waiting for Stop
+fn (t Timer&) Ms() F64 ? device.GpuError {
+    ms := Array<F32>(1)
+    try device.CheckCuda(cu.oann_event_ms(t.a, t.b, ms), "cudaEventElapsedTime")
+    return F64(ms[0])
+}
+
+# ---- tests ----
+
+import "std/rand"
+
+test Kernel.Compile "NVRTC compiles at plan time; the PTX is cached by the text's hash and the next compile reads it" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Kernel.Compile")
+        return
+    }
+    # a text no run has compiled before: elem.cu's with a mark of now
+    text := ElemSource() + "\n// cache test " + $time.Wall() + " " + $time.Now() + "\n"
+    t0 := time.Now()
+    k1 := try Kernel.Compile(d, text, "oann_axpy_f32")
+    first := time.Since(t0)
+    assert not k1.Cached and os.Exists(k1.Path), "compiled, and the PTX kept at " + k1.Path
+    t1 := time.Now()
+    k2 := try Kernel.Compile(d, text, "oann_axpy_f32")
+    second := time.Since(t1)
+    assert k2.Cached and k2.Path == k1.Path
+    Println("compile by NVRTC " + $(F64(first) * 1e-6).Fixed(1) + " ms, from the cache " + $(F64(second) * 1e-6).Fixed(1) + " ms (" + k1.Path + ")")
+    # both run, alike
+    n I64 = 1000
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(i)
+    bx := try device.Buf<F32>.Make(d, n)
+    by := try device.Buf<F32>.Make(d, n)
+    bx.UploadAll(x)
+    Zero(d, by.Addr(0), n * 4)
+    Axpy(d, k1, by, 0, F32(1), bx, 0, n)
+    Axpy(d, k2, by, 0, F32(2), bx, 0, n)
+    y := Array<F32>(n)
+    by.DownloadAll(y)
+    try d.Sync()
+    for i in range n: assert y[i] == F32(3 * i)
+    # a different text is a different file
+    k3 := try Kernel.Compile(d, text + "// another\n", "oann_axpy_f32")
+    assert not k3.Cached and k3.Path != k1.Path
+    try os.Remove(k1.Path) catch os.Error { }
+    try os.Remove(k3.Path) catch os.Error { }
+}
+
+# y on the device against kernels/elem's Axpy on the host, bit for bit, at offsets
+fn axpyCase<T>(d mut device.Device&, k Kernel&, n I64, yf I64, xf I64, alpha T, r mut rand.Rand&) ? device.GpuError {
+    len := n + 40
+    x := Array<T>(len)
+    y := Array<T>(len)
+    for i in range len {
+        x[i] = T(r.Uniform(-2.0, 2.0))
+        y[i] = T(r.Uniform(-2.0, 2.0))
+    }
+    bx := try device.Buf<T>.Make(d, len)
+    by := try device.Buf<T>.Make(d, len)
+    bx.UploadAll(x)
+    by.UploadAll(y)
+    Axpy(d, k, by, yf, alpha, bx, xf, n)
+    got := Array<T>(len)
+    by.DownloadAll(got)
+    try d.Sync()
+    elem.Axpy(y, yf, alpha, x, xf, n)
+    for i in range len: assert got[i] == y[i], "Axpy of " + $n + " at y " + $yf + ", x " + $xf + ": element " + $i + " is " + $got[i] + ", the CPU's " + $y[i]
+}
+
+test Axpy "argument packing: addresses at offsets, F32 and F64 alphas by their bits, a 64-bit count - bit for bit with kernels/elem's" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Axpy")
+        return
+    }
+    r := rand.Rand(3)
+    k32 := try Kernel.Axpy(d, F32(0))
+    k64 := try Kernel.Axpy(d, F64(0))
+    sizes := Array<I64>[1, 7, 255, 256, 257, 1000, 4096 * 256 + 3]
+    for n in sizes {
+        try axpyCase(d, k32, n, 3, 17, F32(-0.3711), r)
+        try axpyCase(d, k64, n, 11, 0, F64(1.0e-3) / 3.0, r)
+    }
+    # an alpha of 0 keeps y
+    try axpyCase(d, k32, 100, 0, 0, F32(0), r)
+}
+
+test Kernel.Compile "a text that does not compile is GpuError.Nvrtc with NVRTC's log" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("NVRTC's error")
+        return
+    }
+    failed := false
+    try Kernel.Compile(d, "extern \"C\" __global__ void broken(float *y) { y[0] = undeclared_thing; }\n", "broken") catch device.GpuError.Nvrtc e {
+        Println("as expected:\n" + e.log)
+        assert e.log.StartsWith("NVRTC_ERROR_COMPILATION") and e.log.Contains("undeclared_thing") and e.log.Contains("error"), e.log
+        failed = true
+    }
+    assert failed, "a broken text compiled"
+}
+
+test Kernel.Compile "a kernel name the module lacks is the driver's error, named" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("a missing kernel")
+        return
+    }
+    failed := false
+    try Kernel.Compile(d, ElemSource(), "oann_nothing") catch device.GpuError.Launch e {
+        Println("as expected: " + e.what)
+        assert e.what.StartsWith("cuModuleGetFunction(oann_nothing): ") and e.what.Len() > 36, e.what
+        failed = true
+    }
+    assert failed
+}
+
+test Launch "a launch the driver refuses is the next Sync's GpuError.Launch with its text; the launch after it runs" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("Launch's error")
+        return
+    }
+    k := try Kernel.Axpy(d, F32(0))
+    n I64 = 64
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(i)
+    bx := try device.Buf<F32>.Make(d, n)
+    by := try device.Buf<F32>.Make(d, n)
+    bx.UploadAll(x)
+    Zero(d, by.Addr(0), n * 4)
+    # 2048 threads a block: more than any device takes
+    Launch(d, k, 1, 2048, by.Addr(0), Arg(F32(1)), bx.Addr(0), Arg(n))
+    failed := false
+    try d.Sync() catch device.GpuError.Launch e {
+        Println("as expected: " + e.what)
+        assert e.what.StartsWith("cuLaunchKernel: ") and e.what.Len() > 16, e.what
+        failed = true
+    }
+    assert failed, "a block of 2048 threads launched"
+    Axpy(d, k, by, 0, F32(2), bx, 0, n)
+    y := Array<F32>(n)
+    by.DownloadAll(y)
+    try d.Sync()
+    for i in range n: assert y[i] == F32(2 * i)
+}
+
+test ElemSource "FastTanh on the GPU is kernels/elem's: bit for bit at 2,000,001 points over [-12, 12], NaN and the infinities" {
+    d := try device.Device.Open() catch device.GpuError.NoDevice {
+        device.Skip("FastTanh")
+        return
+    }
+    k := try Kernel.Compile(d, ElemSource(), "oann_tanh_f32")
+    n I64 = 2000001 + 4
+    x := Array<F32>(n)
+    for i in range n - 4: x[i] = F32(-12.0 + 24.0 * F64(i) / F64(n - 5))
+    x[n - 4], x[n - 3], x[n - 2], x[n - 1] = F32.NaN, F32(Inf), F32(-Inf), F32(-0.0)
+    bx := try device.Buf<F32>.Make(d, n)
+    by := try device.Buf<F32>.Make(d, n)
+    bx.UploadAll(x)
+    Launch(d, k, Blocks(n), Block, by.Addr(0), bx.Addr(0), Arg(n))
+    y := Array<F32>(n)
+    by.DownloadAll(y)
+    try d.Sync()
+    worst F64 = 0
+    for i in range n - 4 {
+        want := elem.FastTanh(x[i])
+        assert y[i].Bits() == want.Bits(), "tanh(" + $x[i] + ") " + $y[i] + ", the CPU's " + $want
+        worst = worst.Max((F64(y[i]) - F64(x[i]).Tanh()).Abs())
+    }
+    assert worst <= 2.0e-7, "FastTanh's stated error"
+    assert y[n - 4] != y[n - 4] and y[n - 3] == 1.0 and y[n - 2] == -1.0 and y[n - 1].Bits() == F32(-0.0).Bits()
+}

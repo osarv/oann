@@ -43,9 +43,10 @@ type GpuError error {
 # cuBLAS's workspace, fixed at Open (cublasSetWorkspace), so no product allocates
 WorkBytes I64 = 32 << 20
 
-# the shim's kinds of status (cuda.c's OANN_CUDA, OANN_CUBLAS)
+# the shim's kinds of status (cuda.c's OANN_CUDA, OANN_CUBLAS, OANN_DRIVER - a kernel's launch, kern.olang)
 statusCuda I32 = 1
 statusCublas I32 = 2
+statusDriver I32 = 3
 
 # the text C gives back, "" for none
 fn Text(p CStr?&) String {
@@ -153,8 +154,10 @@ fn (d mut Device&) Sync() ? GpuError {
     if kind != 0 {
         code := cu.oann_status_code(d.status)
         what := Text(cu.oann_status_what(d.status))
+        text := Text(cu.oann_status_text(d.status))
         cu.oann_status_clear(d.status)
         if kind == statusCublas: try CheckCublas(code, what)
+        if kind == statusDriver: error GpuError.Launch(code, what + ": " + text)
         try CheckCuda(code, what)
     }
     try CheckCuda(st, "cudaStreamSynchronize")

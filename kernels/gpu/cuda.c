@@ -23,12 +23,13 @@
 
 /* ---- the status record: the first failure since it was last cleared ---- */
 
-enum { OANN_OK = 0, OANN_CUDA = 1, OANN_CUBLAS = 2 };
+enum { OANN_OK = 0, OANN_CUDA = 1, OANN_CUBLAS = 2, OANN_DRIVER = 3 };
 
 typedef struct {
-    int32_t kind;      /* OANN_OK, OANN_CUDA or OANN_CUBLAS */
+    int32_t kind;      /* OANN_OK, OANN_CUDA, OANN_CUBLAS or OANN_DRIVER */
     int32_t code;      /* the library's status */
     const char *what;  /* the call that failed: a literal of this file */
+    const char *text;  /* the driver's own words for a driver status (cuGetErrorString's, static), else 0 */
 } oann_status;
 
 uint64_t oann_status_new(void) { return (uint64_t)(uintptr_t)calloc(1, sizeof(oann_status)); }
@@ -36,6 +37,7 @@ void oann_status_free(uint64_t st) { free((void *)(uintptr_t)st); }
 int32_t oann_status_kind(uint64_t st) { return ((oann_status *)(uintptr_t)st)->kind; }
 int32_t oann_status_code(uint64_t st) { return ((oann_status *)(uintptr_t)st)->code; }
 const char *oann_status_what(uint64_t st) { return ((oann_status *)(uintptr_t)st)->what; }
+const char *oann_status_text(uint64_t st) { return ((oann_status *)(uintptr_t)st)->text; }
 void oann_status_clear(uint64_t st) { memset((void *)(uintptr_t)st, 0, sizeof(oann_status)); }
 
 static void note(uint64_t st, int32_t kind, int32_t code, const char *what) {
@@ -171,4 +173,184 @@ void oann_gemm(uint64_t st, uint64_t h, bool ta, bool tb, int32_t m, int32_t n, 
                       (cudaDataType)btype, ldb, pb, (void *)(uintptr_t)c, (cudaDataType)ctype, ldc,
                       (cublasComputeType_t)compute, CUBLAS_GEMM_DEFAULT),
          "cublasGemmEx");
+}
+
+/* ---- device memory, filled and copied on the compute stream (kernels/gpu/kern.olang) ---- */
+
+/* bytes at dst set to value (a byte), on the stream, in order with everything else on it */
+void oann_memset(uint64_t st, uint64_t dst, int32_t value, uint64_t bytes, uint64_t stream) {
+    note(st, OANN_CUDA, cudaMemsetAsync((void *)(uintptr_t)dst, value, (size_t)bytes, (cudaStream_t)(uintptr_t)stream),
+         "cudaMemsetAsync");
+}
+
+/* bytes from the device address src to dst, on the stream */
+void oann_copy(uint64_t st, uint64_t dst, uint64_t src, uint64_t bytes, uint64_t stream) {
+    note(st, OANN_CUDA, cudaMemcpyAsync((void *)(uintptr_t)dst, (const void *)(uintptr_t)src, (size_t)bytes,
+                                        cudaMemcpyDeviceToDevice, (cudaStream_t)(uintptr_t)stream), "cudaMemcpyAsync (device)");
+}
+
+/* ---- timing: events that record time (kern.olang's Timer, for the benches) ---- */
+
+int32_t oann_timer_create(uint64_t *out) {
+    cudaEvent_t ev = 0;
+    cudaError_t e = cudaEventCreate(&ev);
+    *out = (uint64_t)(uintptr_t)ev;
+    return e;
+}
+
+void oann_event_record(uint64_t st, uint64_t ev, uint64_t stream) {
+    note(st, OANN_CUDA, cudaEventRecord((cudaEvent_t)(uintptr_t)ev, (cudaStream_t)(uintptr_t)stream), "cudaEventRecord");
+}
+
+/* the milliseconds from event a to event b, after waiting for b */
+int32_t oann_event_ms(uint64_t a, uint64_t b, float *ms) {
+    cudaError_t e = cudaEventSynchronize((cudaEvent_t)(uintptr_t)b);
+    if (e != cudaSuccess) return e;
+    return cudaEventElapsedTime(ms, (cudaEvent_t)(uintptr_t)a, (cudaEvent_t)(uintptr_t)b);
+}
+
+/* ---- NVRTC: CUDA C text to PTX (kern.olang compiles at plan time and caches the PTX by its text's hash) ---- */
+
+/* NVRTC's version, major * 1000 + minor * 10 (as CUDA's are written), or the negated status */
+int32_t oann_nvrtc_version(void) {
+    int major = 0, minor = 0;
+    nvrtcResult r = nvrtcVersion(&major, &minor);
+    return r == NVRTC_SUCCESS ? major * 1000 + minor * 10 : -(int32_t)r;
+}
+
+/* compiles src (NUL-ended) with the options given one a line (NUL-ended, at most 32); the program in *prog whether
+ * or not it compiled, since its log is read from it - destroyed by oann_nvrtc_destroy. NVRTC's status */
+int32_t oann_nvrtc_compile(const char *src, const char *options, uint64_t *prog) {
+    nvrtcProgram p = 0;
+    nvrtcResult r = nvrtcCreateProgram(&p, src, "oann.cu", 0, 0, 0);
+    *prog = (uint64_t)(uintptr_t)p;
+    if (r != NVRTC_SUCCESS) return r;
+    char buf[2048];
+    const char *opts[32];
+    int n = 0;
+    size_t len = strlen(options);
+    if (len >= sizeof buf) return NVRTC_ERROR_INVALID_OPTION;
+    memcpy(buf, options, len + 1);
+    for (char *s = buf; *s != 0 && n < 32;) {
+        opts[n++] = s;
+        char *e = strchr(s, '\n');
+        if (e == 0) break;
+        *e = 0;
+        s = e + 1;
+    }
+    return nvrtcCompileProgram(p, n, opts);
+}
+
+/* the size in bytes of the program's log and of its PTX, each with its NUL */
+uint64_t oann_nvrtc_log_size(uint64_t prog) {
+    size_t n = 0;
+    if (nvrtcGetProgramLogSize((nvrtcProgram)(uintptr_t)prog, &n) != NVRTC_SUCCESS) return 0;
+    return n;
+}
+
+uint64_t oann_nvrtc_ptx_size(uint64_t prog) {
+    size_t n = 0;
+    if (nvrtcGetPTXSize((nvrtcProgram)(uintptr_t)prog, &n) != NVRTC_SUCCESS) return 0;
+    return n;
+}
+
+/* the log and the PTX into out, which holds the size above */
+int32_t oann_nvrtc_log(uint64_t prog, char *out) { return nvrtcGetProgramLog((nvrtcProgram)(uintptr_t)prog, out); }
+int32_t oann_nvrtc_ptx(uint64_t prog, char *out) { return nvrtcGetPTX((nvrtcProgram)(uintptr_t)prog, out); }
+
+void oann_nvrtc_destroy(uint64_t prog) {
+    nvrtcProgram p = (nvrtcProgram)(uintptr_t)prog;
+    if (p != 0) nvrtcDestroyProgram(&p);
+}
+
+/* ---- the driver API, for loading PTX and launching it ----
+ *
+ * Reached through the runtime (cudaGetDriverEntryPoint), so nothing links libcuda by a path: the entry points are a
+ * table made by oann_driver_new and held by whoever loads a module (a Kernel in kern.olang), freed with it. The
+ * driver's types are given here by their shapes (CUresult an int, handles pointers), so cuda.h is not imported. */
+
+typedef int (*oann_cuModuleLoadData)(void **module, const void *image);
+typedef int (*oann_cuModuleGetFunction)(void **f, void *module, const char *name);
+typedef int (*oann_cuModuleUnload)(void *module);
+typedef int (*oann_cuLaunchKernel)(void *f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
+                                   unsigned bz, unsigned shared, void *stream, void **params, void **extra);
+typedef int (*oann_cuGetErrorString)(int code, const char **text);
+
+typedef struct {
+    oann_cuModuleLoadData load;
+    oann_cuModuleGetFunction get;
+    oann_cuModuleUnload unload;
+    oann_cuLaunchKernel launch;
+    oann_cuGetErrorString text;
+} oann_driver;
+
+static cudaError_t entry(const char *name, void **out) {
+    enum cudaDriverEntryPointQueryResult found = cudaDriverEntryPointSuccess;
+    cudaError_t e = cudaGetDriverEntryPoint(name, out, cudaEnableDefault, &found);
+    if (e == cudaSuccess && (found != cudaDriverEntryPointSuccess || *out == 0)) return cudaErrorSymbolNotFound;
+    return e;
+}
+
+/* the table of the driver's entry points into *out (0 on failure); the runtime's status */
+int32_t oann_driver_new(uint64_t *out) {
+    *out = 0;
+    oann_driver *d = (oann_driver *)calloc(1, sizeof(oann_driver));
+    if (d == 0) return cudaErrorMemoryAllocation;
+    cudaError_t e;
+    if ((e = entry("cuModuleLoadData", (void **)&d->load)) != cudaSuccess ||
+        (e = entry("cuModuleGetFunction", (void **)&d->get)) != cudaSuccess ||
+        (e = entry("cuModuleUnload", (void **)&d->unload)) != cudaSuccess ||
+        (e = entry("cuLaunchKernel", (void **)&d->launch)) != cudaSuccess ||
+        (e = entry("cuGetErrorString", (void **)&d->text)) != cudaSuccess) {
+        free(d);
+        return e;
+    }
+    *out = (uint64_t)(uintptr_t)d;
+    return cudaSuccess;
+}
+
+void oann_driver_free(uint64_t drv) { free((void *)(uintptr_t)drv); }
+
+#define DRV(drv) ((oann_driver *)(uintptr_t)(drv))
+
+/* the driver's text for its status code (static), "" where it has none */
+const char *oann_driver_error(uint64_t drv, int32_t code) {
+    const char *t = 0;
+    if (DRV(drv)->text(code, &t) != 0 || t == 0) return "";
+    return t;
+}
+
+/* image (PTX, NUL-ended) loaded into the current context - the device's, made current by Device.Open - as a module;
+ * the driver's status */
+int32_t oann_module_load(uint64_t drv, const void *image, uint64_t *module) {
+    void *m = 0;
+    int r = DRV(drv)->load(&m, image);
+    *module = (uint64_t)(uintptr_t)m;
+    return r;
+}
+
+int32_t oann_module_function(uint64_t drv, uint64_t module, const char *name, uint64_t *f) {
+    void *p = 0;
+    int r = DRV(drv)->get(&p, (void *)(uintptr_t)module, name);
+    *f = (uint64_t)(uintptr_t)p;
+    return r;
+}
+
+int32_t oann_module_unload(uint64_t drv, uint64_t module) { return DRV(drv)->unload((void *)(uintptr_t)module); }
+
+/* the kernel f launched on the stream over grid x block threads with shared bytes of dynamic shared memory. Its
+ * arguments are n slots of 64 bits (at most 32): a device address, or a number's bits in the slot's low bytes - the
+ * driver copies each parameter's own size from the start of its slot, so a 32-bit parameter reads the low half
+ * (little-endian). A failure is recorded in the status record with the driver's text */
+void oann_launch(uint64_t st, uint64_t drv, uint64_t f, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t bx, uint32_t by,
+                 uint32_t bz, uint32_t shared, uint64_t stream, const uint64_t *args, int32_t n) {
+    void *params[32];
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) params[i] = (void *)&args[i];
+    int r = DRV(drv)->launch((void *)(uintptr_t)f, gx, gy, gz, bx, by, bz, shared, (void *)(uintptr_t)stream, params, 0);
+    oann_status *s = (oann_status *)(uintptr_t)st;
+    if (r != 0 && s->kind == OANN_OK) {
+        note(st, OANN_DRIVER, r, "cuLaunchKernel");
+        s->text = oann_driver_error(drv, r);
+    }
 }
