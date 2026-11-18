@@ -1,0 +1,235 @@
+# Holomorphic EP (Laborieux and Zenke 2022, arXiv 2209.00530) on a planned rate system: the gradient of a loss L at the
+# free fixed point, given dz = dL/ds of one population's activities, as the first Fourier coefficient of the system's
+# response to a complex nudge. Out's drive is moved by -c dz for c = r e^(i 2 pi k / N), k = 0 .. N-1; each nudged
+# phase is settled in complex arithmetic (the weights real, the states complex, rho continued holomorphically) from the
+# free fixed point; then dL/dtheta = -(1 / (N r)) Re sum_k e^(-i 2 pi k / N) dP/dtheta(s_k), P the coupling's products
+# (s_post s_pre^T for a connection, s for a bias), written into ParamGrads as Learner.ImplicitGrad writes them. N = 2 is
+# centered EP; the error falls as r^N (aliasing of the N-th order term), so a large r stays exact for N >= 4.
+# Supported: rate units (Linear, Tanh, Sigmoid, Silu), dense and symmetric connections (an input's folded). The free
+# phase must be settled first. The work room is allocated per call (a measurement tool, not a lesson path).
+
+import "neuron"
+import "conn"
+import "settle"
+import "system"
+
+type HoloError error {
+    Unsupported(what String)
+}
+
+# the settles' sweeps summed over the N points, the worst final change, whether every point converged
+type Holo struct(Sweeps I64 = 0, Residual F64 = 0, Converged Bool = true) { Sweeps, Residual, Converged }
+
+fn cexp(z C64) C64 {
+    m := z.Re.Exp()
+    return C64(m * z.Im.Cos(), m * z.Im.Sin())
+}
+
+# rho continued to complex arguments
+fn crho(f neuron.Rho, z C64) C64 ? HoloError {
+    match f {
+        case neuron.Rho.Linear: return z
+        case neuron.Rho.Tanh {
+            e := cexp(z.Scale(2.0))
+            return C64(e.Re - 1.0, e.Im).Div(C64(e.Re + 1.0, e.Im))
+        }
+        case neuron.Rho.Sigmoid {
+            e := cexp(z.Neg())
+            return C64(1.0, 0.0).Div(C64(1.0 + e.Re, e.Im))
+        }
+        case neuron.Rho.Silu {
+            e := cexp(z.Neg())
+            return z.Div(C64(1.0 + e.Re, e.Im))
+        }
+        case _: error HoloError.Unsupported("holomorphic EP through " + $f)
+    }
+}
+
+fn rhoOf<T>(p settle.Population<T>&) neuron.Rho {
+    model := p.Model
+    return model.rho if model == neuron.Neuron.Rate else neuron.Rho.Linear
+}
+
+# the gradient by holomorphic EP of radius r over points points, each phase settled to the largest change tol in at
+# most sweeps sweeps (step the system's Dt)
+fn Holo.Grad<T>(s mut system.System<T>&, out system.Pop, dz Array<T>&, r F64, points I64, tol F64, sweeps I64) Holo ? HoloError {
+    e := s.E
+    n := s.Batch
+    if e.Spiking: error HoloError.Unsupported("a spiking system")
+    units := 0
+    for p in e.Pops {
+        if p.Model != neuron.Neuron.Rate: error HoloError.Unsupported("a model other than rate")
+        units = units.Max(p.Unit + p.Size)
+    }
+    for lk in e.Links {
+        if lk.Kind != conn.Wiring.Dense and lk.Kind != conn.Wiring.Symmetric: error HoloError.Unsupported("a connection other than dense or symmetric")
+    }
+    total := units * n
+    base := Array<C64>(total)
+    u := Array<C64>(total)
+    a := Array<C64>(total)
+    tot := Array<C64>(total)
+    acc := Array<F64>(e.Grads.Len())
+    # the constant drive of every relaxing unit: drive, bias and the folded connections
+    for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
+        at := p.Unit * n
+        for b in range n {
+            for j in range p.Size: base[at + b * p.Size + j] = C64(F64(p.Drive[b * p.Size + j]) + F64(e.Params[p.Bias + j]), 0.0)
+        }
+    }
+    for lk in e.Links {
+        if not lk.Folded: continue
+        post, pre := e.Pops[lk.Post], e.Pops[lk.Pre]
+        x := pre.Activity(0)
+        for b in range n {
+            for i in range lk.PostSize {
+                v F64 = 0.0
+                for j in range lk.PreSize: v += F64(e.Params[lk.Off + i * lk.PreSize + j]) * F64(x[b * lk.PreSize + j])
+                k := post.Unit * n + b * post.Size + i
+                base[k] = C64(base[k].Re + v, 0.0)
+            }
+        }
+    }
+    o := e.Pops[I64(out)]
+    dt := e.Dt
+    got := Holo()
+    for k in range points {
+        theta := 2.0 * 3.141592653589793 * F64(k) / F64(points)
+        c := C64(r * theta.Cos(), r * theta.Sin())
+        # start from the free fixed point
+        for p in e.Pops {
+            at := p.Unit * n
+            act := p.Activity(0)
+            for i in range n * p.Size {
+                u[at + i] = C64(F64(p.R0.U[i]), 0.0) if p.Role != neuron.Role.Input else C64(F64(act[i]), 0.0)
+                a[at + i] = C64(F64(act[i]), 0.0)
+            }
+        }
+        worst F64 = 0.0
+        done := false
+        sw := 0
+        for sweep in range 1, sweeps + 1 {
+            sw = sweep
+            for i in range total: tot[i] = base[i]
+            for i in range n * o.Size {
+                at := o.Unit * n + i
+                tot[at] = tot[at].Minus(c.Scale(F64(dz[i])))
+            }
+            for lk in e.Links {
+                if lk.Folded: continue
+                post, pre := e.Pops[lk.Post], e.Pops[lk.Pre]
+                for b in range n {
+                    po := post.Unit * n + b * post.Size
+                    pr := pre.Unit * n + b * pre.Size
+                    for i in range lk.PostSize {
+                        for j in range lk.PreSize {
+                            w := F64(e.Params[lk.Off + i * lk.PreSize + j])
+                            tot[po + i] = tot[po + i].Plus(a[pr + j].Scale(w))
+                            if lk.Both: tot[pr + j] = tot[pr + j].Plus(a[po + i].Scale(w))
+                        }
+                    }
+                }
+            }
+            worst = 0.0
+            for p in e.Pops {
+                if p.Role == neuron.Role.Input: continue
+                f := rhoOf(p)
+                at := p.Unit * n
+                for i in range n * p.Size {
+                    d := tot[at + i].Minus(u[at + i]).Scale(dt)
+                    worst = worst.Max(d.Norm().Sqrt())
+                    u[at + i] = u[at + i].Plus(d)
+                    a[at + i] = try crho(f, u[at + i])
+                }
+            }
+            if worst <= tol {
+                done = true
+                break
+            }
+        }
+        got = Holo(got.Sweeps + sw, got.Residual.Max(worst), got.Converged and done)
+        # accumulate -(1 / (N r)) Re(e^(-i theta) P)
+        wk := C64(theta.Cos(), -theta.Sin()).Scale(-1.0 / (F64(points) * r))
+        for lk in e.Links {
+            if lk.Frozen: continue
+            post, pre := e.Pops[lk.Post], e.Pops[lk.Pre]
+            for b in range n {
+                po := post.Unit * n + b * post.Size
+                pr := pre.Unit * n + b * pre.Size
+                for i in range lk.PostSize {
+                    q := wk.Mul(a[po + i])
+                    for j in range lk.PreSize: acc[lk.Off + i * lk.PreSize + j] += q.Mul(a[pr + j]).Re
+                }
+            }
+        }
+        for p in e.Pops {
+            if p.Role == neuron.Role.Input: continue
+            at := p.Unit * n
+            for b in range n {
+                for j in range p.Size: acc[p.Bias + j] += wk.Mul(a[at + b * p.Size + j]).Re
+            }
+        }
+    }
+    for i in range e.Grads.Len(): e.Grads[i] = T(acc[i])
+    for lk in e.Links: lk.MaskGrads(e.Grads)
+    return got
+}
+
+# ---- tests ----
+
+import "std/io"
+import "std/rand"
+import "../tensor"
+import "learn"
+
+fn smallSystem(r mut rand.Rand&) system.System<F64> {
+    s := system.System<F64>(2)
+    root := s.Root()
+    x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 5, neuron.Neuron.Rate(neuron.Rho.Silu))
+    g := s.Population(root, "g", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, g, conn.Wiring.Symmetric)
+    s.Connect(g, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for i in range s.E.Params.Len(): s.E.Params[i] = s.E.Params[i] * 3.0
+    for i in range 6: s.Pop(x).Drive[i] = r.Uniform(-1.0, 1.0)
+    return s
+}
+
+fn relErr(a Array<F64>&, b Array<F64>&) F64 {
+    worst, top := 0.0, 0.0
+    for i in range a.Len() {
+        worst = worst.Max((a[i] - b[i]).Abs())
+        top = top.Max(b[i].Abs())
+    }
+    return worst / top
+}
+
+test Holo.Grad "holomorphic EP is the exact gradient to O(r^N): N = 2 is centered EP's r^2 bias, N = 4 and 8 remove it at a large radius" {
+    r := rand.Rand(7)
+    s := smallSystem(r)
+    b := settle.Budget()
+    b.Tol = 1e-14
+    b.Sweeps = 100000
+    assert s.Settle(settle.Phase.Free, b).Converged
+    dz := tensor.Tensor<F64>.Zeros(2, 3)
+    dz.FillUniform(r, -1.0, 1.0)
+    l := learn.Learner<F64>(s)!
+    dx := tensor.Tensor<F64>.Zeros(2, 3)
+    l.ImplicitGrad(system.Pop(3), dz, system.Implicit.Exact(1e-14, 100000), system.Pop(0), dx)!
+    g := s.E.Grads.Copy()
+    d := dz.Flat()!
+    errs := Vec<F64>()
+    for n in Array<I64>[2, 4, 8] {
+        got := Holo.Grad(s, system.Pop(3), d, 0.5, n, 1e-13, 100000)!
+        assert got.Converged
+        errs.Push(relErr(s.E.Grads, g))
+    }
+    small := Holo.Grad(s, system.Pop(3), d, 0.01, 2, 1e-13, 100000)!
+    e2 := relErr(s.E.Grads, g)
+    try io.PutLn("holomorphic EP's relative error at r 0.5, N 2 4 8: " + $errs + "; N 2 at r 0.01: " + $e2 + " (" + $small.Sweeps + " sweeps)")
+    assert errs[0] > 1e-3 and errs[1] < errs[0] * 0.2 and errs[2] < 1e-5 and e2 < 1e-3, $errs
+}
