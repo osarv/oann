@@ -1186,6 +1186,15 @@ name (a `ShapeError`, as before): BF16/F16 graphs, eager and decoding graphs, Dr
 SelectiveScan, DeltaRule, Permute, Slice, Expand, Custom, and a MatMul of two batched operands. G-M4 and how to
 reproduce it: PROGRESS.md, "GP6".
 
+**As built (GP7, 2026-11-18): what the measures asked for.** Kept: `ProductI8` dequantizes its I32 product in one pass
+(`oann_dequant_i32`; 2466 -> 314 us at 2048^3); the settle's sweeps run as CUDA graphs, `Check` sweeps a graph, captured the
+first time and replayed (`gdev.Graphs`, `Mirror.sweeps`; a cold settle 1.3-1.5x faster, an MNIST epoch at 128 x 128 2.13 ->
+1.06 s, the crossover with the CPU now at about 8192, a tie, and `SettleOn` unchanged); `GpuAdamW.Train` captures a whole `ad`
+step (Forward, Backward, clip, AdamW; AdamW's step scalars come from a device array) and replays it, bit for bit with the
+launches one by one; the column sums behind the bias and norm gradients are tiled (a profile finding; the transformer's step
+5.63 -> 3.71 ms with the graph). Not kept, measured: capturing the settle's prepare, a fused attention kernel row by row (slower
+than the batched products). Already in GP4: the folded constants and zeroed word. Numbers and reproduction: PROGRESS.md, "GP7".
+
 The packages are section 4.4.
 
 ## 2. Module map

@@ -1026,6 +1026,58 @@ MatMul of two batched operands stay on the CPU; `nn/train`'s loops on a GPU grap
 step) - a loop wanting the speed steps `optim.GpuAdamW` itself, as bench/gpuad does. Attention's causal products are full
 (cuBLASLt has no triangular product): half the scores' work is wasted. A short batch runs attention for every sequence.
 
+## The GPU route, GP7: what the measures ask for (wt-gp7, 2026-11-18)
+
+docs/redesign.md 1.10 and 4.4's GP7: each lever kept only where it measured a gain. A compiler build ran beside these
+measurements (load average 1.5 to 15), so every comparison below is the same binary or two binaries run back to back, and
+the figures are the medians of the tool's own rounds; read ratios, not absolutes.
+
+**Kept**
+
+1. **ProductI8's dequantization is one pass** (`oann_dequant_i32` in `src/elem.cu`, launched by `ProductI8.Dequant`; the
+   second F32 product, its plan and `cublasSdgmm` are gone). `make gpult OLANG=olang ARGS=5`, "GPU I32 and F32 out", us:
+   2048x2048x2048 2466 -> 314 (the I32 product alone 200); 64x768x3072 -> 18.3; 128x784x128 -> 13.4. out equals scale[j] c
+   exactly (the test's bound unchanged, 2e-6 relative to F64's). G-M5's blocker is gone.
+2. **The settle's sweeps are CUDA graphs** (`gdev.Graphs`, `Mirror.sweeps`): each group of `Check` sweeps is captured the
+   first time it is asked for and replayed after; the key is the group, the rows, the budget's bits and the populations'
+   structure, 256 graphs at most (more run as launches). Same binary, `OANN_GRAPHS=0` against 1 (`make gpusettle`, medians of
+   5 rounds; us a cold settle / a lesson at batch 32, 128, 512): 560 / 1312, 560 / 1627, 720 / 3021 without; 372 / 1104,
+   412 / 1323, 575 / 2704 with (about 1.3-1.5x a settle, 1.1-1.2x a lesson). On MNIST (`make gpulearn OLANG=olang ARGS="5 1
+   128 128,512 1,gpu4,gpu8"`, hidden 128, the same accuracy and sweeps): an epoch at batch 128 2.13 s -> 1.06 s (the CPU one
+   thread 2.07), at batch 512 0.50 -> 0.41 s. The crossover moves: batch 64 (8192) is now a tie with the CPU (1.71 s with
+   `Check` 8, 2.10 with 4, against 1.68) where GP5 had the CPU 1.5-1.7x ahead; batch 512 x 32 (16384) the GPU is 1.7x ahead
+   (GP5: 1.1x); batch 32 x 128 (4096) the CPU is still 2.3x ahead. `SettleOn` stays at 16384 (8192 is a tie, not a win).
+   `Check` 4 stays the default (8 was 0.96 against 1.06 s at 128 x 128 and slower at 64 x 512: within noise).
+3. **ad's whole step is one graph** (`GpuAdamW.Train(loss, n, clip)`: inputs up, then Forward, Backward, clip and AdamW
+   captured at the second call of a (loss, n, clip) and replayed; the AdamW kernel reads its three step scalars from a
+   device array the host fills, so a replay has each step's). Bit for bit with the launches one by one (a new test over 12
+   steps of changing batch size). `make gpuad`, M2 transformer step: 5.63 -> 5.02 ms (11%) before the next item; 4.58 ->
+   3.71 ms (19%) after. M1: 0.164 -> 0.152 s an epoch in the first (quiet) run, within noise when loaded.
+4. **Column sums tiled** (the profile below): the bias gradient and the norms' gain/bias gradients took one thread a
+   column over 1024 rows (35-75 us a node); a block of 1024 threads, 32 columns by 32 row lanes, partials added in lane
+   order (fixed, no atomics) brings Norm backward from 656 to 157 us and Linear backward from 1659 to 1032 us a step
+   (`make gpuad ARGS="1 1 prof"`, `Graph.GpuProfile`). M2 eager 5.63 -> 4.58 ms.
+
+**Skipped, with numbers**
+
+- **Fewer launches in the sweep**: already done in GP4 (the constants' copies and the residual word's zeroing are in the step
+  kernel and one memset a settle; 4 launches a sweep). Nothing left to fold.
+- **Capturing `prepare`** (the closed form and the folded constants) as a graph too: 385/416/558 against 372/412/581 us a
+  cold settle: no change; removed.
+- **Fused attention** (scores, softmax and the product in one launch a row; dq, dk and dv in two): written and tested to
+  build, and slower than the batched products in the graph step (4.01 against 3.76 ms in an interleaved A/B), so removed.
+  The profile says attention is 1.0 ms of the step's 3.3 (fwd 338, bwd 644 us); a fused kernel would need tiling in shared
+  memory to beat cuBLAS's, not a row a block.
+- **Bias and activation into the products' epilogues**: Linear's forward is 17 us a node of which the bias launch is a few;
+  with the step a graph the saving is at most about 2% (22 nodes); not done.
+
+**Tests** (`make gputest`): the GPU tests as GP6 plus `graphed` (Train against the launches one by one, bit for bit) and the
+AdamW kernel test reading its scalars from the device.
+
+Reproduce: `make gpult OLANG=olang ARGS=5`; `make gpusettle OLANG=olang` and `OANN_GRAPHS=0 ./build/bench_gpusettle` for the
+A/B; `make gpulearn OLANG=olang ARGS="5 1 128 128,512 1,gpu4,gpu8"`; `make gpuad OLANG=olang ARGS="5 100"` (`prof` as the
+third argument prints the step's time on the device by kind, `gpulm` runs the GPU's two transformer rows only).
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP5 are done (above; G-M2's verdict: the
