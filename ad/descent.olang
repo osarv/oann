@@ -50,6 +50,10 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
                                     # the step, or E (+ beta C) rose by more than rounding - and grows by a tenth after
                                     # each kept step, up to 8 Rate: the fixed point is the same, so EP and Implicit
                                     # allow it; Unrolled, which differentiates the steps, refuses it
+    Sphere I64 = 0                  # above 0: the state is groups of Sphere elements, each kept at unit RMS - every step
+                                    # is followed by the projection and the residual is the gradient's part tangent to
+                                    # the sphere. EP allows it (its fixed points are minima under a constraint theta
+                                    # does not move); Unrolled and Implicit, which differentiate the steps, refuse it
     Grow F64 = 8.0                  # Adaptive: the step grows to at most Grow Rate (1: it only shrinks from Rate)
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
@@ -100,6 +104,7 @@ fn (d mut Descent<T>&) at(x Array<F64>&, beta F64) F64 {
     if nudged and d.C < d.E: d.fromCost()
     for i in range d.n: d.gx[i] += beta * d.cx[i]
     worst := 0.0
+    if d.Sphere > 0: return d.tangent(x)
     for i in range d.n: worst = worst.Max(d.gx[i].Abs())
     return worst
 }
@@ -158,6 +163,7 @@ fn (d mut Descent<T>&) Settle(beta F64 = 0.0) Settled {
 fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
     out := Settled()
     most := d.NudgedSteps if beta != 0.0 and d.NudgedSteps > 0 else d.Steps
+    if d.Sphere > 0: d.project()
     rate := d.Rate
     last := 0.0
     for k in range most + 1 {
@@ -168,6 +174,7 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
             if k > 0 and (dot(d.gx, d.prevStep) < 0.0 or now > last + 1e-6 * last.Abs()) {
                 rate *= 0.5
                 for i in range d.n: d.x[i] = d.prev[i] - rate * d.prevStep[i]
+                if d.Sphere > 0: d.project()
                 if k < most: continue
                 for i in range d.n: d.x[i] = d.prev[i]
                 out.Residual = d.at(d.x, beta)
@@ -188,8 +195,36 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
             rate = (rate * 1.1).Min(d.Grow * d.Rate)
         }
         for i in range d.n: d.x[i] -= rate * d.gx[i]
+        if d.Sphere > 0: d.project()
     }
     return out
+}
+
+# every group of Sphere elements of d.x scaled to unit RMS
+fn (d mut Descent<T>&) project() {
+    k := d.Sphere
+    for g in range d.n / k {
+        sq := 0.0
+        for i in range k: sq += d.x[g * k + i] * d.x[g * k + i]
+        f := 1.0 / (sq / F64(k) + 1e-12).Sqrt()
+        for i in range k: d.x[g * k + i] *= f
+    }
+}
+
+# the largest |entry| of gx's part tangent to the sphere at x, group by group
+fn (d Descent<T>&) tangent(x Array<F64>&) F64 {
+    k := d.Sphere
+    worst := 0.0
+    for g in range d.n / k {
+        gx, xx := 0.0, 0.0
+        for i in range k {
+            gx += d.gx[g * k + i] * x[g * k + i]
+            xx += x[g * k + i] * x[g * k + i]
+        }
+        r := gx / (xx + 1e-30)
+        for i in range k: worst = worst.Max((d.gx[g * k + i] - r * x[g * k + i]).Abs())
+    }
+    return worst
 }
 
 # what a settle descends at the point of the last Forward: E + beta C
@@ -221,6 +256,11 @@ fn (d mut Descent<T>&) Train(how Trainer) Settled {
         case Trainer.Unrolled(h): h.Max(1)
         case _: 0
     }
+    ep := match how {
+        case Trainer.Ep(_, _): true
+        case _: false
+    }
+    if d.Sphere > 0 and not ep: unreachable "oann: Descent.Train Unrolled or Implicit with a Sphere state - they differentiate the steps"
     if keep > 0 and d.Adaptive: unreachable "oann: Descent.Train Unrolled with Adaptive steps - it differentiates the steps"
     if d.trail.Len() < keep * d.n: d.trail = Array<F64>(keep * d.n)
     d.Last = d.settle(0.0, keep)
@@ -432,6 +472,44 @@ test Descent.Settle "adaptive steps settle where a fixed step diverges, to the s
     gradOf(d, Trainer.Ep(1e-3, true))
     assert adaptive < d.Last.Steps, $adaptive + " adaptive steps, " + $d.Last.Steps + " fixed"
     Println("  adaptive from 3: " + $adaptive + " steps; fixed 0.2: " + $d.Last.Steps)
+}
+
+# the settled cost from a state of ones, and its central differences in the parameters (Sphere states)
+fn onesCost(d mut Descent<F64>&) F64 {
+    s := d.G.Value(d.X).Flat()!
+    for i in range s.Len(): s[i] = 1.0
+    d.Settle()
+    return d.G.Scalar(d.C)
+}
+
+test Descent.Train "EP on a sphere state against central differences of the settled cost" {
+    g, x, e, c := convex(0.4)
+    d := Descent<F64>(g, x, e, c)
+    d.Rate = 0.05
+    d.Tol = 1e-12
+    d.Sphere = 4
+    ps := g.Params().Flat()!
+    want := Array<F64>(ps.Len())
+    for i in range ps.Len() {
+        old := ps[i]
+        ps[i] = old + 1e-5
+        up := onesCost(d)
+        ps[i] = old - 1e-5
+        down := onesCost(d)
+        ps[i] = old
+        want[i] = (up - down) / 2e-5
+    }
+    s := g.Value(x).Flat()!
+    for i in range s.Len(): s[i] = 1.0
+    d.Train(Trainer.Ep(1e-4, true))
+    pg := g.ParamGrads().Flat()!
+    got := Array<F64>(pg.Len())
+    for i in range pg.Len(): got[i] = pg[i]
+    assert d.Last.Converged and relative(got, want) < 1e-4, "sphere EP " + $relative(got, want)
+    # the settled state is on the sphere
+    sq := 0.0
+    for i in range 4: sq += s[i] * s[i]
+    assert (sq / 4.0 - 1.0).Abs() < 1e-9
 }
 
 test Descent.Train "a few steps of gradient descent on the parameters by EP lower the settled cost" {
