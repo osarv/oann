@@ -77,7 +77,9 @@ fn Mlp.record(g mut graph.Graph<F32>&) Mlp {
 }
 
 # one training epoch and the test accuracy: seconds, loss, accuracy. gpu: AdamW on the device
-fn mlpEpoch(data mnist.Mnist&, threads I64, gpu Bool) F64, F64, F64 {
+fn mlpEpoch(data mnist.Mnist&, threads I64, mode I64) F64, F64, F64 {
+    gpu := mode > 0
+    graphed := mode == 2
     g := graph.Graph<F32>(128, threads)
     net := Mlp.record(g)
     on := device.Backend.Gpu if gpu else device.Backend.Cpu
@@ -94,9 +96,13 @@ fn mlpEpoch(data mnist.Mnist&, threads I64, gpu Bool) F64, F64, F64 {
         o := try optim.GpuAdamW<F32>.For(g, rate = 1e-3, decay = 0.01) catch e { unreachable $e }
         for b in range trainSet.Batches() {
             n := trainSet.Fill(b, xs, ys)
-            g.Forward(n)
-            g.Backward(net.loss)
-            o.Step()
+            if graphed {
+                o.Train(net.loss, n)
+            } else {
+                g.Forward(n)
+                g.Backward(net.loss)
+                o.Step()
+            }
             total += g.Scalar(net.loss) * F64(n)
             seen += n
         }
@@ -138,20 +144,19 @@ fn mlpBench(rounds I64) ? io.Error, os.Error, mnist.MnistError, idx.IdxError {
     }
     data := try mnist.Mnist.Load("data/mnist", mnist.Source)
     try io.Put("M1: 784-128-10 on ad/graph, an epoch of 60000 in batches of 128 (training only, the test accuracy after), " + $rounds + " rounds, medians\n")
-    names := Array<String>["CPU 1 thread", "CPU 4 threads", "GPU"]
-    
-    spent := Array<Vec<F64>>[Vec<F64>(), Vec<F64>(), Vec<F64>()]
-    accuracy := Array<F64>(3)
-    lossAt := Array<F64>(3)
+    names := Array<String>["CPU 1 thread", "CPU 4 threads", "GPU", "GPU, one CUDA graph a step"]
+    spent := Array<Vec<F64>>[Vec<F64>(), Vec<F64>(), Vec<F64>(), Vec<F64>()]
+    accuracy := Array<F64>(4)
+    lossAt := Array<F64>(4)
     for _ in range rounds {
-        for k in range 3 {
-            s, l, a := mlpEpoch(data, 4 if k == 1 else 1, k == 2)
+        for k in range 4 {
+            s, l, a := mlpEpoch(data, 4 if k == 1 else 1, (k - 1).Max(0) if k > 1 else 0)
             spent[k].Push(s)
             accuracy[k] = a
             lossAt[k] = l
         }
     }
-    for k in range 3 {
+    for k in range 4 {
         t := median(spent[k].ToArray())
         try io.Put("  " + names[k] + ": " + $t.Fixed(3) + " s an epoch, train loss " + $lossAt[k].Fixed(4) + ", test accuracy " + $(100.0 * accuracy[k]).Fixed(2) + "%\n")
     }
@@ -160,7 +165,9 @@ fn mlpBench(rounds I64) ? io.Error, os.Error, mnist.MnistError, idx.IdxError {
 # ---- M2 ----
 
 # the median seconds of a step of the character transformer, and the loss after the steps. gpu: on the device
-fn lmSteps(threads I64, gpu Bool, steps I64) F64, F64 {
+fn lmSteps(threads I64, mode I64, steps I64) F64, F64 {
+    gpu := mode > 0
+    graphed := mode == 2
     cfg := gpt.GptConfig.Char(65)
     g := graph.Graph<F32>(16, threads)
     m := gpt.Gpt.New(g, cfg)
@@ -178,10 +185,14 @@ fn lmSteps(threads I64, gpu Bool, steps I64) F64, F64 {
             for i in range toks.Len() { toks[i] = I32(r.Below(65)) }
             for i in range tgts.Len() { tgts[i] = I32(r.Below(65)) }
             t0 := time.Now()
-            g.Forward(16)
-            g.Backward(lm.Loss)
-            o.Clip(1.0)
-            o.Step()
+            if graphed {
+                o.Train(lm.Loss, 16, 1.0)
+            } else {
+                g.Forward(16)
+                g.Backward(lm.Loss)
+                o.Clip(1.0)
+                o.Step()
+            }
             loss = g.Scalar(lm.Loss)
             if s >= 3: times.Push(F64(time.Since(t0)) * 1e-9)
         }
@@ -204,15 +215,15 @@ fn lmSteps(threads I64, gpu Bool, steps I64) F64, F64 {
 
 fn lmBench(rounds I64, steps I64) ? io.Error {
     try io.Put("M2: the character transformer (4 x 128, 4 heads, context 64, 65 characters) a step of 16 sequences, " + $steps + " steps a round, " + $rounds + " rounds, medians\n")
-    names := Array<String>["CPU 1 thread", "CPU 4 threads", "GPU"]
-    spent := Array<Vec<F64>>[Vec<F64>(), Vec<F64>(), Vec<F64>()]
+    names := Array<String>["CPU 1 thread", "CPU 4 threads", "GPU", "GPU, one CUDA graph a step"]
+    spent := Array<Vec<F64>>[Vec<F64>(), Vec<F64>(), Vec<F64>(), Vec<F64>()]
     for _ in range rounds {
-        for k in range 3 {
-            t, _ := lmSteps(4 if k == 1 else 1, k == 2, steps)
+        for k in range 4 {
+            t, _ := lmSteps(4 if k == 1 else 1, (k - 1).Max(0) if k > 1 else 0, steps)
             spent[k].Push(t)
         }
     }
-    for k in range 3 {
+    for k in range 4 {
         t := median(spent[k].ToArray())
         try io.Put("  " + names[k] + ": " + $(t * 1000.0).Fixed(2) + " ms a step (" + $(F64(16 * 64) / t).Fixed(0) + " characters/s)\n")
     }

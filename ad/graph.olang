@@ -75,6 +75,7 @@ if Gpu {
         FreshActs Bool = false
         FreshParams Bool = false
         HostParams Bool = true
+        Capturing Bool = false      # a training step is being captured into a CUDA graph (GP7): nothing uploads meanwhile
     }
 } else {
     type onGpu<T> struct(n I64) { }
@@ -2401,8 +2402,8 @@ if Gpu {
     # the device's mirror (for the optimizer's step, nn/optim)
     fn (g Graph<T>&) Mirror() mut mirror.Mirror<T>& { return g.gpu.M! }
 
-    # a Forward on the device: the parameters up if the host wrote them, every input up, each node's kernels
-    fn (g mut Graph<T>&) gpuForward(n I64) {
+    # the parameters up if the host wrote them, and every input and token up (what a Forward starts with)
+    fn (g mut Graph<T>&) gpuUpload() {
         m := g.gpu.M!
         if g.gpu.HostParams {
             m.Upload(g.mem, 0, g.ParamCount)
@@ -2416,6 +2417,29 @@ if Gpu {
                 case _ { }
             }
         }
+    }
+
+    # a training step's start (nn/optim's GpuAdamW.Train): the batch's n entries in use, the inputs up
+    fn (g mut Graph<T>&) GpuFeed(n I64) {
+        if n < 1 or n > g.Batch: unreachable "oann: a step on " + $n + " entries of a graph planned for " + $g.Batch
+        g.N = n
+        if n != g.viewsN: g.makeViews()
+        g.gpuUpload()
+    }
+
+    # a step replayed from a CUDA graph ran: the device holds newer values than the host's
+    fn (g mut Graph<T>&) GpuFed() {
+        g.gpu.FreshActs = true
+        g.gpu.FreshParams = true
+    }
+
+    # while a step is being captured the Forward and Backward upload nothing (the uploads are on another stream)
+    fn (g mut Graph<T>&) GpuCapturing(on Bool) { g.gpu.Capturing = on }
+
+    # a Forward on the device: the parameters up if the host wrote them, every input up, each node's kernels
+    fn (g mut Graph<T>&) gpuForward(n I64) {
+        m := g.gpu.M!
+        if not g.gpu.Capturing: g.gpuUpload()
         steps := g.gpu.Steps
         for i in range g.nodes.Len() {
             if isLeaf(g.nodes[i].Kind): continue
@@ -2429,7 +2453,7 @@ if Gpu {
     fn (g mut Graph<T>&) gpuBackward(loss Var, accumulate Bool) {
         m := g.gpu.M!
         if accumulate: g.pullParams()
-        if g.gpu.HostParams {
+        if g.gpu.HostParams and not g.gpu.Capturing {
             m.Upload(g.mem, 0, g.ParamCount)
             g.gpu.HostParams = false
         }

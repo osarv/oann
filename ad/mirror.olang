@@ -148,10 +148,12 @@ type AttnPlan<T> unique struct(dev gdev.Device&, node I64, n I64) {
 }
 
 # AdamW's state on the device: the moments and the per-parameter decay mask, the steps taken
-type AdamW<T> unique struct(m gdev.Buf<T>, v gdev.Buf<T>, mask gdev.Buf<U8>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
+type AdamW<T> unique struct(m gdev.Buf<T>, v gdev.Buf<T>, mask gdev.Buf<U8>, hp gdev.Buf<T>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
     M gdev.Buf<T> = m
     V gdev.Buf<T> = v
     mask
+    Hp gdev.Buf<T> = hp               # keep, step and root of the step in hand: the kernel reads them, so a CUDA graph's replay has each step's
+    hostHp mut Array<T>& = Array<T>(3)
     Rate F64 = rate
     Beta1 F64 = beta1
     Beta2 F64 = beta2
@@ -176,6 +178,9 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
     RowLoss gdev.Buf<F64> = losses
     plans mut Vec<AttnPlan<T>>& = Vec<AttnPlan<T>>()
     nodes
+    Graphs mut gdev.Graphs& = gdev.Graphs(64)     # GP7: whole training steps captured once and replayed
+    Key mut Array<U64>& = Array<U64>(8)
+    Warm Bool = false
 }
 
 # ---- the plan ----
@@ -540,7 +545,7 @@ fn (m mut Mirror<T>&) attentionBackward(s Step&, n I64, add0 Bool, add1 Bool, ad
 fn (m mut Mirror<T>&) AdamW(decays Array<U8>&, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) AdamW<T> ? gdev.GpuError {
     n := m.params
     d := m.dev
-    o := AdamW<T>(try gdev.Buf<T>.Make(d, n), try gdev.Buf<T>.Make(d, n), try gdev.Buf<U8>.Make(d, n), rate, beta1, beta2, eps, decay)
+    o := AdamW<T>(try gdev.Buf<T>.Make(d, n), try gdev.Buf<T>.Make(d, n), try gdev.Buf<U8>.Make(d, n), try gdev.Buf<T>.Make(d, 3), rate, beta1, beta2, eps, decay)
     kern.Zero(d, o.M.Addr(0), n * T.Size)
     kern.Zero(d, o.V.Addr(0), n * T.Size)
     o.mask.UploadAll(decays)
@@ -548,13 +553,25 @@ fn (m mut Mirror<T>&) AdamW(decays Array<U8>&, rate F64, beta1 F64, beta2 F64, e
     return o
 }
 
-fn (m mut Mirror<T>&) AdamStep(o mut AdamW<T>&) {
+# the step's scalars, computed on the host as nn/optim computes them and put on the device (a copy staged at once)
+fn (m mut Mirror<T>&) AdamScalars(o mut AdamW<T>&) {
     o.Steps++
     corr1 F64 = 1.0 - o.Beta1.Pow(F64(o.Steps))
     corr2 F64 = 1.0 - o.Beta2.Pow(F64(o.Steps))
+    o.hostHp[0], o.hostHp[1], o.hostHp[2] = T(1.0 - o.Rate * o.Decay), T(o.Rate / corr1), T(1.0 / corr2.Sqrt())
+    o.Hp.Upload(o.hostHp, 0, 0, 3)
+}
+
+# the step's launch (the scalars already on the device)
+fn (m mut Mirror<T>&) AdamLaunch(o mut AdamW<T>&) {
     n := m.params
     m.elems(KAdamW, n, m.at(0), m.at(n), o.M.Addr(0), o.V.Addr(0), o.mask.Addr(0), n64(n), kern.Arg(T(o.Beta1)), kern.Arg(T(o.Beta2)), kern.Arg(T(1.0 - o.Beta1)), kern.Arg(T(1.0 - o.Beta2))
-        kern.Arg(T(1.0 - o.Rate * o.Decay)), kern.Arg(T(o.Rate / corr1)), kern.Arg(T(1.0 / corr2.Sqrt())), kern.Arg(T(o.Eps)))
+        o.Hp.Addr(0), kern.Arg(T(o.Eps)))
+}
+
+fn (m mut Mirror<T>&) AdamStep(o mut AdamW<T>&) {
+    m.AdamScalars(o)
+    m.AdamLaunch(o)
 }
 
 # the gradients scaled so that their Euclidean norm is at most max (optim.ClipNorm's rule); GradNorm reads the norm after

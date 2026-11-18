@@ -228,6 +228,38 @@ if Gpu {
     }
 
     fn (o mut GpuAdamW<T>&) Norm() F64 { return o.g.Mirror().GradNorm() }
+
+    # a whole training step on n entries of the batch: Forward, Backward from loss, the gradients clipped to norm clip (0:
+    # not clipped) and the step - the same launches as calling them one by one, but captured into one CUDA graph at the
+    # second call of a (loss, n, clip) and replayed after it (GP7): the step's hundreds of launches become one. The
+    # inputs go up first, outside the graph. The loss is read afterwards with g.Scalar as always
+    fn (o mut GpuAdamW<T>&) Train(loss graph.Var, n I64, clip F64 = 0.0) {
+        g := o.g
+        g.GpuFeed(n)
+        o.S!.Rate = o.Rate
+        m := g.Mirror()
+        m.AdamScalars(o.S!)
+        key := m.Key
+        key[0], key[1], key[2], key[3] = U64(loss), U64(n), clip.Bits(), U64(g.Pos)
+        key[4], key[5], key[6], key[7] = 0, 0, 0, 0
+        d := device.Opened!
+        i := m.Graphs.Find(key)
+        if i >= 0 {
+            m.Graphs.Replay(d, i)
+            g.GpuFed()
+            return
+        }
+        capture := m.Warm and m.Graphs.Begin(d) == 0
+        g.GpuCapturing(capture)
+        g.Forward(n)
+        g.Backward(loss)
+        if clip > 0.0: m.ClipNorm(clip)
+        m.AdamLaunch(o.S!)
+        g.GpuCapturing(false)
+        m.Warm = true
+        if capture: m.Graphs.Seal(d, key)
+        o.g.DeviceReady()
+    }
 }
 
 # ---- SGD ----

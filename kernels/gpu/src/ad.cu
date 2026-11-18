@@ -476,7 +476,8 @@ extern "C" __global__ void oann_ad_clip(real *x, const double *sumsq, long long 
 
 // nn/optim's AdamW step over n parameters, adamRun operation for operation, the decay only where decays[k] is not 0
 // (decays 0: every parameter decays) - bit for bit with the CPU's
-extern "C" __global__ void oann_ad_adamw(real *p, const real *g, real *m, real *v, const unsigned char *decays, long long n, real b1, real b2, real c1, real c2, real keep, real step, real root, real eps) {
+extern "C" __global__ void oann_ad_adamw(real *p, const real *g, real *m, real *v, const unsigned char *decays, long long n, real b1, real b2, real c1, real c2, const real *hp, real eps) {
+    real keep = hp[0], step = hp[1], root = hp[2];   // the step's scalars, which change each step: read from the device so a CUDA graph replays them
     OANN_LOOP(k, n) {
         real gk = g[k];
         real mk = b1 * m[k] + c1 * gk;

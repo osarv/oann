@@ -33,6 +33,7 @@ import gdev "../kernels/gpu/device"
 import "../kernels/gpu/kern"
 import "../kernels/gpu/blas"
 import "../kernels/device"
+import "std/os"
 import "neuron"
 import "conn"
 import "settle"
@@ -190,6 +191,9 @@ type Mirror<T> unique struct(dev mut gdev.Device&, e settle.Engine<T>&, state gd
     aliveBytes mut Array<U8>& = Array<U8>(e.Units)
     table mut Array<U64>& = Array<U64>(10 * e.Pops.Len())
     relaxing I64 = 0
+    Graphs mut gdev.Graphs& = gdev.Graphs(256)    # GP7: the sweeps of Check at a time, captured once and replayed
+    Graphed Bool = true
+    gkey mut Array<U64>& = Array<U64>(8)
     pend mut Array<I64>& = Array<I64>(4)    # the words read back and not yet scanned: from, to of each of two events
     # which side holds the current copy: the parameters (whole, and the recurrent connections alone), the gradients,
     # each population's state
@@ -269,6 +273,7 @@ fn Mirror<T>.build(dev mut gdev.Device&, e mut settle.Engine<T>&) Mirror<T> ? gd
     at += span(e.Phases, 8)
     m := Mirror<T>(dev, e, try gdev.Buf<T>.Make(dev, total), try gdev.Buf<U8>.Make(dev, at), try gdev.Buf<U64>.Make(dev, 2 * MaxSweeps + 1 + 10 * e.Pops.Len()), try Pinned.Make(at), try Pinned.Make(8 * (MaxSweeps + 1)), try Event.Make(), try Event.Make())
     m.G = count
+    m.Graphed = (try os.Env("OANN_GRAPHS") catch default "1") != "0"
     m.Pot0 = 2 * count
     m.Act0 = m.Pot0 + units * rows
     m.Pot1 = m.Act0 + units * rows
@@ -520,7 +525,7 @@ fn (m mut Mirror<T>&) Settle(e mut settle.Engine<T>&, lo I64, hi I64, b settle.B
     found I64 = -1
     for found < 0 {
         upto := (enq + m.Check.Max(1)).Min(last + 1)
-        for k in range enq, upto: m.sweep(e, k, lo, hi, euclid, tol, inf, stop)
+        m.sweeps(e, enq, upto, lo, hi, euclid, tol, inf, stop)
         enq = upto
         ev := m.ev0.Ev if slot == 0 else m.ev1.Ev
         cu.oann_download_pinned(d.Status(), m.back.Addr + U64(8 * covered), m.Words.Addr(covered), U64(8 * (enq - covered)), d.Stream(), ev)
@@ -546,6 +551,42 @@ fn (m mut Mirror<T>&) Settle(e mut settle.Engine<T>&, lo I64, hi I64, b settle.B
     e.Sweeps += out.Sweeps
     e.Last = out
     return out
+}
+
+# sweeps from .. upto enqueued: as a CUDA graph (GP7) - captured the first time this group of sweeps is asked for, a
+# replay after - or one launch at a time where graphs are off or the table is full. The graph holds the arguments of the
+# launches it recorded (addresses, k, the tolerance, the rows), so its key is everything that varies between settles:
+# the group, the rows, the budget's bits and the structure's signature (which populations are retired, read labels...)
+fn (m mut Mirror<T>&) sweeps(e mut settle.Engine<T>&, from I64, upto I64, lo I64, hi I64, euclid Bool, tol U64, inf U64, stop U64) {
+    if not m.Graphed or upto - from < 2 {
+        for k in range from, upto: m.sweep(e, k, lo, hi, euclid, tol, inf, stop)
+        return
+    }
+    key := m.gkey
+    key[0], key[1], key[2], key[3] = m.signature(e), U64(from), U64(upto), U64(lo)
+    key[4], key[5], key[6], key[7] = U64(hi) + (U64(1) << 40 if euclid else 0), tol, inf, U64(e.Batch)
+    d := m.dev
+    i := m.Graphs.Find(key)
+    if i >= 0 {
+        m.Graphs.Replay(d, i)
+        return
+    }
+    if m.Graphs.Begin(d) != 0 {
+        for k in range from, upto: m.sweep(e, k, lo, hi, euclid, tol, inf, stop)
+        return
+    }
+    for k in range from, upto: m.sweep(e, k, lo, hi, euclid, tol, inf, stop)
+    m.Graphs.Seal(d, key)
+}
+
+# what of the engine's structure the launches' arguments depend on
+fn (m Mirror<T>&) signature(e settle.Engine<T>&) U64 {
+    sig U64 = 14695981039346656037
+    for i in range e.Pops.Len() {
+        p := e.Pops[i]
+        sig = (sig ^ U64(p.Size + 31 * ((1 if p.Retired > 0 else 0) + 2 * (1 if p.Labels.Len() > 0 else 0) + 4 * (1 if p.Target.Len() > 0 else 0)))) * 1099511628211
+    }
+    return sig
 }
 
 # the words of sweeps lo .. hi, once the event is passed: the first that stopped (within tol, or diverged), else -1

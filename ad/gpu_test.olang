@@ -266,6 +266,7 @@ fn adamKernel() ? {
     bv := try gdev.Buf<F32>.Make(d, n)
     bmask := try gdev.Buf<U8>.Make(d, n)
     bmask.UploadAll(mask)
+    bhp := try gdev.Buf<F32>.Make(d, 3)
     kern.Zero(d, bm.Addr(0), n * 4)
     kern.Zero(d, bv.Addr(0), n * 4)
     for step in range 1, 8 {
@@ -275,8 +276,9 @@ fn adamKernel() ? {
         bg.UploadAll(g)
         corr1 F64 = 1.0 - F64(0.9).Pow(F64(step))
         corr2 F64 = 1.0 - F64(0.999).Pow(F64(step))
+        bhp.UploadAll(Array<F32>[F32(1.0 - 0.01 * 0.1), F32(0.01 / corr1), F32(1.0 / corr2.Sqrt())])
         kern.LaunchKit(d, k, mirror.KAdamW, kern.Blocks(n), kern.Block, bp.Addr(0), bg.Addr(0), bm.Addr(0), bv.Addr(0), bmask.Addr(0), kern.Arg(n), kern.Arg(F32(0.9)), kern.Arg(F32(0.999)), kern.Arg(F32(1.0 - 0.9)), kern.Arg(F32(1.0 - 0.999))
-            kern.Arg(F32(1.0 - 0.01 * 0.1)), kern.Arg(F32(0.01 / corr1)), kern.Arg(F32(1.0 / corr2.Sqrt())), kern.Arg(F32(1e-8)))
+            bhp.Addr(0), kern.Arg(F32(1e-8)))
         got := try down(d, bp)
         want := cp.Flat()!
         for i in range n: assert got[i].Bits() == want[i].Bits(), "AdamW step " + $step + " parameter " + $i + ": " + $got[i] + " against " + $want[i]
@@ -458,6 +460,36 @@ fn trained() {
 }
 
 test trained "a graph trained on the GPU - AdamW on the device, clipped - follows the CPU's: the losses within rounding over 20 steps, and it learns" { trained() }
+
+# GP7: Train - a whole step as one CUDA graph from the second call of a (loss, n, clip) - is the same launches as Forward,
+# Backward, Clip and Step one by one: bit for bit over 12 steps of a changing batch size, loss and parameters
+fn graphed() {
+    if not device.GpuAvailable() {
+        gdev.Skip("graphed training")
+        return
+    }
+    c := gpt.GptConfig.Variant(0)
+    _, one, net := pair(charlmOf(c), 4, 5)
+    _, two, _ := pair(charlmOf(c), 4, 5)
+    o1 := try optim.GpuAdamW<F32>.For(one, rate = 0.01, decay = 0.1) catch { unreachable }
+    o2 := try optim.GpuAdamW<F32>.For(two, rate = 0.01, decay = 0.1) catch { unreachable }
+    for step in range 12 {
+        n := 3 if step % 4 == 3 else 4
+        feed(one, net, n, U64(step) + 100, c.Vocab)
+        feed(two, net, n, U64(step) + 100, c.Vocab)
+        one.Forward(n)
+        one.Backward(net.loss)
+        o1.Clip(1.0)
+        o1.Step()
+        o2.Train(net.loss, n, 1.0)
+        l1 := one.Scalar(net.loss)
+        l2 := two.Scalar(net.loss)
+        assert l1 == l2, "step " + $step + ": the graphed step's loss " + $l2 + " against " + $l1
+    }
+    assert Array<F32>[x for x in one.Params().Flat()!] == Array<F32>[x for x in two.Params().Flat()!], "the graphed steps' parameters differ"
+}
+
+test graphed "Train, a whole step as a CUDA graph, equals the launches one by one bit for bit, over steps of changing batch size" { graphed() }
 
 fn refused() ? {
     if not device.GpuAvailable() {

@@ -662,6 +662,30 @@ int32_t oann_capture_end(uint64_t stream, int32_t launches, int32_t *nodes) {
     return e;
 }
 
+/* GP7: a capture kept and replayed. end_keep ends the capture begun by oann_capture_begin and instantiates the graph into
+ * *exec (nodes[0] its node count); launch enqueues one replay on the stream (a failure into the status record); free
+ * destroys it. What was enqueued during the capture is NOT run by the capture: the caller launches the graph */
+int32_t oann_graph_end_keep(uint64_t stream, uint64_t *exec, int32_t *nodes) {
+    cudaGraph_t g = 0;
+    cudaGraphExec_t x = 0;
+    *exec = 0;
+    cudaError_t e = cudaStreamEndCapture((cudaStream_t)(uintptr_t)stream, &g);
+    if (e != cudaSuccess) return e;
+    size_t count = 0;
+    e = cudaGraphGetNodes(g, NULL, &count);
+    nodes[0] = (int32_t)count;
+    if (e == cudaSuccess) e = cudaGraphInstantiate(&x, g, 0);
+    cudaGraphDestroy(g);
+    if (e == cudaSuccess) *exec = (uint64_t)(uintptr_t)x;
+    return e;
+}
+
+void oann_graph_launch(uint64_t st, uint64_t exec, uint64_t stream) {
+    note(st, OANN_CUDA, cudaGraphLaunch((cudaGraphExec_t)(uintptr_t)exec, (cudaStream_t)(uintptr_t)stream), "cudaGraphLaunch");
+}
+
+void oann_graph_free(uint64_t exec) { cudaGraphExecDestroy((cudaGraphExec_t)(uintptr_t)exec); }
+
 /* ---- GP4 (dyn/mirror.olang, the settle on the GPU): pinned host staging, copies through it, events waited on ----
  *
  * A plan stages a batch's inputs (drives, labels, targets, the phases' steps) into pinned memory it allocated at Plan

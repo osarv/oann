@@ -374,3 +374,58 @@ test GpuError "an allocation past the device's memory is cudaMalloc's error, nam
     assert failed, "allocated 4 TiB"
     try d.Sync()
 }
+
+# ---- GP7: CUDA graphs of what is enqueued ----
+
+# graphs captured from the compute stream and replayed: Keys holds a caller's key of eight words a graph (the caller's
+# own meaning), Execs the instantiated graphs. What a graph holds is fixed - addresses and scalar arguments as they were
+# when it was captured - so a key says everything that varied
+type Graphs unique struct(cap I64) {
+    cap
+    Keys mut Array<U64>& = Array<U64>(8 * cap)
+    Execs mut Array<U64>& = Array<U64>(cap)
+    Count I64 = 0
+    Launched I64 = 0                    # replays, over every graph
+} destruct {
+    for i in range Count: cu.oann_graph_free(Execs[i])
+}
+
+# the graph with this key (eight words), or -1
+fn (g Graphs&) Find(key Array<U64>&) I64 {
+    for i in range g.Count {
+        same := true
+        for j in range 8 {
+            if g.Keys[8 * i + j] != key[j] {
+                same = false
+                break
+            }
+        }
+        if same: return i
+    }
+    return -1
+}
+
+# begins capturing the compute stream: what is enqueued until Seal is recorded, not run. False where capture cannot begin
+# or the table is full: 0 where capturing
+fn (g Graphs&) Begin(d mut Device&) I32 {
+    if g.Count >= g.cap: return 1
+    return cu.oann_capture_begin(d.Stream())
+}
+
+# ends the capture and keeps the graph under key, then replays it once (the capture ran nothing)
+fn (g mut Graphs&) Seal(d mut Device&, key Array<U64>&) {
+    x := Array<U64>(1)
+    nodes := Array<I32>(1)
+    st := cu.oann_graph_end_keep(d.Stream(), x, nodes)
+    if st != 0: unreachable "CUDA graph capture failed: " + Text(cu.cudaGetErrorString(st))
+    for j in range 8: g.Keys[8 * g.Count + j] = key[j]
+    g.Execs[g.Count] = x[0]
+    g.Count++
+    cu.oann_graph_launch(d.Status(), x[0], d.Stream())
+    g.Launched++
+}
+
+fn (g mut Graphs&) Replay(d mut Device&, i I64) {
+    cu.oann_graph_launch(d.Status(), g.Execs[i], d.Stream())
+    g.Launched++
+}
