@@ -48,6 +48,10 @@ import "conn"
 # the rows of a unit of work, at most
 Chunk I64 = 128
 
+# the rows of a unit while some rows may stop on their own (Engine.Stoppable): smaller, so a unit whose rows are all done
+# is left out of a sweep
+StopChunk I64 = 8
+
 # the phases a system holds side by side: free, nudged toward the targets, nudged away (centered EP)
 type Phase enum { Free, Plus, Minus }
 
@@ -190,6 +194,13 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     groups mut Array<I64>& = Array<I64>(0)          # the first unit of each population in that order, and the end
     fresh mut Array<Bool>& = Array<Bool>(0)         # Gauss-Seidel: whether population i was swept in this sweep
     seidel Bool = false                             # the running settle's sweeps are Gauss-Seidel
+    Certified mut Array<Bool>& = Array<Bool>(batch) # batch rows the nudged pair's certificate holds for (System.NudgedRate), taken by the next Nudged
+    Stoppable mut Array<Bool>& = Array<Bool>(phases * batch)   # the rows that stop on their own residual: set for one settle, cleared by it
+    RowDone mut Array<Bool>& = Array<Bool>(phases * batch)     # the stoppable rows that have stopped in the running settle
+    RowStop mut Array<I64>& = Array<I64>(phases * batch)       # the sweep each row stopped at in the last settle (-1: it ran to the end)
+    RowRes mut Array<F64>& = Array<F64>(phases * batch)        # each row's residual after the last sweep of a rate settle on rows
+    stopping Bool = false                           # the running settle has rows that may stop
+    Skipped I64 = 0                                 # every population's row-sweeps not run because their rows had stopped
     acc mut History<T>& = History<T>(0, 0)        # Anderson's history
     spec mut Vec<mut Array<T>&>& = Vec<mut Array<T>&>()    # Spectral's vector (zero until drawn), kept to warm-start the next call
     specW mut Vec<mut Array<T>&>& = Vec<mut Array<T>&>()   # its product with the coupling
@@ -249,7 +260,7 @@ fn (e mut Engine<T>&) Ready() {
         l.Index = e.wideSc.Ev.Len()                 # its collector in every scratch
         e.wideSc.Ev.Push(sparse.Events(l.PreSize))
     }
-    most := e.Pops.Len() * e.Phases * ((e.Batch + Chunk - 1) / Chunk)
+    most := e.Pops.Len() * e.Phases * ((e.Batch + StopChunk - 1) / StopChunk).Max((e.Batch + Chunk - 1) / Chunk)
     e.units = Array<I64>(3 * most)
     e.worst = Array<T>(most)
     e.Mass = Array<F64>(units)
@@ -413,6 +424,7 @@ fn (e mut Engine<T>&) clearCounts(p mut Population<T>&, r0 I64, r1 I64) {
 fn (e mut Engine<T>&) plan(lo I64, hi I64) {
     e.count = 0
     e.work = 0
+    step := StopChunk if e.stopping else Chunk
     for at in range e.Pops.Len() {
         i := e.order[at]
         p := e.Pops[i]
@@ -423,11 +435,11 @@ fn (e mut Engine<T>&) plan(lo I64, hi I64) {
         for l in p.Back: carried += e.Links[l].Count
         e.work += (hi - lo) * e.Batch * carried
         for ph in range lo, hi {
-            for c0 := 0, c0 < e.Batch, c0 += Chunk {
+            for c0 := 0, c0 < e.Batch, c0 += step {
                 base := ph * e.Batch
                 e.units[3 * e.count] = i
                 e.units[3 * e.count + 1] = base + c0
-                e.units[3 * e.count + 2] = base + (c0 + Chunk).Min(e.Batch)
+                e.units[3 * e.count + 2] = base + (c0 + step).Min(e.Batch)
                 e.count++
             }
         }
@@ -471,6 +483,10 @@ fn (e mut Engine<T>&) task(u0 I64, u1 I64, t I64, every I64) {
     for u in range u0 + t, u1, every {
         p := e.Pops[e.units[3 * u]]
         r0, r1 := e.units[3 * u + 1], e.units[3 * u + 2]
+        if e.stopping and e.allDone(r0, r1) {
+            e.worst[u] = T(0)
+            continue
+        }
         e.totals(ws, sc, p, r0, r1)
         e.worst[u] = e.lifStep(p, r0, r1) if p.Spiking else e.rateStep(p, r0, r1)
     }
@@ -653,13 +669,15 @@ fn retireLif<T>(p mut Population<T>&, b mut Columns<neuron.LifCell<T>>&, r I64) 
 # made afresh (a nudged phase keeps the free phase's)
 fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
     e.prepare(lo, hi, fold)
+    e.seidel = b.Scheme.GaussSeidel and not e.Spiking
+    e.stopping = e.mayStop(b, lo, hi)
     e.plan(lo, hi)
     e.damping = b.Damping
     e.cur = 0
-    e.seidel = b.Scheme.GaussSeidel and not e.Spiking
     e.acc.Kept, e.acc.Slot, e.acc.Started = 0, 0, false
     out := e.spikes(b) if e.Spiking else e.relax(b, lo * e.Batch, hi * e.Batch, e.depthFor(b))
     e.seidel = false
+    e.endStops()
     if e.cur == 1: e.commit(lo * e.Batch, hi * e.Batch)
     e.cur = 0
     e.Sweeps += out.Sweeps
@@ -677,6 +695,7 @@ fn (e mut Engine<T>&) relax(b Budget, r0 I64, r1 I64, m I64) Settlement {
         worst := F64(e.sweepOnce())
         if rows and worst == worst: worst = e.rowsResidual(r0, r1)
         out := Settlement(k, worst, worst <= b.Tol)
+        if e.stopping and not out.Converged and worst == worst: e.stopRows(r0, r1, b.Tol, k)
         if out.Converged and e.seidel: e.cur = 1 - e.cur
         if out.Converged or out.Diverged() or k == b.Sweeps: return out
         if m > 0: e.accelerate(r0, r1, worst, m)
@@ -704,9 +723,53 @@ fn (e mut Engine<T>&) rowsResidual(r0 I64, r1 I64) F64 {
         for p in e.Pops {
             if p.Role != neuron.Role.Input: sum += rowSquares(p, e.cur, r, inv)
         }
+        e.RowRes[r] = sum.Sqrt()
         worst = neuron.Worse(worst, sum.Sqrt())
     }
     return worst
+}
+
+# whether a settle of phases lo .. hi lets rows stop on their own: some row is Stoppable, and the sweeps are Jacobi's,
+# plain (no Anderson), measured per row (Euclid), of built-in rate models. Clears the rows' record
+fn (e mut Engine<T>&) mayStop(b Budget, lo I64, hi I64) Bool {
+    some := false
+    for r in range lo * e.Batch, hi * e.Batch {
+        e.RowDone[r] = false
+        e.RowStop[r] = -1
+        if e.Stoppable[r]: some = true
+    }
+    return some and b.Euclid and e.builtIn() and not e.Spiking and not e.seidel and e.depthFor(b) == 0
+}
+
+# the settle over: no row stays stoppable into the next settle
+fn (e mut Engine<T>&) endStops() {
+    e.stopping = false
+    for r in range e.Stoppable.Len(): e.Stoppable[r] = false
+}
+
+# whether every row r0 .. r1 has stopped
+fn (e mut Engine<T>&) allDone(r0 I64, r1 I64) Bool {
+    for r in range r0, r1 {
+        if not e.RowDone[r]: return false
+    }
+    e.Skipped += r1 - r0
+    return true
+}
+
+# after sweep k (rows r0 .. r1 measured, RowRes): each stoppable row not yet done whose residual is within tol stops -
+# the state the sweep wrote, one step closer, is the one it keeps, in both buffers, and no unit of rows all stopped
+# runs again
+fn (e mut Engine<T>&) stopRows(r0 I64, r1 I64, tol F64, k I64) {
+    for r in range r0, r1 {
+        if not e.Stoppable[r] or e.RowDone[r] or not (e.RowRes[r] <= tol): continue
+        e.RowDone[r] = true
+        e.RowStop[r] = k
+        for p in e.Pops {
+            if p.Role == neuron.Role.Input: continue
+            n := p.Size
+            copyRows(p.rate(1 - e.cur), p.rate(e.cur), r * n, r * n, n)
+        }
+    }
 }
 
 # the sum over p's live units in row r of ((u' - u) inv)^2, u read from buffer cur and u' from the other

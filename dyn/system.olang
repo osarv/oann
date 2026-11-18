@@ -433,11 +433,16 @@ fn (s mut System<T>&) Nudged(b settle.Budget, beta F64 = 0.5, centered Bool = tr
     if centered: s.E.Beta[2] = -beta
     if Gpu {
         if s.gpu.M != null {
+            for row in range s.E.Batch: s.E.Certified[row] = false
             for ph in range 1, hi: s.gpu.M!.Warm(s.E, ph, 0)
             return s.gpu.M!.Settle(s.E, 1, hi, b, false)
         }
     }
     for ph in range 1, hi: s.E.Warm(ph, 0)
+    for ph in range 1, hi {
+        for row in range s.E.Batch: s.E.Stoppable[ph * s.E.Batch + row] = s.E.Certified[row]
+    }
+    for row in range s.E.Batch: s.E.Certified[row] = false
     return s.E.Settle(1, hi, b, false)
 }
 
@@ -778,6 +783,7 @@ fn (s mut System<T>&) NudgedKappa(beta F64) F64 {
 # worst row's rate (1 where a row is not certified, the free phase did not converge, or the model is spiking) and the
 # rows certified on their own
 fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
+    for row in range s.E.Batch: s.E.Certified[row] = false
     if not free.Converged or s.E.Spiking: return 1.0, 0
     k := s.Kappa()
     for i in range s.E.Pops.Len() {
@@ -789,6 +795,7 @@ fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
     for row in range s.E.Batch {
         q, _ := s.rowRate(row, k, blocks, beta.Abs(), free.Residual)
         worst = worst.Max(q)
+        s.E.Certified[row] = q < 1.0
         if q < 1.0: rows++
     }
     return worst, rows
@@ -1524,6 +1531,38 @@ test System.NudgedRate "the block norm: on a layered system (no lateral blocks) 
     }
     assert gained >= 12 and refused >= 12, $plainRows + " rows certified in the plain norm, " + $blockRows + " in the block norm, " + $gained + " by it alone, " + $refused + " by neither"
     assert tightest > 0.5, "the measured contraction at most " + $tightest + " of the certified rate"
+}
+
+test System.NudgedRate "a per-row stop: certified rows of one batch stop at their own sweeps, every one within the tolerance of where the whole batch's settle leaves it, and the sweeps they skip are not run" {
+    mixed, skipped := 0, 0
+    for trial in range 36 {
+        bound := Norm.Spectral
+        s := System<F64>.layered(U64(200 + trial), [1.0, 2.0, 4.0][trial / 2 % 3], bound)
+        beta := [0.1, 0.5, 1.0][trial / 12]
+        tol := s.LessonTolerance(beta)
+        free := s.Settle(settle.Phase.Free, s.BudgetFor(tol))
+        assert free.Converged
+        for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((trial * 7 + i * 3) % 10)
+        q, rows := s.NudgedRate(beta, free)
+        b := s.BudgetAt(tol, q.Min(0.95))
+        before := s.E.Skipped
+        stopped := s.Nudged(b, beta)
+        assert stopped.Converged
+        at := Array<I64>(6, -1)
+        for r in range 6: at[r] = s.E.RowStop[r]
+        kept := s.potentials()
+        s.Nudged(b, beta)
+        whole := s.potentials()
+        dist := 0.0
+        for i in range kept.Len(): dist = dist.Max((kept[i] - whole[i]).Abs())
+        assert dist <= 10.0 * tol / (1.0 - s.Kappa()), "trial " + $trial + ": the stopped rows are " + $dist + " from the whole settle's, tolerance " + $tol
+        for r in range 2, 6 {
+            if at[r] >= 0 and at[r] != at[2 + (r + 1) % 4]: mixed++
+        }
+        skipped += s.E.Skipped - before
+        assert rows > 0 or s.E.Skipped == before
+    }
+    assert mixed > 0 and skipped > 0, "rows stopped at their own sweeps in " + $mixed + " cases, " + $skipped + " row-sweeps skipped"
 }
 
 # the nudged pair at beta settled sweep by sweep from the free state (free its settlement): in each row the rate

@@ -150,7 +150,8 @@ fn thinned(s system.System<F32>&, keep F64) Bool {
 fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut learn.AdamW<F32>&, trainSet mut loader.Loader<D>&, testSet mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, beta F64, labels mut Array<I32>&, name String&, lessons I64, restrain Bool) ? io.Error {
     t0 := time.Now()
     trainSet.Epoch()
-    sweeps, taught, refused, certified, rows := 0, 0, 0, 0, 0
+    sweeps, taught, refused, certified, rows, nudgedSweeps := 0, 0, 0, 0, 0, 0
+    skipped0 := s.E.Skipped
     loss F64 = 0.0
     for b in range trainSet.Batches() {
         if lessons > 0 and taught >= lessons: break
@@ -165,6 +166,7 @@ fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut learn.
         taught++
         if lesson.Rate < 1.0: certified++
         rows += lesson.Rows
+        nudgedSweeps += lesson.Nudged.Sweeps
         loss += s.Loss(settle.Phase.Free)
         opt.Step()
         s.Hold()
@@ -172,7 +174,7 @@ fn epoch<D>(s mut system.System<F32>&, l mut learn.Learner<F32>&, opt mut learn.
     }
     spent := F64(time.Since(t0)) * 1e-9
     try io.Put($name + ": train loss " + $(loss / F64(taught)).Fixed(4) + ", " + $(F64(sweeps) / F64(taught)).Fixed(1) +
-        " sweeps a lesson, " + $refused + " refused, nudged pairs certified " + $certified + " (rows " + $(100.0 * F64(rows) / F64((taught * s.E.Batch).Max(1))).Fixed(1) + "%), " + $spent.Fixed(2) + " s, " + $(spent * 1e6 / F64(taught.Max(1))).Fixed(0) + " us a lesson; ")
+        " sweeps a lesson, " + $refused + " refused, nudged pairs certified " + $certified + " (rows " + $(100.0 * F64(rows) / F64((taught * s.E.Batch).Max(1))).Fixed(1) + "%, " + $(100.0 * F64(s.E.Skipped - skipped0) / F64((nudgedSweeps * 2 * s.E.Batch * 2).Max(1))).Fixed(1) + "% of the nudged row-sweeps stopped), " + $spent.Fixed(2) + " s, " + $(spent * 1e6 / F64(taught.Max(1))).Fixed(0) + " us a lesson; ")
     try show(s, testSet, pixels, digits, tol, labels, "")
 }
 
