@@ -21,6 +21,16 @@ Moved to oagent (`agent/`): `agent`, `store`, `consolidator`, their examples (`s
 `bandit_settle`), `bench/paired`, and the frozen engine they run on (`circuit`, `linalg`, `optim`, `sparse`, `nn`,
 `ops`, `conv`, `kernels`, `quant`).
 
+## The agent's mechanisms as dyn pieces (wt-dynpieces, 2026-11-18)
+
+Both were already in dyn: the top-k store as a connection (`dyn/store`'s `Memory`, the `Remember` rule, over
+kernels/sparse) and sleep consolidation as a rule (`dyn/sleep`'s `Sleeper`, the `Dream` rule); oagent's legacy engine is
+gone (oagent 5ae86cd). What oagent's consolidator offers and the Sleeper lacked is added: `Parts` (slow answer, store
+read, familiarity apart), a checkpoint's state (`Generator`/`SetGenerator`, `CueInputs`, `Keep`), and dawn rewriting at
+rate 1 whatever the store's day Rate. Tests: Memory's recall against a dense connection masked to the top K (1e-12), a
+restored sleeper's night bit for bit. The agent's slow part stays a gated recurrence on ad/graph (BPTT); rebuilding it
+as a dyn system on the Sleeper is oagent's step.
+
 ## Small graphs (bench/smallgraph, 2026-11-16)
 
 oagent's consolidator moved from its own engine to ad/graph and its nights got 33-40% slower. bench/smallgraph is its

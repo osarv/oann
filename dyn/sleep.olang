@@ -89,6 +89,37 @@ fn (k mut Sleeper<T>&) Answer(withStore Bool, out mut Array<T>&) {
     }
 }
 
+# the system's batch answers for the key rows as clamped, in their parts ([batch, Out] each): the slow part alone into
+# slow, the store's read into fast, and with the memory's Familiarity how familiar each row is to the store, per output
+# (Store.ReadFamiliar), into familiar (left as it is without). Answer(true, ...) is close to slow + fast: the read joins
+# the drive, so they add exactly for a linear readout
+fn (k mut Sleeper<T>&) Parts(slow mut Array<T>&, fast mut Array<T>&, familiar mut Array<T>&) {
+    k.settleSlow()
+    for r in range k.S.Batch {
+        a := k.answer(r)
+        for j in range k.Out: slow[r * k.Out + j] = a[j]
+        k.M.Core.Read(k.M.KeyRow(r), fast[r * k.Out:(r + 1) * k.Out])
+        if k.M.Core.Familiarity: k.M.Core.ReadFamiliar(familiar[r * k.Out:(r + 1) * k.Out])
+    }
+}
+
+# what a checkpoint keeps of a sleeper beside its system and store: its generator's state (std/rand's State: the
+# reservoir's draws and the nights' orders), the cues kept (Kept rows of In, a view) and Seen; Keep and SetGenerator
+# put them back
+fn (k Sleeper<T>&) Generator() Array<U64> { return k.rng.State() }
+
+fn (k mut Sleeper<T>&) SetGenerator(s Array<U64>&) ? rand.Error { try k.rng.SetState(s) }
+
+fn (k Sleeper<T>&) CueInputs() Array<T>& { return k.cues[0:k.Kept * k.In] }
+
+# the cues kept replaced by count rows of u (In each, count at most Cues), out of seen rows the days showed (count when 0)
+fn (k mut Sleeper<T>&) Keep(u Array<T>&, count I64, seen I64 = 0) {
+    assert count >= 0 and count <= k.Cues, "a sleeper keeps at most " + $k.Cues + " cues, not " + $count
+    for i in range count * k.In: k.cues[i] = u[i]
+    k.Kept = count
+    k.Seen = seen if seen > 0 else count
+}
+
 # a day: the batch clamped on the key population with the readout's targets given (known marks the targets observed,
 # default all): the store writes what the slow part's answer lacks, and the key rows join the cues
 fn (k mut Sleeper<T>&) Day(known Array<Bool>?& = null) {
@@ -187,7 +218,8 @@ fn (k mut Sleeper<T>&) teach() F64 ? learn.LearnError {
 }
 
 # dawn: the store cleared, then each dream's residual from the slow part as it now is written at the cue's code, in
-# passes until every residual reads back within DawnTolerance
+# passes until every residual reads back within DawnTolerance - at rate 1 whatever the store's Rate by day (a smaller
+# one averages noisy days; dawn's residuals are exact)
 fn (k mut Sleeper<T>&) dawn() {
     k.M.Core.Clear()
     for first in range 0, k.Kept, k.S.Batch {
@@ -215,7 +247,7 @@ fn (k mut Sleeper<T>&) rewrite() F64 {
         k.M.Core.Encode(k.cues[c * k.In:(c + 1) * k.In], k.idx, k.code)
         k.M.Core.ReadCode(k.idx, k.code, k.res)
         for j in range k.Out: worst = worst.Max(F64((k.resid[c * k.Out + j] - k.res[j]).Abs()))
-        k.M.Core.WriteCode(k.idx, k.code, k.resid[c * k.Out:(c + 1) * k.Out])
+        k.M.Core.WriteCode(k.idx, k.code, k.resid[c * k.Out:(c + 1) * k.Out], 1.0)
     }
     return worst
 }
@@ -235,10 +267,12 @@ fn (d mut Dream&) Apply(params mut Array<F32>&, grads mut Array<F32>&) { d.K.Nig
 fn keepOf(k mut Sleeper<F32>&, row Array<F32>&) { k.keep(row) }
 fn rewriteOf(k mut Sleeper<F32>&) F64 { return k.rewrite() }
 fn dreamRowOf(k mut Sleeper<F32>&) { k.load(0, true) }
+fn keepAllOf(k mut Sleeper<F32>&, u Array<F32>&) { k.Keep(u, 1, 3) }
 
 assert not keepOf.Allocates, "keeping a cue allocates"
 assert not rewriteOf.Allocates, "dawn's rewrite allocates"
 assert not dreamRowOf.Allocates, "loading a replayed batch allocates"
+assert not keepAllOf.Allocates, "restoring the cues allocates"
 
 # ---- tests ----
 
@@ -412,6 +446,52 @@ test Sleeper.Night "nothing kept: a night does nothing; a night is a Tick of the
     k.Day()
     k.Night()!
     assert g.Learner.Lessons == 3 * 2
+}
+
+test Sleeper.Parts "parts: the slow answer and the store's read, apart; on the linear rig they add to the answer with the store" {
+    g := Rig(4, 6, 2, 7)
+    k := g.Sleeper(16, 0.05, 20)
+    keys := Array<F64>(16 * 6)
+    for d in range 2 {
+        g.clamp(keys, d * 24)
+        k.Day()
+        k.Night()!
+    }
+    slow := Array<F64>(8)
+    fast := Array<F64>(8)
+    whole := Array<F64>(8)
+    k.Parts(slow, fast, Array<F64>(0))
+    k.Answer(true, whole)
+    alone := Array<F64>(8)
+    k.Answer(false, alone)
+    for i in range 8 {
+        assert (slow[i] - alone[i]).Abs() < 1e-12
+        assert (slow[i] + fast[i] - whole[i]).Abs() < 1e-9, "row part " + $i + ": " + $slow[i] + " + " + $fast[i] + " against " + $whole[i]
+    }
+}
+
+test Sleeper.Keep "a checkpoint: a sleeper given another's cues, Seen and generator runs the same night, bit for bit" {
+    a := Rig(4, 6, 2, 8) # b's clamps are never made: only what a checkpoint keeps carries a's days over
+    b := Rig(4, 6, 2, 8)
+    ka := a.Sleeper(8, 0.05, 5)
+    kb := b.Sleeper(8, 0.05, 5)
+    keys := Array<F64>(16 * 6)
+    for d in range 4 {
+        a.clamp(keys, d * 24)
+        ka.Day()
+    }
+    assert ka.Seen == 16 and ka.Kept == 8
+    for i in range b.Memory.Core.Table.Len(): b.Memory.Core.Table[i] = a.Memory.Core.Table[i]
+    for i in range b.Memory.Core.Mean.Len(): b.Memory.Core.Mean[i] = a.Memory.Core.Mean[i]
+    kb.Keep(ka.CueInputs(), ka.Kept, ka.Seen)
+    kb.SetGenerator(ka.Generator())!
+    la := ka.Night()!
+    lb := kb.Night()!
+    assert la == lb and kb.Seen == 16
+    pa := a.S.E.Params
+    pb := b.S.E.Params
+    for i in range pa.Len(): assert pa[i] == pb[i]
+    for i in range a.Memory.Core.Table.Len(): assert a.Memory.Core.Table[i] == b.Memory.Core.Table[i]
 }
 
 test Dream.Apply "a Dream rule on a clock runs the night when its Tick does" {
