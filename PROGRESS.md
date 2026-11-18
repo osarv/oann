@@ -79,6 +79,16 @@ Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved roun
   `dot2` (0.49-0.63x, streaming down to 1.06-1.32x), or rows cut into 256-value blocks each summed apart (0.52-0.63x,
   F32 itself slower) - is no faster. Left as it is; the fix belongs in olang's codegen (a BF16 widening SLP keeps
   horizontal, or explicit lanes), and `vdpbf16ps` (avx512_bf16 is on this CPU) stays out, needing BF16 activations.
+- BF16 matrix-vector, the cause found (wt-bf16vec, 2026-11-18; olang O45): not olang's widening IR but LLVM's SLP
+  order - it visits the loop's exit before its header, so a total of two chains' own `laneSum`s (or two rows' results
+  stored side by side) seeds a 2-wide tree pairing the chains' lanes back into the loop; for F32 that tree costs more
+  than it saves, for BF16 the widening tips it. `dotRow` now sums every row, any storage type, in eight chains added
+  lane by lane before one `laneSum` (the order is shared, so the bit-for-bit storage tests hold), one row at a time:
+  a clean zmm loop (vpmovzxwd, vpslld, FMA). Batch 1, 9 rounds alternated with the old build three times (load 10-17):
+  BF16/F32 1 x 784 x 128 0.44-0.60x -> 0.69-0.75x, 1 x 512 x 512 0.58-0.62x -> 0.74-0.86x, 1 x 128 x 512 0.67-0.73x ->
+  0.80-0.84x, 1 x 1024 x 1024 1.42-1.70x -> 1.46-1.70x; F32 unchanged within noise; INT8 weights under F32 unchanged at
+  cache-resident shapes, 2.1-3.2x -> 1.7-2.6x at 1 x 1024 x 1024 (it lost the two-row read of the vector). BF16 >= F32
+  stays out of reach in L2: a widened vector is three vector-port uops to F32's one.
 - `bench/int8`'s F32 ran slow because nn/quant imported ad/graph: the program passed ThinFrom and linked by ThinLTO,
   which inlines no kernel helper across objects (repro/crossinline). nn/quant is now graph-free (`DenseOf`, `ConvOf`)
   and nn/quantgraph reads models from a graph. Against the real F32 path INT8 is slower at 64+ rows: its packed
