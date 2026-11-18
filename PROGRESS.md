@@ -493,6 +493,21 @@ where the softmax bounds hold. What is left to try: a budget per row (rows certi
 clamped budget - needs a per-row stop in dyn/settle), or a tighter `c` (the hidden slopes weighted by the readouts'
 weights, a per-row power iteration).
 
+### A per-row stop in the CPU settle (wt-certrow, 2026-11-18)
+
+`System.NudgedRate` now leaves which rows it certified in `Engine.Certified`; the next `System.Nudged` (CPU only; the
+GPU branch clears it) makes those rows `Engine.Stoppable`. In a Jacobi, plain (no Anderson), Euclid-measured settle of
+built-in rate models, a stoppable row stops at the first sweep its own residual is within the tolerance (`RowStop`
+records the sweep): its state is kept in both buffers and a unit of `StopChunk` = 8 rows (instead of 128, only while some
+row may stop) whose rows have all stopped is not run again (`Engine.Skipped` counts those row-sweeps). Uncertified rows
+keep sweeping to the clamped budget as before. Test: `System.NudgedRate` "a per-row stop" (36 layered systems: rows of
+one batch stop at different sweeps, every row within 10 tol / (1 - kappa) of the whole-batch settle, skipped
+row-sweeps counted). Measured on MNIST `3 60000 128 32 1 0.001 0.5 1 1 0.1 200 1 0 plain spectral`: 0.0 / 0.4 / 1.4% of
+the nudged row-sweeps skipped (epochs 1 / 2 / 3), us a lesson unchanged (2375 at epoch 3 against 2365), accuracy 96.94%
+against 97.07% (the stopped rows sit one step apart). Reading: a batch's rows converge within a few sweeps of each other
+and a unit stops only when all 8 of its rows have, so the stop saves almost nothing at batch 32; it would pay with
+compaction of the live rows into the products (the real lever), not by skipping units.
+
 ## The GPU route, GP1: bindings and a GEMM through cuBLAS (wt-gp1, 2026-11-17)
 
 docs/redesign.md 1.10 and 4.4's GP1. `kernels/gpu/cuda.c` (the C shim: device addresses and handles as U64, host arrays
