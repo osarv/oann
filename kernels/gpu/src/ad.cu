@@ -171,12 +171,23 @@ extern "C" __global__ void oann_ad_bias(real *y, const real *b, long long n, lon
     OANN_LOOP(i, n) y[i] = y[i] + b[i % cols];
 }
 
-// out[c] = the sum of column c over the rows (+ out[c] where add): a bias's gradient. One thread a column, the rows in order
+// out[c] = the sum of column c over the rows (+ out[c] where add): a bias's gradient. GP7: a block of 1024 threads is 32
+// columns by 32 row lanes; lane l sums rows l, l + 32, ... in order, and the 32 partials are added in lane order - a fixed
+// order and no atomics (the one thread a column of GP6 took 35 us for 1024 rows of 128)
 extern "C" __global__ void oann_ad_colsum(real *out, const real *x, long long rows, long long cols, long long add) {
-    OANN_LOOP(c, cols) {
-        real s = (real)0;
-        for (long long r = 0; r < rows; r++) s += x[r * cols + c];
-        out[c] = add ? s + out[c] : s;
+    __shared__ real part[32][33];
+    int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    long long c = (long long)blockIdx.x * 32 + tx;
+    real s = (real)0;
+    if (c < cols) {
+        for (long long r = ty; r < rows; r += 32) s += x[r * cols + c];
+    }
+    part[ty][tx] = s;
+    __syncthreads();
+    if (ty == 0 && c < cols) {
+        real t = (real)0;
+        for (int i = 0; i < 32; i++) t += part[i][tx];
+        out[c] = add ? t + out[c] : t;
     }
 }
 
@@ -308,17 +319,32 @@ extern "C" __global__ void oann_ad_norm_grad(real *dx, const real *dy, const rea
     }
 }
 
-// dgain[c] (+)= sum over rows of dy xhat, dbias[c] (+)= sum of dy; either address 0 where not wanted. One thread a column
+// dgain[c] (+)= sum over rows of dy xhat, dbias[c] (+)= sum of dy; either address 0 where not wanted. Tiled as colsum: 32
+// columns by 32 row lanes, the partials added in lane order
 extern "C" __global__ void oann_ad_norm_param_grad(real *dgain, real *dbias, const real *dy, const real *x, const real *mean, const real *inv, long long rows, long long cols, long long addG, long long addB) {
-    OANN_LOOP(c, cols) {
-        real ag = (real)0, ab = (real)0;
-        for (long long r = 0; r < rows; r++) {
+    __shared__ real pg[32][33];
+    __shared__ real pb[32][33];
+    int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
+    long long c = (long long)blockIdx.x * 32 + tx;
+    real ag = (real)0, ab = (real)0;
+    if (c < cols) {
+        for (long long r = ty; r < rows; r += 32) {
             real g = dy[r * cols + c];
             ag += g * (x[r * cols + c] - mean[r]) * inv[r];
             ab += g;
         }
-        if (dgain) dgain[c] = addG ? ag + dgain[c] : ag;
-        if (dbias) dbias[c] = addB ? ab + dbias[c] : ab;
+    }
+    pg[ty][tx] = ag;
+    pb[ty][tx] = ab;
+    __syncthreads();
+    if (ty == 0 && c < cols) {
+        real tg = (real)0, tb = (real)0;
+        for (int i = 0; i < 32; i++) {
+            tg += pg[i][tx];
+            tb += pb[i][tx];
+        }
+        if (dgain) dgain[c] = addG ? tg + dgain[c] : tg;
+        if (dbias) dbias[c] = addB ? tb + dbias[c] : tb;
     }
 }
 

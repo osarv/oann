@@ -47,8 +47,12 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, ParseError {
         try io.Put("no CUDA device\n")
         return
     }
-    if which != "lm": try mlpBench(rounds)
-    if which != "mlp": try lmBench(rounds, steps)
+    if which != "lm" and which != "prof" and which != "gpulm": try mlpBench(rounds)
+    if which == "prof" {
+        try lmProfile()
+        return
+    }
+    if which != "mlp": try lmBench(rounds, steps, which == "gpulm")
 }
 
 # ---- M1 ----
@@ -213,17 +217,48 @@ fn lmSteps(threads I64, mode I64, steps I64) F64, F64 {
     return median(times.ToArray()), loss
 }
 
-fn lmBench(rounds I64, steps I64) ? io.Error {
+# where the transformer's step spends its time on the device: each node's kernels run back to back, by kind (us a step)
+fn lmProfile() ? io.Error {
+    cfg := gpt.GptConfig.Char(65)
+    g := graph.Graph<F32>(16, 1)
+    m := gpt.Gpt.New(g, cfg)
+    lm := m.Lm(g)
+    try g.Plan(rand.Rand(1), device.Backend.Gpu) catch e { unreachable $e }
+    toks := g.Ints(lm.Tokens).Flat()!
+    tgts := g.Ints(lm.Targets).Flat()!
+    r := rand.Rand(9)
+    for i in range toks.Len() { toks[i] = I32(r.Below(65)) }
+    for i in range tgts.Len() { tgts[i] = I32(r.Below(65)) }
+    g.Forward(16)
+    g.Backward(lm.Loss)
+    g.Profiling = true
+    for k in range g.Times.Len(): g.Times[k] = 0
+    g.GpuProfile(lm.Loss, 50)
+    try io.Put("the transformer's step on the device by kind, kernels back to back (us a step): forward, backward\n")
+    fwd, bwd F64 = 0.0, 0.0
+    for k in range graph.KindNames.Len() {
+        f, b := F64(g.Times[2 * k]) / 1000.0, F64(g.Times[2 * k + 1]) / 1000.0
+        if f + b == 0.0: continue
+        fwd += f
+        bwd += b
+        try io.Put("  " + graph.KindNames[k] + ": " + $f.Fixed(1) + ", " + $b.Fixed(1) + "\n")
+    }
+    try io.Put("  total: " + $fwd.Fixed(1) + ", " + $bwd.Fixed(1) + "\n")
+}
+
+fn lmBench(rounds I64, steps I64, gpuOnly Bool) ? io.Error {
     try io.Put("M2: the character transformer (4 x 128, 4 heads, context 64, 65 characters) a step of 16 sequences, " + $steps + " steps a round, " + $rounds + " rounds, medians\n")
     names := Array<String>["CPU 1 thread", "CPU 4 threads", "GPU", "GPU, one CUDA graph a step"]
     spent := Array<Vec<F64>>[Vec<F64>(), Vec<F64>(), Vec<F64>(), Vec<F64>()]
     for _ in range rounds {
         for k in range 4 {
+            if gpuOnly and k < 2: continue
             t, _ := lmSteps(4 if k == 1 else 1, (k - 1).Max(0) if k > 1 else 0, steps)
             spent[k].Push(t)
         }
     }
     for k in range 4 {
+        if gpuOnly and k < 2: continue
         t := median(spent[k].ToArray())
         try io.Put("  " + names[k] + ": " + $(t * 1000.0).Fixed(2) + " ms a step (" + $(F64(16 * 64) / t).Fixed(0) + " characters/s)\n")
     }

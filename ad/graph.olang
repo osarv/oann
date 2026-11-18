@@ -2399,6 +2399,28 @@ if Gpu {
         g.gpu.FreshParams = true
     }
 
+    # GP7: Times (microseconds, by kind: forward, backward) filled with what each node's kernels take on the device, each
+    # run reps times back to back after a Forward and a Backward from loss on n entries (the profile of a GPU step)
+    fn (g mut Graph<T>&) GpuProfile(loss Var, reps I64) {
+        m := g.gpu.M!
+        n := g.N
+        for i in range g.nodes.Len() {
+            if isLeaf(g.nodes[i].Kind): continue
+            us := m.TimeStep(g.gpu.Steps[i], n, g.Pos, false, false, false, false, reps)
+            g.Times[2 * KindOf(g.nodes[i].Kind)] += I64(us * 1000.0)
+        }
+        for k in range I64(loss) + 1 {
+            i := I64(loss) - k
+            nd := g.nodes[i]
+            if nd.GradOffset < 0 or not g.written[i] or isLeaf(nd.Kind): continue
+            a0 := g.acc(firstInput(nd.Kind, 0))
+            a1 := g.acc(firstInput(nd.Kind, 1))
+            a2 := g.acc(firstInput(nd.Kind, 2))
+            us := m.TimeStep(g.gpu.Steps[i], n, g.Pos, true, a0, a1, a2, reps)
+            g.Times[2 * KindOf(nd.Kind) + 1] += I64(us * 1000.0)
+        }
+    }
+
     # the device's mirror (for the optimizer's step, nn/optim)
     fn (g Graph<T>&) Mirror() mut mirror.Mirror<T>& { return g.gpu.M! }
 

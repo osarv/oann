@@ -236,6 +236,13 @@ fn (m mut Mirror<T>&) rowk(k I64, rows I64, cols I64, args ...U64) {
     kern.LaunchKit(d, m.kit, k, rows, RowBlock(cols), ...args)
 }
 
+# kernel k over cols columns in tiles: a block of 1024 threads a 32 columns (the column sums' kernels)
+fn (m mut Mirror<T>&) tiles(k I64, cols I64, args ...U64) {
+    if cols <= 0: return
+    d := m.dev
+    kern.LaunchKit(d, m.kit, k, (cols + 31) / 32, 1024, ...args)
+}
+
 # kernel k in one block (reductions over a whole array)
 fn (m mut Mirror<T>&) once(k I64, args ...U64) {
     d := m.dev
@@ -429,7 +436,7 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             out := s.Inner
             if s.DA >= 0: m.product(s.DA, rows, cols, s.DY, rows, out, false, s.B, out, cols, false, add0)
             if s.DB >= 0: m.product(s.DB, out, cols, s.DY, rows, out, true, s.A, rows, cols, false, add1)
-            if s.DC >= 0: m.elems(KColSum, out, m.at(s.DC), m.at(s.DY), n64(rows), n64(out), flag(add2))
+            if s.DC >= 0: m.tiles(KColSum, out, m.at(s.DC), m.at(s.DY), n64(rows), n64(out), flag(add2))
         }
         case Work.MatMul {
             k := s.Inner
@@ -484,7 +491,7 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             if s.DA >= 0: m.rowk(KNormGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), m.at(s.B), n64(cols), flag(s.Flag), flag(add0))
             dg U64 = 0 if s.DB < 0 else m.at(s.DB)
             db U64 = 0 if s.DC < 0 else m.at(s.DC)
-            if s.DB >= 0 or s.DC >= 0: m.elems(KNormParam, cols, dg, db, m.at(s.DY), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), n64(rows), n64(cols), flag(add1), flag(add2))
+            if s.DB >= 0 or s.DC >= 0: m.tiles(KNormParam, cols, dg, db, m.at(s.DY), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), n64(rows), n64(cols), flag(add1), flag(add2))
         }
         case Work.Embedding {
             if s.DB >= 0: m.rowk(KEmbedGrad, s.Inner, cols, m.at(s.DB), m.at(s.DY), m.Ints.Addr(s.IntA), n64(rows), n64(cols), flag(add1))
@@ -588,6 +595,25 @@ fn (m mut Mirror<T>&) GradNorm() F64 {
     m.Stats.Download(one, 2 * m.nodes, 0, 1)
     m.sync()
     return one[0].Sqrt()
+}
+
+# ---- GP7: where the device's time goes ----
+
+# microseconds a run of step s takes back to back on the device (reps runs between two events), forward or backward: the
+# profile of a step by node (Graph.GpuProfile). Backward's gradients are written and added as given, the values are
+# whatever the arena holds
+fn (m mut Mirror<T>&) TimeStep(s Step&, n I64, pos I64, backward Bool, add0 Bool, add1 Bool, add2 Bool, reps I64) F64 {
+    d := m.dev
+    t := try kern.Timer.Make(d) catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+    if backward { m.Backward(s, n, pos, add0, add1, add2) } else { m.Forward(s, n, pos) }
+    m.sync()
+    t.Start(d)
+    for _ in range reps {
+        if backward { m.Backward(s, n, pos, add0, add1, add2) } else { m.Forward(s, n, pos) }
+    }
+    t.Stop(d)
+    ms := try t.Ms() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+    return 1000.0 * ms / F64(reps)
 }
 
 # ---- what must not allocate, decided while compiling (S17a, G42) ----
