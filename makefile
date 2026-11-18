@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -158,6 +158,12 @@ bpe:
 board:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_mnist_board examples/mnist_board.olang
 	$(GPUENV) ./build/examples_mnist_board $(ARGS)
+
+# the exact implicit gradient's adjoint, plain sweeps against Anderson's at depth 3 and 5, on 2- and 3-layer rate
+# systems: sweeps and time (bench/adjoint.olang) - ARGS: rounds, batch, tolerance, seed
+adjointbench:
+	$(OLANG) build -output build/bench_adjoint bench/adjoint.olang
+	./build/bench_adjoint $(ARGS)
 
 # M14 (docs/redesign.md 4.3): models/hybrid's transformer with a settle block on tiny Shakespeare, trained twice - every
 # settle from rest, then from the amortizer's guess - and the sweeps a settle takes in each (bench/hybrid.olang) - ARGS:

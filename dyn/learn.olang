@@ -34,7 +34,8 @@
 # as sparse rows.
 #
 # Gradients at a fixed point (ImplicitGrad), for a loss L given through dL/ds of one population's activities: exact
-# (the adjoint lambda = rho'(u) (dz + W_eff^T lambda) solved by a fixed-point iteration on the transposed Jacobian),
+# (the adjoint lambda = rho'(u) (dz + W_eff^T lambda) solved by a fixed-point iteration on the transposed Jacobian,
+# Anderson-accelerated as the settles are where System.Use asks for it),
 # JFB (Jacobian-free: lambda = rho'(u) dz, the feedback ignored - Fung et al. 2022) or EP (two phases nudged through
 # the drive by -+beta dz, their contrast). Then dL/dW = lambda_post s_pre^T (and s_post lambda_pre^T where the
 # connection is read back), dL/db = lambda, and dL/d(drive) = lambda for a relaxing population, rho'(d) W^T lambda for
@@ -1005,17 +1006,22 @@ fn (l mut Learner<T>&) TruncatedGrad(out system.Pop, dz tensor.Tensor<T>&, k I64
 }
 
 # the exact adjoint: lambda <- lambda + dt (rho'(u) (dz + W_eff^T lambda) - lambda) from zero until the change is
-# within tol, at most sweeps sweeps
+# within tol, at most sweeps sweeps - accelerated by Anderson's method where the system's scheme asks for it
+# (System.Use(settle.Sweeping(Anderson = m)): the forward settles' setting, the same depth)
 fn (l mut Learner<T>&) exact(out system.Pop, dz Array<T>&, tol F64, sweeps I64) settle.Settlement ? LearnError {
     l.source(out, dz)
     clear(l.lam, 0, l.lam.Len())
-    dt := T(l.S.E.Dt)
+    e := l.S.E
+    dt := T(e.Dt)
+    m := e.Depth(l.S.Scheme)
+    e.Restart()
     for k in range sweeps + 1 {
         l.carryBack(l.lam, l.adj)
         worst := F64(adjointStep(l.lam, l.next, l.src, l.slope, l.adj, dt))
         l.Adjoint = settle.Settlement(k, worst, worst <= tol)
         if l.Adjoint.Converged: break
         if k == sweeps or l.Adjoint.Diverged(): error LearnError.NotSettled("adjoint", k, worst)
+        if m > 0: e.Accelerate(l.lam, l.next, worst, m)
         l.lam, l.next = l.next, l.lam
     }
     l.fromAdjoint()
@@ -1546,6 +1552,27 @@ test Learner.TruncatedGrad "the truncated adjoint is JFB at k = 0 and tends to t
     l.TruncatedGrad(system.Pop(3), dz, 2000, system.Pop(0), dx)!
     tk := s.E.Grads.Copy()
     assert relative(t0, j) < 1e-12 and relative(tk, g) < 1e-8, $relative(t0, j) + " " + $relative(tk, g)
+}
+
+test Learner.ImplicitGrad "Anderson's adjoint (System.Use, depth 3 and 5) gives the plain adjoint's gradient in a third fewer sweeps or better, both wirings" {
+    for symmetric in [true, false] {
+        r := rand.Rand(33)
+        s := wired(symmetric, r)
+        s.Certify(0.97)
+        dz := tensor.Tensor<F64>.Zeros(2, 3)
+        dz.FillUniform(r, -1.0, 1.0)
+        readLoss(s, dz.Flat()!)
+        l := Learner<F64>(s)!
+        g, dx, _ := implicitOf(l, dz, system.Implicit.Exact(1e-13, 20000))
+        plain := l.Adjoint.Sweeps
+        for m in [3, 5] {
+            s.Use(settle.Sweeping(Anderson = m))
+            a, ax, _ := implicitOf(l, dz, system.Implicit.Exact(1e-13, 20000))
+            try io.PutLn("adjoint sweeps at kappa 0.97, " + ("reciprocal" if symmetric else "one-way") + ": plain " + $plain + ", Anderson(" + $m + ") " + $l.Adjoint.Sweeps)
+            assert relative(a, g) < 1e-9 and relative(ax, dx) < 1e-9 and 3 * l.Adjoint.Sweeps < 2 * plain, $relative(a, g) + " " + $l.Adjoint
+        }
+        s.Use(settle.Sweeping())
+    }
 }
 
 test Learner.ImplicitGrad "the exact gradient through one-way connections (dense, event-driven) against central differences" {

@@ -1230,6 +1230,35 @@ settled cost within 1e-6, Unrolled(400) against implicit within 1e-6 (Unrolled(3
 (beta 1e-3) within 1e-5, one-sided within 1e-2; 30 EP steps halve the settled cost. Found on the way: two Backwards
 after one Forward must run the later-recorded loss first (the plan's liveness assumes it; ad/README.md).
 
+## Anderson's acceleration for the exact adjoint (wt-anderson, 2026-11-18)
+
+dyn/learn's exact implicit gradient (`Implicit.Exact`) now solves its adjoint with Anderson's method where the system's
+scheme asks for it: one setting, `System.Use(settle.Sweeping(Anderson = m))`, accelerates both the forward settles and
+the adjoint, at the same depth, on the settle's history (no new room: Reserve's already covers one phase's rows;
+ImplicitGrad still allocates nothing). The adjoint's safeguard is looser than a settle's - the history is dropped only
+where the residual grows tenfold: with the settle's (drop at any rise) the adjoint took *more* sweeps than plain
+(67 against 45 on 784-256-10), since a linear iteration's sup-norm residual under Anderson is not monotone; with no
+safeguard and with the tenfold one the sweeps were the same. The forward settle's safeguard is unchanged. Truncated
+gradients (TruncatedGrad) stay plain: their k steps are the Neumann series by definition.
+
+`make adjointbench ARGS="5 32 1e-6"` (bench/adjoint.olang): tanh rate systems, symmetric connections, random inputs,
+batch 32, adjoint tolerance 1e-6, F64, the median of 5, one thread:
+
+| system | kappa | plain sweeps | ms | Anderson(3) sweeps | ms | Anderson(5) sweeps | ms | gradient vs plain |
+|---|---|---|---|---|---|---|---|---|
+| 784-256-10 | 0.9 | 45 | 4.54 | 27 | 4.95 | 22 | 4.81 | 1.2e-06 |
+| 784-256-10 | 0.99 | 67 | 6.31 | 36 | 6.73 | 29 | 6.41 | 2.8e-06 |
+| 784-256-256-10 | 0.9 | 57 | 30.01 | 34 | 26.97 | 27 | 22.31 | 7.0e-07 |
+| 784-256-256-10 | 0.99 | 85 | 47.05 | 48 | 32.40 | 35 | 25.99 | 1.2e-06 |
+
+Reading: Anderson(5) halves the adjoint's sweeps or better (2.0-2.4x fewer), Anderson(3) 1.7-1.9x. In time it pays
+where a sweep is dear: the 3-layer system is 1.35-1.8x faster at depth 5; the 2-layer one, whose sweep is one small
+product, is level (the history's dot products cost about what the sweep saved). The gradients agree with the plain
+adjoint's to the tolerance. The test (dyn/learn, kappa 0.97, both wirings): plain 137 / 44 sweeps, Anderson(5) 47 / 27,
+gradients within 1e-9 at tolerance 1e-13. examples/mnist_learn has no exact-gradient path (EP lessons only), so it is
+not measured here; a 3-layer system that needs Anderson on the forward settle (oagent e6) now gets it on the adjoint
+from the same `Use`.
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP5 are done (above; G-M2's verdict: the

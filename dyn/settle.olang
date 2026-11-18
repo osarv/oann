@@ -32,7 +32,7 @@
 # sense - x + f - (dX + dF) gamma, gamma = argmin |f - dF gamma| - rather than x + f. The residual is still measured
 # by the sweep, of the state it read; where it grows the history is dropped and the plain step taken (the safeguard).
 # Rate populations only: a system with a spiking or custom population sweeps plainly. Its room is reserved (Reserve)
-# for a depth up to Depth.
+# for a depth up to Depth. A learner's exact adjoint is accelerated the same way, by the same setting (Accelerate).
 #
 # A step is v += dt r, dt the system's (1: plain fixed-point iteration) - smaller, dt / (1 + beta lambda), in a phase
 # nudged toward its targets (settling.md 1.2: the nudge then only damps) - times 1 - Damping. A spiking system's sweep
@@ -308,8 +308,9 @@ fn firstReady(need Array<I64>&, done Array<Bool>&) I64 {
     unreachable "every population is placed"
 }
 
-# room for Anderson acceleration up to depth: the history of every relaxing population's rows, every phase (it
-# allocates, once, where the caller chooses; a smaller depth than reserved needs nothing)
+# room for Anderson acceleration up to depth: the history of every relaxing population's rows, every phase (a
+# learner's adjoint, Accelerate, needs one phase's); it allocates, once, where the caller chooses
+# (a smaller depth than reserved needs nothing)
 fn (e mut Engine<T>&) Reserve(depth I64) {
     if depth <= e.acc.Depth: return
     size I64 = 0
@@ -792,7 +793,7 @@ fn (e Engine<T>&) depthFor(b Budget) I64 {
         model := p.Model
         if p.Role != neuron.Role.Input and model != neuron.Neuron.Rate: return 0
     }
-    return b.Scheme.Anderson.Min(e.acc.Depth).Max(0)
+    return e.Depth(b.Scheme)
 }
 
 # ---- Anderson acceleration ----
@@ -803,13 +804,52 @@ fn (e Engine<T>&) depthFor(b Budget) I64 {
 # history, and the buffer written becomes the plain sweep's step from the state before it (which the next sweep takes
 # without comparing)
 fn (e mut Engine<T>&) accelerate(r0 I64, r1 I64, worst F64, m I64) {
-    a := e.acc
     n := e.gather(r0, r1)
-    if a.Started and worst > a.Last {
+    if e.acc.step(n, m, worst, 1.0): e.scatter(r0, r1)
+}
+
+# Anderson's method for an iteration outside the settles - a learner's exact adjoint - on the settle's history (the
+# room Reserve made covers every unit's rows of a batch): the depth the scheme gives, at most the depth reserved
+fn (e Engine<T>&) Depth(scheme Sweeping) I64 { return scheme.Anderson.Min(e.acc.Depth).Max(0) }
+
+# the history forgotten: before a new iteration
+fn (e mut Engine<T>&) Restart() { e.acc.Kept, e.acc.Slot, e.acc.Started = 0, 0, false }
+
+# after a step of the iteration from x to next with residual worst, both laid out as a learner's per-unit arrays (a
+# population's rows of Batch at its Unit): next becomes the step Anderson's method of depth m takes instead over the
+# relaxing populations' rows, where it takes one. Its safeguard is looser than a settle's: the history is dropped only
+# where the residual grew tenfold (a linear iteration's residual under Anderson's method is not monotone in the sup
+# norm, and dropping it at every rise cost more sweeps than plain ones)
+fn (e mut Engine<T>&) Accelerate(x Array<T>&, next mut Array<T>&, worst F64, m I64) {
+    a := e.acc
+    at I64 = 0
+    for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
+        for i in range p.Unit * e.Batch, (p.Unit + p.Size) * e.Batch {
+            a.X[at] = x[i]
+            a.F[at] = next[i] - x[i]
+            at++
+        }
+    }
+    if not a.step(at, m, worst, 10.0): return
+    at = 0
+    for p in e.Pops {
+        if p.Role == neuron.Role.Input: continue
+        for i in range p.Unit * e.Batch, (p.Unit + p.Size) * e.Batch {
+            next[i] = a.X[at]
+            at++
+        }
+    }
+}
+
+# a step of depth m over the n values gathered (X the state a step read, F the step it made, worst its residual):
+# whether X now holds the next state - the extrapolation, or, where the residual grew past guard times the last (the
+# safeguard), the plain step from the state before, the history dropped; false where the plain step stands
+fn (a mut History<T>&) step(n I64, m I64, worst F64, guard F64) Bool {
+    if a.Started and worst > guard * a.Last {
         a.Kept, a.Slot, a.Started = 0, 0, false
         for i in range n: a.X[i] = a.PX[i] + a.PF[i]
-        e.scatter(r0, r1)
-        return
+        return true
     }
     if a.Started: a.push(n, m)
     for i in range n {
@@ -818,15 +858,15 @@ fn (e mut Engine<T>&) accelerate(r0 I64, r1 I64, worst F64, m I64) {
     }
     a.Started = true
     a.Last = worst
-    if a.Kept == 0: return
+    if a.Kept == 0: return false
     singular := false
     try a.solve(n, m) catch { singular = true }
     if singular {
         a.Kept, a.Slot = 0, 0
-        return
+        return false
     }
     a.extrapolate(n)
-    e.scatter(r0, r1)
+    return true
 }
 
 # rows r0 .. r1 of every relaxing population gathered: the potentials read (X) and the step to those written (F);

@@ -1,0 +1,101 @@
+# bench/adjoint - the exact implicit gradient's adjoint (dyn/learn's ImplicitGrad, Implicit.Exact) solved by plain
+# fixed-point sweeps against Anderson's acceleration at depth 3 and 5 (System.Use(settle.Sweeping(Anderson = m)), the
+# setting the forward settles share), on a 2-layer (784-256-10) and a 3-layer (784-256-256-10) rate system of tanh
+# units, symmetric connections, random inputs, certified at each gain: the sweeps the adjoint takes to the tolerance and
+# the median time of one over the rounds. The forward settle is plain and run once; the gradients are checked against
+# the plain adjoint's.
+# Arguments, all optional: the rounds (5), the batch (32), the adjoint's tolerance (1e-6), the seed (1). Build and run
+# from the repository's root: make adjointbench ARGS="5 32 1e-6"
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../tensor"
+import "../dyn/neuron"
+import "../dyn/conn"
+import "../dyn/settle"
+import "../dyn/system"
+import "../dyn/learn"
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
+    if i >= args.Len(): return fallback
+    return try json.Json.Parse(args[i]).AsNum()
+}
+
+# a rate system of tanh units: 784 inputs, the hidden layers given, 10 readouts, symmetric between relaxing layers
+fn layered(batch I64, hidden Array<I64>&, kappa F64, r mut rand.Rand&) system.System<F64> ? {
+    s := system.System<F64>(batch)
+    root := s.Root()
+    tanh := neuron.Neuron.Rate(neuron.Rho.Tanh)
+    prev := s.Population(root, "x", 784, tanh, neuron.Role.Input)
+    first := true
+    for i, n in hidden {
+        h := s.Population(root, "h" + $i, n, tanh)
+        s.Connect(prev, h, conn.Wiring.Dense if first else conn.Wiring.Symmetric)
+        prev, first = h, false
+    }
+    y := s.Population(root, "y", 10, tanh, neuron.Role.Readout(neuron.Cost.Squared))
+    s.Connect(prev, y, conn.Wiring.Symmetric)
+    try s.Plan(r)
+    s.Certify(kappa)
+    x := s.Pop(system.Pop(0))
+    for i in range x.Drive.Len(): x.Drive[i] = r.Uniform(-1.0, 1.0)
+    return s
+}
+
+# the largest |a - b| over the largest |b|
+fn relative(a Array<F64>&, b Array<F64>&) F64 {
+    d, top := 0.0, 0.0
+    for i in range a.Len() {
+        d = d.Max((a[i] - b[i]).Abs())
+        top = top.Max(b[i].Abs())
+    }
+    return d / top
+}
+
+fn main() ? {
+    args := os.Args()
+    rounds := I64(try number(args, 1, 5))
+    batch := I64(try number(args, 2, 32))
+    tol := try number(args, 3, 1e-6)
+    seed := U64(try number(args, 4, 1))
+    try io.PutLn("| system | kappa | plain sweeps | ms | Anderson(3) sweeps | ms | Anderson(5) sweeps | ms | worst gradient difference |")
+    try io.PutLn("|---|---|---|---|---|---|---|---|---|")
+    for depth in [1, 2] {
+        for kappa in [0.9, 0.99] {
+            hidden := Array<I64>(depth, 256)
+            try row(hidden, kappa, batch, tol, rounds, seed)
+        }
+    }
+}
+
+fn row(hidden Array<I64>&, kappa F64, batch I64, tol F64, rounds I64, seed U64) ? {
+    r := rand.Rand(seed)
+    s := try layered(batch, hidden, kappa, r)
+    out := system.Pop(hidden.Len() + 1)
+    settled := s.Settle(settle.Phase.Free, settle.Budget(100000, 1e-10))
+    if not settled.Converged: unreachable "the forward settle did not settle: " + $settled
+    l := try learn.Learner<F64>(s)
+    dz := tensor.Tensor<F64>.Zeros(batch, 10)
+    dz.FillUniform(r, -1.0, 1.0)
+    dx := tensor.Tensor<F64>.Zeros(batch, hidden[0])
+    line := "| 784-" + $hidden[0] + ("-" + $hidden[1] if hidden.Len() > 1 else "") + "-10 | " + $kappa + " | "
+    plain := Array<F64>(0)
+    worst := 0.0
+    for m in [0, 3, 5] {
+        s.Use(settle.Sweeping(Anderson = m))
+        times := Array<F64>(rounds)
+        for k in range rounds {
+            t0 := time.Now()
+            try l.ImplicitGrad(out, dz, system.Implicit.Exact(tol, 20000), system.Pop(1), dx)
+            times[k] = F64(time.Since(t0)) * 1e-6
+        }
+        times.Sort(fn(a, b): return a < b)
+        if m == 0: plain = s.E.Grads.Copy()
+        if m > 0: worst = worst.Max(relative(s.E.Grads, plain))
+        line += $l.Adjoint.Sweeps + " | " + times[rounds / 2].Fixed(2) + " | "
+    }
+    try io.PutLn(line + $worst + " |")
+}
