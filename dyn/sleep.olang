@@ -18,6 +18,12 @@
 #   now produce at the cue, in passes until every residual reads back or DawnPasses are done: it holds only what the
 #   slow weights did not absorb, and slow plus store recall the dreams again as exactly as the store can.
 #
+# The slow part may instead be a gated recurrence (dyn/recur, the last argument): the system then supplies the key and
+# value populations and the store, the recurrence answers (its answer plus the store's read is the whole answer) and a
+# night teaches it the dreams by backpropagation through time. With a DayRate (off by default) the slow part also
+# learns by day: one step of gradient descent toward what the store does not already hold, chosen by a backtracking
+# line search (dayStep, descend) - oagent's consolidator's day.
+#
 # Sleep consolidates what the system produces, mistakes included - it does not correct the store. Batches of the
 # system's own size are replayed; the last one is padded by repeating its first row. Nothing is allocated after the
 # Sleeper is made.
@@ -29,9 +35,11 @@ import "settle"
 import "system"
 import "learn"
 import "store"
+import "recur"
 
 type Sleeper<T> struct(l mut learn.Learner<T>&, m mut store.Memory<T>&, Cues I64 = 64, Rate F64 = 0.01, Passes I64 = 20
-        DawnPasses I64 = 10, DawnTolerance F64 = 0.001, Optimize Bool = true, seed U64 = 1) {
+        DawnPasses I64 = 10, DawnTolerance F64 = 0.001, Optimize Bool = true, seed U64 = 1
+        slow mut recur.Recurrence<T>?& = null) {
     L mut learn.Learner<T>& = l
     M mut store.Memory<T>& = m
     S mut system.System<T>& = l.S
@@ -44,9 +52,16 @@ type Sleeper<T> struct(l mut learn.Learner<T>&, m mut store.Memory<T>&, Cues I64
     DawnPasses
     DawnTolerance
     Optimize
+    R mut recur.Recurrence<T>?& = slow              # the slow part, when it is a recurrence and not the system's settle
+    assert slow == null or (slow.In == In and slow.Out == Out and slow.Batch == S.Batch), "a sleeper's recurrence takes the key population's rows to the value population's, over the system's batch"
     Budget settle.Budget = settle.Budget()          # a free settle's budget
+    DayRate F64 = 0.0                               # a day's line search starts at this step; 0: the slow part learns only at night
+    Halvings I64 = 10                               # and halves it at most this many times
+    DayBeta F64 = 0.05                              # a system's day gradient: a centered EP lesson nudged this far
     rng rand.Rand = rand.Rand(seed)
-    opt mut optim.AdamW<T, T>& = optim.AdamW<T, T>(S.Params(), S.ParamGrads(), rate = Rate)
+    opt mut optim.AdamW<T, T>& = optimizerFor<T>(S, slow, Rate)
+    saved mut Array<T>& = Array<T>(S.E.Params.Len() if slow == null else slow.G.ParamCount)
+    given mut Array<T>& = Array<T>(S.Batch * Out)
     cues mut Array<T>& = Array<T>(Cues * In)
     dreams mut Array<T>& = Array<T>(Cues * Out)
     order mut Array<I64>& = Array<I64>(Cues)
@@ -60,29 +75,68 @@ type Sleeper<T> struct(l mut learn.Learner<T>&, m mut store.Memory<T>&, Cues I64
     NightLoss F64 = 0.0                             # the last night's mean loss over its last pass
     DawnError F64 = 0.0                             # the largest error of a read of a residual after the last dawn
     DawnPassesTaken I64 = 0
+    DayLoss F64 = 0.0                               # the last day's loss of the slow part against its target, before its step
+    DaySteps I64 = 0                                # day steps the line search took
+    Declined I64 = 0                                # and gave up
 }
 
-# the slow part's settle: the readout's drive cleared (no store), free phase
-fn (k mut Sleeper<T>&) settleSlow() settle.Settlement {
+# the night's optimizer: AdamW over the recurrence's parameters, or the system's
+fn optimizerFor<T>(s system.System<T>&, slow recur.Recurrence<T>?&, rate F64) mut optim.AdamW<T, T>& {
+    if slow == null: return optim.AdamW<T, T>(s.Params(), s.ParamGrads(), rate = rate)
+    return optim.AdamW<T, T>(slow.Params(), slow.ParamGrads(), rate = rate)
+}
+
+# the slow part's answer to the key rows as clamped: the recurrence run on them, or the system's settle with the
+# readout's drive cleared (no store), free phase
+fn (k mut Sleeper<T>&) settleSlow() {
+    if k.R == null {
+        out := k.S.Pop(k.M.Value)
+        for i in range out.Drive.Len(): out.Drive[i] = T(0)
+        k.S.Settle(settle.Phase.Free, k.Budget)
+        return
+    }
+    k.loadSlow(false)
+    k.R!.Run()
+}
+
+# the key rows (and with targets the readout's targets) into the recurrence
+fn (k mut Sleeper<T>&) loadSlow(targets Bool) {
+    rec := k.R!
+    key := k.S.Pop(k.M.Key)
     out := k.S.Pop(k.M.Value)
-    for i in range out.Drive.Len(): out.Drive[i] = T(0)
-    return k.S.Settle(settle.Phase.Free, k.Budget)
+    for r in range k.S.Batch {
+        rec.Load(r, key.Drive[r * k.In:(r + 1) * k.In])
+        if targets: rec.Target(r, out.Target[r * k.Out:(r + 1) * k.Out])
+    }
 }
 
-# row r of the readout's free-phase answer
+# the answer with the store's read: the read joined to the readout's drive and settled, or added to the recurrence's
+# answer (its output is linear in the read)
+fn (k mut Sleeper<T>&) settleWhole() {
+    if k.R == null {
+        k.M.Recall()
+        k.S.Settle(settle.Phase.Free, k.Budget)
+        return
+    }
+    k.settleSlow()
+    for r in range k.S.Batch {
+        k.M.Core.Read(k.M.KeyRow(r), k.res)
+        a := k.R!.Row(r)
+        for j in range k.Out: a[j] += k.res[j]
+    }
+}
+
+# row r of the last answer: the readout's free phase, or the recurrence's
 fn (k Sleeper<T>&) answer(r I64) Array<T>& {
+    if k.R != null: return k.R!.Row(r)
     return k.S.Pop(k.M.Value).Activity(0)[r * k.Out:(r + 1) * k.Out]
 }
 
 # the system's batch answers for the key rows as clamped, into out ([batch, Out]): the slow part alone, or with the
 # store's read joined to the readout's drive
 fn (k mut Sleeper<T>&) Answer(withStore Bool, out mut Array<T>&) {
-    if withStore {
-        k.M.Recall()
-        k.S.Settle(settle.Phase.Free, k.Budget)
-    } else {
-        k.settleSlow()
-    }
+    if withStore: k.settleWhole()
+    else: k.settleSlow()
     for r in range k.S.Batch {
         a := k.answer(r)
         for j in range k.Out: out[r * k.Out + j] = a[j]
@@ -120,9 +174,11 @@ fn (k mut Sleeper<T>&) Keep(u Array<T>&, count I64, seen I64 = 0) {
     k.Seen = seen if seen > 0 else count
 }
 
-# a day: the batch clamped on the key population with the readout's targets given (known marks the targets observed,
-# default all): the store writes what the slow part's answer lacks, and the key rows join the cues
+# a day: the batch clamped on the key population with the readout's targets given (known marks the outputs observed,
+# default all): with a DayRate the slow part first takes one step of gradient descent toward what the store does not
+# already hold (dayStep); then the store writes what the slow part's answer lacks, and the key rows join the cues
 fn (k mut Sleeper<T>&) Day(known Array<Bool>?& = null) {
+    if k.DayRate > 0.0: k.dayStep(known)
     k.settleSlow()
     for r in range k.S.Batch {
         a := k.answer(r)
@@ -131,6 +187,75 @@ fn (k mut Sleeper<T>&) Day(known Array<Bool>?& = null) {
         k.M.Core.Write(k.M.KeyRow(r), k.res, known)
         k.keep(k.M.KeyRow(r))
     }
+}
+
+# the slow part's day step: its targets the observed outputs less the store's read at each key row (its own answer
+# where unobserved, so nothing is learned there), one step of gradient descent on its loss against them (descend), the
+# readout's targets then put back as given
+fn (k mut Sleeper<T>&) dayStep(known Array<Bool>?&) {
+    out := k.S.Pop(k.M.Value)
+    k.settleSlow()
+    for r in range k.S.Batch {
+        k.M.Core.Read(k.M.KeyRow(r), k.res)
+        a := k.answer(r)
+        for j in range k.Out {
+            i := r * k.Out + j
+            k.given[i] = out.Target[i]
+            out.Target[i] = k.given[i] - k.res[j] if known == null or known[j] else a[j]
+        }
+    }
+    k.descend()
+    for i in range k.given.Len(): out.Target[i] = k.given[i]
+}
+
+# the slow part's loss against the readout's targets as they stand, and with grad its gradient into the parameters'
+# gradients: backpropagation through the recurrence's window, or a centered EP lesson of the system nudged by DayBeta
+# (refused as the learner refuses it)
+fn (k mut Sleeper<T>&) slowLoss(grad Bool) F64 ? learn.LearnError {
+    if k.R != null {
+        k.loadSlow(true)
+        if grad: k.R!.Learn()
+        else: k.R!.Run()
+        return k.R!.Loss()
+    }
+    if not grad {
+        k.settleSlow()
+        return k.S.Loss(settle.Phase.Free)
+    }
+    k.settleSlow()
+    loss := k.S.Loss(settle.Phase.Free)
+    try k.L.Lesson(k.S.Root(), k.DayBeta)
+    return loss
+}
+
+# one step of gradient descent on the slow part's loss by a backtracking line search: from DayRate, halved until the
+# loss falls by at least 1e-4 times the step times the gradient's squared norm (Armijo), at most Halvings times - and
+# no step at all when it never does or the gradient is refused (Declined)
+fn (k mut Sleeper<T>&) descend() {
+    before := try k.slowLoss(true) catch {
+        k.Declined++
+        return
+    }
+    k.DayLoss = before
+    p := (k.S.Params() if k.R == null else k.R!.Params()).Flat()!
+    g := (k.S.ParamGrads() if k.R == null else k.R!.ParamGrads()).Flat()!
+    norm F64 = 0.0
+    for i in range p.Len() {
+        k.saved[i] = p[i]
+        norm += F64(g[i]) * F64(g[i])
+    }
+    if norm == 0.0: return
+    eta F64 = k.DayRate
+    for _ in range k.Halvings + 1 {
+        for i in range p.Len(): p[i] = k.saved[i] - T(eta) * g[i]
+        if (try k.slowLoss(false) catch { unreachable }) <= before - 1e-4 * eta * norm {
+            k.DaySteps++
+            return
+        }
+        eta = 0.5 * eta
+    }
+    for i in range p.Len(): p[i] = k.saved[i]
+    k.Declined++
 }
 
 # a key row into the reservoir of cues
@@ -183,8 +308,7 @@ fn (k mut Sleeper<T>&) Night() F64 ? learn.LearnError {
 fn (k mut Sleeper<T>&) dream() {
     for first in range 0, k.Kept, k.S.Batch {
         k.load(first, false)
-        k.M.Recall()
-        k.S.Settle(settle.Phase.Free, k.Budget)
+        k.settleWhole()
         for r in range k.S.Batch {
             c := k.cueAt(first, r, false)
             a := k.answer(r)
@@ -207,6 +331,13 @@ fn (k mut Sleeper<T>&) teach() F64 ? learn.LearnError {
             for r in range k.S.Batch {
                 c := k.cueAt(first, r, true)
                 for j in range k.Out: out.Target[r * k.Out + j] = k.dreams[c * k.Out + j]
+            }
+            if k.R != null {
+                k.loadSlow(true)
+                k.R!.Learn()
+                if k.Optimize: k.opt.Step()
+                loss += k.R!.Loss() * F64(k.S.Batch)
+                continue
             }
             try k.L.Tick(system.Clock.Sleep)
             if k.Optimize: k.opt.Step()
@@ -261,7 +392,8 @@ type Dream struct(k mut Sleeper<F32>&) {
 fn (d mut Dream&) Apply(params mut Array<F32>&, grads mut Array<F32>&) { d.K.Night()! }
 
 # ---- what must not allocate, decided while compiling (S17a, G42): the day's write, a cue kept, the dawn's rewrite ----
-# Not pinned: whatever settles or takes a product (B2a's note, dyn/learn). Resident memory over many days and nights is
+# Not pinned: whatever settles or takes a product (B2a's note, dyn/learn), nor what reads or writes a recurrence's graph
+# (ad/graph's Data makes a view). Resident memory over many days and nights is
 # measured instead (the tests).
 
 fn keepOf(k mut Sleeper<F32>&, row Array<F32>&) { k.keep(row) }
@@ -549,6 +681,170 @@ test Sleeper.Night "days and nights allocate nothing: resident memory does not g
     for _ in range 40 {
         life(s, x, y, k, r)
         k.Night()!
+    }
+    grown := resident() - before
+    assert grown <= 16, "resident memory grew by " + $grown + " pages"
+}
+
+# a sleeper whose slow part is a gated recurrence (dyn/recur) of one step: the linear task's system supplies the key
+# and value populations and the store, the recurrence answers
+type RecurRig struct(batch I64, n I64, m I64, hidden I64, seed U64) {
+    G mut Rig& = Rig(batch, n, m, seed)
+    Rec mut recur.Recurrence<F64>& = recur.Recurrence<F64>(n, m, hidden, 1, batch, seed + 7)
+    K mut Sleeper<F64>& = Sleeper<F64>(G.Learner, G.Memory, 32, 0.02, 60, 10, 1e-6, true, 5, Rec)
+}
+
+test Sleeper.Answer "a recurrence as the slow part: the sleeper's slow answer is the recurrence's, and with the store the read is added" {
+    q := RecurRig(4, 6, 2, 8, 21)
+    keys := Array<F64>(4 * 6)
+    q.G.clamp(keys, 0)
+    q.K.Day()
+    slow := Array<F64>(8)
+    whole := Array<F64>(8)
+    q.K.Answer(false, slow)
+    q.K.Answer(true, whole)
+    x := q.G.S.Pop(q.G.X)
+    read := Array<F64>(2)
+    for r in range 4: q.Rec.Load(r, x.Drive[r * 6:(r + 1) * 6])
+    q.Rec.Run()
+    for r in range 4 {
+        q.G.Memory.Core.Read(x.Drive[r * 6:(r + 1) * 6], read)
+        for j in range 2 {
+            assert slow[r * 2 + j] == q.Rec.Answers[r * 2 + j]
+            assert (whole[r * 2 + j] - slow[r * 2 + j] - read[j]).Abs() < 1e-12
+        }
+    }
+}
+
+test Sleeper.Night "a recurrence as the slow part: nights teach it the dreams by backpropagation through time" {
+    q := RecurRig(4, 6, 2, 8, 22)
+    keys := Array<F64>(16 * 6)
+    for d in range 4 {
+        q.G.clamp(keys, d * 24)
+        q.K.Day()
+    }
+    before := q.G.error(q.K, keys, false)
+    dreamt := q.G.error(q.K, keys, true)
+    q.K.Night()!
+    after := q.G.error(q.K, keys, false)
+    whole := q.G.error(q.K, keys, true)
+    assert after < 0.6 * before, "the slow part alone: " + $before + " before the night, " + $after + " after"
+    assert whole < 1e-3 + dreamt, "slow and store recall the dreams as before: " + $dreamt + ", then " + $whole
+    assert q.Rec.Runs > 60 and q.K.NightLoss < 0.5 * before * before
+}
+
+test Sleeper.Day "DayRate 0 (the default): a day takes no step, the slow weights stay as they were bit for bit" {
+    q := RecurRig(4, 6, 2, 8, 23)
+    p := q.Rec.Params().Flat()!
+    was := Array<F64>(p.Len())
+    for i in range p.Len(): was[i] = p[i]
+    keys := Array<F64>(8 * 6)
+    q.G.clamp(keys, 0)
+    q.K.Day()
+    q.G.clamp(keys, 24)
+    q.K.Day()
+    for i in range p.Len(): assert p[i] == was[i]
+    assert q.K.DaySteps == 0 and q.K.Declined == 0
+    w := q.G.S.Weights(system.Conn(0)).Flat()!
+    g := Rig(4, 6, 2, 24)
+    k := g.Sleeper(8, 0.05, 1)
+    g.clamp(keys, 0)
+    k.Day()
+    for v in g.S.Weights(system.Conn(0)).Flat()!: assert v == 0.0
+    assert w.Len() == 12 and k.DaySteps == 0
+}
+
+# the consolidator's day update written out (oagent's agent/consolidator.olang, Day with a DayRate): the slow part's
+# targets y - read where known, its own answer elsewhere; the loss of the recurrence written by hand (recur.Reference)
+# and its gradient by central differences; then the Armijo search from rate, halved at most halvings times
+fn dayByHand(p mut Array<F64>&, n I64, m I64, h I64, rows I64, u Array<F64>&, t Array<F64>&, rate F64, halvings I64) {
+    out := Array<F64>(rows * m)
+    before := recur.Reference(p, n, m, h, 1, rows, u, t, out)
+    g := Array<F64>(p.Len())
+    norm F64 = 0.0
+    for i in range p.Len() {
+        at := p[i]
+        p[i] = at + 1e-6
+        up := recur.Reference(p, n, m, h, 1, rows, u, t, out)
+        p[i] = at - 1e-6
+        down := recur.Reference(p, n, m, h, 1, rows, u, t, out)
+        p[i] = at
+        g[i] = (up - down) / 2e-6
+        norm += g[i] * g[i]
+    }
+    saved := Array<F64>(p.Len())
+    for i in range p.Len(): saved[i] = p[i]
+    eta F64 = rate
+    for _ in range halvings + 1 {
+        for i in range p.Len(): p[i] = saved[i] - eta * g[i]
+        if recur.Reference(p, n, m, h, 1, rows, u, t, out) <= before - 1e-4 * eta * norm: return
+        eta = 0.5 * eta
+    }
+    for i in range p.Len(): p[i] = saved[i]
+}
+
+test Sleeper.Day "DayRate: a day's step is the consolidator's - a line search on the recurrence's loss against the targets less the store's read" {
+    q := RecurRig(4, 6, 2, 8, 25)
+    q.K.DayRate = 4.0                               # too long a first step: the search halves it
+    keys := Array<F64>(8 * 6)
+    q.G.clamp(keys, 0)
+    q.K.Day()                                       # the store holds something before the day checked
+    known := Array<Bool>[true, false]
+    q.G.clamp(keys, 24)
+    x := q.G.S.Pop(q.G.X)
+    y := q.G.S.Pop(q.G.Y)
+    p := q.Rec.Params().Flat()!
+    want := Array<F64>(p.Len())
+    for i in range p.Len(): want[i] = p[i]
+    q.K.settleSlow()
+    t := Array<F64>(8)
+    read := Array<F64>(2)
+    for r in range 4 {
+        q.G.Memory.Core.Read(x.Drive[r * 6:(r + 1) * 6], read)
+        for j in range 2: t[r * 2 + j] = y.Target[r * 2 + j] - read[j] if known[j] else q.Rec.Answers[r * 2 + j]
+    }
+    dayByHand(want, 6, 2, 8, 4, x.Drive, t, 4.0, 10)
+    q.K.Day(known)
+    assert q.K.DaySteps == 2 and q.K.Declined == 0
+    worst F64 = 0.0
+    moved F64 = 0.0
+    for i in range p.Len() {
+        worst = worst.Max((p[i] - want[i]).Abs())
+        moved = moved.Max((want[i] - q.K.saved[i]).Abs())
+    }
+    assert worst < 1e-8 and moved > 1e-3, "the parameters differ by " + $worst + " after a step of " + $moved
+}
+
+test Sleeper.Day "DayRate on a system's slow part: days move the slow weights toward the task by EP lessons and a line search" {
+    g := Rig(4, 6, 2, 26)
+    k := g.Sleeper(16, 0.05, 1)
+    k.DayRate = 0.5
+    keys := Array<F64>(16 * 6)
+    fresh := Array<F64>(16 * 6)
+    for d in range 4: g.clamp(fresh, d * 24)
+    first := g.error(k, fresh, false)
+    for d in range 8 {
+        g.clamp(keys, (d % 4) * 24)
+        k.Day()
+    }
+    last := g.error(k, fresh, false)
+    assert k.DaySteps > 0 and last < 0.8 * first, "the slow part alone on new rows: " + $first + " to " + $last + " in " + $k.DaySteps + " steps"
+}
+
+test Sleeper.Night "a recurrence's days (with a DayRate) and nights allocate nothing: resident memory does not grow" {
+    q := RecurRig(4, 6, 2, 8, 27)
+    q.K.DayRate = 0.5
+    keys := Array<F64>(16 * 6)
+    for d in range 6 {
+        q.G.clamp(keys, (d % 4) * 24)
+        q.K.Day()
+        q.K.Night()!
+    }
+    before := resident()
+    for d in range 40 {
+        q.G.clamp(keys, (d % 4) * 24)
+        q.K.Day()
+        q.K.Night()!
     }
     grown := resident() - before
     assert grown <= 16, "resident memory grew by " + $grown + " pages"

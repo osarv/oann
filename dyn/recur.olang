@@ -1,0 +1,206 @@
+# dyn/recur - a gated linear recurrence on ad/graph, trained by backpropagation through time: the slow part a Sleeper
+# (dyn/sleep) consolidates into in place of a system's settle (an agent's slow learner, docs/settling.md 1.9).
+#
+#   l = sigmoid(g + G u),  z = tanh(B u + b),  h = l h_prev + (1 - l) z,  y = C h + c        h starts at 0
+#
+# The gates depend on the input only, so the state is linear in its predecessor (QRNN-style, Bradbury et al. 2017;
+# gating as in Cho et al. 2014). A row is a sequence of Window steps: In = Window * Inputs numbers in, step after step,
+# and Out = Window * Outputs out. The window is unrolled in one planned graph over Batch rows; the loss is the mean over
+# the steps of the mean squared error against the targets. Load rows and targets, then Run (the answers, Row) or Learn
+# (the answers, the loss and every parameter's gradient through time, into Params and ParamGrads for an optimizer).
+#
+# The parameters are laid out g's weights G [Hidden, Inputs] and bias, B [Hidden, Inputs] and b, C [Outputs, Hidden]
+# and c: Glorot-uniform from seed, the gate's bias at GateBias (1: a gate keeping 73% of the state), C at 0 when Quiet
+# (a readout answering 0 until it is taught).
+
+import "std/rand"
+import "../tensor"
+import "../ad/graph"
+import "../kernels/mat"
+
+type Recurrence<T> struct(inputs I64, outputs I64, hidden I64, window I64, batch I64, seed U64 = 1, GateBias F64 = 1.0
+        Quiet Bool = false) {
+    assert inputs >= 1 and outputs >= 1 and hidden >= 1 and window >= 1 and batch >= 1
+    Inputs I64 = inputs
+    Outputs I64 = outputs
+    Hidden I64 = hidden
+    Window I64 = window
+    Batch I64 = batch
+    In I64 = window * inputs
+    Out I64 = window * outputs
+    rng rand.Rand = rand.Rand(seed)
+    nodes mut Array<I64>& = Array<I64>(4 * window + 2)     # each step's input, target, state and output; h0, the loss
+    G mut graph.Graph<T>& = recurrenceFor<T>(inputs, outputs, hidden, window, batch, GateBias, Quiet, nodes, rng)
+    Answers mut Array<T>& = Array<T>(batch * window * outputs)    # the last Run's or Learn's rows, [Batch, Out]
+    Runs I64 = 0
+    h0 mut Array<T>& = G.Data(graph.Var(nodes[4 * window])).Flat()!
+    for i in range h0.Len(): h0[i] = T(0)
+}
+
+# the recurrence recorded and planned: the window unrolled over batch rows; nodes gets each step's input, target, state
+# and output, then h0 and the loss
+fn recurrenceFor<T>(inputs I64, outputs I64, hidden I64, window I64, batch I64, gateBias F64, quiet Bool
+        nodes mut Array<I64>&, r mut rand.Rand&) mut graph.Graph<T>& {
+    g mut graph.Graph<T>& = graph.Graph<T>(batch)
+    a F64 = (6.0 / F64(inputs + hidden)).Sqrt()
+    gw := g.Param(graph.Init.Uniform(-a, a), false, hidden, inputs)
+    gb := g.Param(graph.Init.Constant(gateBias), false, hidden)
+    bw := g.Param(graph.Init.Uniform(-a, a), false, hidden, inputs)
+    bb := g.Param(graph.Init.Zeros, false, hidden)
+    c F64 = (6.0 / F64(hidden + outputs)).Sqrt()
+    cw := g.Param(graph.Init.Zeros if quiet else graph.Init.Uniform(-c, c), false, outputs, hidden)
+    cb := g.Param(graph.Init.Zeros, false, outputs)
+    h0 := g.Input(hidden)
+    h := h0
+    loss graph.Var = graph.Var(-1)
+    for t in range window {
+        u := g.Input(inputs)
+        y := g.Input(outputs)
+        l := g.Act(g.Linear(u, gw, gb), mat.Act.Sigmoid)
+        z := g.Act(g.Linear(u, bw, bb), mat.Act.Tanh)
+        h = g.Add(z, g.Mul(l, g.Sub(h, z)))                # l h_prev + (1 - l) z
+        out := g.Linear(h, cw, cb)
+        g.Keep(h)
+        g.Keep(out)
+        e := g.Mse(out, y)
+        loss = e if t == 0 else g.Add(loss, e)
+        nodes[4 * t] = u
+        nodes[4 * t + 1] = y
+        nodes[4 * t + 2] = h
+        nodes[4 * t + 3] = out
+    }
+    nodes[4 * window] = h0
+    nodes[4 * window + 1] = g.Scale(loss, 1.0 / F64(window))
+    g.Plan(r)!
+    return g
+}
+
+fn (k Recurrence<T>&) node(t I64, part I64) graph.Var { return graph.Var(k.nodes[4 * t + part]) }
+
+# the window's loss node: the mean over its steps of the mean squared error of the output against the targets
+fn (k Recurrence<T>&) LossVar() graph.Var { return graph.Var(k.nodes[4 * k.Window + 1]) }
+
+# row r's sequence u (In numbers, step after step) put in
+fn (k mut Recurrence<T>&) Load(r I64, u Array<T>&) {
+    for t in range k.Window {
+        d := k.G.Data(k.node(t, 0)).Flat()!
+        for i in range k.Inputs: d[r * k.Inputs + i] = u[t * k.Inputs + i]
+    }
+}
+
+# row r's targets y (Out numbers, step after step) put in
+fn (k mut Recurrence<T>&) Target(r I64, y Array<T>&) {
+    for t in range k.Window {
+        d := k.G.Data(k.node(t, 1)).Flat()!
+        for j in range k.Outputs: d[r * k.Outputs + j] = y[t * k.Outputs + j]
+    }
+}
+
+# the rows as loaded run forward: the answers into Answers, the loss against the targets as loaded (Loss)
+fn (k mut Recurrence<T>&) Run() {
+    k.G.Forward(k.Batch)
+    k.Runs++
+    for t in range k.Window {
+        v := k.G.Value(k.node(t, 3))
+        for r in range k.Batch {
+            for j in range k.Outputs: k.Answers[r * k.Out + t * k.Outputs + j] = v.Get(r, j)
+        }
+    }
+}
+
+# Run, then every parameter's gradient of the loss through time into ParamGrads
+fn (k mut Recurrence<T>&) Learn() {
+    k.Run()
+    k.G.Backward(k.LossVar())
+}
+
+# the last Run's loss
+fn (k Recurrence<T>&) Loss() F64 { return k.G.Scalar(k.LossVar()) }
+
+# row r of the last Run's answers (Out numbers)
+fn (k Recurrence<T>&) Row(r I64) mut Array<T>& { return k.Answers[r * k.Out:(r + 1) * k.Out] }
+
+# the parameters, one after another, and their gradients laid out alike
+fn (k Recurrence<T>&) Params() tensor.Tensor<T> { return k.G.Params() }
+
+fn (k Recurrence<T>&) ParamGrads() tensor.Tensor<T> { return k.G.ParamGrads() }
+
+# ---- tests ----
+
+# the recurrence written out by hand from parameters p (laid out as Params), for rows of u: the answers into out and
+# the loss against y - the reference the graph is checked against
+fn Reference(p Array<F64>&, n I64, m I64, h I64, w I64, rows I64, u Array<F64>&, y Array<F64>&, out mut Array<F64>&) F64 {
+    gw := 0
+    gb := gw + h * n
+    bw := gb + h
+    bb := bw + h * n
+    cw := bb + h
+    cb := cw + m * h
+    st := Array<F64>(h)
+    loss F64 = 0.0
+    for r in range rows {
+        for i in range h: st[i] = 0.0
+        for t in range w {
+            x := u[(r * w + t) * n:(r * w + t + 1) * n]
+            for i in range h {
+                a := p[gb + i]
+                c := p[bb + i]
+                for j in range n {
+                    a += p[gw + i * n + j] * x[j]
+                    c += p[bw + i * n + j] * x[j]
+                }
+                l := 1.0 / (1.0 + (-a).Exp())
+                st[i] = l * st[i] + (1.0 - l) * c.Tanh()
+            }
+            for o in range m {
+                v := p[cb + o]
+                for i in range h: v += p[cw + o * h + i] * st[i]
+                out[(r * w + t) * m + o] = v
+                loss += (v - y[(r * w + t) * m + o]) * (v - y[(r * w + t) * m + o])
+            }
+        }
+    }
+    return loss / F64(rows * m * w)
+}
+
+test Recurrence.Learn "the recurrence's answers and gradients through time are the hand-written recurrence's and its finite differences'" {
+    n, m, h, w, rows := 3, 2, 4, 5, 3
+    k := Recurrence<F64>(n, m, h, w, rows, 7)
+    r := rand.Rand(11)
+    u := Array<F64>(rows * w * n)
+    y := Array<F64>(rows * w * m)
+    for i in range u.Len(): u[i] = r.Uniform(-1.0, 1.0)
+    for i in range y.Len(): y[i] = r.Uniform(-1.0, 1.0)
+    for row in range rows {
+        k.Load(row, u[row * w * n:(row + 1) * w * n])
+        k.Target(row, y[row * w * m:(row + 1) * w * m])
+    }
+    k.Learn()
+    p := k.Params().Flat()!
+    g := k.ParamGrads().Flat()!
+    want := Array<F64>(rows * w * m)
+    loss := Reference(p, n, m, h, w, rows, u, y, want)
+    assert (loss - k.Loss()).Abs() < 1e-12, "loss " + $k.Loss() + " against " + $loss
+    for i in range want.Len(): assert (want[i] - k.Answers[i]).Abs() < 1e-12, "answer " + $i
+    q := Array<F64>(p.Len())
+    for i in range p.Len(): q[i] = p[i]
+    worst F64 = 0.0
+    for i in range p.Len() {
+        e F64 = 1e-6
+        q[i] = p[i] + e
+        up := Reference(q, n, m, h, w, rows, u, y, want)
+        q[i] = p[i] - e
+        down := Reference(q, n, m, h, w, rows, u, y, want)
+        q[i] = p[i]
+        fd := (up - down) / (2.0 * e)
+        worst = worst.Max((fd - g[i]).Abs() / (fd.Abs() + 1e-6))
+    }
+    assert worst < 1e-5, "largest relative gradient error " + $worst
+}
+
+test Recurrence.Run "quiet: the readout answers 0 before it is taught" {
+    k := Recurrence<F64>(2, 3, 4, 2, 2, Quiet = true)
+    k.Load(0, Array<F64>[1.0, -1.0, 0.5, 0.25])
+    k.Run()
+    for a in k.Answers: assert a == 0.0
+}

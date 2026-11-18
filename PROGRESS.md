@@ -31,6 +31,18 @@ rate 1 whatever the store's day Rate. Tests: Memory's recall against a dense con
 restored sleeper's night bit for bit. The agent's slow part stays a gated recurrence on ad/graph (BPTT); rebuilding it
 as a dyn system on the Sleeper is oagent's step.
 
+## The agent's slow part on dyn (wt-dynagent, 2026-11-18)
+
+The two pieces oagent's consolidator had and the Sleeper lacked: `dyn/recur`'s `Recurrence<T>`, the consolidator's
+gated linear recurrence on ad/graph trained by BPTT (its answers and gradients checked against the recurrence written
+by hand and its central differences, 1e-12 and 1e-5 relative), as the Sleeper's slow part (`Sleeper(l, m, ..., seed,
+rec)`: the system supplies the key/value populations and the store; dreams are the recurrence's answer plus the
+store's read; nights teach it by BPTT and AdamW); and `DayRate` (off by default; the old path is unchanged): the
+consolidator's day step, a backtracking Armijo line search on the slow part's loss against the targets less the
+store's read (its own answer where unobserved) - matched against that update written by hand on a toy case (1e-8),
+and on a system's slow part through a centered EP lesson. A sleeper's key is the whole row, so a recurrence of Window
+1 (the agent's) is the consolidator's; a longer window keys the store by the whole sequence, not step by step.
+
 ## Small graphs (bench/smallgraph, 2026-11-16)
 
 oagent's consolidator moved from its own engine to ad/graph and its nights got 33-40% slower. bench/smallgraph is its
