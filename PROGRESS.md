@@ -1354,3 +1354,5 @@ XOR (its wall time is noise-dominated there); it costs 0.01-0.08 points. Anderso
 Both together: fewest sweeps (16 a lesson, 5 an answer) but slower than plain per lesson. **The default stays plain Jacobi**: no
 option is faster on every case with unchanged accuracy (Gauss-Seidel is the near miss: -0.08 points on seed 1, XOR time level or worse).
 Logs in the worktree's logs/ (not committed).
+
+**INT8 weights at batch 1: two rows per pass (`dotRow2`).** The BF16 fix's one-row `dotRow` cost INT8-under-F32 streaming 10-20%. `dotRow2` takes two rows with each row's eight chains and order unchanged (the storage test's bit-for-bit sums hold) and reads the vector once; the INT8 storage type only (`pairedRows`). For F32 and BF16 the same loop was 0.4-0.7x F32 (LLVM's SLP vectorizer again), so they keep `dotRow`. bench/storage (loaded machine, alternated 3x, bench shapes 1x512x512 and 1x4096x1024 added), INT8 vs F32: 1x784x128 0.69-0.94x -> 0.83-0.90x (5.0-5.2 us against 6.9-8.4), 1x1024x1024 2.58-2.77x -> 2.72-3.17x, 1x4096x1024 2.39-2.47x -> 2.70-2.81x, 1x512x512 level; BF16 and F32 unchanged.

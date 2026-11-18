@@ -916,7 +916,9 @@ fn gemvRows<M, V, O, A>(rows I64, len I64, alpha A, mx Array<M>&, mo I64, ld I64
         }
         return
     }
-    for i in range rows: out[i] = gemvOut(dotRow(mx, mo + i * ld, vec, len, z), alpha, beta, out[i], like)
+    pairs I64 = rows - rows % 2 if pairedRows(mx) else 0
+    for i in range 0, pairs, 2: dotRow2(mx, mo + i * ld, ld, vec, len, alpha, beta, out, i)
+    for i in range pairs, rows: out[i] = gemvOut(dotRow(mx, mo + i * ld, vec, len, z), alpha, beta, out[i], like)
 }
 
 # alpha s + beta o, beta 0 never reading o
@@ -965,6 +967,70 @@ fn dotRow<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
     s A = laneSum(a0, w)
     for p in range whole, len: s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
     return s
+}
+
+# two rows (o and o + ld) of dotRow in one pass: each row keeps dotRow's eight chains and order, so its sum is the same bit
+# for bit, and the vector is read once for both
+fn dotRow2<M, V, O, A>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A, beta A, out mut Array<O>&, oi I64) {
+    like O
+    z A
+    w I64 = vectorLanes(z)
+    a0, a1, a2, a3 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
+    a4, a5, a6, a7 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
+    b0, b1, b2, b3 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
+    b4, b5, b6, b7 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
+    octs I64 = len - len % (8 * w)
+    for p in range 0, octs, 8 * w {
+        dotStep2(a0, b0, mx, o + p , o + ld + p , vec, p , w)
+        dotStep2(a1, b1, mx, o + p + 1*w, o + ld + p + 1*w, vec, p + 1*w, w)
+        dotStep2(a2, b2, mx, o + p + 2*w, o + ld + p + 2*w, vec, p + 2*w, w)
+        dotStep2(a3, b3, mx, o + p + 3*w, o + ld + p + 3*w, vec, p + 3*w, w)
+        dotStep2(a4, b4, mx, o + p + 4*w, o + ld + p + 4*w, vec, p + 4*w, w)
+        dotStep2(a5, b5, mx, o + p + 5*w, o + ld + p + 5*w, vec, p + 5*w, w)
+        dotStep2(a6, b6, mx, o + p + 6*w, o + ld + p + 6*w, vec, p + 6*w, w)
+        dotStep2(a7, b7, mx, o + p + 7*w, o + ld + p + 7*w, vec, p + 7*w, w)
+    }
+    whole I64 = len - len % w
+    if octs < whole: dotStep2(a0, b0, mx, o + octs, o + ld + octs, vec, octs, w)
+    if octs + 1 * w < whole: dotStep2(a1, b1, mx, o + octs + 1 * w, o + ld + octs + 1 * w, vec, octs + 1 * w, w)
+    if octs + 2 * w < whole: dotStep2(a2, b2, mx, o + octs + 2 * w, o + ld + octs + 2 * w, vec, octs + 2 * w, w)
+    if octs + 3 * w < whole: dotStep2(a3, b3, mx, o + octs + 3 * w, o + ld + octs + 3 * w, vec, octs + 3 * w, w)
+    if octs + 4 * w < whole: dotStep2(a4, b4, mx, o + octs + 4 * w, o + ld + octs + 4 * w, vec, octs + 4 * w, w)
+    if octs + 5 * w < whole: dotStep2(a5, b5, mx, o + octs + 5 * w, o + ld + octs + 5 * w, vec, octs + 5 * w, w)
+    if octs + 6 * w < whole: dotStep2(a6, b6, mx, o + octs + 6 * w, o + ld + octs + 6 * w, vec, octs + 6 * w, w)
+    fold(a0, a1, a2, a3, w)
+    fold(a4, a5, a6, a7, w)
+    for j in range w: a0.v[j] = a0.v[j] + a4.v[j]
+    fold(b0, b1, b2, b3, w)
+    fold(b4, b5, b6, b7, w)
+    for j in range w: b0.v[j] = b0.v[j] + b4.v[j]
+    s A = laneSum(a0, w)
+    t A = laneSum(b0, w)
+    for p in range whole, len {
+        vp A = cast(vec[p], z)
+        s = mulAdd(cast(mx[o + p], z), vp, s)
+        t = mulAdd(cast(mx[o + ld + p], z), vp, t)
+    }
+    out[oi] = gemvOut(s, alpha, beta, out[oi], like)
+    out[oi + 1] = gemvOut(t, alpha, beta, out[oi + 1], like)
+}
+
+fn dotStep2<M, V, A>(acc mut lanes<A>&, acd mut lanes<A>&, mx Array<M>&, mo I64, md I64, vec Array<V>&, p I64, w I64) {
+    z A
+    for j in range w {
+        vj A = cast(vec[p + j], z)
+        acc.v[j] = mulAdd(cast(mx[mo + j], z), vj, acc.v[j])
+        acd.v[j] = mulAdd(cast(mx[md + j], z), vj, acd.v[j])
+    }
+}
+
+# whether a's storage takes dotRow2: INT8 (read once for two rows, 1.0-1.4x a row at a time); for F32 and BF16 the same loop
+# is 0.4-0.7x (LLVM's SLP vectorizer again)
+fn pairedRows<M>(mx Array<M>&) Bool {
+    return match M {
+        case I8: true
+        case _: false
+    }
 }
 
 # a0 = (a0 + a1) + (a2 + a3) lane by lane
