@@ -36,6 +36,11 @@ type Rho enum {
     Tanh                                # the default: rest at 0, slope at most 1, smooth
     HardSigmoid                         # clip(u, 0, 1)
     Relu                                # max(u, 0)
+    Sigmoid                             # the logistic 1 / (1 + e^-u): rest at 1/2, slope at most 1/4
+    Silu                                # u sigmoid(u) (Swish): not monotone, slope at most 1.09984
+    Gelu                                # GELU's tanh form: not monotone, slope at most 1.1290
+    SwiGlu(half I64)                    # a gated (sigma-pi) pair per unit: in a population of 2 half units, gate unit j < half
+                                        # is silu(u_j) u_{j+half}, value unit j + half is u_{j+half} (no bounded slope)
     LifRate(leak F64, threshold F64)    # the steady firing rate of a Lif neuron under the current u
 }
 
@@ -87,6 +92,10 @@ fn Slope(n Neuron) F64 {
     if n != Neuron.Rate: return Inf
     return match n.rho {
         case Rho.LifRate: Inf
+        case Rho.SwiGlu: Inf
+        case Rho.Sigmoid: 0.25
+        case Rho.Silu: 1.09984
+        case Rho.Gelu: 1.1290
         case _: 1.0
     }
 }
@@ -241,6 +250,10 @@ fn Activate<T Float>(f Rho, x T) T {
         case Rho.Tanh: elem.FastTanh(x)
         case Rho.HardSigmoid: clip(x)
         case Rho.Relu: x.Max(T(0))
+        case Rho.Sigmoid: elem.FastSigmoid(x)
+        case Rho.Silu: x * elem.FastSigmoid(x)
+        case Rho.Gelu: elem.FastGeluTanh(x)
+        case Rho.SwiGlu: x * elem.FastSigmoid(x)       # one unit alone: the gate's silu (ActivateRun pairs them)
         case Rho.LifRate(leak, threshold): T(LifRateOf(F64(x), leak, threshold))
     }
 }
@@ -257,7 +270,19 @@ fn ActivateRun<T Float>(f Rho, u Array<T>&, s mut Array<T>&, lo I64, hi I64) {
         case Rho.Tanh { for i in range lo, hi: s[i] = elem.FastTanh(u[i]) }
         case Rho.HardSigmoid { for i in range lo, hi: s[i] = clip(u[i]) }
         case Rho.Relu { for i in range lo, hi: s[i] = u[i].Max(T(0)) }
+        case Rho.Sigmoid { for i in range lo, hi: s[i] = elem.FastSigmoid(u[i]) }
+        case Rho.Silu { for i in range lo, hi: s[i] = u[i] * elem.FastSigmoid(u[i]) }
+        case Rho.Gelu { for i in range lo, hi: s[i] = elem.FastGeluTanh(u[i]) }
+        case Rho.SwiGlu(half) { gateRun(u, s, lo, hi, half) }
         case Rho.LifRate { for i in range lo, hi: s[i] = Activate(f, u[i]) }
+    }
+}
+
+# SwiGlu's activities over whole rows lo .. hi of 2 half units: gate j, silu(u_j) u_{j+half}; value j + half, u_{j+half}
+fn gateRun<T Float>(u Array<T>&, s mut Array<T>&, lo I64, hi I64, half I64) {
+    for i in range lo, hi {
+        j := (i - lo) % (2 * half)
+        s[i] = u[i] * elem.FastSigmoid(u[i]) * u[i + half] if j < half else u[i]
     }
 }
 
@@ -430,6 +455,26 @@ test CostOf "the cross-entropy of a confident right answer is small, of a wrong 
     right := CostOf(Cost.Classes(0.25), s, 0, 3, Array<I32>[0], 0, Array<F64>(0), 0)
     wrong := CostOf(Cost.Classes(0.25), s, 0, 3, Array<I32>[1], 0, Array<F64>(0), 0)
     assert right < 0.01 and wrong > 0.4
+}
+
+test Slope "the stated slope bounds of sigmoid, SiLU and GELU hold and are tight to 1e-4" {
+    for f in Array<Rho>[Rho.Sigmoid, Rho.Silu, Rho.Gelu] {
+        top F64 = 0.0
+        for k in range -8000, 8000 {
+            x := F64(k) * 1e-3
+            top = top.Max(((Activate(f, x + 1e-6) - Activate(f, x - 1e-6)) / 2e-6).Abs())
+        }
+        bound := Slope(Neuron.Rate(f))
+        assert top <= bound + 1e-9 and bound - top < 1e-4, $top + " against " + $bound
+    }
+}
+
+test ActivateRun "SwiGlu gates each value by its partner's silu, row by row" {
+    u := Array<F64>[1.0, -2.0, 3.0, 0.5, 2.0, 0.0, 1.0, -1.0]
+    s := Array<F64>(8)
+    ActivateRun(Rho.SwiGlu(2), u, s, 0, 8)
+    assert (s[0] - 3.0 / (1.0 + (-1.0).Exp())).Abs() < 1e-12 and s[2] == 3.0 and s[3] == 0.5
+    assert s[5] == 0.0 and s[6] == 1.0 and (s[4] - 2.0 / (1.0 + (-2.0).Exp())).Abs() < 1e-12
 }
 
 test Slope "rate neurons with a bounded slope have one, others none" {

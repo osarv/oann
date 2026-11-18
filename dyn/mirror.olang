@@ -75,6 +75,14 @@ fn Event.Make() Event ? gdev.GpuError {
     return Event(out[0])
 }
 
+# whether an activation has no GPU kernel
+fn gpuless(f neuron.Rho) Bool {
+    return match f {
+        case neuron.Rho.Sigmoid, neuron.Rho.Silu, neuron.Rho.Gelu, neuron.Rho.SwiGlu: true
+        case _: false
+    }
+}
+
 # the GPU's activation for a population's model (kernels does not import dyn: kern.Rho repeats neuron.Rho)
 fn rhoOf(n neuron.Neuron) kern.Rho {
     f := neuron.Rho.Linear
@@ -84,6 +92,7 @@ fn rhoOf(n neuron.Neuron) kern.Rho {
         case neuron.Rho.Tanh: kern.Rho.Tanh
         case neuron.Rho.HardSigmoid: kern.Rho.HardSigmoid
         case neuron.Rho.Relu: kern.Rho.Relu
+        case neuron.Rho.Sigmoid, neuron.Rho.Silu, neuron.Rho.Gelu, neuron.Rho.SwiGlu: unreachable "Refusal names activations without a GPU kernel"
         case neuron.Rho.LifRate(leak, threshold): kern.Rho.LifRate(leak, threshold)
     }
 }
@@ -219,6 +228,7 @@ fn Refusal<T>(e settle.Engine<T>&, scheme settle.Sweeping) String {
         model := p.Model
         if model == neuron.Neuron.Lif: return "spiking populations (Lif)"
         if model == neuron.Neuron.Custom: return "custom neuron models"
+        if model == neuron.Neuron.Rate and gpuless(model.rho): return "sigmoid, SiLU, GELU or SwiGlu activations"
     }
     for l in e.Links {
         match l.Kind {

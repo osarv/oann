@@ -53,6 +53,7 @@ import "../tensor"
 import "../kernels/mat"
 import "../kernels/gemm"
 import "../kernels/device"
+import "../kernels/elem"
 import "neuron"
 import "conn"
 import "settle"
@@ -889,6 +890,8 @@ fn (l mut Learner<T>&) ImplicitGrad(out system.Pop, dz tensor.Tensor<T>&, how sy
     if s.E.Spiking: error LearnError.Unsupported("implicit gradients of a spiking system")
     for p in s.E.Pops {
         if p.Model == neuron.Neuron.Custom: error LearnError.Unsupported("implicit gradients through a custom model")
+        model := p.Model
+        if model == neuron.Neuron.Rate and model.rho == neuron.Rho.SwiGlu: error LearnError.Unsupported("implicit gradients through gated (SwiGlu) units")
     }
     if s.Pop(out).Role == neuron.Role.Input: error LearnError.Unsupported("a loss on an input population's activities")
     d := try dz.Flat()
@@ -926,6 +929,15 @@ fn SlopeRun<T>(f neuron.Rho, u Array<T>&, s Array<T>&, d mut Array<T>&, at I64, 
         case neuron.Rho.Tanh { for i in range count: d[at + i] = T(1) - s[i] * s[i] }
         case neuron.Rho.HardSigmoid { for i in range count: d[at + i] = T(1) if u[i] > T(0) and u[i] < T(1) else T(0) }
         case neuron.Rho.Relu { for i in range count: d[at + i] = T(1) if u[i] > T(0) else T(0) }
+        case neuron.Rho.Sigmoid { for i in range count: d[at + i] = s[i] * (T(1) - s[i]) }
+        case neuron.Rho.Silu {
+            for i in range count {
+                g := elem.FastSigmoid(u[i])
+                d[at + i] = g * (T(1) + u[i] * (T(1) - g))
+            }
+        }
+        case neuron.Rho.Gelu { for i in range count: d[at + i] = geluSlope(u[i]) }
+        case neuron.Rho.SwiGlu { unreachable "SwiGlu's Jacobian is not diagonal: ImplicitGrad refuses it" }
         case neuron.Rho.LifRate(leak, threshold) {
             for i in range count {
                 x := F64(u[i])
@@ -933,6 +945,14 @@ fn SlopeRun<T>(f neuron.Rho, u Array<T>&, s Array<T>&, d mut Array<T>&, at I64, 
             }
         }
     }
+}
+
+# GELU's tanh form's slope: 0.5 (1 + t) + 0.5 x (1 - t^2) c (1 + 3 a x^2), t = tanh(c (x + a x^3))
+fn geluSlope<T Float>(x T) T {
+    c := T(0.7978845608028654)
+    a := T(0.044715)
+    t := elem.FastTanh(c * (x + a * x * x * x))
+    return T(0.5) * (T(1) + t) + T(0.5) * x * (T(1) - t * t) * c * (T(1) + T(3) * a * x * x)
 }
 
 # the source of the adjoint, rho'(u) dz on out's units, zero elsewhere
@@ -1244,12 +1264,12 @@ test Learner.Contrast "the contrast written is its definition for every wiring -
 # three tanh inputs, four hidden units with a lateral block, three readouts (cross-entropy at T = 0.25), hidden and
 # readout reciprocal: feedback worth having (the recurrent weights tripled, then certified at 0.9); two rows
 # (with a signal "reward", the root's first, declared before the plan)
-fn gradientSystem(r mut rand.Rand&, reward Bool = false, skip Bool = false) system.System<F64> {
+fn gradientSystem(r mut rand.Rand&, reward Bool = false, skip Bool = false, rho neuron.Rho = neuron.Rho.Tanh) system.System<F64> {
     s := system.System<F64>(2)
     root := s.Root()
     if reward: s.Signal(root, "reward")
     x := s.Population(root, "x", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Input)
-    h := s.Population(root, "h", 4, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    h := s.Population(root, "h", 4, neuron.Neuron.Rate(rho))
     y := s.Population(root, "y", 3, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
     s.Connect(x, h, conn.Wiring.Dense)
     s.Connect(h, h, conn.Wiring.Symmetric)
@@ -1322,6 +1342,34 @@ test Learner.Lesson "the centered contrast is the gradient of the cost at the fr
     l.Tol = 0.0
     l.Lesson(s.Root(), 0.001)!
     assert relative(s.E.Grads, reference) < 1e-5
+}
+
+test Learner.Lesson "other activations: the centered contrast is the cost's gradient to O(beta^2) for sigmoid, SiLU and GELU (a symmetric system's fixed points stay stationary points of its energy without monotone rho); the gated SwiGlu's is not (a floor near 10%)" {
+    for rho in Array<neuron.Rho>[neuron.Rho.Sigmoid, neuron.Rho.Silu, neuron.Rho.Gelu, neuron.Rho.SwiGlu(2)] {
+        s := gradientSystem(rand.Rand(11), rho = rho)
+        if rho == neuron.Rho.SwiGlu {
+            # no slope bound to certify by: the recurrent weights back to a sixth of the tripled draw
+            for c in range 1, 3 {
+                w := s.Weights(system.Conn(c)).Flat()!
+                for i in range w.Len(): w[i] = w[i] / 6.0
+            }
+        }
+        reference := lossGradient(s)
+        l := Learner<F64>(s)!
+        l.Tol = 1e-13
+        l.Sweeps = 20000
+        errs := Array<F64>(3)
+        for i, beta in Array<F64>[0.1, 0.01, 0.001] {
+            l.Lesson(s.Root(), beta)!
+            errs[i] = relative(s.E.Grads, reference)
+        }
+        try io.PutLn($rho + ": centered contrast's relative error at beta 0.1, 0.01, 0.001: " + $errs)
+        if rho == neuron.Rho.SwiGlu {
+            assert errs[2] > 0.01, "SwiGlu " + $errs
+            continue
+        }
+        assert errs[0] / errs[1] > 50.0 and errs[2] < 1e-5, $rho + " " + $errs
+    }
 }
 
 test Learner.Lesson "a skip connection from the inputs into the readout (folded): the centered contrast is still the cost's gradient" {
