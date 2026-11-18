@@ -952,8 +952,8 @@ asked (no device, no driver: false, not an error). `System.Plan(r, on)` and `Gra
 plan. The first plan on the GPU opens the device (ordinal 0) into the module's global `device.Opened`, where it lives as
 long as the program, so every plan's buffers go before it. A plan on the GPU where the build has none is
 `device.DeviceError.Unavailable`; a part with no GPU form is `DeviceError.Unsupported("no GPU form of ...")`, by name;
-the device's failure `DeviceError.Failed` with CUDA's words. A graph has no GPU form until GP6: `Graph.Plan` on the GPU
-is refused (as a `ShapeError`, so its callers' error sets stay as they are). The makefile passes `-define Gpu=true`
+the device's failure `DeviceError.Failed` with CUDA's words. `Graph.Plan` on the GPU is GP6's (As built, GP6, below); what it has no form of is
+refused (as a `ShapeError`, so its callers' error sets stay as they are). The makefile passes `-define Gpu=true`
 wherever `/usr/include/cuda_runtime_api.h` exists (`GPU=0` leaves it out); `make test` runs the CPU's tests either way,
 since nothing plans on the GPU unless told to.
 
@@ -1165,6 +1165,26 @@ interleaved, medians (tables and reproduction in PROGRESS.md, "GP5"). On MNIST, 
   drift apart by rounding and the medians over 15 seeds agree (97.12 / 97.12% at hidden 128, 96.11 / 96.04% at 1024; the
   mean difference a seed -0.06 and -0.03 points against seed ranges of 0.9 and 2 points).
 - `System.Hold` with nothing masked no longer brings the parameters down and up each lesson on the GPU.
+
+**As built (GP6, 2026-11-18): `ad` on the GPU, G-M4.** `Graph.Plan(r, on = Gpu)` lays the arena out as on the CPU
+and mirrors it: `ad/mirror.olang` holds the same array as one device buffer (the same offsets, so the liveness reuse is the
+plan's), and `Graph.Forward`/`Backward` run a list of launches over it - `ad/graph.olang` lowers each node to a plain-data
+`Step` at Plan, the mirror runs step i, the graph keeps the order and which gradients are added (`acc`). Products are
+cuBLAS (`blas.Gemm`; attention's per-head products cuBLASLt's batched `Product`, planned at Plan for the whole batch and
+used for a short one, whose unused sequences are computed and never read), everything else `kernels/gpu/src/ad.cu`
+(compiled once as one module, `kern.Kit`): act (seven, `FastExp` and `FastTanh` as the CPU's) and its gradient, softmax
+with the causal mask in the kernel (GP3's note: weights and dS are zero above the diagonal, as the products are full),
+log-sum-exp, log-softmax, layer and RMS norms forward and backward, cross entropy and Mse (the loss summed in F64 by one
+block), embedding and positions with their gradients, bias, column sums, sums, clip and AdamW (`nn/optim.GpuAdamW`: nn/optim's
+step bit for bit, decay as a per-parameter mask). Reductions are one block a row in a fixed order and nothing uses atomics
+(embedding's and positions' gradients sum in the CPU's order), so a GPU run repeats bit for bit; against the CPU it agrees
+within rounding (tests: 2e-4 of the largest value for the perceptron, 5e-4 for the transformer). Residency: the device
+owns the arena; inputs and tokens go up at every Forward, the parameters up where the host wrote them, and `Value`, `Grad`,
+`Params`, `ParamGrads`, `Scalar` bring down what the device holds newer (`Scalar` of a loss reads one F64), so existing
+host loops and optimizers still work (slowly, a download and upload a step); `GpuAdamW` moves nothing. Refused at Plan by
+name (a `ShapeError`, as before): BF16/F16 graphs, eager and decoding graphs, Dropout, Rope, Conv2d, MaxPool2d, Scan,
+SelectiveScan, DeltaRule, Permute, Slice, Expand, Custom, and a MatMul of two batched operands. G-M4 and how to
+reproduce it: PROGRESS.md, "GP6".
 
 The packages are section 4.4.
 

@@ -985,10 +985,51 @@ The sweeps a lesson are unchanged; the accuracies the same within the seeds (CPU
 Reproduce: `make data OLANG=olang` once, then the commands above; one run alone is
 `make mnistlearn OLANG=olang ARGS="3 60000 1024 128 1 0.001 0.5 gpu"` (`gpu1`, `gpu16`, a thread count, or `auto`).
 
+## The GPU route, GP6: ad on the GPU, G-M4 (wt-gp6, 2026-11-18)
+
+docs/redesign.md 1.10 and 4.4's GP6 (the as-built note is in 1.10). `Graph.Plan(r, on = Gpu)`: `ad/mirror.olang` (the
+arena as one device buffer at the CPU plan's offsets; a graph's node lowered to a `Step`, run by cuBLAS and
+`kernels/gpu/src/ad.cu`), `kern.Kit` (many kernels of one text, one module), `optim.GpuAdamW` (AdamW and the clip on the
+device), `ad/gpu_test.olang` (in `make gputest`), `bench/gpuad.olang` (`make gpuad`).
+
+**Tests** (`make gputest`: 42 passed, GP4's 34 and GP6's 8 in `ad/gpu_test.olang`): every activation and its gradient
+(written, added, from x and from y) against `kernels/elem` at odd sizes, within 2e-6 of the largest value; softmax, causal
+softmax, their gradients and log-sum-exp at rows of 1 to 1000; layer and RMS norms (stats, apply, dx, dgain, dbias); AdamW
+bit for bit with nn/optim's over 7 steps with a decay mask; the perceptron (a full batch, 11, 1) and the character
+transformer (the two variants without Rope, Dropout or BF16, and the character configuration at batch 8) forward and
+backward against the CPU's (loss, logits, every parameter's gradient: 2e-4 and 5e-4 of the largest) and a second GPU run
+identical bit for bit; 20 AdamW steps clipped to norm 1 with the optimizer on the device against the host's (loss within
+1e-2 and the norm within 2e-2 of the CPU's at every step: 20 steps of rounding drift, and it learns); what has no GPU form
+refused at Plan by name. The step's allocation is pinned (`assert not ... .Allocates` on Forward, Backward, a launch, a
+product, attention, AdamW's step).
+
+**G-M4** (`make gpuad OLANG=olang ARGS="5 100"`, 2026-11-18; MNIST from `make data`; Ryzen 5 7600, RTX 4060 under WSL2,
+rounds interleaved CPU 1 thread, CPU 4 threads, GPU, medians of 5):
+
+| | CPU 1 thread | CPU 4 threads | GPU | GPU against the best CPU |
+|---|---|---|---|---|
+| M1: an epoch of 60000, 784-128-10, batch 128, AdamW (training only) | 0.276 s | 0.275 s | 0.136 s | 2.0x |
+| M2: a step of the character transformer, 16 x 64 (forward, backward, clip, AdamW, loss read) | 59.61 ms | 43.46 ms | 5.62 ms | 7.7x (10.6x one thread) |
+
+The same epoch loss and test accuracy on all three (0.4156, 93.53%). The M2 step is 182,000 characters/s on the GPU against
+17,000 (one thread). The perceptron's step is small (a batch of 128 through 100,000 parameters: 0.29 ms of the 0.136 s epoch
+a batch of 469 is launches and the loss's wait), so its gain is 2x; the transformer's is the products and attention, 7.7x.
+**Verdict for G-M4**: `ad` on the GPU pays for the transformer at once, and the perceptron by 2x - the element kernels
+and attention as built are enough; the next lever is fusion (bias, activation and residual into the products' epilogues;
+CUDA graphs for the step's ~250 launches), GP7's, not more kernels.
+
+Reproduce: `make data OLANG=olang` once, then `make gpuad OLANG=olang ARGS="5 100"` (`mlp` or `lm` as a third argument runs
+one half). The GPU tests: `make gputest OLANG=olang`.
+
+**Limits.** F32 and F64 graphs only (BF16 graphs refused); Dropout, Rope, convolutions, scans, permuted/sliced views and a
+MatMul of two batched operands stay on the CPU; `nn/train`'s loops on a GPU graph work through Value/Params (a transfer a
+step) - a loop wanting the speed steps `optim.GpuAdamW` itself, as bench/gpuad does. Attention's causal products are full
+(cuBLASLt has no triangular product): half the scores' work is wasted. A short batch runs attention for every sequence.
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP5 are done (above; G-M2's verdict: the
-  settle on the GPU from batch x hidden 16384, `Check` 4); GP6 (`ad` on the GPU) next. For GP7 G-M2 says the GPU's
+  settle on the GPU from batch x hidden 16384, `Check` 4); GP6 (`ad` on the GPU, above) is done. For GP7 G-M2 says the GPU's
   fixed cost a settle (about 1 ms whatever its size) sets the crossover: CUDA graphs or fewer readbacks would move it
   below 16384.
 - INT8 on the GPU: a one-pass kernel dequantizing GemmI8's I32 product (kern.olang) instead of the second, F32-summed
