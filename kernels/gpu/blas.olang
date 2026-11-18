@@ -19,6 +19,7 @@
 
 import cu "cuda.c"
 import "device"
+import "kern"
 import "../gemm"
 import "../mat"
 import "std/rand"
@@ -377,28 +378,25 @@ fn (p Product<SC, SA, SB>&) RunBatch(d mut device.Device&, c mut device.DBatch<S
 # output, as kernels/gemm's GemmI8 reads them), summed in I32 by cuBLASLt's integer tensor cores (CUBLAS_COMPUTE_32I,
 # exact), the accumulators kept in c. cuBLAS's INT8 is signed on both sides, so the activations are quantized to I8
 # with the zero point at 0 (the CPU's are U8 with one): the result differs from the CPU's in that rounding only.
-# out: cuBLAS has no way from an I32 matrix to an F32 one - cublasLtMatrixTransform converts no integer type, and
-# cuBLASLt's per-row alpha vector exists for I8 results only - so out is a second product of the same operands summed in
-# F32 (CUBLAS_COMPUTE_32F over I8: no tensor cores, 10x the I32 product's time; exact while a sum stays under 2^24 in
-# magnitude, within a few F32 units past it), then scaled per output (cublasSdgmm). RunI32 gives c alone. An element
-# kernel dequantizing c in one pass (GP2's NVRTC) replaces the second product. cuBLASLt wants k and the lds multiples
-# of 4 (the padding nn/quant keeps gives that)
-type ProductI8 unique struct(dev device.Device&) {
+# out: cuBLAS has no way from an I32 matrix to an F32 one (cublasLtMatrixTransform converts no integer type, and
+# cuBLASLt's per-row alpha vector exists for I8 results only), so GP3 summed a second product in F32 and scaled it with
+# cublasSdgmm (13x the I32 product). GP7: one pass of our kernel over c instead (oann_dequant_i32, elem.cu), which
+# reads the integer sums exactly. RunI32 gives c alone. cuBLASLt wants k and the lds multiples of 4 (the padding
+# nn/quant keeps gives that)
+type ProductI8 unique struct(dev device.Device&, k kern.Kernel) {
     dev
+    k
     exact U64 = 0
-    float U64 = 0
     n I64 = 0
     m I64 = 0
     Exact Choice = Choice()
-    Scaled Choice = Choice()
     tried mut Array<I64>& = Array<I64>(40)
 } destruct {
     if exact != 0: cu.oann_lt_free(exact)
-    if float != 0: cu.oann_lt_free(float)
 }
 
 fn ProductI8.Plan(d mut device.Device&, c device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, out device.DMat<F32>&) ProductI8 ? device.GpuError {
-    p := ProductI8(d)
+    p := ProductI8(d, try kern.Kernel.Compile(d, kern.ElemSource(), "oann_dequant_i32"))
     m, n, k := a.Rows, b.Rows, a.Cols
     if m == 0 or n == 0: return p
     p.m, p.n = m, n
@@ -409,10 +407,6 @@ fn ProductI8.Plan(d mut device.Device&, c device.DMat<I32>&, a device.DMat<I8>&,
     try device.CheckCublas(st, "cublasLtMatmulAlgoGetHeuristic for INT8 " + shape + " in I32")
     p.exact = h[0]
     p.Exact = Choice.Of(info)
-    st = cu.oann_lt_plan(h, d.Lt(), cu.CUBLAS_COMPUTE_32F, cu.CUDA_R_32F, true, false, I32(n), I32(m), I32(k), cu.CUDA_R_8I, b.Ld, 0, b.Addr(0, 0), cu.CUDA_R_8I, a.Ld, 0, a.Addr(0, 0), cu.CUDA_R_32F, out.Ld, 0, out.Addr(0, 0), 1, cu.CUBLASLT_REDUCTION_SCHEME_NONE, cu.CUBLASLT_EPILOGUE_DEFAULT, 0, 0, U64(device.WorkBytes), info)
-    try device.CheckCublas(st, "cublasLtMatmulAlgoGetHeuristic for INT8 " + shape + " in F32")
-    p.float = h[0]
-    p.Scaled = Choice.Of(info)
     return p
 }
 
@@ -422,7 +416,7 @@ fn (p ProductI8&) RunI32(d mut device.Device&, c mut device.DMat<I32>&, a device
     cu.oann_lt_run(d.Status(), d.Lt(), p.exact, 1, 0, b.Addr(0, 0), a.Addr(0, 0), c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
 }
 
-# both products tuned, as Product's Tune: c and out overwritten
+# the integer product tuned, as Product's Tune: c overwritten (out is kept for the signature's sake, unused)
 fn (p mut ProductI8&) Tune(d mut device.Device&, c mut device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, out mut device.DMat<F32>&, reps I64 = 20) ? device.GpuError {
     if p.exact == 0: return
     try d.Sync()
@@ -430,18 +424,19 @@ fn (p mut ProductI8&) Tune(d mut device.Device&, c mut device.DMat<I32>&, a devi
     st := cu.oann_lt_tune(d.Lt(), p.exact, b.Addr(0, 0), a.Addr(0, 0), c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info, p.tried)
     try tuned(st)
     p.Exact = Choice.Of(info)
-    st = cu.oann_lt_tune(d.Lt(), p.float, b.Addr(0, 0), a.Addr(0, 0), out.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream(), I32(reps), info, p.tried)
-    try tuned(st)
-    p.Scaled = Choice.Of(info)
 }
 
-# c = a b^T in I32 and out = scale[j] c[i, j] in F32 (scale: n per-output scales, the activations' step times each
-# weight row's): GemmI8 on the device, enqueued on d's compute stream
-fn (p ProductI8&) Run(d mut device.Device&, c mut device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, scale device.Buf<F32>&, out mut device.DMat<F32>&) {
+# out = scale[j] c[i, j] in F32 from c alone (scale: n per-output scales, the activations' step times each weight
+# row's), one pass
+fn (p ProductI8&) Dequant(d mut device.Device&, c device.DMat<I32>&, scale device.Buf<F32>&, out mut device.DMat<F32>&) {
     if p.exact == 0: return
-    cu.oann_lt_run(d.Status(), d.Lt(), p.exact, 1, 0, b.Addr(0, 0), a.Addr(0, 0), c.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
-    cu.oann_lt_run(d.Status(), d.Lt(), p.float, 1, 0, b.Addr(0, 0), a.Addr(0, 0), out.Addr(0, 0), 1, 0, 0, 0, d.Work(), U64(device.WorkBytes), d.Stream())
-    cu.oann_scale_rows(d.Status(), d.Blas(), I32(p.n), I32(p.m), out.Addr(0, 0), out.Ld, scale.Addr(0))
+    kern.Launch(d, p.k, kern.Blocks(p.m * p.n), kern.Block, c.Addr(0, 0), U64(c.Ld), out.Addr(0, 0), U64(out.Ld), scale.Addr(0), U64(p.m), U64(p.n))
+}
+
+# c = a b^T in I32 and out = scale[j] c[i, j] in F32: GemmI8 on the device, enqueued on d's compute stream
+fn (p ProductI8&) Run(d mut device.Device&, c mut device.DMat<I32>&, a device.DMat<I8>&, b device.DMat<I8>&, scale device.Buf<F32>&, out mut device.DMat<F32>&) {
+    p.RunI32(d, c, a, b)
+    p.Dequant(d, c, scale, out)
 }
 
 # ---- tests: kernels/gemm is the oracle ----
@@ -975,7 +970,7 @@ fn i8Case(d mut device.Device&, r mut rand.Rand&, m I64, n I64, k I64) ? device.
     bc.DownloadAll(gc)
     bo.DownloadAll(gout)
     try d.Sync()
-    what := "INT8 " + $m + "x" + $n + "x" + $k + " (" + p.Exact.Str() + "; " + p.Scaled.Str() + ")"
+    what := "INT8 " + $m + "x" + $n + "x" + $k + " (" + p.Exact.Str() + ")"
     for i in range m {
         for j in range n {
             s I32 = 0

@@ -130,3 +130,14 @@ extern "C" __global__ void oann_tanh_f32(float *y, const float *x, long long n) 
     }
 OANN_ADAMW(oann_adamw_f32, float, sqrtf)
 OANN_ADAMW(oann_adamw_f64, double, sqrt)
+
+// out[i, j] = scale[j] c[i, j], c in I32 (row ld ldc), out in F32 (row ld ldo): an INT8 product's dequantization in one
+// pass over the integer product's accumulators (GP7). F32(c) is exact up to 2^24 in magnitude, then rounded once
+extern "C" __global__ void oann_dequant_i32(const int *c, long long ldc, float *out, long long ldo, const float *scale,
+                                            long long m, long long n) {
+    long long total = m * n;
+    for (long long k = (long long)blockIdx.x * blockDim.x + threadIdx.x; k < total; k += (long long)gridDim.x * blockDim.x) {
+        long long i = k / n, j = k - i * n;
+        out[i * ldo + j] = scale[j] * (float)c[i * ldc + j];
+    }
+}
