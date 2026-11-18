@@ -903,7 +903,7 @@ fn gemmDirect<SA, SB, S, A>(ta Bool, m I64, n I64, k I64, alpha A, a Array<SA>&,
 }
 
 # out[i os] = alpha (the sum over p < len of M(i, p) v[p vs]) + beta out[i os] for i < rows, M(i, p) at mat[mo + i ld
-# + p]: a's rows dotted with v, four rows at a time against one read of v, each in two vectors of partial sums
+# + p]: a's rows dotted with v, a row at a time (dotRow)
 fn gemvRows<M, V, O, A>(rows I64, len I64, alpha A, mx Array<M>&, mo I64, ld I64, vec Array<V>&, vs I64, beta A, out mut Array<O>&, os I64) {
     like O
     z A
@@ -916,9 +916,7 @@ fn gemvRows<M, V, O, A>(rows I64, len I64, alpha A, mx Array<M>&, mo I64, ld I64
         }
         return
     }
-    two I64 = rows - rows % 2
-    for i in range 0, two, 2: dot2(mx, mo + i * ld, ld, vec, len, alpha, beta, out, i)
-    if two < rows: out[two] = gemvOut(dot1(mx, mo + two * ld, vec, len, z), alpha, beta, out[two], like)
+    for i in range rows: out[i] = gemvOut(dotRow(mx, mo + i * ld, vec, len, z), alpha, beta, out[i], like)
 }
 
 # alpha s + beta o, beta 0 never reading o
@@ -926,83 +924,56 @@ fn gemvOut<A, O>(s A, alpha A, beta A, o O, like O) O {
     return cast(alpha * s, like) if beta == 0 else cast(alpha * s + beta * cast(o, s), like)
 }
 
-# the partial sums of a dot product, a vector of them (measured: one vector per row, two rows against one read of the
-# vector, is what LLVM keeps in registers - more rows or wider lanes it splits into 128-bit pieces and spills)
+# the partial sums of a dot product, a vector of them (measured: eight of them for one row LLVM keeps in registers)
 type lanes<A> struct() {
     v := Array<A>(16)
 }
 
-# out[i] and out[i + 1] from the dot products of rows o and o + ld of mx with vec (contiguous), each in two vectors of
-# partial sums (alternate vectors' worth of len) added at the end, the rest of len one at a time - the order dotNarrow
-# sums a BF16 row in, so that BF16 storage is its widened F32's product bit for bit
-fn dot2<M, V, A, O>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A, beta A, out mut Array<O>&, i I64) {
-    z A
-    like O
-    match M {
-        case BF16 {
-            dot2Narrow(mx, o, ld, vec, len, alpha, beta, out, i)
-            return
-        }
-        case _ { }
-    }
+# the dot product of row o of mx with vec (contiguous) in eight vectors of partial sums - vector b of len in sum b % 8,
+# added lane by lane ((0 + 1) + (2 + 3)) + ((4 + 5) + (6 + 7)), then in order - and the rest of len one at a time: one
+# order for every storage type, so that BF16 or INT8 storage is its widened F32's product bit for bit. Eight chains
+# keep both multiply-add ports busy for one row. The chains are added lane by lane before one laneSum: a total of each
+# chain's own laneSum (or two rows in one loop, their results stored side by side) pairs the chains' last lanes, and
+# LLVM's SLP vectorizer, which meets that pair after the loop before the loop's own sums, takes the loop apart into
+# 128-bit pieces of two chains - for BF16, whose widening it counts as cheap, 0.07-0.21x F32 (olang HISTORY, O-BF16)
+fn dotRow<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
     w I64 = vectorLanes(z)
-    acc, acc2, acc3, acc4 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
-    pairs I64 = len - len % (2 * w)
-    for p in range 0, pairs, 2 * w {
-        dotStep(acc, mx, o + p, vec, p, w)
-        dotStep(acc2, mx, o + ld + p, vec, p, w)
-        dotStep(acc3, mx, o + p + w, vec, p + w, w)
-        dotStep(acc4, mx, o + ld + p + w, vec, p + w, w)
+    a0, a1, a2, a3 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
+    a4, a5, a6, a7 := lanes<A>(), lanes<A>(), lanes<A>(), lanes<A>()
+    octs I64 = len - len % (8 * w)
+    for p in range 0, octs, 8 * w {
+        dotStep(a0, mx, o + p, vec, p, w)
+        dotStep(a1, mx, o + p + w, vec, p + w, w)
+        dotStep(a2, mx, o + p + 2 * w, vec, p + 2 * w, w)
+        dotStep(a3, mx, o + p + 3 * w, vec, p + 3 * w, w)
+        dotStep(a4, mx, o + p + 4 * w, vec, p + 4 * w, w)
+        dotStep(a5, mx, o + p + 5 * w, vec, p + 5 * w, w)
+        dotStep(a6, mx, o + p + 6 * w, vec, p + 6 * w, w)
+        dotStep(a7, mx, o + p + 7 * w, vec, p + 7 * w, w)
     }
     whole I64 = len - len % w
-    if pairs < whole {
-        dotStep(acc, mx, o + pairs, vec, pairs, w)
-        dotStep(acc2, mx, o + ld + pairs, vec, pairs, w)
-    }
-    s A = laneSum(acc, w) + laneSum(acc3, w)
-    t A = laneSum(acc2, w) + laneSum(acc4, w)
-    for p in range whole, len {
-        s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
-        t = mulAdd(cast(mx[o + ld + p], z), cast(vec[p], z), t)
-    }
-    out[i] = gemvOut(s, alpha, beta, out[i], like)
-    out[i + 1] = gemvOut(t, alpha, beta, out[i + 1], like)
-}
-
-# BF16 rows: each row on its own, in two vectors of partial sums. Two rows against one read of vec, as above, LLVM's
-# vectorizer pairs the rows' widenings in 128-bit pieces (4.7x slower); four vectors a row it splits likewise. I8 rows
-# are faster as above (measured, bench/storage)
-fn dot2Narrow<M, V, A, O>(mx Array<M>&, o I64, ld I64, vec Array<V>&, len I64, alpha A, beta A, out mut Array<O>&, i I64) {
-    z A
-    like O
-    out[i] = gemvOut(dotNarrow(mx, o, vec, len, z), alpha, beta, out[i], like)
-    out[i + 1] = gemvOut(dotNarrow(mx, o + ld, vec, len, z), alpha, beta, out[i + 1], like)
-}
-
-fn dotNarrow<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
-    w I64 = vectorLanes(z)
-    acc := lanes<A>()
-    acc2 := lanes<A>()
-    pairs I64 = len - len % (2 * w)
-    for p in range 0, pairs, 2 * w {
-        dotStep(acc, mx, o + p, vec, p, w)
-        dotStep(acc2, mx, o + p + w, vec, p + w, w)
-    }
-    whole I64 = len - len % w
-    if pairs < whole: dotStep(acc, mx, o + pairs, vec, pairs, w)
-    s A = laneSum(acc, w) + laneSum(acc2, w)
+    if octs < whole: dotStep(a0, mx, o + octs, vec, octs, w)
+    if octs + w < whole: dotStep(a1, mx, o + octs + w, vec, octs + w, w)
+    if octs + 2 * w < whole: dotStep(a2, mx, o + octs + 2 * w, vec, octs + 2 * w, w)
+    if octs + 3 * w < whole: dotStep(a3, mx, o + octs + 3 * w, vec, octs + 3 * w, w)
+    if octs + 4 * w < whole: dotStep(a4, mx, o + octs + 4 * w, vec, octs + 4 * w, w)
+    if octs + 5 * w < whole: dotStep(a5, mx, o + octs + 5 * w, vec, octs + 5 * w, w)
+    if octs + 6 * w < whole: dotStep(a6, mx, o + octs + 6 * w, vec, octs + 6 * w, w)
+    fold(a0, a1, a2, a3, w)
+    fold(a4, a5, a6, a7, w)
+    for j in range w: a0.v[j] = a0.v[j] + a4.v[j]
+    s A = laneSum(a0, w)
     for p in range whole, len: s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
     return s
 }
 
-fn dot1<M, V, A>(mx Array<M>&, o I64, vec Array<V>&, len I64, z A) A {
-    w I64 = vectorLanes(z)
-    acc := lanes<A>()
-    whole I64 = len - len % w
-    for p in range 0, whole, w: dotStep(acc, mx, o + p, vec, p, w)
-    s A = laneSum(acc, w)
-    for p in range whole, len: s = mulAdd(cast(mx[o + p], z), cast(vec[p], z), s)
-    return s
+# a0 = (a0 + a1) + (a2 + a3) lane by lane
+fn fold<A>(a0 mut lanes<A>&, a1 lanes<A>&, a2 mut lanes<A>&, a3 lanes<A>&, w I64) {
+    for j in range w {
+        a0.v[j] = a0.v[j] + a1.v[j]
+        a2.v[j] = a2.v[j] + a3.v[j]
+    }
+    for j in range w: a0.v[j] = a0.v[j] + a2.v[j]
 }
 
 fn dotStep<M, V, A>(acc mut lanes<A>&, mx Array<M>&, mo I64, vec Array<V>&, p I64, w I64) {
