@@ -1012,8 +1012,8 @@ rounds interleaved CPU 1 thread, CPU 4 threads, GPU, medians of 5):
 | M2: a step of the character transformer, 16 x 64 (forward, backward, clip, AdamW, loss read) | 59.61 ms | 43.46 ms | 5.62 ms | 7.7x (10.6x one thread) |
 
 The same epoch loss and test accuracy on all three (0.4156, 93.53%). The M2 step is 182,000 characters/s on the GPU against
-17,000 (one thread). The perceptron's step is small (a batch of 128 through 100,000 parameters: 0.29 ms of the 0.136 s epoch
-a batch of 469 is launches and the loss's wait), so its gain is 2x; the transformer's is the products and attention, 7.7x.
+17,000 (one thread). The perceptron's step is small (a batch of 128 through 100,000 parameters: 0.136 s over 469 batches is 0.29 ms a
+batch, mostly launches and the loss's wait), so its gain is 2x; the transformer's is the products and attention, 7.7x.
 **Verdict for G-M4**: `ad` on the GPU pays for the transformer at once, and the perceptron by 2x - the element kernels
 and attention as built are enough; the next lever is fusion (bias, activation and residual into the products' epilogues;
 CUDA graphs for the step's ~250 launches), GP7's, not more kernels.
