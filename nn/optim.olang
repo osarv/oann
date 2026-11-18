@@ -31,6 +31,14 @@ import "../kernels/mat"
 import "../kernels/elem"
 import "../kernels/gemm"
 import "../io/checkpoint"
+import "../kernels/device"
+
+Gpu Bool = false
+
+if Gpu {
+    import "../ad/mirror"
+    import gdev "../kernels/gpu/device"
+}
 
 # what a training loop asks of an optimizer: a step from the gradients the last Backward left, and the learning rate to
 # take the next one with - a schedule's
@@ -182,6 +190,44 @@ fn adamRun<A, G>(p mut Array<A>&, gr Array<G>&, m mut Array<A>&, v mut Array<A>&
         v[k] = vk
         p[k] = keep * p[k] - step * mk / (vk.Sqrt() * root + eps)
     }
+}
+
+# AdamW over the parameters of a graph planned on the GPU (ad/mirror): this module's AdamW step for step and bit for bit
+# (the same operations in the same order, spans' decay as a mask), the moments on the device with the parameters and
+# gradients, so a step moves nothing. Rate may change between steps. Clip scales the gradients to a norm at most max
+# first, as ClipNorm does (Norm reads the norm it measured, and waits)
+if Gpu {
+    type GpuAdamW<T> struct(g mut graph.Graph<T>&, rate F64 = 0.001, beta1 F64 = 0.9, beta2 F64 = 0.999, eps F64 = 1e-8, decay F64 = 0.0) {
+        g
+        Rate F64 = rate
+        S mut mirror.AdamW<T>?& = null
+    }
+
+    fn GpuAdamW<T>.For(g mut graph.Graph<T>&, rate F64 = 0.001, beta1 F64 = 0.9, beta2 F64 = 0.999, eps F64 = 1e-8, decay F64 = 0.0) GpuAdamW<T> ? device.DeviceError {
+        if not g.OnGpu: error device.DeviceError.Unsupported("a graph planned on the CPU: use AdamW")
+        o := GpuAdamW<T>(g, rate, beta1, beta2, eps, decay)
+        mask := Array<U8>(g.ParamCount)
+        for r in Spans(g) {
+            for k in range r.Lo, r.Hi: mask[k] = 1 if r.Decay else 0
+        }
+        o.S = try g.Mirror().AdamW(mask, rate, beta1, beta2, eps, decay) catch gdev.GpuError err { error device.DeviceError.Failed("AdamW's moments: " + $err) }
+        return o
+    }
+
+    fn (o mut GpuAdamW<T>&) SetRate(rate F64) { o.Rate = rate }
+
+    fn (o mut GpuAdamW<T>&) Step() {
+        o.S!.Rate = o.Rate
+        o.g.DeviceReady()
+        o.g.Mirror().AdamStep(o.S!)
+    }
+
+    fn (o mut GpuAdamW<T>&) Clip(max F64) {
+        o.g.DeviceReady()
+        o.g.Mirror().ClipNorm(max)
+    }
+
+    fn (o mut GpuAdamW<T>&) Norm() F64 { return o.g.Mirror().GradNorm() }
 }
 
 # ---- SGD ----

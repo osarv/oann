@@ -19,7 +19,7 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 GPUDEFINE = $(if $(filter 0,$(GPU)),,$(if $(wildcard /usr/include/cuda_runtime_api.h),-define Gpu=true,))
 
 # the GPU backend's tests: the CPU's tests run green either way (they plan on the CPU); these need the define
-GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang
+GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang ad/gpu_test.olang
 
 # where WSL keeps its libcuda.so.1, put first on the loader's path for the GPU targets: a native Linux driver package
 # installed beside the toolkit (libnvidia-compute) can shadow WSL's in the loader's cache, and CUDA then finds no

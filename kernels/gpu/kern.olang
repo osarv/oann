@@ -30,6 +30,7 @@ import "std/time"
 # the text of our kernels (src/*.cu), read while compiling
 ElemText := String(embed "src/elem.cu")
 RateText := String(embed "src/rate.cu")
+AdText := String(embed "src/ad.cu")
 
 # threads a block for the element kernels, and the most blocks a launch takes (each thread then loops over the rest)
 Block I64 = 256
@@ -336,6 +337,33 @@ fn (o mut AdamW<T>&) Step(d mut device.Device&, p U64, g U64) {
     n := o.M.N
     Launch(d, o.k, Blocks(n), Block, p, g, o.M.Addr(0), o.V.Addr(0), Arg(n), Arg(T(o.Beta1)), Arg(T(o.Beta2))
         Arg(T(1.0 - o.Beta1)), Arg(T(1.0 - o.Beta2)), Arg(T(1.0 - o.Lr * o.Decay)), Arg(T(o.Lr / corr1)), Arg(T(1.0 / corr2.Sqrt())), Arg(T(o.Eps)))
+}
+
+# ---- GP6: many kernels of one text, loaded once ----
+
+# the kernels named of one compiled text, one module: Funs[i] is names[i]'s. ad/mirror compiles its thirty-odd element
+# kernels as one text, so NVRTC and the driver's JIT run once, not once a kernel
+type Kit unique struct(k Kernel, count I64) {
+    k
+    Funs mut Array<U64>& = Array<U64>(count)
+}
+
+fn Kit.Compile(dev mut device.Device&, text String&, names Array<String>&) Kit ? device.GpuError {
+    kit := Kit(try Kernel.Compile(dev, text, names[0]), names.Len())
+    kit.Funs[0] = kit.k.fun
+    out := Array<U64>(1)
+    for i in range 1, names.Len() {
+        st := cu.oann_module_function(kit.k.drv, kit.k.module, names[i].ToC(), out)
+        try checkDriver(kit.k.drv, st, "cuModuleGetFunction(" + names[i] + ")")
+        kit.Funs[i] = out[0]
+    }
+    return kit
+}
+
+# kernel i of the kit enqueued as Launch does
+fn LaunchKit(d mut device.Device&, kit Kit&, i I64, grid I64, block I64, args ...U64) {
+    assert args.Len() <= 32, "a kernel takes at most 32 arguments here"
+    cu.oann_launch(d.Status(), kit.k.drv, kit.Funs[i], U32(grid), 1, 1, U32(block), 1, 1, 0, d.Stream(), args, I32(args.Len()))
 }
 
 # ---- timing on the device (the benches) ----

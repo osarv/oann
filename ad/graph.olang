@@ -61,6 +61,25 @@ import "std/time"
 import "std/list"
 import "std/os"
 
+Gpu Bool = false
+
+if Gpu {
+    import "mirror"
+
+    # the graph's mirror on the GPU where it was planned there (ad/mirror), its lowered steps, and which side holds the
+    # newer copy of what: the activations (values, kept tensors, activation gradients), the parameters and their
+    # gradients - and whether the host has written the parameters since they went up
+    type onGpu<T> struct(n I64) {
+        M mut mirror.Mirror<T>?& = null
+        Steps mut Array<mirror.Step>& = Array<mirror.Step>(0)
+        FreshActs Bool = false
+        FreshParams Bool = false
+        HostParams Bool = true
+    }
+} else {
+    type onGpu<T> struct(n I64) { }
+}
+
 # a node's handle: an index into the graph's nodes
 type Var I64
 
@@ -368,6 +387,8 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     q8Sums mut Array<I32>& = Array<I32>(0)      # its integer products
     q8Scale mut Array<F32>& = Array<F32>(0)     # its dequantization, per output
     wsI8 mut gemm.Workspace<I32>& = gemm.Workspace<I32>(threads)
+    gpu mut onGpu<T>& = onGpu<T>(0)
+    OnGpu Bool = false              # planned on the GPU (ad/mirror): the arena lives there, and the host reads it through Value, Grad, Params
     problem String = ""             # the first shape that did not fit, "" while every one has
     planned Bool = false
     # a captured graph's views of each node's value and gradient (an empty tensor for none) for the entries in use,
@@ -1016,7 +1037,7 @@ fn (g Graph<T>&) accLen() I64 {
 # default kernels/device's default backend (device.SetDefault; the CPU until set): a graph has no GPU form yet
 # (docs/redesign.md 4.4, GP6), so the GPU is refused here, saying so, never run on the CPU instead
 fn (g mut Graph<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.Default()) ? tensor.ShapeError {
-    try onCpu(on)
+    try g.check(on)
     try g.Check()
     if g.planned: unreachable "oann: a graph is planned once"
     if g.Eager {
@@ -1026,18 +1047,32 @@ fn (g mut Graph<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.D
     l := try g.Lay()
     g.begin(r)
     g.arrange(l, r)
+    try g.place(on)
 }
 
-# a graph's backend: the CPU, or the refusal of the GPU (a ShapeError, so Plan's callers handle it as they do a shape)
-fn onCpu(on device.Backend) ? tensor.ShapeError {
-    if on == device.Backend.Gpu: error tensor.ShapeError.Mismatch("no GPU form of ad's graphs yet (docs/redesign.md 4.4, GP6): plan this graph on device.Backend.Cpu")
+# a graph's backend: the CPU, or the GPU where the build has it, the graph is captured, F32 or F64, and every operation
+# has a GPU form - else refused, saying what (a ShapeError, so Plan's callers handle it as they do a shape)
+fn (g Graph<T>&) check(on device.Backend) ? tensor.ShapeError {
+    if on != device.Backend.Gpu: return
+    if Gpu {
+        why := g.refusal()
+        if why != "": error tensor.ShapeError.Mismatch("no GPU form of " + why + ": plan this graph on device.Backend.Cpu")
+    } else {
+        error tensor.ShapeError.Mismatch("built without -define Gpu=true: plan this graph on device.Backend.Cpu, or build with the define")
+    }
+}
+
+# the graph's mirror on the device, made after the arena is: where the plan is for the GPU
+fn (g mut Graph<T>&) place(on device.Backend) ? tensor.ShapeError {
+    if on != device.Backend.Gpu: return
+    if Gpu { try g.attach() }
 }
 
 # Plan with the layout computed beforehand - baked while compiling, `PlanBaked(r, comptime layoutOf())` - or taken from
 # another graph recorded the same way: nothing is laid out here. A layout that does not fit the graph (another node
 # count, another size) is an error of the program
 fn (g mut Graph<T>&) PlanBaked(r mut rand.Rand&, l Layout&, on device.Backend = device.Backend.Default()) ? tensor.ShapeError {
-    try onCpu(on)
+    try g.check(on)
     try g.Check()
     if g.planned: unreachable "oann: a graph is planned once"
     if g.Eager: unreachable "oann: an eager graph has no layout"
@@ -1056,6 +1091,7 @@ fn (g mut Graph<T>&) PlanBaked(r mut rand.Rand&, l Layout&, on device.Backend = 
     }
     g.begin(r)
     g.arrange(l, r)
+    try g.place(on)
 }
 
 # the planned state: the dropout generator drawn from r, the whole batch in use; an eager graph keeps r
@@ -1473,6 +1509,9 @@ fn (g Graph<T>&) inUse(nd Node&) tensor.Shape {
 # v's value, a view of its storage: writing it writes the graph. Valid until a later operation of the step reuses the
 # storage, unless v is an input, a parameter, an output, a loss or kept (Keep)
 fn (g Graph<T>&) Value(v Var) tensor.Tensor<T> {
+    if Gpu {
+        if g.OnGpu: g.hostRead(v, false)
+    }
     if g.viewsN != g.N: return g.valueView(v)
     if g.unplaced[v]: unreachable "oann: the value of a node given no storage (nothing reads it); Keep it to read it"
     return g.views[v]
@@ -1507,6 +1546,9 @@ fn (g Graph<T>&) placedAt(v I64) I64 {
 # v's gradient, laid out row-major in v's shape - for a node that has one (a parameter, or anything depending on one)
 fn (g Graph<T>&) Grad(v Var) tensor.Tensor<T> {
     if g.nodes[v].GradOffset < 0: unreachable "oann: the gradient of a node that depends on no parameter"
+    if Gpu {
+        if g.OnGpu: g.hostRead(v, true)
+    }
     if g.viewsN == g.N: return g.gradViews[v]
     return g.gradRaw(v)
 }
@@ -1594,6 +1636,9 @@ fn (g Graph<T>&) accOf<A>(i I64) mut Array<A>& {
 # a loss's value in F64, or any one-element node's element
 fn (g Graph<T>&) Scalar(v Var) F64 {
     nd := g.nodes[v]
+    if Gpu {
+        if g.OnGpu and isLoss(nd.Kind): return g.gpuLoss(v)
+    }
     return match nd.Kind {
         case Op.CrossEntropy(_, _), Op.Mse(_, _): g.losses[v]
         case _: F64(g.Value(v).Get(0))
@@ -1601,10 +1646,20 @@ fn (g Graph<T>&) Scalar(v Var) F64 {
 }
 
 # every parameter, one after another, as one tensor - what an optimizer updates (a captured graph's)
-fn (g Graph<T>&) Params() tensor.Tensor<T> { return tensor.Tensor<T>.Over(g.mem, 0, g.ParamCount)! }
+fn (g Graph<T>&) Params() tensor.Tensor<T> {
+    if Gpu {
+        if g.OnGpu: g.pullParams()
+    }
+    return tensor.Tensor<T>.Over(g.mem, 0, g.ParamCount)!
+}
 
 # every parameter's gradient, laid out as Params() is
-fn (g Graph<T>&) ParamGrads() tensor.Tensor<T> { return tensor.Tensor<T>.Over(g.mem, g.ParamCount, g.ParamCount)! }
+fn (g Graph<T>&) ParamGrads() tensor.Tensor<T> {
+    if Gpu {
+        if g.OnGpu: g.pullParams()
+    }
+    return tensor.Tensor<T>.Over(g.mem, g.ParamCount, g.ParamCount)!
+}
 
 # whether weight decay applies to parameter v
 fn (g Graph<T>&) Decays(v Var) Bool {
@@ -1790,6 +1845,12 @@ fn (g mut Graph<T>&) Forward(n I64) {
     if g.Decode and g.Pos + n > limit: unreachable "oann: decoding positions " + $g.Pos + " ... " + $(g.Pos + n - 1) + " of " + $limit
     g.N = n
     if n != g.viewsN: g.makeViews()
+    if Gpu {
+        if g.OnGpu {
+            g.gpuForward(n)
+            return
+        }
+    }
     for i in range g.nodes.Len() {
         if isLeaf(g.nodes[i].Kind): continue
         if not g.Profiling {
@@ -1937,6 +1998,12 @@ fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false) {
         unreachable "oann: Backward from a node that is no scalar depending on a parameter, or while decoding"
     }
     count := g.nodes.Len()
+    if Gpu {
+        if g.OnGpu {
+            g.gpuBackward(loss, accumulate)
+            return
+        }
+    }
     for i in range count: g.written[i] = accumulate and g.nodes[i].Kind == Op.Param
     one := g.Grad(loss)
     one.Fill(T(1.0))
@@ -2114,6 +2181,318 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
         }
         case Op.Custom(f, first, count): g.customBack<A>(i, f, first, count)
         case _ { }
+    }
+}
+
+# ---- the GPU (ad/mirror, docs/redesign.md 1.10, GP6) ----
+
+# input j (0 to 2) of an operation, or -1: inputsOf without the array
+fn firstInput(k Op, j I64) I64 {
+    return match k {
+        case Op.Linear(x, w, b): I64(x) if j == 0 else (I64(w) if j == 1 else I64(b))
+        case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
+        case Op.MatMul(a, b, _, _), Op.Add(a, b), Op.Sub(a, b), Op.Mul(a, b), Op.Mse(a, b), Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b): I64(a) if j == 0 else (I64(b) if j == 1 else -1)
+        case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sum(x, _), Op.Reshape(x), Op.Contiguous(x): I64(x) if j == 0 else -1
+        case _: -1
+    }
+}
+
+# whether an operation is a loss, its value kept in F64
+fn isLoss(k Op) Bool {
+    return match k {
+        case Op.CrossEntropy(_, _), Op.Mse(_, _): true
+        case _: false
+    }
+}
+
+# mat.Act's number, as ad.cu has them
+fn actCode(a mat.Act) I64 {
+    return match a {
+        case mat.Act.Relu: 0
+        case mat.Act.Gelu: 1
+        case mat.Act.GeluTanh: 2
+        case mat.Act.Silu: 3
+        case mat.Act.Sigmoid: 4
+        case mat.Act.Tanh: 5
+        case mat.Act.Softplus: 6
+    }
+}
+
+if Gpu {
+    # what of the graph has no GPU form: its name, or "" for none. A GPU graph is captured, of F32 or F64, with the
+    # operations ad.cu and cuBLAS have; permuted and sliced views, dropout, convolutions, scans, rotary positions, a
+    # custom operation, decoding and batched products of two batched operands stay on the CPU
+    fn (g Graph<T>&) refusal() String {
+        match T {
+            case F32, F64 { }
+            case _ { return "a graph of BF16 or F16 (mixed precision)" }
+        }
+        if g.Eager: return "an eager graph"
+        if g.Decode: return "a decoding graph"
+        for i in range g.nodes.Len() {
+            nd := g.nodes[i]
+            name := KindNames[KindOf(nd.Kind)]
+            match nd.Kind {
+                case Op.MatMul(a, b, ta, _) {
+                    if g.nodes[b].Dims.Rank != 2 or (g.nodes[a].Dims.Rank != 2 and ta): return "MatMul of batched operands (node " + $i + ")"
+                }
+                case Op.Dropout(_, _), Op.Rope(_, _, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
+                case Op.DeltaRule(_, _, _, _, _), Op.Permute(_), Op.Slice(_, _, _), Op.Expand(_), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
+                case _ { }
+            }
+        }
+        return ""
+    }
+
+    # the offset of v's value in the arena, or -1 for no node
+    fn (g Graph<T>&) valAt(v I64) I64 { return -1 if v < 0 else g.placedAt(v) }
+
+    fn (g Graph<T>&) gradAt(v I64) I64 { return -1 if v < 0 else g.nodes[v].GradOffset }
+
+    fn (g Graph<T>&) intsAt(v I64) I64 { return -1 if v < 0 else g.nodes[v].IntOffset }
+
+    # node i as a step of the mirror
+    fn (g Graph<T>&) lower(i I64) mirror.Step {
+        nd := g.nodes[i]
+        d := nd.Dims
+        last := d[d.Rank - 1]
+        rows := d.Count() / last
+        s := mirror.Step(mirror.Work.Nothing)
+        s.Rows = rows
+        s.Batched = nd.Batched
+        match nd.Kind {
+            case Op.Linear(x, w, b) {
+                s.Do = mirror.Work.Linear
+                s.Cols = g.nodes[x].Dims[g.nodes[x].Dims.Rank - 1]
+                s.Inner = last
+                s.A, s.B, s.C = g.valAt(x), g.valAt(w), g.valAt(b)
+                s.DA, s.DB, s.DC = g.gradAt(x), g.gradAt(w), g.gradAt(b)
+            }
+            case Op.MatMul(a, b, ta, tb) {
+                s.Do = mirror.Work.MatMul
+                ad := g.nodes[a].Dims
+                s.Cols = last
+                s.Inner = ad[ad.Rank - 2] if ta else ad[ad.Rank - 1]
+                s.TA, s.TB = ta, tb
+                s.A, s.B = g.valAt(a), g.valAt(b)
+                s.DA, s.DB = g.gradAt(a), g.gradAt(b)
+            }
+            case Op.Add(a, b) {
+                s.Do = mirror.Work.Add
+                s.Cols = last
+                s.A, s.B, s.DA, s.DB = g.valAt(a), g.valAt(b), g.gradAt(a), g.gradAt(b)
+            }
+            case Op.Sub(a, b) {
+                s.Do = mirror.Work.Sub
+                s.Cols = last
+                s.A, s.B, s.DA, s.DB = g.valAt(a), g.valAt(b), g.gradAt(a), g.gradAt(b)
+            }
+            case Op.Mul(a, b) {
+                s.Do = mirror.Work.Mul
+                s.Cols = last
+                s.A, s.B, s.DA, s.DB = g.valAt(a), g.valAt(b), g.gradAt(a), g.gradAt(b)
+            }
+            case Op.Scale(x, k) {
+                s.Do = mirror.Work.Scale
+                s.Cols, s.K, s.A, s.DA = last, k, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Act(x, a) {
+                s.Do = mirror.Work.Act
+                s.Cols, s.Code, s.A, s.DA = last, actCode(a), g.valAt(x), g.gradAt(x)
+            }
+            case Op.LeakyRelu(x, slope) {
+                s.Do = mirror.Work.Leaky
+                s.Cols, s.K, s.A, s.DA = last, slope, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Softmax(x) {
+                s.Do = mirror.Work.Softmax
+                s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+            }
+            case Op.LogSoftmax(x) {
+                s.Do = mirror.Work.LogSoftmax
+                s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Norm(x, gain, b, rms, eps) {
+                s.Do = mirror.Work.Norm
+                s.Cols, s.Flag, s.K = last, rms, eps
+                s.A, s.B, s.C = g.valAt(x), g.valAt(gain), g.valAt(b)
+                s.DA, s.DB, s.DC = g.gradAt(x), g.gradAt(gain), g.gradAt(b)
+                s.Saved = nd.SavedOffset
+            }
+            case Op.Embedding(t, table) {
+                s.Do = mirror.Work.Embedding
+                s.Cols, s.Inner = last, g.nodes[table].Dims[0]
+                s.IntA = g.intsAt(t)
+                s.B, s.DB = g.valAt(table), g.gradAt(table)
+            }
+            case Op.Positions(x, table) {
+                s.Do = mirror.Work.Positions
+                s.Cols, s.Inner, s.Ctx = last, g.nodes[table].Dims[0], d[1]
+                s.A, s.B, s.DA, s.DB = g.valAt(x), g.valAt(table), g.gradAt(x), g.gradAt(table)
+            }
+            case Op.Attention(q, k, v, heads, causal) {
+                s.Do = mirror.Work.Attention
+                s.Cols, s.Heads, s.Ctx, s.Flag, s.Inner = last, heads, d[1], causal, i
+                s.A, s.B, s.C = g.valAt(q), g.valAt(k), g.valAt(v)
+                s.DA, s.DB, s.DC = g.gradAt(q), g.gradAt(k), g.gradAt(v)
+                s.Saved, s.Scratch = nd.SavedOffset, nd.ScratchOffset
+            }
+            case Op.CrossEntropy(z, c) {
+                s.Do = mirror.Work.CrossEntropy
+                zd := g.nodes[z].Dims
+                s.Cols, s.Rows, s.Inner = zd[zd.Rank - 1], zd.Count() / zd[zd.Rank - 1], i
+                s.Batched = g.nodes[z].Batched
+                s.A, s.DA, s.IntA, s.Saved = g.valAt(z), g.gradAt(z), g.intsAt(c), nd.SavedOffset
+            }
+            case Op.Mse(a, b) {
+                s.Do = mirror.Work.Mse
+                ad := g.nodes[a].Dims
+                s.Cols, s.Rows, s.Inner = ad[ad.Rank - 1], ad.Count() / ad[ad.Rank - 1], i
+                s.Batched = g.nodes[a].Batched
+                s.A, s.B, s.DA, s.DB = g.valAt(a), g.valAt(b), g.gradAt(a), g.gradAt(b)
+            }
+            case Op.Contiguous(x) {
+                s.Do = mirror.Work.Copy
+                s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Reshape(x) {
+                s.Do = mirror.Work.Reshape
+                s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Sum(x, mean) {
+                s.Do = mirror.Work.Sum
+                xd := g.nodes[x].Dims
+                s.Cols, s.Rows, s.Flag = xd[xd.Rank - 1], xd.Count() / xd[xd.Rank - 1], mean
+                s.Batched = g.nodes[x].Batched
+                s.A, s.DA = g.valAt(x), g.gradAt(x)
+            }
+            case _ { }
+        }
+        s.Y, s.DY = g.valAt(i), nd.GradOffset
+        return s
+    }
+
+    # the device's arena for the planned graph: every node lowered, its buffers allocated and its kernels compiled
+    fn (g mut Graph<T>&) attach() ? tensor.ShapeError {
+        try device.Open() catch e { error tensor.ShapeError.Mismatch("no GPU: " + $e) }
+        steps := Vec<mirror.Step>()
+        rowloss I64 = 1
+        for i in range g.nodes.Len() {
+            s := g.lower(i)
+            if s.Do == mirror.Work.CrossEntropy: rowloss = rowloss.Max(s.Rows)
+            steps.Push(s)
+        }
+        all := steps.ToArray()
+        g.gpu.Steps = all
+        g.gpu.M = try mirror.Mirror<T>.Make(device.Opened!, all, g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
+        g.OnGpu = true
+        g.gpu.HostParams = true
+    }
+
+    # before the optimizer steps the parameters on the device: any the host wrote are up, and the device's now newer
+    fn (g Graph<T>&) DeviceReady() {
+        if g.gpu.HostParams {
+            g.gpu.M!.Upload(g.mem, 0, g.ParamCount)
+            g.gpu.HostParams = false
+        }
+        g.gpu.FreshParams = true
+    }
+
+    # the device's mirror (for the optimizer's step, nn/optim)
+    fn (g Graph<T>&) Mirror() mut mirror.Mirror<T>& { return g.gpu.M! }
+
+    # a Forward on the device: the parameters up if the host wrote them, every input up, each node's kernels
+    fn (g mut Graph<T>&) gpuForward(n I64) {
+        m := g.gpu.M!
+        if g.gpu.HostParams {
+            m.Upload(g.mem, 0, g.ParamCount)
+            g.gpu.HostParams = false
+        }
+        for i in range g.nodes.Len() {
+            nd := g.nodes[i]
+            match nd.Kind {
+                case Op.Input, Op.Constant { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
+                case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
+                case _ { }
+            }
+        }
+        steps := g.gpu.Steps
+        for i in range g.nodes.Len() {
+            if isLeaf(g.nodes[i].Kind): continue
+            m.Forward(steps[i], n, g.Pos)
+        }
+        g.gpu.FreshActs = true
+        g.gpu.FreshParams = true
+    }
+
+    # a Backward on the device, the order and the adds of the CPU's
+    fn (g mut Graph<T>&) gpuBackward(loss Var, accumulate Bool) {
+        m := g.gpu.M!
+        if accumulate: g.pullParams()
+        if g.gpu.HostParams {
+            m.Upload(g.mem, 0, g.ParamCount)
+            g.gpu.HostParams = false
+        }
+        count := g.nodes.Len()
+        for i in range count: g.written[i] = accumulate and g.nodes[i].Kind == Op.Param
+        m.Fill(g.nodes[loss].GradOffset, 1, 1.0)
+        g.written[loss] = true
+        steps := g.gpu.Steps
+        for k in range I64(loss) + 1 {
+            i := I64(loss) - k
+            nd := g.nodes[i]
+            if nd.GradOffset < 0 or not g.written[i] or isLeaf(nd.Kind): continue
+            a0 := g.acc(firstInput(nd.Kind, 0))
+            a1 := g.acc(firstInput(nd.Kind, 1))
+            a2 := g.acc(firstInput(nd.Kind, 2))
+            m.Backward(steps[i], g.N, g.Pos, a0, a1, a2)
+        }
+        for i in range count {
+            if g.nodes[i].Kind == Op.Param and not g.written[i]: m.Fill(g.nodes[i].GradOffset, g.nodes[i].Dims.Count(), 0.0)
+        }
+        g.gpu.FreshActs = true
+        g.gpu.FreshParams = true
+    }
+
+    # a loss's value from the device: the F64 it was summed in
+    fn (g Graph<T>&) gpuLoss(v Var) F64 {
+        x := g.gpu.M!.Loss(v)
+        g.losses[v] = x
+        return x
+    }
+
+    # the host's copy of node v brought up to date where the device's is newer: a parameter's (or a gradient's) by
+    # pullParams, an input's never (the host owns it), anything else by pullActs
+    fn (g Graph<T>&) hostRead(v Var, grad Bool) {
+        nd := g.nodes[v]
+        if nd.Kind == Op.Param {
+            g.pullParams()
+            return
+        }
+        if isLeaf(nd.Kind) and not grad: return
+        g.pullActs()
+    }
+
+    # the parameters and their gradients down where the device's are newer; after it the host may write the parameters,
+    # so they go up again at the next Forward
+    fn (g Graph<T>&) pullParams() {
+        if g.gpu.FreshParams {
+            g.gpu.M!.DownloadRange(g.mem, 0, 2 * g.ParamCount)
+            g.gpu.FreshParams = false
+        }
+        g.gpu.HostParams = true
+    }
+
+    # the activation region (and the watched inputs' gradients) down where the device's is newer
+    fn (g Graph<T>&) pullActs() {
+        if not g.gpu.FreshActs: return
+        m := g.gpu.M!
+        m.DownloadRange(g.mem, g.mem.Len() - g.ActivationSize, g.ActivationSize)
+        for i in range g.nodes.Len() {
+            nd := g.nodes[i]
+            if (nd.Kind == Op.Input or nd.Kind == Op.Constant) and nd.GradOffset >= 0: m.DownloadRange(g.mem, nd.GradOffset, nd.Dims.Count())
+        }
+        g.gpu.FreshActs = false
     }
 }
 
@@ -2621,19 +3000,29 @@ test Graph.Plan "a shape that does not fit is reported by Plan, naming it, and n
     assert failed
 }
 
-test Graph.Plan "on the GPU, the default backend or named, a graph is refused saying it has no GPU form yet; on the CPU it plans" {
+test Graph.Plan "on the GPU where the build has none, a graph is refused saying so; on the CPU it plans" {
     for named in Array<Bool>[true, false] {
         g := Graph<F32>(4)
         g.Act(g.Linear(g.Input(3), g.Param(Init.Zeros, true, 2, 3)), mat.Act.Relu)
         said := ""
-        if named {
-            try g.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+        if Gpu {
+            # a build with the GPU plans it (ad/gpu_test); a part with no GPU form is refused by name
+            g2 := Graph<F32>(4)
+            g2.Dropout(g2.Linear(g2.Input(3), g2.Param(Init.Zeros, true, 2, 3)), 0.5)
+            if device.GpuAvailable() {
+                try g2.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+                assert said.Contains("no GPU form of Dropout"), said
+            }
         } else {
-            device.SetDefault(device.Backend.Gpu)
-            try g.Plan(rand.Rand(1)) catch tensor.ShapeError e { said = $e }
-            device.SetDefault(device.Backend.Cpu)
+            if named {
+                try g.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+            } else {
+                device.SetDefault(device.Backend.Gpu)
+                try g.Plan(rand.Rand(1)) catch tensor.ShapeError e { said = $e }
+                device.SetDefault(device.Backend.Cpu)
+            }
+            assert said.Contains("built without -define Gpu=true"), said
         }
-        assert said.Contains("no GPU form of ad's graphs"), said
         try g.Plan(rand.Rand(1), device.Backend.Cpu)
     }
 }

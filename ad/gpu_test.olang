@@ -1,0 +1,480 @@
+# ad/gpu_test - ad on the GPU against ad on the CPU (docs/redesign.md 1.10, "Testing: the CPU kernels are the oracle"; GP6).
+# Built only with -define Gpu=true (make gputest): kernels/gpu asserts it.
+#
+# The element kernels (kernels/gpu/src/ad.cu) against kernels/elem on raw buffers: every activation and its gradient,
+# softmax (plain and causal), log-sum-exp, layer and RMS norms forward and backward, AdamW (bit for bit). Then whole
+# graphs planned on both backends from one seed and fed the same batch: the perceptron and the character transformer
+# (and its variants), forward and backward within rounding of the CPU's, two GPU runs identical, a short batch, a few
+# AdamW steps with the optimizer on the device against the host's, and what has no GPU form refused by name.
+
+import "graph"
+import "mirror"
+import "../kernels/mat"
+import "../kernels/elem"
+import "../kernels/device"
+import gdev "../kernels/gpu/device"
+import "../kernels/gpu/kern"
+import "../models/gpt"
+import "../nn/optim"
+import "../tensor"
+import "std/rand"
+
+fn randoms(n I64, lo F64, hi F64, r mut rand.Rand&) Array<F32> {
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(r.Uniform(lo, hi))
+    return x
+}
+
+# the largest |a - b| over the arrays, and the largest |b|
+fn worst(a Array<F32>&, b Array<F32>&) F64, F64 {
+    w F64 = 0.0
+    big F64 = 0.0
+    for i in range b.Len() {
+        w = w.Max((F64(a[i]) - F64(b[i])).Abs())
+        big = big.Max(F64(b[i]).Abs())
+    }
+    return w, big
+}
+
+# the kernels' kit, compiled for F32
+fn kit(d mut gdev.Device&) kern.Kit ? gdev.GpuError { return try kern.Kit.Compile(d, mirror.Source(F32(0)), mirror.Names) }
+
+# x on the device
+fn up(d mut gdev.Device&, x Array<F32>&) gdev.Buf<F32> ? gdev.GpuError {
+    b := try gdev.Buf<F32>.Make(d, x.Len())
+    b.UploadAll(x)
+    return b
+}
+
+fn down(d mut gdev.Device&, b gdev.Buf<F32>&) Array<F32> ? gdev.GpuError {
+    out := Array<F32>(b.N)
+    b.DownloadAll(out)
+    try d.Sync()
+    return out
+}
+
+fn acts() Array<mat.Act> {
+    return Array<mat.Act>[mat.Act.Relu, mat.Act.Gelu, mat.Act.GeluTanh, mat.Act.Silu, mat.Act.Sigmoid, mat.Act.Tanh, mat.Act.Softplus]
+}
+
+fn actCase() ? {
+    d := try gdev.Device.Open() catch gdev.GpuError.NoDevice {
+        gdev.Skip("Act")
+        return
+    }
+    k := try kit(d)
+    r := rand.Rand(5)
+    for n in Array<I64>[1, 31, 1000, 4099] {
+        x := randoms(n, -7.0, 7.0, r)
+        dy := randoms(n, -2.0, 2.0, r)
+        start := randoms(n, -1.0, 1.0, r)
+        bx := try up(d, x)
+        bdy := try up(d, dy)
+        by := try gdev.Buf<F32>.Make(d, n)
+        for ai in range 7 {
+            a := acts()[ai]
+            want := Array<F32>(n)
+            elem.Act(want, x, a)
+            kern.LaunchKit(d, k, mirror.KAct, kern.Blocks(n), kern.Block, by.Addr(0), bx.Addr(0), kern.Arg(n), kern.Arg(I64(ai)))
+            got := try down(d, by)
+            w, big := worst(got, want)
+            assert w <= 2.0e-6 * (1.0 + big), "act " + $ai + " at " + $n + ": " + $w
+            # the gradient from x, written then added
+            wantG := Array<F32>(n)
+            elem.ActGrad(wantG, dy, x, a, false)
+            bdx := try up(d, start)
+            kern.LaunchKit(d, k, mirror.KActGrad, kern.Blocks(n), kern.Block, bdx.Addr(0), bdy.Addr(0), bx.Addr(0), kern.Arg(n), kern.Arg(I64(ai)), kern.Arg(I64(0)), kern.Arg(I64(0)))
+            gotG := try down(d, bdx)
+            wg, bigG := worst(gotG, wantG)
+            assert wg <= 2.0e-6 * (1.0 + bigG), "act grad " + $ai + " at " + $n + ": " + $wg
+            wantA := Array<F32>[start[i] + wantG[i] for i in range n]
+            bdx.UploadAll(start)
+            kern.LaunchKit(d, k, mirror.KActGrad, kern.Blocks(n), kern.Block, bdx.Addr(0), bdy.Addr(0), bx.Addr(0), kern.Arg(n), kern.Arg(I64(ai)), kern.Arg(I64(0)), kern.Arg(I64(1)))
+            gotA := try down(d, bdx)
+            wa, bigA := worst(gotA, wantA)
+            assert wa <= 2.0e-6 * (1.0 + bigA), "act grad added " + $ai + " at " + $n + ": " + $wa
+            # Relu, Sigmoid, Tanh from the output
+            if ai == 0 or ai == 4 or ai == 5 {
+                wantO := Array<F32>(n)
+                elem.ActGradOut(wantO, dy, want, a, false)
+                by.UploadAll(want)
+                kern.LaunchKit(d, k, mirror.KActGrad, kern.Blocks(n), kern.Block, bdx.Addr(0), bdy.Addr(0), by.Addr(0), kern.Arg(n), kern.Arg(I64(ai)), kern.Arg(I64(1)), kern.Arg(I64(0)))
+                gotO := try down(d, bdx)
+                wo, bigO := worst(gotO, wantO)
+                assert wo <= 2.0e-6 * (1.0 + bigO), "act grad from the output " + $ai + ": " + $wo
+            }
+        }
+    }
+}
+
+test actCase "every activation and its gradient on the GPU against kernels/elem's, written and added, at odd sizes" { try actCase() }
+
+# rows of cols of x through softmax: the GPU's against the CPU's, plain or causal (rows of ctx positions)
+fn softmaxCase(d mut gdev.Device&, k kern.Kit&, rows I64, cols I64, ctx I64, causal Bool, r mut rand.Rand&) ? gdev.GpuError {
+    x := randoms(rows * cols, -4.0, 4.0, r)
+    dy := randoms(rows * cols, -1.0, 1.0, r)
+    want := Array<F32>(rows * cols)
+    m := mat.Mat<F32>(want, 0, rows, cols, cols)
+    elem.RowSoftmax(m, mat.Mat<F32>(x, 0, rows, cols, cols), F32(1.0))
+    if causal {
+        for i in range rows {
+            last := i % ctx + 1
+            run := Array<F32>(last)
+            for j in range last: run[j] = x[i * cols + j]
+            rm := mat.Mat<F32>(run, 0, 1, last, last)
+            elem.RowSoftmaxInPlace(rm, F32(1.0))
+            for j in range cols: want[i * cols + j] = run[j] if j < last else F32(0)
+        }
+    }
+    bx := try up(d, x)
+    by := try gdev.Buf<F32>.Make(d, rows * cols)
+    kern.LaunchKit(d, k, mirror.KSoftmax, rows, mirror.RowBlock(cols), by.Addr(0), bx.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)))
+    got := try down(d, by)
+    w, big := worst(got, want)
+    what := "softmax " + $rows + " x " + $cols + (" causal ctx " + $ctx if causal else "")
+    assert w <= 1.0e-6 * (1.0 + big), what + ": " + $w
+    # the backward: dx = p (dy - <dy, p>) over the valid entries, 0 after
+    wantG := Array<F32>(rows * cols)
+    for i in range rows {
+        last := i % ctx + 1 if causal else cols
+        dot F64 = 0.0
+        for j in range last: dot += F64(dy[i * cols + j]) * F64(want[i * cols + j])
+        for j in range last: wantG[i * cols + j] = F32(F64(want[i * cols + j]) * (F64(dy[i * cols + j]) - dot))
+    }
+    bdy := try up(d, dy)
+    bdx := try gdev.Buf<F32>.Make(d, rows * cols)
+    kern.LaunchKit(d, k, mirror.KSoftmaxGrad, rows, mirror.RowBlock(cols), bdx.Addr(0), bdy.Addr(0), by.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(F32(1.0)), kern.Arg(I64(0)))
+    gotG := try down(d, bdx)
+    wg, bigG := worst(gotG, wantG)
+    assert wg <= 1.0e-6 * (1.0 + bigG), what + " backward: " + $wg
+    # the log-sum-exp of the same rows
+    if not causal {
+        wl := Array<F32>(rows)
+        elem.RowLogSumExp(wl, mat.Mat<F32>(x, 0, rows, cols, cols))
+        bl := try gdev.Buf<F32>.Make(d, rows)
+        kern.LaunchKit(d, k, mirror.KLse, rows, mirror.RowBlock(cols), bl.Addr(0), bx.Addr(0), kern.Arg(cols))
+        gl := try down(d, bl)
+        wlw, bigL := worst(gl, wl)
+        assert wlw <= 2.0e-6 * (1.0 + bigL), "log-sum-exp " + $rows + " x " + $cols + ": " + $wlw
+    }
+}
+
+fn softmaxAll() ? {
+    d := try gdev.Device.Open() catch gdev.GpuError.NoDevice {
+        gdev.Skip("Softmax")
+        return
+    }
+    k := try kit(d)
+    r := rand.Rand(6)
+    for cols in Array<I64>[1, 5, 32, 33, 64, 300, 1000] { try softmaxCase(d, k, 7, cols, 1, false, r) }
+    for ctx in Array<I64>[1, 8, 33, 64] { try softmaxCase(d, k, 3 * ctx, ctx, ctx, true, r) }
+}
+
+test softmaxAll "softmax, causal softmax, their gradients and log-sum-exp on the GPU against kernels/elem's" { try softmaxAll() }
+
+# the norms: stats, apply, gradients (dx added too, dgain, dbias) against kernels/elem's, layer or RMS
+fn normCase(d mut gdev.Device&, k kern.Kit&, rows I64, cols I64, rms Bool, r mut rand.Rand&) ? gdev.GpuError {
+    x := randoms(rows * cols, -3.0, 3.0, r)
+    dy := randoms(rows * cols, -1.0, 1.0, r)
+    gain := randoms(cols, 0.5, 1.5, r)
+    bias := randoms(cols, -0.5, 0.5, r)
+    eps := F32(1.0e-5)
+    mean := Array<F32>(rows)
+    inv := Array<F32>(rows)
+    xm := mat.Mat<F32>(x, 0, rows, cols, cols)
+    elem.RowNormStats(mean, inv, xm, eps, rms)
+    y := Array<F32>(rows * cols)
+    elem.RowNormApply(mat.Mat<F32>(y, 0, rows, cols, cols), xm, mean, inv, gain, Array<F32>(0) if rms else bias)
+    dx := Array<F32>(rows * cols)
+    dm := mat.Mat<F32>(dx, 0, rows, cols, cols)
+    elem.RowNormGrad(dm, mat.Mat<F32>(dy, 0, rows, cols, cols), xm, mean, inv, gain, rms, false)
+    dg := Array<F32>(cols)
+    db := Array<F32>(cols)
+    elem.RowNormParamGrad(dg, db, mat.Mat<F32>(dy, 0, rows, cols, cols), xm, mean, inv, false)
+    bx := try up(d, x)
+    bdy := try up(d, dy)
+    bgain := try up(d, gain)
+    bbias := try up(d, bias)
+    bmean := try gdev.Buf<F32>.Make(d, rows)
+    binv := try gdev.Buf<F32>.Make(d, rows)
+    by := try gdev.Buf<F32>.Make(d, rows * cols)
+    bdx := try gdev.Buf<F32>.Make(d, rows * cols)
+    bdg := try gdev.Buf<F32>.Make(d, cols)
+    bdb := try gdev.Buf<F32>.Make(d, cols)
+    n := rows * cols
+    kern.LaunchKit(d, k, mirror.KNormStats, rows, mirror.RowBlock(cols), bmean.Addr(0), binv.Addr(0), bx.Addr(0), kern.Arg(cols), kern.Arg(eps), kern.Arg(I64(1 if rms else 0)))
+    bias0 U64 = 0 if rms else bbias.Addr(0)
+    kern.LaunchKit(d, k, mirror.KNormApply, kern.Blocks(n), kern.Block, by.Addr(0), bx.Addr(0), bmean.Addr(0), binv.Addr(0), bgain.Addr(0), bias0, kern.Arg(n), kern.Arg(cols))
+    kern.LaunchKit(d, k, mirror.KNormGrad, rows, mirror.RowBlock(cols), bdx.Addr(0), bdy.Addr(0), bx.Addr(0), bmean.Addr(0), binv.Addr(0), bgain.Addr(0), kern.Arg(cols), kern.Arg(I64(1 if rms else 0)), kern.Arg(I64(0)))
+    kern.LaunchKit(d, k, mirror.KNormParam, kern.Blocks(cols), kern.Block, bdg.Addr(0), bdb.Addr(0), bdy.Addr(0), bx.Addr(0), bmean.Addr(0), binv.Addr(0), kern.Arg(rows), kern.Arg(cols), kern.Arg(I64(0)), kern.Arg(I64(0)))
+    what := ("rms " if rms else "layer ") + "norm " + $rows + " x " + $cols
+    gm := try down(d, bmean)
+    gi := try down(d, binv)
+    wm, bm := worst(gm, mean)
+    wi, bi := worst(gi, inv)
+    assert wm <= 2.0e-6 * (1.0 + bm) and wi <= 2.0e-6 * (1.0 + bi), what + " stats: " + $wm + ", " + $wi
+    gy := try down(d, by)
+    wy, byy := worst(gy, y)
+    assert wy <= 4.0e-6 * (1.0 + byy), what + " apply: " + $wy
+    gdx := try down(d, bdx)
+    wd, bdd := worst(gdx, dx)
+    assert wd <= 1.0e-5 * (1.0 + bdd), what + " dx: " + $wd
+    ggg := try down(d, bdg)
+    wg, bgg := worst(ggg, dg)
+    assert wg <= 1.0e-5 * (1.0 + bgg), what + " dgain: " + $wg
+    gbb := try down(d, bdb)
+    wb, bbb := worst(gbb, db)
+    assert wb <= 1.0e-5 * (1.0 + bbb), what + " dbias: " + $wb
+}
+
+fn normAll() ? {
+    d := try gdev.Device.Open() catch gdev.GpuError.NoDevice {
+        gdev.Skip("Norm")
+        return
+    }
+    k := try kit(d)
+    r := rand.Rand(7)
+    for cols in Array<I64>[1, 7, 32, 128, 129, 500] {
+        try normCase(d, k, 13, cols, false, r)
+        try normCase(d, k, 13, cols, true, r)
+    }
+}
+
+test normAll "layer and RMS norms on the GPU, forward and backward, against kernels/elem's" { try normAll() }
+
+fn adamKernel() ? {
+    d := try gdev.Device.Open() catch gdev.GpuError.NoDevice {
+        gdev.Skip("AdamW")
+        return
+    }
+    k := try kit(d)
+    r := rand.Rand(8)
+    n I64 = 1003
+    p := randoms(n, -1.0, 1.0, r)
+    mask := Array<U8>(n)
+    spans := Vec<optim.Span>()
+    for i in range n { mask[i] = U8(1 if (i / 100) % 2 == 0 else 0) }
+    for i in range 0, n, 100 { spans.Push(optim.Span(i, (i + 100).Min(n), (i / 100) % 2 == 0)) }
+    # the CPU's: the parameters and the gradients one region, as a graph lays them out
+    cp := tensor.Tensor<F32>.Over(Array<F32>[p[i] for i in range n], 0, n)!
+    gr := Array<F32>(n)
+    cg := tensor.Tensor<F32>.Over(gr, 0, n)!
+    o := optim.AdamW(cp, cg, rate = 0.01, decay = 0.1, spans = spans.ToArray())
+    bp := try up(d, p)
+    bg := try gdev.Buf<F32>.Make(d, n)
+    bm := try gdev.Buf<F32>.Make(d, n)
+    bv := try gdev.Buf<F32>.Make(d, n)
+    bmask := try gdev.Buf<U8>.Make(d, n)
+    bmask.UploadAll(mask)
+    kern.Zero(d, bm.Addr(0), n * 4)
+    kern.Zero(d, bv.Addr(0), n * 4)
+    for step in range 1, 8 {
+        g := randoms(n, -1.0, 1.0, r)
+        for i in range n: gr[i] = g[i]
+        o.Step()
+        bg.UploadAll(g)
+        corr1 F64 = 1.0 - F64(0.9).Pow(F64(step))
+        corr2 F64 = 1.0 - F64(0.999).Pow(F64(step))
+        kern.LaunchKit(d, k, mirror.KAdamW, kern.Blocks(n), kern.Block, bp.Addr(0), bg.Addr(0), bm.Addr(0), bv.Addr(0), bmask.Addr(0), kern.Arg(n), kern.Arg(F32(0.9)), kern.Arg(F32(0.999)), kern.Arg(F32(1.0 - 0.9)), kern.Arg(F32(1.0 - 0.999))
+            kern.Arg(F32(1.0 - 0.01 * 0.1)), kern.Arg(F32(0.01 / corr1)), kern.Arg(F32(1.0 / corr2.Sqrt())), kern.Arg(F32(1e-8)))
+        got := try down(d, bp)
+        want := cp.Flat()!
+        for i in range n: assert got[i].Bits() == want[i].Bits(), "AdamW step " + $step + " parameter " + $i + ": " + $got[i] + " against " + $want[i]
+    }
+}
+
+test adamKernel "AdamW's kernel is nn/optim's step bit for bit, decay only where the mask says, over many steps" { try adamKernel() }
+
+# ---- whole graphs ----
+
+# a network recorded on a graph: its handles
+type Net struct(x graph.Var, y graph.Var, logits graph.Var, loss graph.Var, tokens Bool) {
+    x
+    y
+    logits
+    loss
+    tokens
+}
+
+fn Net.mlp(g mut graph.Graph<F32>&) Net {
+    x := g.Input(20)
+    y := g.Classes()
+    w1 := g.Param(graph.Init.Uniform(-0.3, 0.3), true, 32, 20)
+    b1 := g.Param(graph.Init.Uniform(-0.3, 0.3), false, 32)
+    w2 := g.Param(graph.Init.Uniform(-0.3, 0.3), true, 10, 32)
+    b2 := g.Param(graph.Init.Uniform(-0.3, 0.3), false, 10)
+    h := g.Act(g.Linear(x, w1, b1), mat.Act.Relu)
+    logits := g.Linear(h, w2, b2)
+    g.Keep(logits)
+    return Net(x, y, logits, g.CrossEntropy(logits, y), false)
+}
+
+fn charlmOf(c gpt.GptConfig) fn&(g mut graph.Graph<F32>&) Net {
+    return fn(g mut graph.Graph<F32>&) Net {
+        m := gpt.Gpt.New(g, c)
+        lm := m.Lm(g)
+        g.Keep(lm.Logits)
+        return Net(lm.Tokens, lm.Targets, lm.Logits, lm.Loss, true)
+    }
+}
+
+# fills the batch of n entries the same on both graphs: tokens or inputs and classes from the seed
+fn feed(g mut graph.Graph<F32>&, net Net&, n I64, seed U64, classes I64) {
+    r := rand.Rand(seed)
+    if net.tokens {
+        t := g.Ints(net.x).Flat()!
+        c := g.Ints(net.y).Flat()!
+        for i in range t.Len() { t[i] = I32(r.Below(classes)) }
+        for i in range c.Len() { c[i] = I32(r.Below(classes)) }
+        return
+    }
+    xs := g.Data(net.x).Flat()!
+    for i in range xs.Len(): xs[i] = F32(r.Uniform(-1.0, 1.0))
+    ys := g.Ints(net.y).Flat()!
+    for i in range ys.Len(): ys[i] = I32(r.Below(classes))
+}
+
+# what the two graphs hold after a forward and backward: the largest difference against the largest value
+fn closeTo(cpu mut graph.Graph<F32>&, gpu mut graph.Graph<F32>&, net Net&, tol F64, what String&) {
+    lc := cpu.Scalar(net.loss)
+    lg := gpu.Scalar(net.loss)
+    assert (lc - lg).Abs() <= tol * (1.0 + lc.Abs()), what + ": the loss " + $lg + " against the CPU's " + $lc
+    zc := cpu.Value(net.logits).Flat()!
+    zg := gpu.Value(net.logits).Flat()!
+    wz, bz := worst(zg, zc)
+    assert wz <= tol * (1.0 + bz), what + ": the logits differ by " + $wz + " of " + $bz
+    gc := cpu.ParamGrads().Flat()!
+    gg := gpu.ParamGrads().Flat()!
+    wg, bg := worst(gg, gc)
+    assert wg <= tol * (1.0 + bg), what + ": the gradients differ by " + $wg + " of " + $bg
+}
+
+fn pair(record fn&(g mut graph.Graph<F32>&) Net, batch I64, seed U64) graph.Graph<F32>, graph.Graph<F32>, Net {
+    cpu := graph.Graph<F32>(batch)
+    net := record(cpu)
+    gpu := graph.Graph<F32>(batch)
+    record(gpu)
+    try cpu.Plan(rand.Rand(seed), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(seed), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    return cpu, gpu, net
+}
+
+fn mlpCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("the perceptron")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.mlp(g) }, 16, 3)
+    assert gpu.OnGpu and not cpu.OnGpu
+    assert cpu.Params().Flat()! == gpu.Params().Flat()!
+    for n in Array<I64>[16, 11, 1, 16] {
+        feed(cpu, net, n, U64(n) + 7, 10)
+        feed(gpu, net, n, U64(n) + 7, 10)
+        cpu.Forward(n)
+        cpu.Backward(net.loss)
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "perceptron at " + $n)
+        first := Array<F32>[v for v in gpu.ParamGrads().Flat()!]
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        assert first == Array<F32>[v for v in gpu.ParamGrads().Flat()!], "perceptron at " + $n + ": a second run differs"
+    }
+}
+
+test mlpCase "the perceptron on the GPU: forward and backward within rounding of the CPU's, a full batch and a short one, twice alike" { mlpCase() }
+
+fn charlmCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("the transformer")
+        return
+    }
+    for v in Array<I64>[0, 2] {
+        c := gpt.GptConfig.Variant(v)
+        cpu, gpu, net := pair(charlmOf(c), 4, 11)
+        for n in Array<I64>[4, 3] {
+            feed(cpu, net, n, U64(n) + 1, c.Vocab)
+            feed(gpu, net, n, U64(n) + 1, c.Vocab)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 5.0e-4, "transformer variant " + $v + " at " + $n)
+            first := Array<F32>[x for x in gpu.ParamGrads().Flat()!]
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            assert first == Array<F32>[x for x in gpu.ParamGrads().Flat()!], "transformer variant " + $v + ": a second run differs"
+        }
+    }
+    c := gpt.GptConfig.Char(65)
+    cpu, gpu, net := pair(charlmOf(c), 8, 2)
+    feed(cpu, net, 8, 9, 65)
+    feed(gpu, net, 8, 9, 65)
+    cpu.Forward(8)
+    cpu.Backward(net.loss)
+    gpu.Forward(8)
+    gpu.Backward(net.loss)
+    closeTo(cpu, gpu, net, 5.0e-4, "the character transformer")
+}
+
+test charlmCase "the character transformer on the GPU, its variants too: forward and backward within rounding of the CPU's, twice alike" { charlmCase() }
+
+fn trained() {
+    if not device.GpuAvailable() {
+        gdev.Skip("training")
+        return
+    }
+    c := gpt.GptConfig.Variant(0)
+    cpu, gpu, net := pair(charlmOf(c), 4, 5)
+    oc := optim.AdamW(cpu.Params(), cpu.ParamGrads(), rate = 0.01, decay = 0.1, spans = optim.Spans(cpu))
+    og := try optim.GpuAdamW<F32>.For(gpu, rate = 0.01, decay = 0.1) catch { unreachable }
+    first F64 = 0.0
+    last F64 = 0.0
+    for step in range 20 {
+        feed(cpu, net, 4, 100, c.Vocab)
+        feed(gpu, net, 4, 100, c.Vocab)
+        cpu.Forward(4)
+        cpu.Backward(net.loss)
+        nc := optim.ClipNorm(cpu.ParamGrads(), 1.0)
+        oc.Step()
+        gpu.Forward(4)
+        gpu.Backward(net.loss)
+        og.Clip(1.0)
+        ng := og.Norm()
+        og.Step()
+        lc := cpu.Scalar(net.loss)
+        lg := gpu.Scalar(net.loss)
+        assert (nc - ng).Abs() <= 2.0e-2 * (1.0 + nc), "step " + $step + ": the gradient norm " + $ng + " against the CPU's " + $nc
+        assert (lc - lg).Abs() <= 1.0e-2 * (1.0 + lc), "step " + $step + ": the loss " + $lg + " against the CPU's " + $lc
+        if step == 0: first = lg
+        last = lg
+    }
+    assert last < first, "no learning: " + $first + " to " + $last
+    # the parameters, read back, are the CPU's within the drift of 20 steps
+    pc := cpu.Params().Flat()!
+    pg := gpu.Params().Flat()!
+    w, big := worst(pg, pc)
+    assert w <= 5.0e-3 * (1.0 + big), "the parameters differ by " + $w
+}
+
+test trained "a graph trained on the GPU - AdamW on the device, clipped - follows the CPU's: the losses within rounding over 20 steps, and it learns" { trained() }
+
+fn refused() ? {
+    if not device.GpuAvailable() {
+        gdev.Skip("the refusals")
+        return
+    }
+    g := graph.Graph<F32>(4)
+    g.Dropout(g.Linear(g.Input(3), g.Param(graph.Init.Zeros, true, 2, 3)), 0.5)
+    said := ""
+    try g.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+    assert said.Contains("no GPU form of Dropout"), said
+    b := graph.Graph<BF16>(4)
+    b.Linear(b.Input(3), b.Param(graph.Init.Zeros, true, 2, 3))
+    said = ""
+    try b.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+    assert said.Contains("BF16"), said
+    try g.Plan(rand.Rand(1), device.Backend.Cpu)
+}
+
+test refused "a part with no GPU form is refused at Plan by name, and nothing is planned on the device" { try refused() }

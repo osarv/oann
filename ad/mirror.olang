@@ -1,0 +1,591 @@
+# ad/mirror - a planned graph on the GPU (docs/redesign.md 1.10, GP6): the device mirror of ad/graph's arena. The graph lays
+# its parameters, gradients, inputs and activations out in one array (graph.olang, "Captured"); on the GPU the same
+# array is one buffer of the same length and every node's value, gradient, kept tensors and scratch are at the same
+# element offsets, so the plan is the CPU's - its liveness reuse included - and a step is a list of launches over it.
+# Built only with -define Gpu=true (kernels/gpu asserts it); ad/graph imports it under `if Gpu`.
+#
+# The graph lowers each node to a `Step` (plain numbers: the operation, the offsets of its operands' values and
+# gradients, its sizes) at Plan; the mirror runs step i's forward or backward at the entries in use. It knows nothing of
+# graph.olang (which imports it), so the order, which gradients are added to rather than written (the graph's `acc`),
+# and what a loss's backward starts from stay the graph's.
+#
+# What runs where. Products are cuBLAS (blas.Gemm; attention's per-head products cuBLASLt's batched `Product`, planned
+# per batch size on first use); everything else is kernels/gpu/src/ad.cu, one launch an operation (softmax, norms,
+# losses and sums reduce one block a row in a fixed order, no atomics, so a run is the same bit for bit every time on
+# one GPU; the sums' order is not the CPU's, so results agree within rounding, not bit for bit). Attention's causal
+# products are full (cuBLASLt has no triangular product) and its softmax kernel masks: the weights are zero above the
+# diagonal and so is dS. The graph's step allocates nothing on the device or the host: every buffer is made at Plan.
+#
+# Who owns what: the device owns the arena while the loop runs; the graph (graph.olang) keeps one flag a side and
+# brings the arena down where the host reads a value, a gradient or a parameter, and up where the host has written them
+# (the parameters; inputs go up at every Forward).
+
+import cu "../kernels/gpu/cuda.c"
+import gdev "../kernels/gpu/device"
+import "../kernels/gpu/kern"
+import "../kernels/gpu/blas"
+
+Gpu Bool = false
+
+assert Gpu, "ad/mirror is the GPU's and is built only with -define Gpu=true: import it under if Gpu { ... }"
+
+# the operations with a GPU form, and Unsupported for the rest (named by the graph)
+type Work enum {
+    Nothing
+    Unsupported
+    Linear
+    MatMul
+    Add
+    Sub
+    Mul
+    Scale
+    Act
+    Leaky
+    Softmax
+    LogSoftmax
+    Norm
+    Embedding
+    Positions
+    Attention
+    CrossEntropy
+    Mse
+    Copy
+    Reshape
+    Sum
+}
+
+# one node, lowered: offsets are elements of the arena (-1: none), ints those of the I32 region
+type Step struct(Do Work) {
+    Do
+    Y I64 = -1              # its value
+    A I64 = -1              # its inputs' values
+    B I64 = -1
+    C I64 = -1
+    DY I64 = -1             # its gradient, and its inputs' (-1: not wanted)
+    DA I64 = -1
+    DB I64 = -1
+    DC I64 = -1
+    Saved I64 = -1
+    Scratch I64 = -1
+    IntA I64 = -1           # the tokens or classes it reads
+    Rows I64 = 0            # the main operand's rows (its elements over its last axis) and last axis, at the planned batch
+    Cols I64 = 0
+    Inner I64 = 0           # a product's depth; a table's rows (Embedding, Positions); a loss's slot
+    Batched Bool = false    # the main operand has the batch on its first axis: its rows are Rows / batch each entry
+    TA Bool = false
+    TB Bool = false
+    Flag Bool = false       # Norm: rms; Attention: causal; Sum: mean
+    Code I64 = 0            # Act: mat.Act's number
+    Heads I64 = 0
+    Ctx I64 = 0
+    K F64 = 0.0             # Scale's factor, LeakyRelu's slope, Norm's eps
+}
+
+# rows of the main operand at n entries in use
+fn (s Step&) RowsAt(n I64, batch I64) I64 { return s.Rows / batch * n if s.Batched else s.Rows }
+
+# kernel numbers: the order of Names
+KAct := 0
+KActGrad := 1
+KLeaky := 2
+KLeakyGrad := 3
+KFill := 4
+KCopy := 5
+KPut := 6
+KCombine := 7
+KMul := 8
+KMulGrad := 9
+KScale := 10
+KBias := 11
+KColSum := 12
+KSoftmax := 13
+KSoftmaxGrad := 14
+KLse := 15
+KLogSoftmax := 16
+KLogSoftmaxGrad := 17
+KNormStats := 18
+KNormApply := 19
+KNormGrad := 20
+KNormParam := 21
+KEmbed := 22
+KEmbedGrad := 23
+KPositions := 24
+KPositionsGrad := 25
+KSumLast := 26
+KSumLastGrad := 27
+KCeRows := 28
+KCeTotal := 29
+KCeGrad := 30
+KMse := 31
+KMseGrad := 32
+KSumsq := 33
+KClip := 34
+KAdamW := 35
+
+Names := Array<String>["oann_ad_act", "oann_ad_act_grad", "oann_ad_leaky", "oann_ad_leaky_grad", "oann_ad_fill", "oann_ad_copy", "oann_ad_put"
+    "oann_ad_combine", "oann_ad_mul", "oann_ad_mul_grad", "oann_ad_scale", "oann_ad_bias", "oann_ad_colsum", "oann_ad_softmax"
+    "oann_ad_softmax_grad", "oann_ad_lse", "oann_ad_logsoftmax", "oann_ad_logsoftmax_grad", "oann_ad_norm_stats", "oann_ad_norm_apply"
+    "oann_ad_norm_grad", "oann_ad_norm_param_grad", "oann_ad_embed", "oann_ad_embed_grad", "oann_ad_positions", "oann_ad_positions_grad"
+    "oann_ad_sumlast", "oann_ad_sumlast_grad", "oann_ad_ce_rows", "oann_ad_ce_total", "oann_ad_ce_grad", "oann_ad_mse", "oann_ad_mse_grad"
+    "oann_ad_sumsq", "oann_ad_clip", "oann_ad_adamw"]
+
+# the text of the kernels for real type T: the prelude, elem.cu, the typedef, ad.cu
+fn Source<T>(like T) String {
+    return kern.ElemSource() + "\n// ad/mirror.olang: the specialization\ntypedef " + kern.RealName(like) + " real;\n" + kern.AdText
+}
+
+# attention's six products at one batch size, planned (an empty Product where a gradient is not wanted)
+type AttnPlan<T> unique struct(dev gdev.Device&, node I64, n I64) {
+    dev
+    node
+    n
+    scores blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    pv blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    dp blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    dq blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    dk blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    dv blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+}
+
+# AdamW's state on the device: the moments and the per-parameter decay mask, the steps taken
+type AdamW<T> unique struct(m gdev.Buf<T>, v gdev.Buf<T>, mask gdev.Buf<U8>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
+    M gdev.Buf<T> = m
+    V gdev.Buf<T> = v
+    mask
+    Rate F64 = rate
+    Beta1 F64 = beta1
+    Beta2 F64 = beta2
+    Eps F64 = eps
+    Decay F64 = decay
+    Steps I64 = 0
+}
+
+# a planned graph's mirror on dev: Mem the arena (size elements, the first params of them the parameters, the gradients
+# the next params), Ints the tokens and classes, Stats two F64 a node (a loss's value and the entries it counted; two
+# more at the end for the gradients' norm), RowLoss a cross entropy's rows' losses
+type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>) {
+    dev
+    Size I64 = size
+    params
+    batch
+    kit
+    steps
+    Mem gdev.Buf<T> = mem
+    Ints gdev.Buf<I32> = intMem
+    Stats gdev.Buf<F64> = stats
+    RowLoss gdev.Buf<F64> = losses
+    plans mut Vec<AttnPlan<T>>& = Vec<AttnPlan<T>>()
+    nodes
+}
+
+# ---- the plan ----
+
+# the mirror of a graph of these steps, its arena of size elements (params of them parameters), ints I32s, planned for
+# batch entries: the buffers allocated and the kernels compiled now. rowloss: the most rows a cross entropy takes
+fn Mirror<T>.Make(dev mut gdev.Device&, steps Array<Step>&, size I64, params I64, ints I64, batch I64, rowloss I64) Mirror<T> ? gdev.GpuError {
+    z T
+    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss))
+    try m.planAll()
+    kern.Zero(dev, m.Mem.Addr(0), size * T.Size)
+    kern.Zero(dev, m.Stats.Addr(0), (2 * steps.Len() + 4) * 8)
+    try dev.Sync()
+    return m
+}
+
+# ---- launching ----
+
+fn (m Mirror<T>&) at(i I64) U64 { return m.Mem.Addr(i) }
+
+# the threads of a row kernel's block for a row of cols elements: a power of two from 32 to 256
+fn RowBlock(cols I64) I64 {
+    b I64 = 32
+    for b < cols and b < 256: b *= 2
+    return b
+}
+
+fn mat<T>(m Mirror<T>&, off I64, rows I64, cols I64) gdev.DMat<T> { return gdev.DMat<T>(m.Mem, off, rows, cols, cols) }
+
+# a failure of the device ends the program with CUDA's words (a step has no error to give back as)
+fn (m mut Mirror<T>&) sync() {
+    st := cu.oann_stream_sync(m.dev.Stream())
+    if st != 0 or cu.oann_status_kind(m.dev.Status()) != 0 {
+        try m.dev.Sync() catch gdev.GpuError err { unreachable "the GPU failed: " + $err }
+        unreachable "the GPU failed: " + gdev.Text(cu.cudaGetErrorString(st))
+    }
+}
+
+# waits for everything enqueued
+fn (m mut Mirror<T>&) Sync() { m.sync() }
+
+# kernel k over n elements, a grid-stride launch
+fn (m mut Mirror<T>&) elems(k I64, n I64, args ...U64) {
+    if n <= 0: return
+    d := m.dev
+    kern.LaunchKit(d, m.kit, k, kern.Blocks(n), kern.Block, ...args)
+}
+
+# kernel k, one block of `block` threads a row, rows of them
+fn (m mut Mirror<T>&) rowk(k I64, rows I64, cols I64, args ...U64) {
+    if rows <= 0: return
+    d := m.dev
+    kern.LaunchKit(d, m.kit, k, rows, RowBlock(cols), ...args)
+}
+
+# kernel k in one block (reductions over a whole array)
+fn (m mut Mirror<T>&) once(k I64, args ...U64) {
+    d := m.dev
+    kern.LaunchKit(d, m.kit, k, 1, 256, ...args)
+}
+
+fn n64(x I64) U64 { return kern.Arg(x) }
+
+fn flag(b Bool) U64 { return 1 if b else 0 }
+
+# attention's operands as batches: the rows of x in sequences of ctx, its columns in heads; the weights stacked. A local
+# between, never a call's value lent on (repro/tempfacts)
+fn headsOf<T>(m Mirror<T>&, off I64, rows I64, cols I64, ctx I64, heads I64) gdev.DBatch<T> {
+    x := mat(m, off, rows, cols)
+    return gdev.DBatch<T>.Heads(x, ctx, heads)
+}
+
+fn stackedOf<T>(m Mirror<T>&, off I64, rows I64, cols I64, ctx I64, heads I64) gdev.DBatch<T> {
+    x := mat(m, off, rows, cols)
+    return gdev.DBatch<T>.Stacked(x, ctx, heads)
+}
+
+# C = op(A) op(B) + beta C over views of the arena
+fn (m mut Mirror<T>&) product(c I64, cr I64, cc I64, a I64, ar I64, ac I64, ta Bool, b I64, br I64, bc I64, tb Bool, add Bool) {
+    cm := mat(m, c, cr, cc)
+    am := mat(m, a, ar, ac)
+    bm := mat(m, b, br, bc)
+    blas.Gemm<T, F64>(m.dev, cm, am, ta, bm, tb, 1.0, 1.0 if add else 0.0)
+}
+
+# ---- crossing ----
+
+# host[from ... from + n - 1] up to the arena at the same offsets
+fn (m mut Mirror<T>&) Upload(host Array<T>&, from I64, n I64) {
+    if n > 0: m.Mem.Upload(host, from, from, n)
+}
+
+fn (m mut Mirror<T>&) UploadInts(host Array<I32>&, from I64, n I64) {
+    if n > 0: m.Ints.Upload(host, from, from, n)
+}
+
+# the whole arena down into host, and waits
+fn (m mut Mirror<T>&) Download(host mut Array<T>&) {
+    m.Mem.Download(host, 0, 0, m.Size)
+    m.sync()
+}
+
+# n elements of the arena from `from` down into host's, and waits
+fn (m mut Mirror<T>&) DownloadRange(host mut Array<T>&, from I64, n I64) {
+    if n <= 0: return
+    m.Mem.Download(host, from, from, n)
+    m.sync()
+}
+
+# the value of loss slot i as F64: the F64 the kernel summed, not the T it was rounded to
+fn (m mut Mirror<T>&) Loss(i I64) F64 {
+    one := Array<F64>(1)
+    m.Stats.Download(one, 2 * i, 0, 1)
+    m.sync()
+    return one[0]
+}
+
+# n elements from `at` set to v
+fn (m mut Mirror<T>&) Fill(at I64, n I64, v F64) { m.elems(KFill, n, m.at(at), kern.Arg(T(v)), n64(n)) }
+
+# ---- forward ----
+
+# step s's forward at n entries in use, the first position of the step pos
+fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
+    rows := s.RowsAt(n, m.batch)
+    cols := s.Cols
+    count := rows * cols
+    match s.Do {
+        case Work.Linear {
+            m.product(s.Y, rows, s.Inner, s.A, rows, cols, false, s.B, s.Inner, cols, true, false)
+            if s.C >= 0: m.elems(KBias, count / cols * s.Inner, m.at(s.Y), m.at(s.C), n64(rows * s.Inner), n64(s.Inner))
+        }
+        case Work.MatMul {
+            ar := s.Inner if s.TA else rows
+            ac := rows if s.TA else s.Inner
+            br := cols if s.TB else s.Inner
+            bc := s.Inner if s.TB else cols
+            m.product(s.Y, rows, cols, s.A, ar, ac, s.TA, s.B, br, bc, s.TB, false)
+        }
+        case Work.Add: m.elems(KCombine, count, m.at(s.Y), m.at(s.A), m.at(s.B), kern.Arg(T(1.0)), n64(count))
+        case Work.Sub: m.elems(KCombine, count, m.at(s.Y), m.at(s.A), m.at(s.B), kern.Arg(T(-1.0)), n64(count))
+        case Work.Mul: m.elems(KMul, count, m.at(s.Y), m.at(s.A), m.at(s.B), n64(count))
+        case Work.Scale: m.elems(KScale, count, m.at(s.Y), m.at(s.A), kern.Arg(T(s.K)), n64(count))
+        case Work.Act: m.elems(KAct, count, m.at(s.Y), m.at(s.A), n64(count), n64(s.Code))
+        case Work.Leaky: m.elems(KLeaky, count, m.at(s.Y), m.at(s.A), n64(count), kern.Arg(T(s.K)))
+        case Work.Copy: m.elems(KCopy, count, m.at(s.Y), m.at(s.A), n64(count))
+        case Work.Softmax: m.rowk(KSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), n64(1), n64(0))
+        case Work.LogSoftmax: m.rowk(KLogSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols))
+        case Work.Norm {
+            m.rowk(KNormStats, rows, cols, m.at(s.Saved), m.at(s.Saved + rows), m.at(s.A), n64(cols), kern.Arg(T(s.K)), flag(s.Flag))
+            bias U64 = 0 if s.C < 0 else m.at(s.C)
+            m.elems(KNormApply, count, m.at(s.Y), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), m.at(s.B), bias, n64(count), n64(cols))
+        }
+        case Work.Embedding {
+            m.elems(KEmbed, count, m.at(s.Y), m.Ints.Addr(s.IntA), m.at(s.B), n64(count), n64(cols))
+        }
+        case Work.Positions: m.elems(KPositions, count, m.at(s.Y), m.at(s.A), m.at(s.B), n64(count), n64(cols), n64(s.Ctx), n64(pos), n64(s.Inner))
+        case Work.Attention: m.attentionForward(s, n, pos)
+        case Work.CrossEntropy {
+            m.rowk(KCeRows, rows, cols, m.at(s.Saved), m.RowLoss.Addr(0), m.at(s.A), m.Ints.Addr(s.IntA), n64(cols))
+            m.once(KCeTotal, m.Stats.Addr(2 * s.Inner), m.at(s.Y), m.RowLoss.Addr(0), m.Ints.Addr(s.IntA), n64(rows))
+        }
+        case Work.Mse: m.once(KMse, m.Stats.Addr(2 * s.Inner), m.at(s.Y), m.at(s.A), m.at(s.B), n64(count))
+        case Work.Sum {
+            k T = T(1.0 / F64(cols)) if s.Flag else T(1.0)
+            m.rowk(KSumLast, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), kern.Arg(k))
+        }
+        case _ { }
+    }
+}
+
+# the attention plan of node s: made at Plan for the whole batch (Make) and used for any batch in use - a short batch runs
+# the products of every sequence, the unused ones' results never read (sequences are independent, and the arena has the
+# room), so no step plans, allocates or grows anything
+fn (m Mirror<T>&) planFor(s Step&) I64 {
+    for i in range m.plans.Len() {
+        if m.plans[i].node == s.Inner: return i
+    }
+    unreachable "oann: an attention node with no plan"
+}
+
+fn (m mut Mirror<T>&) planAll() ? gdev.GpuError {
+    for i in range m.steps.Len() {
+        s := m.steps[i]
+        if s.Do != Work.Attention: continue
+        qrows := m.batch * s.Ctx
+        q := headsOf(m, s.A, qrows, s.Cols, s.Ctx, s.Heads)
+        k := headsOf(m, s.B, qrows, s.Cols, s.Ctx, s.Heads)
+        v := headsOf(m, s.C, qrows, s.Cols, s.Ctx, s.Heads)
+        o := headsOf(m, s.Y, qrows, s.Cols, s.Ctx, s.Heads)
+        p := stackedOf(m, s.Saved, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
+        m.plans.Push(try m.makePlan(s, m.batch, q, k, v, o, p))
+    }
+}
+
+fn (m mut Mirror<T>&) makePlan(s Step&, n I64, q gdev.DBatch<T>&, k gdev.DBatch<T>&, v gdev.DBatch<T>&, o gdev.DBatch<T>&, p gdev.DBatch<T>&) AttnPlan<T> ? gdev.GpuError {
+    d := m.dev
+    qrows := n * s.Ctx
+    plan := AttnPlan<T>(d, s.Inner, n)
+    plan.scores = try blas.Product<T, T, T>.PlanBatch(d, p, q, false, k, true)
+    plan.pv = try blas.Product<T, T, T>.PlanBatch(d, o, p, false, v, false)
+    if s.Scratch < 0: return plan
+    ds := stackedOf(m, s.Scratch, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
+    plan.dp = try blas.Product<T, T, T>.PlanBatch(d, ds, o, false, v, true)
+    if s.DA >= 0 {
+        dq := headsOf(m, s.DA, qrows, s.Cols, s.Ctx, s.Heads)
+        plan.dq = try blas.Product<T, T, T>.PlanBatch(d, dq, ds, false, k, false)
+    }
+    if s.DB >= 0 {
+        dk := headsOf(m, s.DB, qrows, s.Cols, s.Ctx, s.Heads)
+        plan.dk = try blas.Product<T, T, T>.PlanBatch(d, dk, ds, true, q, false)
+    }
+    if s.DC >= 0 {
+        dv := headsOf(m, s.DC, qrows, s.Cols, s.Ctx, s.Heads)
+        plan.dv = try blas.Product<T, T, T>.PlanBatch(d, dv, p, true, o, false)
+    }
+    return plan
+}
+
+fn (m mut Mirror<T>&) attentionForward(s Step&, n I64, pos I64) {
+    i := m.planFor(s)
+    qrows := m.batch * s.Ctx
+    dm := s.Cols
+    q := headsOf(m, s.A, qrows, dm, s.Ctx, s.Heads)
+    k := headsOf(m, s.B, qrows, dm, s.Ctx, s.Heads)
+    v := headsOf(m, s.C, qrows, dm, s.Ctx, s.Heads)
+    o := headsOf(m, s.Y, qrows, dm, s.Ctx, s.Heads)
+    p := stackedOf(m, s.Saved, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
+    scale := 1.0 / F64(dm / s.Heads).Sqrt()
+    d := m.dev
+    m.plans[i].scores.RunBatch(d, p, q, k, scale)
+    m.rowk(KSoftmax, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Saved), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag))
+    m.plans[i].pv.RunBatch(d, o, p, v)
+}
+
+# ---- backward ----
+
+# step s's backward at n entries: the gradients of its inputs from its own. add0, add1, add2: whether each of the
+# inputs' gradients (in the order of A, B, C) is added to what is there
+fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, add2 Bool) {
+    rows := s.RowsAt(n, m.batch)
+    cols := s.Cols
+    count := rows * cols
+    match s.Do {
+        case Work.Linear {
+            out := s.Inner
+            if s.DA >= 0: m.product(s.DA, rows, cols, s.DY, rows, out, false, s.B, out, cols, false, add0)
+            if s.DB >= 0: m.product(s.DB, out, cols, s.DY, rows, out, true, s.A, rows, cols, false, add1)
+            if s.DC >= 0: m.elems(KColSum, out, m.at(s.DC), m.at(s.DY), n64(rows), n64(out), flag(add2))
+        }
+        case Work.MatMul {
+            k := s.Inner
+            ar := k if s.TA else rows
+            ac := rows if s.TA else k
+            br := cols if s.TB else k
+            bc := k if s.TB else cols
+            if s.DA >= 0 {
+                if s.TA: m.product(s.DA, ar, ac, s.B, br, bc, s.TB, s.DY, rows, cols, true, add0)
+                else: m.product(s.DA, ar, ac, s.DY, rows, cols, false, s.B, br, bc, not s.TB, add0)
+            }
+            if s.DB >= 0 {
+                if s.TB: m.product(s.DB, br, bc, s.DY, rows, cols, true, s.A, ar, ac, s.TA, add1)
+                else: m.product(s.DB, br, bc, s.A, ar, ac, not s.TA, s.DY, rows, cols, false, add1)
+            }
+        }
+        case Work.Add {
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+            if s.DB >= 0: m.elems(KPut, count, m.at(s.DB), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add1))
+        }
+        case Work.Sub {
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+            if s.DB >= 0: m.elems(KPut, count, m.at(s.DB), m.at(s.DY), kern.Arg(T(-1.0)), n64(count), flag(add1))
+        }
+        case Work.Mul {
+            if s.DA >= 0: m.elems(KMulGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.B), n64(count), flag(add0))
+            if s.DB >= 0: m.elems(KMulGrad, count, m.at(s.DB), m.at(s.DY), m.at(s.A), n64(count), flag(add1))
+        }
+        case Work.Scale {
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(s.K)), n64(count), flag(add0))
+        }
+        case Work.Copy, Work.Reshape {
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+        }
+        case Work.Act {
+            if s.DA >= 0 {
+                fromOut := s.Code == 0 or s.Code == 4 or s.Code == 5
+                src := s.Y if fromOut else s.A
+                m.elems(KActGrad, count, m.at(s.DA), m.at(s.DY), m.at(src), n64(count), n64(s.Code), flag(fromOut), flag(add0))
+            }
+        }
+        case Work.Leaky {
+            if s.DA >= 0: m.elems(KLeakyGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.A), n64(count), kern.Arg(T(s.K)), flag(add0))
+        }
+        case Work.Softmax {
+            if s.DA >= 0: m.rowk(KSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), n64(1), n64(0), kern.Arg(T(1.0)), flag(add0))
+        }
+        case Work.LogSoftmax {
+            if s.DA >= 0: m.rowk(KLogSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), flag(add0))
+        }
+        case Work.Norm {
+            if s.DA >= 0: m.rowk(KNormGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), m.at(s.B), n64(cols), flag(s.Flag), flag(add0))
+            dg U64 = 0 if s.DB < 0 else m.at(s.DB)
+            db U64 = 0 if s.DC < 0 else m.at(s.DC)
+            if s.DB >= 0 or s.DC >= 0: m.elems(KNormParam, cols, dg, db, m.at(s.DY), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), n64(rows), n64(cols), flag(add1), flag(add2))
+        }
+        case Work.Embedding {
+            if s.DB >= 0: m.rowk(KEmbedGrad, s.Inner, cols, m.at(s.DB), m.at(s.DY), m.Ints.Addr(s.IntA), n64(rows), n64(cols), flag(add1))
+        }
+        case Work.Positions {
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+            if s.DB >= 0: m.elems(KPositionsGrad, s.Inner * cols, m.at(s.DB), m.at(s.DY), n64(rows), n64(cols), n64(s.Ctx), n64(pos), n64(s.Inner), flag(add1))
+        }
+        case Work.Attention: m.attentionBackward(s, n, add0, add1, add2)
+        case Work.CrossEntropy {
+            if s.DA >= 0: m.elems(KCeGrad, count, m.at(s.DA), m.at(s.Saved), m.Ints.Addr(s.IntA), m.at(s.DY), m.Stats.Addr(2 * s.Inner), n64(count), n64(cols), flag(add0))
+        }
+        case Work.Mse {
+            da U64 = 0 if s.DA < 0 else m.at(s.DA)
+            db U64 = 0 if s.DB < 0 else m.at(s.DB)
+            if s.DA >= 0 or s.DB >= 0: m.elems(KMseGrad, count, da, db, m.at(s.A), m.at(s.B), m.at(s.DY), n64(count), flag(add0), flag(add1))
+        }
+        case Work.Sum {
+            k T = T(1.0 / F64(cols)) if s.Flag else T(1.0)
+            if s.DA >= 0: m.elems(KSumLastGrad, count, m.at(s.DA), m.at(s.DY), n64(count), n64(cols), kern.Arg(k), flag(add0))
+        }
+        case _ { }
+    }
+}
+
+fn (m mut Mirror<T>&) attentionBackward(s Step&, n I64, add0 Bool, add1 Bool, add2 Bool) {
+    i := m.planFor(s)
+    qrows := m.batch * s.Ctx
+    dm := s.Cols
+    d := m.dev
+    q := headsOf(m, s.A, qrows, dm, s.Ctx, s.Heads)
+    k := headsOf(m, s.B, qrows, dm, s.Ctx, s.Heads)
+    v := headsOf(m, s.C, qrows, dm, s.Ctx, s.Heads)
+    dout := headsOf(m, s.DY, qrows, dm, s.Ctx, s.Heads)
+    p := stackedOf(m, s.Saved, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
+    ds := stackedOf(m, s.Scratch, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
+    scale := 1.0 / F64(dm / s.Heads).Sqrt()
+    m.plans[i].dp.RunBatch(d, ds, dout, v)
+    m.rowk(KSoftmaxGrad, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Scratch), m.at(s.Scratch), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag), kern.Arg(T(scale)), n64(0))
+    if s.DA >= 0 {
+        dq := headsOf(m, s.DA, qrows, dm, s.Ctx, s.Heads)
+        m.plans[i].dq.RunBatch(d, dq, ds, k, 1.0, 1.0 if add0 else 0.0)
+    }
+    if s.DB >= 0 {
+        dk := headsOf(m, s.DB, qrows, dm, s.Ctx, s.Heads)
+        m.plans[i].dk.RunBatch(d, dk, ds, q, 1.0, 1.0 if add1 else 0.0)
+    }
+    if s.DC >= 0 {
+        dv := headsOf(m, s.DC, qrows, dm, s.Ctx, s.Heads)
+        m.plans[i].dv.RunBatch(d, dv, p, dout, 1.0, 1.0 if add2 else 0.0)
+    }
+}
+
+# ---- the optimizer ----
+
+# AdamW over the graph's parameters on the device, nn/optim's step for step and bit for bit: its moments zero, decaying
+# where decays (a byte a parameter, 1 for decay) says
+fn (m mut Mirror<T>&) AdamW(decays Array<U8>&, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) AdamW<T> ? gdev.GpuError {
+    n := m.params
+    d := m.dev
+    o := AdamW<T>(try gdev.Buf<T>.Make(d, n), try gdev.Buf<T>.Make(d, n), try gdev.Buf<U8>.Make(d, n), rate, beta1, beta2, eps, decay)
+    kern.Zero(d, o.M.Addr(0), n * T.Size)
+    kern.Zero(d, o.V.Addr(0), n * T.Size)
+    o.mask.UploadAll(decays)
+    try d.Sync()
+    return o
+}
+
+fn (m mut Mirror<T>&) AdamStep(o mut AdamW<T>&) {
+    o.Steps++
+    corr1 F64 = 1.0 - o.Beta1.Pow(F64(o.Steps))
+    corr2 F64 = 1.0 - o.Beta2.Pow(F64(o.Steps))
+    n := m.params
+    m.elems(KAdamW, n, m.at(0), m.at(n), o.M.Addr(0), o.V.Addr(0), o.mask.Addr(0), n64(n), kern.Arg(T(o.Beta1)), kern.Arg(T(o.Beta2)), kern.Arg(T(1.0 - o.Beta1)), kern.Arg(T(1.0 - o.Beta2))
+        kern.Arg(T(1.0 - o.Rate * o.Decay)), kern.Arg(T(o.Rate / corr1)), kern.Arg(T(1.0 / corr2.Sqrt())), kern.Arg(T(o.Eps)))
+}
+
+# the gradients scaled so that their Euclidean norm is at most max (optim.ClipNorm's rule); GradNorm reads the norm after
+fn (m mut Mirror<T>&) ClipNorm(max F64) {
+    n := m.params
+    slot := m.Stats.Addr(2 * m.nodes)
+    m.once(KSumsq, slot, m.at(n), n64(n))
+    m.elems(KClip, n, m.at(n), slot, n64(n), kern.Arg(max))
+}
+
+# the norm the last ClipNorm measured (before clipping)
+fn (m mut Mirror<T>&) GradNorm() F64 {
+    one := Array<F64>(1)
+    m.Stats.Download(one, 2 * m.nodes, 0, 1)
+    m.sync()
+    return one[0].Sqrt()
+}
+
+# ---- what must not allocate, decided while compiling (S17a, G42) ----
+
+fn forwardOf(m mut Mirror<F32>&, s Step&) { m.Forward(s, 1, 0) }
+fn backwardOf(m mut Mirror<F32>&, s Step&) { m.Backward(s, 1, 0, false, false, false) }
+fn elemsOf(m mut Mirror<F32>&) { m.elems(KAct, 5, 1, 2) }
+fn productOf(m mut Mirror<F32>&) { m.product(0, 1, 1, 0, 1, 1, false, 0, 1, 1, false, false) }
+fn attnOf(m mut Mirror<F32>&, s Step&) { m.attentionForward(s, 1, 0) }
+fn attnBOf(m mut Mirror<F32>&, s Step&) { m.attentionBackward(s, 1, false, false, false) }
+fn adamOf(m mut Mirror<F32>&, o mut AdamW<F32>&) { m.AdamStep(o) }
+assert not elemsOf.Allocates, "a launch allocates"
+assert not productOf.Allocates, "a product allocates"
+assert not attnOf.Allocates, "attention's forward allocates"
+assert not attnBOf.Allocates, "attention's backward allocates"
+assert not adamOf.Allocates, "AdamW's step allocates"
+assert not forwardOf.Allocates, "a forward step allocates"
+assert not backwardOf.Allocates, "a backward step allocates"
