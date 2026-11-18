@@ -45,9 +45,11 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     Rate F64 = 0.1                  # the step: below 2 / (the largest curvature of E in x) for the descent to settle
     Tol F64 = 1e-10                 # a settle stops once every |dE/dx + beta dC/dx| is below it
     Steps I64 = 100000              # and after this many steps at most
+    NudgedSteps I64 = 0             # a nudged settle's cap where above 0 (it starts at the free fixed point, nearby)
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
     Adjoint Settled = Settled()     # the last implicit solve
+    Nudged Settled = Settled()      # EP's last nudged settle
     Forwards I64 = 0                # the graph's Forward and Backward passes run so far, the compute a caller counts
     Backwards I64 = 0
     n I64 = g.Info(state).Dims.Count()
@@ -148,14 +150,15 @@ fn (d mut Descent<T>&) Settle(beta F64 = 0.0) Settled {
 # the settle from d.x; with keep > 0, the last keep states before the last are kept in the trail
 fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
     out := Settled()
-    for k in range d.Steps + 1 {
+    most := d.NudgedSteps if beta != 0.0 and d.NudgedSteps > 0 else d.Steps
+    for k in range most + 1 {
         out.Residual = d.at(d.x, beta)
         out.Steps = k
         if out.Residual < d.Tol {
             out.Converged = true
             break
         }
-        if k == d.Steps: break
+        if k == most: break
         if keep > 0: d.record(k % keep)
         for i in range d.n: d.x[i] -= d.Rate * d.gx[i]
     }
@@ -244,7 +247,7 @@ fn (d mut Descent<T>&) implicit(tol F64, iterations I64) {
 
 # the nudged settles from the free fixed point and their contrast
 fn (d mut Descent<T>&) ep(beta F64, centered Bool) {
-    d.settle(beta, 0)
+    d.Nudged = d.settle(beta, 0)
     for i in range d.p: d.acc[i] = d.gp[i]
     if not centered {
         d.at(d.free, 0.0)
@@ -252,7 +255,7 @@ fn (d mut Descent<T>&) ep(beta F64, centered Bool) {
         return
     }
     for i in range d.n: d.x[i] = d.free[i]
-    d.settle(-beta, 0)
+    d.Nudged = d.settle(-beta, 0)
     for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / (2.0 * beta)
 }
 
@@ -365,6 +368,11 @@ test Descent.Train "unrolled, implicit and EP gradients against each other and c
         f0, b0 := d.Forwards, d.Backwards
         n := d.Settle().Steps
         assert d.Forwards - f0 == n + 1 and d.Backwards - b0 == n + 1
+        # the nudged settles' own cap
+        d.NudgedSteps = 3
+        gradOf(d, Trainer.Ep(1e-3, true))
+        assert d.Nudged.Steps <= 3 and d.Last.Steps > 3
+        d.NudgedSteps = 0
     }
 }
 
