@@ -66,6 +66,19 @@ Measured on the shared 4-core Zen 4 (load 4-13), medians of 5-7 interleaved roun
   memory it reads half the bytes and is 2x. F32 rows are summed in the same order (two vectors a row), so BF16 storage stays
   its widened product bit for bit; INT8 weights widened through that path went 0.92x -> 0.78-0.90x at 1 x 784 x 128
   (GemmI8 is INT8's own path). `vdpbf16ps` would need the activations in BF16 too, and olang does not form it.
+- BF16 matrix-vector, looked at again (wt-bf16mv, 2026-11-18; Sapphire Rapids 4-core VM, load 15-24, medians of 9-15
+  interleaved rounds): batch 1 against F32 is 0.49-0.66x at 1 x 784 x 128, 0.72x at 1 x 128 x 512, 0.51-0.63x at
+  1 x 512 x 128 and 1 x 512 x 512 (weights in L2), 1.42-1.73x at 1 x 1024 x 1024 and 1 x 4096 x 1024 (streaming). Why:
+  `dotNarrow`'s row has two FMA chains (25 steps x 4 cycles a row at depth 784, plus a 15-add `laneSum`), where F32's
+  `dot2` has four over two rows; the scheduler fills with each row's waiting FMAs, so rows barely overlap. Every form
+  with more than two chains in one loop is taken apart by LLVM 18's SLP vectorizer, which pairs the chains' BF16
+  widenings vertically (`vmovw`/`vpinsrw` gathers, 0.07-0.21x): two rows (as before), two rows against two copies of
+  the vector, the second row's lanes reversed or `+ 0.0`, four vectors or a 32-lane accumulator for one row, one row
+  widened into a buffer and the other in place, the widening written as `F32.FromBits(U32(b.Bits()) << 16)` (worse:
+  `Bits()` is kept opaque per element). What does vectorize - both rows widened into an L1 buffer first, then F32's
+  `dot2` (0.49-0.63x, streaming down to 1.06-1.32x), or rows cut into 256-value blocks each summed apart (0.52-0.63x,
+  F32 itself slower) - is no faster. Left as it is; the fix belongs in olang's codegen (a BF16 widening SLP keeps
+  horizontal, or explicit lanes), and `vdpbf16ps` (avx512_bf16 is on this CPU) stays out, needing BF16 activations.
 - `bench/int8`'s F32 ran slow because nn/quant imported ad/graph: the program passed ThinFrom and linked by ThinLTO,
   which inlines no kernel helper across objects (repro/crossinline). nn/quant is now graph-free (`DenseOf`, `ConvOf`)
   and nn/quantgraph reads models from a graph. Against the real F32 path INT8 is slower at 64+ rows: its packed
