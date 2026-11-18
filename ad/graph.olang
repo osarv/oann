@@ -148,6 +148,10 @@ type Op enum {
     Contiguous(x Var)                               # a view's elements copied, laid out as rows
     Sum(x Var, mean Bool)                           # over the last axis (its mean where mean)
     Custom(f mut any Function&, first I64, count I64)   # inputs: Graph.customIn[first ...]
+    Sqrt(x Var)                                     # element by element; the gradient is infinite at 0
+    Log(x Var)                                      # element by element; -infinity at 0, NaN below
+    Shift(x Var, k F64)                             # x + k: a scalar added to every element
+    StablemaxCE(logits Var, classes Var)            # cross-entropy over stablemax (Prieto et al.): a scalar
 }
 
 # ---- profiling ----
@@ -157,7 +161,7 @@ KindNames := Array<String&>[
     "Input", "Tokens", "Classes", "Constant", "Param", "Linear", "MatMul", "Add", "Sub", "Mul", "Scale", "Act"
     "LeakyRelu", "Softmax", "LogSoftmax", "Norm", "Embedding", "Positions", "Rope", "Attention", "Dropout"
     "CrossEntropy", "Mse", "Conv2d", "MaxPool2d", "Scan", "SelectiveScan", "DeltaRule", "Reshape", "Permute", "Slice"
-    "Expand", "Contiguous", "Sum", "Custom"
+    "Expand", "Contiguous", "Sum", "Custom", "Sqrt", "Log", "Shift", "StablemaxCE"
 ]
 
 fn KindOf(k Op) I64 {
@@ -197,6 +201,10 @@ fn KindOf(k Op) I64 {
         case Op.Contiguous(_): 32
         case Op.Sum(_, _): 33
         case Op.Custom(_, _, _): 34
+        case Op.Sqrt(_): 35
+        case Op.Log(_): 36
+        case Op.Shift(_, _): 37
+        case Op.StablemaxCE(_, _): 38
     }
 }
 
@@ -266,8 +274,8 @@ fn inputsOf(k Op) Array<I64> {
     match k {
         case Op.Linear(x, w, b): set3(out, x, w, b)
         case Op.MatMul(a, b, _, _), Op.Add(a, b), Op.Sub(a, b), Op.Mul(a, b), Op.Mse(a, b): set3(out, a, b, None)
-        case Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b): set3(out, a, b, None)
-        case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x): out[0] = x
+        case Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b), Op.StablemaxCE(a, b): set3(out, a, b, None)
+        case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sqrt(x), Op.Log(x), Op.Shift(x, _): out[0] = x
         case Op.Rope(x, _, _), Op.Dropout(x, _), Op.MaxPool2d(x, _), Op.Sum(x, _): out[0] = x
         case Op.Reshape(x), Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x), Op.Contiguous(x): out[0] = x
         case Op.Norm(x, g, b, _, _), Op.Attention(x, g, b, _, _), Op.Conv2d(x, g, b, _), Op.Scan(x, g, b): set3(out, x, g, b)
@@ -313,7 +321,7 @@ fn isLeaf(k Op) Bool {
 fn readsInputs(k Op) Bool {
     return match k {
         case Op.Act(_, a): not ops.ActFromOutput(a)
-        case Op.Add(_, _), Op.Sub(_, _), Op.Scale(_, _), Op.Softmax(_), Op.LogSoftmax(_), Op.CrossEntropy(_, _): false
+        case Op.Add(_, _), Op.Sub(_, _), Op.Scale(_, _), Op.Softmax(_), Op.LogSoftmax(_), Op.CrossEntropy(_, _), Op.Sqrt(_), Op.Shift(_, _): false
         case Op.Embedding(_, _), Op.Positions(_, _), Op.Rope(_, _, _), Op.Dropout(_, _), Op.MaxPool2d(_, _): false
         case Op.Sum(_, _), Op.Reshape(_), Op.Permute(_), Op.Slice(_, _, _), Op.Expand(_), Op.Contiguous(_): false
         case _: true
@@ -323,7 +331,7 @@ fn readsInputs(k Op) Bool {
 # whether an operation's backward reads its own value
 fn readsOwn(k Op) Bool {
     return match k {
-        case Op.Softmax(_), Op.LogSoftmax(_), Op.Scan(_, _, _), Op.Custom(_, _, _): true
+        case Op.Softmax(_), Op.LogSoftmax(_), Op.Scan(_, _, _), Op.Custom(_, _, _), Op.Sqrt(_): true
         case Op.Act(_, a): ops.ActFromOutput(a)
         case _: false
     }
@@ -374,6 +382,7 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     ParamCount I64 = 0              # the parameters' elements: the arena's first region
     ActivationSize I64 = 0          # the activation region's elements, after reuse
     Reuse Bool = true               # set false before Plan: every activation buffer apart
+    NoGrad Bool = false             # set true before Plan: a forward-only graph - no gradient buffers, no Backward (evaluation)
     N I64 = batch                   # the batch entries in use: those the last Forward ran on
     Training Bool = true            # dropout acts only while training
     Pos I64 = 0                     # the first position of the step (Positions, Rope; decoding)
@@ -577,6 +586,27 @@ fn (g mut Graph<T>&) Act(x Var, a mat.Act) Var { return g.like("Act", x, fn(d): 
 
 fn (g mut Graph<T>&) LeakyRelu(x Var, slope F64) Var { return g.like("LeakyRelu", x, fn(d): return Op.LeakyRelu(d, slope)) }
 
+# sqrt x, element by element: NaN below 0, an infinite gradient at 0
+fn (g mut Graph<T>&) Sqrt(x Var) Var { return g.like("Sqrt", x, fn(d): return Op.Sqrt(d)) }
+
+# log x, element by element: -infinity at 0, NaN below
+fn (g mut Graph<T>&) Log(x Var) Var { return g.like("Log", x, fn(d): return Op.Log(d)) }
+
+# x + k, k added to every element
+fn (g mut Graph<T>&) AddScalar(x Var, k F64) Var { return g.like("AddScalar", x, fn(d): return Op.Shift(d, k)) }
+
+# x - k
+fn (g mut Graph<T>&) SubScalar(x Var, k F64) Var { return g.AddScalar(x, -k) }
+
+# x k (Scale)
+fn (g mut Graph<T>&) MulScalar(x Var, k F64) Var { return g.Scale(x, k) }
+
+# x / k
+fn (g mut Graph<T>&) DivScalar(x Var, k F64) Var { return g.Scale(x, 1.0 / k) }
+
+# k - x
+fn (g mut Graph<T>&) ScalarSub(k F64, x Var) Var { return g.AddScalar(g.Scale(x, -1.0), k) }
+
 fn (g mut Graph<T>&) Softmax(x Var) Var { return g.like("Softmax", x, fn(d): return Op.Softmax(d)) }
 
 fn (g mut Graph<T>&) LogSoftmax(x Var) Var { return g.like("LogSoftmax", x, fn(d): return Op.LogSoftmax(d)) }
@@ -665,6 +695,19 @@ fn (g mut Graph<T>&) CrossEntropy(logits Var, classes Var) Var {
         return logits
     }
     return g.add(Op.CrossEntropy(g.dense(logits), classes), tensor.Shape.Of(1), false)
+}
+
+# the mean over the entries whose class is not negative of -log of the class's share of stablemax(logits) (Prieto et
+# al., "Grokking at the edge of numerical stability"): s(x) = x + 1 for x >= 0, 1 / (1 - x) below, normalized over the
+# last axis - softmax's replacement that does not saturate to a one-hot in low precision. Shapes as CrossEntropy's
+fn (g mut Graph<T>&) StablemaxCE(logits Var, classes Var) Var {
+    if not g.known("StablemaxCE", logits) or not g.known("StablemaxCE", classes): return logits
+    c := g.nodes[classes]
+    if c.Kind != Op.Classes or dropLast(g.dims(logits)) != c.Dims or not g.batched(logits) {
+        g.fail("StablemaxCE of " + $g.shape(logits) + " against " + $g.shape(classes) + ": a Classes() of the logits' leading axes")
+        return logits
+    }
+    return g.add(Op.StablemaxCE(g.dense(logits), classes), tensor.Shape.Of(1), false)
 }
 
 # the mean of (a - b)^2
@@ -929,7 +972,7 @@ fn (g Graph<T>&) customScratch(first I64, count I64) I64 {
 fn (g Graph<T>&) wants() Array<Bool> {
     count := g.nodes.Len()
     out := Array<Bool>(count)
-    if g.Decode: return out
+    if g.Decode or g.NoGrad: return out
     for i in range count {
         nd := g.nodes[i]
         if nd.Kind == Op.Param or nd.Watch {
@@ -1450,7 +1493,7 @@ fn (g mut Graph<T>&) grow(i I64) {
 # whether node i's gradient is wanted, from what is recorded so far
 fn (g Graph<T>&) wantedNow(i I64) Bool {
     nd := g.nodes[i]
-    if g.Decode: return false
+    if g.Decode or g.NoGrad: return false
     if nd.Kind == Op.Param or nd.Watch: return true
     for x in g.inputsOfNode(i) {
         if x >= 0 and g.nodes[x].GradOffset >= 0: return true
@@ -1641,7 +1684,7 @@ fn (g Graph<T>&) Scalar(v Var) F64 {
         if g.OnGpu and isLoss(nd.Kind): return g.gpuLoss(v)
     }
     return match nd.Kind {
-        case Op.CrossEntropy(_, _), Op.Mse(_, _): g.losses[v]
+        case Op.CrossEntropy(_, _), Op.Mse(_, _), Op.StablemaxCE(_, _): g.losses[v]
         case _: F64(g.Value(v).Get(0))
     }
 }
@@ -1660,6 +1703,39 @@ fn (g Graph<T>&) ParamGrads() tensor.Tensor<T> {
         if g.OnGpu: g.pullParams()
     }
     return tensor.Tensor<T>.Over(g.mem, g.ParamCount, g.ParamCount)!
+}
+
+# this graph's parameters set to src's - a graph recorded the same way, with the same parameter count: the two then
+# compute with one set of values (a BF16 graph's masters are copied and rounded in). Call it after the step that changed
+# src's parameters, before the next Forward of this one
+fn (g mut Graph<T>&) CopyParamsFrom(src Graph<T>&) {
+    if g.ParamCount != src.ParamCount: unreachable "oann: CopyParamsFrom a graph with " + $src.ParamCount + " parameter elements into one with " + $g.ParamCount
+    if Gpu {
+        if g.OnGpu or src.OnGpu: unreachable "oann: CopyParamsFrom of a graph planned on the GPU"
+    }
+    if g.HasMasters() {
+        to := g.Masters().Flat()!
+        from := src.Masters().Flat()!
+        for i in range to.Len(): to[i] = from[i]
+        g.SyncParams()
+        return
+    }
+    to := g.Params().Flat()!
+    from := src.Params().Flat()!
+    for i in range to.Len(): to[i] = from[i]
+}
+
+# src's parameter gradients added to this graph's: after both graphs ran Backward (the second with accumulate false), this
+# one holds the sum - the gradient of one parameter set used by both, which an optimizer stepping this graph's region
+# then takes. A graph recorded the same way as src
+fn (g mut Graph<T>&) AddGradsFrom(src Graph<T>&) {
+    if g.ParamCount != src.ParamCount: unreachable "oann: AddGradsFrom a graph with " + $src.ParamCount + " parameter elements into one with " + $g.ParamCount
+    if Gpu {
+        if g.OnGpu or src.OnGpu: unreachable "oann: AddGradsFrom of a graph planned on the GPU"
+    }
+    to := g.ParamGrads().Flat()!
+    from := src.ParamGrads().Flat()!
+    for i in range to.Len(): to[i] = T(F64(to[i]) + F64(from[i]))
 }
 
 # whether weight decay applies to parameter v
@@ -1884,6 +1960,13 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         case Op.Sub(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(-1.0))
         case Op.Mul(a, b): ops.Mul<T, A>(y, g.Value(a), g.Value(b))
         case Op.Scale(x, k): ops.Scale<T, A>(y, g.Value(x), A(k))
+        case Op.Shift(x, k): ops.Shift<T, A>(y, g.Value(x), A(k))
+        case Op.Sqrt(x): ops.Sqrt<T, A>(y, g.Value(x))
+        case Op.Log(x): ops.Log<T, A>(y, g.Value(x))
+        case Op.StablemaxCE(z, c) {
+            g.losses[i] = ops.StablemaxCE<T, A>(g.Value(z), g.intsOf(c))
+            y.Set(T(g.losses[i]), 0)
+        }
         case Op.Act(x, a): ops.Act(y, g.Value(x), a)
         case Op.LeakyRelu(x, slope): ops.LeakyRelu<T, A>(y, g.Value(x), A(slope))
         case Op.Softmax(x): ops.Softmax(y, g.Value(x))
@@ -1995,8 +2078,8 @@ fn (g mut Graph<T>&) customForward(i I64, f mut any Function&, first I64, count 
 # is added to the one already there instead, summing several batches' gradients before one update
 fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false) {
     top := g.nodes[loss]
-    if g.Decode or top.Dims.Count() != 1 or top.GradOffset < 0 {
-        unreachable "oann: Backward from a node that is no scalar depending on a parameter, or while decoding"
+    if g.Decode or g.NoGrad or top.Dims.Count() != 1 or top.GradOffset < 0 {
+        unreachable "oann: Backward from a node that is no scalar depending on a parameter, or while decoding or on a NoGrad graph"
     }
     count := g.nodes.Len()
     if Gpu {
@@ -2070,6 +2153,26 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             dx := g.gradOf(x)
             ax := g.acc(x)
             if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(k), ax)
+        }
+        case Op.Shift(x, _) {
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax)
+        }
+        case Op.Sqrt(x) {
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            if ops.Wanted(dx): ops.SqrtBackward<T, A>(dy, g.Value(Var(i)), dx, ax)
+        }
+        case Op.Log(x) {
+            dx := g.gradOf(x)
+            ax := g.acc(x)
+            if ops.Wanted(dx): ops.LogBackward<T, A>(dy, g.Value(x), dx, ax)
+        }
+        case Op.StablemaxCE(z, c) {
+            dz := g.gradOf(z)
+            az := g.acc(z)
+            if ops.Wanted(dz): ops.StablemaxCEBackward<T, A>(A(dy.Get(0)), g.intsOf(c), g.Value(z), dz, az)
         }
         case Op.Act(x, a) {
             dx := g.gradOf(x)
@@ -2230,6 +2333,7 @@ if Gpu {
         }
         if g.Eager: return "an eager graph"
         if g.Decode: return "a decoding graph"
+        if g.NoGrad: return "a graph without gradients"
         for i in range g.nodes.Len() {
             nd := g.nodes[i]
             name := KindNames[KindOf(nd.Kind)]
@@ -2239,6 +2343,7 @@ if Gpu {
                 }
                 case Op.Dropout(_, _), Op.Rope(_, _, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
                 case Op.DeltaRule(_, _, _, _, _), Op.Permute(_), Op.Slice(_, _, _), Op.Expand(_), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
+                case Op.Sqrt(_), Op.Log(_), Op.Shift(_, _), Op.StablemaxCE(_, _) { return name + " (node " + $i + ")" }
                 case _ { }
             }
         }
@@ -3261,4 +3366,137 @@ test Graph.PlanBaked "a graph planned from the baked layout runs as the one that
     feedMlp(b)
     last := Var(a.nodes.Len() - 1)
     assert a.Value(last).Flat()![0] == b.Value(last).Flat()![0]
+}
+
+# the largest gap between each parameter's gradient from Backward and its central difference, for a graph of F64
+fn gradGap(g mut Graph<F64>&, loss Var) F64 {
+    g.Forward(g.Batch)
+    g.Backward(loss)
+    ps := g.Params().Flat()!
+    gr := g.ParamGrads().Flat()!
+    exact := Array<F64>(ps.Len())
+    for i in range ps.Len(): exact[i] = gr[i]
+    worst F64 = 0.0
+    h := 1e-6
+    for i in range ps.Len() {
+        old := ps[i]
+        ps[i] = old + h
+        g.Forward(g.Batch)
+        up := g.Scalar(loss)
+        ps[i] = old - h
+        g.Forward(g.Batch)
+        down := g.Scalar(loss)
+        ps[i] = old
+        worst = worst.Max((exact[i] - (up - down) / (2.0 * h)).Abs())
+    }
+    return worst
+}
+
+test Graph "Sqrt, Log and scalar operands: values, and gradients equal central differences" {
+    g := Graph<F64>(2)
+    w := g.Param(Init.Uniform(0.5, 2.0), true, 2, 3)
+    target := g.Param(Init.Normal(0.0, 1.0), true, 2, 3)
+    a := g.Sqrt(w)
+    b := g.Log(w)
+    c := g.DivScalar(g.AddScalar(a, 0.5), 2.0)
+    d := g.ScalarSub(1.0, g.MulScalar(b, 3.0))
+    h := g.SubScalar(g.Add(c, d), 0.25)
+    loss := g.Mse(h, target)
+    g.Keep(a)
+    g.Keep(b)
+    g.Keep(h)
+    try g.Plan(rand.Rand(5))
+    g.Forward(2)
+    x := g.Value(w).Flat()![4]
+    assert (g.Value(a).Flat()![4] - x.Sqrt()).Abs() < 1e-12 and (g.Value(b).Flat()![4] - x.Log()).Abs() < 1e-12
+    assert (g.Value(h).Flat()![4] - ((x.Sqrt() + 0.5) / 2.0 + (1.0 - 3.0 * x.Log()) - 0.25)).Abs() < 1e-12
+    assert gradGap(g, loss) < 1e-6
+}
+
+test Graph "stablemax cross-entropy: the loss as written, an ignored row, and gradients equal central differences" {
+    g := Graph<F64>(3)
+    x := g.Input(4)
+    w := g.Param(Init.Normal(0.0, 1.5), true, 5, 4)
+    y := g.Classes()
+    out := g.Linear(x, w)
+    g.Keep(out)
+    loss := g.StablemaxCE(out, y)
+    try g.Plan(rand.Rand(6))
+    set(g, x, Array<F64>[1, 0.5, -1, 2, -0.5, 1, 0.3, 0.2, 1, 1, -2, 0.1])
+    c := g.Ints(y).Flat()!
+    c[0] = 2
+    c[1] = 4
+    c[2] = -1
+    g.Forward(3)
+    o := g.Value(out).Flat()!
+    total F64 = 0.0
+    for r in range 2 {
+        sum F64 = 0.0
+        for j in range 5: sum += ops.Stable<F64>(o[r * 5 + j])
+        total += (sum / ops.Stable<F64>(o[r * 5 + I64(c[r])])).Log()
+    }
+    assert (g.Scalar(loss) - total / 2.0).Abs() < 1e-12
+    assert gradGap(g, loss) < 1e-6
+}
+
+test Graph "NoGrad: the same forward, no gradient storage, and a Backward is refused only there" {
+    a := Graph<F64>(2)
+    b := Graph<F64>(2)
+    b.NoGrad = true
+    la := a.noGradNet()
+    lb := b.noGradNet()
+    try a.Plan(rand.Rand(7))
+    try b.Plan(rand.Rand(7))
+    a.Forward(2)
+    b.Forward(2)
+    assert a.Scalar(la) == b.Scalar(lb)
+    assert a.ArenaBytes() > b.ArenaBytes()
+    assert b.Info(la).GradOffset < 0
+    a.Backward(la)
+}
+
+fn (g mut Graph<T>&) noGradNet() Var {
+    w := g.Param(Init.Normal(0.0, 1.0), true, 4, 3)
+    h := g.Act(g.Linear(g.Constant(2, 3), w), mat.Act.Tanh)
+    return g.Mse(h, g.Constant(2, 4))
+}
+
+fn sharedLoss(a mut Graph<F64>&, b mut Graph<F64>&, la Var, lb Var) F64 {
+    b.CopyParamsFrom(a)
+    a.Forward(2)
+    b.Forward(2)
+    return a.Scalar(la) + b.Scalar(lb)
+}
+
+test Graph "one parameter set used by two graphs: copied in, the gradients added, equal to the sum's central differences" {
+    a := Graph<F64>(2)
+    b := Graph<F64>(2)
+    xa := a.Input(3)
+    xb := b.Input(3)
+    ya := a.Input(2)
+    yb := b.Input(2)
+    la := a.Mse(a.Linear(xa, a.Param(Init.Normal(0.0, 1.0), true, 2, 3)), ya)
+    lb := b.Mse(b.Linear(xb, b.Param(Init.Zeros, true, 2, 3)), yb)
+    try a.Plan(rand.Rand(8))
+    try b.Plan(rand.Rand(9))
+    set(a, xa, Array<F64>[1, 2, 3, -1, 0, 1])
+    set(b, xb, Array<F64>[0.5, -2, 1, 2, 2, -1])
+    set(a, ya, Array<F64>[0, 1, 1, 0])
+    set(b, yb, Array<F64>[2, -1, 0, 3])
+    sharedLoss(a, b, la, lb)
+    a.Backward(la)
+    b.Backward(lb)
+    a.AddGradsFrom(b)
+    ps := a.Params().Flat()!
+    gr := a.ParamGrads().Flat()!
+    h := 1e-6
+    for i in range ps.Len() {
+        old := ps[i]
+        ps[i] = old + h
+        up := sharedLoss(a, b, la, lb)
+        ps[i] = old - h
+        down := sharedLoss(a, b, la, lb)
+        ps[i] = old
+        assert (gr[i] - (up - down) / (2.0 * h)).Abs() < 1e-6, "parameter " + $i
+    }
 }
