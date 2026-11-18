@@ -1,0 +1,372 @@
+# ad/descent - a state settled by gradient descent on an energy written on the graph, and the network's parameters
+# trained three ways through that settle.
+#
+# The graph holds an energy E(x, theta) - a scalar node - over a state x (an Input given to Watch) and the parameters
+# theta, and a cost C(x) beside it (a scalar reading the state and data, not the parameters: the loss of the settled
+# state). A settle runs x <- x - Rate (dE/dx + beta dC/dx) from the state's current value until the largest |step
+# direction| is below Tol (or Steps run out); each step is one Forward and the graph's ordinary Backward from E (and,
+# nudged, from C). Every row of the batch settles at once: E is a sum over the rows.
+#
+# The gradient of the cost at the free fixed point, dL/dtheta for L = C(x*(theta)), three ways (Trainer):
+# - Unrolled(h): backpropagation through the last h steps of the settle - lambda = dC/dx at the last state, then back
+#   through each step x' = x - Rate g(x): dL/dtheta -= Rate (d g/dtheta)^T lambda, lambda -= Rate H lambda;
+# - Implicit(tol, iterations): the exact gradient at the fixed point, dL/dtheta = -(d g/dtheta)^T lambda where
+#   H lambda = dC/dx (H = d2E/dx2, solved by conjugate gradients: H symmetric positive definite at a strict minimum);
+# - Ep(beta, centered): equilibrium propagation - the free settle, then a nudged one from it (E + beta C; centered, also
+#   one at -beta), dL/dtheta = (dE/dtheta(x+beta) - dE/dtheta(x-beta)) / (2 beta) (uncentered: x* for x-beta, beta for
+#   2 beta). Only first derivatives, each dE/dtheta by the graph's Backward.
+# The first two need second derivatives the graph does not record: H v and (d g/dtheta)^T v are central differences of
+# the first derivatives along v, (dE/dx, dE/dtheta)(x +- eps v) / (2 eps) with eps = Eps / |v| - two Forward and
+# Backward passes per product, exact for an energy quadratic in x up to rounding, O(Eps^2) otherwise.
+#
+# A trainer leaves the state at the free fixed point (C's value the free cost) and dL/dtheta in the graph's
+# ParamGrads(), so an optimizer over Params() steps it as after any Backward. Nothing is allocated after the Descent is
+# made but Unrolled's trail of h states, laid out at the first Train that needs it.
+
+import "graph"
+import "std/rand"
+
+type Trainer enum { Unrolled(h I64), Implicit(tol F64, iterations I64), Ep(beta F64, centered Bool) }
+
+# how a settle (or the adjoint's solve) ended: the steps taken, the last residual (the largest |step direction|, or the
+# solve's residual norm) and whether it got below the tolerance
+type Settled struct(Steps I64 = 0, Residual F64 = 0, Converged Bool = false) {
+    Steps
+    Residual
+    Converged
+}
+
+# descent on g's energy over the state: a graph planned with state given to Watch, energy and cost scalar nodes
+type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var, cost graph.Var) {
+    G mut graph.Graph<T>& = g
+    X graph.Var = state
+    E graph.Var = energy
+    C graph.Var = cost
+    Rate F64 = 0.1                  # the step: below 2 / (the largest curvature of E in x) for the descent to settle
+    Tol F64 = 1e-10                 # a settle stops once every |dE/dx + beta dC/dx| is below it
+    Steps I64 = 100000              # and after this many steps at most
+    Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
+    Last Settled = Settled()        # the last settle (the free one, after a trainer)
+    Adjoint Settled = Settled()     # the last implicit solve
+    n I64 = g.Info(state).Dims.Count()
+    p I64 = g.ParamCount
+    x mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())      # the state being settled
+    free mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())   # the free fixed point
+    gx mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())     # dE/dx (+ beta dC/dx) at the last point
+    cx mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())     # dC/dx there
+    lam mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())    # the adjoint
+    dir mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())    # conjugate gradients' direction and residual
+    res mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())
+    hv mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())     # H v
+    up mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())     # a difference's two sides
+    down mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())
+    gp mut Array<F64>& = Array<F64>(g.ParamCount)                   # dE/dtheta at the last point
+    mv mut Array<F64>& = Array<F64>(g.ParamCount)                   # (d g/dtheta)^T v
+    acc mut Array<F64>& = Array<F64>(g.ParamCount)                  # the gradient being assembled
+    trail mut Array<F64>& = Array<F64>(0)                           # Unrolled's last h states, a ring
+}
+
+# ---- the graph at a point ----
+
+# x into the state, a Forward, a Backward from E: gx = dE/dx (+ beta dC/dx, a second Backward from C where beta is not
+# 0), gp = dE/dtheta; the largest |gx|. Of two Backwards after one Forward, the one from the node recorded later runs
+# first: the plan places buffers by a backward from the last node, so that one's gradients never overwrite a value the
+# other's backward reads
+fn (d mut Descent<T>&) at(x Array<F64>&, beta F64) F64 {
+    g := d.G
+    s := g.Value(d.X).Flat()!
+    for i in range d.n: s[i] = T(x[i])
+    g.Forward(g.Batch)
+    nudged := beta != 0.0
+    if nudged and d.C > d.E: d.fromCost()
+    g.Backward(d.E)
+    dx := g.Grad(d.X).Flat()!
+    for i in range d.n: d.gx[i] = F64(dx[i])
+    pg := g.ParamGrads().Flat()!
+    for i in range d.p: d.gp[i] = F64(pg[i])
+    if nudged and d.C < d.E: d.fromCost()
+    for i in range d.n: d.gx[i] += beta * d.cx[i]
+    worst := 0.0
+    for i in range d.n: worst = worst.Max(d.gx[i].Abs())
+    return worst
+}
+
+# a Backward from C after the Forward: dC/dx into cx
+fn (d mut Descent<T>&) fromCost() {
+    d.G.Backward(d.C)
+    cx := d.G.Grad(d.X).Flat()!
+    for i in range d.n: d.cx[i] = F64(cx[i])
+}
+
+# dC/dx at x into out
+fn (d mut Descent<T>&) costGrad(x Array<F64>&, out mut Array<F64>&) {
+    g := d.G
+    s := g.Value(d.X).Flat()!
+    for i in range d.n: s[i] = T(x[i])
+    g.Forward(g.Batch)
+    g.Backward(d.C)
+    cx := g.Grad(d.X).Flat()!
+    for i in range d.n: out[i] = F64(cx[i])
+}
+
+# H v into hv and (d g/dtheta)^T v into mv, by central differences of (dE/dx, dE/dtheta) at x +- eps v
+fn (d mut Descent<T>&) along(x Array<F64>&, v Array<F64>&) {
+    size := norm(v)
+    if size == 0.0 {
+        for i in range d.n: d.hv[i] = 0.0
+        for i in range d.p: d.mv[i] = 0.0
+        return
+    }
+    eps := d.Eps / size
+    for i in range d.n: d.up[i] = x[i] + eps * v[i]
+    d.at(d.up, 0.0)
+    for i in range d.n: d.hv[i] = d.gx[i]
+    for i in range d.p: d.mv[i] = d.gp[i]
+    for i in range d.n: d.down[i] = x[i] - eps * v[i]
+    d.at(d.down, 0.0)
+    for i in range d.n: d.hv[i] = (d.hv[i] - d.gx[i]) / (2.0 * eps)
+    for i in range d.p: d.mv[i] = (d.mv[i] - d.gp[i]) / (2.0 * eps)
+}
+
+# ---- settling ----
+
+# the state settled from its current value, nudged by beta toward the cost (0: the free phase); the state and C's value
+# are the settled ones after it
+fn (d mut Descent<T>&) Settle(beta F64 = 0.0) Settled {
+    s := d.G.Value(d.X).Flat()!
+    for i in range d.n: d.x[i] = F64(s[i])
+    return d.settle(beta, 0)
+}
+
+# the settle from d.x; with keep > 0, the last keep states before the last are kept in the trail
+fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
+    out := Settled()
+    for k in range d.Steps + 1 {
+        out.Residual = d.at(d.x, beta)
+        out.Steps = k
+        if out.Residual < d.Tol {
+            out.Converged = true
+            break
+        }
+        if k == d.Steps: break
+        if keep > 0: d.record(k % keep)
+        for i in range d.n: d.x[i] -= d.Rate * d.gx[i]
+    }
+    return out
+}
+
+fn (d mut Descent<T>&) record(slot I64) {
+    for i in range d.n: d.trail[slot * d.n + i] = d.x[i]
+}
+
+# the state at x, a Forward: C's and E's values are x's
+fn (d mut Descent<T>&) put(x Array<F64>&) {
+    s := d.G.Value(d.X).Flat()!
+    for i in range d.n: s[i] = T(x[i])
+    d.G.Forward(d.G.Batch)
+}
+
+# ---- training ----
+
+# dL/dtheta into the graph's ParamGrads() by how, from a free settle starting at the state's current value; the state is
+# left at the free fixed point. The free settle's outcome
+fn (d mut Descent<T>&) Train(how Trainer) Settled {
+    s := d.G.Value(d.X).Flat()!
+    for i in range d.n: d.x[i] = F64(s[i])
+    keep := match how {
+        case Trainer.Unrolled(h): h.Max(1)
+        case _: 0
+    }
+    if d.trail.Len() < keep * d.n: d.trail = Array<F64>(keep * d.n)
+    d.Last = d.settle(0.0, keep)
+    for i in range d.n: d.free[i] = d.x[i]
+    match how {
+        case Trainer.Unrolled(h): d.unrolled(h.Max(1).Min(d.Last.Steps))
+        case Trainer.Implicit(tol, iterations): d.implicit(tol, iterations)
+        case Trainer.Ep(beta, centered): d.ep(beta, centered)
+    }
+    d.put(d.free)
+    pg := d.G.ParamGrads().Flat()!
+    for i in range d.p: pg[i] = T(d.acc[i])
+    return d.Last
+}
+
+# back through the last h steps: lambda from dC/dx at the last state
+fn (d mut Descent<T>&) unrolled(h I64) {
+    d.costGrad(d.free, d.lam)
+    for i in range d.p: d.acc[i] = 0.0
+    keep := d.trail.Len() / d.n
+    for j in range h {
+        slot := (d.Last.Steps - 1 - j) % keep
+        for i in range d.n: d.res[i] = d.trail[slot * d.n + i]
+        d.along(d.res, d.lam)
+        for i in range d.p: d.acc[i] -= d.Rate * d.mv[i]
+        for i in range d.n: d.lam[i] -= d.Rate * d.hv[i]
+    }
+}
+
+# H lambda = dC/dx by conjugate gradients from 0, then -(d g/dtheta)^T lambda
+fn (d mut Descent<T>&) implicit(tol F64, iterations I64) {
+    d.costGrad(d.free, d.res)
+    for i in range d.n {
+        d.lam[i] = 0.0
+        d.dir[i] = d.res[i]
+    }
+    rr := dot(d.res, d.res)
+    out := Settled(0, rr.Sqrt(), rr.Sqrt() < tol)
+    for k in range iterations {
+        if out.Converged: break
+        d.along(d.free, d.dir)
+        curve := dot(d.dir, d.hv)
+        if curve <= 0.0: break
+        a := rr / curve
+        for i in range d.n {
+            d.lam[i] += a * d.dir[i]
+            d.res[i] -= a * d.hv[i]
+        }
+        next := dot(d.res, d.res)
+        for i in range d.n: d.dir[i] = d.res[i] + next / rr * d.dir[i]
+        rr = next
+        out = Settled(k + 1, rr.Sqrt(), rr.Sqrt() < tol)
+    }
+    d.Adjoint = out
+    d.along(d.free, d.lam)
+    for i in range d.p: d.acc[i] = -d.mv[i]
+}
+
+# the nudged settles from the free fixed point and their contrast
+fn (d mut Descent<T>&) ep(beta F64, centered Bool) {
+    d.settle(beta, 0)
+    for i in range d.p: d.acc[i] = d.gp[i]
+    if not centered {
+        d.at(d.free, 0.0)
+        for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / beta
+        return
+    }
+    for i in range d.n: d.x[i] = d.free[i]
+    d.settle(-beta, 0)
+    for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / (2.0 * beta)
+}
+
+fn dot(a Array<F64>&, b Array<F64>&) F64 {
+    total F64 = 0.0
+    for i in range a.Len(): total += a[i] * b[i]
+    return total
+}
+
+fn norm(a Array<F64>&) F64 { return dot(a, a).Sqrt() }
+
+# ---- tests ----
+
+# a small convex energy on a graph of 2 rows: E = 1/2 |x|^2 + 1/2 |W x + b - u|^2 + q/4 sum x^4 (q 0 or 0.4), the cost
+# C = 1/2 |x - y|^2; u and y data
+fn convex(q F64) graph.Graph<F64>, graph.Var, graph.Var, graph.Var {
+    g := graph.Graph<F64>(2)
+    x := g.Input(4)
+    g.Watch(x)
+    u := g.Input(3)
+    y := g.Input(4)
+    w := g.Param(graph.Init.Normal(0.0, 0.5), true, 3, 4)
+    b := g.Param(graph.Init.Normal(0.0, 0.5), false, 3)
+    r := g.Sub(g.Linear(x, w, b), u)
+    xx := g.Mul(x, x)
+    e := g.Add(g.Scale(summed(g, xx), 0.5), g.Scale(summed(g, g.Mul(r, r)), 0.5))
+    if q != 0.0: e = g.Add(e, g.Scale(summed(g, g.Mul(xx, xx)), q / 4.0))
+    c0 := g.Sub(x, y)
+    c := g.Scale(summed(g, g.Mul(c0, c0)), 0.5)
+    g.Keep(e)
+    g.Keep(c)
+    g.Plan(rand.Rand(3))!
+    fill(g, u, rand.Rand(4), 1.0)
+    fill(g, y, rand.Rand(5), 1.0)
+    return g, x, e, c
+}
+
+# every element summed: over the last axis, then over the rows
+fn summed(g mut graph.Graph<F64>&, v graph.Var) graph.Var { return g.Sum(g.Sum(v)) }
+
+fn fill(g mut graph.Graph<F64>&, v graph.Var, r rand.Rand, k F64) {
+    t := g.Value(v)
+    t.FillUniform(r, -k, k)
+}
+
+# the cost at the free fixed point, settled from 0
+fn costAt(d mut Descent<F64>&) F64 {
+    s := d.G.Value(d.X).Flat()!
+    for i in range s.Len(): s[i] = 0.0
+    d.Settle()
+    return d.G.Scalar(d.C)
+}
+
+# dL/dtheta by central differences of the settled cost
+fn differences(d mut Descent<F64>&) Array<F64> {
+    ps := d.G.Params().Flat()!
+    out := Array<F64>(ps.Len())
+    h := 1e-5
+    for i in range ps.Len() {
+        old := ps[i]
+        ps[i] = old + h
+        up := costAt(d)
+        ps[i] = old - h
+        down := costAt(d)
+        ps[i] = old
+        out[i] = (up - down) / (2.0 * h)
+    }
+    return out
+}
+
+fn gradOf(d mut Descent<F64>&, how Trainer) Array<F64> {
+    s := d.G.Value(d.X).Flat()!
+    for i in range s.Len(): s[i] = 0.0
+    d.Train(how)
+    pg := d.G.ParamGrads().Flat()!
+    out := Array<F64>(pg.Len())
+    for i in range pg.Len(): out[i] = pg[i]
+    return out
+}
+
+fn relative(a Array<F64>&, b Array<F64>&) F64 {
+    worst, top := 0.0, 0.0
+    for i in range a.Len() {
+        worst = worst.Max((a[i] - b[i]).Abs())
+        top = top.Max(b[i].Abs())
+    }
+    return worst / top
+}
+
+test Descent.Train "unrolled, implicit and EP gradients against each other and central differences, quadratic and quartic energies" {
+    for q in Array<F64>[0.0, 0.4] {
+        g, x, e, c := convex(q)
+        d := Descent<F64>(g, x, e, c)
+        d.Rate = 0.2
+        d.Tol = 1e-12
+        want := differences(d)
+        im := gradOf(d, Trainer.Implicit(1e-12, 100))
+        assert d.Last.Converged and d.Adjoint.Converged and relative(im, want) < 1e-6, "q " + $q + ": implicit " + $relative(im, want)
+        un := gradOf(d, Trainer.Unrolled(400))
+        assert relative(un, im) < 1e-6, "q " + $q + ": unrolled(400) " + $relative(un, im)
+        short := gradOf(d, Trainer.Unrolled(3))
+        assert relative(short, im) > 1e-3, "q " + $q + ": unrolled(3) " + $relative(short, im)
+        ep := gradOf(d, Trainer.Ep(1e-3, true))
+        assert relative(ep, im) < 1e-5, "q " + $q + ": EP centered " + $relative(ep, im)
+        one := gradOf(d, Trainer.Ep(1e-3, false))
+        assert relative(one, im) < 1e-2 and relative(one, im) > relative(ep, im), "q " + $q + ": EP one-sided " + $relative(one, im)
+        # the state is left at the free fixed point
+        assert (g.Scalar(c) - costAt(d)).Abs() < 1e-12
+    }
+}
+
+test Descent.Train "a few steps of gradient descent on the parameters by EP lower the settled cost" {
+    g, x, e, c := convex(0.4)
+    d := Descent<F64>(g, x, e, c)
+    d.Rate = 0.2
+    before := costAt(d)
+    ps := g.Params().Flat()!
+    for _ in range 30 {
+        gradOf(d, Trainer.Ep(1e-2, true))
+        pg := g.ParamGrads().Flat()!
+        for i in range ps.Len(): ps[i] -= 0.1 * pg[i]
+    }
+    after := costAt(d)
+    assert after < 0.5 * before, $before + " -> " + $after
+}

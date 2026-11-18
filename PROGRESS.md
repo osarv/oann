@@ -1093,6 +1093,17 @@ Reproduce: `make gpult OLANG=olang ARGS=5`; `make gpusettle OLANG=olang` and `OA
 A/B; `make gpulearn OLANG=olang ARGS="5 1 128 128,512 1,gpu4,gpu8"`; `make gpuad OLANG=olang ARGS="5 100"` (`prof` as the
 third argument prints the step's time on the device by kind, `gpulm` runs the GPU's two transformer rows only).
 
+## One graph energy, three trainers (wt-bothmodes, 2026-11-18)
+
+ad/descent: a state settled by gradient descent on an energy recorded on the graph (dE/dx by its Backward), the
+parameters' gradient of a cost at the fixed point by backpropagation through the last h steps, the exact implicit
+gradient (conjugate gradients on the adjoint) or equilibrium propagation (free and nudged settles, dE/dtheta's
+contrast - first derivatives only). Second derivatives are central differences of the first (the graph records no
+second-order backward). Tested on a quadratic and a quartic convex energy: implicit against central differences of the
+settled cost within 1e-6, Unrolled(400) against implicit within 1e-6 (Unrolled(3) off by more than 1e-3), centered EP
+(beta 1e-3) within 1e-5, one-sided within 1e-2; 30 EP steps halve the settled cost. Found on the way: two Backwards
+after one Forward must run the later-recorded loss first (the plan's liveness assumes it; ad/README.md).
+
 ## Next
 
 - The open work of docs/redesign.md: the GPU route (question 1) - GP1 to GP5 are done (above; G-M2's verdict: the
