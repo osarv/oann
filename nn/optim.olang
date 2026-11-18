@@ -319,6 +319,195 @@ fn sgdRun<A, G>(p mut Array<A>&, gr Array<G>&, u mut Array<A>&, lo I64, hi I64, 
     }
 }
 
+# ---- Muon ----
+
+# a 2-D parameter of the region: Rows x Cols elements from Lo, row-major, decaying or not
+type MuonMatrix struct(Lo I64, Rows I64, Cols I64, Decay Bool) {
+    Lo
+    Rows
+    Cols
+    Decay
+}
+
+# the 2-D parameters of g's region, each one matrix (Muon's: hidden weights - give the list by hand to leave an embedding
+# or an output layer to AdamW)
+fn MuonMatrices<T>(g graph.Graph<T>&) Array<MuonMatrix> {
+    out := Vec<MuonMatrix>()
+    for i in range g.Size() {
+        nd := g.Info(graph.Var(i))
+        if nd.Kind == graph.Op.Param and nd.Dims.Rank == 2: out.Push(MuonMatrix(nd.Offset, nd.Dims[0], nd.Dims[1], g.Decays(graph.Var(i))))
+    }
+    return out.ToArray()
+}
+
+# the runs of a region that no matrix covers, cut from the decay runs given (or the whole region, decaying)
+fn restOf(count I64, mats Array<MuonMatrix>&, spans Array<Span>?&) Array<Span> {
+    covered := Array<Bool>(count)
+    for m in mats {
+        for k in range m.Rows * m.Cols: covered[m.Lo + k] = true
+    }
+    out := Vec<Span>()
+    for r in runsOf(spans, count) {
+        lo I64 = r.Lo
+        for k in range r.Lo, r.Hi + 1 {
+            if k < r.Hi and not covered[k]: continue
+            if k > lo: out.Push(Span(lo, k, r.Decay))
+            lo = k + 1
+        }
+    }
+    return out.ToArray()
+}
+
+# Newton-Schulz's coefficients (Jordan et al., Muon): the quintic x <- a x + b x^3 + c x^5 on singular values, five times
+NsA := 3.4445
+NsB := -4.7750
+NsC := 2.0315
+
+# room for orthogonalizing matrices of up to `elems` elements with their short side at most `side`
+type NsWork<A> struct(elems I64, side I64) {
+    x mut Array<A>& = Array<A>(elems)
+    t mut Array<A>& = Array<A>(elems)
+    gram mut Array<A>& = Array<A>(side * side)
+    poly mut Array<A>& = Array<A>(side * side)
+}
+
+# w (rows x cols, row-major) replaced by the nearest-to-orthogonal matrix Newton-Schulz's five quintic steps reach: its
+# singular values all near 1 (within about 0.7 - 1.2), its singular vectors w's. The matrix is scaled to Frobenius norm
+# 1 first (so w's scale does not matter), and worked on with its short side as rows
+fn Orthogonalize<A>(w mut Array<A>&, rows I64, cols I64, work mut NsWork<A>&) {
+    tall := rows > cols
+    r := cols if tall else rows
+    c := rows if tall else cols
+    n := rows * cols
+    x := work.x
+    norm A = 0.0
+    for k in range n: norm += w[k] * w[k]
+    inv := A(1.0) / (norm.Sqrt() + A(1e-7))
+    for i in range r {
+        for j in range c: x[i * c + j] = (w[j * cols + i] if tall else w[i * cols + j]) * inv
+    }
+    for _ in range 5: nsStep(x, work.t, work.gram, work.poly, r, c)
+    for i in range r {
+        for j in range c {
+            if tall: w[j * cols + i] = x[i * c + j]
+            else: w[i * cols + j] = x[i * c + j]
+        }
+    }
+}
+
+# one quintic step on x (r x c, r <= c): x <- a x + (b G + c G G) x with G = x x^T
+fn nsStep<A>(x mut Array<A>&, t mut Array<A>&, gram mut Array<A>&, poly mut Array<A>&, r I64, c I64) {
+    a A = A(NsA)
+    b A = A(NsB)
+    k A = A(NsC)
+    for i in range r {
+        for j in range r {
+            s A = 0.0
+            for q in range c: s += x[i * c + q] * x[j * c + q]
+            gram[i * r + j] = s
+        }
+    }
+    for i in range r {
+        for j in range r {
+            s A = 0.0
+            for q in range r: s += gram[i * r + q] * gram[q * r + j]
+            poly[i * r + j] = b * gram[i * r + j] + k * s
+        }
+    }
+    for i in range r {
+        for j in range c {
+            s A = a * x[i * c + j]
+            for q in range r: s += poly[i * r + q] * x[q * c + j]
+            t[i * c + j] = s
+        }
+    }
+    for q in range r * c: x[q] = t[q]
+}
+
+# Muon (Jordan et al., Keller Jordan's reference): for each 2-D parameter, momentum (buf <- buf + (1 - momentum) (g -
+# buf); with nesterov the step takes g + momentum (buf - g)), then the step orthogonalized by Newton-Schulz and scaled by
+# sqrt(max(1, rows / cols)), p <- p (1 - rate decay) - rate scale update. Every element no matrix covers (biases, gains,
+# whatever `matrices` leaves out) is stepped by AdamW at `adamRate`, as the reference does; SetRate scales both rates
+# together. Over one flat region as AdamW is, with the matrices' places in it (`MuonMatrices(g)`)
+type Muon<A, G> struct(params tensor.Tensor<A>, grads tensor.Tensor<G>, matrices Array<MuonMatrix>, rate F64 = 0.02
+        momentum F64 = 0.95, nesterov Bool = true, decay F64 = 0.0, adamRate F64 = 0.001, spans Array<Span>?& = null) {
+    Rate F64 = rate
+    Momentum F64 = momentum
+    Nesterov Bool = nesterov
+    Decay F64 = decay
+    mats Array<MuonMatrix>& = matrices
+    p mut Array<A>& = params.Flat()!
+    gr Array<G>& = grads.Flat()!
+    Buf mut Array<A>& = Array<A>(params.Count())
+    work mut NsWork<A>& = NsWork<A>(maxElems(matrices), maxSide(matrices))
+    u mut Array<A>& = Array<A>(maxElems(matrices))
+    Adam mut AdamW<A, G>& = AdamW<A, G>(params, grads, rate = adamRate, decay = decay, spans = restOf(params.Count(), matrices, spans))
+}
+
+fn maxElems(mats Array<MuonMatrix>&) I64 {
+    n I64 = 0
+    for m in mats: n = n.Max(m.Rows * m.Cols)
+    return n
+}
+
+fn maxSide(mats Array<MuonMatrix>&) I64 {
+    n I64 = 0
+    for m in mats: n = n.Max(m.Rows.Min(m.Cols))
+    return n
+}
+
+fn (o mut Muon<A, G>&) SetRate(rate F64) {
+    if o.Rate > 0.0: o.Adam.Rate = o.Adam.Rate * rate / o.Rate
+    o.Rate = rate
+}
+
+fn (o mut Muon<A, G>&) Step() {
+    for m in o.mats: o.matrix(m)
+    o.Adam.Step()
+}
+
+fn (o mut Muon<A, G>&) matrix(m MuonMatrix&) {
+    mu A = A(o.Momentum)
+    for k in range m.Rows * m.Cols {
+        gk A = A(o.gr[m.Lo + k])
+        b A = o.Buf[m.Lo + k]
+        b += (gk - b) * (A(1.0) - mu)
+        o.Buf[m.Lo + k] = b
+        o.u[k] = gk + (b - gk) * mu if o.Nesterov else b
+    }
+    Orthogonalize<A>(o.u, m.Rows, m.Cols, o.work)
+    scale A = A((F64(m.Rows) / F64(m.Cols)).Max(1.0).Sqrt())
+    keep A = A(1.0 - o.Rate * o.Decay) if m.Decay else A(1.0)
+    step A = A(o.Rate) * scale
+    for k in range m.Rows * m.Cols: o.p[m.Lo + k] = keep * o.p[m.Lo + k] - step * o.u[k]
+}
+
+# ---- weight EMA ----
+
+# an exponential moving average of a region's values, shadow <- decay shadow + (1 - decay) w: Update after each optimizer
+# step, Swap to put the average into the region for evaluation and Swap again to put the weights back. For a BF16 graph
+# keep the average of its masters (`g.Masters()`)
+type Ema<A> struct(params tensor.Tensor<A>, decay F64 = 0.999) {
+    Decay F64 = decay
+    p mut Array<A>& = params.Flat()!
+    Shadow mut Array<A>& = params.Flat()!.Copy()
+}
+
+fn (e mut Ema<A>&) Update() {
+    d A = A(e.Decay)
+    c A = A(1.0 - e.Decay)
+    for k in range e.p.Len(): e.Shadow[k] = d * e.Shadow[k] + c * e.p[k]
+}
+
+# the region's values and the average exchanged
+fn (e mut Ema<A>&) Swap() {
+    for k in range e.p.Len() {
+        v := e.p[k]
+        e.p[k] = e.Shadow[k]
+        e.Shadow[k] = v
+    }
+}
+
 # ---- what must not allocate, decided while compiling (S17a, G42): a step of either optimizer, in either precision, and
 # a whole training step - forward, backward, clipping and AdamW ----
 
@@ -741,4 +930,61 @@ test AdamW "a step allocates nothing: the resident memory does not grow over 20 
     # a step's own allocations would show as kilobytes a step; the pages that move once (the arena chunk pool, the
     # reading's own buffers) are within four
     assert resident() <= before + 24, "grew by " + $(resident() - before) + " kB"
+}
+
+# the scalar Newton-Schulz recursion a diagonal entry follows, five steps
+fn nsScalar(x F64) F64 {
+    for _ in range 5: x = NsA * x + NsB * x * x * x + NsC * x * x * x * x * x
+    return x
+}
+
+test Muon "Newton-Schulz on a diagonal matrix follows the scalar quintic five times, wide or tall, whatever the scale" {
+    for tall in range 2 {
+        rows := 3 if tall == 1 else 2
+        cols := 2 if tall == 1 else 3
+        w := Array<F64>(6)
+        w[0] = 4.0
+        w[cols + 1] = 2.0
+        work := NsWork<F64>(6, 2)
+        Orthogonalize<F64>(w, rows, cols, work)
+        norm := 20.0.Sqrt()
+        assert (w[0] - nsScalar(4.0 / norm)).Abs() < 1e-5
+        assert (w[cols + 1] - nsScalar(2.0 / norm)).Abs() < 1e-5
+        assert w[1].Abs() < 1e-12 and w[cols].Abs() < 1e-12
+    }
+}
+
+test Muon "a step: the matrix by momentum and Newton-Schulz, the bias by AdamW, decay on the matrix only" {
+    p := tensor.Tensor<F64>.Zeros(6)
+    g := tensor.Tensor<F64>.Zeros(6)
+    pd := p.Flat()!
+    gd := g.Flat()!
+    pd[0], pd[3], pd[4], pd[5] = 1.0, 1.0, 1.0, 1.0
+    gd[0], gd[3], gd[4], gd[5] = 2.0, 1.0, 0.5, -3.0
+    mats := Array<MuonMatrix>[MuonMatrix(0, 2, 2, true)]
+    o := Muon(p, g, mats, rate = 0.1, momentum = 0.9, decay = 0.5, adamRate = 0.01)
+    o.Step()
+    # nesterov, first step: the momentum buffer is 0.1 g, the direction g + 0.9 (0.1 g - g) = 0.19 g, then the scale does not matter
+    norm := 5.0.Sqrt()
+    assert (pd[0] - (1.0 * (1.0 - 0.1 * 0.5) - 0.1 * nsScalar(2.0 / norm))).Abs() < 1e-5
+    assert (pd[3] - (1.0 * (1.0 - 0.1 * 0.5) - 0.1 * nsScalar(1.0 / norm))).Abs() < 1e-5
+    # AdamW's first step moves each element by rate in the sign of its gradient (no decay run given: it decays, 0.5 here)
+    assert (pd[4] - (1.0 * (1.0 - 0.01 * 0.5) - 0.01)).Abs() < 1e-6
+    assert (pd[5] - (1.0 * (1.0 - 0.01 * 0.5) + 0.01)).Abs() < 1e-6
+    o.SetRate(0.05)
+    assert o.Rate == 0.05 and (o.Adam.Rate - 0.005).Abs() < 1e-15
+}
+
+test Ema "averages the region's values, and Swap exchanges the average with the weights" {
+    p := tensor.Tensor<F64>.Zeros(2)
+    pd := p.Flat()!
+    pd[0], pd[1] = 1.0, -1.0
+    e := Ema(p, decay = 0.9)
+    pd[0], pd[1] = 3.0, 0.0
+    e.Update()
+    assert (e.Shadow[0] - (0.9 * 1.0 + 0.1 * 3.0)).Abs() < 1e-15 and (e.Shadow[1] - (-0.9)).Abs() < 1e-15
+    e.Swap()
+    assert (pd[0] - 1.2).Abs() < 1e-15 and e.Shadow[0] == 3.0
+    e.Swap()
+    assert pd[0] == 3.0 and (e.Shadow[0] - 1.2).Abs() < 1e-15
 }

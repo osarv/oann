@@ -11,7 +11,10 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 - `optim.olang` - `AdamW` and `Sgd` over ONE FLAT REGION (two tensors laid out alike: a graph's
   `Params()`/`ParamGrads()`, a settling system's, a BF16 graph's `Masters()` with its BF16 gradients), the runs of the
   region that decay (`Spans(g)`), `ClipNorm`, the schedules `WarmupCosine` and `WarmupLinear`, and `Projector`, the
-  delta-rule input projection that stands in for weight decay.
+  delta-rule input projection that stands in for weight decay; `Muon` (momentum, then Newton-Schulz orthogonalization of each
+  2-D parameter's step - `MuonMatrices(g)` lists them, the other elements go to AdamW at `adamRate`; `Orthogonalize` is
+  the Newton-Schulz step on its own) and `Ema`, a weight average (`Update` after each step, `Swap` to evaluate with the
+  average and `Swap` back).
 - `train.olang` - the loops: `Epoch`/`Evaluate` for a classifier over a `loader.Loader`; `LmStep`/`LmEvaluate` for a
   language model over any batch source with `Random` and `At` (data/text's `Windows`, data/tokens' `Tokens`); `Fit`, a
   whole run with reports, a record through io/runlog and checkpoints; `Save`/`Resume`, safetensors files holding the
