@@ -1064,15 +1064,15 @@ the figures are the medians of the tool's own rounds; read ratios, not absolutes
   kernel and one memset a settle; 4 launches a sweep). Nothing left to fold.
 - **Capturing `prepare`** (the closed form and the folded constants) as a graph too: 385/416/558 against 372/412/581 us a
   cold settle: no change; removed.
-- **Fused attention** (scores, softmax and the product in one launch a row; dq, dk and dv in two): written and tested to
-  build, and slower than the batched products in the graph step (4.01 against 3.76 ms in an interleaved A/B), so removed.
+- **Fused attention** (scores, softmax and the product in one launch a row; dq, dk and dv in two): written and timed (not
+  correctness-tested), and slower than the batched products in the graph step (4.01 against 3.76 ms in an interleaved A/B), so removed.
   The profile says attention is 1.0 ms of the step's 3.3 (fwd 338, bwd 644 us); a fused kernel would need tiling in shared
   memory to beat cuBLAS's, not a row a block.
 - **Bias and activation into the products' epilogues**: Linear's forward is 17 us a node of which the bias launch is a few;
   with the step a graph the saving is at most about 2% (22 nodes); not done.
 
-**Tests** (`make gputest`): the GPU tests as GP6 plus `graphed` (Train against the launches one by one, bit for bit) and the
-AdamW kernel test reading its scalars from the device.
+**Tests**: `make test` 364 passed, 0 failed; `make gputest` 43 passed (GP6's 42 plus `graphed` (Train against the launches one by one, bit for bit) and the
+AdamW kernel test reading its scalars from the device, and the norm test's tiled launch).
 
 Reproduce: `make gpult OLANG=olang ARGS=5`; `make gpusettle OLANG=olang` and `OANN_GRAPHS=0 ./build/bench_gpusettle` for the
 A/B; `make gpulearn OLANG=olang ARGS="5 1 128 128,512 1,gpu4,gpu8"`; `make gpuad OLANG=olang ARGS="5 100"` (`prof` as the
