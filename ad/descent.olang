@@ -46,6 +46,10 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     Tol F64 = 1e-10                 # a settle stops once every |dE/dx + beta dC/dx| is below it
     Steps I64 = 100000              # and after this many steps at most
     NudgedSteps I64 = 0             # a nudged settle's cap where above 0 (it starts at the free fixed point, nearby)
+    Adaptive Bool = false           # a settle's step is undone and halved when it overshot - the new gradient opposes
+                                    # the step, or E (+ beta C) rose by more than rounding - and grows by a tenth after
+                                    # each kept step, up to 8 Rate: the fixed point is the same, so EP and Implicit
+                                    # allow it; Unrolled, which differentiates the steps, refuses it
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
     Adjoint Settled = Settled()     # the last implicit solve
@@ -68,6 +72,8 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     mv mut Array<F64>& = Array<F64>(g.ParamCount)                   # (d g/dtheta)^T v
     acc mut Array<F64>& = Array<F64>(g.ParamCount)                  # the gradient being assembled
     trail mut Array<F64>& = Array<F64>(0)                           # Unrolled's last h states, a ring
+    prev mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())   # Adaptive: the last accepted point and its step
+    prevStep mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())
 }
 
 # ---- the graph at a point ----
@@ -151,18 +157,44 @@ fn (d mut Descent<T>&) Settle(beta F64 = 0.0) Settled {
 fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
     out := Settled()
     most := d.NudgedSteps if beta != 0.0 and d.NudgedSteps > 0 else d.Steps
+    rate := d.Rate
+    last := 0.0
     for k in range most + 1 {
-        out.Residual = d.at(d.x, beta)
+        res := d.at(d.x, beta)
         out.Steps = k
-        if out.Residual < d.Tol {
+        if d.Adaptive {
+            now := d.objective(beta)
+            if k > 0 and (dot(d.gx, d.prevStep) < 0.0 or now > last + 1e-6 * last.Abs()) {
+                rate *= 0.5
+                for i in range d.n: d.x[i] = d.prev[i] - rate * d.prevStep[i]
+                if k < most: continue
+                for i in range d.n: d.x[i] = d.prev[i]
+                out.Residual = d.at(d.x, beta)
+                break
+            }
+            last = now
+        }
+        out.Residual = res
+        if res < d.Tol {
             out.Converged = true
             break
         }
         if k == most: break
         if keep > 0: d.record(k % keep)
-        for i in range d.n: d.x[i] -= d.Rate * d.gx[i]
+        if d.Adaptive {
+            for i in range d.n: d.prev[i] = d.x[i]
+            for i in range d.n: d.prevStep[i] = d.gx[i]
+            rate = (rate * 1.1).Min(8.0 * d.Rate)
+        }
+        for i in range d.n: d.x[i] -= rate * d.gx[i]
     }
     return out
+}
+
+# what a settle descends at the point of the last Forward: E + beta C
+fn (d Descent<T>&) objective(beta F64) F64 {
+    e := d.G.Scalar(d.E)
+    return e + beta * d.G.Scalar(d.C) if beta != 0.0 else e
 }
 
 fn (d mut Descent<T>&) record(slot I64) {
@@ -188,6 +220,7 @@ fn (d mut Descent<T>&) Train(how Trainer) Settled {
         case Trainer.Unrolled(h): h.Max(1)
         case _: 0
     }
+    if keep > 0 and d.Adaptive: unreachable "oann: Descent.Train Unrolled with Adaptive steps - it differentiates the steps"
     if d.trail.Len() < keep * d.n: d.trail = Array<F64>(keep * d.n)
     d.Last = d.settle(0.0, keep)
     for i in range d.n: d.free[i] = d.x[i]
@@ -374,6 +407,30 @@ test Descent.Train "unrolled, implicit and EP gradients against each other and c
         assert d.Nudged.Steps <= 3 and d.Last.Steps > 3
         d.NudgedSteps = 0
     }
+}
+
+test Descent.Settle "adaptive steps settle where a fixed step diverges, to the same fixed point and EP gradient" {
+    g, x, e, c := convex(0.4)
+    d := Descent<F64>(g, x, e, c)
+    d.Rate = 0.2
+    d.Tol = 1e-12
+    want := gradOf(d, Trainer.Implicit(1e-12, 100))
+    d.Rate = 3.0
+    d.Steps = 200
+    s := g.Value(x).Flat()!
+    for i in range s.Len(): s[i] = 0.0
+    assert not d.Settle().Converged, "a fixed step of 3 should not settle"
+    d.Adaptive = true
+    d.Steps = 100000
+    ep := gradOf(d, Trainer.Ep(1e-3, true))
+    assert d.Last.Converged and relative(ep, want) < 1e-5, "adaptive EP " + $relative(ep, want)
+    # and from the fixed step that settles, in fewer steps
+    adaptive := d.Last.Steps
+    d.Adaptive = false
+    d.Rate = 0.2
+    gradOf(d, Trainer.Ep(1e-3, true))
+    assert adaptive < d.Last.Steps, $adaptive + " adaptive steps, " + $d.Last.Steps + " fixed"
+    Println("  adaptive from 3: " + $adaptive + " steps; fixed 0.2: " + $d.Last.Steps)
 }
 
 test Descent.Train "a few steps of gradient descent on the parameters by EP lower the settled cost" {
