@@ -48,6 +48,8 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
     Adjoint Settled = Settled()     # the last implicit solve
+    Forwards I64 = 0                # the graph's Forward and Backward passes run so far, the compute a caller counts
+    Backwards I64 = 0
     n I64 = g.Info(state).Dims.Count()
     p I64 = g.ParamCount
     x mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())      # the state being settled
@@ -77,9 +79,11 @@ fn (d mut Descent<T>&) at(x Array<F64>&, beta F64) F64 {
     s := g.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
     g.Forward(g.Batch)
+    d.Forwards++
     nudged := beta != 0.0
     if nudged and d.C > d.E: d.fromCost()
     g.Backward(d.E)
+    d.Backwards++
     dx := g.Grad(d.X).Flat()!
     for i in range d.n: d.gx[i] = F64(dx[i])
     pg := g.ParamGrads().Flat()!
@@ -94,6 +98,7 @@ fn (d mut Descent<T>&) at(x Array<F64>&, beta F64) F64 {
 # a Backward from C after the Forward: dC/dx into cx
 fn (d mut Descent<T>&) fromCost() {
     d.G.Backward(d.C)
+    d.Backwards++
     cx := d.G.Grad(d.X).Flat()!
     for i in range d.n: d.cx[i] = F64(cx[i])
 }
@@ -105,6 +110,8 @@ fn (d mut Descent<T>&) costGrad(x Array<F64>&, out mut Array<F64>&) {
     for i in range d.n: s[i] = T(x[i])
     g.Forward(g.Batch)
     g.Backward(d.C)
+    d.Forwards++
+    d.Backwards++
     cx := g.Grad(d.X).Flat()!
     for i in range d.n: out[i] = F64(cx[i])
 }
@@ -164,6 +171,7 @@ fn (d mut Descent<T>&) put(x Array<F64>&) {
     s := d.G.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
     d.G.Forward(d.G.Batch)
+    d.Forwards++
 }
 
 # ---- training ----
@@ -353,6 +361,10 @@ test Descent.Train "unrolled, implicit and EP gradients against each other and c
         assert relative(one, im) < 1e-2 and relative(one, im) > relative(ep, im), "q " + $q + ": EP one-sided " + $relative(one, im)
         # the state is left at the free fixed point
         assert (g.Scalar(c) - costAt(d)).Abs() < 1e-12
+        # every pass counted: a free settle of n steps alone is n + 1 of each
+        f0, b0 := d.Forwards, d.Backwards
+        n := d.Settle().Steps
+        assert d.Forwards - f0 == n + 1 and d.Backwards - b0 == n + 1
     }
 }
 
