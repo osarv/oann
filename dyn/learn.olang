@@ -971,6 +971,39 @@ fn (l mut Learner<T>&) jfb(out system.Pop, dz Array<T>&) settle.Settlement {
     return settle.Settlement(0, 0, true)
 }
 
+# a truncated adjoint between JFB and exact (a Neumann series cut after k terms, the phantom gradient): lambda
+# starts at JFB's rho'(u) dz and takes k of the exact adjoint's damped steps; k = 0 is JFB, k large the exact gradient.
+# Written like ImplicitGrad (ParamGrads, and dL/d(drive) of inp into dx); gives the last step's largest change. The same
+# refusals as ImplicitGrad.
+fn (l mut Learner<T>&) TruncatedGrad(out system.Pop, dz tensor.Tensor<T>&, k I64, inp system.Pop, dx mut tensor.Tensor<T>&) settle.Settlement ? LearnError, tensor.ShapeError {
+    s := l.S
+    try l.shaped(out, dz)
+    try l.shaped(inp, dx)
+    if s.OnGpu(): error LearnError.Unsupported("implicit gradients of a system planned on the GPU")
+    if s.E.Spiking: error LearnError.Unsupported("implicit gradients of a spiking system")
+    for p in s.E.Pops {
+        if p.Model == neuron.Neuron.Custom: error LearnError.Unsupported("implicit gradients through a custom model")
+        model := p.Model
+        if model == neuron.Neuron.Rate and model.rho == neuron.Rho.SwiGlu: error LearnError.Unsupported("implicit gradients through gated (SwiGlu) units")
+    }
+    if s.Pop(out).Role == neuron.Role.Input: error LearnError.Unsupported("a loss on an input population's activities")
+    d := try dz.Flat()
+    into := try dx.Flat()
+    l.slopes()
+    l.source(out, d)
+    for i in range l.lam.Len(): l.lam[i] = l.src[i]
+    dt := T(l.S.E.Dt)
+    worst F64 = 0.0
+    for _ in range k {
+        l.carryBack(l.lam, l.adj)
+        worst = F64(adjointStep(l.lam, l.next, l.src, l.slope, l.adj, dt))
+        l.lam, l.next = l.next, l.lam
+    }
+    l.fromAdjoint()
+    l.driveGrad(inp, into)
+    return settle.Settlement(k, worst, true)
+}
+
 # the exact adjoint: lambda <- lambda + dt (rho'(u) (dz + W_eff^T lambda) - lambda) from zero until the change is
 # within tol, at most sweeps sweeps
 fn (l mut Learner<T>&) exact(out system.Pop, dz Array<T>&, tol F64, sweeps I64) settle.Settlement ? LearnError {
@@ -1495,6 +1528,24 @@ test Learner.ImplicitGrad "exact, JFB and EP gradients at a fixed point against 
     assert cosine > 0.5 and dot(jx, jx) == 0.0, "cosine " + $cosine
     # the drives are as they were: the free state is the equilibrium of the given ones
     assert (readLoss(s, d) - dot(d, s.Pop(system.Pop(3)).Activity(0)[0:6])).Abs() < 1e-12
+}
+
+test Learner.TruncatedGrad "the truncated adjoint is JFB at k = 0 and tends to the exact gradient as k grows" {
+    r := rand.Rand(31)
+    s := wired(true, r)
+    dz := tensor.Tensor<F64>.Zeros(2, 3)
+    dz.FillUniform(r, -1.0, 1.0)
+    d := dz.Flat()!
+    readLoss(s, d)
+    l := Learner<F64>(s)!
+    g, _, _ := implicitOf(l, dz, system.Implicit.Exact(1e-14, 20000))
+    j, _, _ := implicitOf(l, dz, system.Implicit.Jfb)
+    dx := tensor.Tensor<F64>.Zeros(2, s.Pop(system.Pop(0)).Size)
+    l.TruncatedGrad(system.Pop(3), dz, 0, system.Pop(0), dx)!
+    t0 := s.E.Grads.Copy()
+    l.TruncatedGrad(system.Pop(3), dz, 2000, system.Pop(0), dx)!
+    tk := s.E.Grads.Copy()
+    assert relative(t0, j) < 1e-12 and relative(tk, g) < 1e-8, $relative(t0, j) + " " + $relative(tk, g)
 }
 
 test Learner.ImplicitGrad "the exact gradient through one-way connections (dense, event-driven) against central differences" {
