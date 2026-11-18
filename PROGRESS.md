@@ -493,7 +493,41 @@ where the softmax bounds hold. What is left to try: a budget per row (rows certi
 clamped budget - needs a per-row stop in dyn/settle), or a tighter `c` (the hidden slopes weighted by the readouts'
 weights, a per-row power iteration).
 
-### A per-row stop in the CPU settle (wt-certrow, 2026-11-18; not merged - the code stays on branch wt-certrow)
+### Rows that stop leave the products (wt-compact, 2026-11-18)
+
+Built on wt-certrow's per-row stop (below), which saved ~1%. First measured, with an instrumented build, where each row
+of an Euclid-measured (spectral) settle first meets the tolerance against the sweep the whole batch stops at (MNIST
+`1 60000 128 B 1 0.001 0.5 1 1 0.1 200 1 0 plain spectral`, row-sweeps a stop of each row at its own residual would
+leave out): batch 32: 31% of the free and 78% of the nudged (68% overall; the certified rows alone 29% of the nudged);
+batch 128: 37 / 86 / 79%; batch 512: 38 / 90 / 85% (certified alone 13%). The rows do not converge together: the batch
+runs for its slowest row, most rows are in after a tenth of the sweeps, and the uncertified rows are most of it. The
+"rows converge within a few sweeps of each other" read below was wrong - a unit of 8 stopped only when all 8 were
+certified and in, and two thirds of the rows were not certified.
+
+So: in a Jacobi, plain, Euclid-measured settle of built-in rate models (`Engine.mayStop`, `Engine.RowStops`, true by
+default), free and nudged, **every row** stops at the first sweep its own residual is within the tolerance - the test
+the whole batch passes is each row's residual within it, so a row that passes is done whatever the others do (the
+certificate, where there is one, bounds its distance as before; an uncertified row is held to what the batch's last row
+was always held to). The row keeps the state its sweep wrote, in both buffers, and leaves the work: `Engine.plan`
+makes the units the runs of consecutive live rows (at most `Chunk`), re-planned after a sweep in which rows stopped, so
+the products run over the live rows only - no data moved, the rows stay where they are. `Engine.Skipped` counts the
+row-sweeps left out. wt-certrow's `Certified`/`Stoppable` and its units of 8 are gone. Test: `System.Settle` "a per-row
+stop" (36 layered systems: free and nudged settles with and without the stop within 10 tol / (1 - kappa) of each other,
+rows stopping at different sweeps, row-sweeps left out).
+
+| MNIST spectral, 1 thread (2 runs, alternated) | row-sweeps left out | us a lesson, master | us a lesson, stop | accuracy master / stop |
+|---|---|---|---|---|
+| batch 32, epoch 3 (seed 1) | 71% | 2446 / 2430 | 1707 / 1604 | 97.07 / 96.88% |
+| batch 32, epoch 3, seeds 2 / 3 | | 2225 / 2453 | 1588 / 1749 | 96.90 / 96.84%, 96.66 / 96.62% |
+| batch 128, epoch 1 | 80% | 13787 / 14000 | 5608 / 6199 | 93.70 / 93.85% |
+| batch 512, epoch 1 | 85% | 89399 / 95113 | 23531 / 23375 | 92.24 / 92.23% |
+
+1.45x a lesson at batch 32, 2.3x at 128, 3.9x at 512 - a larger batch now costs about what its rows need, not what its
+slowest row needs (at 512, 46 us a sample against 175). Accuracy moves by -0.19 to +0.15 points; at batch 32 three seeds
+are 0.04-0.19 lower (a stopped row is up to tol / (1 - q) from its fixed point where the batch's later sweeps used to
+take it closer). The test answers' free settles stop by row too. Not on the GPU (dyn/mirror sweeps whole batches).
+
+### A per-row stop in the CPU settle (wt-certrow, 2026-11-18; superseded by the entry above)
 
 `System.NudgedRate` now leaves which rows it certified in `Engine.Certified`; the next `System.Nudged` (CPU only; the
 GPU branch clears it) makes those rows `Engine.Stoppable`. In a Jacobi, plain (no Anderson), Euclid-measured settle of
