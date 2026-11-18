@@ -67,12 +67,17 @@ if Gpu {
     import "mirror"
 
     # the graph's mirror on the GPU where it was planned there (ad/mirror), its lowered steps, and which side holds the
-    # newer copy of what: the activations (values, kept tensors, activation gradients), the parameters and their
-    # gradients - and whether the host has written the parameters since they went up
+    # newer copy of what: a node's value or gradient on the host is the device's as of run Gen where its ValGen or
+    # GradGen says so (a Forward or Backward is a new run; GP8: a read brings down that node's alone), the parameters
+    # and their gradients - whether the host has written the parameters since they went up - and the inputs the host
+    # was handed since the last Forward (they go up again before a Backward: what it reads of them is the host's)
     type onGpu<T> struct(n I64) {
         M mut mirror.Mirror<T>?& = null
         Steps mut Array<mirror.Step>& = Array<mirror.Step>(0)
-        FreshActs Bool = false
+        Gen I64 = 1
+        ValGen mut Array<I64>& = Array<I64>(n)
+        GradGen mut Array<I64>& = Array<I64>(n)
+        Touched mut Array<Bool>& = Array<Bool>(n)
         FreshParams Bool = false
         HostParams Bool = true
         Capturing Bool = false      # a training step is being captured into a CUDA graph (GP7): nothing uploads meanwhile
@@ -1633,12 +1638,18 @@ fn (g mut Graph<T>&) acc(v I64) Bool {
 # an input's whole planned batch, whatever the last Forward ran on: where the caller puts the next step's (Value is the
 # entries in use)
 fn (g Graph<T>&) Data(v Var) tensor.Tensor<T> {
+    if Gpu {
+        if g.OnGpu: g.handedOut(v)
+    }
     nd := g.nodes[v]
     return over<T>(g.vals[v].mem, nd.Offset, nd.Dims, nd.Strides)
 }
 
 # the tokens or classes of v (Tokens, Classes), the whole planned batch: where the caller puts a batch's
 fn (g Graph<T>&) Ints(v Var) tensor.Tensor<I32> {
+    if Gpu {
+        if g.OnGpu: g.handedOut(v)
+    }
     nd := g.nodes[v]
     if nd.IntOffset < 0: unreachable "oann: Ints of a node holding no tokens or classes"
     return over<I32>(g.ints[v].mem, nd.IntOffset, nd.Dims, rowMajor(nd.Dims))
@@ -2297,6 +2308,7 @@ fn firstInput(k Op, j I64) I64 {
         case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
         case Op.MatMul(a, b, _, _), Op.Add(a, b), Op.Sub(a, b), Op.Mul(a, b), Op.Mse(a, b), Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b): I64(a) if j == 0 else (I64(b) if j == 1 else -1)
         case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sum(x, _), Op.Reshape(x), Op.Contiguous(x): I64(x) if j == 0 else -1
+        case Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x): I64(x) if j == 0 else -1
         case _: -1
     }
 }
@@ -2324,8 +2336,11 @@ fn actCode(a mat.Act) I64 {
 
 if Gpu {
     # what of the graph has no GPU form: its name, or "" for none. A GPU graph is captured, of F32 or F64, with the
-    # operations ad.cu and cuBLAS have; permuted and sliced views, dropout, convolutions, scans, rotary positions, a
-    # custom operation, decoding and batched products of two batched operands stay on the CPU
+    # operations ad.cu and cuBLAS have; dropout, convolutions, scans, rotary positions, a custom operation and decoding
+    # stay on the CPU. GP8: views (Permute, Slice, Expand) run where what reads them reads a Contiguous copy (Linear, Add
+    # and the element operations record one) or is a product of two stacks of matrices (both batched, or neither), which
+    # reads its operands through their strides; a product by a matrix reading a view through leading strides of its own
+    # (MatMul's first operand may be one on the CPU) is refused
     fn (g Graph<T>&) refusal() String {
         match T {
             case F32, F64 { }
@@ -2338,13 +2353,24 @@ if Gpu {
             nd := g.nodes[i]
             name := KindNames[KindOf(nd.Kind)]
             match nd.Kind {
-                case Op.MatMul(a, b, ta, _) {
-                    if g.nodes[b].Dims.Rank != 2 or (g.nodes[a].Dims.Rank != 2 and ta): return "MatMul of batched operands (node " + $i + ")"
+                case Op.MatMul(a, b, _, _) {
+                    an := g.nodes[a]
+                    bn := g.nodes[b]
+                    if bn.Dims.Rank > 2 and an.Batched != bn.Batched: return "MatMul of a batched stack and an unbatched one (node " + $i + ")"
+                    # a product of two stacks reads each operand through its strides, the last 1 (no copy recorded)
+                    if bn.Dims.Rank > 2 and an.Strides[an.Dims.Rank - 1] == 1 and bn.Strides[bn.Dims.Rank - 1] == 1: continue
                 }
                 case Op.Dropout(_, _), Op.Rope(_, _, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
-                case Op.DeltaRule(_, _, _, _, _), Op.Permute(_), Op.Slice(_, _, _), Op.Expand(_), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
+                case Op.DeltaRule(_, _, _, _, _), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
                 case Op.Sqrt(_), Op.Log(_), Op.Shift(_, _), Op.StablemaxCE(_, _) { return name + " (node " + $i + ")" }
                 case _ { }
+            }
+            if isView(nd.Kind) or nd.Kind == Op.Contiguous: continue
+            ins := inputsOf(nd.Kind)
+            for x in ins {
+                if x >= 0 and g.nodes[x].Base >= 0 and g.nodes[x].Strides != rowMajor(g.nodes[x].Dims) {
+                    return name + " of a strided view (node " + $i + " reads node " + $x + " through strides)"
+                }
             }
         }
         return ""
@@ -2357,8 +2383,32 @@ if Gpu {
 
     fn (g Graph<T>&) intsAt(v I64) I64 { return -1 if v < 0 else g.nodes[v].IntOffset }
 
-    # node i as a step of the mirror
-    fn (g Graph<T>&) lower(i I64) mirror.Step {
+    # a view's geometry onto the end of geo (mirror.GeoSize numbers): dims and the strides read at, the window on axis wa
+    # (-1: none) from lo to hi; where it starts
+    fn geoOf(geo mut Vec<I64>&, dims tensor.Shape&, strides tensor.Shape&, wa I64, lo I64, hi I64) I64 {
+        at := geo.Len()
+        for _ in range mirror.GeoSize: geo.Push(0)
+        geo[at] = dims.Rank
+        geo[at + 1], geo[at + 2], geo[at + 3] = wa, lo, hi
+        for k in range dims.Rank {
+            geo[at + 4 + k] = dims[k]
+            geo[at + 10 + k] = strides[k]
+        }
+        return at
+    }
+
+    # a view's backward step: x's gradient from the view's, over x's elements (its rows and columns)
+    fn (g Graph<T>&) viewBackOf(s mut mirror.Step&, x Var) Node {
+        xn := g.nodes[x]
+        xl := xn.Dims[xn.Dims.Rank - 1]
+        s.Do = mirror.Work.ViewBack
+        s.Rows, s.Cols, s.Batched = xn.Dims.Count() / xl, xl, xn.Batched
+        s.A, s.DA = g.valAt(x), g.gradAt(x)
+        return xn
+    }
+
+    # node i as a step of the mirror (a view's geometry onto geo)
+    fn (g Graph<T>&) lower(i I64, geo mut Vec<I64>&) mirror.Step {
         nd := g.nodes[i]
         d := nd.Dims
         last := d[d.Rank - 1]
@@ -2382,6 +2432,20 @@ if Gpu {
                 s.TA, s.TB = ta, tb
                 s.A, s.B = g.valAt(a), g.valAt(b)
                 s.DA, s.DB = g.gradAt(a), g.gradAt(b)
+                if g.nodes[b].Dims.Rank > 2 {
+                    # two stacks: the leading axes' matrices, each operand through its own strides (GP8)
+                    at := geo.Len()
+                    for _ in range mirror.GeoSize: geo.Push(0)
+                    four := ad.Rank == 4
+                    geo[at], geo[at + 1] = ad[0], ad[1] if four else 1
+                    for j, v in Array<Var>[a, b] {
+                        st := g.nodes[v].Strides
+                        r := st.Rank
+                        o := at + 2 + 3 * j
+                        geo[o], geo[o + 1], geo[o + 2] = st[0], st[1] if four else 0, st[r - 2]
+                    }
+                    s.Geo = at
+                }
             }
             case Op.Add(a, b) {
                 s.Do = mirror.Work.Add
@@ -2458,8 +2522,40 @@ if Gpu {
                 s.A, s.B, s.DA, s.DB = g.valAt(a), g.valAt(b), g.gradAt(a), g.gradAt(b)
             }
             case Op.Contiguous(x) {
-                s.Do = mirror.Work.Copy
+                s.Do = mirror.Work.Gather
                 s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+                xn := g.nodes[x]
+                s.Geo = geoOf(geo, xn.Dims, xn.Strides, -1, 0, 0)
+            }
+            case Op.Permute(x) {
+                # x's gradient (dense in x's dims) read from dy (dense in the view's) at the strides of the view's axis
+                # each of x's is: found by matching strides and dims, as the CPU's backward does (permuted)
+                xn := g.viewBackOf(s, x)
+                st := rowMajor(nd.Dims)
+                src := Array<I64>(6)
+                for k in range d.Rank {
+                    for a in range d.Rank {
+                        if xn.Strides[a] == nd.Strides[k] and xn.Dims[a] == d[k]: src[a] = st[k]
+                    }
+                }
+                s.Geo = geoOf(geo, xn.Dims, tensor.Shape.Of(...src[0:d.Rank]), -1, 0, 0)
+            }
+            case Op.Slice(x, axis, lo) {
+                xn := g.viewBackOf(s, x)
+                s.Geo = geoOf(geo, xn.Dims, rowMajor(nd.Dims), axis, lo, lo + d[axis])
+            }
+            case Op.Expand(x) {
+                xn := g.viewBackOf(s, x)
+                lead := d.Rank - xn.Dims.Rank
+                xs := rowMajor(xn.Dims)
+                kept := Array<I64>(6)
+                for k in range xn.Dims.Rank {
+                    if xn.Dims[k] == d[lead + k]: kept[lead + k] = xs[k]
+                }
+                s.Geo = geoOf(geo, d, tensor.Shape.Of(...kept[0:d.Rank]), -1, 0, 0)
+                ts := rowMajor(d)
+                for k in range d.Rank: geo[s.Geo + 16 + k] = ts[k]
+                geo[s.Geo + 22] = 1
             }
             case Op.Reshape(x) {
                 s.Do = mirror.Work.Reshape
@@ -2474,23 +2570,27 @@ if Gpu {
             }
             case _ { }
         }
-        s.Y, s.DY = g.valAt(i), nd.GradOffset
+        s.Y, s.DY, s.Node = g.valAt(i), nd.GradOffset, i
+        # a main operand of the batch axis alone ([batch]: one row of Cols = Batch) is one row of the entries in use
+        s.BatchLast = s.Batched and s.Rows == 1 and g.Batch > 1
         return s
     }
 
     # the device's arena for the planned graph: every node lowered, its buffers allocated and its kernels compiled
     fn (g mut Graph<T>&) attach() ? tensor.ShapeError {
         try device.Open() catch e { error tensor.ShapeError.Mismatch("no GPU: " + $e) }
+        g.gpu = onGpu<T>(g.nodes.Len())
         steps := Vec<mirror.Step>()
         rowloss I64 = 1
+        geo := Vec<I64>()
         for i in range g.nodes.Len() {
-            s := g.lower(i)
+            s := g.lower(i, geo)
             if s.Do == mirror.Work.CrossEntropy: rowloss = rowloss.Max(s.Rows)
             steps.Push(s)
         }
         all := steps.ToArray()
         g.gpu.Steps = all
-        g.gpu.M = try mirror.Mirror<T>.Make(device.Opened!, all, g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
+        g.gpu.M = try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
         g.OnGpu = true
         g.gpu.HostParams = true
     }
@@ -2538,6 +2638,7 @@ if Gpu {
         }
         for i in range g.nodes.Len() {
             nd := g.nodes[i]
+            g.gpu.Touched[i] = false
             match nd.Kind {
                 case Op.Input, Op.Constant { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
                 case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
@@ -2556,7 +2657,7 @@ if Gpu {
 
     # a step replayed from a CUDA graph ran: the device holds newer values than the host's
     fn (g mut Graph<T>&) GpuFed() {
-        g.gpu.FreshActs = true
+        g.gpu.Gen++
         g.gpu.FreshParams = true
     }
 
@@ -2572,7 +2673,7 @@ if Gpu {
             if isLeaf(g.nodes[i].Kind): continue
             m.Forward(steps[i], n, g.Pos)
         }
-        g.gpu.FreshActs = true
+        g.gpu.Gen++
         g.gpu.FreshParams = true
     }
 
@@ -2584,6 +2685,7 @@ if Gpu {
             m.Upload(g.mem, 0, g.ParamCount)
             g.gpu.HostParams = false
         }
+        if not g.gpu.Capturing: g.uploadTouched()
         count := g.nodes.Len()
         for i in range count: g.written[i] = accumulate and g.nodes[i].Kind == Op.Param
         m.Fill(g.nodes[loss].GradOffset, 1, 1.0)
@@ -2601,7 +2703,7 @@ if Gpu {
         for i in range count {
             if g.nodes[i].Kind == Op.Param and not g.written[i]: m.Fill(g.nodes[i].GradOffset, g.nodes[i].Dims.Count(), 0.0)
         }
-        g.gpu.FreshActs = true
+        g.gpu.Gen++
         g.gpu.FreshParams = true
     }
 
@@ -2613,15 +2715,45 @@ if Gpu {
     }
 
     # the host's copy of node v brought up to date where the device's is newer: a parameter's (or a gradient's) by
-    # pullParams, an input's never (the host owns it), anything else by pullActs
+    # pullParams, an input's never (the host owns it: handed out, it may be written, so it goes up before a Backward),
+    # anything else by pullNode
     fn (g Graph<T>&) hostRead(v Var, grad Bool) {
         nd := g.nodes[v]
         if nd.Kind == Op.Param {
             g.pullParams()
             return
         }
-        if isLeaf(nd.Kind) and not grad: return
-        g.pullActs()
+        if isLeaf(nd.Kind) and not grad {
+            g.gpu.Touched[v] = true
+            return
+        }
+        g.pullNode(v, grad)
+    }
+
+    # an input (or tokens, classes, a constant) handed to the host to write: it goes up before the next Backward too,
+    # since a Backward reads what the host wrote after the Forward (a loss's targets set from its outputs). A parameter
+    # handed out is the host's from now on (pullParams)
+    fn (g Graph<T>&) handedOut(v Var) {
+        if g.nodes[v].Kind == Op.Param {
+            g.pullParams()
+            return
+        }
+        g.gpu.Touched[v] = true
+    }
+
+    # the inputs handed out since the last Forward, up (before a Backward)
+    fn (g mut Graph<T>&) uploadTouched() {
+        m := g.gpu.M!
+        for i in range g.nodes.Len() {
+            if not g.gpu.Touched[i]: continue
+            g.gpu.Touched[i] = false
+            nd := g.nodes[i]
+            match nd.Kind {
+                case Op.Input, Op.Constant { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
+                case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
+                case _ { }
+            }
+        }
     }
 
     # the parameters and their gradients down where the device's are newer; after it the host may write the parameters,
@@ -2634,16 +2766,23 @@ if Gpu {
         g.gpu.HostParams = true
     }
 
-    # the activation region (and the watched inputs' gradients) down where the device's is newer
-    fn (g Graph<T>&) pullActs() {
-        if not g.gpu.FreshActs: return
+    # node v's value (its storage's: a view's base's) or gradient down where the device's is newer - that node's alone,
+    # not the activation region (GP8: a step reading a few outputs moves those)
+    fn (g Graph<T>&) pullNode(v Var, grad Bool) {
         m := g.gpu.M!
-        m.DownloadRange(g.mem, g.mem.Len() - g.ActivationSize, g.ActivationSize)
-        for i in range g.nodes.Len() {
-            nd := g.nodes[i]
-            if (nd.Kind == Op.Input or nd.Kind == Op.Constant) and nd.GradOffset >= 0: m.DownloadRange(g.mem, nd.GradOffset, nd.Dims.Count())
+        gen := g.gpu.Gen
+        if grad {
+            nd := g.nodes[v]
+            if g.gpu.GradGen[v] == gen or nd.GradOffset < 0: return
+            m.DownloadRange(g.mem, nd.GradOffset, nd.Dims.Count())
+            g.gpu.GradGen[v] = gen
+            return
         }
-        g.gpu.FreshActs = false
+        root := g.rootOf(v)
+        rn := g.nodes[root]
+        if g.gpu.ValGen[root] == gen or isLeaf(rn.Kind) or rn.Offset < 0: return
+        m.DownloadRange(g.mem, rn.Offset, rn.Dims.Count())
+        g.gpu.ValGen[root] = gen
     }
 }
 

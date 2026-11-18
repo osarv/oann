@@ -491,6 +491,106 @@ fn graphed() {
 
 test graphed "Train, a whole step as a CUDA graph, equals the launches one by one bit for bit, over steps of changing batch size" { graphed() }
 
+# GP8: views on the GPU - Permute (rank 3 and 4, of a parameter, of a view), Slice (a middle axis and the last, of a
+# view), Expand (of a slice, of a parameter, then permuted) - each read through a Contiguous copy, and their gradients
+# back into their bases'; with a loss over [batch] vectors (the batch the last axis) whose weights the host sets after
+# the Forward. Net.x is the input, Net.y the classes; the weights' input is recorded first (node 0)
+fn Net.views(g mut graph.Graph<F32>&) Net {
+    w := g.Input()
+    x := g.Input(6, 5)
+    a := g.Linear(g.Permute(x, 0, 2, 1), g.Param(graph.Init.Uniform(-0.4, 0.4), true, 7, 6), g.Param(graph.Init.Uniform(-0.1, 0.1), false, 7))
+    t := g.Permute(g.Act(a, mat.Act.Softplus), 0, 2, 1)
+    h := g.Add(x, g.Slice(t, 1, 1, 7))
+    e := g.Expand(g.Slice(h, 1, 0, 1), 6, 5)
+    h2 := g.Mul(h, g.Act(e, mat.Act.Sigmoid))
+    q := g.Reshape(g.Permute(g.Reshape(h2, 2, 3, 5), 0, 2, 1, 3), 6, 5)
+    z := g.Linear(g.Slice(q, 2, 1, 4), g.Param(graph.Init.Uniform(-0.5, 0.5), true, 4, 3))
+    pp := g.Param(graph.Init.Uniform(-0.5, 0.5), false, 1, 5)
+    mm := g.MatMul(h, g.Permute(g.Expand(pp, 4, 5), 1, 0))
+    pw := g.Param(graph.Init.Uniform(-0.5, 0.5), true, 4, 5)
+    logits := g.Add(g.Add(z, mm), g.MatMul(h2, g.Permute(pw, 1, 0)))
+    g.Keep(logits)
+    y := g.Classes(6)
+    v := g.Mul(g.Mean(g.Mean(g.Mul(h2, h2))), w)
+    loss := g.Add(g.CrossEntropy(logits, y), g.Reshape(g.Scale(g.Sum(v), 0.1), 1))
+    return Net(x, y, logits, loss, false)
+}
+
+fn viewsCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("views")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.views(g) }, 5, 13)
+    for n in Array<I64>[5, 3, 1, 5] {
+        feed(cpu, net, n, U64(n) + 21, 4)
+        feed(gpu, net, n, U64(n) + 21, 4)
+        cpu.Forward(n)
+        gpu.Forward(n)
+        # the weights set after the Forward, before the Backward (as a loss's targets read from its outputs are)
+        weights(cpu, net, n)
+        weights(gpu, net, n)
+        cpu.Backward(net.loss)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "views at " + $n)
+        first := Array<F32>[v for v in gpu.ParamGrads().Flat()!]
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        assert first == Array<F32>[v for v in gpu.ParamGrads().Flat()!], "views at " + $n + ": a second run differs"
+    }
+}
+
+# the [batch] input of Net.views (node 0) set to entry-dependent weights
+fn weights(g mut graph.Graph<F32>&, net Net&, n I64) {
+    wv := g.Data(graph.Var(0)).Flat()!
+    for i in range wv.Len(): wv[i] = F32(0.5 + F64(i % 3) + F64(n))
+}
+
+test viewsCase "views on the GPU - Permute, Slice, Expand, of parameters and of views - and [batch] vectors: within rounding of the CPU's, a short batch, inputs set after the Forward, twice alike" { viewsCase() }
+
+# GP8: a MatMul of two stacks of matrices - attention written out by hand, heads as permuted views read through their
+# strides (rank 4), and a rank-3 product with its first operand transposed
+fn Net.stacks(g mut graph.Graph<F32>&) Net {
+    x := g.Input(5, 8)
+    q := g.Linear(x, g.Param(graph.Init.Uniform(-0.4, 0.4), true, 8, 8))
+    k := g.Linear(x, g.Param(graph.Init.Uniform(-0.4, 0.4), true, 8, 8))
+    v := g.Linear(x, g.Param(graph.Init.Uniform(-0.4, 0.4), true, 8, 8))
+    qh := g.Permute(g.Reshape(q, 5, 2, 4), 0, 2, 1, 3)
+    kh := g.Permute(g.Reshape(k, 5, 2, 4), 0, 2, 1, 3)
+    vh := g.Permute(g.Reshape(v, 5, 2, 4), 0, 2, 1, 3)
+    p := g.Softmax(g.Scale(g.MatMul(qh, kh, false, true), 0.5))
+    o := g.Reshape(g.Permute(g.MatMul(p, vh), 0, 2, 1, 3), 5, 8)
+    logits := g.Linear(o, g.Param(graph.Init.Uniform(-0.5, 0.5), true, 3, 8))
+    g.Keep(logits)
+    y := g.Classes(5)
+    c := g.MatMul(q, k, true, false)
+    reg := g.Reshape(g.Scale(g.Sum(g.Mean(g.Mean(g.Mul(c, c)))), 0.01), 1)
+    return Net(x, y, logits, g.Add(g.CrossEntropy(logits, y), reg), false)
+}
+
+fn stacksCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("products of stacks")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.stacks(g) }, 4, 17)
+    for n in Array<I64>[4, 3, 4] {
+        feed(cpu, net, n, U64(n) + 5, 3)
+        feed(gpu, net, n, U64(n) + 5, 3)
+        cpu.Forward(n)
+        cpu.Backward(net.loss)
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "stacks at " + $n)
+        first := Array<F32>[v for v in gpu.ParamGrads().Flat()!]
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        assert first == Array<F32>[v for v in gpu.ParamGrads().Flat()!], "stacks at " + $n + ": a second run differs"
+    }
+}
+
+test stacksCase "a MatMul of two stacks on the GPU (attention by hand, heads as permuted views; a transposed rank-3 product): within rounding of the CPU's, a short batch, twice alike" { stacksCase() }
+
 fn refused() ? {
     if not device.GpuAvailable() {
         gdev.Skip("the refusals")
@@ -506,6 +606,13 @@ fn refused() ? {
     said = ""
     try b.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
     assert said.Contains("BF16"), said
+    # a product reading a view's rows through leading strides of its own (no Contiguous copy is recorded for it), by a
+    # matrix (a product of stacks reads them so)
+    v := graph.Graph<F32>(4)
+    v.MatMul(v.Permute(v.Input(2, 3, 5), 0, 2, 1, 3), v.Param(graph.Init.Zeros, true, 5, 2))
+    said = ""
+    try v.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
+    assert said.Contains("MatMul of a strided view"), said
     try g.Plan(rand.Rand(1), device.Backend.Cpu)
 }
 

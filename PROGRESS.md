@@ -1140,6 +1140,75 @@ Reproduce: `make gpult OLANG=olang ARGS=5`; `make gpusettle OLANG=olang` and `OA
 A/B; `make gpulearn OLANG=olang ARGS="5 1 128 128,512 1,gpu4,gpu8"`; `make gpuad OLANG=olang ARGS="5 100"` (`prof` as the
 third argument prints the step's time on the device by kind, `gpulm` runs the GPU's two transformer rows only).
 
+## The GPU route, GP8: views, stacks, and oagent's e2 on the GPU (wt-gp8, 2026-11-18)
+
+What oagent's experiment graph `experiments/e2-ebr/ebr.olang` (an energy-based reasoner on Sudoku: token-axis mixing by
+`g.Permute(h, 0, 2, 1)`, a hand-written energy gradient, deep supervision) needed to plan on the GPU, and what it gains.
+Trying it found Permute refused first; after views, two GP6 bugs that only a graph like e2's reaches.
+
+**On the GPU now** (`ad/mirror.olang`, `ad/graph.olang`, `kernels/gpu/src/ad.cu`):
+- **Views.** Permute, Slice and Expand plan on the GPU. A view still copies nothing; what reads it through a recorded
+  `Contiguous` (Linear, Add, Mul, the element operations, Reshape) gets a strided gather (`oann_ad_gather`: up to rank 6,
+  the view's dims and strides in a geometry table, `Step.Geo`), and a view's gradient goes back into its base's as the
+  CPU's `viewBack` does: Permute's and Slice's as the same gather with the strides inverted (Slice's with a window,
+  zero outside), Expand's by `oann_ad_unexpand`, a sum over the broadcast axes in dy's order (no atomics, deterministic,
+  the CPU's order of adds). A product by a matrix reading a view through leading strides of its own (no copy recorded
+  for it on the CPU) is refused by name ("MatMul of a strided view").
+- **MatMul of two stacks** (both operands batched, or neither: rank 3, or rank 4 with two leading axes): cuBLASLt's
+  batched products (`MatPlan`: forward and both gradients planned at Plan for the planned batch, a short batch running
+  every matrix as attention does), each operand read through its own strides - attention written out by hand, heads as
+  permuted views, with no copy.
+- **Fixed on the way (GP6's)**: (1) a `[batch]` vector (rank 1, the batch its only axis) ran on 0 elements
+  (`Rows / batch * n` with Rows 1): e2's per-puzzle convergence loss and its gradient were zero on the GPU -
+  `Step.BatchLast`, one row of the entries in use; (2) an input written between Forward and Backward (e2 sets the
+  convergence loss's targets from the decoded output) never went up - an input handed out by `Data`, `Ints` or `Value`
+  is marked and goes up before the Backward; (3) uploads went on the copy stream, ordered before later launches but not
+  after earlier ones, so a Forward still in flight could read the next input (a flaky test showed it) - ad's uploads now
+  go on the compute stream. And `Value`/`Grad` on a GPU graph bring down that node's storage alone (a generation stamp a
+  node), not the whole activation region as before: e2's stepper reads one [B, 81, 32] state per step.
+
+**Tests** (`make gputest`: `ad/gpu_test.olang` 11 passed - GP7's 9 plus): `viewsCase` - Permute (rank 3 and 4, of a
+parameter, of a view), Slice (a middle axis, the last axis, of a view), Expand (of a slice; of a parameter, then
+permuted), a loss over `[batch]` vectors whose weights are set after the Forward: loss, logits and every parameter's
+gradient within 2e-4 of the largest against the CPU (GP6's perceptron bound) at batch 5, 3, 1, 5, a second GPU run
+identical bit for bit; `stacksCase` - attention by hand (heads as permuted views, rank-4 stacks, `tb`), a transposed
+rank-3 product (`ta`), at batch 4, 3, 4, same bounds; `refused` adds the strided-view product. e2's own graphs, one
+step from the same inputs (a `cmp=1` mode in a scratch copy): logits, the end state and q within 5e-7 relative,
+every parameter's gradient within 1.1e-6 (ebr) and 5.6e-7 (loop) of the largest. `make test`: 373 passed, 0 failed.
+
+**e2 train step, CPU against GPU** (2026-11-18; Ryzen 5 7600, RTX 4060 under WSL2; the experiment as it is - host
+AdamW, the stepper's state read back every step, noise drawn on the host - with only a `gpu=1` switch and a step timer;
+d 32, k 81, m 64, 2 blocks, H 4, n 6..8; ms a step after a warm-up, seed 1; the machine shared with other sessions'
+runs, load average 4.7-7.3 on 6 cores, so the CPU runs at 1 and 2 threads only; read ratios):
+
+| arm, batch | CPU 1 thread | CPU 2 threads | GPU | GPU against the best CPU | of which host noise (CPU / GPU) | the rest: CPU / GPU |
+|---|---|---|---|---|---|---|
+| ebr, 32 | 156.2 | 149.1 | 26.9 | 5.5x | 12.3 / 13.5 | 136.8 / 13.4 (10x) |
+| loop, 32 | 119.6 | 117.9 | 22.8 | 5.2x | 12.4 / 13.9 | 105.5 / 8.9 (12x) |
+| ebr, 128 | 605.0 | 596.1 | 77.7 | 7.7x | 47.1 / 49.5 | 549 / 28.2 (19x) |
+| loop, 128 | 467.1 | 469.4 | 73.0 | 6.4x | 48.8 / 53.9 | 418 / 19.1 (22x) |
+| ebr, 512 | 3097 | 3158 | 303.5 | 10.2x | 240 / 201 | 2857 / 103 (28x) |
+| loop, 512 | 2346 | 2334 | 344.2 | 6.8x | 247 / 235 | 2099 / 110 (19x) |
+
+The same trajectory on both (step 50's cross entropy and the run's ends agree; the graphs within rounding, above).
+The CPU's second thread buys nothing: e2's products (81 x 32 x 81 a puzzle) are too small to split. **On the GPU the
+experiment's own host work is now most of a step**: the noise (`r.Normal` per element, B x 81 x 32 a stepper step and 4
+of them a trainer step) is half the step at batch 32 and two thirds at 512; the GPU's part (stepper, trainer forward and
+backward, the host AdamW's transfers) is 13 ms at 32 and 103 ms at 512. Next levers, the experiment's: draw the noise on
+the device (or reuse one draw scaled per slot), step `optim.GpuAdamW` (or `Train`, one CUDA graph) instead of the host
+AdamW and its parameter copies between the two graphs. **The ep arm** (oann's `ad/descent`, which writes the state and
+reads dE/dx and dE/dtheta through the host every settle step) works on a GPU graph unchanged: 50 steps at batch 32,
+265 passes a step, 0.2 min on the GPU against 1.9 min on the CPU at 2 threads (the same cross entropy 2.0900, the same
+settle steps) - about 0.9 ms a pass, bound by the per-pass round trip (state up, gradients and parameters down);
+a settle kept on the device (the descent step as kernels) would be the lever, not done here.
+
+Reproduce: `make gputest OLANG=olang`; e2: copy `ebr.olang`, add `gpu=1` (`device.SetDefault(device.Backend.Gpu)` before
+the graphs are planned), build with `-define Gpu=true`, `arm=ebr|loop batch=32|128|512 steps=100 evalcount=1`.
+
+**Still refused on the GPU**: BF16/F16 graphs, eager and decoding graphs, Dropout, Rope, Conv2d, MaxPool2d, Scan,
+SelectiveScan, DeltaRule, Custom, Sqrt, Log, Shift, StablemaxCE, a product by a matrix reading a view through
+leading strides, and a product of a batched stack by an unbatched one.
+
 ## One graph energy, three trainers (wt-bothmodes, 2026-11-18)
 
 ad/descent: a state settled by gradient descent on an energy recorded on the graph (dE/dx by its Backward), the

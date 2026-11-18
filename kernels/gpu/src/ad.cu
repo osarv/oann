@@ -514,3 +514,62 @@ extern "C" __global__ void oann_ad_adamw(real *p, const real *g, real *m, real *
         p[k] = kp * p[k] - step * mk / (sqrt(vk) * root + eps);
     }
 }
+
+// ---- views (GP8): Permute, Slice and Expand read through strides, and their gradients back ----
+
+// y (+)= x read through strides: y dense over n elements of dims (d0 implied, d1 ... d5 for the axes after the
+// first, rank of them in all), element i at coordinates c read at x[sum c_k s_k]. Axis wa (-1: none) is a window
+// [wlo, whi): a coordinate there is read at c - wlo, and outside it nothing is read (y written 0, or left) - a slice's
+// gradient into its base's. A contiguous copy of a view (wa -1, add 0) and a permutation's gradient (the strides
+// inverted) are the same kernel
+extern "C" __global__ void oann_ad_gather(real *y, const real *x, long long n, long long add, long long rank, long long wa, long long wlo, long long whi,
+    long long d1, long long d2, long long d3, long long d4, long long d5,
+    long long s0, long long s1, long long s2, long long s3, long long s4, long long s5) {
+    const long long d[6] = {1, d1, d2, d3, d4, d5};
+    const long long s[6] = {s0, s1, s2, s3, s4, s5};
+    OANN_LOOP(i, n) {
+        long long r = i, off = 0;
+        bool in = true;
+        for (int k = (int)rank - 1; k >= 0; k--) {
+            long long c = k > 0 ? r % d[k] : r;
+            r = k > 0 ? r / d[k] : 0;
+            if (k == wa) {
+                if (c < wlo || c >= whi) in = false;
+                c -= wlo;
+            }
+            off += c * s[k];
+        }
+        if (in) y[i] = add ? y[i] + x[off] : x[off];
+        else if (!add) y[i] = (real)0;
+    }
+}
+
+// an Expand's gradient: dx (+)= dy summed over what was broadcast. dx dense over n elements; the view's axes (rank of
+// them, dims v) each kept - at dx's stride xs_k, its coordinate (j / xs_k) % v_k - or broadcast (xs_k 0), summed over;
+// dy dense, at strides t. The sum runs over dy in its own order, as the CPU's walk adds, so the two agree bit for bit
+extern "C" __global__ void oann_ad_unexpand(real *dx, const real *dy, long long n, long long add, long long rank,
+    long long v0, long long v1, long long v2, long long v3, long long v4, long long v5,
+    long long x0, long long x1, long long x2, long long x3, long long x4, long long x5,
+    long long t0, long long t1, long long t2, long long t3, long long t4, long long t5) {
+    const long long v[6] = {v0, v1, v2, v3, v4, v5};
+    const long long xs[6] = {x0, x1, x2, x3, x4, x5};
+    const long long t[6] = {t0, t1, t2, t3, t4, t5};
+    OANN_LOOP(j, n) {
+        long long base = 0, reps = 1;
+        for (int k = 0; k < (int)rank; k++) {
+            if (xs[k] != 0) base += ((j / xs[k]) % v[k]) * t[k];
+            else reps *= v[k];
+        }
+        real acc = add ? dx[j] : (real)0;
+        for (long long b = 0; b < reps; b++) {
+            long long r = b, off = base;
+            for (int k = (int)rank - 1; k >= 0; k--) {
+                if (xs[k] != 0) continue;
+                off += (r % v[k]) * t[k];
+                r /= v[k];
+            }
+            acc = acc + dy[off];
+        }
+        dx[j] = acc;
+    }
+}

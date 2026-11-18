@@ -1186,6 +1186,14 @@ name (a `ShapeError`, as before): BF16/F16 graphs, eager and decoding graphs, Dr
 SelectiveScan, DeltaRule, Permute, Slice, Expand, Custom, and a MatMul of two batched operands. G-M4 and how to
 reproduce it: PROGRESS.md, "GP6".
 
+**As built (GP8, 2026-11-18): views and stacks.** Permute, Slice and Expand plan on the GPU: a Contiguous copy of a view
+is a strided gather and a view's gradient goes back into its base's (a gather with the strides inverted, a window for
+Slice, a sum over the broadcast axes in the CPU's order for Expand); a MatMul of two stacks (rank 3 or 4, both batched
+or neither) runs cuBLASLt's batched products planned at Plan, each operand read through its strides. Fixed: `[batch]`
+vectors ran on no elements; inputs written between Forward and Backward now go up before the Backward; ad's uploads go on
+the compute stream (after the launches before them); `Value` brings down that node alone. oagent's e2 trains 5-10x faster
+than the CPU's best (its host noise now half the step or more). Numbers: PROGRESS.md, "GP8".
+
 **As built (GP7, 2026-11-18): what the measures asked for.** Kept: `ProductI8` dequantizes its I32 product in one pass
 (`oann_dequant_i32`; 2466 -> 314 us at 2048^3); the settle's sweeps run as CUDA graphs, `Check` sweeps a graph, captured the
 first time and replayed (`gdev.Graphs`, `Mirror.sweeps`; a cold settle 1.3-1.5x faster, an MNIST epoch at 128 x 128 2.13 ->

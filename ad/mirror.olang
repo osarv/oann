@@ -52,6 +52,8 @@ type Work enum {
     Copy
     Reshape
     Sum
+    Gather          # GP8: a view read through its strides into a dense run (a Contiguous copy)
+    ViewBack        # GP8: a Permute's, Slice's or Expand's gradient into its base's (nothing forward)
 }
 
 # one node, lowered: offsets are elements of the arena (-1: none), ints those of the I32 region
@@ -72,6 +74,7 @@ type Step struct(Do Work) {
     Cols I64 = 0
     Inner I64 = 0           # a product's depth; a table's rows (Embedding, Positions); a loss's slot
     Batched Bool = false    # the main operand has the batch on its first axis: its rows are Rows / batch each entry
+    BatchLast Bool = false  # ... and that axis is its only one ([batch]): one row of the entries in use (GP8)
     TA Bool = false
     TB Bool = false
     Flag Bool = false       # Norm: rms; Attention: causal; Sum: mean
@@ -79,10 +82,25 @@ type Step struct(Do Work) {
     Heads I64 = 0
     Ctx I64 = 0
     K F64 = 0.0             # Scale's factor, LeakyRelu's slope, Norm's eps
+    Geo I64 = -1            # Gather, ViewBack, a MatMul of stacks: its geometry's first element in the mirror's table
+    Node I64 = -1           # the graph's node it is
 }
 
+# a view's geometry, GeoSize numbers in the mirror's table: the rank, the window's axis (-1: none), its low and high
+# bounds, the dims (6), the strides read at (6), dy's strides (6, an Expand's gradient), the kernel (0 gather, 1 unexpand).
+# A MatMul of two stacks of matrices (both operands batched: GP8): the groups (the first axis) and members (the second
+# of four, else 1), then a's group stride, member stride and row stride, then b's - each operand read through its own
+# strides (a permuted view of heads as it is, with no copy)
+GeoSize := 24
+
 # rows of the main operand at n entries in use
-fn (s Step&) RowsAt(n I64, batch I64) I64 { return s.Rows / batch * n if s.Batched else s.Rows }
+fn (s Step&) RowsAt(n I64, batch I64) I64 {
+    if s.BatchLast: return 1
+    return s.Rows / batch * n if s.Batched else s.Rows
+}
+
+# the main operand's last axis at n entries in use: the entries themselves where it is the batch's
+fn (s Step&) ColsAt(n I64) I64 { return n if s.BatchLast else s.Cols }
 
 # kernel numbers: the order of Names
 KAct := 0
@@ -121,13 +139,15 @@ KMseGrad := 32
 KSumsq := 33
 KClip := 34
 KAdamW := 35
+KGather := 36
+KUnexpand := 37
 
 Names := Array<String>["oann_ad_act", "oann_ad_act_grad", "oann_ad_leaky", "oann_ad_leaky_grad", "oann_ad_fill", "oann_ad_copy", "oann_ad_put"
     "oann_ad_combine", "oann_ad_mul", "oann_ad_mul_grad", "oann_ad_scale", "oann_ad_bias", "oann_ad_colsum", "oann_ad_softmax"
     "oann_ad_softmax_grad", "oann_ad_lse", "oann_ad_logsoftmax", "oann_ad_logsoftmax_grad", "oann_ad_norm_stats", "oann_ad_norm_apply"
     "oann_ad_norm_grad", "oann_ad_norm_param_grad", "oann_ad_embed", "oann_ad_embed_grad", "oann_ad_positions", "oann_ad_positions_grad"
     "oann_ad_sumlast", "oann_ad_sumlast_grad", "oann_ad_ce_rows", "oann_ad_ce_total", "oann_ad_ce_grad", "oann_ad_mse", "oann_ad_mse_grad"
-    "oann_ad_sumsq", "oann_ad_clip", "oann_ad_adamw"]
+    "oann_ad_sumsq", "oann_ad_clip", "oann_ad_adamw", "oann_ad_gather", "oann_ad_unexpand"]
 
 # the text of the kernels for real type T: the prelude, elem.cu, the typedef, ad.cu
 fn Source<T>(like T) String {
@@ -145,6 +165,15 @@ type AttnPlan<T> unique struct(dev gdev.Device&, node I64, n I64) {
     dq blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
     dk blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
     dv blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+}
+
+# a MatMul of two stacks' products at the planned batch: forward, and the two gradients (an empty Product where not wanted)
+type MatPlan<T> unique struct(dev gdev.Device&, node I64) {
+    dev
+    node
+    fwd blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    da blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
+    db blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
 }
 
 # AdamW's state on the device: the moments and the per-parameter decay mask, the steps taken
@@ -165,8 +194,9 @@ type AdamW<T> unique struct(m gdev.Buf<T>, v gdev.Buf<T>, mask gdev.Buf<U8>, hp 
 # a planned graph's mirror on dev: Mem the arena (size elements, the first params of them the parameters, the gradients
 # the next params), Ints the tokens and classes, Stats two F64 a node (a loss's value and the entries it counted; two
 # more at the end for the gradients' norm), RowLoss a cross entropy's rows' losses
-type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>) {
+type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, geo Array<I64>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>) {
     dev
+    geo
     Size I64 = size
     params
     batch
@@ -177,6 +207,7 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
     Stats gdev.Buf<F64> = stats
     RowLoss gdev.Buf<F64> = losses
     plans mut Vec<AttnPlan<T>>& = Vec<AttnPlan<T>>()
+    mplans mut Vec<MatPlan<T>>& = Vec<MatPlan<T>>()
     nodes
     Graphs mut gdev.Graphs& = gdev.Graphs(64)     # GP7: whole training steps captured once and replayed
     Key mut Array<U64>& = Array<U64>(8)
@@ -186,10 +217,11 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
 # ---- the plan ----
 
 # the mirror of a graph of these steps, its arena of size elements (params of them parameters), ints I32s, planned for
-# batch entries: the buffers allocated and the kernels compiled now. rowloss: the most rows a cross entropy takes
-fn Mirror<T>.Make(dev mut gdev.Device&, steps Array<Step>&, size I64, params I64, ints I64, batch I64, rowloss I64) Mirror<T> ? gdev.GpuError {
+# batch entries: the buffers allocated and the kernels compiled now. rowloss: the most rows a cross entropy takes; geo
+# the views' geometries (Step.Geo)
+fn Mirror<T>.Make(dev mut gdev.Device&, steps Array<Step>&, geo Array<I64>&, size I64, params I64, ints I64, batch I64, rowloss I64) Mirror<T> ? gdev.GpuError {
     z T
-    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss))
+    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, geo, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss))
     try m.planAll()
     kern.Zero(dev, m.Mem.Addr(0), size * T.Size)
     kern.Zero(dev, m.Stats.Addr(0), (2 * steps.Len() + 4) * 8)
@@ -275,13 +307,25 @@ fn (m mut Mirror<T>&) product(c I64, cr I64, cc I64, a I64, ar I64, ac I64, ta B
 
 # ---- crossing ----
 
+# n elements of host from host[from] up to b from element to, on the compute stream: after every launch enqueued before
+# it, which may still read what it overwrites (GP8: an input written between a Forward and its Backward went up on the
+# copy stream, ordered before what came after but not after what came before - the Forward still in flight read the
+# new value), and before every launch after it
+fn upload<S>(d mut gdev.Device&, b gdev.Buf<S>&, host Array<S>&, from I64, to I64, n I64) {
+    if n <= 0: return
+    sz := U64(S.Size)
+    cu.oann_upload(d.Status(), b.Addr(to), host, U64(from) * sz, U64(n) * sz, d.Stream(), d.Uploaded(), d.Stream())
+}
+
 # host[from ... from + n - 1] up to the arena at the same offsets
 fn (m mut Mirror<T>&) Upload(host Array<T>&, from I64, n I64) {
-    if n > 0: m.Mem.Upload(host, from, from, n)
+    d := m.dev
+    upload(d, m.Mem, host, from, from, n)
 }
 
 fn (m mut Mirror<T>&) UploadInts(host Array<I32>&, from I64, n I64) {
-    if n > 0: m.Ints.Upload(host, from, from, n)
+    d := m.dev
+    upload(d, m.Ints, host, from, from, n)
 }
 
 # the whole arena down into host, and waits
@@ -313,7 +357,7 @@ fn (m mut Mirror<T>&) Fill(at I64, n I64, v F64) { m.elems(KFill, n, m.at(at), k
 # step s's forward at n entries in use, the first position of the step pos
 fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
     rows := s.RowsAt(n, m.batch)
-    cols := s.Cols
+    cols := s.ColsAt(n)
     count := rows * cols
     match s.Do {
         case Work.Linear {
@@ -321,6 +365,10 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
             if s.C >= 0: m.elems(KBias, count / cols * s.Inner, m.at(s.Y), m.at(s.C), n64(rows * s.Inner), n64(s.Inner))
         }
         case Work.MatMul {
+            if s.Geo >= 0 {
+                m.stacks(s, false, false, false)
+                return
+            }
             ar := s.Inner if s.TA else rows
             ac := rows if s.TA else s.Inner
             br := cols if s.TB else s.Inner
@@ -355,8 +403,20 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
             k T = T(1.0 / F64(cols)) if s.Flag else T(1.0)
             m.rowk(KSumLast, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), kern.Arg(k))
         }
+        case Work.Gather: m.view(s.Geo, s.Y, s.A, count, false)
         case _ { }
     }
+}
+
+# a view's kernel over n elements of y from x by the geometry at g (Step.Geo): a gather, or an Expand's gradient's sum
+fn (m mut Mirror<T>&) view(g I64, y I64, x I64, n I64, add Bool) {
+    if m.geo[g + 22] == 1 {
+        m.elems(KUnexpand, n, m.at(y), m.at(x), n64(n), flag(add), n64(m.geo[g]), n64(m.geo[g + 4]), n64(m.geo[g + 5]), n64(m.geo[g + 6]), n64(m.geo[g + 7]), n64(m.geo[g + 8]), n64(m.geo[g + 9])
+            n64(m.geo[g + 10]), n64(m.geo[g + 11]), n64(m.geo[g + 12]), n64(m.geo[g + 13]), n64(m.geo[g + 14]), n64(m.geo[g + 15]), n64(m.geo[g + 16]), n64(m.geo[g + 17]), n64(m.geo[g + 18]), n64(m.geo[g + 19]), n64(m.geo[g + 20]), n64(m.geo[g + 21]))
+        return
+    }
+    m.elems(KGather, n, m.at(y), m.at(x), n64(n), flag(add), n64(m.geo[g]), n64(m.geo[g + 1]), n64(m.geo[g + 2]), n64(m.geo[g + 3]), n64(m.geo[g + 5]), n64(m.geo[g + 6]), n64(m.geo[g + 7]), n64(m.geo[g + 8]), n64(m.geo[g + 9])
+        n64(m.geo[g + 10]), n64(m.geo[g + 11]), n64(m.geo[g + 12]), n64(m.geo[g + 13]), n64(m.geo[g + 14]), n64(m.geo[g + 15]))
 }
 
 # the attention plan of node s: made at Plan for the whole batch (Make) and used for any batch in use - a short batch runs
@@ -372,6 +432,7 @@ fn (m Mirror<T>&) planFor(s Step&) I64 {
 fn (m mut Mirror<T>&) planAll() ? gdev.GpuError {
     for i in range m.steps.Len() {
         s := m.steps[i]
+        if s.Do == Work.MatMul and s.Geo >= 0: m.mplans.Push(try m.planStacks(s))
         if s.Do != Work.Attention: continue
         qrows := m.batch * s.Ctx
         q := headsOf(m, s.A, qrows, s.Cols, s.Ctx, s.Heads)
@@ -380,6 +441,87 @@ fn (m mut Mirror<T>&) planAll() ? gdev.GpuError {
         o := headsOf(m, s.Y, qrows, s.Cols, s.Ctx, s.Heads)
         p := stackedOf(m, s.Saved, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
         m.plans.Push(try m.makePlan(s, m.batch, q, k, v, o, p))
+    }
+}
+
+# ---- GP8: products of two stacks of matrices ----
+
+# operand j's stack (0 a, 1 b, -1 dense: the product, the gradients) of the MatMul s: rows x cols matrices from off, as
+# its geometry says. A short batch runs every matrix of the planned one, as attention does (the unused ones' results
+# never read, within the buffers planned for them)
+fn (m Mirror<T>&) stack(s Step&, off I64, rows I64, cols I64, j I64) gdev.DBatch<T> {
+    g := s.Geo
+    groups := m.geo[g]
+    members := m.geo[g + 1]
+    if j < 0: return gdev.DBatch<T>(m.Mem, off, rows, cols, cols, groups, members * rows * cols, members, rows * cols)
+    o := g + 2 + 3 * j
+    return gdev.DBatch<T>(m.Mem, off, rows, cols, m.geo[o + 2], groups, m.geo[o], members, m.geo[o + 1])
+}
+
+# the matrices' shapes: the product's rows m, depth k, columns n; a's and b's rows and columns as stored
+fn (m Mirror<T>&) stackDims(s Step&) I64, I64, I64, I64, I64, I64, I64 {
+    rows := s.Rows / (m.geo[s.Geo] * m.geo[s.Geo + 1])
+    k := s.Inner
+    n := s.Cols
+    ar := k if s.TA else rows
+    ac := rows if s.TA else k
+    br := n if s.TB else k
+    bc := k if s.TB else n
+    return rows, k, n, ar, ac, br, bc
+}
+
+fn (m mut Mirror<T>&) planStacks(s Step&) MatPlan<T> ? gdev.GpuError {
+    d := m.dev
+    p := MatPlan<T>(d, s.Node)
+    rows, _, n, ar, ac, br, bc := m.stackDims(s)
+    y := m.stack(s, s.Y, rows, n, -1)
+    a := m.stack(s, s.A, ar, ac, 0)
+    b := m.stack(s, s.B, br, bc, 1)
+    p.fwd = try blas.Product<T, T, T>.PlanBatch(d, y, a, s.TA, b, s.TB)
+    if s.DY < 0: return p
+    dy := m.stack(s, s.DY, rows, n, -1)
+    if s.DA >= 0 {
+        da := m.stack(s, s.DA, ar, ac, -1)
+        if s.TA { p.da = try blas.Product<T, T, T>.PlanBatch(d, da, b, s.TB, dy, true) }
+        else { p.da = try blas.Product<T, T, T>.PlanBatch(d, da, dy, false, b, not s.TB) }
+    }
+    if s.DB >= 0 {
+        db := m.stack(s, s.DB, br, bc, -1)
+        if s.TB { p.db = try blas.Product<T, T, T>.PlanBatch(d, db, dy, true, a, s.TA) }
+        else { p.db = try blas.Product<T, T, T>.PlanBatch(d, db, a, not s.TA, dy, false) }
+    }
+    return p
+}
+
+fn (m Mirror<T>&) stacksFor(s Step&) I64 {
+    for i in range m.mplans.Len() {
+        if m.mplans[i].node == s.Node: return i
+    }
+    unreachable "oann: a product of stacks with no plan"
+}
+
+# the MatMul of two stacks s forward, or its backward (the gradients added to where add0, add1)
+fn (m mut Mirror<T>&) stacks(s Step&, backward Bool, add0 Bool, add1 Bool) {
+    i := m.stacksFor(s)
+    d := m.dev
+    rows, _, n, ar, ac, br, bc := m.stackDims(s)
+    a := m.stack(s, s.A, ar, ac, 0)
+    b := m.stack(s, s.B, br, bc, 1)
+    if not backward {
+        y := m.stack(s, s.Y, rows, n, -1)
+        m.mplans[i].fwd.RunBatch(d, y, a, b)
+        return
+    }
+    dy := m.stack(s, s.DY, rows, n, -1)
+    if s.DA >= 0 {
+        da := m.stack(s, s.DA, ar, ac, -1)
+        if s.TA { m.mplans[i].da.RunBatch(d, da, b, dy, 1.0, 1.0 if add0 else 0.0) }
+        else { m.mplans[i].da.RunBatch(d, da, dy, b, 1.0, 1.0 if add0 else 0.0) }
+    }
+    if s.DB >= 0 {
+        db := m.stack(s, s.DB, br, bc, -1)
+        if s.TB { m.mplans[i].db.RunBatch(d, db, dy, a, 1.0, 1.0 if add1 else 0.0) }
+        else { m.mplans[i].db.RunBatch(d, db, a, dy, 1.0, 1.0 if add1 else 0.0) }
     }
 }
 
@@ -429,7 +571,7 @@ fn (m mut Mirror<T>&) attentionForward(s Step&, n I64, pos I64) {
 # inputs' gradients (in the order of A, B, C) is added to what is there
 fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, add2 Bool) {
     rows := s.RowsAt(n, m.batch)
-    cols := s.Cols
+    cols := s.ColsAt(n)
     count := rows * cols
     match s.Do {
         case Work.Linear {
@@ -439,6 +581,10 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             if s.DC >= 0: m.tiles(KColSum, out, m.at(s.DC), m.at(s.DY), n64(rows), n64(out), flag(add2))
         }
         case Work.MatMul {
+            if s.Geo >= 0 {
+                m.stacks(s, true, add0, add1)
+                return
+            }
             k := s.Inner
             ar := k if s.TA else rows
             ac := rows if s.TA else k
@@ -468,8 +614,11 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
         case Work.Scale {
             if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(s.K)), n64(count), flag(add0))
         }
-        case Work.Copy, Work.Reshape {
+        case Work.Copy, Work.Reshape, Work.Gather {
             if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+        }
+        case Work.ViewBack {
+            if s.DA >= 0: m.view(s.Geo, s.DA, s.DY, count, add0)
         }
         case Work.Act {
             if s.DA >= 0 {
@@ -566,7 +715,8 @@ fn (m mut Mirror<T>&) AdamScalars(o mut AdamW<T>&) {
     corr1 F64 = 1.0 - o.Beta1.Pow(F64(o.Steps))
     corr2 F64 = 1.0 - o.Beta2.Pow(F64(o.Steps))
     o.hostHp[0], o.hostHp[1], o.hostHp[2] = T(1.0 - o.Rate * o.Decay), T(o.Rate / corr1), T(1.0 / corr2.Sqrt())
-    o.Hp.Upload(o.hostHp, 0, 0, 3)
+    d := m.dev
+    upload(d, o.Hp, o.hostHp, 0, 0, 3)
 }
 
 # the step's launch (the scalars already on the device)
