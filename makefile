@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench xor spiking prune hybridbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -77,6 +77,13 @@ gpulearn:
 	$(OLANG) build -define Gpu=true -output build/examples_mnist_learn examples/mnist_learn.olang
 	$(OLANG) build -define Gpu=true -output build/bench_gpulearn bench/gpulearn.olang
 	$(GPUENV) ./build/bench_gpulearn $(ARGS)
+
+# G-M4: ad/graph on the GPU - M1's perceptron epoch (MNIST, make data) and M2's character-transformer step on the CPU (1 and
+# 4 threads) and the GPU (AdamW and the clip on the device), interleaved, medians (bench/gpuad.olang) - ARGS: rounds,
+# transformer steps a round, and mlp or lm to run one only
+gpuad:
+	$(OLANG) build -define Gpu=true -output build/bench_gpuad bench/gpuad.olang
+	$(GPUENV) ./build/bench_gpuad $(ARGS)
 
 # M1 on ad/graph: the 784-128-10 perceptron on MNIST, each epoch timed - ARGS: epochs, threads, seed, and bf16
 mlpad:
