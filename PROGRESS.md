@@ -1802,3 +1802,25 @@ First measure, XOR (2-32-2, the readout connection ternary, EP and AdamW at 0.03
 scaling reached the latent weights, one seed of four solved XOR and three stopped at the same loss, 0.0867, with the
 gradient near zero. Ternary weights learn slower than real ones here; how they fare on the experiments' tasks is
 for the experiments.
+
+## A pairwise energy sampled by many chains (wt-potts, 2026-11-21)
+
+nn/potts: a Potts energy over a sparse graph of K-valued cells - a K x K pair table shared by the edges and unary terms
+linear in each cell's features - fitted by pseudolikelihood (each cell's conditional at a known answer exact, the
+gradient for both tables in one pass, checked against central differences) and searched by `Sampler`: many chains,
+each annealed by Gibbs sweeps over the graph's colour classes (a greedy colouring; tested that no class holds
+neighbours) from T0 to T1, then zero-temperature sweeps until nothing moves, each chain stopping on its own; chains
+on tasks, each with its own generator (the answers do not depend on the thread count, tested). A cell's pair energies
+are kept as a field and updated only where a neighbour moves. `Langevin` is the relaxed counterpart (softmax logits
+descended with annealed noise). bench/potts, the colouring energy on planted 3-colourable graphs (each cell joined
+to 3 others), 32 chains of 300 annealing sweeps, ms a search:
+
+| cells | 1 thread | 4 threads | best chain a proper colouring |
+|---|---|---|---|
+| 256 | 130 | 40 | 4 of 4 graphs |
+| 1024 | 561 | 166 | 2 of 4 |
+| 2048 | 1168 | 345 | 0 of 4 (more sweeps needed) |
+
+About 50 ns a cell update at K 3, most of it the draw's exponentials (three of about 8 ns each); the field saved a
+quarter. The sparse settle step at those sizes (bench/graphsettle, batch 8, D 16, one thread, a step): 256 cells 2078
+-> 784 us, 512 4390 -> 1131, 1024 20866 -> 4051, 2048 110262 -> 5775 (19x) against the dense adjacency product.

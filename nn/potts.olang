@@ -1,0 +1,499 @@
+# nn/potts - a pairwise (Potts) energy over a sparse graph of cells, each taking one of K values, learned by
+# pseudolikelihood and searched by many annealed chains at once.
+#
+#     E(x) = sum over edges u -> v of w_uv W[x_v, x_u] / 2  +  sum over cells i of sum_f F[i, f] B[f, x_i]
+#
+# The graph is message.Edges (each undirected edge given both ways, so every pair is counted once through the half;
+# a batch of graphs laid out as one graph whose parts share no edge, as there). W is a K x K table shared by every edge,
+# symmetric when fitted with `Symmetric`; the unary term is linear in each cell's features F (a clue one-hot, a degree,
+# a bias - whatever describes a cell), B a features x K table. A cell's local energy - what it adds with each value, its
+# neighbours held - is L_i[c] = sum_f F[i, f] B[f, c] + sum over its edges w W[c, x_u].
+#
+# Learning: `PseudoGrad` - each cell's conditional over its K values given its neighbours at an answer is exact
+# (softmax of -L_i), so the loss is the mean cross-entropy of those conditionals at known answers: no sampling, no
+# relaxation, a gradient for W and B in one pass (Besag 1975).
+#
+# Search: `Sampler` - Chains chains over the same graph, each a full assignment. A sweep visits the cells by colour
+# class (a greedy colouring of the graph: no two cells of a class are neighbours, so a class's cells are conditionally
+# independent - chromatic Gibbs; a chain takes them in turn, the chains run in parallel), each cell drawing its value
+# from softmax(-L_i / T), its pair energies kept as a field updated only where a neighbour moves; T falls geometrically from
+# T0 to T1 over the annealing sweeps, then zero-temperature sweeps (each cell its lowest-energy value) until no cell
+# moves. A chain stops on its own once a sweep at T <= Tstop moves nothing. Chains run on up to Threads tasks, each
+# chain with its own generator, so a result does not depend on the thread count. `Langevin` is the continuous
+# counterpart: each cell's values relaxed to softmax(theta_i), theta descended on the relaxed energy with noise of
+# temperature T (annealed), the answer each cell's largest.
+
+import "message"
+import "../kernels/elem"
+import "std/rand"
+
+# the energy's tables: W (K x K, row the cell's value, column the neighbour's), B (features x K)
+type Potts struct(k I64, features I64) {
+    K I64 = k
+    Features I64 = features
+    W mut Array<F64>& = Array<F64>(k * k)
+    B mut Array<F64>& = Array<F64>(features * k)
+}
+
+# the graph-colouring rule as an energy (no features): an edge of equal values costs 1
+fn Potts.Colouring(k I64) Potts {
+    m := Potts(k, 1)
+    for a in range k: m.W[a * k + a] = 1.0
+    return m
+}
+
+# cell i's local energies into L[lo .. lo + K]: its unary term and its edges' pairs, the neighbours at x[xo + u]
+fn (m Potts&) Local(e message.Edges&, f Array<F64>&, x Array<I32>&, xo I64, i I64, L mut Array<F64>&, lo I64) {
+    k := m.K
+    for c in range k: L[lo + c] = 0.0
+    for q in range m.Features {
+        v := f[i * m.Features + q]
+        if v == 0.0: continue
+        for c in range k: L[lo + c] += v * m.B[q * k + c]
+    }
+    for a in range e.First(i), e.First(i + 1) {
+        w := F64(e.Weight(a))
+        col := I64(x[xo + e.Source(a)])
+        for c in range k: L[lo + c] += w * m.W[c * k + col]
+    }
+}
+
+# the energy of the assignment x[xo .. xo + cells]
+fn (m Potts&) Energy(e message.Edges&, f Array<F64>&, x Array<I32>&, xo I64) F64 {
+    k := m.K
+    total F64 = 0.0
+    for i in range e.Nodes {
+        xi := I64(x[xo + i])
+        for q in range m.Features: total += f[i * m.Features + q] * m.B[q * k + xi]
+        for a in range e.First(i), e.First(i + 1): total += 0.5 * F64(e.Weight(a)) * m.W[xi * k + I64(x[xo + e.Source(a)])]
+    }
+    return total
+}
+
+# the pseudolikelihood's negative log at the answer y (cells long): summed over the cells, returned; its gradient
+# added to gw (K x K) and gb (features x K). L is scratch of K
+fn (m Potts&) PseudoGrad(e message.Edges&, f Array<F64>&, y Array<I32>&, gw mut Array<F64>&, gb mut Array<F64>&, L mut Array<F64>&) F64 {
+    k := m.K
+    nll F64 = 0.0
+    for i in range e.Nodes {
+        m.Local(e, f, y, 0, i, L, 0)
+        low := L[0]
+        for c in range 1, k: low = low.Min(L[c])
+        z F64 = 0.0
+        for c in range k: z += (low - L[c]).Exp()
+        yi := I64(y[i])
+        nll += L[yi] - low + z.Log()
+        for c in range k {
+            g := (1.0 if c == yi else 0.0) - (low - L[c]).Exp() / z      # dNLL / dL_c
+            for q in range m.Features: gb[q * k + c] += g * f[i * m.Features + q]
+            for a in range e.First(i), e.First(i + 1): gw[c * k + I64(y[e.Source(a)])] += g * F64(e.Weight(a))
+        }
+    }
+    return nll
+}
+
+# a gradient of W made symmetric: each pair's two entries replaced by their mean (a W kept symmetric stays so)
+fn Symmetric(gw mut Array<F64>&, k I64) {
+    for a in range k {
+        for b in range a + 1, k {
+            s := 0.5 * (gw[a * k + b] + gw[b * k + a])
+            gw[a * k + b] = s
+            gw[b * k + a] = s
+        }
+    }
+}
+
+# how a search anneals: Sweeps sweeps at T falling geometrically from T0 to T1, then zero-temperature sweeps until
+# no cell moves (at most Polish); a chain stops once a sweep at T <= Tstop moves nothing
+type Schedule struct(Sweeps I64 = 200, T0 F64 = 2.0, T1 F64 = 0.05, Tstop F64 = 0.1, Polish I64 = 50) {
+    Sweeps
+    T0
+    T1
+    Tstop
+    Polish
+}
+
+# sweep s's temperature (0 past the annealing)
+fn (s Schedule&) At(sweep I64) F64 {
+    if sweep >= s.Sweeps: return 0.0
+    return s.T0 * (s.T1 / s.T0).Pow(F64(sweep) / F64((s.Sweeps - 1).Max(1)))
+}
+
+# Chains chains over a graph of cells cells: their assignments X (chain c's at c cells), each chain's sweeps run and
+# energy at its end, the graph's colour classes
+type Sampler struct(cells I64, chains I64, k I64, threads I64 = 1) {
+    Cells I64 = cells
+    Chains I64 = chains
+    K I64 = k
+    Threads I64 = threads if threads > 0 else 1
+    X mut Array<I32>& = Array<I32>(chains * cells)
+    Sweeps mut Array<I64>& = Array<I64>(chains)
+    Energies mut Array<F64>& = Array<F64>(chains)
+    order mut Array<I64>& = Array<I64>(cells)          # the cells by colour class
+    classes mut Array<I64>& = Array<I64>(cells + 1)    # class q's cells: order[classes[q] .. classes[q + 1]]
+    Colours I64 = 0
+    seeds mut Array<U64>& = Array<U64>(chains)         # each chain's generator (xorshift)
+    scratch mut Array<F64>& = Array<F64>(chains * k)
+    theta mut Array<F64>& = Array<F64>(0)              # Langevin's logits, chains x cells x K
+    unary mut Array<F64>& = Array<F64>(cells * k)      # each cell's unary energies, made once a search
+    field mut Array<F64>& = Array<F64>(chains * cells * k)   # each chain's cells' pair energies, kept current
+}
+
+# a greedy colouring of e's graph (each cell the lowest colour no neighbour has, in order of falling degree): the
+# classes a sweep takes in turn
+fn (s mut Sampler&) Colour(e message.Edges&) {
+    n := s.Cells
+    colour := Array<I64>(n, -1)
+    byDegree := Array<I64>(n)
+    for i in range n: byDegree[i] = i
+    byDegree.Sort(fn(a, b): return e.Degree(a) > e.Degree(b) or (e.Degree(a) == e.Degree(b) and a < b))
+    used := Array<Bool>(n + 1)
+    most I64 = 0
+    for i in byDegree {
+        for a in range e.First(i), e.First(i + 1) {
+            c := colour[e.Source(a)]
+            if c >= 0: used[c] = true
+        }
+        c I64 = 0
+        for used[c]: c++
+        colour[i] = c
+        most = most.Max(c + 1)
+        for a in range e.First(i), e.First(i + 1) {
+            u := colour[e.Source(a)]
+            if u >= 0: used[u] = false
+        }
+    }
+    s.Colours = most
+    for q in range most + 1: s.classes[q] = 0
+    for i in range n: s.classes[colour[i] + 1] += 1
+    for q in range most: s.classes[q + 1] += s.classes[q]
+    next := Array<I64>(most)
+    for q in range most: next[q] = s.classes[q]
+    for i in range n {
+        s.order[next[colour[i]]] = i
+        next[colour[i]] += 1
+    }
+}
+
+# every chain's generator seeded from r, and its assignment drawn uniformly
+fn (s mut Sampler&) Start(r mut rand.Rand&) {
+    for c in range s.Chains: s.seeds[c] = r.Next() | 1
+    for c in range s.Chains {
+        for i in range s.Cells: s.X[c * s.Cells + i] = I32(nextBelow(s.seeds, c, s.K))
+    }
+}
+
+# chain c's generator: xorshift64*, a uniform in [0, 1)
+fn nextUniform(seeds mut Array<U64>&, c I64) F64 {
+    x := seeds[c]
+    x ^= x >> 12
+    x ^= x << 25
+    x ^= x >> 27
+    seeds[c] = x
+    return F64((x * 2685821657736338717) >> 11) / 9007199254740992.0
+}
+
+fn nextBelow(seeds mut Array<U64>&, c I64, n I64) I64 { return I64(nextUniform(seeds, c) * F64(n)).Min(n - 1) }
+
+# every chain annealed by Gibbs sweeps over the colour classes as sched says (after Colour and Start): X holds each
+# chain's answer, Energies its energy, Sweeps its sweeps. The edges must come both ways with one weight
+fn (s mut Sampler&) Anneal(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule) {
+    k := s.K
+    for i in range s.Cells {
+        for v in range k: s.unary[i * k + v] = 0.0
+        for q in range m.Features {
+            fv := f[i * m.Features + q]
+            if fv == 0.0: continue
+            for v in range k: s.unary[i * k + v] += fv * m.B[q * k + v]
+        }
+    }
+    tasks := s.Threads.Min(s.Chains)
+    if tasks <= 1 {
+        s.chains(m, e, f, sched, 0, s.Chains)
+        return
+    }
+    share := (s.Chains + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo := t * share
+            hi := (lo + share).Min(s.Chains)
+            if lo < hi: spawn s.chains(m, e, f, sched, lo, hi)
+        }
+    }
+}
+
+fn (s mut Sampler&) chains(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, c0 I64, c1 I64) {
+    for c in range c0, c1: s.chain(m, e, f, sched, c)
+}
+
+# chain c: its sweeps, then its energy. Each cell's pair energies are kept as a field, changed only where a neighbour
+# changes value (the edges are both ways with one weight, as an undirected graph's are), so a sweep costs a cell's K
+# values plus its neighbours' updates only where it moves
+fn (s mut Sampler&) chain(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, c I64) {
+    k := s.K
+    n := s.Cells
+    xo := c * n
+    fo := c * n * k
+    lo := c * k
+    X, field, L, unary, order, seeds, W := s.X, s.field, s.scratch, s.unary, s.order, s.seeds, m.W
+    for i in range n {
+        for v in range k: field[fo + i * k + v] = 0.0
+        for a in range e.First(i), e.First(i + 1) {
+            w := F64(e.Weight(a))
+            col := I64(X[xo + e.Source(a)])
+            for v in range k: field[fo + i * k + v] += w * W[v * k + col]
+        }
+    }
+    total := sched.Sweeps + sched.Polish
+    s.Sweeps[c] = total
+    for sweep in range total {
+        t := sched.At(sweep)
+        moved I64 = 0
+        for at in range n {
+            i := order[at]
+            for v in range k: L[lo + v] = unary[i * k + v] + field[fo + i * k + v]
+            v := draw(L, lo, k, t, seeds, c) if t > 0.0 else lowest(L, lo, k)
+            was := I64(X[xo + i])
+            if v == was: continue
+            moved++
+            X[xo + i] = I32(v)
+            for a in range e.First(i), e.First(i + 1) {
+                w := F64(e.Weight(a))
+                u := e.Source(a)
+                for x in range k: field[fo + u * k + x] += w * (W[x * k + v] - W[x * k + was])
+            }
+        }
+        if moved == 0 and t <= sched.Tstop {
+            s.Sweeps[c] = sweep + 1
+            break
+        }
+    }
+    s.Energies[c] = m.Energy(e, f, s.X, xo)
+}
+
+# a value drawn from softmax(-L / t) over L[lo .. lo + k] (L overwritten by the unnormalized weights)
+fn draw(L mut Array<F64>&, lo I64, k I64, t F64, seeds mut Array<U64>&, c I64) I64 {
+    low := L[lo]
+    for v in range 1, k: low = low.Min(L[lo + v])
+    inv := 1.0 / t
+    z F64 = 0.0
+    for v in range k {
+        w := elem.FastExp((low - L[lo + v]) * inv)
+        L[lo + v] = w
+        z += w
+    }
+    u := nextUniform(seeds, c) * z
+    for v in range k - 1 {
+        u -= L[lo + v]
+        if u <= 0.0: return v
+    }
+    return k - 1
+}
+
+# the value of lowest local energy (the first of equals)
+fn lowest(L Array<F64>&, lo I64, k I64) I64 {
+    best I64 = 0
+    for v in range 1, k {
+        if L[lo + v] < L[lo + best]: best = v
+    }
+    return best
+}
+
+# the value of largest theta (the first of equals)
+fn largest(L Array<F64>&, lo I64, k I64) I64 {
+    best I64 = 0
+    for v in range 1, k {
+        if L[lo + v] > L[lo + best]: best = v
+    }
+    return best
+}
+
+# the chain of lowest energy
+fn (s Sampler&) Best() I64 {
+    best I64 = 0
+    for c in range 1, s.Chains {
+        if s.Energies[c] < s.Energies[best]: best = c
+    }
+    return best
+}
+
+# the relaxed search: each chain's cells as softmax(theta) over their K values (theta drawn small at random), steps
+# steps of theta -= rate dE/dtheta + sqrt(2 rate T) noise on the relaxed energy (each cell's expected local energy
+# against its neighbours' distributions), T annealed by sched's first Sweeps; X then each cell's most likely value,
+# Energies its energy (after Colour and Start)
+fn (s mut Sampler&) Langevin(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, rate F64) {
+    k := s.K
+    n := s.Cells
+    if s.theta.Len() < s.Chains * n * k: s.theta = Array<F64>(s.Chains * n * k)
+    tasks := s.Threads.Min(s.Chains)
+    share := (s.Chains + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo := t * share
+            hi := (lo + share).Min(s.Chains)
+            if lo < hi: spawn s.relaxChains(m, e, f, sched, rate, lo, hi)
+        }
+    }
+}
+
+fn (s mut Sampler&) relaxChains(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, rate F64, c0 I64, c1 I64) {
+    for c in range c0, c1: s.relax(m, e, f, sched, rate, c)
+}
+
+fn (s mut Sampler&) relax(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, rate F64, c I64) {
+    k := s.K
+    n := s.Cells
+    base := c * n * k
+    for i in range n * k: s.theta[base + i] = 0.1 * (nextUniform(s.seeds, c) - 0.5)
+    p := Array<F64>(n * k)
+    g := Array<F64>(k)
+    for step in range sched.Sweeps {
+        t := sched.At(step)
+        softmaxAll(s.theta, base, p, n, k)
+        for at in range n {
+            i := s.order[at]
+            # dE/dp_i: the unary term and each edge's neighbour distribution through W
+            for v in range k: g[v] = 0.0
+            for q in range m.Features {
+                fv := f[i * m.Features + q]
+                if fv == 0.0: continue
+                for v in range k: g[v] += fv * m.B[q * k + v]
+            }
+            for a in range e.First(i), e.First(i + 1) {
+                w := F64(e.Weight(a))
+                u := e.Source(a)
+                for v in range k {
+                    sum F64 = 0.0
+                    for x in range k: sum += m.W[v * k + x] * p[u * k + x]
+                    g[v] += w * sum
+                }
+            }
+            # through the softmax: dE/dtheta_v = p_v (g_v - p . g)
+            mean F64 = 0.0
+            for v in range k: mean += p[i * k + v] * g[v]
+            noise := (2.0 * rate * t).Sqrt()
+            for v in range k {
+                gauss := (nextUniform(s.seeds, c) + nextUniform(s.seeds, c) + nextUniform(s.seeds, c) - 1.5) * 2.0
+                s.theta[base + i * k + v] -= rate * p[i * k + v] * (g[v] - mean) - noise * gauss
+            }
+        }
+    }
+    for i in range n: s.X[c * n + i] = I32(largest(s.theta, base + i * k, k))
+    s.Sweeps[c] = sched.Sweeps
+    s.Energies[c] = m.Energy(e, f, s.X, c * n)
+}
+
+# each cell's softmax of theta[base + i K ..] into p
+fn softmaxAll(theta Array<F64>&, base I64, p mut Array<F64>&, n I64, k I64) {
+    for i in range n {
+        top := theta[base + i * k]
+        for v in range 1, k: top = top.Max(theta[base + i * k + v])
+        z F64 = 0.0
+        for v in range k {
+            p[i * k + v] = (theta[base + i * k + v] - top).Exp()
+            z += p[i * k + v]
+        }
+        for v in range k: p[i * k + v] /= z
+    }
+}
+
+assert not Potts.PseudoGrad.Allocates, "a pseudolikelihood gradient allocates"
+
+# ---- tests ----
+
+# a planted k-colourable graph of n cells: each cell joined to `links` others of another colour, both ways; its
+# planted colours
+fn planted(n I64, k I64, links I64, r mut rand.Rand&) message.Edges, Array<I32> {
+    colour := Array<I32>(n)
+    for i in range n: colour[i] = I32(r.Below(k))
+    src, dst := Array<I32>(2 * n * links), Array<I32>(2 * n * links)
+    count I64 = 0
+    for i in range n {
+        for _ in range links {
+            j := r.Below(n)
+            if j == i or colour[j] == colour[i]: continue
+            src[count], dst[count] = I32(i), I32(j)
+            src[count + 1], dst[count + 1] = I32(j), I32(i)
+            count += 2
+        }
+    }
+    e := message.Edges(n, 2 * n * links)
+    e.Set(src, dst, count)
+    return e, colour
+}
+
+test Sampler.Anneal "annealed chromatic Gibbs over many chains finds a proper colouring of a planted 3-colourable graph; the chains do not depend on the thread count" {
+    r := rand.Rand(7)
+    e, _ := planted(120, 3, 2, r)
+    m := Potts.Colouring(3)
+    f := Array<F64>(120)
+    answers := Vec<Array<I32>>()
+    for threads in Array<I64>[1, 3] {
+        s := Sampler(120, 16, 3, threads)
+        s.Colour(e)
+        s.Start(rand.Rand(9))
+        s.Anneal(m, e, f, Schedule(300, 2.0, 0.05))
+        assert s.Energies[s.Best()] == 0.0, "best energy " + $s.Energies[s.Best()]
+        answers.Push(s.X)
+    }
+    assert answers[0] == answers[1]
+}
+
+test Sampler.Colour "no two cells of a colour class are neighbours, and the classes cover every cell once" {
+    r := rand.Rand(3)
+    e, _ := planted(200, 4, 3, r)
+    s := Sampler(200, 1, 4)
+    s.Colour(e)
+    seen := Array<I64>(200, -1)
+    for q in range s.Colours {
+        for at in range s.classes[q], s.classes[q + 1] {
+            assert seen[s.order[at]] < 0
+            seen[s.order[at]] = q
+        }
+    }
+    for i in range 200 {
+        assert seen[i] >= 0
+        for a in range e.First(i), e.First(i + 1): assert seen[e.Source(a)] != seen[i]
+    }
+}
+
+test Potts.PseudoGrad "the pseudolikelihood's gradient equals its central differences, for W and B" {
+    r := rand.Rand(4)
+    e, y := planted(30, 3, 2, r)
+    m := Potts(3, 2)
+    for i in range 9: m.W[i] = r.Uniform(-1.0, 1.0)
+    for i in range 6: m.B[i] = r.Uniform(-1.0, 1.0)
+    f := Array<F64>(60)
+    for i in range 60: f[i] = r.Uniform(0.0, 1.0)
+    gw, gb, L := Array<F64>(9), Array<F64>(6), Array<F64>(3)
+    m.PseudoGrad(e, f, y, gw, gb, L)
+    h := 1e-6
+    sw, sb := Array<F64>(9), Array<F64>(6)
+    for i in range 15 {
+        tab := m.W if i < 9 else m.B
+        j := i if i < 9 else i - 9
+        keep := tab[j]
+        tab[j] = keep + h
+        up := m.PseudoGrad(e, f, y, sw, sb, L)
+        tab[j] = keep - h
+        down := m.PseudoGrad(e, f, y, sw, sb, L)
+        tab[j] = keep
+        want := (up - down) / (2.0 * h)
+        got := gw[j] if i < 9 else gb[j]
+        assert (got - want).Abs() < 1e-5 * (1.0 + want.Abs()), $i + ": " + $got + " against " + $want
+    }
+}
+
+test Sampler.Langevin "the relaxed annealed search reaches a colouring with few conflicts, its energies the assignments'" {
+    r := rand.Rand(11)
+    e, _ := planted(60, 3, 2, r)
+    m := Potts.Colouring(3)
+    f := Array<F64>(60)
+    s := Sampler(60, 8, 3, 2)
+    s.Colour(e)
+    s.Start(rand.Rand(5))
+    s.Langevin(m, e, f, Schedule(400, 0.3, 0.001), 1.0)
+    best := s.Best()
+    assert s.Energies[best] <= 2.0, "best energy " + $s.Energies[best]
+    assert s.Energies[best] == m.Energy(e, f, s.X, best * 60)
+}

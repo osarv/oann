@@ -1,0 +1,58 @@
+# nn/potts: annealed chromatic Gibbs over many chains on planted 3-colourable graphs (each cell joined to 3 others),
+# the colouring energy: ms a search, sweeps a chain, the share of searches whose best chain is a proper colouring, at
+# 1 and 4 threads. From the repository's root:
+#     make pottsbench ARGS="chains sweeps"    (32 300)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn/message"
+import "../nn/potts"
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    chains := try args[1].ParseInt() if args.Len() > 1 else 32
+    sweeps := try args[2].ParseInt() if args.Len() > 2 else 300
+    m := potts.Potts.Colouring(3)
+    try io.PutLn("cells | threads | ms a search | sweeps a chain | solved")
+    for n in Array<I64>[256, 1024, 2048] {
+        for threads in Array<I64>[1, 4] {
+            r := rand.Rand(1)
+            solved, total, swept := 0, 0.0, 0.0
+            for _ in range 4 {
+                e := graph(n, r)
+                f := Array<F64>(n)
+                s := potts.Sampler(n, chains, 3, threads)
+                s.Colour(e)
+                s.Start(r)
+                t0 := time.Now()
+                s.Anneal(m, e, f, potts.Schedule(sweeps, 2.0, 0.05))
+                total += F64(time.Since(t0)) * 1e-6
+                for c in range chains: swept += F64(s.Sweeps[c])
+                if s.Energies[s.Best()] == 0.0: solved += 1
+            }
+            try io.PutLn($n + " | " + $threads + " | " + $(total / 4.0).Fixed(1) + " | " + $(swept / F64(4 * chains)).Fixed(0) + " | " + $solved + "/4")
+        }
+    }
+}
+
+# a planted 3-colourable graph: each cell joined to 3 others of another colour, both ways
+fn graph(n I64, r mut rand.Rand&) message.Edges {
+    colour := Array<I64>(n)
+    for i in range n: colour[i] = r.Below(3)
+    src, dst := Array<I32>(6 * n), Array<I32>(6 * n)
+    count I64 = 0
+    for i in range n {
+        for _ in range 3 {
+            j := r.Below(n)
+            if j == i or colour[j] == colour[i]: continue
+            src[count], dst[count] = I32(i), I32(j)
+            src[count + 1], dst[count + 1] = I32(j), I32(i)
+            count += 2
+        }
+    }
+    e := message.Edges(n, 6 * n)
+    e.Set(src, dst, count)
+    return e
+}
