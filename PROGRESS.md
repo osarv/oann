@@ -1289,13 +1289,11 @@ from the same `Use`.
   below 16384.
 - INT8 on the GPU: a one-pass kernel dequantizing GemmI8's I32 product (kern.olang) instead of the second, F32-summed
   product (GP3: 192 against 2466 us at 2048^3); then G-M5.
-- kernels/gemm with 4 threads is 2-4.5x slower than 1 thread at 32 and 128 rows of x 784 x 128 (G-M1, above).
 - The nudged pair's certificate per batch: `NudgedRate` with the block norm certifies 60% of MNIST's rows at epoch 3
   (44% before; above), no batch of 32. Next lever: a budget per row (a per-row stop in dyn/settle), or a tighter
   hidden-to-readout block.
 - Compacting retired units (above, if it pays).
-- INT8: shallow products (the CNN's depth 9 and 144) and the per-lane `vpdpbusd`
-  lowering (repro/vnnitile).
+- INT8: shallow products (the CNN's depth 9 and 144).
 
 ## Done since C3
 
@@ -1407,3 +1405,32 @@ option is faster on every case with unchanged accuracy (Gauss-Seidel is the near
 Logs in the worktree's logs/ (not committed).
 
 **INT8 weights at batch 1: two rows per pass (`dotRow2`).** The BF16 fix's one-row `dotRow` cost INT8-under-F32 streaming 10-20%. `dotRow2` takes two rows with each row's eight chains and order unchanged (the storage test's bit-for-bit sums hold) and reads the vector once; the INT8 storage type only (`pairedRows`). For F32 and BF16 the same loop was 0.4-0.7x F32 (LLVM's SLP vectorizer again), so they keep `dotRow`. bench/storage (loaded machine, alternated 3x, bench shapes 1x512x512 and 1x4096x1024 added), INT8 vs F32: 1x784x128 0.69-0.94x -> 0.83-0.90x (5.0-5.2 us against 6.9-8.4), 1x1024x1024 2.58-2.77x -> 2.72-3.17x, 1x4096x1024 2.39-2.47x -> 2.70-2.81x, 1x512x512 level; BF16 and F32 unchanged.
+
+## Products split under one join (wt-gemmjoin, 2026-11-21)
+
+A spawn and its join cost about 30 us a task on the 4-core VM, most of it the sleeping worker's wake (a plain C condvar
+round trip measures 25 us there; a spinning one 0.6 us). kernels/gemm split a large product once per packed block of
+op(B) - a join per 256 of the depth, four for a depth of 784 - so a split paid that four times. Now `packedProduct` starts
+its tasks once: each runs the whole blocked loop over its own part, a run of tile rows (where the result is at least as
+tall as wide; every task packs op(B), the narrower panel) or of tile columns (every task packs op(A)), with panels of
+its own from the workspace (Reserve's room already holds one per thread). The split threshold drops from 16 M to 4 M
+multiply-adds a task (2 M, and at most a task per three tiles, measured level). Sums are unchanged: the tests (a
+column-split product past a block of columns, and an epilogue on one, added) hold bit for bit across thread counts.
+
+bench/storage F32, 4 threads, alternated runs (us; one thread unchanged within noise):
+
+| shape | before | after | one thread |
+|---|---|---|---|
+| 64 x 784 x 128 | 130 | 122-133 | 130 |
+| 128 x 784 x 128 | 218-227 | 155-179 | 221 |
+| 1024 x 512 x 128 | 608-643 | 408-556 | 1050 |
+| 1024 x 128 x 512 | 369-553 | 358-579 | 900 |
+| 512^3 | 887-1065 | 660-920 | 1820 |
+| 1024^3 | 4810-5050 | 4750-5230 | 14400 |
+
+bench/lm (the character transformer, 20 steps), 4 threads: a step 63.1 / 63.5 -> 53.8 / 57.0 ms, its products 42.8-48.2 ->
+33.7-34.5 ms. G-M1's 4-thread slowdown at 32 and 128 rows (fixed 2026-11-17 by not splitting them) now turns into a
+gain at 128 rows. Left: the workers' wake itself (an olang runtime matter: spinning briefly before parking would bring a
+split to a few microseconds), and duplicate packing of the narrower operand, which caps 64-128-row products.
+
+Also re-checked repro/ against olang 3b47ad852: every bug but `tempref` is fixed (repro/README.md).

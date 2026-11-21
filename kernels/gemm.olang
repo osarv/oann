@@ -27,8 +27,9 @@
 # one column) skip packing altogether. The epilogue - a bias and an activation - runs on each block of rows as soon as
 # it is summed, while it is in the cache.
 #
-# Threads. The workspace fixes the thread count. A product large enough is split by runs of its output's tile rows
-# over that many tasks (join/spawn), GemmBatch by runs of its matrices; no element's sum depends on the split, so a
+# Threads. The workspace fixes the thread count. A product large enough is split over that many tasks under one join -
+# by runs of its result's tile rows, or of its tile columns where it is wider than tall, each task blocking its own
+# part with panels of its own - and GemmBatch by runs of its matrices; no element's sum depends on the split, so a
 # result is the same for every thread count, bit for bit.
 #
 # Shapes are checked by the callers, once (docs/redesign.md, section 3, decision 1): nothing here checks a shape, and a
@@ -687,31 +688,18 @@ fn triangleDepth(lower Bool, ta Bool, ti I64, tr I64, p0 I64, depth I64, diag I6
     return 0, clampI(ti + tr + diag - p0, 0, depth)
 }
 
-# the m x n x k product from sa and sb (as packing reads them: ta and tb its trans), one packed block of op(B) at a
-# time into bp, rows in runs of share over tasks (one: the calling thread), each task packing its rows of op(A) into
-# its own panel of ap (panel elements)
-fn gemmBlocks<SA, SB, A, S, H>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al A, be A, c mut Array<S>&, ldc I64, share I64, ap mut Array<A>&, panel I64, bp mut Array<A>&, sh H, exchanged Bool, lower Bool, result Bool, diag I64, ep Epilogue) {
+# rows i0 .. i1 by columns j0 .. j1 of the m x n x k product from sa and sb (as packing reads them: ta and tb its
+# trans), one packed block of op(B) at a time into bp, op(A)'s rows packed into ap - on the calling thread: a task of
+# a split product runs one of these on its own part, with panels of its own
+fn gemmBlocks<SA, SB, A, S, H>(i0 I64, i1 I64, j0 I64, j1 I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al A, be A, c mut Array<S>&, ldc I64, ap mut Array<A>&, bp mut Array<A>&, sh H, exchanged Bool, lower Bool, result Bool, diag I64, ep Epilogue) {
     nc := blockCols(al)
-    tasks I64 = (m + share - 1) / share
-    for jc in range 0, n, nc {
-        cols I64 = lesser(nc, n - jc)
+    for jc in range j0, j1, nc {
+        cols I64 = lesser(nc, j1 - jc)
         for pc in range 0, k, kc {
             depth I64 = lesser(kc, k - pc)
             sb.pack(tb, jc, pc, cols, depth, bPanel(), sh, false, 0, bp)
             bk := block<A>(pc, depth, k, cols, jc, bp, al, be if pc == 0 else 1, lower, result, diag, exchanged)
-            if tasks <= 1: gemmRows(sa, ta, 0, m, bk, ap, c, ldc, sh, ep)
-            else: rowsInTasks(sa, ta, m, share, tasks, bk, ap, panel, c, ldc, sh, ep)
-        }
-    }
-}
-
-# one block's rows in runs of share, a task each, each packing into its own panel of ap
-fn rowsInTasks<SA, A, S, H>(sa SA, ta Bool, m I64, share I64, tasks I64, bk block<A>&, ap mut Array<A>&, panel I64, c mut Array<S>&, ldc I64, sh H, ep Epilogue) {
-    join {
-        for t in range tasks {
-            lo I64 = t * share
-            hi I64 = lesser(m, lo + share)
-            if lo < hi: spawn gemmRows(sa, ta, lo, hi, bk, ap[t * panel:(t + 1) * panel], c, ldc, sh, ep)
+            gemmRows(sa, ta, i0, i1, bk, ap, c, ldc, sh, ep)
         }
     }
 }
@@ -726,13 +714,12 @@ fn emptyProduct<A, S>(m I64, n I64, be A, c mut Array<S>&, ldc I64, ep Epilogue,
     finish(c, ldc, 0, m, 0, n, ep, be)
 }
 
-# the multiply-adds a task must have to itself to be worth starting: a spawn and join cost on the order of 100 us a
-# block of the product, so a product splits into at most one task for each madds of its work (m n k), and below two
+# the multiply-adds a task must have to itself to be worth starting: a spawn and its join cost tens of microseconds (a
+# sleeping thread woken), so a product splits into at most one task for each madds of its work (m n k), and below two
 # runs on the calling thread
-madds I64 = 16000000
+madds I64 = 4000000
 
-# the packed product: op(B)'s one panel and op(A)'s one per task from ws - a product large enough split over up to
-# ws.Threads tasks by rows of the result, a multiple of the tile's rows each. Thin and exchanged as tiling.choose says
+# a product by the blocked algorithm, its tiling chosen
 fn product<SA, SB, S, A>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al A, be A, c mut Array<S>&, ldc I64, ws mut Workspace<A>&, ep Epilogue, mayExchange Bool) {
     if k == 0 {
         emptyProduct(m, n, be, c, ldc, ep, false, 0)
@@ -752,17 +739,45 @@ fn product<SA, SB, S, A>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al
     else: packedProduct(m, n, k, sa, ta, sb, not tb, al, be, c, ldc, ws, choice.thin, false, ep)
 }
 
+# the packed product: one task, or up to ws.Threads tasks under one join, each computing a part of the result with
+# panels of its own from ws - a run of tile rows each where the result is at least as tall as it is wide (every task
+# packing all of op(B), the narrower operand's panel), else a run of tile columns (every task packing all of op(A)). Thin
+# and exchanged as tiling.choose says. No element's sum depends on the split
 fn packedProduct<SA, SB, A, S>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al A, be A, c mut Array<S>&, ldc I64, ws mut Workspace<A>&, thin Bool, exchanged Bool, ep Epilogue) {
     nr I64 = vectorLanes(al) if thin else tileCols(al)
     depthMax I64 = lesser(k, kc)
-    bp := ws.panelsB(depthMax * lesser((n + nr - 1) / nr * nr, blockCols(al)))
-    tasks I64 = lesser(lesser(ws.Threads, (m + microRows - 1) / microRows), m * n * k / madds)
-    tasks = tasks.Max(1)
-    share I64 = ((m + tasks - 1) / tasks + microRows - 1) / microRows * microRows
-    panel I64 = lesser(blockRows(al), share) * depthMax
-    ap := ws.panelsA(tasks * panel)
-    if thin: gemmBlocks(m, n, k, sa, ta, sb, tb, al, be, c, ldc, share, ap, panel, bp, thinTile(), exchanged, false, false, 0, ep)
-    else: gemmBlocks(m, n, k, sa, ta, sb, tb, al, be, c, ldc, share, ap, panel, bp, wideTile(), exchanged, false, false, 0, ep)
+    byRows Bool = m >= n
+    units I64 = (m + microRows - 1) / microRows if byRows else (n + nr - 1) / nr
+    tasks I64 = lesser(lesser(ws.Threads, units), m * n * k / madds).Max(1)
+    step I64 = microRows if byRows else nr
+    share I64 = ((m if byRows else n) + tasks - 1) / tasks
+    share = (share + step - 1) / step * step
+    rowsEach I64 = share if byRows else m
+    colsEach I64 = n if byRows else share
+    asize I64 = lesser(blockRows(al), roundUp(rowsEach, microRows)) * depthMax
+    bsize I64 = lesser(blockCols(al), roundUp(colsEach, nr)) * depthMax
+    ap := ws.panelsA(tasks * asize)
+    bp := ws.panelsB(tasks * bsize)
+    if tasks <= 1 {
+        if thin: gemmBlocks(0, m, 0, n, k, sa, ta, sb, tb, al, be, c, ldc, ap, bp, thinTile(), exchanged, false, false, 0, ep)
+        else: gemmBlocks(0, m, 0, n, k, sa, ta, sb, tb, al, be, c, ldc, ap, bp, wideTile(), exchanged, false, false, 0, ep)
+        return
+    }
+    join {
+        for t in range tasks {
+            lo I64 = t * share
+            hi I64 = lesser(m if byRows else n, lo + share)
+            if lo >= hi: continue
+            i0 I64 = lo if byRows else 0
+            i1 I64 = hi if byRows else m
+            j0 I64 = 0 if byRows else lo
+            j1 I64 = n if byRows else hi
+            pa := ap[t * asize:(t + 1) * asize]
+            pb := bp[t * bsize:(t + 1) * bsize]
+            if thin: spawn gemmBlocks(i0, i1, j0, j1, k, sa, ta, sb, tb, al, be, c, ldc, pa, pb, thinTile(), exchanged, false, false, 0, ep)
+            else: spawn gemmBlocks(i0, i1, j0, j1, k, sa, ta, sb, tb, al, be, c, ldc, pa, pb, wideTile(), exchanged, false, false, 0, ep)
+        }
+    }
 }
 
 # a triangle as the blocked product reads it: a lower-triangular left operand, a triangular result, the diagonal
@@ -831,8 +846,8 @@ fn (r batchRun<S, SA, SB, A>&) go(lo I64, hi I64, ap mut Array<A>&, bp mut Array
 }
 
 fn (r batchRun<S, SA, SB, A>&) blocks<T>(sa operand<SA>&, sb operand<SB>&, cd mut Array<T>&, ldc I64, ap mut Array<A>&, bp mut Array<A>&) {
-    if r.thin: gemmBlocks(r.m, r.n, r.k, sa, r.ta, sb, not r.tb, r.al, r.be, cd, ldc, r.m, ap, 0, bp, thinTile(), false, r.lower, r.result, r.diag, Epilogue.None)
-    else: gemmBlocks(r.m, r.n, r.k, sa, r.ta, sb, not r.tb, r.al, r.be, cd, ldc, r.m, ap, 0, bp, wideTile(), false, r.lower, r.result, r.diag, Epilogue.None)
+    if r.thin: gemmBlocks(0, r.m, 0, r.n, r.k, sa, r.ta, sb, not r.tb, r.al, r.be, cd, ldc, ap, bp, thinTile(), false, r.lower, r.result, r.diag, Epilogue.None)
+    else: gemmBlocks(0, r.m, 0, r.n, r.k, sa, r.ta, sb, not r.tb, r.al, r.be, cd, ldc, ap, bp, wideTile(), false, r.lower, r.result, r.diag, Epilogue.None)
 }
 
 # dst = src for an m x n matrix, converted - of row i its first i + reach columns (a triangular result: reach d + 1)
@@ -1660,7 +1675,7 @@ fn productCase(m I64, n I64, k I64, form I64, r mut rand.Rand&) {
 
 test Gemm "against the plain sum: every transpose, alpha and beta, across block boundaries, any thread count" {
     r := rand.Rand(5)
-    sizes := Array<I64>[3, 5, 7, 37, 29, 41, 300, 270, 517, 1, 700, 3, 130, 1, 64, 600, 9, 16]
+    sizes := Array<I64>[3, 5, 7, 37, 29, 41, 300, 270, 517, 1, 700, 3, 130, 1, 64, 600, 9, 16, 40, 2100, 300]
     for s in range sizes.Len() / 3 {
         for form in range 4: productCase(sizes[3 * s], sizes[3 * s + 1], sizes[3 * s + 2], form, r)
     }
@@ -2031,6 +2046,7 @@ test Epilogue "a bias and an activation on the summed result: every activation, 
         epilogueCase(3, 40, 17, act, r)
         epilogueCase(130, 70, 300, act, r)
         epilogueCase(10, 300, 64, act, r)
+        epilogueCase(40, 400, 600, act, r)
     }
     assert actOf(-2.0, softplusAct()) - (1.0 + (-2.0).Exp()).Log() < 1e-15 and actOf(NaN, reluAct()).IsNan()
 }

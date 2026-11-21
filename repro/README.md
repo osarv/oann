@@ -1,32 +1,35 @@
 # repro
 
 Minimal programs for olang issues found while writing oann. Each file's header says what it shows and what was expected.
-Last re-checked against olang 374c1e3c (2026-11-15); the files were brought to that syntax (`olang fix`, then by hand
-where the library changed) so each builds or fails as its header says.
+Last re-checked against olang 3b47ad852 (2026-11-21): of the bugs, only `tempref` still reproduces; `fieldname` is a
+deliberate rule. The fixed files are kept as regression cases.
 
 | file | status | why |
 |---|---|---|
 | `fieldname.olang` | reproduces | D3a: a constructor field may not share a function's name in its module. A deliberate rule, kept as a record of the friction |
-| `joinparen.olang` | reproduces | E13b: `$alpha (" x")` calls what was rendered. The rule is deliberate, but the message is now `E13b: F64 is not a function`, not the E11b that named the way out (`$(...)`) - worth restoring |
-| `lambdacapture.olang` | reproduces (new) | O17: a value captured by a lambda and lent to a callee that only reads it (building a local struct holding the read-only parameter) is "the callee can store through it"; the same call outside the lambda is accepted |
-| `nullmigrate.olang` | reproduces (new) | `olang fix` crashes in `tools/null_migrate.olang:162` (slice bounds out of range) on a T2c error reported inside a generic's instance; the tools after it do not run |
+| `joinparen.olang` | fixed (message) | E13b's rule stays deliberate; the message is E11b again ("'(' after a piece of text calls it"), naming the way out |
+| `lambdacapture.olang` | fixed | builds and prints 0 twice (2026-11-21) |
+| `nullmigrate.olang` | fixed | `olang fix` no longer crashes: it leaves the T2c it cannot place to be fixed by hand and names it (2026-11-21) |
 | `fieldofresult.olang` | fixed | builds and prints ok: region inference (QCB) replaced the O10d refusal. Kept as a regression case |
 | `membercascade.olang` | fixed | one error, `S has no member 'flag'`, no second one |
 | `nestedtry.olang` | no longer a limitation | a `try` takes the whole expression after it (E24): `try entry["shape"].AsArr() catch { ... }` covers the lookup and the conversion with one clause. The old nested form still gets R9, as the spec says |
-| `variadicat.olang` | reproduces (new) | E31: a variadic `At(idx ...I64)` is the operator for one index only; `x[i, j]` is an error. An N-d tensor (rank known at run time) cannot declare `t[i, j]` for every rank |
-| `traittype.olang` | reproduces (new) | a trait method's signature naming a type not in scope (its module not imported) is not reported; a generic calling it through `any` then fails in lowering ("an unknown type ... a local"). Expected M22 at the trait |
-| `colfields.olang` | reproduces (new) | `Columns<C>.Fields` is empty when C's fields are lower case, even in C's own module, so a generic cannot reach a column by reflection; capitalized fields work (dyn's cells are capitalized for it) |
-| `genref.olang` | fixed | D18c/T22a: a method generator yielding an enum read from the receiver's Vec is refused once the enum has a case holding a reference (`any Update&`), whatever case is yielded; `.Copy()` does not help. dyn's `System.Rules` was one (now `AttachedAt`) |
+| `variadicat.olang` | fixed | `x[1, 1]` calls a variadic At with two indices; its test passes (2026-11-21) |
+| `traittype.olang` | fixed | T2 "unknown type 'Tensor'" at the trait's signature (2026-11-21) |
+| `colfields.olang` | fixed | `Columns<C>.Fields` holds lower-case fields in C's own module: the generic clears them, prints 0 (2026-11-21) |
+| `genref.olang` | fixed | the generator builds and prints 1 (olang HoldingGenerator) |
 | `tempref.olang` | reproduces (new) | a temporary passed to a `&` parameter of a function whose result copies it into a struct also holding a reference, that result itself a temporary passed by reference, is built in the referent's scope at every call: resident memory grows without bound. ad/graph took tensors by value to avoid it |
 | `allocfacts.olang` | fixed | both asserts hold on olang master of 2026-11-15 (G42 counts running ways only, a fixed array in place is no allocation). Kept as a regression case |
 | `methodfacts.olang` | fixed | `Box<I64>.Fill.Allocates` is read (ad/graph pins `Graph<F32>.Forward.Allocates` directly). Kept as a regression case |
-| `tempfacts.olang` | reproduces (new) | G42 counts a method called on a call's value (`Sh.Make(n).Count()`, a temporary lent to a `&` receiver or parameter) as allocating, while the same value in a local first does not. Pinning the training step meant binding every such temporary to a local (ad/ops, ad/graph, kernels/attention, dyn/settle) |
-| `reassignfacts.olang` | reproduces (new) | G42 counts a struct local reassigned from a view of itself (`u = u.Inner()`) as allocating, a new local from the same view not. ad/ops's `storageOf` is unrolled for it |
+| `tempfacts.olang` | fixed | both asserts hold (2026-11-21); the locals bound for it in ad/, kernels/ and dyn/ may go |
+| `reassignfacts.olang` | fixed | both asserts hold (2026-11-21) |
 | `tryindex.olang` | fixed | builds and runs: `try` no longer makes an array index inside its operand a checked one (indexing is unchecked, `try a.Get(i)` the checked form) |
-| `learnerarg.olang` | reproduces (new) | C2d: a struct of another module holding a reference parameter (dyn/learn's `Learner`, dyn/bridge's `Bridge`), made inside a function from that function's reference parameter, "would outlive" the argument, though it is a local dropped there; the same struct copied into the root module builds. dyn/bridge's tests build the system inside the helper instead |
-| `factcascade.olang` | reproduces (new) | any other error in a program (an unused import here) makes every `assert not f.Allocates` (S17a, G42) read false: 36 spurious S17a errors from dyn/ and nn/optim behind one unneeded `try` while writing models/hybrid |
+| `learnerarg.olang` | fixed | builds and prints nothing (2026-11-21) |
+| `factcascade.olang` | fixed | with an unused import added, the M5a error alone (2026-11-21) |
 | `crossinline.olang` | fixed | a program past ThinFrom (8 MB of IR) links by ThinLTO, which neither inlines a body over ImportLimit instructions from another object nor vectorizes again: gemm 16 x 16 x 11 in F64 is 2.2x slower in a program that also imports ad/graph, and elem's activations called fastExp64 per element (6x slower) until they got array-wide forms. Found by bench/smallgraph |
-| `vnnitile.olang` | reproduces (new) | a packed INT8 micro-kernel in the VNNI layout (four adjacent products a lane, summed into I32) builds to vpmaddwd on widened bytes, never vpdpbusd: LLVM forms it only from a reduction to one value (LaneDot). GemmI8 takes padded dot products instead (kernels/gemm `dots`), each closed by a horizontal sum, and shallow products (the CNN's depth 9 and 144) keep the 16-product path
+| `joinleak.olang` | fixed | 200 000 joins of two tasks grow the resident set by 92 pages (about 2 bytes a join; 110 before) |
+| `spawnleak.olang` | fixed | 100 000 joins grow it by 7 pages |
+| `condnull.olang` | fixed | builds and prints 3 |
+| `vnnitile.olang` | fixed | olang's grouped lane total (E39's `Sum<A>(n)`) builds the VNNI row to vpdpbusd; kernels/gemm's INT8 dots use it |
 
 
 The `Status` line in each file's header repeats the row.
