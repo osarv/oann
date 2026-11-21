@@ -1879,3 +1879,15 @@ product. Two integer forms (I32 lanes times the bit tables; then mask tables, AN
 F32 lanes on this CPU (their loops did not vectorize as well); held as F32, the integers' sums are exact up to 2^24 (132k
 columns), so it runs MatVec's lanes: bench/ternary, one thread, us - 1024^2 126.5 (F32 activations 131.5, F32 Gemv
 133), 2048^2 499 (497, 556), 4096^2 1998 (2003, 2314).
+
+## Sparse settles from adjacency lists, and Langevin steps (wt-sparsesettle, 2026-11-21)
+
+`message.Edges.SetAdjacency(adj, graphs, n)`: a batch's edges straight from per-node adjacency lists - no n x n matrix
+read (SetDense's cost): 8 graphs of 256 nodes 796 -> 38 us, of 2048 nodes 59.4 -> 0.29 ms (205x); tested equal to
+SetDense's edges. With it a settle over sparse graphs is `g.Custom(message.Passing(edges, Agg.Sum), z)` in place of
+`g.MatMul(A, z)` and `edges.SetAdjacency(...)` each batch, the whole step then costing its edges (bench/graphsettle:
+2048 nodes x 8, 110 -> 5.8 ms a step).
+
+ad/descent: `Temperature` and `Cooling` - Langevin steps, Gaussian noise of variance 2 rate T after every settle step,
+T multiplied by Cooling each step (annealing). Tested on E = |x|^2 / 2: each element's variance at a fixed T within
+20% of the discretized chain's T / (1 - rate / 2), and cooling at 0.99 returns the state to the minimum.

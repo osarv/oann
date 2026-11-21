@@ -80,6 +80,26 @@ fn (e mut Edges&) SetDense(adj Array<F32>&, graphs I64, n I64) {
     e.Count = k
 }
 
+# the edges of a batch of graphs given as adjacency lists: graphs of n nodes each, adj[q n + v] graph q's node v's
+# neighbours (0 .. n - 1 within its graph), each an edge u -> v of weight 1 (an undirected graph lists each pair both
+# ways). No n x n matrix is read, so a batch costs its edges. Allocates nothing; the edges must fit the room made
+fn (e mut Edges&) SetAdjacency(adj Array<Vec<I64>>&, graphs I64, n I64) {
+    if graphs * n != e.Nodes: unreachable "message.Edges.SetAdjacency: " + $graphs + " graphs of " + $n + " nodes and room for " + $e.Nodes
+    k I64 = 0
+    for row in range e.Nodes {
+        e.ptr[row] = k
+        base := row / n * n
+        for u in adj[row] {
+            if k >= e.src.Len(): unreachable "message.Edges.SetAdjacency: more edges than the room for " + $e.src.Len()
+            e.src[k] = I32(base + u)
+            e.val[k] = 1.0
+            k += 1
+        }
+    }
+    e.ptr[e.Nodes] = k
+    e.Count = k
+}
+
 # node v's in-degree
 fn (e Edges&) Degree(v I64) I64 { return e.ptr[v + 1] - e.ptr[v] }
 
@@ -166,6 +186,7 @@ fn (l Layer&) Apply(g mut graph.Graph<F32>&, p mut Passing&, x graph.Var) graph.
 }
 
 assert not Edges.Set.Allocates, "setting a batch's edges allocates"
+assert not Edges.SetAdjacency.Allocates, "setting a batch's edges from adjacency lists allocates"
 assert not Edges.SetDense.Allocates, "setting a batch's edges from dense matrices allocates"
 assert not Passing.Forward.Allocates, "message passing allocates"
 assert not Passing.Backward.Allocates, "message passing's backward allocates"
@@ -271,3 +292,28 @@ test Edges.SetDense "edges from dense batched adjacency: Agg.Sum is the batched 
     }
 }
 
+
+test Edges.SetAdjacency "adjacency lists give the edges dense matrices give, for a batch of graphs" {
+    r := rand.Rand(6)
+    graphs, n := 3, 5
+    adj := Array<Vec<I64>>(graphs * n)
+    dense := Array<F32>(graphs * n * n)
+    for q in range graphs {
+        for v in range n {
+            for u in range n {
+                if u == v or r.Below(3) != 0: continue
+                adj[q * n + v].Push(u)
+                dense[(q * n + v) * n + u] = 1.0
+            }
+        }
+    }
+    a, b := Edges(graphs * n, 64), Edges(graphs * n, 64)
+    a.SetAdjacency(adj, graphs, n)
+    b.SetDense(dense, graphs, n)
+    x := Array<F32>(graphs * n * 2)
+    for i in range x.Len(): x[i] = F32(r.Uniform(-1.0, 1.0))
+    ya, yb := Array<F32>(x.Len()), Array<F32>(x.Len())
+    a.Spread(ya, x, 2, Agg.Sum)
+    b.Spread(yb, x, 2, Agg.Sum)
+    assert a.Count == b.Count and ya == yb
+}

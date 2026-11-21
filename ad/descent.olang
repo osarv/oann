@@ -68,7 +68,11 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     Jitter F64 = 0.0                # above 0: after every settle step each state element moves by uniform noise in
                                     # [-Jitter, Jitter] (a quantizer's error at training time; Unrolled treats it as a
                                     # constant, straight through). 0: no noise, the settle unchanged
-    jit U64 = U64(0x9E3779B97F4A7C15)   # the jitter's generator (xorshift)
+    Temperature F64 = 0.0           # above 0: Langevin steps - after every settle step each state element moves by
+                                    # Gaussian noise of variance 2 rate T, T starting at Temperature and multiplied by
+                                    # Cooling every step (annealing); a sample of exp(-E / T) at a fixed T. 0: none
+    Cooling F64 = 1.0
+    jit U64 = U64(0x9E3779B97F4A7C15)   # the jitter's and the Langevin noise's generator (xorshift)
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
     RowEnergy graph.Var = graph.None    # Margin: a node of the energy row by row (Batch values summing to E), kept
@@ -225,16 +229,29 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
         }
         for i in range d.n: d.x[i] -= rate * d.gx[i]
         if d.Jitter > 0.0 {
-            for i in range d.n {
-                d.jit ^= d.jit << 13
-                d.jit ^= d.jit >> 7
-                d.jit ^= d.jit << 17
-                d.x[i] += d.Jitter * (2.0 * F64(d.jit >> 11) / 9007199254740992.0 - 1.0)
-            }
+            for i in range d.n: d.x[i] += d.Jitter * (2.0 * d.uniform() - 1.0)
+        }
+        if d.Temperature > 0.0 {
+            sd := (2.0 * rate * d.Temperature * d.Cooling.Pow(F64(k))).Sqrt()
+            for i in range d.n: d.x[i] += sd * d.gauss()
         }
         if d.Sphere > 0: d.project()
     }
     return out
+}
+
+# the noise generator's next uniform in (0, 1)
+fn (d mut Descent<T>&) uniform() F64 {
+    d.jit ^= d.jit << 13
+    d.jit ^= d.jit >> 7
+    d.jit ^= d.jit << 17
+    return (F64(d.jit >> 11) + 0.5) / 9007199254740992.0
+}
+
+# a standard normal (Box-Muller)
+fn (d mut Descent<T>&) gauss() F64 {
+    u, v := d.uniform(), d.uniform()
+    return (-2.0 * u.Log()).Sqrt() * (6.283185307179586 * v).Cos()
 }
 
 # every group of Sphere elements of d.x scaled to unit RMS
@@ -752,4 +769,30 @@ test Descent.AddMargin "the settled-pair margin: two settles, the right one judg
         steps++
     }
     assert d.Active == 0 and steps < 500, $steps + " steps"
+}
+
+test Descent.Settle "Langevin steps sample exp(-E / T): on E = |x|^2 / 2 each element's variance is about T, and cooling brings the state back to the minimum" {
+    g := graph.Graph<F64>(1)
+    x := g.Input(400)
+    g.Watch(x)
+    e := g.Scale(summed(g, g.Mul(x, x)), 0.5)
+    g.Keep(e)
+    g.Plan(rand.Rand(3))!
+    d := Descent<F64>(g, x, e, e)
+    d.Rate = 0.05
+    d.Tol = 0.0
+    d.Steps = 2000
+    d.Temperature = 0.1
+    d.Settle()
+    s := g.Value(x).Flat()!
+    sq F64 = 0.0
+    for i in range 400: sq += s[i] * s[i]
+    variance := sq / 400.0
+    # the discretized chain's variance is T / (1 - rate / 2)
+    assert (variance / (0.1 / 0.975) - 1.0).Abs() < 0.2, $variance
+    d.Cooling = 0.99
+    d.Settle()
+    sq = 0.0
+    for i in range 400: sq += s[i] * s[i]
+    assert sq / 400.0 < 1e-3, $(sq / 400.0)
 }
