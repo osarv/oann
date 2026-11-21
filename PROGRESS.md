@@ -1891,3 +1891,8 @@ SetDense's edges. With it a settle over sparse graphs is `g.Custom(message.Passi
 ad/descent: `Temperature` and `Cooling` - Langevin steps, Gaussian noise of variance 2 rate T after every settle step,
 T multiplied by Cooling each step (annealing). Tested on E = |x|^2 / 2: each element's variance at a fixed T within
 20% of the discretized chain's T / (1 - rate / 2), and cooling at 0.99 returns the state to the minimum.
+
+`potts.Fitter`: pseudolikelihood fitting by Adam - Add each example of a batch (graph, features, known answer), Step
+(the batch's mean gradient, W kept symmetric). Tested: from planted 3-colourings (4 graphs of 60 cells a step, 150
+steps) the loss falls below 0.7 of its start and the fitted energy's chains find a proper colouring of a new graph of
+120 cells.

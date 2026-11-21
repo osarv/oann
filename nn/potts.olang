@@ -110,6 +110,55 @@ fn Symmetric(gw mut Array<F64>&, k I64) {
     }
 }
 
+# pseudolikelihood fitting by Adam: Add each example of a batch (a graph, its cells' features, a known answer), then
+# Step - the mean gradient over the batch's cells taken, W's made symmetric where Symmetrize, one Adam step at rate;
+# Loss the batch's mean negative log-pseudolikelihood a cell
+type Fitter struct(m mut Potts&) {
+    M mut Potts& = m
+    Symmetrize Bool = true
+    Loss F64 = 0.0
+    Steps I64 = 0
+    gw mut Array<F64>& = Array<F64>(m.K * m.K)
+    gb mut Array<F64>& = Array<F64>(m.Features * m.K)
+    mw mut Array<F64>& = Array<F64>(m.K * m.K)
+    vw mut Array<F64>& = Array<F64>(m.K * m.K)
+    mb mut Array<F64>& = Array<F64>(m.Features * m.K)
+    vb mut Array<F64>& = Array<F64>(m.Features * m.K)
+    L mut Array<F64>& = Array<F64>(m.K)
+    nll F64 = 0.0
+    cells I64 = 0
+}
+
+fn (t mut Fitter&) Add(e message.Edges&, f Array<F64>&, y Array<I32>&) {
+    t.nll += t.M.PseudoGrad(e, f, y, t.gw, t.gb, t.L)
+    t.cells += e.Nodes
+}
+
+fn (t mut Fitter&) Step(rate F64) F64 {
+    if t.cells == 0: return 0.0
+    if t.Symmetrize: Symmetric(t.gw, t.M.K)
+    t.Steps++
+    n := F64(t.cells)
+    adam(t.M.W, t.gw, t.mw, t.vw, n, rate, t.Steps)
+    adam(t.M.B, t.gb, t.mb, t.vb, n, rate, t.Steps)
+    t.Loss = t.nll / n
+    t.nll, t.cells = 0.0, 0
+    return t.Loss
+}
+
+# one Adam step on p from the summed gradient g over n cells (g cleared)
+fn adam(p mut Array<F64>&, g mut Array<F64>&, m mut Array<F64>&, v mut Array<F64>&, n F64, rate F64, step I64) {
+    c1 := 1.0 - 0.9.Pow(F64(step))
+    c2 := 1.0 - 0.999.Pow(F64(step))
+    for i in range p.Len() {
+        gi := g[i] / n
+        m[i] = 0.9 * m[i] + 0.1 * gi
+        v[i] = 0.999 * v[i] + 0.001 * gi * gi
+        p[i] -= rate * (m[i] / c1) / ((v[i] / c2).Sqrt() + 1e-8)
+        g[i] = 0.0
+    }
+}
+
 # how a search anneals: Sweeps sweeps at T falling geometrically from T0 to T1, then zero-temperature sweeps until
 # no cell moves (at most Polish); a chain stops once a sweep at T <= Tstop moves nothing
 type Schedule struct(Sweeps I64 = 200, T0 F64 = 2.0, T1 F64 = 0.05, Tstop F64 = 0.1, Polish I64 = 50) {
@@ -564,4 +613,26 @@ test Sampler.Langevin "the relaxed annealed search reaches a colouring with few 
     best := s.Best()
     assert s.Energies[best] <= 2.0, "best energy " + $s.Energies[best]
     assert s.Energies[best] == m.Energy(e, f, s.X, best * 60)
+}
+
+test Fitter "pseudolikelihood fitting learns the colouring rule from planted answers: the fitted energy's chains find proper colourings" {
+    r := rand.Rand(12)
+    m := Potts(3, 1)
+    t := Fitter(m)
+    first F64 = 0.0
+    for step in range 150 {
+        for _ in range 4 {
+            e, y := planted(60, 3, 2, r)
+            t.Add(e, Array<F64>(60), y)
+        }
+        loss := t.Step(0.05)
+        if step == 0: first = loss
+    }
+    assert t.Loss < 0.7 * first, $first + " -> " + $t.Loss
+    e, _ := planted(120, 3, 2, r)
+    s := Sampler(120, 16, 3)
+    s.Colour(e)
+    s.Start(r)
+    s.Anneal(m, e, Array<F64>(120), Schedule(300, 2.0, 0.05))
+    assert Potts.Colouring(3).Energy(e, Array<F64>(120), s.X, s.Best() * 120) == 0.0
 }
