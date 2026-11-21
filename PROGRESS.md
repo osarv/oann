@@ -1937,3 +1937,10 @@ sweep run on one thread keeps its larger products. A row's sums do not depend on
 every thread count). bench/sweep, 4 threads, us a sweep (two runs each, the machine noisy to about 25%): H 1024, B 128
 2056-2554 (1 thread) -> 845-861 (4 threads, was about 2200); H 256, B 128 189 -> 148; B 8 and 32 even with one thread
 (they were up to 1.5x slower).
+
+## Deep supervision in ad/descent (wt-deepsup, 2026-11-21)
+
+An experiment had forked ad/descent for two additions; both are here now, so the fork can go. `Descent.Ds`: Unrolled(h)
+with deep supervision - each unrolled step's state adds Ds C(x) to the cost differentiated, the gradient of C(x_T) +
+Ds (C(x_T-1) + ... + C(x_T-h)) (tested against central differences of that sum over a 12-step settle). The fork's
+Gaussian jitter of sd s after each step is `Temperature` = s^2 / (2 Rate) (Langevin steps, above).

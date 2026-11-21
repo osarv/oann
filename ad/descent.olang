@@ -72,6 +72,8 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
                                     # Gaussian noise of variance 2 rate T, T starting at Temperature and multiplied by
                                     # Cooling every step (annealing); a sample of exp(-E / T) at a fixed T. 0: none
     Cooling F64 = 1.0
+    Ds F64 = 0.0                    # Unrolled's deep supervision: each unrolled step's state adds Ds C(x) to the cost
+                                    # differentiated - the gradient of C(x_T) + Ds (C(x_T-1) + ... + C(x_T-h)). 0: none
     jit U64 = U64(0x9E3779B97F4A7C15)   # the jitter's and the Langevin noise's generator (xorshift)
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
@@ -343,6 +345,10 @@ fn (d mut Descent<T>&) unrolled(h I64) {
         d.along(d.res, d.lam)
         for i in range d.p: d.acc[i] -= d.Rate * d.mv[i]
         for i in range d.n: d.lam[i] -= d.Rate * d.hv[i]
+        if d.Ds > 0.0 {
+            d.costGrad(d.res, d.cx)
+            for i in range d.n: d.lam[i] += d.Ds * d.cx[i]
+        }
     }
 }
 
@@ -795,4 +801,34 @@ test Descent.Settle "Langevin steps sample exp(-E / T): on E = |x|^2 / 2 each el
     sq = 0.0
     for i in range 400: sq += s[i] * s[i]
     assert sq / 400.0 < 1e-3, $(sq / 400.0)
+}
+
+test Descent.Train "deep supervision: Unrolled with Ds is the gradient of the last state's cost plus Ds times each unrolled state's" {
+    g, x, e, c := convex(0.4)
+    d := Descent<F64>(g, x, e, c)
+    d.Rate = 0.2
+    d.Tol = 0.0
+    n := 12
+    d.Steps = n
+    d.Ds = 0.5
+    got := gradOf(d, Trainer.Unrolled(n))
+    ps := g.Params().Flat()!
+    h := 1e-5
+    for i in range ps.Len() {
+        old := ps[i]
+        js := Array<F64>(2)
+        for side in range 2 {
+            ps[i] = old + (h if side == 0 else -h)
+            total F64 = 0.0
+            for t in range n + 1 {
+                d.Steps = t
+                total += costAt(d) * (1.0 if t == n else d.Ds)
+            }
+            js[side] = total
+        }
+        ps[i] = old
+        d.Steps = n
+        want := (js[0] - js[1]) / (2.0 * h)
+        assert (got[i] - want).Abs() < 1e-5 * (1.0 + want.Abs()), $i + ": " + $got[i] + " against " + $want
+    }
 }
