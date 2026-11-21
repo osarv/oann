@@ -1752,3 +1752,18 @@ step being a Forward and a state-only Backward. bench/graphsettle, one thread, u
 rows, and those settles have many rows (nodes x batch); dyn's large gain came from sweeps of 8 rows and from merging
 W^T + W. The step's cost there is the thin per-node products (k 16, n 32: about 26 GMAC/s) and the elementwise
 operations, not the weights' packing. Reverted.
+
+## Subnormals flushed at start-up, a fast exact GELU (wt-ftzgelu, 2026-11-21)
+
+kernels/fpmode: `FlushDenormals` sets x86's flush-to-zero and denormals-are-zero (MXCSR, through a ten-line C file);
+`Graph.Plan`, `Graph.PlanBaked` and `System.Plan` run `fpmode.Startup()`, which flushes unless `fpmode.KeepSubnormals`
+was set first. The mode is per thread and olang's task workers are made at the first spawns that need them, taking
+the mode of the thread that makes them - so a plan, made before a program's tasks, covers them (checked: four tasks
+spawned after it all flush). A loop decaying toward zero through the subnormal range: 1.62 -> 0.06 ns an element
+(27x). The suite is unchanged (413 passed).
+
+The exact GELU (`mat.Act.Gelu`, x Phi(x)) read the C library's erfc, a call an element that blocks vectorizing: 8.5 ns
+an element in F32 against 0.66 for the tanh form. `elem.FastErfc` is Numerical Recipes' erfcc (t exp(-z^2 + a degree-9
+polynomial in t), relative error below 1.2e-7) on FastExp in F32 - within 1e-6 of the library's erfc in F64 for |z| <=
+2, the error growing as z^2 beyond (exp(-z^2) of a rounded z, where GELU reads x times a number below 1e-3) - and the
+library's erfc still in F64. GELU and its slope use it: 8.5 -> 1.5 ns an element.

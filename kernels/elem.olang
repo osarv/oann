@@ -180,7 +180,25 @@ fn softplus<A Float>(x A) A {
 
 # GELU exactly: x Phi(x) = x erfc(-x / sqrt(2)) / 2, the library's erfc, accurate for negative x as 1 + erf is not
 fn geluExact<A Float>(x A) A {
-    return 0.5 * x * (-x * 0.7071067811865476).Erfc()
+    return 0.5 * x * FastErfc(-x * 0.7071067811865476)
+}
+
+# erfc(z): the C library's in F64; in F32 Numerical Recipes' erfcc - t exp(-z^2 + a polynomial in t), t = 1 / (1 +
+# |z| / 2), relative error below 1.2e-7 for every z (Press et al., 6.2) - on FastExp, so a loop of it vectorizes
+# (GELU in F32: 8.5 -> 1.5 ns an element). In F32 the error grows as z^2 past |z| 2 (exp(-z^2) of a rounded z): what
+# GELU reads there is x times a number below 1e-3, so its absolute error stays below F32's rounding of 1
+fn FastErfc<T Float>(z T) T {
+    match T {
+        case F64: return z.Erfc()
+        case F16: return F16(FastErfc(F32(z)))
+        case BF16: return BF16(FastErfc(F32(z)))
+        case _ { }
+    }
+    a := z.Abs()
+    t := 1.0 / (1.0 + 0.5 * a)
+    p := -1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))))
+    r := t * FastExp(p - a * a)
+    return r if z >= 0.0 else 2.0 - r
 }
 
 # act(x)
@@ -212,8 +230,8 @@ fn Slope<A Float>(x A, a mat.Act) A {
 }
 
 fn geluExactSlope<A Float>(x A) A {
-    cdf A = 0.5 * (-x * 0.7071067811865476).Erfc()
-    pdf A = 0.3989422804014327 * (-0.5 * x * x).Exp()
+    cdf A = 0.5 * FastErfc(-x * 0.7071067811865476)
+    pdf A = 0.3989422804014327 * FastExp(-0.5 * x * x)
     return cdf + x * pdf
 }
 
@@ -843,6 +861,18 @@ test FastTanh "stays within 2.0e-7 (F32) and 3.0e-16 (F64) of the C library's ta
     assert s32 <= 1.0e-7, "sigmoid F32 " + $s32
     assert s64 <= 2.5e-16, "sigmoid F64 " + $s64
     assert FastTanh(F32(100.0)) == 1.0 and FastTanh(F32(-100.0)) == -1.0 and FastTanh(F32(-0.0)).Bits() == F32(-0.0).Bits()
+}
+
+test FastErfc "F32 within 1e-6 relative to the C library's erfc in F64 for |z| <= 2, and 1e-6 z^2 beyond to |z| 9 (exp(-z^2) of an F32 z)" {
+    worst, far := 0.0, 0.0
+    for i in range 18001 {
+        z := -9.0 + 0.001 * F64(i)
+        want := z.Erfc()
+        e := (F64(FastErfc(F32(z))) - want).Abs() / want
+        if z.Abs() <= 2.0: worst = worst.Max(e)
+        else: far = far.Max(e / (z * z))
+    }
+    assert worst < 1e-6 and far < 1e-6, $worst + " " + $far
 }
 
 test FastGeluTanh "stays within 1.5e-7 (F32) and 5e-16 (F64) times max(1, |x|) of the tanh formula in F64, |x| <= 10" {

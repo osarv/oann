@@ -1,0 +1,34 @@
+# kernels/fpmode - how the CPU treats subnormal floats. A subnormal operand or result (|x| below 1.2e-38 in F32) takes
+# a slow path in the FPU's microcode, often 100 cycles a multiply-add: a settle relaxing toward zero, a decaying trace
+# or a long product of gates runs into them and slows by an order of magnitude with no change to any result that
+# matters. FlushDenormals sets flush-to-zero and denormals-are-zero (x86's MXCSR FTZ and DAZ): subnormal results are
+# written as zero and subnormal operands read as zero. It holds for the thread that calls it and for the threads
+# started after it (olang's task workers are made at the first spawns that need them, and take the mode of the thread
+# that makes them); workers already running keep theirs - so call it first thing in main. Off by default, as C's and
+# olang's arithmetic are.
+
+import fp "fpmode.c"
+import "std/os"
+
+# set before a graph or a system is planned to keep subnormals computed exactly: Plan otherwise flushes them (Startup)
+KeepSubnormals Bool = false
+
+# what Graph.Plan and System.Plan run first: subnormals flushed unless KeepSubnormals - a plan is where a program's
+# heavy work starts, before its tasks' workers exist, so they inherit it
+fn Startup() {
+    if not KeepSubnormals: FlushDenormals()
+}
+
+# subnormals flushed to zero (on) or computed exactly (off); whether the target has the switch (x86 does)
+fn FlushDenormals(on Bool = true) Bool { return fp.oann_flush_denormals(1 if on else 0) != 0 }
+
+# whether subnormals are flushed on this thread
+fn Flushing() Bool { return fp.oann_flushing() != 0 }
+
+test FlushDenormals "a subnormal result is flushed to zero, and kept again once switched off" {
+    if not FlushDenormals(): return
+    small := F32(os.Args().Len()) * F32(1.0e-30)       # read at run time, never folded while compiling
+    assert small * F32(1.0e-10) == F32(0.0)
+    FlushDenormals(false)
+    assert small * F32(3.0e-10) != F32(0.0) and not Flushing()      # another product: one computed before the switch may be reused
+}
