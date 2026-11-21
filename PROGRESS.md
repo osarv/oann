@@ -1625,3 +1625,13 @@ step of the models it is used on. Its three products a step (G = x x^T, b G + c 
 with the workspace in NsWork: 128 x 128 0.60 ms (28x), 512 x 128 1.78 ms (38x), 128 x 512 1.55 ms (39x), 512 x 512 27 ms
 (50x), 1024 x 256 13 ms (35x), one thread. Muon's tests hold; a step of Muon and an Ema update and swap are now pinned
 allocation-free (`assert not ... .Allocates`), beside AdamW's and Sgd's.
+
+## Softmax rows: the maximum in lanes (wt-softmax, 2026-11-21)
+
+A softmax row's running maximum ("v if v > top else top", one chain) is left scalar by the vectorizer and was most of
+a row's cost: 1.4-2.2 ns an element against 0.5 for the exponentials beside it. `elem.MaxIn` keeps sixteen lanes and
+folds them (the same value, NaNs as before), and SoftmaxRun / SoftmaxRunTo use it: a row of 64 0.74 ns an element (was
+1.41), of 256 0.59 (was 1.91), bit for bit. Inside attention (4 heads, D 128, 1024 rows, causal): the softmax at context
+64 364 -> 262 us, at 256 1278 -> 527 us; bench/lm's attention forward 4.0-4.4 -> 3.7-4.2 ms (its causal rows at context
+64 average 32 elements, where little is gained). The products of attention at small context (15-24 GMAC/s, tiny batched
+matrices) are what is left there.

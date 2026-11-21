@@ -437,6 +437,29 @@ fn total8<A>(v Array<A>&) A {
     return g[0] + g[1]
 }
 
+# the largest of x[from + i] for i < n (n > 0), in A: a NaN never replaces a number, and a NaN first stays (as a
+# running "v if v > top else top" from x[from] gives it). Sixteen lanes at a time - a running maximum
+# is a chain the vectorizer leaves scalar - which made a softmax row 1.7-3x faster
+fn MaxIn<S, A>(x Array<S>&, from I64, n I64) A {
+    top A = A(x[from])
+    whole I64 = n - n % 16
+    if whole > 0 {
+        lanes := Array<A>(16, top)
+        for i in range 0, whole, 16 {
+            for j in range 16 {
+                v A = A(x[from + i + j])
+                lanes[j] = v if v > lanes[j] else lanes[j]
+            }
+        }
+        for j in range 16: top = lanes[j] if lanes[j] > top else top
+    }
+    for j in range whole, n {
+        v A = A(x[from + j])
+        top = v if v > top else top
+    }
+    return top
+}
+
 # the sum of x[from + i] for i < n, in A
 fn SumIn<S, A>(x Array<S>&, from I64, n I64) A {
     acc := Array<A>(8)
@@ -506,11 +529,7 @@ fn Axpy<T>(y mut Array<T>&, yf I64, alpha T, x Array<T>&, xf I64, n I64) {
 # the check fails and the scalar loop runs, three times as slowly)
 fn SoftmaxRun<S, A>(row mut Array<S>&, from I64, n I64, inv A) {
     if n == 0: return
-    top A = A(row[from])
-    for j in range 1, n {
-        v A = A(row[from + j])
-        top = v if v > top else top
-    }
+    top A = MaxIn<S, A>(row, from, n)
     for j in range n: row[from + j] = S(FastExp((A(row[from + j]) - top) * inv))
     softmaxScale<S, A>(row, from, n)
 }
@@ -518,11 +537,7 @@ fn SoftmaxRun<S, A>(row mut Array<S>&, from I64, n I64, inv A) {
 # the same from src to dst, which must not overlap src (or be it, slowly): row r of a Mat softmax with a destination
 fn SoftmaxRunTo<S, A>(dst mut Array<S>&, d I64, src Array<S>&, s I64, n I64, inv A) {
     if n == 0: return
-    top A = A(src[s])
-    for j in range 1, n {
-        v A = A(src[s + j])
-        top = v if v > top else top
-    }
+    top A = MaxIn<S, A>(src, s, n)
     for j in range n: dst[d + j] = S(FastExp((A(src[s + j]) - top) * inv))
     softmaxScale<S, A>(dst, d, n)
 }
