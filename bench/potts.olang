@@ -1,7 +1,9 @@
-# nn/potts: annealed chromatic Gibbs over many chains on planted 3-colourable graphs (each cell joined to 3 others),
-# the colouring energy: ms a search, sweeps a chain, the share of searches whose best chain is a proper colouring, at
-# 1 and 4 threads. From the repository's root:
-#     make pottsbench ARGS="chains sweeps"    (32 300)
+# nn/potts: multi-chain annealed chromatic Gibbs and the pseudolikelihood fit, timed. Two problems: Sudoku (81 cells of
+# 9 values, each joined to its 20 peers, 30 clues given as unary features of a planted grid; the energy the rule's:
+# equal peers cost 1, a clue's other values 2) and colouring (planted 3-colourable graphs of 256 to 2048 cells, each
+# joined to 3 others). Per case: ms a search, ns a cell update (one cell drawn once in one chain), the share of searches
+# whose best chain has energy 0, and the fit's ns a cell (PseudoGrad at the planted answer). From the repository's root:
+#     make pottsbench ARGS="chains sweeps threads"    (32 300 1)
 
 import "std/io"
 import "std/os"
@@ -14,33 +16,39 @@ fn main() ? io.Error, ParseError {
     args := os.Args()
     chains := try args[1].ParseInt() if args.Len() > 1 else 32
     sweeps := try args[2].ParseInt() if args.Len() > 2 else 300
-    m := potts.Potts.Colouring(3)
-    try io.PutLn("cells | threads | ms a search | sweeps a chain | solved")
-    for n in Array<I64>[256, 1024, 2048] {
-        for threads in Array<I64>[1, 4] {
-            r := rand.Rand(1)
-            solved, total, swept := 0, 0.0, 0.0
-            for _ in range 4 {
-                e := graph(n, r)
-                f := Array<F64>(n)
-                s := potts.Sampler(n, chains, 3, threads)
-                s.Colour(e)
-                s.Start(r)
-                t0 := time.Now()
-                s.Anneal(m, e, f, potts.Schedule(sweeps, 2.0, 0.05))
-                total += F64(time.Since(t0)) * 1e-6
-                for c in range chains: swept += F64(s.Sweeps[c])
-                if s.Energies[s.Best()] == 0.0: solved += 1
-            }
-            try io.PutLn($n + " | " + $threads + " | " + $(total / 4.0).Fixed(1) + " | " + $(swept / F64(4 * chains)).Fixed(0) + " | " + $solved + "/4")
-        }
-    }
+    threads := try args[3].ParseInt() if args.Len() > 3 else 1
+    try io.PutLn("case | ms a search | ns a cell update | solved | fit ns a cell")
+    r := rand.Rand(1)
+    try run("sudoku 81 x 9", 81, 9, chains, sweeps, threads, r, true)
+    for n in Array<I64>[256, 1024, 2048]: try run("colouring " + $n + " x 3", n, 3, chains, sweeps, threads, r, false)
 }
 
-# a planted 3-colourable graph: each cell joined to 3 others of another colour, both ways
-fn graph(n I64, r mut rand.Rand&) message.Edges {
-    colour := Array<I64>(n)
-    for i in range n: colour[i] = r.Below(3)
+fn run(name String&, n I64, k I64, chains I64, sweeps I64, threads I64, r mut rand.Rand&, sudoku Bool) ? io.Error {
+    rounds := 8
+    total, updates, fit := 0.0, 0.0, 0.0
+    solved := 0
+    for _ in range rounds {
+        e, y, f, m := sudokuCase(r) if sudoku else colourCase(n, r)
+        s := potts.Sampler(n, chains, k, threads)
+        s.Colour(e)
+        s.Start(r)
+        t0 := time.Now()
+        s.Anneal(m, e, f, potts.Schedule(sweeps, 2.0, 0.05))
+        total += F64(time.Since(t0)) * 1e-6
+        for c in range chains: updates += F64(s.Sweeps[c] * n)
+        if s.Energies[s.Best()] == 0.0: solved += 1
+        gw, gb, L := Array<F64>(k * k), Array<F64>(m.Features * k), Array<F64>(k)
+        t1 := time.Now()
+        for _ in range 20: m.PseudoGrad(e, f, y, gw, gb, L)
+        fit += F64(time.Since(t1)) / F64(20 * n)
+    }
+    try io.PutLn(name + " | " + $(total / F64(rounds)).Fixed(1) + " | " + $(total * 1e6 / updates).Fixed(1) + " | " + $solved + "/" + $rounds + " | " + $(fit / F64(rounds)).Fixed(1))
+}
+
+# a planted 3-colourable graph: each cell joined to 3 others of another colour, both ways; no features
+fn colourCase(n I64, r mut rand.Rand&) message.Edges, Array<I32>, Array<F64>, potts.Potts {
+    colour := Array<I32>(n)
+    for i in range n: colour[i] = I32(r.Below(3))
     src, dst := Array<I32>(6 * n), Array<I32>(6 * n)
     count I64 = 0
     for i in range n {
@@ -54,5 +62,44 @@ fn graph(n I64, r mut rand.Rand&) message.Edges {
     }
     e := message.Edges(n, 6 * n)
     e.Set(src, dst, count)
-    return e
+    return e, colour, Array<F64>(n), potts.Potts.Colouring(3)
+}
+
+# a Sudoku: the 81 cells' peer graph, a planted grid (a shuffled pattern), 30 clues as features (10 a cell: the clue's
+# value one-hot, or the last for none), the rule's energy
+fn sudokuCase(r mut rand.Rand&) message.Edges, Array<I32>, Array<F64>, potts.Potts {
+    perm := Array<I64>(9)
+    for d in range 9: perm[d] = d
+    for d in range 8 {
+        j := d + r.Below(9 - d)
+        perm[d], perm[j] = perm[j], perm[d]
+    }
+    grid := Array<I32>(81)
+    for i in range 81: grid[i] = I32(perm[(i / 9 * 3 + i / 27 + i % 9) % 9])
+    src, dst := Array<I32>(81 * 20), Array<I32>(81 * 20)
+    count I64 = 0
+    for a in range 81 {
+        for b in range 81 {
+            peer := a / 9 == b / 9 or a % 9 == b % 9 or (a / 27 == b / 27 and a % 9 / 3 == b % 9 / 3)
+            if a == b or not peer: continue
+            src[count], dst[count] = I32(b), I32(a)
+            count += 1
+        }
+    }
+    e := message.Edges(81, 81 * 20)
+    e.Set(src, dst, count)
+    f := Array<F64>(81 * 10)
+    for i in range 81: f[i * 10 + 9] = 1.0
+    for _ in range 30 {
+        i := r.Below(81)
+        f[i * 10 + 9] = 0.0
+        for d in range 9: f[i * 10 + d] = 0.0
+        f[i * 10 + I64(grid[i])] = 1.0
+    }
+    m := potts.Potts(9, 10)
+    for a in range 9: m.W[a * 9 + a] = 1.0
+    for c in range 9 {
+        for v in range 9: m.B[c * 9 + v] = 0.0 if v == c else 2.0
+    }
+    return e, grid, f, m
 }

@@ -1844,3 +1844,21 @@ the backward always over a context of 64 or more, the forward where heads are 12
 The chunked forms are pinned allocation-free. bench/deltagraph, a DeltaRule node, one thread, ms forward / backward:
 4 x 1024, 4 heads of 64: 16.0 / 93.8 -> 15.4 / 55.5 (a step 1.55x); 1 x 4096, 8 heads of 128: 119.0 / 731.7 -> 91.6 /
 274.6 (2.3x).
+
+## nn/potts measured on Sudoku and colouring (wt-pottsspeed, 2026-11-21)
+
+bench/potts now times a Sudoku case too (81 cells of 9 values, 20 peers each, 30 clues as unary features of a planted
+grid, the rule's energy) beside planted 3-colourings, and the pseudolikelihood fit. Changes: the draw's exponentials
+in one F32 pass, then their sum (Sudoku 175 -> 147 ns a cell update; colouring about 54 -> 49-54); the fit's gradient
+skips zero features (Sudoku 394 -> 338 ns a cell). 32 chains of 300 annealing sweeps, 8 rounds a case:
+
+| case | 1 thread: ms a search, ns an update | 4 threads | best chain at energy 0 | fit ns a cell |
+|---|---|---|---|---|
+| Sudoku 81 x 9 | 93.7, 147 | 26.2, 41 | 8/8 | 338 |
+| colouring 256 x 3 | 121, 49 | 35.4, 14.3 | 8/8 | 70 |
+| colouring 1024 x 3 | 535, 54 | 157, 15.8 | 5/8 | 88 |
+| colouring 2048 x 3 | 1049, 53 | 332, 16.7 | 0/8 | 79 |
+
+Where an update goes (colouring, 1024 cells): about 22 ns at zero temperature (no draw), 74 at T 1 (a draw and most
+cells moving, each move updating its neighbours' fields). What would buy more: chains in vector lanes - a cell's
+fields laid out across chains and the class swept for all chains at once - not done.

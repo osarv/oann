@@ -83,10 +83,16 @@ fn (m Potts&) PseudoGrad(e message.Edges&, f Array<F64>&, y Array<I32>&, gw mut 
         for c in range k: z += (low - L[c]).Exp()
         yi := I64(y[i])
         nll += L[yi] - low + z.Log()
-        for c in range k {
-            g := (1.0 if c == yi else 0.0) - (low - L[c]).Exp() / z      # dNLL / dL_c
-            for q in range m.Features: gb[q * k + c] += g * f[i * m.Features + q]
-            for a in range e.First(i), e.First(i + 1): gw[c * k + I64(y[e.Source(a)])] += g * F64(e.Weight(a))
+        for c in range k: L[c] = (1.0 if c == yi else 0.0) - (low - L[c]).Exp() / z      # dNLL / dL_c
+        for q in range m.Features {
+            fv := f[i * m.Features + q]
+            if fv == 0.0: continue
+            for c in range k: gb[q * k + c] += L[c] * fv
+        }
+        for a in range e.First(i), e.First(i + 1) {
+            w := F64(e.Weight(a))
+            col := I64(y[e.Source(a)])
+            for c in range k: gw[c * k + col] += L[c] * w
         }
     }
     return nll
@@ -276,12 +282,9 @@ fn draw(L mut Array<F64>&, lo I64, k I64, t F64, seeds mut Array<U64>&, c I64) I
     low := L[lo]
     for v in range 1, k: low = low.Min(L[lo + v])
     inv := 1.0 / t
+    for v in range k: L[lo + v] = F64(elem.FastExp(F32((low - L[lo + v]) * inv)))      # one vectorizable pass, in F32
     z F64 = 0.0
-    for v in range k {
-        w := elem.FastExp((low - L[lo + v]) * inv)
-        L[lo + v] = w
-        z += w
-    }
+    for v in range k: z += L[lo + v]
     u := nextUniform(seeds, c) * z
     for v in range k - 1 {
         u -= L[lo + v]
