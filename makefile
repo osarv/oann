@@ -6,7 +6,7 @@ OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
 TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang \
-	ad/graph.olang ad/descent.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang \
+	ad/graph.olang ad/descent.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/holo.olang dyn/store.olang dyn/recur.olang dyn/sleep.olang dyn/halt.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -177,6 +177,12 @@ hybridbench:
 graphcount:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_graph_count examples/graph_count.olang
 	./build/examples_graph_count $(ARGS)
+
+# a one-block self-attention encoder over variable-length histories against a larger flat perceptron
+# (examples/history_encode.olang) - ARGS: steps, seed
+historyencode:
+	$(OLANG) build $(GPUDEFINE) -output build/examples_history_encode examples/history_encode.olang
+	./build/examples_history_encode $(ARGS)
 
 # XOR by rate neurons on dyn, taught by equilibrium propagation (examples/xor_settle.olang)
 xor:

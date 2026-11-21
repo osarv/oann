@@ -1,0 +1,124 @@
+# nn/history - a small self-attention encoder over a variable-length history: a sequence of up to Ctx feature vectors
+# (events, observations, moves) read into one vector of width D. One pre-normalized causal transformer block over the
+# history projected to D with a learned position each, a final normalization, then a pooling: the mean of the valid
+# positions, or the last valid position's row.
+#
+# Variable length, exactly. A history of n < Ctx entries fills positions 0 .. n - 1 and leaves the rest as padding -
+# anything at all. Attention is causal, so a valid position reads only positions at or before it, never padding, and
+# every other operation of the block is per position; the pooling weights (`Weights`) are zero on the padding. So the
+# encoding of a history, and every gradient, is the same whatever the padding holds (a test), and one planned graph
+# serves every length up to Ctx.
+#
+#     enc := history.Encoder.New(g, inputs, ctx, D, heads, history.Pool.Mean)
+#     x := g.Input(ctx, inputs)
+#     w := g.Input(1, ctx)                     # the pooling weights, Weights(lengths) each batch
+#     h := enc.Apply(g, x, w)                  # [batch, D]
+
+import "../ad/graph"
+import "layers"
+
+# how the positions' rows become one: their mean over the valid positions, or the last valid one's (the causal block's
+# reading of the whole history)
+type Pool enum { Mean, Last }
+
+# the encoder: In projects each entry to D, Positions (Ctx x D) adds where it is, Block is one transformer block,
+# Final normalizes; Reading says how it is pooled
+type Encoder struct(In layers.Dense, Positions graph.Var, Block layers.AttentionBlock, Final layers.Norm, Ctx I64, D I64, Reading Pool) {
+    In
+    Positions
+    Block
+    Final
+    Ctx
+    D
+    Reading
+}
+
+# an encoder of histories of up to ctx entries of inputs features, width D, heads heads (dividing D)
+fn Encoder.New<T>(g mut graph.Graph<T>&, inputs I64, ctx I64, D I64, heads I64, pool Pool = Pool.Mean) Encoder {
+    proj := layers.Dense.New(g, inputs, D)
+    pos := g.Param(graph.Init.Normal(0.0, 0.02), true, ctx, D)
+    block := layers.AttentionBlock.New(g, D, heads)
+    return Encoder(proj, pos, block, layers.Norm.New(g, D), ctx, D, pool)
+}
+
+# the encoding [batch, D] of x [batch, Ctx, inputs], pooled by w [batch, 1, Ctx] (filled by Weights)
+fn (e Encoder&) Apply<T>(g mut graph.Graph<T>&, x graph.Var, w graph.Var) graph.Var { return e.Pooled(g, e.Rows(g, x), w) }
+
+# every position's row before pooling, [batch, Ctx, D]: the block's output, normalized
+fn (e Encoder&) Rows<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
+    h := g.Positions(e.In.Apply(g, x), e.Positions)
+    return e.Final.Apply(g, e.Block.Apply(g, h))
+}
+
+# rows [batch, Ctx, D] pooled by w [batch, 1, Ctx]: [batch, D]
+fn (e Encoder&) Pooled<T>(g mut graph.Graph<T>&, rows graph.Var, w graph.Var) graph.Var { return g.Reshape(g.MatMul(w, rows), e.D) }
+
+# the pooling weights of rows histories, row b lengths[b] long (1 .. Ctx): 1 / n over its n valid positions (Mean), or
+# 1 at its last (Last), 0 on the padding - into out, rows x Ctx
+fn (e Encoder&) Weights<T>(lengths Array<I64>&, rows I64, out mut Array<T>&) { Weights(e.Reading, e.Ctx, lengths, rows, out) }
+
+# the same for histories of up to ctx entries pooled by pool
+fn Weights<T>(pool Pool, ctx I64, lengths Array<I64>&, rows I64, out mut Array<T>&) {
+    for b in range rows {
+        n := lengths[b]
+        for t in range ctx {
+            v F64 = 0.0
+            if pool == Pool.Mean and t < n: v = 1.0 / F64(n)
+            if pool == Pool.Last and t == n - 1: v = 1.0
+            out[b * ctx + t] = T(v)
+        }
+    }
+}
+
+# ---- tests ----
+
+import "std/rand"
+
+test Encoder "a history's encoding and every gradient are the same whatever its padding holds, mean and last; the mean is the valid rows' mean" {
+    for pool in Array<Pool>[Pool.Mean, Pool.Last] {
+        r := rand.Rand(4)
+        g := graph.Graph<F64>(6)
+        enc := Encoder.New(g, 5, 8, 16, 4, pool)
+        x := g.Input(8, 5)
+        w := g.Input(1, 8)
+        rows := enc.Rows(g, x)
+        h := enc.Pooled(g, rows, w)
+        target := g.Input(16)
+        loss := g.Mse(h, target)
+        g.Keep(rows)
+        g.Keep(h)
+        try g.Plan(r) catch { unreachable }
+        lengths := Array<I64>[1, 3, 8, 5, 2, 7]
+        xs := g.Value(x).Flat()!
+        for i in range xs.Len(): xs[i] = r.Uniform(-1.0, 1.0)
+        ts := g.Value(target).Flat()!
+        for i in range ts.Len(): ts[i] = r.Uniform(-1.0, 1.0)
+        enc.Weights(lengths, 6, g.Value(w).Flat()!)
+        g.Forward(6)
+        g.Backward(loss)
+        first := g.Value(h).Clone()
+        grads := g.ParamGrads().Clone()
+        # new padding, nothing else changed
+        for b in range 6 {
+            for t in range lengths[b], 8 {
+                for j in range 5: xs[(b * 8 + t) * 5 + j] = r.Uniform(-9.0, 9.0)
+            }
+        }
+        g.Forward(6)
+        g.Backward(loss)
+        assert g.Value(h).Flat()! == first.Flat()!, $pool + ": the encoding moved with the padding"
+        assert g.ParamGrads().Flat()! == grads.Flat()!, $pool + ": a gradient moved with the padding"
+        if pool == Pool.Last: continue
+        # the mean of the block's normalized rows over the valid positions
+        each := g.Value(rows).Flat()!
+        out := first.Flat()!
+        for b in range 6 {
+            for j in range 16 {
+                s F64 = 0.0
+                for t in range lengths[b]: s += each[(b * 8 + t) * 16 + j]
+                assert (s / F64(lengths[b]) - out[b * 16 + j]).Abs() < 1e-12, "row " + $b
+            }
+        }
+    }
+}
+

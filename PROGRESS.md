@@ -1480,3 +1480,25 @@ A mean cannot count (it loses the degree), so it misses the counting task even o
 falls to near chance on larger ones; a sum both counts and, from two colour columns, compares (red - blue), so it holds
 up on graphs larger and denser than any it saw. A run takes half a second.
 
+## A small self-attention encoder over variable-length histories (wt-history, 2026-11-21)
+
+`nn/history.Encoder`: a projection of each entry to width D, a learned position, one causal pre-normalized
+`AttentionBlock`, a final norm, and a pooling by a batched weights input (`Weights`: the mean over the valid positions,
+or the last valid position). Histories are right-padded; causal attention means no valid position reads padding and
+everything else is per position, so the encoding and every parameter gradient are bit for bit the same whatever the
+padding holds (the test fills it twice), and one planned graph serves every length.
+
+`examples/history_encode` (`make historyencode`): histories of 1-16 symbols of 8, one-hot, zeros past the end; the
+encoder (D 32, 4 heads, 13.6-13.8k parameters) against a flat perceptron over the padded history (128-256-256-classes,
+99-101k parameters); AdamW at 0.002, batches of 64, 3000 steps, then 50 fresh batches. Test accuracy, seeds 1 / 2 / 3:
+
+| task | encoder | flat perceptron | flat, 15000 steps (equal time, seed 1) |
+|---|---|---|---|
+| most frequent symbol (encoder: mean) | 99.75 / 99.94 / 99.88% | 98.94 / 98.75 / 98.59% | 99.34% |
+| last symbol seen before (encoder: last) | 99.41 / 99.78 / 97.03% | 87.06 / 87.31 / 87.62% | 97.78% |
+
+At equal steps the encoder wins with a seventh of the parameters, most on the comparison of the last entry against
+the rest (+10-12 points). A step costs 2.7-2.9 ms against 0.5-0.6 ms on the CPU (attention at Ctx 16 is dominated by
+small products), and at equal time the perceptron closes most of the gap (97.8% against 99.4% on repeat). The encoder's
+lead is in parameters and steps, not yet in CPU time at this size.
+

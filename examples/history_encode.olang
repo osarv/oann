@@ -1,0 +1,103 @@
+# A small self-attention encoder over variable-length histories (nn/history) against a larger flat perceptron over
+# the same histories padded to full length. A history is 1 .. 16 symbols of 8 (one-hot), the rest zeros. Two tasks:
+# frequent - the symbol the history holds most often (the lowest of a tie), read by the encoder's mean; repeat - whether
+# the last symbol occurred earlier in the history, read by the encoder's last position. The encoder: width 32, 4 heads,
+# one block, a dense head; the perceptron: 128 -> 256 -> 256 -> classes, about seven times the parameters. AdamW,
+# batches of 64, then 50 batches of fresh histories. Arguments, all optional: training steps (3000), seed (1).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../nn/history"
+import "../nn/layers"
+import "../nn/optim"
+
+Batch I64 = 64
+Ctx I64 = 16
+Symbols I64 = 8
+
+# a batch of histories into x (Batch x Ctx x Symbols, one-hot, zeros past each length), lengths and labels
+fn fill(r mut rand.Rand&, x mut Array<F32>&, lengths mut Array<I64>&, labels mut Array<I32>&, task I64) {
+    for i in range x.Len(): x[i] = 0.0
+    counts := Array<I64>(Symbols)
+    for b in range Batch {
+        n := 1 + r.Below(Ctx)
+        lengths[b] = n
+        for s in range Symbols: counts[s] = 0
+        seen := false
+        for t in range n {
+            s := r.Below(Symbols)
+            x[(b * Ctx + t) * Symbols + s] = 1.0
+            if t == n - 1: seen = counts[s] > 0
+            counts[s] += 1
+        }
+        best I64 = 0
+        for s in range Symbols {
+            if counts[s] > counts[best]: best = s
+        }
+        labels[b] = I32(best if task == 0 else (1 if seen else 0))
+    }
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    steps := try args[1].ParseInt() if args.Len() > 1 else 3000
+    seed := U64(try args[2].ParseInt()) if args.Len() > 2 else U64(1)
+    for task in range 2 {
+        classes := Symbols if task == 0 else 2
+        name := "frequent" if task == 0 else "repeat"
+        pool := history.Pool.Mean if task == 0 else history.Pool.Last
+        # the encoder
+        r := rand.Rand(seed)
+        g := graph.Graph<F32>(Batch)
+        y := g.Classes()
+        x := g.Input(Ctx, Symbols)
+        w := g.Input(1, Ctx)
+        enc := history.Encoder.New(g, Symbols, Ctx, 32, 4, pool)
+        logits := layers.Dense.New(g, 32, classes).Apply(g, enc.Apply(g, x, w))
+        try run(g, r, x, w, y, logits, task, classes, steps, pool, "history encoder", name)
+        # the flat perceptron
+        r2 := rand.Rand(seed)
+        f := graph.Graph<F32>(Batch)
+        fy := f.Classes()
+        fx := f.Input(Ctx * Symbols)
+        flogits := layers.Mlp.New(f, Array<I64>[Ctx * Symbols, 256, 256, classes]).Apply(f, fx)
+        try run(f, r2, fx, graph.None, fy, flogits, task, classes, steps, pool, "flat perceptron", name)
+    }
+}
+
+# trains a model (w its pooling weights' input, None for none) and prints its test accuracy and time a step
+fn run(g mut graph.Graph<F32>&, r mut rand.Rand&, x graph.Var, w graph.Var, y graph.Var, logits graph.Var, task I64, classes I64, steps I64, pool history.Pool, model String&, name String&) ? io.Error {
+    loss := g.CrossEntropy(logits, y)
+    try g.Plan(r) catch e { unreachable "the model's shapes: " + $e }
+    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 0.002)
+    lengths := Array<I64>(Batch)
+    xs := g.Value(x).Flat()!
+    ys := g.Ints(y).Flat()!
+    t0 := time.Now()
+    for _ in range steps {
+        fill(r, xs, lengths, ys, task)
+        if w != graph.None: history.Weights(pool, Ctx, lengths, Batch, g.Value(w).Flat()!)
+        g.Forward(Batch)
+        g.Backward(loss)
+        o.Step()
+    }
+    each := F64(time.Since(t0)) / F64(steps) * 1e-3
+    right I64 = 0
+    for _ in range 50 {
+        fill(r, xs, lengths, ys, task)
+        if w != graph.None: history.Weights(pool, Ctx, lengths, Batch, g.Value(w).Flat()!)
+        g.Forward(Batch)
+        out := g.Value(logits).Flat()!
+        for b in range Batch {
+            best I64 = 0
+            for c in range classes {
+                if out[b * classes + c] > out[b * classes + best]: best = c
+            }
+            if I32(best) == ys[b]: right += 1
+        }
+    }
+    try io.PutLn(name + ", " + model + " (" + $g.Params().Count() + " parameters): test accuracy " + $(100.0 * F64(right) / F64(50 * Batch)).Fixed(2) + "%, " + $each.Fixed(0) + " us a step")
+}
