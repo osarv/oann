@@ -1801,7 +1801,9 @@ First measure, XOR (2-32-2, the readout connection ternary, EP and AdamW at 0.03
 -> 0.130 for seed 2), every weight a row's scale times -1, 0 or +1 after every step (tested). Before the certificate's
 scaling reached the latent weights, one seed of four solved XOR and three stopped at the same loss, 0.0867, with the
 gradient near zero. Ternary weights learn slower than real ones here; how they fare on the experiments' tasks is
-for the experiments.
+for the experiments. Wider is not better in this setting: with 128 hidden units (the same rate, 300 lessons) four
+seeds ended at losses 0.50, 0.087, 0.130 and 0.50 (from 0.28-0.37), two of them rising - the rate tuned for 32 units
+is too large for the latent weights of a 128-wide ternary row.
 
 ## A pairwise energy sampled by many chains (wt-potts, 2026-11-21)
 
