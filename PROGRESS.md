@@ -1944,3 +1944,11 @@ An experiment had forked ad/descent for two additions; both are here now, so the
 with deep supervision - each unrolled step's state adds Ds C(x) to the cost differentiated, the gradient of C(x_T) +
 Ds (C(x_T-1) + ... + C(x_T-h)) (tested against central differences of that sum over a 12-step settle). The fork's
 Gaussian jitter of sd s after each step is `Temperature` = s^2 / (2 Rate) (Langevin steps, above).
+
+A low-bit settle state, from a second experiment's fork: `StateBits` (above 0: after every settle step the state is
+rounded per block of `StateBlock` elements - 0: a batch row - with a scale of its own: 1 bit sign times the block's mean
+|x|; 2 bits -s, 0, s past 0.7 mean |x|; else symmetric levels, the scale min(max |x|, `StateClip` rms) / (2^(bits-1)
+- 1); `StateStochastic` rounds stochastically from the noise generator), `ReadRounded` (the state kept exact, the
+energy reading it rounded). Straight through: the unrolled gradient ignores the rounding. Tested: after a settle every
+block lies on its levels (4 bits: whole multiples of its top / 7; 1 bit: plus or minus one value), and read-rounded
+leaves the state off them.

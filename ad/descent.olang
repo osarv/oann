@@ -72,6 +72,16 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
                                     # Gaussian noise of variance 2 rate T, T starting at Temperature and multiplied by
                                     # Cooling every step (annealing); a sample of exp(-E / T) at a fixed T. 0: none
     Cooling F64 = 1.0
+    StateBits I64 = 0               # above 0: a low-bit state - after every settle step it is rounded to this many bits,
+                                    # per block of StateBlock elements (0: a batch row) with a scale of its own (1 bit:
+                                    # sign times the block's mean |x|; 2: -s, 0, s past 0.7 mean |x|; else symmetric
+                                    # levels, the scale min(max |x|, StateClip rms) / (2^(bits-1) - 1)); straight
+                                    # through: the unrolled gradient ignores the rounding
+    StateClip F64 = 3.0
+    StateBlock I64 = 0
+    StateStochastic Bool = false    # stochastic rounding (from the noise generator)
+    ReadRounded Bool = false        # the state kept exact, the energy reading it rounded (a wide accumulator, a low-bit message)
+    xq mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())    # ReadRounded's rounded copy
     Ds F64 = 0.0                    # Unrolled's deep supervision: each unrolled step's state adds Ds C(x) to the cost
                                     # differentiated - the gradient of C(x_T) + Ds (C(x_T-1) + ... + C(x_T-h)). 0: none
     jit U64 = U64(0x9E3779B97F4A7C15)   # the jitter's and the Langevin noise's generator (xorshift)
@@ -202,7 +212,7 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
     rate := d.Rate
     last := 0.0
     for k in range most + 1 {
-        res := d.at(d.x, beta, false)
+        res := d.at(d.rounded(), beta, false)
         out.Steps = k
         if d.Adaptive {
             now := d.objective(beta)
@@ -238,8 +248,63 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
             for i in range d.n: d.x[i] += sd * d.gauss()
         }
         if d.Sphere > 0: d.project()
+        if d.StateBits > 0 and not d.ReadRounded: d.quantize(d.x)
     }
     return out
+}
+
+# the state the energy reads: d.x, or its rounded copy where ReadRounded
+fn (d mut Descent<T>&) rounded() mut Array<F64>& {
+    if d.StateBits <= 0 or not d.ReadRounded: return d.x
+    for i in range d.n: d.xq[i] = d.x[i]
+    d.quantize(d.xq)
+    return d.xq
+}
+
+# x rounded in place as StateBits, StateBlock, StateClip and StateStochastic say
+fn (d mut Descent<T>&) quantize(x mut Array<F64>&) {
+    per := d.StateBlock if d.StateBlock > 0 else d.n / d.G.Batch
+    for b in range x.Len() / per: d.block(x, b * per, per)
+}
+
+fn (d mut Descent<T>&) block(x mut Array<F64>&, o I64, per I64) {
+    bits := d.StateBits
+    mx, sq, ab := 0.0, 0.0, 0.0
+    for i in range o, o + per {
+        mx = mx.Max(x[i].Abs())
+        sq += x[i] * x[i]
+        ab += x[i].Abs()
+    }
+    if mx == 0.0: return
+    ab /= F64(per)
+    if bits == 1 {
+        for i in range o, o + per: x[i] = ab if x[i] >= 0.0 else -ab
+        return
+    }
+    if bits == 2 {
+        t := 0.7 * ab
+        s, c := 0.0, 0.0
+        for i in range o, o + per {
+            if x[i].Abs() <= t: continue
+            s += x[i].Abs()
+            c += 1.0
+        }
+        s = s / c if c > 0.0 else ab
+        for i in range o, o + per: x[i] = (s if x[i] > 0.0 else -s) if x[i].Abs() > t else 0.0
+        return
+    }
+    lv := F64((1 << (bits - 1)) - 1)
+    sc := mx.Min(d.StateClip * (sq / F64(per)).Sqrt()) / lv
+    for i in range o, o + per {
+        q := x[i] / sc
+        if d.StateStochastic {
+            fl := q.Floor()
+            q = fl + 1.0 if d.uniform() < q - fl else fl
+        } else {
+            q = q.Round()
+        }
+        x[i] = q.Max(-lv).Min(lv) * sc
+    }
 }
 
 # the noise generator's next uniform in (0, 1)
@@ -831,4 +896,44 @@ test Descent.Train "deep supervision: Unrolled with Ds is the gradient of the la
         want := (js[0] - js[1]) / (2.0 * h)
         assert (got[i] - want).Abs() < 1e-5 * (1.0 + want.Abs()), $i + ": " + $got[i] + " against " + $want
     }
+}
+
+test Descent.Settle "a low-bit state: after a settle every block's values lie on its own levels (4 bits: at most 15; 1 bit: +- one value), and read-rounded keeps the state exact" {
+    g, x, e, c := convex(0.4)
+    d := Descent<F64>(g, x, e, c)
+    d.Rate = 0.2
+    d.Tol = 0.0
+    d.Steps = 30
+    s := g.Value(x).Flat()!
+    for bits in Array<I64>[4, 1] {
+        d.StateBits = bits
+        for i in range s.Len(): s[i] = 0.3 * F64(i % 5) - 0.6
+        d.Settle()
+        for row in range 2 {
+            levels := Vec<F64>()
+            for j in range 4 {
+                v := s[row * 4 + j]
+                seen := false
+                for l in levels: seen = seen or (l - v).Abs() < 1e-12
+                if not seen: levels.Push(v)
+            }
+            top F64 = 0.0
+            for l in levels: top = top.Max(l.Abs())
+            if bits == 1: assert levels.Len() <= 2 and (levels.Len() < 2 or (levels[0] + levels[1]).Abs() < 1e-12)
+            # 4 bits: every value an integer multiple (|q| <= 7) of the block's step
+            if bits == 4 and top > 0.0 {
+                step := top / 7.0
+                for l in levels: assert ((l / step) - (l / step).Round()).Abs() < 1e-6, $l + " on steps of " + $step
+            }
+        }
+    }
+    d.StateBits = 4
+    d.ReadRounded = true
+    for i in range s.Len(): s[i] = 0.3 * F64(i % 5) - 0.6
+    d.Settle()
+    distinct I64 = 0
+    for i in range s.Len() {
+        for j in range i: distinct += 1 if (s[i] - s[j]).Abs() > 1e-9 else 0
+    }
+    assert distinct > 0
 }
