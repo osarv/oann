@@ -1901,3 +1901,7 @@ steps) the loss falls below 0.7 of its start and the fitted energy's chains find
 thread): Sudoku 715 ns a cell step, the best chain's energy 31.6 on average (Gibbs: 43 ns, energy 0 on 6-8 of 8);
 colouring 256 cells 73 ns, energy 19.3 (Gibbs 0). The relaxed search is the weaker and slower one on these discrete
 problems; it is kept for continuous relaxations, not made faster.
+
+`potts.ClueFeatures`: a constraint problem's cell features (a clue one-hot with a no-clue slot, the degree / 4) - with
+them a Potts' B holds per-clue unary tables and a per-value degree term, the model e.g. a planted-colouring solver
+fits; tested against the local energies written out.

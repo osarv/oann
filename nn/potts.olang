@@ -110,6 +110,21 @@ fn Symmetric(gw mut Array<F64>&, k I64) {
     }
 }
 
+# the common cell features of a constraint problem, k + 2 a cell into out: a one-hot of the cell's clue (its value,
+# or the slot k where clues[i] < 0: none), then its degree / 4 (a cell's neighbours' weight in its energy). A Potts
+# of ClueFeatureCount(k) features over them has B's rows k + 1 per-clue unary tables and a per-value degree term
+fn ClueFeatures(e message.Edges&, clues Array<I32>&, k I64, out mut Array<F64>&) {
+    w := k + 2
+    for i in range e.Nodes {
+        for q in range w: out[i * w + q] = 0.0
+        c := I64(clues[i])
+        out[i * w + (c if c >= 0 else k)] = 1.0
+        out[i * w + k + 1] = F64(e.Degree(i)) / 4.0
+    }
+}
+
+fn ClueFeatureCount(k I64) I64 { return k + 2 }
+
 # pseudolikelihood fitting by Adam: Add each example of a batch (a graph, its cells' features, a known answer), then
 # Step - the mean gradient over the batch's cells taken, W's made symmetric where Symmetrize, one Adam step at rate;
 # Loss the batch's mean negative log-pseudolikelihood a cell
@@ -635,4 +650,25 @@ test Fitter "pseudolikelihood fitting learns the colouring rule from planted ans
     s.Start(r)
     s.Anneal(m, e, Array<F64>(120), Schedule(300, 2.0, 0.05))
     assert Potts.Colouring(3).Energy(e, Array<F64>(120), s.X, s.Best() * 120) == 0.0
+}
+
+test ClueFeatures "a cell's clue one-hot (or the no-clue slot) and its degree / 4; a Potts over them adds the clue's row and the degree term" {
+    r := rand.Rand(2)
+    e, y := planted(30, 3, 2, r)
+    clues := Array<I32>(30, -1)
+    clues[4], clues[9] = y[4], y[9]
+    f := Array<F64>(30 * ClueFeatureCount(3))
+    ClueFeatures(e, clues, 3, f)
+    m := Potts(3, ClueFeatureCount(3))
+    for i in range m.B.Len(): m.B[i] = r.Uniform(-1.0, 1.0)
+    L := Array<F64>(3)
+    zeros := Array<I32>(30)
+    for i in range 30 {
+        m.Local(e, f, zeros, 0, i, L, 0)
+        row := I64(clues[i]) if clues[i] >= 0 else 3
+        for c in range 3 {
+            want := m.B[row * 3 + c] + m.B[4 * 3 + c] * F64(e.Degree(i)) / 4.0 + F64(e.Degree(i)) * m.W[c * 3]
+            assert (L[c] - want).Abs() < 1e-12
+        }
+    }
 }
