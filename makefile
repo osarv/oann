@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -192,6 +192,13 @@ bestof:
 
 # a settle step on graph-structured states: the dense adjacency product against message passing over its edges, and the
 # state's gradient alone (bench/graphsettle.olang) - ARGS: steps, batch, D, hidden, node counts
+# the settle's sweep cost: a self-coupled hidden population of H units at batch B, its weights packed in every sweep
+# against packed once a settle (the reciprocal self-connection then one product of W^T + W) (bench/sweep.olang) - ARGS:
+# sweeps, threads, hidden sizes
+sweepbench:
+	$(OLANG) build -output build/bench_sweep bench/sweep.olang
+	./build/bench_sweep $(ARGS)
+
 graphsettle:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_graphsettle bench/graphsettle.olang
 	./build/bench_graphsettle $(ARGS)

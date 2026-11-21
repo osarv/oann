@@ -1,0 +1,67 @@
+# The settle's sweep cost: a system of a hidden population of H tanh units coupled to itself (dense, reciprocal) and a
+# readout of 10, driven by a folded input of 64, settled for a fixed number of sweeps (no tolerance, no row stops) at
+# batch B, on 1 thread or more. Reported: us a sweep and the coupling's GFLOPS (2 H^2 B multiply-adds a sweep each way).
+# From the repository's root:
+#     make sweepbench ARGS="sweeps threads hidden..."    (200 1, 128 256 512 1024)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../dyn/system"
+import "../dyn/neuron"
+import "../dyn/conn"
+import "../dyn/settle"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn build(batch I64, hidden I64, threads I64) system.System<F32> {
+    s := system.System<F32>(batch, threads)
+    x := s.Population(s.Root(), "x", 64, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", hidden, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 10, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(rand.Rand(1))!
+    r := rand.Rand(2)
+    px := s.Pop(x)
+    for i in range px.Drive.Len(): px.Drive[i] = F32(r.Uniform(-1.0, 1.0))
+    return s
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    sweeps := try number(args, 1, 200)
+    threads := try number(args, 2, 1)
+    sizes := Array<I64>[128, 256, 512, 1024]
+    if args.Len() > 3 {
+        sizes = Array<I64>(args.Len() - 3)
+        for i in range sizes.Len(): sizes[i] = try args[i + 3].ParseInt()
+    }
+    for hidden in sizes {
+        for batch in Array<I64>[8, 32, 128, 512] {
+          for ahead in Array<Bool>[false, true] {
+            s := build(batch, hidden, threads)
+            s.E.RowStops = false
+            s.E.PackAhead = ahead
+            b := settle.Budget(sweeps, -1.0)
+            s.Reset(settle.Phase.Free)
+            s.Settle(settle.Phase.Free, settle.Budget(5, -1.0))
+            best F64 = 1e30
+            for _ in range 3 {
+                s.Reset(settle.Phase.Free)
+                t0 := time.Now()
+                out := s.Settle(settle.Phase.Free, b)
+                each := F64(time.Since(t0)) / F64(out.Sweeps + 1) * 1e-3
+                best = best.Min(each)
+            }
+            flops := 4.0 * F64(hidden * hidden * batch) / (best * 1e3)
+            try io.PutLn("H " + $hidden + " B " + $batch + (" packed ahead" if ahead else " packed each sweep") + ": " + $best.Fixed(1) + " us a sweep, " + $flops.Fixed(1) + " GFLOPS")
+          }
+        }
+    }
+}

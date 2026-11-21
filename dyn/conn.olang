@@ -63,6 +63,12 @@ type Scratch<T> struct(units I64, rows I64, rank I64) {
     Ev mut Vec<mut sparse.Events&>& = Vec<mut sparse.Events&>()
 }
 
+# the rows a product must have to read the weights packed ahead: up to this many, Gemm's vector paths read them in place
+PackedRows I64 = 4
+
+# the units a population on either side of a dense connection must have for its weights to be packed ahead
+PackedWidth I64 = 64
+
 # a connection from the population numbered Pre (PreSize units) to Post (PostSize), as Plan lays it out
 type Link<T> struct(pre I64, post I64, preSize I64, postSize I64, wiring Wiring, both Bool, frozen Bool) {
     Pre I64 = pre
@@ -87,7 +93,36 @@ type Link<T> struct(pre I64, post I64, preSize I64, postSize I64, wiring Wiring,
     delta mut Array<T>& = Array<T>(0)                     # a sweep's changes, rows x pre
     ptr mut Array<I64>& = Array<I64>(0)                   # a sparse form's pattern, until Lay
     idx mut Array<I32>& = Array<I32>(0)
+    Fwd mut gemm.Packed<T>& = gemm.Packed<T>(0, 0)      # dense in a sweep: W^T packed ahead (Repack), carried forward
+    Bwd mut gemm.Packed<T>& = gemm.Packed<T>(0, 0)      # and W, carried back where reciprocal
+    Packs Bool = false                                    # Fwd and Bwd hold W as it is: the products read them
+    Merged Bool = false                                   # a population's reciprocal connection to itself: Fwd holds W^T + W, both ways in one product
 }
+
+# a dense connection carried in every sweep gets room for its weights packed ahead (Fwd, Bwd); made when the
+# system is planned
+fn (l mut Link<T>&) Prepack() {
+    if l.Folded or not (l.Kind == Wiring.Dense or l.Kind == Wiring.Symmetric): return
+    if l.PreSize < PackedWidth or l.PostSize < PackedWidth: return    # narrow: Gemm's own tiling (exchanged) wins
+    l.Fwd = gemm.Packed<T>(l.PreSize, l.PostSize)
+    if l.Both: l.Bwd = gemm.Packed<T>(l.PostSize, l.PreSize)
+}
+
+# the weights packed ahead as they are now, for the sweeps of a settle - Gemm's packing of them done once instead of
+# in every sweep. Packs stays set until Unpack: the weights must not change in between
+fn (l mut Link<T>&) Repack() {
+    if l.Fwd.N == 0: return
+    l.Fwd.Pack(l.W, true)
+    if l.Both: l.Bwd.Pack(l.W, false)
+    l.Packs = true
+    l.Merged = l.Both and l.Pre == l.Post
+    if not l.Merged: return
+    # both ways read the same activities into the same totals, so they are one product with W^T + W - the panels of
+    # the two are laid out alike (op(B) k x n either way), so the sum is the panels' sum
+    for i in range l.Fwd.Panels.Len(): l.Fwd.Panels[i] += l.Bwd.Panels[i]
+}
+
+fn (l mut Link<T>&) Unpack() { l.Packs, l.Merged = false, false }
 
 # the parameters a connection of this wiring holds, before a sparse pattern is drawn (an upper bound for those)
 fn (l Link<T>&) Params() I64 {
@@ -196,7 +231,9 @@ fn (l mut Link<T>&) Forward(ws mut gemm.Workspace<T>&, sc mut Scratch<T>&, total
     to := mat.Mat<T>(total, r0 * post, n, post, post)
     from := mat.Mat<T>(s, r0 * pre, n, pre, pre)
     match l.Kind {
-        case Wiring.Dense, Wiring.Symmetric { gemm.Gemm(ws, to, from, false, l.W, true, T(1), T(1)) }
+        case Wiring.Dense, Wiring.Symmetric {
+            if l.Packs and n > PackedRows { gemm.GemmPacked(ws, to, from, false, l.Fwd, T(1), T(1)) } else { gemm.Gemm(ws, to, from, false, l.W, true, T(1), T(1)) }
+        }
         case Wiring.LowRank(rank) {
             mid := mat.Mat<T>(sc.Mid, 0, n, rank, rank)
             gemm.Gemm(ws, mid, from, false, l.B, true, T(1), T(0))
@@ -217,7 +254,10 @@ fn (l mut Link<T>&) Backward(ws mut gemm.Workspace<T>&, sc mut Scratch<T>&, tota
     to := mat.Mat<T>(total, r0 * pre, n, pre, pre)
     from := mat.Mat<T>(s, r0 * post, n, post, post)
     match l.Kind {
-        case Wiring.Dense, Wiring.Symmetric { gemm.Gemm(ws, to, from, false, l.W, false, T(1), T(1)) }
+        case Wiring.Dense, Wiring.Symmetric {
+            if l.Merged and n > PackedRows: return            # carried by Forward, W^T + W
+            if l.Packs and n > PackedRows { gemm.GemmPacked(ws, to, from, false, l.Bwd, T(1), T(1)) } else { gemm.Gemm(ws, to, from, false, l.W, false, T(1), T(1)) }
+        }
         case Wiring.LowRank(rank) {
             mid := mat.Mat<T>(sc.Mid, 0, n, rank, rank)
             gemm.Gemm(ws, mid, from, false, l.W, false, T(1), T(0))

@@ -298,6 +298,7 @@ assert not Gemm<BF16, BF16, BF16, F32>.Allocates, "a BF16 product allocates"
 assert not Gemm<F32, F32, I8, F32>.Allocates, "a product of INT8 weights allocates"
 assert not GemmBatch<F32, F32, F32, F32>.Allocates, "a batch of products allocates"
 assert not Gemv<F32, F32>.Allocates, "a matrix-vector product allocates"
+assert not GemmPacked<F32, F32, F32>.Allocates, "a product of B packed ahead allocates"
 assert not GemmI8.Allocates, "an INT8 product allocates"
 
 # ---- the operands as packing reads them ----
@@ -793,6 +794,111 @@ fn packedProduct<SA, SB, A, S>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bo
             pb := bp[t * bsize:(t + 1) * bsize]
             if thin: spawn gemmBlocks(i0, i1, j0, j1, k, sa, ta, sb, tb, al, be, c, ldc, pa, pb, thinTile(), exchanged, false, false, 0, ep)
             else: spawn gemmBlocks(i0, i1, j0, j1, k, sa, ta, sb, tb, al, be, c, ldc, pa, pb, wideTile(), exchanged, false, false, 0, ep)
+        }
+    }
+}
+
+# ---- op(B) packed ahead ----
+
+# op(B) packed once into Gemm's panels, for products that read it many times unchanged - a layer's weights over many
+# steps, a settle's coupling over its sweeps: GemmPacked skips the packing of op(B) every Gemm does, so a product of a
+# few rows reads its panels where they are, in L2 while they fit. The tile width is chosen for n at Packed's making
+# (thin for a narrow result); never exchanged. Pack again whenever B changes
+type Packed<A> struct(k I64, n I64) {
+    K I64 = k
+    N I64 = n
+    Thin Bool = tiling.choose(microRows, n, microRows, tileCols(A(0)), vectorLanes(A(0)), false).thin
+    Panels mut Array<A>& = Array<A>(roundUp(n, vectorLanes(A(0)) if tiling.choose(microRows, n, microRows, tileCols(A(0)), vectorLanes(A(0)), false).thin else tileCols(A(0))) * k)
+}
+
+# op(b) (k x n: b, or b's transpose where tb) packed into p's panels
+fn (p mut Packed<A>&) Pack<SB>(b mat.Mat<SB>&, tb Bool) {
+    ob := operand<SB>.of(b)
+    if p.Thin: p.fill(ob, tb, thinTile())
+    else: p.fill(ob, tb, wideTile())
+}
+
+fn (p mut Packed<A>&) fill<SB, H>(ob operand<SB>&, tb Bool, sh H) {
+    z A
+    nr := tileColsOf(z, sh)
+    nc := blockCols(z)
+    for jc in range 0, p.N, nc {
+        cols I64 = lesser(nc, p.N - jc)
+        for pc in range 0, p.K, kc {
+            ob.pack(not tb, jc, pc, cols, lesser(kc, p.K - pc), bPanel(), sh, false, 0, p.Panels[jc * p.K + roundUp(cols, nr) * pc:])
+        }
+    }
+}
+
+# c = alpha op(a) B + beta c, then the epilogue, B packed ahead (c.Cols = b.N, op(a)'s depth b.K): Gemm without the
+# packing of B - the same sums, bit for bit, as Gemm's packed path with the same tile. Split over ws.Threads tasks as
+# Gemm's packed product is, by rows or by columns
+fn GemmPacked<SC, SA, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&, ta Bool, b Packed<A>&, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
+    m, n, k := c.Rows, c.Cols, b.K
+    if m == 0 or n == 0: return
+    cd := c.Data[c.Off:]
+    if k == 0 {
+        emptyProduct(m, n, beta, cd, c.Ld, epi, false, 0)
+        return
+    }
+    oa := operand<SA>.of(a)
+    if k > kc and not sameType(cd, alpha) {
+        wide := ws.wideC(m * n)
+        if beta != 0: copyInto(wide, n, cd, c.Ld, m, n, alpha, n)
+        prepacked(m, oa, ta, b, alpha, beta, wide, n, ws, epi)
+        copyInto(cd, c.Ld, wide, n, m, n, cd[0], n)
+        return
+    }
+    prepacked(m, oa, ta, b, alpha, beta, cd, c.Ld, ws, epi)
+}
+
+fn prepacked<SA, A, S>(m I64, sa SA, ta Bool, b Packed<A>&, al A, be A, c mut Array<S>&, ldc I64, ws mut Workspace<A>&, ep Epilogue) {
+    n, k := b.N, b.K
+    nr I64 = vectorLanes(al) if b.Thin else tileCols(al)
+    byRows Bool = m >= n
+    units I64 = (m + microRows - 1) / microRows if byRows else (n + nr - 1) / nr
+    tasks I64 = lesser(lesser(ws.Threads, units), m * n * k / madds).Max(1)
+    step I64 = microRows if byRows else nr
+    share I64 = ((m if byRows else n) + tasks - 1) / tasks
+    share = (share + step - 1) / step * step
+    rowsEach I64 = share if byRows else m
+    asize I64 = lesser(blockRows(al), roundUp(rowsEach, microRows)) * lesser(k, kc)
+    ap := ws.panelsA(tasks * asize)
+    if tasks <= 1 {
+        if b.Thin: packedBlocks(0, m, 0, n, sa, ta, b, al, be, c, ldc, ap, thinTile(), ep)
+        else: packedBlocks(0, m, 0, n, sa, ta, b, al, be, c, ldc, ap, wideTile(), ep)
+        return
+    }
+    join {
+        for t in range tasks {
+            lo I64 = t * share
+            hi I64 = lesser(m if byRows else n, lo + share)
+            if lo >= hi: continue
+            i0 I64 = lo if byRows else 0
+            i1 I64 = hi if byRows else m
+            j0 I64 = 0 if byRows else lo
+            j1 I64 = n if byRows else hi
+            pa := ap[t * asize:(t + 1) * asize]
+            if b.Thin: spawn packedBlocks(i0, i1, j0, j1, sa, ta, b, al, be, c, ldc, pa, thinTile(), ep)
+            else: spawn packedBlocks(i0, i1, j0, j1, sa, ta, b, al, be, c, ldc, pa, wideTile(), ep)
+        }
+    }
+}
+
+# rows i0 .. i1 by columns j0 .. j1 (a multiple of the tile's columns apart, but at n) of a product whose op(B) is
+# packed ahead: gemmBlocks reading each block of B's panels where it is
+fn packedBlocks<SA, A, S, H>(i0 I64, i1 I64, j0 I64, j1 I64, sa SA, ta Bool, b Packed<A>&, al A, be A, c mut Array<S>&, ldc I64, ap mut Array<A>&, sh H, ep Epilogue) {
+    nr := tileColsOf(al, sh)
+    nc := blockCols(al)
+    k := b.K
+    for jc in range 0, b.N, nc {
+        cols I64 = lesser(nc, b.N - jc)
+        js, je := j0.Max(jc), j1.Min(jc + cols)
+        if js >= je: continue
+        for pc in range 0, k, kc {
+            depth I64 = lesser(kc, k - pc)
+            bk := block<A>(pc, depth, k, je - js, js, b.Panels[jc * k + roundUp(cols, nr) * pc + (js - jc) * depth:], al, be if pc == 0 else 1, false, false, 0, false)
+            gemmRows(sa, ta, i0, i1, bk, ap, c, ldc, sh, ep)
         }
     }
 }
@@ -1997,6 +2103,33 @@ fn gemvCase(rows I64, cols I64, r mut rand.Rand&) {
         s F64 = 0.0
         for j in range cols: s = s + F64(ab[i, j]) * F64(xf[j])
         assert (F64(yf[i]) - s).Abs() < 1e-6 * F64(cols)
+    }
+}
+
+test GemmPacked "B packed ahead: the packed product's sums bit for bit, every transpose, narrow and wide, block boundaries, threads" {
+    r := rand.Rand(31)
+    dims := Array<I64>[1, 5, 9, 12, 10, 8, 37, 40, 513, 2, 2100, 64, 130, 300, 33, 700, 17, 260]
+    for i in range 0, dims.Len(), 3 {
+        m, n, k := dims[i], dims[i + 1], dims[i + 2]
+        for threads in Array<I64>[1, 4] {
+            for form in range 4 {
+                ta, tb := form % 2 == 1, form / 2 == 1
+                a := uniform(k if ta else m, m if ta else k, F32(0), r)
+                b := uniform(n if tb else k, k if tb else n, F32(0), r)
+                p := Packed<F32>(k, n)
+                p.Pack(b, tb)
+                ws := Workspace<F32>(threads, 2100)
+                c, d := uniform(m, n, F32(0), r), uniform(m, n, F32(0), r)
+                fill(c, F32(1))
+                fill(d, F32(1))
+                GemmPacked(ws, c, a, ta, p, 0.5, 2.0)
+                want, _ := reference(a, ta, b, tb)
+                assert maxDiff(c, want, 0.5, 2.0) < 1e-4 * F64(k), "packed " + $m + "x" + $n + "x" + $k
+                # the same tiling through Gemm's own packing (never exchanged here, so the sums agree bit for bit)
+                product(m, n, k, operand<F32>.of(a), ta, operand<F32>.of(b), tb, F32(0.5), F32(2.0), d.Data[d.Off:], d.Ld, ws, Epilogue.None, false)
+                assert sameBits(c, d), "packed vs Gemm " + $m + "x" + $n + "x" + $k
+            }
+        }
     }
 }
 

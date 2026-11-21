@@ -1652,3 +1652,36 @@ whole sequences' within 1e-12. `bench/sample` (`make samplebench`), one thread, 
 | 2 x 128, vocabulary 512 | 64 | 16 + 48 | 1145 tokens/s | 32754 tokens/s (28.6x) |
 | 4 x 128, vocabulary 512 | 16 | 16 + 48 | 733 | 18973 (25.9x) |
 
+
+## The settle's sweep: weights packed once a settle (wt-fusedsweep, 2026-11-21)
+
+Item 1 of the kernel list (a fused settle sweep that keeps W on-chip across sweeps). On the CPU every sweep's carry was
+a Gemm that packed W into its panels again - at a few rows that packing is most of the product, and W is read twice
+from L2/L3 for one pass of arithmetic. Now `gemm.Packed<A>` holds op(B) in Gemm's panels and `GemmPacked` runs the
+product on them (bit for bit Gemm's packed path with the same tile; a test, every transpose, block edges, threads);
+each dense connection of a sweep carried with both sides at least 64 units wide gets room for its packed weights at
+Plan, and a settle of more than four rows and two or more sweeps packs them once at its start (`Engine.PackAhead`, on
+by default; dropped at its end, so learning between settles is free to change W). A population's reciprocal
+connection to itself is carried both ways in one product: its two packed forms are laid out alike, so W^T + W is
+their panels' sum - half the multiply-adds and half the weights read a sweep. A settle stays allocation-free; a test
+holds packed and unpacked settles (Jacobi and Gauss-Seidel) to the same fixed point within 1e-9.
+
+`bench/sweep` (`make sweepbench`): a hidden population of H tanh units coupled to itself (dense, reciprocal), a
+readout of 10, fixed sweeps, one thread, us a sweep (packed every sweep -> once a settle):
+
+| H | B 8 | B 32 | B 128 | B 512 |
+|---|---|---|---|---|
+| 128 | 15.4 -> 5.3 | 31.8 -> 15.0 | 94.7 -> 53.5 | 382 -> 226 |
+| 256 | 49.0 -> 14.4 | 98.3 -> 42.7 | 276 -> 148 | 1239 -> 684 |
+| 512 | 250 -> 46.2 | 463 -> 139 | 1285 -> 673 | 4821 -> 1990 |
+| 1024 | 1858 -> 191 | 2454 -> 503 | 5358 -> 2060 | 21954 -> 8032 |
+
+1.7-9.7x; the self-coupled case gains most at small batches (H 1024, B 8: 9.7x), where the old sweep spent its time
+packing. A layered system gains only from the packing: the same system without the merge was 1.1-3.7x. The 784-128-10
+MNIST system is unchanged (its in-sweep weights, 128 x 10, are below the 64-unit floor, where Gemm's exchanged tiling
+wins). At four threads a sweep of one unit (batch up to 128 in one phase) is not faster: a product split over threads
+there costs more in wakes than it saves (tried, reverted); batches of several units run their units in parallel as
+before (H 1024, B 512: 2.1 ms a sweep).
+
+On the GPU the same idea is one launch for all of a settle's sweeps with a region's W in shared memory; it needs the
+local machine's RTX 4060 and is left for a session there.
