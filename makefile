@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -192,9 +192,28 @@ bestof:
 
 # a settle step on graph-structured states: the dense adjacency product against message passing over its edges, and the
 # state's gradient alone (bench/graphsettle.olang) - ARGS: steps, batch, D, hidden, node counts
+# the settle's sweep cost: a self-coupled hidden population of H units at batch B, its weights packed in every sweep
+# against packed once a settle (the reciprocal self-connection then one product of W^T + W) (bench/sweep.olang) - ARGS:
+# sweeps, threads, hidden sizes
+sweepbench:
+	$(OLANG) build -output build/bench_sweep bench/sweep.olang
+	./build/bench_sweep $(ARGS)
+
+# attention keeping its weights against the flash form keeping none: forward and backward ms, causal, F32, contexts 256
+# to 4096 (bench/flash.olang) - ARGS: threads, rounds
+flashbench:
+	$(OLANG) build -output build/bench_flash bench/flash.olang
+	./build/bench_flash $(ARGS)
+
 graphsettle:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_graphsettle bench/graphsettle.olang
 	./build/bench_graphsettle $(ARGS)
+
+# sampling a batch of continuations: rerunning the context for every token against batched key-value-cached decoding
+# (bench/sample.olang) - ARGS: layers, width, batch, prompt, new tokens, vocabulary
+samplebench:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_sample bench/sample.olang
+	./build/bench_sample $(ARGS)
 
 # XOR by rate neurons on dyn, taught by equilibrium propagation (examples/xor_settle.olang)
 xor:

@@ -1,0 +1,62 @@
+# kernels/attention: Attention (the weights made and kept, Ctx x Ctx a sequence and head) against FlashAttention (the
+# weights made a block at a time, never kept), causal, F32, forward and backward, ms a call (the best of rounds) and
+# the bytes of weights Attention keeps. From the repository's root:
+#     make flashbench ARGS="threads rounds"    (1 3)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/mat"
+import "../kernels/gemm"
+import att "../kernels/attention"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn ms(t0 I64) F64 { return F64(time.Since(t0)) / 1.0e6 }
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    threads := try number(args, 1, 1)
+    rounds := try number(args, 2, 3)
+    r := rand.Rand(1)
+    try io.PutLn("ctx | seqs x heads x dh | Attention fwd / bwd ms | Flash fwd / bwd ms | weights kept MB")
+    shapes := Array<I64>[256, 8, 4, 32, 1024, 2, 4, 64, 2048, 1, 8, 64, 4096, 1, 4, 64]
+    for x in range 0, shapes.Len(), 4 {
+        ctx, seqs, heads, dh := shapes[x], shapes[x + 1], shapes[x + 2], shapes[x + 3]
+        n, dim := seqs * ctx, heads * dh
+        q, k, v, o, dout := Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim)
+        for i in range n * dim {
+            q[i], k[i], v[i], dout[i] = F32(r.Normal()), F32(r.Normal()), F32(r.Normal()), F32(r.Normal())
+        }
+        dq, dk, dv := Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim)
+        m := fn(a mut Array<F32>&): return mat.Mat<F32>(a, 0, n, dim, dim)
+        at := att.Heads(heads, ctx, true)
+        best := Array<F64>(4, 1e30)
+        probs := Array<F32>(n * heads * ctx)
+        scratch := Array<F32>(att.AttentionScratch(n, heads, ctx))
+        ws := gemm.Workspace<F32>(threads)
+        att.ReserveAttention(ws, ctx, dh, F32(0))
+        f := att.Flash<F32>.For(threads, ctx, dh)
+        lse := Array<F32>(n * heads)
+        for _ in range rounds {
+            t0 := time.Now()
+            att.Attention(ws, m(o), m(q), m(k), m(v), mat.Mat<F32>(probs, 0, n * heads, ctx, ctx), at)
+            best[0] = best[0].Min(ms(t0))
+            t0 = time.Now()
+            att.AttentionGrad(ws, m(dq), m(dk), m(dv), m(dout), m(q), m(k), m(v), mat.Mat<F32>(probs, 0, n * heads, ctx, ctx), scratch, at)
+            best[1] = best[1].Min(ms(t0))
+            t0 = time.Now()
+            att.FlashAttention(f, m(o), m(q), m(k), m(v), lse, at)
+            best[2] = best[2].Min(ms(t0))
+            t0 = time.Now()
+            att.FlashAttentionGrad(f, m(dq), m(dk), m(dv), m(dout), m(q), m(k), m(v), m(o), lse, at)
+            best[3] = best[3].Min(ms(t0))
+        }
+        mb := F64(2 * n * heads * ctx * 4) / 1.0e6
+        try io.PutLn($ctx + " | " + $seqs + " x " + $heads + " x " + $dh + " | " + $best[0].Fixed(2) + " / " + $best[1].Fixed(2) + " | " + $best[2].Fixed(2) + " / " + $best[3].Fixed(2) + " | " + $mb.Fixed(0))
+    }
+}

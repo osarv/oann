@@ -1635,3 +1635,90 @@ folds them (the same value, NaNs as before), and SoftmaxRun / SoftmaxRunTo use i
 64 364 -> 262 us, at 256 1278 -> 527 us; bench/lm's attention forward 4.0-4.4 -> 3.7-4.2 ms (its causal rows at context
 64 average 32 elements, where little is gained). The products of attention at small context (15-24 GMAC/s, tiny batched
 matrices) are what is left there.
+
+## Batched key-value-cached decoding (wt-batchdecode, 2026-11-21)
+
+Sampling many continuations (best-of-N proposers, reranking) ran the whole context through the model for every new
+token: a graph of Batch sequences, one Forward over the context a token. A decoding graph now takes a batch: planned
+with decode set and Batch > 1, its batched nodes are stored position by position ([ctx, batch, ...]), so one position of
+every sequence is a run of rows that every operation reads as a batch; attention keeps a key-value cache per sequence;
+positions and rotary angles count from the rows in use. Such a graph runs one position a Forward (views are refused by
+name). `generate.CachedBatch(g, m, prompts, p, count, temperature, r)` prefills the prompts a position a step and then
+samples every row a token a step. Tested: each row greedily the tokens its prompt alone decodes to, and every logit the
+whole sequences' within 1e-12. `bench/sample` (`make samplebench`), one thread, random weights:
+
+| model | batch | prompt + new | rerun | cached batch |
+|---|---|---|---|---|
+| 2 x 128, vocabulary 512 | 64 | 16 + 48 | 1145 tokens/s | 32754 tokens/s (28.6x) |
+| 4 x 128, vocabulary 512 | 16 | 16 + 48 | 733 | 18973 (25.9x) |
+
+
+## The settle's sweep: weights packed once a settle (wt-fusedsweep, 2026-11-21)
+
+Item 1 of the kernel list (a fused settle sweep that keeps W on-chip across sweeps). On the CPU every sweep's carry was
+a Gemm that packed W into its panels again - at a few rows that packing is most of the product, and W is read twice
+from L2/L3 for one pass of arithmetic. Now `gemm.Packed<A>` holds op(B) in Gemm's panels and `GemmPacked` runs the
+product on them (bit for bit Gemm's packed path with the same tile; a test, every transpose, block edges, threads);
+each dense connection of a sweep carried with both sides at least 64 units wide gets room for its packed weights at
+Plan, and a settle of more than four rows and two or more sweeps packs them once at its start (`Engine.PackAhead`, on
+by default; dropped at its end, so learning between settles is free to change W). A population's reciprocal
+connection to itself is carried both ways in one product: its two packed forms are laid out alike, so W^T + W is
+their panels' sum - half the multiply-adds and half the weights read a sweep. A settle stays allocation-free; a test
+holds packed and unpacked settles (Jacobi and Gauss-Seidel) to the same fixed point within 1e-9.
+
+`bench/sweep` (`make sweepbench`): a hidden population of H tanh units coupled to itself (dense, reciprocal), a
+readout of 10, fixed sweeps, one thread, us a sweep (packed every sweep -> once a settle):
+
+| H | B 8 | B 32 | B 128 | B 512 |
+|---|---|---|---|---|
+| 128 | 15.4 -> 5.3 | 31.8 -> 15.0 | 94.7 -> 53.5 | 382 -> 226 |
+| 256 | 49.0 -> 14.4 | 98.3 -> 42.7 | 276 -> 148 | 1239 -> 684 |
+| 512 | 250 -> 46.2 | 463 -> 139 | 1285 -> 673 | 4821 -> 1990 |
+| 1024 | 1858 -> 191 | 2454 -> 503 | 5358 -> 2060 | 21954 -> 8032 |
+
+1.7-9.7x; the self-coupled case gains most at small batches (H 1024, B 8: 9.7x), where the old sweep spent its time
+packing. A layered system gains only from the packing: the same system without the merge was 1.1-3.7x. The 784-128-10
+MNIST system is unchanged (its in-sweep weights, 128 x 10, are below the 64-unit floor, where Gemm's exchanged tiling
+wins). At four threads a sweep of one unit (batch up to 128 in one phase) is not faster: a product split over threads
+there costs more in wakes than it saves (tried, reverted); batches of several units run their units in parallel as
+before (H 1024, B 512: 2.1 ms a sweep).
+
+On the GPU the same idea is one launch for all of a settle's sweeps with a region's W in shared memory; it needs the
+local machine's RTX 4060 and is left for a session there.
+
+## The chunked delta rule's workspaces (wt-deltachunk, 2026-11-21)
+
+Item 2 of the kernel list (a chunked gated delta-rule scan). kernels/scan already had it in the WY form, forward and
+backward; its chunked backward is 1.6-2.7x the sequential one (bench/scan: 4x1024, 4 heads of 64, 46.8 against 83.6
+ms; 1x4096, 8 heads of 128, 233 against 630 ms), its forward about even at heads of 64 (1.4x at 128). ad/graph still
+runs the sequential forms: its Forward and Backward are pinned allocation-free and the chunked form's `Allocates` fact
+is true. Each task's gemm.Workspace is now reserved in the scan.Work (it was made at every call), the products' result
+operands are locals, and still the fact holds: every part asserted alone is allocation-free and the resident memory
+does not grow over 20000 calls (repro/chunkfacts.olang, sent to olang). Once the fact clears, the graph's DeltaRule
+takes the chunked form.
+
+## Flash attention (wt-flash, 2026-11-21)
+
+Item 3 of the kernel list. `kernels/attention.FlashAttention` and `FlashAttentionGrad`: for each sequence and head the
+queries are taken 128 at a time and the keys and values 128 at a time, each block's scores made by gemm and folded into
+a running row maximum, sum and output (the online softmax; FlashAttention's tiling), blocks past a causal row never
+made; the backward recomputes each block's weights from the row's log-sum-exp the forward keeps (one number a row and
+head) - nothing Ctx x Ctx is stored. `Flash<A>` holds a gemm.Workspace and scratch a task; both calls are
+allocation-free. Tested against Attention and AttentionGrad (F64 within 1e-11, a context of 150 against blocks of
+128, one and three threads) and F32 against the F64 reference. ad/graph runs it for attention over a context of
+`FlashFrom` (512) or more on the CPU, not decoding (the node keeps the log-sum-exp in its accumulator space; a test
+holds a graph's values and gradients to the weighted form's within 1e-10).
+
+bench/flash (`make flashbench`), causal, F32, ms forward / backward (weights kept by the weighted form):
+
+| ctx, seqs x heads x dh | 1 thread: weighted | flash | 4 threads: weighted | flash | weights kept |
+|---|---|---|---|---|---|
+| 256, 8 x 4 x 32 | 3.9 / 5.6 | 3.3 / 6.3 | 2.4 / 6.2 | 1.7 / 2.9 | 17 MB |
+| 1024, 2 x 4 x 64 | 20.0 / 38.4 | 15.8 / 32.4 | 6.3 / 12.2 | 3.9 / 7.8 | 67 MB |
+| 2048, 1 x 8 x 64 | 76.4 / 137.6 | 63.8 / 123.2 | 23.6 / 41.1 | 16.0 / 32.3 | 268 MB |
+| 4096, 1 x 4 x 64 | 150.4 / 294.4 | 113.3 / 218.8 | 41.5 / 82.6 | 28.7 / 56.7 | 537 MB |
+
+Blocks of 64 x 64 were slower than the weighted form (6.0 / 8.3 ms at 256, one thread, with exp and the row maximum
+scalar); elem's FastExp and sixteen-lane maximum and 128-wide blocks brought it level or ahead. In a training step
+(bench/lm: 4 layers of 128, 4 heads, context 1024, 2 sequences, 4 threads) attention 86.7 -> 41.6 ms, a step 163 ->
+118 ms, and the 268 MB of kept weights (four layers) gone.

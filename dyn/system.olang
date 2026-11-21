@@ -2099,3 +2099,34 @@ fn settleOf(s mut System<F32>&, b settle.Budget) F64 { return s.Settle(settle.Ph
 fn nudgedOf(s mut System<F32>&, b settle.Budget) F64 { return s.Nudged(b).Residual }
 assert not settleOf.Allocates, "a settle allocates"
 assert not nudgedOf.Allocates, "a nudged pair allocates"
+
+test System.Settle "weights packed ahead - a reciprocal connection of a population to itself merged into one product - settle to the fixed point the unpacked sweeps reach" {
+    sizes := Array<I64>[96, 160]
+    for gs in Array<Bool>[false, true] {
+        for at in range 2 {
+            n := sizes[at]
+            states := Vec<Array<F64>>()
+            for ahead in Array<Bool>[false, true] {
+                s := System<F64>(9, 1)
+                x := s.Population(s.Root(), "x", 7, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+                h := s.Population(s.Root(), "h", n, neuron.Neuron.Rate(neuron.Rho.Tanh))
+                g := s.Population(s.Root(), "g", 80, neuron.Neuron.Rate(neuron.Rho.Tanh))
+                s.Connect(x, h, conn.Wiring.Dense)
+                s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+                s.Connect(h, g, conn.Wiring.Symmetric)
+                try s.Plan(rand.Rand(5)) catch { unreachable }
+                s.Certify(0.7)
+                s.E.PackAhead = ahead
+                d := rand.Rand(6)
+                for i in range s.Pop(x).Drive.Len(): s.Pop(x).Drive[i] = d.Uniform(-1.0, 1.0)
+                out := s.Settle(settle.Phase.Free, settle.Budget(300, 1e-11, Scheme = settle.Sweeping(GaussSeidel = gs)))
+                assert out.Converged, "n " + $n + ": " + $out.Residual
+                st := s.State<neuron.RateCell<F64>>(h).S
+                kept := Array<F64>(st.Len())
+                for i in range st.Len(): kept[i] = st[i]
+                states.Push(kept)
+            }
+            for i in range states[0].Len(): assert (states[0][i] - states[1][i]).Abs() < 1e-9, "n " + $n + " unit " + $i
+        }
+    }
+}

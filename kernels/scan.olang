@@ -28,9 +28,8 @@
 # Work is split over tasks by sequence, channel block or head - never across a sum - so a result is the same for every
 # thread count (the sums over channel blocks and sequences of the selective scan's backward are added in a fixed order).
 # The work object holds the thread count and the scratch, reserved once (ReserveGated, ReserveSelective, ReserveDelta)
-# and never grown, so a scan allocates nothing - but for the chunked delta rule, whose products each task makes a
-# gemm.Workspace for (sized for the chunk, in the task's own scope, and gone with it: the Workspace's panels cannot be
-# kept in a collection yet).
+# and never grown, so a scan allocates nothing - the chunked delta rule's products included, each task with a
+# gemm.Workspace of its own, reserved beside the scratch (though the compiler's facts do not yet see it: see the asserts).
 #
 # A backward needs the forward's states: the forward writes the state at the start of every chunk (`keep`, the chunk size
 # being at.Chunk of the Seq both are given) and the backward recomputes the rest of a chunk from it - one state per chunk
@@ -54,6 +53,13 @@ type Seq struct(Len I64, Chunk I64 = 64, Heads I64 = 1) {
 type Work<A> struct(threads I64, room I64 = 0) {
     Threads I64 = threads if threads > 0 else 1
     buf mut Array<A>& = Array<A>(room)
+    products mut Vec<mut gemm.Workspace<A>&>& = Vec<mut gemm.Workspace<A>&>()   # the chunked delta rule's, one a task
+}
+
+# room for one task's chunk products of each of tasks tasks, a chunk's sizes up to dim (ReserveDelta's)
+fn (w mut Work<A>&) reserveProducts(tasks I64, dim I64) {
+    for w.products.Len() < tasks: w.products.Push(gemm.Workspace<A>(1))
+    for p in w.products: p.Reserve(dim)
 }
 
 fn (w mut Work<A>&) scratch(n I64) mut Array<A>& {
@@ -97,6 +103,7 @@ fn (w mut Work<A>&) ReserveDelta(rows I64, kcols I64, vcols I64, at Seq) {
     w.Reserve(tasks * deltaScratch(false, at, dk, dv))
     w.Reserve(tasks * deltaGradScratch(at, dk, dv))
     w.Reserve(tasks * (deltaChunkSize(c, dk, dv) + deltaGradChunkSize(c, dk, dv)))
+    w.reserveProducts(tasks, roomOf(c, dk, dv))
 }
 
 
@@ -981,7 +988,6 @@ fn deltaBuf<A>.Carve(z mut Array<A>&, c I64, dk I64, dv I64) deltaBuf<A> {
     return deltaBuf<A>(qc, qs, kc, kg, kk, qk, gm, ag, x, d, oc, bet, alp, gam, c, dk, dv)
 }
 
-fn view<A>(a mut Array<A>&, off I64, rows I64, cols I64, ld I64) mat.Mat<A> { return mat.Mat<A>(a, off, rows, cols, ld) }
 
 # q, k of head h for the chunk's `rows` positions from row r0 into qc and kc; v into x's left columns and the keys scaled
 # by gam into its right ones (the triangular system's right-hand side R); beta and gate; the products of the gate (gam)
@@ -1020,17 +1026,20 @@ fn deltaPrepare<A>(ws mut gemm.Workspace<A>&, b deltaBuf<A>&, rows I64) {
     dv := b.dv
     wd := dv + dk
     c := b.c
-    km := view(b.kc, 0, rows, dk, dk)
-    gemm.Gemm(ws, view(b.kk, 0, rows, rows, c), km, false, km, true)
-    gemm.Gemm(ws, view(b.qk, 0, rows, rows, c), view(b.qc, 0, rows, dk, dk), false, km, true)
+    km := mat.Mat<A>(b.kc, 0, rows, dk, dk)
+    res1 := mat.Mat<A>(b.kk, 0, rows, rows, c)
+    gemm.Gemm(ws, res1, km, false, km, true)
+    res2 := mat.Mat<A>(b.qk, 0, rows, rows, c)
+    tm1 := mat.Mat<A>(b.qc, 0, rows, dk, dk)
+    gemm.Gemm(ws, res2, tm1, false, km, true)
     for i in range rows {
-        xi := b.x[i * wd:(i + 1) * wd]
+        xi := i * wd
         for j in range i {
             coef := b.gm[i * c + j] * b.kk[i * c + j]
-            xj := b.x[j * wd:(j + 1) * wd]
-            for e in range wd: xi[e] -= coef * xj[e]
+            xj := j * wd
+            for e in range wd: b.x[xi + e] -= coef * b.x[xj + e]
         }
-        for e in range wd: xi[e] = b.bet[i] * xi[e]
+        for e in range wd: b.x[xi + e] = b.bet[i] * b.x[xi + e]
         for j in range i + 1: b.ag[i * c + j] = b.gm[i * c + j] * b.qk[i * c + j]
         for j in range i + 1, rows: b.ag[i * c + j] = 0.0
         for e in range dk {
@@ -1046,7 +1055,9 @@ fn deltaNew<A>(ws mut gemm.Workspace<A>&, b deltaBuf<A>&, rows I64, s0 mat.Mat<A
     for i in range rows {
         for c in range b.dv: b.d[i * b.dv + c] = b.x[i * wd + c]
     }
-    gemm.Gemm(ws, view(b.d, 0, rows, b.dv, b.dv), view(b.x, b.dv, rows, b.dk, wd), false, s0, false, -1.0, 1.0)
+    dm := mat.Mat<A>(b.d, 0, rows, b.dv, b.dv)
+    wm := mat.Mat<A>(b.x, b.dv, rows, b.dk, wd)
+    gemm.Gemm(ws, dm, wm, false, s0, false, -1.0, 1.0)
 }
 
 # one head of one sequence by chunks: per chunk D = U - W S (the new values), O = (gam Q) S + ag D, then S <- gam_end S +
@@ -1064,25 +1075,29 @@ fn deltaChunks<S, A>(a deltaArgs<S>&, out mat.Mat<S>&, st mat.Mat<A>&, keep mut 
         deltaLoad(a, b, r0, rows, h)
         deltaPrepare(ws, b, rows)
         deltaNew(ws, b, rows, state)
-        dm := view(b.d, 0, rows, dv, dv)
-        om := view(b.oc, 0, rows, dv, dv)
-        gemm.Gemm(ws, om, view(b.qs, 0, rows, dk, dk), false, state, false)
-        gemm.Gemm(ws, om, view(b.ag, 0, rows, rows, b.c), false, dm, false, 1.0, 1.0)
+        dm := mat.Mat<A>(b.d, 0, rows, dv, dv)
+        om := mat.Mat<A>(b.oc, 0, rows, dv, dv)
+        tm2 := mat.Mat<A>(b.qs, 0, rows, dk, dk)
+        gemm.Gemm(ws, om, tm2, false, state, false)
+        tm3 := mat.Mat<A>(b.ag, 0, rows, rows, b.c)
+        gemm.Gemm(ws, om, tm3, false, dm, false, 1.0, 1.0)
         for i in range rows {
             oo := out.Off + (r0 + i) * out.Ld + h * dv
             for c in range dv: out.Data[oo + c] = S(b.oc[i * dv + c])
         }
-        gemm.Gemm(ws, state, view(b.kg, 0, rows, dk, dk), true, dm, false, 1.0, b.gam[rows - 1])
+        tm4 := mat.Mat<A>(b.kg, 0, rows, dk, dk)
+        gemm.Gemm(ws, state, tm4, true, dm, false, 1.0, b.gam[rows - 1])
     }
 }
 
-type deltaJob<S, A, K> struct(args deltaArgs<S>, out mat.Mat<S>, st mat.Mat<A>, keep mut Array<A>&, z mut Array<A>&, per I64, kind K) {
+type deltaJob<S, A, K> struct(args deltaArgs<S>, out mat.Mat<S>, st mat.Mat<A>, keep mut Array<A>&, z mut Array<A>&, per I64, kind K, products mut Vec<mut gemm.Workspace<A>&>&) {
     args
     out
     st
     keep
     z
     per
+    products
 }
 
 # unit u: sequence u / Heads, head u % Heads; task t works in z's t-th share
@@ -1091,9 +1106,8 @@ fn (j deltaJob<S, A, K>&) run(lo I64, hi I64, task I64) {
     heads := j.args.at.Heads
     match K {
         case chunkwise {
-            products := gemm.Workspace<A>(1, roomOf(j.args.at.Chunk, j.args.dk(), j.args.dv()))
             b := deltaBuf<A>.Carve(mine, j.args.at.Chunk, j.args.dk(), j.args.dv())
-            for u in range lo, hi: deltaChunks<S, A>(j.args, j.out, j.st, j.keep, products, b, u / heads, u % heads)
+            for u in range lo, hi: deltaChunks<S, A>(j.args, j.out, j.st, j.keep, j.products[task], b, u / heads, u % heads)
             return
         }
         case _ { }
@@ -1102,7 +1116,7 @@ fn (j deltaJob<S, A, K>&) run(lo I64, hi I64, task I64) {
 }
 
 # the two forms of the delta rule, as a type, so that each form's code is compiled into its own instance alone: the
-# sequential one allocates nothing (its facts are its own), the chunked one makes a workspace per task
+# sequential one and the chunked one each have facts of their own
 type stepwise struct() { }
 type chunkwise struct() { }
 
@@ -1118,7 +1132,9 @@ fn deltaRun<S, A, K>(ws mut Work<A>&, kind K, out mut mat.Mat<S>&, state mut mat
     tasks := ws.Threads if ws.Threads < units else units
     per := deltaScratch(not isChunked(kind), at, q.Cols / at.Heads, v.Cols / at.Heads)
     z := ws.scratch(tasks * per)
-    job := deltaJob<S, A, K>(deltaArgs<S>(q, k, v, beta, gate, at), out, state, keep, z, per, kind)
+    if isChunked(kind) and ws.products.Len() < tasks: unreserved(tasks, ws.products.Len())
+    args := deltaArgs<S>(q, k, v, beta, gate, at)
+    job := deltaJob<S, A, K>(args, out, state, keep, z, per, kind, ws.products)
     spread(job, units, ws.Threads)
 }
 
@@ -1352,7 +1368,7 @@ fn deltaGradChunks<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b de
         rows := lesser(f.at.Chunk, (s + 1) * f.at.Len - r0)
         slot := ((s * f.at.Heads + h) * chunks + k) * dk * dv
         for e in range dk * dv: gb.s0[e] = g.keep[slot + e]
-        s0 := view(gb.s0, 0, dk, dv, dv)
+        s0 := mat.Mat<A>(gb.s0, 0, dk, dv, dv)
         deltaLoad(f, b, r0, rows, h)
         deltaPrepare(ws, b, rows)
         deltaNew(ws, b, rows, s0)
@@ -1380,17 +1396,18 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
             gb.dkk[i * c + j] = 0.0
         }
     }
-    dm := view(b.d, 0, rows, dv, dv)
-    om := view(gb.dom, 0, rows, dv, dv)
-    ddm := view(gb.dd, 0, rows, dv, dv)
-    dkgm := view(gb.dkg, 0, rows, dk, dk)
-    dagm := view(gb.dag, 0, rows, rows, c)
-    dqm := view(gb.dq, 0, rows, dk, dk)
-    dkm := view(gb.dk, 0, rows, dk, dk)
-    ds0m := view(gb.ds0, 0, dk, dv, dv)
-    kcm := view(b.kc, 0, rows, dk, dk)
+    dm := mat.Mat<A>(b.d, 0, rows, dv, dv)
+    om := mat.Mat<A>(gb.dom, 0, rows, dv, dv)
+    ddm := mat.Mat<A>(gb.dd, 0, rows, dv, dv)
+    dkgm := mat.Mat<A>(gb.dkg, 0, rows, dk, dk)
+    dagm := mat.Mat<A>(gb.dag, 0, rows, rows, c)
+    dqm := mat.Mat<A>(gb.dq, 0, rows, dk, dk)
+    dkm := mat.Mat<A>(gb.dk, 0, rows, dk, dk)
+    ds0m := mat.Mat<A>(gb.ds0, 0, dk, dv, dv)
+    kcm := mat.Mat<A>(b.kc, 0, rows, dk, dk)
     # S_C = gam_end S0 + kg^T D:  dD = kg G,  dkg = D G^T,  dS0 = gam_end G,  dgam_end = <G, S0>
-    gemm.Gemm(ws, ddm, view(b.kg, 0, rows, dk, dk), false, gm, false)
+    tm5 := mat.Mat<A>(b.kg, 0, rows, dk, dk)
+    gemm.Gemm(ws, ddm, tm5, false, gm, false)
     gemm.Gemm(ws, dkgm, dm, false, gm, true)
     for e0 in range dk {
         for e in range dv {
@@ -1399,7 +1416,8 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
         }
     }
     # O = (gam Q) S0 + ag D:  dS0 += (gam Q)^T dO,  d(gam Q) = dO S0^T,  dag = dO D^T,  dD += ag^T dO
-    gemm.Gemm(ws, ds0m, view(b.qs, 0, rows, dk, dk), true, om, false, 1.0, 1.0)
+    tm6 := mat.Mat<A>(b.qs, 0, rows, dk, dk)
+    gemm.Gemm(ws, ds0m, tm6, true, om, false, 1.0, 1.0)
     gemm.Gemm(ws, dqm, om, false, s0, true)
     for i in range rows {
         for e in range dk {
@@ -1408,7 +1426,8 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
         }
     }
     gemm.Gemm(ws, dagm, om, false, dm, true)
-    gemm.Gemm(ws, ddm, view(b.ag, 0, rows, rows, c), true, om, false, 1.0, 1.0)
+    tm7 := mat.Mat<A>(b.ag, 0, rows, rows, c)
+    gemm.Gemm(ws, ddm, tm7, true, om, false, 1.0, 1.0)
     # ag = gm * (Q K^T) on and below the diagonal:  dgm = dag * qk (strictly below), dQK = dag * gm,  dQ += dQK K,  dK = dQK^T Q
     for i in range rows {
         for j in range i {
@@ -1418,13 +1437,16 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
         for j in range i + 1, rows: gb.dag[i * c + j] = 0.0
     }
     gemm.Gemm(ws, dqm, dagm, false, kcm, false, 1.0, 1.0)
-    gemm.Gemm(ws, dkm, dagm, true, view(b.qc, 0, rows, dk, dk), false)
+    tm8 := mat.Mat<A>(b.qc, 0, rows, dk, dk)
+    gemm.Gemm(ws, dkm, dagm, true, tm8, false)
     # D = U - W S0:  dU = dD,  dW = -dD S0^T,  dS0 -= W^T dD
     for i in range rows {
         for e in range dv: gb.dx[i * wd + e] = gb.dd[i * dv + e]
     }
-    gemm.Gemm(ws, view(gb.dx, dv, rows, dk, wd), ddm, false, s0, true, -1.0, 0.0)
-    gemm.Gemm(ws, ds0m, view(b.x, dv, rows, dk, wd), true, ddm, false, -1.0, 1.0)
+    res3 := mat.Mat<A>(gb.dx, dv, rows, dk, wd)
+    gemm.Gemm(ws, res3, ddm, false, s0, true, -1.0, 0.0)
+    tm9 := mat.Mat<A>(b.x, dv, rows, dk, wd)
+    gemm.Gemm(ws, ds0m, tm9, true, ddm, false, -1.0, 1.0)
     # N X = diag(beta) R, N = I + diag(beta) tril(gm * kk, -1):  dY = N^-T dX (back substitution, in dx)
     for j in range rows {
         t := last - j
@@ -1435,7 +1457,10 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
             for e in range wd: xt[e] -= coef * xu[e]
         }
     }
-    gemm.Gemm(ws, view(gb.zz, 0, rows, rows, c), view(gb.dx, 0, rows, wd, wd), false, view(b.x, 0, rows, wd, wd), true)
+    res4 := mat.Mat<A>(gb.zz, 0, rows, rows, c)
+    tm10 := mat.Mat<A>(gb.dx, 0, rows, wd, wd)
+    tm11 := mat.Mat<A>(b.x, 0, rows, wd, wd)
+    gemm.Gemm(ws, res4, tm10, false, tm11, true)
     for i in range rows {
         for t in range i {
             z := gb.zz[i * c + t]
@@ -1460,7 +1485,7 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
         }
     }
     # kk = K K^T below the diagonal:  dK += (dkk + dkk^T) K
-    dkkm := view(gb.dkk, 0, rows, rows, c)
+    dkkm := mat.Mat<A>(gb.dkk, 0, rows, rows, c)
     gemm.Gemm(ws, dkm, dkkm, false, kcm, false, 1.0, 1.0)
     gemm.Gemm(ws, dkm, dkkm, true, kcm, false, 1.0, 1.0)
     # kg_i = gm[end, i] K_i
@@ -1471,7 +1496,10 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
         }
     }
     # gam and gm from the gate: dalpha_i = sum over t >= i of gm[t, i] (dgam_t gam_{i-1} + sum_j dgm[t, j] gm[i-1, j])
-    gemm.Gemm(ws, view(gb.ee, 0, rows, rows, c), view(gb.dgm, 0, rows, rows, c), false, view(b.gm, 0, rows, rows, c), true)
+    res5 := mat.Mat<A>(gb.ee, 0, rows, rows, c)
+    tm12 := mat.Mat<A>(gb.dgm, 0, rows, rows, c)
+    tm13 := mat.Mat<A>(b.gm, 0, rows, rows, c)
+    gemm.Gemm(ws, res5, tm12, false, tm13, true)
     for i in range rows {
         total A = 0.0
         before A = b.gam[i - 1] if i > 0 else 1.0
@@ -1497,10 +1525,11 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
     }
 }
 
-type deltaGradJob<S, A, K> struct(g deltaGradArgs<S, A>, z mut Array<A>&, per I64, kind K) {
+type deltaGradJob<S, A, K> struct(g deltaGradArgs<S, A>, z mut Array<A>&, per I64, kind K, products mut Vec<mut gemm.Workspace<A>&>&) {
     g
     z
     per
+    products
 }
 
 fn (j deltaGradJob<S, A, K>&) run(lo I64, hi I64, task I64) {
@@ -1508,7 +1537,7 @@ fn (j deltaGradJob<S, A, K>&) run(lo I64, hi I64, task I64) {
     heads := j.g.f.at.Heads
     match K {
         case chunkwise {
-            products := gemm.Workspace<A>(1, roomOf(j.g.f.at.Chunk, j.g.f.dk(), j.g.f.dv()))
+            products := j.products[task]
             c, dk, dv := j.g.f.at.Chunk, j.g.f.dk(), j.g.f.dv()
             b := deltaBuf<A>.Carve(mine, c, dk, dv)
             gb := deltaGradBuf<A>.Carve(mine[deltaChunkSize(c, dk, dv):], c, dk, dv)
@@ -1527,7 +1556,8 @@ fn deltaGradRun<S, A, K>(ws mut Work<A>&, kind K, dq mut mat.Mat<S>&, dk mut mat
     vd := v.Cols / at.Heads
     per := deltaChunkSize(at.Chunk, kd, vd) + deltaGradChunkSize(at.Chunk, kd, vd) if isChunked(kind) else deltaGradScratch(at, kd, vd)
     z := ws.scratch(tasks * per)
-    job := deltaGradJob<S, A, K>(deltaGradArgs<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), dq, dk, dv, dbeta, dgate, dout, dstate, keep, add), z, per, kind)
+    if isChunked(kind) and ws.products.Len() < tasks: unreserved(tasks, ws.products.Len())
+    job := deltaGradJob<S, A, K>(deltaGradArgs<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), dq, dk, dv, dbeta, dgate, dout, dstate, keep, add), z, per, kind, ws.products)
     spread(job, units, ws.Threads)
 }
 
@@ -1542,7 +1572,8 @@ fn DeltaRuleGradChunked<S, A>(ws mut Work<A>&, dq mut mat.Mat<S>&, dk mut mat.Ma
 }
 
 # a scan allocates nothing once its Work is reserved - the sequential forms and their backward (S17a, G42); the chunked
-# delta rule makes a gemm workspace per task
+# delta rule's facts still count an allocation (its chunk matrices, views of the task's scratch, reach gemm through
+# the job; repro/chunkfacts.olang)
 assert not GatedScan<F32, F32>.Allocates, "a gated scan allocates"
 assert not GatedScanGrad<F32, F32>.Allocates, "a gated scan's backward allocates"
 assert not SelectiveScan<F32, F32>.Allocates, "a selective scan allocates"

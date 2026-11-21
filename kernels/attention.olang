@@ -339,6 +339,248 @@ fn rotatePairs<S, A>(x mut mat.Mat<S>&, r I64, c0 I64, half I64, w I64, cs Array
     }
 }
 
+# ---- flash attention ----
+
+# Attention with no weights kept: for each (sequence, head) the queries are taken flashRows at a time and the keys and
+# values flashCols at a time, each block's scores made by gemm and folded into a running row maximum, sum and output
+# (the online softmax: Milakov and Gimelshein 2018; FlashAttention, Dao et al. 2022). A causal block past a query
+# block's last row is never made. The backward recomputes each block's weights from the row's log-sum-exp (lse, one
+# number a row and head) the forward keeps. Memory: a few blocks a task, nothing Ctx x Ctx - long contexts fit, and the
+# weights are never written out and read back. The same softmax in another order: equal to Attention up to rounding.
+flashRows I64 = 128
+flashCols I64 = 128
+
+# a task's blocks: scores (and weights) and their gradient, flashRows x flashCols; the running output, maximum and sum;
+# the backward's key-block gradients and the query gradients of the whole sequence and the rows' D = rowsum(dO O)
+fn flashScratch(ctx I64, dh I64) I64 { return 2 * flashRows * flashCols + flashRows * dh + 2 * flashRows + 2 * flashCols * dh + ctx * dh + ctx }
+
+# the workspace of FlashAttention and FlashAttentionGrad: the thread count, a gemm.Workspace and scratch a task, room for
+# sequences of up to ctx positions and heads of up to dh columns. Made where the attention is planned; nothing is
+# allocated by a call
+type Flash<A> struct(threads I64) {
+    Threads I64 = threads if threads > 0 else 1
+    Ctx I64 = 0
+    Dh I64 = 0
+    per I64 = 0
+    buf mut Array<A>& = Array<A>(0)
+    ws mut Vec<mut gemm.Workspace<A>&>& = Vec<mut gemm.Workspace<A>&>()
+}
+
+# room for sequences of up to ctx positions in heads of up to dh columns; never shrinks
+fn (f mut Flash<A>&) Reserve(ctx I64, dh I64) {
+    if ctx <= f.Ctx and dh <= f.Dh: return
+    f.Ctx, f.Dh = f.Ctx.Max(ctx), f.Dh.Max(dh)
+    f.per = flashScratch(f.Ctx, f.Dh)
+    f.buf = Array<A>(f.Threads * f.per)
+    for f.ws.Len() < f.Threads: f.ws.Push(gemm.Workspace<A>(1))
+    for w in f.ws: w.Reserve(flashRows.Max(flashCols).Max(f.Dh))
+}
+
+fn Flash<A>.For(threads I64, ctx I64, dh I64) Flash<A> {
+    f := Flash<A>(threads)
+    f.Reserve(ctx, dh)
+    return f
+}
+
+# one task's matrices e0 .. e1 - 1 (e = s heads + h), forward or backward
+type flashJob<S, A> struct(f mut Flash<A>&, res mut mat.Mat<S>&, out mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, lse mut Array<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, at Heads, backward Bool, adds I64) {
+    f
+    res
+    out
+    q
+    k
+    v
+    lse
+    dq
+    dk
+    dv
+    dout
+    at
+    backward
+    adds
+}
+
+fn (j flashJob<S, A>&) run(e0 I64, e1 I64, t I64) {
+    sc := j.f.buf[t * j.f.per:(t + 1) * j.f.per]
+    ws := j.f.ws[t]
+    for e in range e0, e1 {
+        if j.backward { flashBack<S, A>(j, ws, sc, e) } else { flashFore<S, A>(j, ws, sc, e) }
+    }
+}
+
+# the job over the seqs heads matrices, in runs on up to f.Threads tasks
+fn flashSpread<S, A>(j flashJob<S, A>&, count I64) {
+    tasks := j.f.Threads.Min(count)
+    if tasks <= 1 {
+        j.run(0, count, 0)
+        return
+    }
+    share := (count + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo := t * share
+            hi := (lo + share).Min(count)
+            if lo < hi: spawn j.run(lo, hi, t)
+        }
+    }
+}
+
+# the keys a query row i0 + r reads of the block from j0, bc wide: all, or up to its own position where causal
+fn flashReach(causal Bool, i I64, j0 I64, bc I64) I64 {
+    if not causal: return bc
+    return (i - j0 + 1).Max(0).Min(bc)
+}
+
+# matrix e's attention, block by block: out's rows of its head, and lse[e Ctx + i] for each of its rows
+fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>&, e I64) {
+    at := j.at
+    ctx := at.Ctx
+    dh := j.q.Cols / at.Count
+    scale A = 1.0 / A(dh).Sqrt()
+    r0, c0 := e / at.Count * ctx, e % at.Count * dh
+    so, oo, mo, lo := 0, 2 * flashRows * flashCols, 2 * flashRows * flashCols + flashRows * dh, 2 * flashRows * flashCols + flashRows * dh + flashRows
+    for i0 in range 0, ctx, flashRows {
+        br := flashRows.Min(ctx - i0)
+        for r in range br {
+            sc[mo + r] = A.Min
+            sc[lo + r] = 0.0
+            for d in range dh: sc[oo + r * dh + d] = 0.0
+        }
+        reach := i0 + br if at.Causal else ctx
+        qi := block(j.q, r0 + i0, c0, br, dh)
+        om := mat.Mat<A>(sc, oo, br, dh, dh)
+        for j0 in range 0, reach, flashCols {
+            bc := flashCols.Min(reach - j0)
+            kj, vj := block(j.k, r0 + j0, c0, bc, dh), block(j.v, r0 + j0, c0, bc, dh)
+            sm := mat.Mat<A>(sc, so, br, bc, flashCols)
+            gemm.Gemm(ws, sm, qi, false, kj, true, scale, 0.0)
+            for r in range br: flashFold(sc, so + r * flashCols, bc, flashReach(at.Causal, i0 + r, j0, bc), mo + r, lo + r, oo + r * dh, dh)
+            gemm.Gemm(ws, om, sm, false, vj, false, 1.0, 1.0)
+        }
+        for r in range br {
+            inv A = 1.0 / sc[lo + r]
+            row := (r0 + i0 + r) * j.res.Ld + j.res.Off + c0
+            for d in range dh: j.res.Data[row + d] = S(sc[oo + r * dh + d] * inv)
+            j.lse[e * ctx + i0 + r] = sc[mo + r] + sc[lo + r].Log()
+        }
+    }
+}
+
+# one row's scores s[at .. at + bc] (the first lim readable) folded into its running maximum m, sum l and output o:
+# the scores become their weights exp(s - m') (zero past lim), and l and o are rescaled by exp(m - m')
+fn flashFold<A>(s mut Array<A>&, at I64, bc I64, lim I64, mi I64, li I64, oi I64, dh I64) {
+    for c in range lim, bc: s[at + c] = 0.0
+    if lim == 0: return
+    top := s[mi].Max(elem.MaxIn<A, A>(s, at, lim))
+    shrink A = elem.FastExp(s[mi] - top)
+    for c in range lim: s[at + c] = elem.FastExp(s[at + c] - top)
+    sum := rowSum(s, at, lim)
+    s[li] = s[li] * shrink + sum
+    s[mi] = top
+    for d in range dh: s[oi + d] *= shrink
+}
+
+# s[at .. at + n]'s sum, in eight lanes
+fn rowSum<A>(s Array<A>&, at I64, n I64) A {
+    lanes := Array<A>(8)
+    whole := n - n % 8
+    for i in range 0, whole, 8 {
+        for j in range 8: lanes[j] += s[at + i + j]
+    }
+    total A = 0.0
+    for j in range 8: total += lanes[j]
+    for i in range whole, n: total += s[at + i]
+    return total
+}
+
+# matrix e's gradients: dS = P (dP - D) scale, P = exp(S - lse), dP = dO V^T, D = rowsum(dO O); dQ = dS K, dK = dS^T Q,
+# dV = P^T dO - each key block's dK and dV summed over the query blocks that read it, dQ over the whole sequence
+fn flashBack<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>&, e I64) {
+    at := j.at
+    ctx := at.Ctx
+    dh := j.q.Cols / at.Count
+    scale A = 1.0 / A(dh).Sqrt()
+    r0, c0 := e / at.Count * ctx, e % at.Count * dh
+    po, go := 0, flashRows * flashCols
+    ko := 2 * flashRows * flashCols + flashRows * dh + 2 * flashRows
+    vo, qo := ko + flashCols * dh, ko + 2 * flashCols * dh
+    dd := qo + ctx * dh
+    for i in range ctx {
+        row := (r0 + i) * j.dout.Ld + j.dout.Off + c0
+        orow := (r0 + i) * j.out.Ld + j.out.Off + c0
+        sum A = 0.0
+        for d in range dh: sum += A(j.dout.Data[row + d]) * A(j.out.Data[orow + d])
+        sc[dd + i] = sum
+        for d in range dh: sc[qo + i * dh + d] = 0.0
+    }
+    for j0 in range 0, ctx, flashCols {
+        bc := flashCols.Min(ctx - j0)
+        for x in range bc * dh {
+            sc[ko + x] = 0.0
+            sc[vo + x] = 0.0
+        }
+        kj, vj := block(j.k, r0 + j0, c0, bc, dh), block(j.v, r0 + j0, c0, bc, dh)
+        dkm, dvm := mat.Mat<A>(sc, ko, bc, dh, dh), mat.Mat<A>(sc, vo, bc, dh, dh)
+        first := j0 / flashRows * flashRows if at.Causal else 0
+        for i0 in range first, ctx, flashRows {
+            br := flashRows.Min(ctx - i0)
+            qi, doi := block(j.q, r0 + i0, c0, br, dh), block(j.dout, r0 + i0, c0, br, dh)
+            pm, gm := mat.Mat<A>(sc, po, br, bc, flashCols), mat.Mat<A>(sc, go, br, bc, flashCols)
+            gemm.Gemm(ws, pm, qi, false, kj, true, scale, 0.0)
+            gemm.Gemm(ws, gm, doi, false, vj, true, 1.0, 0.0)
+            for r in range br {
+                lim := flashReach(at.Causal, i0 + r, j0, bc)
+                l := j.lse[e * ctx + i0 + r]
+                dr := sc[dd + i0 + r]
+                for c in range lim {
+                    p := elem.FastExp(sc[po + r * flashCols + c] - l)
+                    sc[po + r * flashCols + c] = p
+                    sc[go + r * flashCols + c] = p * (sc[go + r * flashCols + c] - dr) * scale
+                }
+                for c in range lim, bc {
+                    sc[po + r * flashCols + c] = 0.0
+                    sc[go + r * flashCols + c] = 0.0
+                }
+            }
+            dqi := mat.Mat<A>(sc, qo + i0 * dh, br, dh, dh)
+            gemm.Gemm(ws, dvm, pm, true, doi, false, 1.0, 1.0)
+            gemm.Gemm(ws, dqi, gm, false, kj, false, 1.0, 1.0)
+            gemm.Gemm(ws, dkm, gm, true, qi, false, 1.0, 1.0)
+        }
+        flashPut(j.dk, sc, ko, r0 + j0, c0, bc, dh, j.adds % 4 / 2 == 1)
+        flashPut(j.dv, sc, vo, r0 + j0, c0, bc, dh, j.adds / 4 == 1)
+    }
+    flashPut(j.dq, sc, qo, r0, c0, ctx, dh, j.adds % 2 == 1)
+}
+
+# rows x dh of the scratch from at into d's rows r0 .. and columns c0 .. - added where add, else written; nothing where
+# d is not wanted (no rows)
+fn flashPut<S, A>(d mut mat.Mat<S>&, sc Array<A>&, at I64, r0 I64, c0 I64, rows I64, dh I64, add Bool) {
+    if d.Rows == 0: return
+    for r in range rows {
+        row := (r0 + r) * d.Ld + d.Off + c0
+        for c in range dh {
+            x := sc[at + r * dh + c]
+            d.Data[row + c] = S(A(d.Data[row + c]) + x) if add else S(x)
+        }
+    }
+}
+
+# out = attention(q, k, v) as Attention computes it, with no weights kept: lse (n heads numbers) gets each row's
+# log-sum-exp of its scaled scores, for FlashAttentionGrad. f gives the tasks, the products' workspaces and the scratch
+fn FlashAttention<S, A>(f mut Flash<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, lse mut Array<A>&, at Heads) {
+    job := flashJob<S, A>(f, out, q, q, k, v, lse, out, out, out, q, at, false, 0)       # the backward's fields unread
+    flashSpread(job, q.Rows / at.Ctx * at.Count)
+}
+
+# AttentionGrad's gradients from the forward's out and lse instead of its weights: each block's weights recomputed. A
+# gradient not wanted is an empty matrix (Rows 0); one wanted is written, or added to where its add flag is set
+fn FlashAttentionGrad<S, A>(f mut Flash<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, out mat.Mat<S>&, lse mut Array<A>&, at Heads, addQ Bool = false, addK Bool = false, addV Bool = false) {
+    adds := (1 if addQ else 0) + (2 if addK else 0) + (4 if addV else 0)
+    job := flashJob<S, A>(f, dq, out, q, k, v, lse, dq, dk, dv, dout, at, true, adds)    # res unread
+    flashSpread(job, q.Rows / at.Ctx * at.Count)
+}
+
 # ---- tests ----
 
 import "std/rand"
@@ -648,3 +890,64 @@ test Attention "a context of 256, parts smaller than a sequence's heads: F32 for
     longContext(true, 1)
     longContext(false, 4)
 }
+
+test FlashAttention "equals Attention, causal and not, a context not a multiple of the block, one and three threads; its gradients equal AttentionGrad's" {
+    r := rand.Rand(17)
+    seqs, ctx, heads, dim := 2, 150, 2, 32
+    n := seqs * ctx
+    dh := dim / heads
+    for causal in Array<Bool>[true, false] {
+        for threads in Array<I64>[1, 3] {
+            q, k, v, dout := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+            fill(q, r, 1.0)
+            fill(k, r, 1.0)
+            fill(v, r, 1.0)
+            fill(dout, r, 1.0)
+            at := Heads(heads, ctx, causal)
+            qm, km, vm, dom := mat.Mat<F64>(q, 0, n, dim, dim), mat.Mat<F64>(k, 0, n, dim, dim), mat.Mat<F64>(v, 0, n, dim, dim), mat.Mat<F64>(dout, 0, n, dim, dim)
+            want, got := Array<F64>(n * dim), Array<F64>(n * dim)
+            wm, gm := mat.Mat<F64>(want, 0, n, dim, dim), mat.Mat<F64>(got, 0, n, dim, dim)
+            pr := Array<F64>(n * heads * ctx)
+            prm := mat.Mat<F64>(pr, 0, n * heads, ctx, ctx)
+            ws := gemm.Workspace<F64>(threads, ctx)
+            Attention(ws, wm, qm, km, vm, prm, at)
+            f := Flash<F64>.For(threads, ctx, dh)
+            lse := Array<F64>(n * heads)
+            FlashAttention(f, gm, qm, km, vm, lse, at)
+            for i in range n * dim: assert (want[i] - got[i]).Abs() < 1e-12, "out " + $i
+            grads := Vec<Array<F64>>()
+            for flash in Array<Bool>[false, true] {
+                dq, dk, dv := Array<F64>(n * dim, 0.5), Array<F64>(n * dim), Array<F64>(n * dim)
+                dqm, dkm, dvm := mat.Mat<F64>(dq, 0, n, dim, dim), mat.Mat<F64>(dk, 0, n, dim, dim), mat.Mat<F64>(dv, 0, n, dim, dim)
+                if flash { FlashAttentionGrad(f, dqm, dkm, dvm, dom, qm, km, vm, gm, lse, at, addQ = true) } else {
+                    scratch := Array<F64>(AttentionScratch(n, heads, ctx))
+                    AttentionGrad(ws, dqm, dkm, dvm, dom, qm, km, vm, prm, scratch, at, addQ = true)
+                }
+                grads.Push(dq)
+                grads.Push(dk)
+                grads.Push(dv)
+            }
+            for g in range 3 {
+                for i in range n * dim: assert (grads[g][i] - grads[g + 3][i]).Abs() < 1e-11, "gradient " + $g + " at " + $i
+            }
+        }
+    }
+    # F32 against F64
+    q, k, v := Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim)
+    fill(q, r, 1.0)
+    fill(k, r, 1.0)
+    fill(v, r, 1.0)
+    at := Heads(heads, ctx, true)
+    o32 := Array<F32>(n * dim)
+    f := Flash<F32>.For(2, ctx, dh)
+    lse := Array<F32>(n * heads)
+    FlashAttention(f, mat.Mat<F32>(o32, 0, n, dim, dim), mat.Mat<F32>(q, 0, n, dim, dim), mat.Mat<F32>(k, 0, n, dim, dim), mat.Mat<F32>(v, 0, n, dim, dim), lse, at)
+    q64, k64, v64 := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+    for i in range n * dim {
+        q64[i], k64[i], v64[i] = F64(q[i]), F64(k[i]), F64(v[i])
+    }
+    want, _ := reference(q64, k64, v64, seqs, ctx, heads, dim, true)
+    for i in range n * dim: assert (F64(o32[i]) - want[i]).Abs() < 1e-5, "F32 at " + $i
+}
+assert not FlashAttention<F32, F32>.Allocates, "flash attention allocates"
+assert not FlashAttentionGrad<F32, F32>.Allocates, "flash attention's backward allocates"

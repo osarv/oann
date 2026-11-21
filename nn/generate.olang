@@ -91,6 +91,36 @@ fn CachedTokens<E>(g mut graph.Graph<E>&, m train.LanguageModel&, prompt Array<I
     return all.ToArray()
 }
 
+# a batch of sequences generated at once on g, a graph planned for decoding Batch sequences
+# (`graph.Graph<E>(batch, 1, Mode.Captured, true)`): prompts holds each sequence's prompt, all of length p (row b at
+# prompts[b p ..]); every sequence gets count tokens more, each drawn from its own logits, and the result holds them
+# row by row (p + count a row). The prompts are run one position a step for the whole batch, then a token a step: a
+# step costs a forward of one position per sequence and attention over the cache, the batch's rows sharing each
+# product. p + count must fit the context. Several samples of one prompt: the prompt repeated in several rows
+fn CachedBatch<E>(g mut graph.Graph<E>&, m train.LanguageModel&, prompts Array<I32>&, p I64, count I64, temperature F64
+        r mut rand.Rand&) Array<I32> {
+    rows := g.Batch
+    width := p + count
+    if p < 1 or width > m.Ctx: unreachable "generate.CachedBatch: prompts of " + $p + " and " + $count + " more tokens in a context of " + $m.Ctx
+    out := Array<I32>(rows * width)
+    for b in range rows {
+        for t in range p: out[b * width + t] = prompts[b * p + t]
+    }
+    g.Training = false
+    ids := g.Ints(m.Tokens).Flat()!
+    for t in range width - 1 {
+        g.Pos = t
+        for b in range rows: ids[b] = out[b * width + t]
+        g.Forward(1)
+        if t + 1 < p: continue
+        z := g.Value(m.Logits).Flat()!
+        vocab := z.Len() / rows
+        for b in range rows: out[b * width + t + 1] = Sample(z[b * vocab:(b + 1) * vocab], temperature, r)
+    }
+    g.Pos = 0
+    return out
+}
+
 # the last n tokens of "all" run from position 0, starting the cache again; gives n
 fn prefill<E>(g mut graph.Graph<E>&, ids mut Array<I32>&, all Vec<I32>&, n I64) I64 {
     g.Pos = 0
@@ -198,3 +228,40 @@ test Cached "on text: the prompt encoded by the corpus, the result decoded, and 
     out := try Cached(dec, m, c, "ab", 5, 0.0, rand.Rand(1))
     assert out.Len() == 7 and out == (try Rerun(once, m, c, "ab", 5, 0.0, rand.Rand(1)))
 }
+
+test CachedBatch "a batch decoded at once: each row the tokens its prompt alone gives, greedily, and the logits running the whole sequences give" {
+    full, _, _, m := trained()
+    batch, bm := model<F64>(3, true)
+    batch.Plan(rand.Rand(31))!
+    batch.Params().Convert(full.Params())!
+    _, dec, _, _ := trained()
+    prompts := Array<I32>[3, 1, 4, 1, 5, 9, 2, 6, 5]
+    got := CachedBatch(batch, bm, prompts, 3, 4, 0.0, rand.Rand(1))
+    assert got.Len() == 21
+    for b in range 3 {
+        want := CachedTokens(dec, m, prompts[b * 3:b * 3 + 3], 4, 0.0, rand.Rand(1))
+        assert got[b * 7:b * 7 + 7] == want, "row " + $b + ": " + $got[b * 7:b * 7 + 7] + " against " + $want
+    }
+    # the logits of each row against the whole sequences run at once (batch 2 of the full graph holds rows 0 and 1)
+    seq := full.Ints(m.Tokens).Flat()!
+    for i in range 16: seq[i] = 0
+    for b in range 2 {
+        for t in range 7: seq[b * 8 + t] = got[b * 7 + t]
+    }
+    full.Training = false
+    full.Forward(2)
+    want := full.Value(m.Logits)
+    ids := batch.Ints(bm.Tokens).Flat()!
+    worst F64 = 0.0
+    for t in range 7 {
+        batch.Pos = t
+        for b in range 3: ids[b] = got[b * 7 + t]
+        batch.Forward(1)
+        z := batch.Value(bm.Logits).Flat()!
+        for b in range 2 {
+            for c in range 11: worst = worst.Max((z[b * 11 + c] - want.Get(b, t, c)).Abs())
+        }
+    }
+    assert worst < 1e-12, "batched logits differ by " + $worst
+}
+
