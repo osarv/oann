@@ -99,7 +99,21 @@ fn rowSumAt(t Ternary&, r I64, x Array<F32>&, xo I64) F32 {
     return total
 }
 
+# y = W x with x quantized to 8 bits first (BitNet's absmax: a scale max |x| / 127 for the vector, each element rounded
+# to an integer in -127 .. 127, into q, Cols long): each row's sum is a sum of those integers - additions and
+# subtractions only, the form an FPGA's adder trees take - then times the row's scale and x's. The integers are held
+# in F32 here, where every such sum is exact up to 2^24 (132,000 columns of 127), so the CPU runs MatVec's lanes on them
+fn MatVecI8(y mut Array<F32>&, t Ternary&, x Array<F32>&, q mut Array<F32>&) {
+    top F32 = 0.0
+    for c in range t.Cols: top = top.Max(x[c].Abs())
+    sx := top / 127.0 if top > 0.0 else F32(1.0)
+    inv := 1.0 / sx
+    for c in range t.Cols: q[c] = (x[c] * inv).Round()
+    for r in range t.Rows: y[r] = t.Scale[r] * sx * rowSumAt(t, r, q, 0)
+}
+
 assert not MatVec.Allocates, "a ternary product allocates"
+assert not MatVecI8.Allocates, "a ternary product of 8-bit activations allocates"
 
 # ---- tests ----
 
@@ -134,5 +148,28 @@ test Ternary "absmean quantization, the weights read back, and MatVec and MatMul
                 if b == 0: assert (F64(y[q]) - (want + 1.0)).Abs() < 1e-4 * F64(cols).Sqrt()
             }
         }
+    }
+}
+
+test MatVecI8 "8-bit activations: the integer sums of the quantized vector, within the quantization's error of the F32 product" {
+    r := rand.Rand(8)
+    rows, cols := 40, 333
+    w := mat.Mat<F32>(Array<F32>(rows * cols), 0, rows, cols, cols)
+    for e in range rows * cols: w.Data[e] = F32(r.Normal())
+    t := Ternary.Quantize(w)
+    x := Array<F32>(cols)
+    for e in range cols: x[e] = F32(r.Uniform(-1.0, 1.0))
+    q := Array<F32>(cols)
+    exact, got := Array<F32>(rows), Array<F32>(rows)
+    MatVec(exact, t, x)
+    MatVecI8(got, t, x, q)
+    for j in range rows {
+        sum I64 = 0
+        for c in range cols: sum += t.Get(j, c) * I64(q[c])
+        for c in range cols: assert q[c] == q[c].Round() and q[c].Abs() <= 127.0
+        top F32 = 0.0
+        for c in range cols: top = top.Max(x[c].Abs())
+        assert (F64(got[j]) - F64(t.Scale[j]) * F64(top / 127.0) * F64(sum)).Abs() < 1e-3 * F64(t.Scale[j]) * F64(cols)
+        assert (F64(got[j]) - F64(exact[j])).Abs() < F64(t.Scale[j]) * F64(cols).Sqrt() * 0.01, "row " + $j
     }
 }

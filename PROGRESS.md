@@ -1786,7 +1786,7 @@ lanes ran slower than one. Tested against the dequantized product. bench/ternary
 
 On the CPU it wins once F32's weights leave the caches (from about 1024 x 1024) and holds 16x the weights in the
 same memory; in cache, F32's FMAs are faster. The form is the FPGA's: adder trees over selected activations.
-nn/ternary trains such layers: `Quantizer`, an operation reading a latent F32 weight matrix as its absmean ternary values times each row's scale, its gradient passed straight through to the latent weights, and `Linear` over it, `Export` giving kernels/ternary's form with the same product (a test learns a ternary map to under 5% of its first loss and checks the exported MatVec against the graph's forward to 1e-5). Not yet: 8-bit activations.
+nn/ternary trains such layers: `Quantizer`, an operation reading a latent F32 weight matrix as its absmean ternary values times each row's scale, its gradient passed straight through to the latent weights, and `Linear` over it, `Export` giving kernels/ternary's form with the same product (a test learns a ternary map to under 5% of its first loss and checks the exported MatVec against the graph's forward to 1e-5). 8-bit activations: below.
 
 ## Ternary connections in dyn (wt-dynternary, 2026-11-21)
 
@@ -1869,3 +1869,13 @@ every neighbour's fields as one vector multiply-add. The per-chain path is gone.
 thread: Sudoku 147 -> 40.7 (3.6x), colouring 256 49 -> 11.2, 1024 54 -> 11.4, 2048 53 -> 11.5 (4.7x); 4 threads (32
 chains: two groups) Sudoku 25.5, colouring 9.0. Solved shares as before within the noise of 8 rounds (colouring 1024:
 3/8 against 5/8, the chains' random streams now different).
+
+## Ternary weights times 8-bit activations (wt-ternary8, 2026-11-21)
+
+`ternary.MatVecI8`: the vector quantized by absmax to integers in -127 .. 127 (BitNet b1.58's activations), each row's
+sum of those integers - adds and subtracts only, an FPGA's adder trees - times the row's scale and the vector's. Tested:
+the integers are integers, the result is their exact sum scaled, and within the quantization's error of the F32
+product. Two integer forms (I32 lanes times the bit tables; then mask tables, AND and add) ran 3.5-4x slower than the
+F32 lanes on this CPU (their loops did not vectorize as well); held as F32, the integers' sums are exact up to 2^24 (132k
+columns), so it runs MatVec's lanes: bench/ternary, one thread, us - 1024^2 126.5 (F32 activations 131.5, F32 Gemv
+133), 2048^2 499 (497, 556), 4096^2 1998 (2003, 2314).
