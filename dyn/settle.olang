@@ -49,6 +49,9 @@ import "halt"
 # the rows of a unit of work, at most
 Chunk I64 = 128
 
+# the fewest rows a unit is cut to when a system's threads would otherwise sit idle (Engine.cut)
+LeastChunk I64 = 16
+
 # the phases a system holds side by side: free, nudged toward the targets, nudged away (centered EP)
 type Phase enum { Free, Plus, Minus }
 
@@ -176,7 +179,7 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     Spiking Bool = false
     Window I64 = 1
     Units I64 = 0                                   # every population's units
-    TaskWork I64 = 2000000                          # the multiply-adds a sweep needs to be split over tasks
+    TaskWork I64 = 6000000                          # the multiply-adds a sweep needs to be split over tasks
     Sweeps I64 = 0                                  # every sweep of every settle
     Last Settlement = Settlement()
     cur I64 = 0                                     # the buffer a sweep reads
@@ -187,6 +190,8 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     wideSc mut conn.Scratch<T>& = conn.Scratch<T>(0, 0, 0)
     sc mut Vec<mut conn.Scratch<T>&>& = Vec<mut conn.Scratch<T>&>()
     units mut Array<I64>& = Array<I64>(0)           # a settle's units: population, first row, end row
+    cut I64 = Chunk                                 # a unit's most rows: Chunk, or share where a split sweep has fewer units than threads
+    share I64 = Chunk                               # a thread's share of a batch's rows, at least LeastChunk
     work I64 = 0                                    # a sweep's multiply-adds, about
     count I64 = 0
     worst mut Array<T>& = Array<T>(0)               # each unit's residual
@@ -264,7 +269,8 @@ fn (e mut Engine<T>&) Ready() {
         l.Index = e.wideSc.Ev.Len()                 # its collector in every scratch
         e.wideSc.Ev.Push(sparse.Events(l.PreSize))
     }
-    most := e.Pops.Len() * e.Phases * ((e.Batch + Chunk - 1) / Chunk + (e.Batch + 1) / 2)
+    e.share = (((e.Batch + e.Threads - 1) / e.Threads + 7) / 8 * 8).Max(LeastChunk).Min(Chunk)
+    most := e.Pops.Len() * e.Phases * ((e.Batch + e.share - 1) / e.share + (e.Batch + 1) / 2)
     e.units = Array<I64>(3 * most)
     e.worst = Array<T>(most)
     e.Mass = Array<F64>(units)
@@ -434,6 +440,15 @@ fn (e mut Engine<T>&) clearCounts(p mut Population<T>&, r0 I64, r1 I64) {
 # RowDone), as runs of consecutive rows of at most Chunk, the populations in sweep order - the stopped rows are left out
 # of the products, which run over the live rows only
 fn (e mut Engine<T>&) plan(lo I64, hi I64) {
+    e.cut = Chunk
+    e.planAt(lo, hi)
+    # a sweep split over tasks with fewer units than threads: its units cut smaller, about a thread's share of a batch
+    if e.Threads <= 1 or e.work < e.TaskWork or e.count >= e.Threads or e.share >= Chunk: return
+    e.cut = e.share
+    e.planAt(lo, hi)
+}
+
+fn (e mut Engine<T>&) planAt(lo I64, hi I64) {
     e.count = 0
     e.work = 0
     e.idle = 0
@@ -464,7 +479,7 @@ fn (e mut Engine<T>&) runs(i I64, r0 I64, r1 I64) I64 {
             continue
         }
         end := r + 1
-        for end < r1 and end - r < Chunk and not (e.stopping and e.RowDone[end]): end++
+        for end < r1 and end - r < e.cut and not (e.stopping and e.RowDone[end]): end++
         e.units[3 * e.count] = i
         e.units[3 * e.count + 1] = r
         e.units[3 * e.count + 2] = end

@@ -1926,3 +1926,14 @@ thread, 32 chains of 300 sweeps, ms a search / ns a cell update / satisfied:
 (The units there carry small random tables: their cost, not a rule. A hand-set unit cannot penalize a clause: a unit
 only lowers the free energy, so a not-all-equal rule through units has to reward the satisfied patterns - what a
 fit finds.)
+
+## A settle's units cut to the threads (wt-sweepcut, 2026-11-21)
+
+A sweep's units are a population's rows in chunks of 128, so at batch 128 or less each population was one unit and a
+system's other threads sat idle (bench/sweep, H 1024, B 128: 2.1 ms at 1 thread and at 4). Now a sweep that is split
+over tasks (TaskWork, raised 2M -> 6M multiply-adds: below it the wakes cost more than they save) and has fewer units
+than threads cuts them to about a thread's share of a batch (at least 16 rows); otherwise units stay 128 rows, so a
+sweep run on one thread keeps its larger products. A row's sums do not depend on the cut (tested: results the same for
+every thread count). bench/sweep, 4 threads, us a sweep (two runs each, the machine noisy to about 25%): H 1024, B 128
+2056-2554 (1 thread) -> 845-861 (4 threads, was about 2200); H 256, B 128 189 -> 148; B 8 and 32 even with one thread
+(they were up to 1.5x slower).
