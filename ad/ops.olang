@@ -613,6 +613,21 @@ fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q t
     attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal), addQ, addK, addV)
 }
 
+# attention with no weights kept (kernels/attention's flash form): lse gets each row's log-sum-exp per head
+fn FlashAttention<S, A>(f mut attention.Flash<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool) {
+    om := rows(out)
+    qm, km, vm := rows(q), rows(k), rows(v)
+    attention.FlashAttention(f, om, qm, km, vm, lse, attention.Heads(heads, ctx, causal))
+}
+
+fn FlashAttentionBackward<S, A>(f mut attention.Flash<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, out tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
+    dqm := gradRows(dq)
+    dkm := gradRows(dk)
+    dvm := gradRows(dv)
+    gm, qm, km, vm, om := rows(dout), rows(q), rows(k), rows(v), rows(out)
+    attention.FlashAttentionGrad(f, dqm, dkm, dvm, gm, qm, km, vm, om, lse, attention.Heads(heads, ctx, causal), addQ, addK, addV)
+}
+
 # causal attention while decoding: rows are positions first ... of each sequence - a sequence's n rows in a run (one
 # sequence), or one row a sequence (a batch, one position a step) - its keys and values kept in its own part of the cache
 fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, cache mut Array<S>&, ctx I64, scores mut Array<A>&, first I64, heads I64) {
