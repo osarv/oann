@@ -1,0 +1,106 @@
+# nn/ternary - layers whose weights are ternary while training (BitNet b1.58, Ma et al. 2024): the latent weights are
+# F32 parameters as usual; the forward reads them quantized - each output row's scale the mean of its |w|, each weight
+# round(w / scale) clipped to -1, 0, +1, times the scale - and the backward passes the gradient straight through the
+# rounding to the latent weights (the straight-through estimator, Bengio et al. 2013). The trained layer's weights go to
+# kernels/ternary for inference by `Export`: the same quantization, so the product is the one trained.
+#
+#     q := ternary.Quantizer()                      # one per graph: an operation (Custom), kept as long as the graph
+#     layer := ternary.Linear.New(g, inputs, outputs)
+#     y := layer.Apply(g, q, x)                     # x W_q^T + b
+#     ...after training: t := layer.Export(g)       # kernels/ternary.Ternary
+
+import "../ad/graph"
+import "../tensor"
+import "../kernels/mat"
+import kt "../kernels/ternary"
+import "layers"
+
+# the quantizing operation: its input a weight matrix [out, in], its output that matrix's ternary values times each
+# row's scale; its gradient the output's, unchanged (straight through)
+type Quantizer struct() { }
+
+fn (q Quantizer&) Shape(inputs Array<tensor.Shape>&) tensor.Shape { return inputs[0] }
+
+fn (q mut Quantizer&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) {
+    w := inputs[0]
+    Quantize(out.Flat()!, w.Flat()!, w.Dim(0), w.Dim(1))
+}
+
+fn (q mut Quantizer&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
+    d, g := dinputs[0].Flat()!, dout.Flat()!
+    for i in range g.Len(): d[i] = g[i]
+}
+
+# out = w's rows quantized (rows x cols): kernels/ternary.Ternary.Quantize's rule, dequantized
+fn Quantize(out mut Array<F32>&, w Array<F32>&, rows I64, cols I64) {
+    for r in range rows {
+        sum F64 = 0.0
+        for c in range cols: sum += F64(w[r * cols + c]).Abs()
+        scale := sum / F64(cols) if sum > 0.0 else 1.0
+        for c in range cols: out[r * cols + c] = F32(scale * (F64(w[r * cols + c]) / scale).Round().Max(-1.0).Min(1.0))
+    }
+}
+
+# a dense layer of ternary weights: its latent weights and bias a layers.Dense's
+type Linear struct(D layers.Dense) { D }
+
+fn Linear.New(g mut graph.Graph<F32>&, inputs I64, outputs I64, bias Bool = true) Linear { return Linear(layers.Dense.New(g, inputs, outputs, bias)) }
+
+# x W_q^T + b, the weights read through q
+fn (l Linear&) Apply(g mut graph.Graph<F32>&, q mut Quantizer&, x graph.Var) graph.Var {
+    return g.Linear(x, g.Custom(q, l.D.W), l.D.B)
+}
+
+# the trained weights in kernels/ternary's form (the bias, if any, stays the graph's: g.Value(l.D.B))
+fn (l Linear&) Export(g graph.Graph<F32>&) kt.Ternary {
+    w := g.Value(l.D.W)
+    return kt.Ternary.Quantize(mat.Mat<F32>(w.Flat()!, 0, w.Dim(0), w.Dim(1), w.Dim(1)))
+}
+
+assert not Quantizer.Forward.Allocates, "quantizing weights allocates"
+assert not Quantizer.Backward.Allocates, "the straight-through gradient allocates"
+
+# ---- tests ----
+
+import "std/rand"
+import "optim"
+
+test Linear "a ternary layer learns a ternary map through the straight-through gradient, and its forward is the exported kernel's product" {
+    g := graph.Graph<F32>(32)
+    q := Quantizer()
+    x := g.Input(16)
+    layer := Linear.New(g, 16, 8, false)
+    y := layer.Apply(g, q, x)
+    t := g.Input(8)
+    loss := g.Mse(y, t)
+    r := rand.Rand(5)
+    try g.Plan(r) catch { unreachable }
+    # a target map with ternary weights: learnable exactly
+    target := Array<F32>(8 * 16)
+    for i in range target.Len(): target[i] = F32(r.Below(3)) - 1.0
+    xs, ts := g.Value(x).Flat()!, g.Value(t).Flat()!
+    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 0.01, decay = 0.0)
+    first, last := 0.0, 0.0
+    for step in range 400 {
+        for i in range xs.Len(): xs[i] = F32(r.Uniform(-1.0, 1.0))
+        for b in range 32 {
+            for j in range 8 {
+                s F32 = 0.0
+                for c in range 16: s += target[j * 16 + c] * xs[b * 16 + c]
+                ts[b * 8 + j] = s
+            }
+        }
+        g.Forward(32)
+        g.Backward(loss)
+        if step == 0: first = g.Scalar(loss)
+        last = g.Scalar(loss)
+        o.Step()
+    }
+    assert last < 0.05 * first, $first + " -> " + $last
+    # the forward is the exported kernel's product
+    g.Forward(32)
+    k := layer.Export(g)
+    out := Array<F32>(8)
+    kt.MatVec(out, k, xs[0:16])
+    for j in range 8: assert (out[j] - g.Value(y).Flat()![j]).Abs() < 1e-5
+}

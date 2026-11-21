@@ -1786,4 +1786,4 @@ lanes ran slower than one. Tested against the dequantized product. bench/ternary
 
 On the CPU it wins once F32's weights leave the caches (from about 1024 x 1024) and holds 16x the weights in the
 same memory; in cache, F32's FMAs are faster. The form is the FPGA's: adder trees over selected activations.
-Not yet: a ternary layer in ad/graph (training by the straight-through estimator) and 8-bit activations.
+nn/ternary trains such layers: `Quantizer`, an operation reading a latent F32 weight matrix as its absmean ternary values times each row's scale, its gradient passed straight through to the latent weights, and `Linear` over it, `Export` giving kernels/ternary's form with the same product (a test learns a ternary map to under 5% of its first loss and checks the exported MatVec against the graph's forward to 1e-5). Not yet: 8-bit activations.
