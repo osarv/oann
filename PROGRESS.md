@@ -1896,3 +1896,8 @@ T multiplied by Cooling each step (annealing). Tested on E = |x|^2 / 2: each ele
 (the batch's mean gradient, W kept symmetric). Tested: from planted 3-colourings (4 graphs of 60 cells a step, 150
 steps) the loss falls below 0.7 of its start and the fitted energy's chains find a proper colouring of a new graph of
 120 cells.
+
+`Sampler.Langevin` measured beside annealed Gibbs (bench/potts, 32 chains, 300 steps, T 0.3 -> 0.001, rate 1, one
+thread): Sudoku 715 ns a cell step, the best chain's energy 31.6 on average (Gibbs: 43 ns, energy 0 on 6-8 of 8);
+colouring 256 cells 73 ns, energy 19.3 (Gibbs 0). The relaxed search is the weaker and slower one on these discrete
+problems; it is kept for continuous relaxations, not made faster.

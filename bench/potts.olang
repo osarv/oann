@@ -17,7 +17,7 @@ fn main() ? io.Error, ParseError {
     chains := try args[1].ParseInt() if args.Len() > 1 else 32
     sweeps := try args[2].ParseInt() if args.Len() > 2 else 300
     threads := try args[3].ParseInt() if args.Len() > 3 else 1
-    try io.PutLn("case | ms a search | ns a cell update | solved | fit ns a cell")
+    try io.PutLn("case | ms a search | ns a cell update | solved | fit ns a cell | Langevin ns a cell step, lowest energy")
     r := rand.Rand(1)
     try run("sudoku 81 x 9", 81, 9, chains, sweeps, threads, r, true)
     for n in Array<I64>[256, 1024, 2048]: try run("colouring " + $n + " x 3", n, 3, chains, sweeps, threads, r, false)
@@ -25,7 +25,7 @@ fn main() ? io.Error, ParseError {
 
 fn run(name String&, n I64, k I64, chains I64, sweeps I64, threads I64, r mut rand.Rand&, sudoku Bool) ? io.Error {
     rounds := 8
-    total, updates, fit := 0.0, 0.0, 0.0
+    total, updates, fit, lang, langE := 0.0, 0.0, 0.0, 0.0, 0.0
     solved := 0
     for _ in range rounds {
         e, y, f, m := sudokuCase(r) if sudoku else colourCase(n, r)
@@ -41,8 +41,13 @@ fn run(name String&, n I64, k I64, chains I64, sweeps I64, threads I64, r mut ra
         t1 := time.Now()
         for _ in range 20: m.PseudoGrad(e, f, y, gw, gb, L)
         fit += F64(time.Since(t1)) / F64(20 * n)
+        s.Start(r)
+        t2 := time.Now()
+        s.Langevin(m, e, f, potts.Schedule(sweeps, 0.3, 0.001), 1.0)
+        lang += F64(time.Since(t2)) / F64(chains * sweeps * n)
+        langE += s.Energies[s.Best()]
     }
-    try io.PutLn(name + " | " + $(total / F64(rounds)).Fixed(1) + " | " + $(total * 1e6 / updates).Fixed(1) + " | " + $solved + "/" + $rounds + " | " + $(fit / F64(rounds)).Fixed(1))
+    try io.PutLn(name + " | " + $(total / F64(rounds)).Fixed(1) + " | " + $(total * 1e6 / updates).Fixed(1) + " | " + $solved + "/" + $rounds + " | " + $(fit / F64(rounds)).Fixed(1) + " | " + $(lang / F64(rounds)).Fixed(1) + ", " + $(langE / F64(rounds)).Fixed(2))
 }
 
 # a planted 3-colourable graph: each cell joined to 3 others of another colour, both ways; no features
