@@ -1635,3 +1635,20 @@ folds them (the same value, NaNs as before), and SoftmaxRun / SoftmaxRunTo use i
 64 364 -> 262 us, at 256 1278 -> 527 us; bench/lm's attention forward 4.0-4.4 -> 3.7-4.2 ms (its causal rows at context
 64 average 32 elements, where little is gained). The products of attention at small context (15-24 GMAC/s, tiny batched
 matrices) are what is left there.
+
+## Batched key-value-cached decoding (wt-batchdecode, 2026-11-21)
+
+Sampling many continuations (best-of-N proposers, reranking) ran the whole context through the model for every new
+token: a graph of Batch sequences, one Forward over the context a token. A decoding graph now takes a batch: planned
+with decode set and Batch > 1, its batched nodes are stored position by position ([ctx, batch, ...]), so one position of
+every sequence is a run of rows that every operation reads as a batch; attention keeps a key-value cache per sequence;
+positions and rotary angles count from the rows in use. Such a graph runs one position a Forward (views are refused by
+name). `generate.CachedBatch(g, m, prompts, p, count, temperature, r)` prefills the prompts a position a step and then
+samples every row a token a step. Tested: each row greedily the tokens its prompt alone decodes to, and every logit the
+whole sequences' within 1e-12. `bench/sample` (`make samplebench`), one thread, random weights:
+
+| model | batch | prompt + new | rerun | cached batch |
+|---|---|---|---|---|
+| 2 x 128, vocabulary 512 | 64 | 16 + 48 | 1145 tokens/s | 32754 tokens/s (28.6x) |
+| 4 x 128, vocabulary 512 | 16 | 16 + 48 | 733 | 18973 (25.9x) |
+

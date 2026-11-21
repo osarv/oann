@@ -234,6 +234,20 @@ type Node struct(Kind Op, Dims tensor.Shape, Batched Bool) {
     Watch Bool = false          # its gradient wanted though it depends on no parameter (an input's)
 }
 
+# a batch decoding several sequences at once stores its batched nodes position by position - [ctx, batch, ...] - so that
+# one position of every sequence is a run of rows, which every operation reads as it reads a batch
+fn positionMajor(dims tensor.Shape&) tensor.Shape {
+    st := Array<I64>(6)
+    n I64 = 1
+    for a := dims.Rank - 1, a >= 2, a-- {
+        st[a] = n
+        n *= dims[a]
+    }
+    st[0] = n
+    st[1] = n * dims[0]
+    return tensor.Shape.Of(...st[0:dims.Rank])
+}
+
 # the row-major strides of dims
 fn rowMajor(dims tensor.Shape&) tensor.Shape {
     st := Array<I64>(6)
@@ -429,7 +443,9 @@ fn (g Graph<T>&) Check() ? tensor.ShapeError {
 
 fn (g mut Graph<T>&) add(kind Op, dims tensor.Shape, batched Bool) Var {
     if g.planned and not g.Eager: unreachable "oann: operations are recorded before Plan"
-    g.nodes.Push(Node(kind, dims, batched))
+    nd := Node(kind, dims, batched)
+    if g.Decode and batched and dims.Rank >= 2 and dims[0] > 1: nd.Strides = positionMajor(dims)
+    g.nodes.Push(nd)
     v := Var(g.nodes.Len() - 1)
     if g.Eager: g.eagerNode(v)
     return v
@@ -832,6 +848,10 @@ fn (g mut Graph<T>&) customRoom() {
 
 # a view of x's storage: these dims and strides from offset (relative to x's own first element)
 fn (g mut Graph<T>&) view(kind Op, x Var, dims tensor.Shape, strides tensor.Shape, offset I64) Var {
+    if g.Decode and g.Batch > 1 {
+        g.fail("views (Reshape, Permute, Slice, Expand) on a graph decoding " + $g.Batch + " sequences at once")
+        return x
+    }
     nd := g.nodes[x]
     base := nd.Base if nd.Base >= 0 else I64(x)
     at := (nd.Offset if nd.Base >= 0 else 0) + offset
@@ -942,7 +962,7 @@ fn (g Graph<T>&) extrasOf(i I64) extras {
 # and a row of scores
 fn (g Graph<T>&) attentionExtras(nd Node&, heads I64) extras {
     t := nd.Dims[1]
-    if g.Decode: return extras(2 * t * nd.Dims[2], 0, 0, t)
+    if g.Decode: return extras(2 * t * nd.Dims[2] * nd.Dims[0], 0, 0, t)
     p := nd.Dims[0] * t * heads * t
     return extras(p, p, 0, 0)
 }
@@ -1933,6 +1953,7 @@ fn (g mut Graph<T>&) Forward(n I64) {
     limit := g.nodes[0].Dims[1] if g.Decode else g.Batch
     if n < 1 or n > g.Batch and not g.Decode: unreachable "oann: Forward on " + $n + " entries of a graph planned for " + $g.Batch
     if g.Decode and g.Pos + n > limit: unreachable "oann: decoding positions " + $g.Pos + " ... " + $(g.Pos + n - 1) + " of " + $limit
+    if g.Decode and g.Batch > 1 and n > 1: unreachable "oann: a decoding graph of " + $g.Batch + " sequences runs one position a Forward"
     g.N = n
     if n != g.viewsN: g.makeViews()
     if Gpu {

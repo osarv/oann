@@ -551,8 +551,9 @@ fn Positions<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, table tensor.Ten
     ym := rows(y)
     xm := rows(x)
     t := rows(table)
+    n := y.Dim(1)               # the positions in use: a row's is first + its index among them
     for r in range ym.Rows {
-        p := t.Off + (first + r % ctx) % t.Rows * t.Ld
+        p := t.Off + (first + r % n) % t.Rows * t.Ld
         for c in range ym.Cols: ym.Data[ym.Off + r * ym.Ld + c] = S(A(xm.Data[xm.Off + r * xm.Ld + c]) + A(t.Data[p + c]))
     }
 }
@@ -573,7 +574,7 @@ fn PositionsBackward<S, A>(dy tensor.Tensor<S>, ctx I64, first I64, dx mut tenso
 fn Rope<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64) {
     try y.Convert(x) catch { unreachable }
     ym := rows(y)
-    attention.Rope(ym, first, attention.Heads(heads, ctx), base)
+    attention.Rope(ym, first, attention.Heads(heads, y.Dim(1)), base)
 }
 
 # dx (+)= dy rotated back; tmp holds dy's elements while they are rotated, where dx is added to
@@ -612,15 +613,24 @@ fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q t
     attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal), addQ, addK, addV)
 }
 
-# causal attention while decoding: rows are positions first ... of one sequence, keys and values kept in the cache
+# causal attention while decoding: rows are positions first ... of each sequence - a sequence's n rows in a run (one
+# sequence), or one row a sequence (a batch, one position a step) - its keys and values kept in its own part of the cache
 fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, cache mut Array<S>&, ctx I64, scores mut Array<A>&, first I64, heads I64) {
     qm := rows(q)
     d := qm.Cols
-    keys := mat.Mat<S>(cache, 0, ctx, d, d)
-    values := mat.Mat<S>(cache, ctx * d, ctx, d, d)
     om := rows(out)
     km, vm := rows(k), rows(v)
-    attention.AttentionStep(om, qm, km, vm, keys, values, scores, first, heads)
+    n := q.Dim(1)
+    for b in range q.Dim(0) {
+        at := b * 2 * ctx * d
+        keys := mat.Mat<S>(cache, at, ctx, d, d)
+        values := mat.Mat<S>(cache, at + ctx * d, ctx, d, d)
+        qb := mat.Mat<S>(qm.Data, qm.Off + b * n * qm.Ld, n, d, qm.Ld)
+        kb := mat.Mat<S>(km.Data, km.Off + b * n * km.Ld, n, d, km.Ld)
+        vb := mat.Mat<S>(vm.Data, vm.Off + b * n * vm.Ld, n, d, vm.Ld)
+        ob := mat.Mat<S>(om.Data, om.Off + b * n * om.Ld, n, d, om.Ld)
+        attention.AttentionStep(ob, qb, kb, vb, keys, values, scores, first, heads)
+    }
 }
 
 # ---- dropout ----

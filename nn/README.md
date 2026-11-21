@@ -19,7 +19,7 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   language model over any batch source with `Random` and `At` (data/text's `Windows`, data/tokens' `Tokens`); `Fit`, a
   whole run with reports, a record through io/runlog and checkpoints; `Save`/`Resume`, safetensors files holding the
   parameters, the optimizer's state and the step, which resume a run bit for bit.
-- `generate.olang` - `Sample` and the generators: `CachedTokens`/`Cached` through a decoding graph's key-value cache,
+- `generate.olang` - `Sample` and the generators: `CachedTokens`/`Cached` through a decoding graph's key-value cache, `CachedBatch` (a batch of sequences decoded at once on a graph planned to decode Batch sequences: a forward of one position a sequence a step, each sequence its own cache - several samples of a prompt as rows),
   `RerunTokens`/`Rerun` running the context again, on token ids and on text.
 
 - `message.olang` - message passing over a sparse graph: `Edges` (each node's incoming edges, compressed rows, set afresh from an edge list each batch, or by `SetDense` from a batch of dense adjacency matrices - entry (v, u) an edge u -> v of that weight - without allocating), `Passing` (an operation of a `Graph<F32>` through `Custom`: each node's message the `Agg.Sum` or `Agg.Mean` of its in-neighbours' rows, its backward the transpose), and `Layer` (act(x Self^T + message Msg^T + B)). A batch of graphs is one graph of disjoint parts, a part's nodes a run of rows.
