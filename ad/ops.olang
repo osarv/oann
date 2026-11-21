@@ -790,7 +790,9 @@ fn DeltaRule<S, A>(work mut scan.Work<A>&, out mut tensor.Tensor<S>&, state mut 
     zero(state)
     om := rows(out)
     qm, km, vm, bm, gm := rows(q), rows(k), rows(v), rows(beta), rows(gate)
-    scan.DeltaRule(work, om, state, qm, km, vm, bm, gm, scan.Seq(ctx, 64, heads), keep)
+    at := scan.Seq(ctx, 64, heads)
+    # the chunked (WY) form where it is faster: heads of 128 or wider (measured, bench/scan; at 64 the forms tie)
+    if qm.Cols / heads >= 128 and ctx >= 64 { scan.DeltaRuleChunked(work, om, state, qm, km, vm, bm, gm, at, keep) } else { scan.DeltaRule(work, om, state, qm, km, vm, bm, gm, at, keep) }
 }
 
 fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, ctx I64, heads I64, keep Array<A>&, dstate mut mat.Mat<A>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool, dbeta mut tensor.Tensor<S>&, addB Bool, dgate mut tensor.Tensor<S>&, addG Bool) {
@@ -806,7 +808,9 @@ fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tens
     dbm := rows(dbeta)
     dgm := rows(dgate)
     om, qm, km, vm, bm, gm := rows(dout), rows(q), rows(k), rows(v), rows(beta), rows(gate)
-    scan.DeltaRuleGrad(work, dqm, dkm, dvm, dbm, dgm, dstate, om, qm, km, vm, bm, gm, keep, scan.Seq(ctx, 64, heads), true)
+    at := scan.Seq(ctx, 64, heads)
+    # the chunked form: 1.6-2.7x the sequential one (bench/scan)
+    if ctx >= 64 { scan.DeltaRuleGradChunked(work, dqm, dkm, dvm, dbm, dgm, dstate, om, qm, km, vm, bm, gm, keep, at, true) } else { scan.DeltaRuleGrad(work, dqm, dkm, dvm, dbm, dgm, dstate, om, qm, km, vm, bm, gm, keep, at, true) }
 }
 
 # ---- reductions ----

@@ -1836,3 +1836,11 @@ spike count (saturating at the accumulator's width), a table exp and a fixed-poi
 xorshift noise with an approximate normal. Moved here from an experiment, where they were written generic; on the
 way the table exp's index was found rounding to nearest while each entry holds its interval's midpoint - a bias of
 up to half a step (0.023 at d 0.14 with 32 entries a unit) - and now truncates (within 0.02 everywhere, tested).
+
+## The graph's delta rule on the chunked form (wt-graphchunk, 2026-11-21)
+
+olang 2e3a77a96 cleared the chunked delta rule's allocation fact (repro/chunkfacts, removed), so ad/graph takes it:
+the backward always over a context of 64 or more, the forward where heads are 128 wide or more (at 64 the forms tie).
+The chunked forms are pinned allocation-free. bench/deltagraph, a DeltaRule node, one thread, ms forward / backward:
+4 x 1024, 4 heads of 64: 16.0 / 93.8 -> 15.4 / 55.5 (a step 1.55x); 1 x 4096, 8 heads of 128: 119.0 / 731.7 -> 91.6 /
+274.6 (2.3x).
