@@ -1563,3 +1563,10 @@ free settle's own fixed point is the wrong answer.
 energy, a verifier), the best kept per row - a fast proposer ranked by a slower energy. Tested on a proposer walking a
 grid and a squared-distance scorer.
 
+Its settled-pair form, `Descent.AddMargin(m, weight, start, right)` (wt-margin2): both states settled - the state as
+it is and a second settle from `start` - the caller's `right(z, row)` judging each; a row with one right and one wrong
+settled state whose energies are less than m apart adds weight (dE/dtheta(right) - dE/dtheta(wrong)) on top of what
+ParamGrads holds, so it serves as a fine-tuning term beside Unrolled, Implicit or EP. Tested on the double wells: the
+term is weight times the summed hinge's derivative (central differences, within 1e-6) added to the gradient already
+there, and its steps put every right state m below the wrong one.
+

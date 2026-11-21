@@ -21,6 +21,10 @@
 #   dE_r/dtheta(free), averaged over the batch: the answer reached from the target pushed down, the one reached from the
 #   other start pushed up, until the target's basin is the deeper by m. It needs the energy row by row (RowEnergy: a
 #   node of one value a row summing to E), and no cost; Active says how many rows took the step.
+# The same contrast between two settled states as a term added to any trainer's gradient: AddMargin(m, weight, start,
+# right) settles a second time from start, asks right which of each row's two settled states answers it, and where
+# exactly one does and the right one's energy is not m below the wrong one's, adds weight (dE/dtheta(right) -
+# dE/dtheta(wrong)) to ParamGrads - a fine-tuning term beside Unrolled, Implicit or EP.
 # The first two need second derivatives the graph does not record: H v and (d g/dtheta)^T v are central differences of
 # the first derivatives along v, (dE/dx, dE/dtheta)(x +- eps v) / (2 eps) with eps = Eps / |v| - two Forward and
 # Backward passes per product, exact for an energy quadratic in x up to rounding, O(Eps^2) otherwise.
@@ -378,6 +382,46 @@ fn (d mut Descent<T>&) margin(m F64) {
     for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / F64(rows)
 }
 
+# the settled-pair margin, added to ParamGrads (after a Train or any Backward): the state as it is (the first settled
+# state) against a second settle from start; right(z, row) tells whether row's part of state z answers it. A row with
+# one right and one wrong settled state, E_r(right) > E_r(wrong) - m, adds weight (dE/dtheta(right) - dE/dtheta(wrong));
+# rows that do not are given the same state in both passes and cancel. The state is left as it was. The rows that added
+fn (d mut Descent<T>&) AddMargin(m F64, weight F64, start Array<F64>&, right fn&(z Array<F64>&, row I64) Bool) I64 {
+    if d.RowEnergy == graph.None: unreachable "oann: Descent.AddMargin needs RowEnergy, the energy row by row"
+    g := d.G
+    s := g.Value(d.X).Flat()!
+    for i in range d.n: d.free[i] = F64(s[i])
+    pg := g.ParamGrads().Flat()!
+    for i in range d.p: d.acc[i] = F64(pg[i])
+    d.rowsAt(d.free, d.eF)
+    for i in range d.n: d.x[i] = start[i]
+    d.Nudged = d.settle(0.0, 0)
+    d.rowsAt(d.x, d.eT)
+    rows := g.Batch
+    per := d.n / rows
+    d.Active = 0
+    for r in range rows {
+        a, b := right(d.free, r), right(d.x, r)
+        aRight, bRight := a and not b, b and not a
+        on := (aRight and d.eF[r] > d.eT[r] - m) or (bRight and d.eT[r] > d.eF[r] - m)
+        if on: d.Active++
+        # up: the right state (or, off, the first state in both), other: the wrong one
+        for i in range r * per, (r + 1) * per {
+            d.up[i] = d.free[i] if aRight or not on else d.x[i]
+            d.down[i] = d.x[i] if aRight and on else (d.free[i] if on else d.up[i])
+        }
+    }
+    if d.Active > 0 {
+        d.at(d.up, 0.0)
+        for i in range d.p: d.acc[i] += weight * d.gp[i]
+        d.at(d.down, 0.0)
+        for i in range d.p: d.acc[i] -= weight * d.gp[i]
+    }
+    d.put(d.free)
+    for i in range d.p: pg[i] = T(d.acc[i])
+    return d.Active
+}
+
 # each row's energy at the state x (a Forward) into out
 fn (d mut Descent<T>&) rowsAt(x Array<F64>&, out mut Array<F64>&) {
     g := d.G
@@ -654,3 +698,41 @@ test Descent.Train "Margin: the hinge between the target's well and the other st
     for r in range rows: assert d.eT[r] + m <= d.eF[r] + 1e-9 or (d.x[r] - d.free[r]).Abs() <= d.Apart
 }
 
+
+test Descent.AddMargin "the settled-pair margin: two settles, the right one judged by the caller; the term added is weight times the gradient of the summed hinge, on top of what ParamGrads held, and its steps put every right state m below the wrong one" {
+    rows, m, weight := 8, 1.0, 0.3
+    g, x, rowE, e, c := wells(rows, 0.05)
+    d := Descent<F64>(g, x, e, c)
+    d.RowEnergy = rowE
+    d.Rate = 0.05
+    t := Array<F64>(rows)
+    for r in range rows: t[r] = 1.0 if r % 2 == 0 else -1.0
+    right := fn(z Array<F64>&, row I64) Bool { return z[row] * t[row] > 0.0 }
+    d.Settle(0.0)                                   # the first settled state: every row in the wrong well
+    first := Array<F64>(rows)
+    for r in range rows: first[r] = d.x[r]
+    pg := g.ParamGrads().Flat()!
+    pg[0] = 0.25                                    # what a trainer left there
+    active := d.AddMargin(m, weight, t, right)
+    assert active == rows and g.Value(x).Flat()![0] == first[0], "the state is left as it was"
+    yr := Array<F64>(rows)
+    for r in range rows: yr[r] = d.x[r]
+    ws := g.Params().Flat()!
+    w := ws[0]
+    ws[0] = w + 1e-6
+    up := hingeAt(d, yr, first, m)
+    ws[0] = w - 1e-6
+    want := 0.25 + weight * F64(rows) * (up - hingeAt(d, yr, first, m)) / 2e-6
+    ws[0] = w
+    got := g.ParamGrads().Flat()![0]
+    assert (got - want).Abs() < 1e-6 * (1.0 + want.Abs()), "AddMargin's gradient " + $got + " against " + $want
+    steps I64 = 0
+    for d.Active > 0 and steps < 500 {
+        for r in range rows: g.Value(x).Flat()![r] = first[r]
+        g.ParamGrads().Flat()![0] = 0.0
+        d.AddMargin(m, weight, t, right)
+        ws[0] -= 0.1 * g.ParamGrads().Flat()![0]
+        steps++
+    }
+    assert d.Active == 0 and steps < 500, $steps + " steps"
+}
