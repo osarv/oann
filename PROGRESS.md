@@ -1458,3 +1458,25 @@ Seed 1, 3 epochs, 784-128-10, batches of 32 (the test answers settle as they do 
 So an answer needs a third to a half of the sweeps the residual asks for at a cost of 0.02-0.14 points (k 3-5); one
 seed. Reproduce: `make mnistlearn ARGS="3 60000 128 32 1 0.001 0.5 1 1 0.1 200 1 0 plain spectral 5"`.
 
+## Message passing over sparse graphs, sum or mean (wt-message, 2026-11-21)
+
+`nn/message`: `Edges` holds each node's incoming edges as compressed rows, refilled from an edge list per batch without
+allocating; `Passing` is a `Graph<F32>` operation (through `Custom`) giving each node the sum (`Agg.Sum`) or the mean
+(`Agg.Mean`) of its in-neighbours' rows, its backward the transpose; `Layer` is act(x Self^T + m Msg^T + B). A batch of
+graphs is one graph of disjoint parts. Tested against the edge list directly, values and gradients, both aggregations.
+
+`examples/graph_count` (`make graphcount`): nodes red or blue; two message-passing layers of width 16 and a dense head;
+1500 steps of AdamW on batches of 256 nodes of small graphs (8-16 nodes, 1-4 in-edges a node), then 40 batches each of
+graphs like them and of larger, denser ones (64-128 nodes, 1-10 in-edges). Node accuracy, seeds 1 / 2 / 3:
+
+| task | aggregation | small graphs | larger graphs |
+|---|---|---|---|
+| at least three red in-neighbours | sum | 100 / 100 / 100% | 92.8 / 96.8 / 95.3% |
+| | mean | 93.9 / 94.5 / 93.8% | 58.4 / 60.6 / 59.0% |
+| more red than blue in-neighbours | sum | 100 / 100 / 100% | 99.98 / 100 / 98.9% |
+| | mean | 100 / 100 / 100% | 95.1 / 94.9 / 94.8% |
+
+A mean cannot count (it loses the degree), so it misses the counting task even on the graphs it was trained on and
+falls to near chance on larger ones; a sum both counts and, from two colour columns, compares (red - blue), so it holds
+up on graphs larger and denser than any it saw. A run takes half a second.
+

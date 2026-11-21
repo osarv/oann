@@ -1,0 +1,202 @@
+# nn/message - message passing over a sparse graph: each node's message is the sum - or the mean - of its
+# in-neighbours' rows, as one operation of the autodiff graph (ad/graph's Custom), and a layer of it.
+#
+# The nodes are the rows of the input (every axis but the last flattened): a batch of graphs is laid out as one graph
+# whose parts share no edge - each part's nodes a run of rows, its edges among them - so graphs of any size go through
+# one planned graph; rows no edge reaches get a zero message. The edges are `Edges`, a sparse pattern of the incoming
+# edges of every node (compressed rows: node v's sources src[ptr[v]] .. src[ptr[v + 1] - 1]), set afresh for each batch
+# without allocating once its room is made.
+#
+# Sum or mean. A mean message is the same size whatever a node's degree; a sum grows with it, so a model can count -
+# the aggregation that carries to graphs larger than those it was trained on where what matters is how many neighbours
+# have a property (Xu et al. 2019, "How powerful are graph neural networks?"). Both are offered; neither is the default.
+#
+#     edges := message.Edges(nodes, most)
+#     sum := message.Passing(edges, message.Agg.Sum)    # the operation, kept as long as the graph
+#     layer := message.Layer.New(g, D, D)
+#     h := layer.Apply(g, sum, x)                       # act(x Self^T + message(x) Msg^T + B)
+#     ... each batch: edges.Set(src, dst, count), then Forward and Backward
+
+import "../ad/graph"
+import "../tensor"
+import "layers"
+import "../kernels/mat"
+
+# how a node's incoming rows are combined: added, or added and divided by the node's in-degree (0 with none)
+type Agg enum { Sum, Mean }
+
+# the incoming edges of nodes nodes, room for up to most of them: Set fills it from an edge list
+type Edges struct(nodes I64, most I64) {
+    Nodes I64 = nodes
+    Count I64 = 0
+    ptr mut Array<I64>& = Array<I64>(nodes + 1)
+    src mut Array<I32>& = Array<I32>(most)
+    next mut Array<I64>& = Array<I64>(nodes)        # Set's cursor per node
+}
+
+# the edges src[e] -> dst[e] for e < count (a node may appear in any number of them, an edge more than once; a self
+# loop is an edge like any other): grouped by destination, in the order given. Allocates nothing; count must be at
+# most the room made
+fn (e mut Edges&) Set(src Array<I32>&, dst Array<I32>&, count I64) {
+    if count > e.src.Len(): unreachable "message.Edges: " + $count + " edges and room for " + $e.src.Len()
+    e.Count = count
+    for v in range e.Nodes + 1: e.ptr[v] = 0
+    for i in range count: e.ptr[I64(dst[i]) + 1] += 1
+    for v in range e.Nodes: e.ptr[v + 1] += e.ptr[v]
+    for v in range e.Nodes: e.next[v] = e.ptr[v]
+    for i in range count {
+        d := I64(dst[i])
+        e.src[e.next[d]] = src[i]
+        e.next[d] += 1
+    }
+}
+
+# node v's in-degree
+fn (e Edges&) Degree(v I64) I64 { return e.ptr[v + 1] - e.ptr[v] }
+
+# the weight of each of v's incoming rows: 1 for a sum, one over its in-degree for a mean
+fn (e Edges&) weight(v I64, agg Agg) F32 {
+    n := e.Degree(v)
+    if agg == Agg.Sum or n == 0: return 1.0
+    return 1.0 / F32(n)
+}
+
+# out = A x (sum) or D^-1 A x (mean), x and out nodes x width, A the adjacency (row v: v's in-neighbours)
+fn (e Edges&) Spread(out mut Array<F32>&, x Array<F32>&, width I64, agg Agg) {
+    for v in range e.Nodes {
+        o := v * width
+        for j in range width: out[o + j] = 0.0
+        w := e.weight(v, agg)
+        for k in range e.ptr[v], e.ptr[v + 1] {
+            s := I64(e.src[k]) * width
+            for j in range width: out[o + j] += w * x[s + j]
+        }
+    }
+}
+
+# dx = A^T dout (with the mean's weights): every edge u -> v hands v's gradient back to u
+fn (e Edges&) Gather(dx mut Array<F32>&, dout Array<F32>&, width I64, agg Agg) {
+    for i in range e.Nodes * width: dx[i] = 0.0
+    for v in range e.Nodes {
+        o := v * width
+        w := e.weight(v, agg)
+        for k in range e.ptr[v], e.ptr[v + 1] {
+            s := I64(e.src[k]) * width
+            for j in range width: dx[s + j] += w * dout[o + j]
+        }
+    }
+}
+
+# the message of every node as an operation of a Graph<F32> (Custom): its input's rows the nodes (as many as the
+# edges' Nodes), its output the same shape. The graph keeps a reference to it: made where the graph is, it lives as
+# long; one serves every layer that passes messages over the same edges the same way
+type Passing struct(edges mut Edges&, agg Agg) {
+    E mut Edges& = edges
+    How Agg = agg
+}
+
+fn (p Passing&) Shape(inputs Array<tensor.Shape>&) tensor.Shape { return inputs[0] }
+
+fn (p mut Passing&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) {
+    x := inputs[0]
+    p.E.Spread(out.Flat()!, x.Flat()!, x.Dim(x.Rank() - 1), p.How)
+}
+
+fn (p mut Passing&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
+    p.E.Gather(dinputs[0].Flat()!, dout.Flat()!, dout.Dim(dout.Rank() - 1), p.How)
+}
+
+# a message-passing layer: h = act(x Self^T + m Msg^T + B), m each node's message (Agg of its in-neighbours' rows) -
+# a node's own row and its neighbourhood's weighed apart (GraphSAGE's form; with Agg.Sum and a sum over the self term
+# it is GIN's). Plain data, as nn/layers' layers are; the aggregation is the Passing it is applied with
+type Layer struct(Self layers.Dense, Msg layers.Dense, Act mat.Act) {
+    Self
+    Msg
+    Act
+}
+
+# a layer from inputs to outputs, the self term with a bias, the message's without
+fn Layer.New(g mut graph.Graph<F32>&, inputs I64, outputs I64, act mat.Act = mat.Act.Relu) Layer {
+    return Layer(layers.Dense.New(g, inputs, outputs), layers.Dense.New(g, inputs, outputs, false), act)
+}
+
+# the layer over x's rows (the nodes of p's edges), recorded on g; the messages read the edges as they are at each
+# Forward
+fn (l Layer&) Apply(g mut graph.Graph<F32>&, p mut Passing&, x graph.Var) graph.Var {
+    m := g.Custom(p, x)
+    return g.Act(g.Add(l.Self.Apply(g, x), l.Msg.Apply(g, m)), l.Act)
+}
+
+assert not Edges.Set.Allocates, "setting a batch's edges allocates"
+assert not Passing.Forward.Allocates, "message passing allocates"
+assert not Passing.Backward.Allocates, "message passing's backward allocates"
+
+# ---- tests ----
+
+import "std/rand"
+
+# a reference: out[v] = w(v) sum over edges u -> v of x[u], straight from the edge list
+fn referenceOf(x Array<F32>&, width I64, nodes I64, src Array<I32>&, dst Array<I32>&, count I64, agg Agg) Array<F64> {
+    out := Array<F64>(nodes * width)
+    deg := Array<I64>(nodes)
+    for i in range count: deg[I64(dst[i])] += 1
+    for i in range count {
+        d, u := I64(dst[i]), I64(src[i])
+        w F64 = 1.0 if agg == Agg.Sum else 1.0 / F64(deg[d])
+        for j in range width: out[d * width + j] += w * F64(x[u * width + j])
+    }
+    return out
+}
+
+test Passing "sum and mean messages are the edge list's, every edge once, nodes without edges zero; the backward is the transpose" {
+    r := rand.Rand(3)
+    nodes, width, count := 12, 5, 30
+    src := Array<I32>(count)
+    dst := Array<I32>(count)
+    for i in range count {
+        src[i] = I32(r.Below(nodes))
+        dst[i] = I32(r.Below(nodes - 2))          # the last two nodes receive nothing
+    }
+    e := Edges(nodes, 40)
+    e.Set(src, dst, count)
+    for agg in Array<Agg>[Agg.Sum, Agg.Mean] {
+        g := graph.Graph<F32>(nodes)
+        x := g.Param(graph.Init.Uniform(-1.0, 1.0), false, nodes, width)
+        p := Passing(e, agg)
+        m := g.Custom(p, x)
+        w := g.Constant(nodes, width)
+        loss := g.Sum(g.Sum(g.Mul(m, w)))
+        try g.Plan(r) catch { unreachable }
+        xs := g.Value(x).Flat()!
+        ws := g.Value(w).Flat()!
+        for i in range nodes * width {
+            xs[i] = F32(r.Uniform(-1.0, 1.0))
+            ws[i] = F32(r.Uniform(-1.0, 1.0))
+        }
+        g.Forward(nodes)
+        g.Backward(loss)
+        want := referenceOf(xs, width, nodes, src, dst, count, agg)
+        got := g.Value(m).Flat()!
+        for i in range nodes * width: assert (F64(got[i]) - want[i]).Abs() < 1e-5, $agg + " " + $i
+        for j in range width: assert got[(nodes - 1) * width + j] == 0.0
+        # d loss / d x[u] = sum over edges u -> v of w(v) ws[v]
+        dx := g.Grad(x).Flat()!
+        dwant := referenceOf(ws, width, nodes, dst, src, count, Agg.Sum)
+        if agg == Agg.Mean {
+            for i in range nodes * width: dwant[i] = 0.0
+            for k in range count {
+                d, u := I64(dst[k]), I64(src[k])
+                for j in range width: dwant[u * width + j] += F64(ws[d * width + j]) / F64(e.Degree(d))
+            }
+        }
+        for i in range nodes * width: assert (F64(dx[i]) - dwant[i]).Abs() < 1e-5, $agg + " gradient " + $i
+    }
+}
+
+test Edges "set again for another batch, the pattern is the new one and nothing is allocated" {
+    e := Edges(4, 6)
+    e.Set(Array<I32>[0, 1, 2], Array<I32>[3, 3, 0], 3)
+    assert e.Degree(3) == 2 and e.Degree(0) == 1 and e.Degree(1) == 0
+    e.Set(Array<I32>[3, 3, 3, 3, 0, 1], Array<I32>[1, 1, 2, 2, 2, 2], 6)
+    assert e.Degree(3) == 0 and e.Degree(1) == 2 and e.Degree(2) == 4 and e.Count == 6
+}

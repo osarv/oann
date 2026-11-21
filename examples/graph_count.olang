@@ -1,0 +1,97 @@
+# Message passing over random graphs (nn/message), sum against mean aggregation. Each node is red or blue; two node
+# tasks: count - does the node have at least three red in-neighbours - and majority - does it have more red than blue
+# in-neighbours. A model is two message-passing layers of width 16 and a dense layer to two classes, trained on small
+# graphs (8-16 nodes, 1-4 incoming edges a node) and tested on graphs like them and on larger, denser ones (64-128
+# nodes, 1-10 incoming edges a node). A batch is 256 nodes: whole graphs laid one after another, the rows left over
+# isolated and unlabelled. Arguments, all optional: training steps (1500), seed (1).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "../ad/graph"
+import "../nn/message"
+import "../nn/layers"
+import "../nn/optim"
+
+Rows I64 = 256
+
+# a batch of random graphs into the rows: colours (one-hot, two columns), edges, labels for task (0 count, 1
+# majority); graphs of lo .. hi nodes, each node with 1 .. deg incoming edges from the same graph
+fn fill(r mut rand.Rand&, x mut Array<F32>&, edges mut message.Edges&, labels mut Array<I32>&, src mut Array<I32>&, dst mut Array<I32>&, task I64, lo I64, hi I64, deg I64) {
+    for i in range Rows * 2: x[i] = 0.0
+    for i in range Rows: labels[i] = -1
+    count I64 = 0
+    at I64 = 0
+    for {
+        n := lo + r.Below(hi - lo + 1)
+        if at + n > Rows: break
+        for v in range n: x[(at + v) * 2 + r.Below(2)] = 1.0
+        for v in range n {
+            red, blue := 0, 0
+            for _ in range 1 + r.Below(deg) {
+                u := at + r.Below(n)
+                src[count], dst[count] = I32(u), I32(at + v)
+                count += 1
+                if x[u * 2] == 1.0: red += 1
+                else: blue += 1
+            }
+            labels[at + v] = I32(1 if (red >= 3 if task == 0 else red > blue) else 0)
+        }
+        at += n
+    }
+    edges.Set(src, dst, count)
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    steps := try args[1].ParseInt() if args.Len() > 1 else 1500
+    seed := U64(try args[2].ParseInt()) if args.Len() > 2 else U64(1)
+    most := Rows * 10
+    for task in range 2 {
+        for agg in Array<message.Agg>[message.Agg.Sum, message.Agg.Mean] {
+            r := rand.Rand(seed)
+            edges := message.Edges(Rows, most)
+            pass := message.Passing(edges, agg)
+            g := graph.Graph<F32>(Rows)
+            x := g.Input(2)
+            y := g.Classes()
+            l1 := message.Layer.New(g, 2, 16)
+            l2 := message.Layer.New(g, 16, 16)
+            head := layers.Dense.New(g, 16, 2)
+            logits := head.Apply(g, l2.Apply(g, pass, l1.Apply(g, pass, x)))
+            loss := g.CrossEntropy(logits, y)
+            try g.Plan(r) catch e { unreachable "the model's shapes: " + $e }
+            o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 0.01)
+            src, dst := Array<I32>(most), Array<I32>(most)
+            xs := g.Value(x).Flat()!
+            ys := g.Ints(y).Flat()!
+            for _ in range steps {
+                fill(r, xs, edges, ys, src, dst, task, 8, 16, 4)
+                g.Forward(Rows)
+                g.Backward(loss)
+                o.Step()
+            }
+            small := accuracy(g, r, edges, x, y, logits, src, dst, task, 8, 16, 4)
+            large := accuracy(g, r, edges, x, y, logits, src, dst, task, 64, 128, 10)
+            try io.PutLn(("count" if task == 0 else "majority") + ", " + ("sum" if agg == message.Agg.Sum else "mean") + ": small graphs " + $(100.0 * small).Fixed(2) + "%, larger graphs " + $(100.0 * large).Fixed(2) + "%")
+        }
+    }
+}
+
+# the fraction of labelled nodes answered right over 40 batches of fresh graphs of lo .. hi nodes
+fn accuracy(g mut graph.Graph<F32>&, r mut rand.Rand&, edges mut message.Edges&, x graph.Var, y graph.Var, logits graph.Var, src mut Array<I32>&, dst mut Array<I32>&, task I64, lo I64, hi I64, deg I64) F64 {
+    right, seen := 0, 0
+    xs := g.Value(x).Flat()!
+    ys := g.Ints(y).Flat()!
+    for _ in range 40 {
+        fill(r, xs, edges, ys, src, dst, task, lo, hi, deg)
+        g.Forward(Rows)
+        out := g.Value(logits).Flat()!
+        for v in range Rows {
+            if ys[v] < 0: continue
+            seen += 1
+            if I32(1 if out[v * 2 + 1] > out[v * 2] else 0) == ys[v]: right += 1
+        }
+    }
+    return F64(right) / F64(seen)
+}
