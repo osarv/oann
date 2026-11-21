@@ -65,6 +65,10 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
                                     # the sphere. EP allows it (its fixed points are minima under a constraint theta
                                     # does not move); Unrolled and Implicit, which differentiate the steps, refuse it
     Grow F64 = 8.0                  # Adaptive: the step grows to at most Grow Rate (1: it only shrinks from Rate)
+    Jitter F64 = 0.0                # above 0: after every settle step each state element moves by uniform noise in
+                                    # [-Jitter, Jitter] (a quantizer's error at training time; Unrolled treats it as a
+                                    # constant, straight through). 0: no noise, the settle unchanged
+    jit U64 = U64(0x9E3779B97F4A7C15)   # the jitter's generator (xorshift)
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
     RowEnergy graph.Var = graph.None    # Margin: a node of the energy row by row (Batch values summing to E), kept
@@ -220,6 +224,14 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
             rate = (rate * 1.1).Min(d.Grow * d.Rate)
         }
         for i in range d.n: d.x[i] -= rate * d.gx[i]
+        if d.Jitter > 0.0 {
+            for i in range d.n {
+                d.jit ^= d.jit << 13
+                d.jit ^= d.jit >> 7
+                d.jit ^= d.jit << 17
+                d.x[i] += d.Jitter * (2.0 * F64(d.jit >> 11) / 9007199254740992.0 - 1.0)
+            }
+        }
         if d.Sphere > 0: d.project()
     }
     return out
