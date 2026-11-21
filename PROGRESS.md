@@ -1606,3 +1606,13 @@ For small transformers on the CPU (bench/lm, 4 x 128, ctx 64) nothing moved: the
 a core's peak), attention at context 64 is 15% of a step at 9 GMAC/s (its tiny batched products and softmax - the next
 target), and 4 threads were the lever (wt-gemmjoin).
 
+## Checkpoints stream (wt-ckstream, 2026-11-21)
+
+A large model's save ran out of memory: io/checkpoint's Writer kept every tensor encoded in memory and Bytes made the
+whole file again before writing it, and File.Load read the whole file. Now a Writer encodes each tensor as it is added
+into a scratch file (TMPDIR) a buffer of 64 KB at a time, Save writes the header and copies the scratch data after it
+the same way (then removes it), and File.Load reads only the header and serves each tensor from the open file a buffer
+at a time; File.Parse over bytes in memory and Writer.Bytes stay. The API is unchanged but Bytes (now fallible: it reads
+the scratch back) and Discard (a writer given up without a Save). A test pins it: 64 MB of F32 saved and read back
+raise the peak address space by 0 pages now, against 73732 pages (288 MB) with the old writer and loader.
+

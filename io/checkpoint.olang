@@ -6,17 +6,22 @@
 # byte range of what follows the header. PyTorch, JAX, numpy and Hugging Face read and write it, so this is how a model
 # leaves oann or comes into it.
 #
-# Writing: a Writer takes tensors by name, each rounded once to the dtype it is stored in (its own type's, or the one
-# AddAs names), and Save or Bytes gives the file. Reading: a File is a file's bytes with its header read - a view,
-# nothing of the data is copied - and gives a tensor by name, into a tensor the caller has (Read: the shape must be
-# the stored one, nothing is allocated) or a new one (Get). Elements are converted into the reader's type as a
+# Writing: a Writer takes tensors by name - views of them, nothing copied - each to be rounded once to the dtype it is
+# stored in (its own type's, or the one AddAs names); Save streams the file - the header, then each tensor encoded
+# through a buffer of a fixed size - so saving costs the header and that buffer beyond the tensors, whatever their
+# size, and the tensors must be left as they are until it returns; Bytes gives the file in memory. Reading: a File is
+# a file's header read and its data where it is - the file on disk, read a buffer at a time (Load), or bytes in memory
+# (Parse), never copied - and gives a tensor by name, into a tensor the caller has (Read: the shape must be the stored
+# one, nothing is allocated) or a new one (Get). Elements are converted into the reader's type as a
 # conversion D(x) does, rounded to nearest, ties to even, so a file of one dtype reads into a tensor of another.
 #
 # Dtypes: F64 F32 F16 BF16 F8E4M3 F8E5M2 (safetensors' "F8_E4M3" and "F8_E5M2") and I64 I32 I16 I8 U64 U32 U16 U8 - every
 # element type a Tensor holds but Bool. A header naming another dtype is a Dtype error.
 
+import "std/io"
 import "std/json"
 import "std/os"
+import unistd "unistd.h"
 import "../tensor"
 
 type SafetensorsError error {
@@ -24,6 +29,7 @@ type SafetensorsError error {
     Missing(name String) # no tensor of that name in the file
     Dtype              # a dtype this module does not hold
     Duplicate(name String) # two tensors added under one name
+    Io(path String)    # a writer's scratch file could not be made or written
 }
 
 # how the elements of a tensor are stored
@@ -182,11 +188,28 @@ type Entry struct(Key String, Type Dtype, Shape Array<I64>, Begin I64, End I64) 
     End
 }
 
-# tensors added by name, encoded as they come
+# the bytes a save or a load moves at a time
+Chunk I64 = 1 << 16
+
+# tensors added by name, each encoded as it comes into a scratch file of the data (Chunk bytes at a time), which Save
+# then copies after the header - so neither holds more than the header and a buffer, whatever the tensors' size. The
+# scratch file is in TMPDIR (/tmp), removed by Save, Bytes and Discard
 type Writer struct() {
     entries Vec<Entry> = Vec<Entry>()
-    body Vec<U8> = Vec<U8>()
+    size I64 = 0                            # the data's bytes so far
     meta Vec<String> = Vec<String>()       # key, value, key, value ...
+    data mut Vec<os.File>& = Vec<os.File>() # the scratch file, made at the first Add
+    scratch String = ""
+    buf mut Array<U8>& = Array<U8>(Chunk)
+}
+
+# a scratch file's name no other writer has: the process and a count
+scratchCount mut Array<I64>& = Array<I64>(1)
+
+fn scratchPath() String {
+    dir := try os.Env("TMPDIR") catch { } default "/tmp"
+    scratchCount[0] += 1
+    return $dir + "/oann-checkpoint-" + $unistd.getpid() + "-" + $scratchCount[0] + ".data"
 }
 
 # a metadata pair of the header (beside "format": "pt")
@@ -205,17 +228,29 @@ fn (w mut Writer&) AddAs<T>(name String&, t tensor.Tensor<T>&, d Dtype) ? Safete
     for e in w.entries.View() {
         if e.Key == name: error SafetensorsError.Duplicate($name)
     }
-    c := t if t.Contiguous() else t.Clone()
-    w.encode(name, try c.Flat() catch { unreachable }, t.Dims, d)
+    c := t if t.Contiguous() else t.Clone()        # a strided view is copied, once
+    if w.data.Len() == 0 {
+        w.scratch = scratchPath()
+        w.data.Push(try os.File.Create(w.scratch) catch { error SafetensorsError.Io($w.scratch) })
+    }
+    xs := try c.Flat() catch { unreachable }
+    width := d.Width()
+    per := w.buf.Len() / width
+    for i0 in range 0, xs.Len(), per {
+        n := per.Min(xs.Len() - i0)
+        for i in range n: putBits(w.buf, i * width, bitsOf(xs[i0 + i], d), width)
+        try w.data[0].Write(w.buf[:n * width]) catch { error SafetensorsError.Io($w.scratch) }
+    }
+    begin := w.size
+    w.size += xs.Len() * width
+    w.entries.Push(Entry(name, d, Array<I64>[t.Dims[a] for a in range t.Dims.Rank], begin, w.size))
 }
 
-fn (w mut Writer&) encode<T>(name String&, elements Array<T>&, dims tensor.Shape&, d Dtype) {
-    width := d.Width()
-    out := Array<U8>(elements.Len() * width)
-    for i, x in elements: putBits(out, i * width, bitsOf(x, d), width)
-    begin := w.body.Len()
-    w.body.PushAll(out)
-    w.entries.Push(Entry(name, d, Array<I64>[dims[a] for a in range dims.Rank], begin, w.body.Len()))
+# the scratch file removed, if any: a writer given up without a Save
+fn (w mut Writer&) Discard() {
+    if w.data.Len() == 0: return
+    w.data.Clear()
+    try os.Remove(w.scratch) catch { }
 }
 
 # the name a field of a record has in a file when it is not the field's own
@@ -259,8 +294,8 @@ fn fieldName<T>(name String&) String& {
     return name
 }
 
-# the file: header, padded, then the data
-fn (w Writer&) Bytes() Array<U8> {
+# the header: its JSON, padded with spaces to a multiple of eight bytes
+fn (w Writer&) header() String {
     sb := StringBuilder()
     sb.Push("{\"__metadata__\":{")
     sb.Push("\"format\":\"pt\"")
@@ -275,12 +310,21 @@ fn (w Writer&) Bytes() Array<U8> {
     }
     sb.PushChar('}')
     for sb.Len() % 8 != 0: sb.PushChar(' ')
-    header := sb.ToString()
-    out := Array<U8>(8 + header.Len() + w.body.Len())
+    return sb.ToString()
+}
+
+# the file in memory: header, padded, then the data (the scratch file read back and removed)
+fn (w mut Writer&) Bytes() Array<U8> ? os.Error {
+    header := w.header()
+    out := Array<U8>(8 + header.Len() + w.size)
     putBits(out, 0, U64(header.Len()), 8)
     for i in range header.Len(): out[8 + i] = U8(header[i])
-    base := 8 + header.Len()
-    for i, b in w.body.View(): out[base + i] = b
+    if w.size > 0 {
+        w.data.Clear()
+        f := try os.File.Open(w.scratch)
+        try readAt(f, 0, out[8 + header.Len():]) catch io.Error { error os.Error.Failed($w.scratch) }
+        try os.Remove(w.scratch)
+    }
     return out
 }
 
@@ -294,21 +338,39 @@ fn dimsText(dims Array<I64>&) String {
     return sb.ToString()
 }
 
-# the file at "path"
-fn (w Writer&) Save(path String&) ? os.Error {
-    try os.WriteFile(path, w.Bytes())
+# the file at "path": the header, then the data copied from the scratch file a buffer of Chunk bytes at a time, which
+# is then removed - nothing as large as the data is made
+fn (w mut Writer&) Save(path String&) ? os.Error {
+    f := try os.File.Create(path)
+    header := w.header()
+    head := Array<U8>(8 + header.Len())
+    putBits(head, 0, U64(header.Len()), 8)
+    for i in range header.Len(): head[8 + i] = U8(header[i])
+    try f.Write(head) catch io.Error { error os.Error.Failed($path) }
+    if w.size == 0: return
+    w.data.Clear()                          # closed: every byte written is there to read
+    src := try os.File.Open(w.scratch)
+    for at in range 0, w.size, w.buf.Len() {
+        part := w.buf[:(w.size - at).Min(w.buf.Len())]
+        try readAt(src, at, part) catch io.Error { error os.Error.Failed($w.scratch) }
+        try f.Write(part) catch io.Error { error os.Error.Failed($path) }
+    }
+    try os.Remove(w.scratch)
 }
 
 # ---- reading ----
 
-# a file's bytes with the header read: where each tensor is. The bytes are the caller's, viewed, never copied
-type File struct(bytes Array<U8>&, Entries Array<Entry>&, Meta Map<String, String>, base I64) {
+# a file with its header read: where each tensor is. Its data is the caller's bytes, viewed, never copied (Parse), or
+# the file on disk, read a buffer at a time as tensors are read (Load: disk holds it open)
+type File struct(bytes Array<U8>&, Entries Array<Entry>&, Meta Map<String, String>, base I64, disk mut Vec<os.File>& = Vec<os.File>()) {
     bytes
     Entries
     Meta
     base
+    disk
     index Map<String, I64> = Map<String, I64>()
     for i, e in Entries: index.Put(e.Key, i)
+    chunk mut Array<U8>& = Array<U8>(Chunk if disk.Len() > 0 else 0)
 }
 
 # the file held in "bytes"
@@ -317,15 +379,21 @@ fn File.Parse(bytes Array<U8>&) File ? SafetensorsError {
     hl := getBits(bytes, 0, 8)
     if hl < 2 or hl > U64(bytes.Len() - 8): error SafetensorsError.Malformed
     base I64 = 8 + I64(hl)
-    doc := try json.Json.Parse(String(bytes[8:base])) catch { error SafetensorsError.Malformed }
+    entries, meta := try parseHeader(bytes[8:base], bytes.Len() - base)
+    return File(bytes, entries, meta, base)
+}
+
+# the header's entries and metadata, the data size bytes long
+fn parseHeader(text Array<U8>&, size I64) Array<Entry>, Map<String, String> ? SafetensorsError {
+    doc := try json.Json.Parse(String(text)) catch { error SafetensorsError.Malformed }
     obj := try doc.AsObj() catch { error SafetensorsError.Malformed }
     entries Vec<Entry> = Vec<Entry>()
     meta Map<String, String> = Map<String, String>()
     for i, key in obj.Keys {
         if key == "__metadata__": try readMeta(obj.Values[i], meta)
-        else: entries.Push(try Entry.Parse(key, obj.Values[i], bytes.Len() - base))
+        else: entries.Push(try Entry.Parse(key, obj.Values[i], size))
     }
-    return File(bytes, entries.ToArray(), meta, base)
+    return entries.ToArray(), meta
 }
 
 fn readMeta(j json.Json&, meta mut Map<String, String>&) ? SafetensorsError {
@@ -358,10 +426,34 @@ fn Entry.Parse(name String&, j json.Json&, size I64) Entry ? SafetensorsError {
     return Entry($name, d, dims, first, last)
 }
 
-# the file at "path", read whole
+# the file at "path": its header read, its data left on disk and read a buffer of Chunk bytes at a time as tensors are
+# read - a load holds the header and that buffer beyond the tensors read into, whatever the file's size
 fn File.Load(path String&) File ? os.Error, SafetensorsError {
-    bytes Array<U8>& = try os.ReadFile(path)
-    return try File.Parse(bytes)
+    disk mut Vec<os.File>& = Vec<os.File>()
+    disk.Push(try os.File.Open(path))
+    f := disk[0]
+    size := unistd.lseek(f.Fd(), 0, 2)
+    if size < 10: error SafetensorsError.Malformed
+    head := Array<U8>(8)
+    try readAt(f, 0, head) catch io.Error { error os.Error.Failed($path) }
+    hl := getBits(head, 0, 8)
+    if hl < 2 or hl > U64(size - 8): error SafetensorsError.Malformed
+    base I64 = 8 + I64(hl)
+    text := Array<U8>(I64(hl))
+    try readAt(f, 8, text) catch io.Error { error os.Error.Failed($path) }
+    entries, meta := try parseHeader(text, size - base)
+    return File(Array<U8>(0), entries, meta, base, disk)
+}
+
+# buf filled from the file's byte at, every byte of it (a short file is a malformed one)
+fn readAt(f os.File&, at I64, buf mut Array<U8>&) ? io.Error {
+    unistd.lseek(f.Fd(), at, 0)
+    got I64 = 0
+    for got < buf.Len() {
+        part := try f.Read(buf[got:])
+        if part.Len() == 0: error io.Error.Partial(got)
+        got += part.Len()
+    }
 }
 
 # the tensors' names, in the file's order
@@ -386,7 +478,17 @@ fn (f File&) Read<T>(name String&, dst mut tensor.Tensor<T>&) ? SafetensorsError
     like T
     out := try dst.Flat()
     width := e.Type.Width()
-    for i in range out.Len(): out[i] = elementAt(f.bytes, f.base + e.Begin + i * width, e.Type, like)
+    if f.disk.Len() == 0 {
+        for i in range out.Len(): out[i] = elementAt(f.bytes, f.base + e.Begin + i * width, e.Type, like)
+        return
+    }
+    per := f.chunk.Len() / width
+    for i0 in range 0, out.Len(), per {
+        n := per.Min(out.Len() - i0)
+        buf := f.chunk[:n * width]
+        try readAt(f.disk[0], f.base + e.Begin + i0 * width, buf) catch io.Error { error SafetensorsError.Malformed }
+        for i in range n: out[i0 + i] = elementAt(buf, i * width, e.Type, like)
+    }
 }
 
 # the tensor "name" as a new tensor of element type T, of the stored shape
@@ -433,7 +535,7 @@ fn tensorOf<T>(vs Array<F64>&, dims ...I64) tensor.Tensor<T> {
 fn roundTrip<T, U>(t tensor.Tensor<T>&, d Dtype) tensor.Tensor<U> {
     w := Writer()
     try w.AddAs("x", t, d) catch { unreachable }
-    f := try File.Parse(w.Bytes()) catch { unreachable }
+    f := try File.Parse(w.Bytes()!) catch { unreachable }
     return try f.Get<U>("x") catch { unreachable }
 }
 
@@ -514,7 +616,7 @@ test File.Read "tensors are read by name, in any order, into the caller's own te
     try w.Add("b.bias", tensorOf<F32>(Array<F64>[1.0, 2.0, 3.0], 3))
     try w.AddAs("a.weight", tensorOf<F32>(Array<F64>[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3), Dtype.F8E4M3)
     try w.Add("c", tensorOf<I16>(Array<F64>[-7.0], 1))
-    bytes := w.Bytes()
+    bytes := w.Bytes()!
     header := String(bytes[8:8 + I64(getBits(bytes, 0, 8))])
     assert (8 + header.Len()) % 8 == 0 and header[0] == '{'
     assert (try header.Find("\"a.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[2,3],\"data_offsets\":[12,18]}") catch default -1) > 0
@@ -534,7 +636,7 @@ test File.Read "tensors are read by name, in any order, into the caller's own te
 test File.Read "a tensor of the wrong shape, a missing name and a duplicate are errors naming what is wrong" {
     w := Writer()
     try w.Add("w", tensorOf<F32>(Array<F64>[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3))
-    f := try File.Parse(w.Bytes())
+    f := try File.Parse(w.Bytes()!)
     wrong := tensor.Tensor<F32>.Zeros(3, 2)
     shaped := false
     try f.Read("w", wrong) catch tensor.ShapeError.Mismatch { shaped = true } catch { }
@@ -553,7 +655,7 @@ test Writer.Add "a view is written row-major whatever its strides: a transpose, 
     try w.Add("t", try t.Permute(1, 0))
     try w.Add("col", try t.Select(1, 2))
     try w.Add("tail", try t.Slice(1, 1, 3))
-    f := try File.Parse(w.Bytes())
+    f := try File.Parse(w.Bytes()!)
     assert (try f.Get<F32>("t")) == tensorOf<F32>(Array<F64>[1.0, 4.0, 2.0, 5.0, 3.0, 6.0], 3, 2)
     assert (try f.Get<F32>("col")) == tensorOf<F32>(Array<F64>[3.0, 6.0], 2)
     assert (try f.Get<F32>("tail")) == tensorOf<F32>(Array<F64>[2.0, 3.0, 5.0, 6.0], 2, 2)
@@ -683,7 +785,7 @@ test Writer.AddFields "a record's tensors are named by the path through its fiel
     m := Model.Sample(10.0)
     w := Writer()
     try w.AddFields("", m)
-    f := try File.Parse(w.Bytes())
+    f := try File.Parse(w.Bytes()!)
     assert f.Names() == Array<String>["wte", "blocks.0.attn.q", "blocks.0.attn.k", "blocks.0.attn.c_proj", "blocks.0.bias"
         "blocks.1.attn.q", "blocks.1.attn.k", "blocks.1.attn.c_proj", "blocks.1.bias"]
     assert (try f.Get<F32>("blocks.1.attn.c_proj")) == filled(3, 13.0)
@@ -692,5 +794,35 @@ test Writer.AddFields "a record's tensors are named by the path through its fiel
     assert z.wte == m.wte and z.blocks[1].attn.out == m.blocks[1].attn.out and z.blocks[0].bias == m.blocks[0].bias
     other := Writer()
     try other.AddFields("net", z)
-    assert (try File.Parse(other.Bytes())).Has("net.blocks.0.attn.q")
+    assert (try File.Parse(other.Bytes()!)).Has("net.blocks.0.attn.q")
+}
+
+# the peak address space in 4 KB pages (VmPeak, /proc), as dyn's tests read it
+fn peakPages() I64 {
+    for line in (try os.ReadFile("/proc/self/status") catch { unreachable }).Lines() {
+        if line.StartsWith("VmPeak:"): return (try line[7:line.Len() - 3].Trim().ParseInt(10) catch { unreachable }) / 4
+    }
+    return 0
+}
+
+test Writer.Save "saving and loading stream: 64 MB of tensors saved and read back raise the peak address space by a few buffers, not by the data" {
+    n I64 = 1 << 24
+    big := tensor.Tensor<F32>.Zeros(n / 1024, 1024)
+    data := big.Flat()!
+    for i in range n: data[i] = F32(i % 1000) * 0.5
+    back := tensor.Tensor<F32>.Zeros(n / 1024, 1024)
+    path := (try os.Env("TMPDIR") catch { } default "/tmp") + "/oann-checkpoint-test-" + $unistd.getpid() + ".safetensors"
+    before := peakPages()
+    w := Writer()
+    w.Add("big", big)!
+    w.Meta("step", "7")
+    w.Save(path)!
+    saved := peakPages() - before
+    f := File.Load(path)!
+    f.Read("big", back)!
+    loaded := peakPages() - before
+    os.Remove(path)!
+    assert back.Flat()! == data and f.Meta.Get("step")! == "7"
+    # the data is 16384 pages; a save that held it once more, or a load that read the file whole, would add that many
+    assert saved < 2048 and loaded < 2048, "the peak grew by " + $saved + " pages saving and " + $loaded + " loading"
 }
