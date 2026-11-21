@@ -399,7 +399,9 @@ fn (o mut AdamW<T>&) Step() {
     lr := T(o.Rate / corr1)
     root := T(1.0 / corr2.Sqrt())
     eps := T(o.Eps)
+    o.S.Latent()
     adamRun(o.S.E.Params, o.S.E.Grads, o.M, o.V, b1, b2, c1, c2, keep, lr, root, eps)
+    o.S.Quantized()
 }
 
 # nn/optim's adamRun over the whole region
@@ -1614,6 +1616,39 @@ fn xorRight<T>(s system.System<T>&, y system.Pop) I64 {
         if I64(predicted[b]) == (b / 2) ^ (b % 2): right++
     }
     return right
+}
+
+test AdamW.Step "ternary weights: after every step each weight of a ternary connection is its row's scale times -1, 0 or +1, and EP through the latent weights lowers XOR's loss" {
+    r := rand.Rand(2)
+    s := system.System<F32>(4)
+    x := s.Population(s.Root(), "x", 2, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "h", 32, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(s.Root(), "y", 2, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.Classes()))
+    s.Connect(x, h, conn.Wiring.Dense)
+    c := s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Ternary(c)
+    s.Plan(r)!
+    s.Certify(0.9)
+    xorData(s, x, y, 0.0)
+    l := Learner<F32>(s)!
+    o := AdamW<F32>.For(s, 0.03)!
+    lk := s.E.Links[I64(c)]
+    s.Settle(settle.Phase.Free, settle.Budget())
+    first := s.Loss(settle.Phase.Free)
+    for _ in range 300 {
+        l.Lesson(s.Root(), 0.5)!
+        o.Step()
+        for q in range lk.PostSize {
+            scale F32 = 0.0
+            for j in range lk.PreSize {
+                v := s.E.Params[lk.Off + q * lk.PreSize + j].Abs()
+                if v != 0.0 and scale == 0.0: scale = v
+                assert v == 0.0 or v == scale, "row " + $q + " weight " + $j
+            }
+        }
+    }
+    s.Settle(settle.Phase.Free, settle.Budget())
+    assert s.Loss(settle.Phase.Free) < 0.75 * first, $first + " -> " + $s.Loss(settle.Phase.Free)
 }
 
 test Learner.Lesson "XOR by rate neurons: two inputs, eight tanh units, two readouts (cross-entropy), EP lessons and Adam" {

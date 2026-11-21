@@ -95,8 +95,22 @@ type Link<T> struct(pre I64, post I64, preSize I64, postSize I64, wiring Wiring,
     idx mut Array<I32>& = Array<I32>(0)
     Fwd mut gemm.Packed<T>& = gemm.Packed<T>(0, 0)      # dense in a sweep: W^T packed ahead (Repack), carried forward
     Bwd mut gemm.Packed<T>& = gemm.Packed<T>(0, 0)      # and W, carried back where reciprocal
+    Ternary Bool = false                                  # its weights ternary while it learns (System.Ternary): Latent holds the real ones
+    Latent mut Array<T>& = Array<T>(0)
     Packs Bool = false                                    # Fwd and Bwd hold W as it is: the products read them
     Merged Bool = false                                   # a population's reciprocal connection to itself: Fwd holds W^T + W, both ways in one product
+}
+
+# the region's weights (post x pre) set to the absmean ternary form of the latent ones: each post row's scale the mean
+# of its |w|, each weight round(w / scale) clipped to -1, 0, +1, times the scale (nn/ternary's and kernels/ternary's rule)
+fn (l Link<T>&) Quantize(params mut Array<T>&) {
+    rows, cols := l.PostSize, l.PreSize
+    for r in range rows {
+        sum F64 = 0.0
+        for c in range cols: sum += F64(l.Latent[r * cols + c]).Abs()
+        scale := sum / F64(cols) if sum > 0.0 else 1.0
+        for c in range cols: params[l.Off + r * cols + c] = T(scale * (F64(l.Latent[r * cols + c]) / scale).Round().Max(-1.0).Min(1.0))
+    }
 }
 
 # a dense connection carried in every sweep gets room for its weights packed ahead (Fwd, Bwd); made when the
@@ -387,6 +401,7 @@ fn (l Link<T>&) Scale(params mut Array<T>&, f F64) {
     kind := l.Kind
     n := l.PostSize * kind.rank if kind == Wiring.LowRank else l.Count
     for i in range l.Off, l.Off + n: params[i] = T(F64(params[i]) * f)
+    for i in range l.Latent.Len(): l.Latent[i] = T(F64(l.Latent[i]) * f)     # a ternary connection's latent weights alike
 }
 
 # ---- pruning ----

@@ -1787,3 +1787,18 @@ lanes ran slower than one. Tested against the dequantized product. bench/ternary
 On the CPU it wins once F32's weights leave the caches (from about 1024 x 1024) and holds 16x the weights in the
 same memory; in cache, F32's FMAs are faster. The form is the FPGA's: adder trees over selected activations.
 nn/ternary trains such layers: `Quantizer`, an operation reading a latent F32 weight matrix as its absmean ternary values times each row's scale, its gradient passed straight through to the latent weights, and `Linear` over it, `Export` giving kernels/ternary's form with the same product (a test learns a ternary map to under 5% of its first loss and checks the exported MatVec against the graph's forward to 1e-5). Not yet: 8-bit activations.
+
+## Ternary connections in dyn (wt-dynternary, 2026-11-21)
+
+`System.Ternary(c)` before Plan makes a dense or symmetric connection's weights ternary while the system learns: the
+parameters hold each post row's absmean form (scale times -1, 0, +1) - what every sweep, energy, certificate and
+adjoint reads, unchanged - and the connection keeps the latent real weights. A lesson's gradient (EP's contrast, the
+implicit gradient) is taken at the ternary weights and stepped into the latent ones (straight through):
+`System.Latent()` before an optimizer's step, `System.Quantized()` after it - learn.AdamW does both. Certify and
+Restrain scale the latent weights with the parameters. CPU only (refused on the GPU at Plan).
+
+First measure, XOR (2-32-2, the readout connection ternary, EP and AdamW at 0.03, 300 lessons): the loss falls (0.243
+-> 0.130 for seed 2), every weight a row's scale times -1, 0 or +1 after every step (tested). Before the certificate's
+scaling reached the latent weights, one seed of four solved XOR and three stopped at the same loss, 0.0867, with the
+gradient near zero. Ternary weights learn slower than real ones here; how they fare on the experiments' tasks is
+for the experiments.
