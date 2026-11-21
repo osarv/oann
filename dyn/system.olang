@@ -108,6 +108,8 @@ type System<T> struct(batch I64, threads I64 = 1, phases I64 = 3) {
     Planned Bool = false
     Scheme settle.Sweeping = settle.Sweeping()          # the sweeps of the budgets it gives (BudgetFor)
     Bound Norm = Norm.Spectral                          # the norm Certify, Restrain, Rate and the tolerances hold kappa in
+    rateBlocks mut Array<F64>& = Array<F64>(4)          # NudgedRate's reading of the coupling (blocks)
+    rateM mut Array<F64>& = Array<F64>(5)               # and its matrix M (blockMatrix), kept so that a rate allocates nothing
     mods mut Vec<modRec>& = Vec<modRec>[modRec(-1, "root")]
     pops mut Vec<popRec>& = Vec<popRec>()
     sigs mut Vec<sigRec>& = Vec<sigRec>()
@@ -832,8 +834,9 @@ fn (s System<T>&) plainRate(row I64, k F64, b F64, rest F64) F64 {
 # the recurrent weights within the hidden units (every relaxing unit not a readout), between them and the readouts, and
 # within the readouts, each sigma = kappa / the largest slope (a block's norm is at most the whole's) or 0 where no
 # connection joins those units, and the hidden units' largest slope
-fn (s System<T>&) blocks(k F64) Array<F64> {
-    out := Array<F64>(4, 0.0)
+fn (s System<T>&) blocks(k F64) Array<F64>& {
+    out := s.rateBlocks
+    for i in range 4: out[i] = 0.0
     slope := s.slope()
     if not (slope > 0.0 and slope <= F64.Max): return out
     sigma := k / slope
@@ -883,12 +886,12 @@ fn (s System<T>&) blockRate(row I64, blocks Array<F64>&, b F64, rest F64) F64, F
 }
 
 # blockRate's M within radius ry of row's readouts: [a, b, c, d at -beta, d at +beta]
-fn (s System<T>&) blockMatrix(row I64, blocks Array<F64>&, b F64, ry F64) Array<F64> {
+fn (s System<T>&) blockMatrix(row I64, blocks Array<F64>&, b F64, ry F64) Array<F64>& {
     euclid := s.Bound == Norm.Spectral
     sy := s.readoutSlope(row, ry)
     c, w := s.forceOver(row, ry, euclid)
     sh := blocks[3]
-    m := Array<F64>(5, 0.0)
+    m := s.rateM
     m[0], m[1], m[2] = blocks[0] * sh, blocks[1] * sy, blocks[1] * sh
     m[3], m[4] = blocks[2] * sy + b * w, blocks[2] * sy + b * c
     return m
@@ -2089,3 +2092,10 @@ test System.Retire "a system with a retired unit converges, free and nudged, the
     s.Retire(Pop(1), 1)
     assert s.Settle(settle.Phase.Free, settle.Budget(40 * 400, 2.0 / 400.0)).Converged
 }
+
+# a settle, a nudged pair and a lesson allocate nothing: every product's workspace is reserved at Plan (Engine.Ready),
+# so a sweep, a settle and a lesson can be pinned allocation-free
+fn settleOf(s mut System<F32>&, b settle.Budget) F64 { return s.Settle(settle.Phase.Free, b).Residual }
+fn nudgedOf(s mut System<F32>&, b settle.Budget) F64 { return s.Nudged(b).Residual }
+assert not settleOf.Allocates, "a settle allocates"
+assert not nudgedOf.Allocates, "a nudged pair allocates"

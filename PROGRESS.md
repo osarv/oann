@@ -1528,3 +1528,21 @@ near the memory's capacity) let spurious and other stored states fall below the 
 little better than one settle (e.g. 6 patterns, drive 0.1: 10.9% -> 22.7% at 16 tries, the oracle 84%). The energy
 selects well exactly when the model's energy ranks its answers well - what the tries buy is bounded by that, not by N.
 
+
+## Pinned allocation-free: a settle, a nudged pair, a lesson; repro/ trimmed (wt-pinned, 2026-11-21)
+
+Every gemm workspace a system uses is reserved at Plan (settle.Engine.Ready), and ad/graph's Forward and Backward were
+already pinned. Now pinned too, decided while compiling: a free settle and a nudged pair (dyn/system `settleOf`,
+`nudgedOf`) and a whole EP lesson - the free settle, the nudged pair's certified rate and settle, the contrast
+(dyn/learn `lessonOf`). The one thing in the way was `NudgedRate`'s two small arrays made per call (the coupling's four
+block norms and the 2 x 2 matrix M), now kept on the System. ad/descent's settle is not pinned: it reads the state and
+its gradient through `Graph.Value`/`Grad` each step, which makes views where a graph's views are stale and syncs from
+the GPU - caching the arrays would skip that sync, so it stays as it is.
+
+gemm with a storage type per operand (low-precision weights under F32 state) was already in kernels/gemm
+(`Gemm<SC, SA, SB, A>`, BF16/F16/F8/INT8 weights widened as packed; the test "a storage type per operand ... bit for
+bit", bench/storage).
+
+repro/ re-checked against olang f73ca3c4f: every repro but `tempref` (still +72 kB over 100 000 calls) is fixed, and the
+fixed ones are removed (git keeps them); `fieldname` stays as the record of a deliberate rule. Comments that named a
+removed repro now say it was fixed.

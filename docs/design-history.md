@@ -1065,9 +1065,9 @@ larger lever now that the products are fast.
 
 No compiler bug: everything phase 4 needed compiled as the spec says. Two frictions, both spec-conforming:
 
-- `repro/nestedtry.olang` - a catch clause covers its own `try` only, so `try (try entry["shape"]).AsArr() catch {
+- `repro/nestedtry, fixed in olang and removed 2026-11-21` - a catch clause covers its own `try` only, so `try (try entry["shape"]).AsArr() catch {
   ... }` - look a member up, then convert it - lets the lookup's error escape. `checkpoint.member` converts it first.
-- `repro/tryindex.olang` - `try doc[names[k]]` checks `names[k]` too (E16d), adding `BuiltinError` to what the try can
+- `repro/tryindex, fixed in olang and removed 2026-11-21` - `try doc[names[k]]` checks `names[k]` too (E16d), adding `BuiltinError` to what the try can
   fail with, though only the lookup was meant. Naming the element first avoids it.
 
 And two limits worth a library: no regular expressions, so GPT-2's pre-tokenization pattern is a hand-written scanner;
@@ -1916,7 +1916,7 @@ The makefile's `OLANG` is `/home/user/wt/oannc5/build/out` (olang ada716d). Two 
 - **A field of a call's value result passed straight to a call is refused** (O10d, "this value lives in this
   function's own scope") when the call's receiver is a reference parameter - `o.stepIn(g.Masters().Data, ...)` in
   optim's `AdamW` and `Sgd`, the consolidator's night and the agent's checkpoints, all of which olang efdb82c took. Each
-  result is named first (`masters := g.Masters()`). `repro/fieldofresult`.
+  result is named first (`masters := g.Masters()`). `repro/fieldofresult, fixed in olang and removed 2026-11-21`.
 - **A view-giving function left a local in the scope its result lands in, at every call.** `nn.Graph.Value` copied its
   node (`nd := g.nodes[v]`, 160 bytes) and passed it to `g.rows(nd)`, whose number sized the returned view; the compiled
   `Value` allocated the copy in its result scope, which lands where the graph's storage lives, so every `Value`, `Grad`

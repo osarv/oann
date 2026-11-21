@@ -191,8 +191,8 @@ apart, for M9). `DeltaRule` takes its heads from `beta`'s last axis; `Conv2d` an
 An operation whose kernel needs rows gets a `Contiguous` copy of a view that is not, recorded for it. The scans run their
 sequential forms (the chunked ones agree to rounding only). `Ahead` (an input's next batch filled on a task
 during the step) is built for the loops, not the graph: see "As built (Ahead)" below. A step allocates nothing (resident memory flat, tested); it was
-not pinned with `assert not ....Allocates`, as function facts read too coarsely then (repro/allocfacts.olang,
-repro/methodfacts.olang, both fixed since). A `Custom` operation's tensors, given to an `any`, were built where the graph
+not pinned with `assert not ....Allocates`, as function facts read too coarsely then (repro/allocfacts, fixed in olang and removed 2026-11-21,
+repro/methodfacts, fixed in olang and removed 2026-11-21, both fixed since). A `Custom` operation's tensors, given to an `any`, were built where the graph
 lives at each call. Since the kernel follow-ups (section 4.1, the end) both are pinned: see there.
 
 **As built (Ahead, 2026-11-17).** The next batch is filled on a task while the step trains, into staging buffers beside the
@@ -200,7 +200,7 @@ graph's input storage (double-buffered: the task writes the stage, the step read
 over after the `join`), so nothing about the graph's plan changes. `train.EpochAhead(g, c, loader, o, stage)` with
 `train.Ahead.For(g, c)` for a classifier; `Config.Overlap` (`Fit`) and `train.LmStepAhead` with `train.LmAhead.For(g, m)` for a
 language model. Batches come in the same order, so losses and parameters match `Epoch`/`LmStep` bit for bit (tested), and
-the step allocates nothing beyond what a `join` keeps (olang repro/spawnleak.olang). A source whose `Random` can fail reports
+the step allocates nothing beyond what a `join` keeps (olang repro/spawnleak, fixed in olang and removed 2026-11-21). A source whose `Random` can fail reports
 `TrainError.Draw`. `examples/mnist_mlp` and `charlm` take the word `ahead`. Measured in PROGRESS.md: no gain here.
 
 **As built (C4, 2026-11-15).** What `Plan` decides is plain data, `Layout` (per node a `Placed` of its six offsets, `needs`,
@@ -327,7 +327,7 @@ are constant and the evaluator can decide the bound.
    `Budget`, `Settlement` in `settle`; the `@Keep` attribute is `@neuron.Keep`. A planned system's running part is
    `settle.Engine<T>` (populations, connections, regions, workspaces), which `System` holds and drives.
 2. **Cells' fields are capitalized**: `RateCell<T>(U, S)`, `LifCell<T>(V, S, Syn, Spike, Trace, Count, @Keep Theta)` -
-   readable by `dyn/learn` and by reflection over `Columns<C>.Fields` (empty for lower-case fields: `repro/colfields.olang`).
+   readable by `dyn/learn` and by reflection over `Columns<C>.Fields` (empty for lower-case fields: `repro/colfields, fixed in olang and removed 2026-11-21`).
 3. **`System<T>`'s T is the state's and the weights' element**: F32 to run (decision 3's settle state), F64 for
    checks. Low-precision weights under F32 state wait for a product taking operands of two storage types (gemm's
    `Gemm<S, A>` holds one S for c, a and b); recorded for the kernels.
@@ -357,7 +357,7 @@ are constant and the evaluator can decide the bound.
 9. **Threads**: a sweep's units are one population's rows of one phase, 128 rows at most; they do not depend on the
    thread count, so a settle is the same bit for bit for any (tested with every wiring, free and nudged). A sweep is
    split over tasks only when it does at least `TaskWork` (2M) multiply-adds: a join costs more than a small sweep, and
-   every join keeps about 110 bytes until the program ends (`repro/joinleak.olang`, an olang bug), so a long run in
+   every join keeps about 110 bytes until the program ends (`repro/joinleak, fixed in olang and removed 2026-11-21`, an olang bug), so a long run in
    tasks grows; one thread is flat (M9). The constants (inputs folded through their connections, once a settle) are
    whole-batch products split by gemm's own threads. Gauss-Seidel sweeps (`Sweeping.GaussSeidel`): the populations
    in a topological order of the one-way connections, each reading what the sweep already wrote of the ones before
@@ -453,7 +453,7 @@ Where the build departs from the sketch and B2a's notes, and why:
    rule) and every rule, lesson and gradient works in room laid out once for the planned system, which the learner
    holds. `l.Lesson(m, beta, centered = true)` and `l.Contrast(m, beta, centered)` are callable without attaching.
 2. **`System.Rules(c)` is gone**: the generator was refused once instantiated (D18c/T22a: it yields an enum one case of
-   which holds `any Update&`; `repro/genref.olang`), so `Attachments()` and `AttachedAt(i)` read the rules back and
+   which holds `any Update&`; `repro/genref, fixed in olang and removed 2026-11-21`), so `Attachments()` and `AttachedAt(i)` read the rules back and
    `Attached` gained its `When`. `System.Value(sig)` (a signal by handle) and `Within(p, m)` (a population in a module's
    subtree) were added for the rules; a signal declared after `Plan` now gets room (it indexed past the signals).
 3. **Rules.** `Ep(beta, centered)` on a clock is a whole lesson (free settle, nudged phases side by side, the contrast
@@ -542,7 +542,7 @@ Where the build departs from the sketch above (`dyn.Settle(g, system, input, gra
    normalized stream. `hybrid.Step` steps both regions (the graph's by nn/train's `LmStep`, then the system's gradient
    clipped, its optimizer stepped and `Restrain(Kappa)`, so every settle stays certified). It is made in pieces the
    program holds - system, bridge, `Settled`, `Detach`, graph - since each refers to the one before
-   (repro/learnerarg.olang: a Learner, so a Bridge, cannot even be made in a helper taking the system by reference).
+   (repro/learnerarg, fixed in olang and removed 2026-11-21: a Learner, so a Bridge, cannot even be made in a helper taking the system by reference).
 
 Measured (tests in `dyn/bridge.olang`, `models/hybrid.olang`): the op's backward against central differences of its
 output (F64, a recurrent system of a sparse, a low-rank, a tiled and a symmetric block, two leading axes): exact 1.0e-10
@@ -626,7 +626,7 @@ field overrides a name.
    decaying or not (`optim.Spans(g)`: a graph's parameters, decaying where it says; none given: the whole region
    decays). `Save`/`Load` write and read the moments and the step count through io/checkpoint. `ClipNorm(grads, max)`,
    `WarmupCosine`, `WarmupLinear`. A step of either optimizer, in either precision, is pinned allocation-free while
-   compiling (`assert not f.Allocates`, S17a; the graph's `Forward`/`Backward` could not be then, repro/allocfacts.olang -
+   compiling (`assert not f.Allocates`, S17a; the graph's `Forward`/`Backward` could not be then, repro/allocfacts, fixed in olang and removed 2026-11-21 -
    since the kernel follow-ups, section 4.1's end, they are, and so is a whole training step).
 2. **The projection regularizer is a `Projector<T>`** of its own, not an option of the optimizer: it is graph-specific.
    Made on a graph before `Plan` (it keeps every dense layer's output and input to the step's end, since activation
@@ -1374,8 +1374,8 @@ path: A2 -> B1 -> B3 -> C1 -> C3.
    empty arrays; `conv.Patches.Pack`'s three per-panel arrays are fixed (32); the chunked delta rule's forms are types
    (`stepwise`, `chunkwise`), so the sequential one's instance holds none of the chunked one's per-task workspace. And two
    over-counts of olang's facts, worked around by binding call results to locals: a call's value lent to a `&`
-   parameter or receiver reads as allocating (repro/tempfacts.olang - `rows(x)` straight into `Gemm`, `g.nodes[x]`
-   into `inUse`), and so does a local reassigned from a view of itself (repro/reassignfacts.olang - `ops.storageOf`).
+   parameter or receiver reads as allocating (repro/tempfacts, fixed in olang and removed 2026-11-21 - `rows(x)` straight into `Gemm`, `g.nodes[x]`
+   into `inUse`), and so does a local reassigned from a view of itself (repro/reassignfacts, fixed in olang and removed 2026-11-21 - `ops.storageOf`).
    Joins allocate nothing (a sparse product's and a sweep's tasks are no reason to leave a function unpinned).
 3. **A bug, found by the reservation**: the chunked delta rule's backward multiplied by the whole decay matrix `gm`
    while `deltaLoad` wrote only its lower triangle - the upper one was whatever the scratch held, zero only in a freshly
@@ -1404,7 +1404,7 @@ path: A2 -> B1 -> B3 -> C1 -> C3.
 7. **Looked into in the follow-ups (PROGRESS.md, 2026-11-16)**: a BF16 matrix-vector product was 0.21x F32's - two rows
    against one read of the vector let LLVM pair the rows' widenings in 128-bit pieces; one row at a time it is 0.62-0.68x
    at 1 x 784 x 128 and 1.9-2.0x at 1 x 1024 x 1024. `bench/int8`'s F32 products at 12-17 GFLOPS were ThinLTO's (the program
-   imported ad/graph through nn/quant, repro/crossinline); without the graph they run at 80-142 and INT8 is 0.53-0.75x
+   imported ad/graph through nn/quant, repro/crossinline, fixed in olang and removed 2026-11-21); without the graph they run at 80-142 and INT8 is 0.53-0.75x
    F32 at 64-1024 rows.
 
 Measured (a 4-core machine shared with another compiler agent and this agent's `make test`, load 1-5; speeds are ratios
