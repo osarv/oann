@@ -1722,3 +1722,22 @@ Blocks of 64 x 64 were slower than the weighted form (6.0 / 8.3 ms at 256, one t
 scalar); elem's FastExp and sixteen-lane maximum and 128-wide blocks brought it level or ahead. In a training step
 (bench/lm: 4 layers of 128, 4 heads, context 1024, 2 sequences, 4 threads) attention 86.7 -> 41.6 ms, a step 163 ->
 118 ms, and the 268 MB of kept weights (four layers) gone.
+
+## The sparse settle step (wt-sparsestep, 2026-11-21)
+
+A settle over graph-structured states written with a dense adjacency product (`g.MatMul(A, z)`, A [batch, n, n]) pays
+n^2 per graph whatever the degree. The edge-list form is nn/message: `edges := message.Edges(nodes, most)`,
+`pass := message.Passing(edges, message.Agg.Sum)`, then `g.Custom(pass, z)` in place of the product - the same A z
+(signed or weighted edges included), its backward A^T dz; each batch `edges.Set(src, dst, count)` from the edge
+lists (SetDense reads dense matrices, but costs n^2 itself: 1.5 ms a batch at n 256). Its inner loops are now plain
+per-element loops instead of slice expressions: forward 255 -> 178 us, backward 245 -> 198 us at n 256 (batch 32, D
+16, degree about 6). Split over tasks and a pull-form backward by out-edges were tried and gained nothing (the pass
+is memory-bound at these widths). bench/graphsettle, one thread, us a step (energy forward and backward):
+
+| n | dense A z | edges | edges, the state's gradient alone |
+|---|---|---|---|
+| 32 | 235 | 226 | 172 |
+| 128 | 1417 | 949 | 744 |
+| 256 | 4305 | 2214 | 1789 |
+
+What is left of a sparse step is the per-node dense layers (Linear about half), which no adjacency form changes.
