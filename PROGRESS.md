@@ -1824,3 +1824,13 @@ to 3 others), 32 chains of 300 annealing sweeps, ms a search:
 About 50 ns a cell update at K 3, most of it the draw's exponentials (three of about 8 ns each); the field saved a
 quarter. The sparse settle step at those sizes (bench/graphsettle, batch 8, D 16, one thread, a step): 256 cells 2078
 -> 784 us, 512 4390 -> 1131, 1024 20866 -> 4051, 2048 110262 -> 5775 (19x) against the dense adjacency product.
+
+## Integer spiking kernels (wt-spike, 2026-11-21)
+
+kernels/spike: integer-only kernels for spiking and event-driven models on fixed-point hardware - fixed point with
+saturating widths and a rounding shift, a sigma-delta encoder (a unit sends signed quanta of its change; what it has
+sent tracks its value to within a quantum, tested), CSR fan-out and an event's scatter of integer weights times its
+spike count (saturating at the accumulator's width), a table exp and a fixed-point softmax, a power-of-two leak, and
+xorshift noise with an approximate normal. Moved here from an experiment, where they were written generic; on the
+way the table exp's index was found rounding to nearest while each entry holds its interval's midpoint - a bias of
+up to half a step (0.023 at d 0.14 with 32 entries a unit) - and now truncates (within 0.02 everywhere, tested).

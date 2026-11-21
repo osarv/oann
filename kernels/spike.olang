@@ -1,0 +1,221 @@
+# kernels/spike - integer-only spiking kernels: every operation one a hardware datapath does in a step, widths
+# emulated by saturation, so a model run through them is the model an FPGA (or another fixed-point target) would run.
+#
+#   fixed point   Fix(x, frac), Real(q, frac), Sat(q, bits), Shr(q, k) (rounding shift), MulShr(a, b, k), FracFor and
+#                 Quant (a weight array at the most fraction bits a width allows)
+#   SigmaDelta    a per-unit sigma-delta encoder: what was sent so far and a quantum; Encode gives the signed spike
+#                 count (the change in quanta since the last send, truncated toward zero; reset by subtraction)
+#   Csr           a graph's fan-out lists (from adjacency lists), the order a router walks them
+#   Scatter       one event: a row of integer weights times a spike count added into each target's accumulator row
+#   ExpLut        exp(-d) for d >= 0 from a table (fraction-bit input and output), for softmax and leaks
+#   Softmax       a fixed-point softmax of a short vector through ExpLut and one division
+#   Leak          a leaky integrator's decay by a power of two: v - (v >> k)
+#   Lfsr          a 64-bit xorshift for on-chip noise; Gauss4 an approximate normal (the sum of four uniforms)
+
+fn Fix(x F64, frac I64) I64 { return I64((x * F64(1 << frac)).Round()) }
+
+fn Real(q I64, frac I64) F64 { return F64(q) / F64(1 << frac) }
+
+# saturates q to a signed width of bits
+fn Sat(q I64, bits I64) I64 {
+    hi := (1 << (bits - 1)) - 1
+    lo := -(1 << (bits - 1))
+    if q > hi: return hi
+    if q < lo: return lo
+    return q
+}
+
+# q / 2^k rounded to nearest (ties away from zero), as a shifter with a rounding bit
+fn Shr(q I64, k I64) I64 {
+    if k <= 0: return q << (-k)
+    half := 1 << (k - 1)
+    if q >= 0: return (q + half) >> k
+    return -((-q + half) >> k)
+}
+
+fn MulShr(a I64, b I64, k I64) I64 { return Shr(a * b, k) }
+
+# the largest frac (bits after the point) at which every value of w fits a signed width of bits
+fn FracFor(w Array<F64>&, bits I64) I64 {
+    mx := 0.0
+    for x in w: mx = mx.Max(x.Abs())
+    f := 0
+    lim := F64((1 << (bits - 1)) - 1)
+    for f < 30 and mx * F64(1 << (f + 1)) <= lim: f++
+    return f
+}
+
+# w quantized to a signed width of bits at frac bits after the point
+fn Quant(w Array<F64>&, frac I64, bits I64) Array<I64> {
+    out := Array<I64>(w.Len())
+    for i in range w.Len(): out[i] = Sat(Fix(w[i], frac), bits)
+    return out
+}
+
+type SigmaDelta struct(n I64) {
+    Sent mut Array<I64>& = Array<I64>(n)
+    Q I64 = 1
+}
+
+# unit i now holds v: the signed number of quanta sent (0: silent); Sent moves by that many quanta
+fn (s mut SigmaDelta&) Encode(i I64, v I64) I64 {
+    r := v - s.Sent[i]
+    c := r / s.Q
+    s.Sent[i] += c * s.Q
+    return c
+}
+
+# fan-out lists: the targets of node i are Idx[Start[i] .. Start[i + 1])
+type Csr struct(n I64) {
+    Start mut Array<I64>& = Array<I64>(n + 1)
+    Idx mut Vec<I64>& = Vec<I64>()
+}
+
+fn Csr.From(adj Array<Vec<I64>>&) Csr {
+    c := Csr(adj.Len())
+    for i in range adj.Len() {
+        c.Start[i] = c.Idx.Len()
+        for j in adj[i]: c.Idx.Push(j)
+    }
+    c.Start[adj.Len()] = c.Idx.Len()
+    return c
+}
+
+fn (c Csr&) Deg(i I64) I64 { return c.Start[i + 1] - c.Start[i] }
+
+# one event of count spikes from node i on channel row: w[row * width .. +width) times count added into acc of each
+# target of i (acc laid out width a node), at accumulator width bits; returns the targets touched
+fn Scatter(c Csr&, i I64, w Array<I64>&, row I64, width I64, count I64, acc mut Array<I64>&, bits I64) I64 {
+    for e in range c.Start[i], c.Start[i + 1] {
+        t := c.Idx[e]
+        for k in range width: acc[t * width + k] = Sat(acc[t * width + k] + w[row * width + k] * count, bits)
+    }
+    return c.Start[i + 1] - c.Start[i]
+}
+
+# exp(-d) for d in [0, Range), d at InFrac bits, table step 2^-Step, output at OutFrac bits; 0 past the range
+type ExpLut struct(size I64) {
+    Tab mut Array<I64>& = Array<I64>(size)
+    InFrac I64 = 10
+    OutFrac I64 = 12
+    Step I64 = 5       # entries per unit of d: 2^Step
+}
+
+fn ExpLut.New(inFrac I64, outFrac I64, step I64, rng I64) ExpLut {
+    size := rng << step
+    l := ExpLut(size)
+    l.InFrac = inFrac
+    l.OutFrac = outFrac
+    l.Step = step
+    for k in range size: l.Tab[k] = Fix((-(F64(k) + 0.5) / F64(1 << step)).Exp(), outFrac)
+    return l
+}
+
+fn (l ExpLut&) Exp(d I64) I64 {
+    if d < 0: d = 0
+    k := d >> (l.InFrac - l.Step)          # the interval d falls in (entry k holds its midpoint), truncated
+    if k >= l.Tab.Len(): return 0
+    return l.Tab[k]
+}
+
+# softmax of u[off .. off + k) (InFrac bits) into s[off ..] (OutFrac bits): subtract the max, the table, one divide
+fn Softmax(l ExpLut&, u Array<I64>&, off I64, k I64, s mut Array<I64>&) {
+    mx := u[off]
+    for c in range 1, k: mx = mx.Max(u[off + c])
+    t := 0
+    for c in range k {
+        s[off + c] = l.Exp(mx - u[off + c])
+        t += s[off + c]
+    }
+    if t == 0: t = 1
+    for c in range k: s[off + c] = (s[off + c] << l.OutFrac) / t
+}
+
+fn Leak(v I64, k I64) I64 { return v - (v >> k) }
+
+type Lfsr struct() {
+    S U64 = U64(0x2545F4914F6CDD1D)
+}
+
+fn (r mut Lfsr&) Next() U64 {
+    r.S ^= r.S << 13
+    r.S ^= r.S >> 7
+    r.S ^= r.S << 17
+    return r.S
+}
+
+# an approximate standard normal at frac bits: the sum of four uniforms on [-1, 1), scaled to unit variance
+fn (r mut Lfsr&) Gauss4(frac I64) I64 {
+    s := 0
+    for _ in range 4: s += I64(r.Next() >> 48) - 32768
+    # each uniform has variance 1/3 (in units of 32768): the sum's sd is 32768 * 2 / sqrt(3)
+    return Shr(s * Fix(0.8660254037844386, 14), 15 + 14 - frac)
+}
+
+
+# ---- tests ----
+
+test Shr "a rounding shift: nearest, ties away from zero, both signs; Sat clips to a signed width" {
+    assert Shr(5, 1) == 3 and Shr(-5, 1) == -3 and Shr(4, 1) == 2 and Shr(6, 2) == 2 and Shr(-6, 2) == -2 and Shr(3, -2) == 12
+    assert Sat(200, 8) == 127 and Sat(-200, 8) == -128 and Sat(5, 8) == 5
+    assert Real(Fix(0.375, 8), 8) == 0.375 and MulShr(Fix(1.5, 10), Fix(2.0, 10), 10) == Fix(3.0, 10)
+    w := Array<F64>[0.5, -1.75, 0.25]
+    f := FracFor(w, 8)
+    q := Quant(w, f, 8)
+    assert f == 6 and q[1] == -112 and q[1] >= -128
+}
+
+test SigmaDelta "what has been sent tracks the value to within a quantum, and a still value goes silent" {
+    s := SigmaDelta(1)
+    s.Q = 16
+    sent I64 = 0
+    for t in range 200 {
+        v := (t * 37) % 500 - 250
+        sent += s.Encode(0, v) * s.Q
+        assert (v - sent).Abs() < s.Q and sent == s.Sent[0]
+    }
+    s.Encode(0, 100)
+    assert s.Encode(0, 100) == 0
+}
+
+test Scatter "events through the fan-out lists sum to the dense product, saturating at the accumulator's width" {
+    adj := Array<Vec<I64>>(3)
+    adj[0].Push(1)
+    adj[0].Push(2)
+    adj[2].Push(0)
+    c := Csr.From(adj)
+    w := Array<I64>[1, 2, 3, -4]
+    acc := Array<I64>(6)
+    assert Scatter(c, 0, w, 0, 2, 3, acc, 16) == 2 and acc == Array<I64>[0, 0, 3, 6, 3, 6]
+    Scatter(c, 2, w, 1, 2, 2, acc, 16)
+    assert acc == Array<I64>[6, -8, 3, 6, 3, 6] and c.Deg(1) == 0
+    Scatter(c, 0, w, 0, 2, 1000, acc, 8)
+    assert acc[3] == 127
+}
+
+test ExpLut "the table is exp(-d) to within its step, zero past its range; Softmax sums to one at its fraction bits" {
+    l := ExpLut.New(10, 12, 5, 16)
+    for i in range 0, 15000, 37 {
+        d := Real(i, 10)
+        assert (Real(l.Exp(i), 12) - (-d).Exp()).Abs() < 0.02, $d
+    }
+    assert l.Exp(Fix(17.0, 10)) == 0
+    u := Array<I64>[Fix(0.5, 10), Fix(-1.0, 10), Fix(2.0, 10)]
+    s := Array<I64>(3)
+    Softmax(l, u, 0, 3, s)
+    assert (s[0] + s[1] + s[2] - 4096).Abs() <= 3 and s[2] > s[0] and s[0] > s[1]
+    assert Leak(1024, 3) == 896
+}
+
+test Lfsr "Gauss4 has mean about 0 and standard deviation about 1" {
+    r := Lfsr()
+    n := 20000
+    sum, sq := 0.0, 0.0
+    for _ in range n {
+        x := Real(r.Gauss4(12), 12)
+        sum += x
+        sq += x * x
+    }
+    mean := sum / F64(n)
+    assert mean.Abs() < 0.03 and (sq / F64(n) - mean * mean - 1.0).Abs() < 0.05
+}
