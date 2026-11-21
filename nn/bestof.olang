@@ -1,0 +1,87 @@
+# nn/bestof - best-of-N selection by a model's own score. A model that can answer a query in several ways - settles
+# from different starting states, samples drawn at a temperature, descents from noise - answers it N times; each
+# candidate gets a number the model itself supplies (an energy, a loss, a log-likelihood, a verifier's score) and the
+# best one is kept, row by row. Nothing here knows the model: a candidate is a row of numbers and a score.
+#
+#     best := bestof.BestOf<F32>(rows, width, bestof.Order.Lowest)       # lowest energy wins
+#     for k in range n {
+#         ...candidate k of every row into x (rows x width), its energy into e...
+#         best.OfferRows(k, x, e)
+#     }
+#     ...best.Best (rows x width), best.Score, best.Index...
+#
+# Or with the candidates made by a function: best.Search(n, fn(k, x, scores) { ... }). A score that is NaN never wins;
+# the first of equal scores is kept, so the choice does not depend on anything but the scores and their order.
+# Allocation-free once made.
+
+# which end of the scores wins
+type Order enum { Lowest, Highest }
+
+# the best candidate so far of each of rows rows, each candidate width numbers
+type BestOf<T> struct(rows I64, width I64, order Order = Order.Lowest) {
+    Rows I64 = rows
+    Width I64 = width
+    Wins Order = order
+    Best mut Array<T>& = Array<T>(rows * width)     # each row's best candidate
+    Score mut Array<F64>& = Array<F64>(rows)        # its score
+    Index mut Array<I64>& = Array<I64>(rows)        # which candidate it was (-1: none offered yet)
+    Offered I64 = 0                                 # the candidates offered since the last Reset, per row
+    x mut Array<T>& = Array<T>(rows * width)        # Search's candidates
+    s mut Array<F64>& = Array<F64>(rows)            # and their scores
+}
+
+# forgets every row's best: the next candidate offered wins
+fn (b mut BestOf<T>&) Reset() {
+    for r in range b.Rows: b.Index[r] = -1
+    b.Offered = 0
+}
+
+# whether score a beats score best (a NaN never does)
+fn (b BestOf<T>&) beats(a F64, best F64) Bool {
+    if a != a: return false
+    if b.Wins == Order.Lowest: return a < best
+    return a > best
+}
+
+# candidate k of row r, x[off] .. x[off + Width - 1], scored score: kept where it is the row's first or beats its best
+fn (b mut BestOf<T>&) Offer(r I64, k I64, score F64, x Array<T>&, off I64) {
+    if b.Index[r] >= 0 and not b.beats(score, b.Score[r]): return
+    if b.Index[r] < 0 and score != score: return
+    b.Index[r] = k
+    b.Score[r] = score
+    for j in range b.Width: b.Best[r * b.Width + j] = x[off + j]
+}
+
+# candidate k of every row: row r's at x[r Width ..], its score scores[r]
+fn (b mut BestOf<T>&) OfferRows(k I64, x Array<T>&, scores Array<F64>&) {
+    for r in range b.Rows: b.Offer(r, k, scores[r], x, r * b.Width)
+    b.Offered += 1
+}
+
+# n candidates of every row made by make(k, x, scores) - candidate k's rows into x (Rows x Width), their scores into
+# scores - and the best kept (after a Reset)
+fn (b mut BestOf<T>&) Search(n I64, make fn&(k I64, x mut Array<T>&, scores mut Array<F64>&)) {
+    b.Reset()
+    for k in range n {
+        make(k, b.x, b.s)
+        b.OfferRows(k, b.x, b.s)
+    }
+}
+
+assert not BestOf<F32>.OfferRows.Allocates, "offering candidates allocates"
+
+test BestOf "lowest and highest: each row keeps its best candidate, the first of equals, never a NaN" {
+    b := BestOf<F64>(3, 2)
+    b.Reset()
+    b.OfferRows(0, Array<F64>[1.0, 1.0, 2.0, 2.0, 3.0, 3.0], Array<F64>[5.0, NaN, 1.0])
+    b.OfferRows(1, Array<F64>[4.0, 4.0, 5.0, 5.0, 6.0, 6.0], Array<F64>[2.0, 7.0, 1.0])
+    b.OfferRows(2, Array<F64>[7.0, 7.0, 8.0, 8.0, 9.0, 9.0], Array<F64>[3.0, 4.0, NaN])
+    assert b.Index == Array<I64>[1, 2, 0] and b.Score == Array<F64>[2.0, 4.0, 1.0]
+    assert b.Best == Array<F64>[4.0, 4.0, 8.0, 8.0, 3.0, 3.0] and b.Offered == 3
+    h := BestOf<F64>(1, 1, Order.Highest)
+    h.Search(4, fn(k, x, s) {
+        x[0] = F64(k)
+        s[0] = F64((k * 7) % 4)
+    })
+    assert h.Index[0] == 1 and h.Best[0] == 1.0 and h.Score[0] == 3.0
+}

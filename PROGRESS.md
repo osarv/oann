@@ -1502,3 +1502,29 @@ the rest (+10-12 points). A step costs 2.7-2.9 ms against 0.5-0.6 ms on the CPU 
 small products), and at equal time the perceptron closes most of the gap (97.8% against 99.4% on repeat). The encoder's
 lead is in parameters and steps, not yet in CPU time at this size.
 
+## Best-of-N by a model's own score (wt-bestof, 2026-11-21)
+
+`nn/bestof.BestOf<T>`: N candidates per row (settles from different starts, samples, descents from noise), each scored
+by the model itself - an energy or a loss (`Order.Lowest`), a likelihood or a verifier's score (`Order.Highest`) - and
+the best kept per row (`Offer`, `OfferRows`, or `Search` with a function making the candidates); NaN never wins, the
+first of equals is kept, nothing allocated.
+
+`examples/best_of` (`make bestof`): a continuous Hopfield memory on dyn - 64 tanh units connected reciprocally by Hebbian
+weights (gain 4) storing 4 random +-1 patterns, the cue a stored pattern with 20% of its signs flipped as a drive of
+0.3. Each query is settled from 16 random starting states; candidate k is the signs of the k-th settle, scored by
+`dyn/energy.Of`. Recall (every sign of the cued pattern) over 512 queries, seeds 1 / 2 / 3:
+
+| tries | one settle | lowest energy of N | any of N (oracle) |
+|---|---|---|---|
+| 1 | 43.0 / 35.7 / 37.3% | | |
+| 2 | | 63.5 / 52.3 / 60.5% | 63.5 / 59.4 / 60.7% |
+| 4 | | 85.2 / 62.3 / 82.6% | 85.2 / 81.6 / 83.4% |
+| 8 | | 96.5 / 64.8 / 95.7% | 96.5 / 95.7 / 97.1% |
+| 16 | | 99.8 / 64.1 / 98.2% | 99.8 / 99.8 / 100.0% |
+
+Where the cue's pattern is the deepest minimum the energy finds it as often as the oracle does (seeds 1 and 3); seed 2's
+patterns hold a pair the energy confuses, and selection stalls at 64%. A weaker drive (0.1) or more patterns (6-8 of 64,
+near the memory's capacity) let spurious and other stored states fall below the cued one: then the lowest energy is
+little better than one settle (e.g. 6 patterns, drive 0.1: 10.9% -> 22.7% at 16 tries, the oracle 84%). The energy
+selects well exactly when the model's energy ranks its answers well - what the tries buy is bounded by that, not by N.
+

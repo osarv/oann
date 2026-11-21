@@ -18,6 +18,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `tinystories.olang` | `prep`, then a GPT or an SSM of 10 million parameters on TinyStories: loss curve, tokens a second | `tinystories` |
 | `graph_count.olang` | message passing (`nn/message`) over random graphs, sum against mean aggregation, on a counting and a majority node task: trained on small graphs, tested on them and on larger, denser ones | `graphcount` |
 | `history_encode.olang` | `nn/history`'s encoder (one attention block, 14k parameters) against a flat perceptron (100k) over histories of 1-16 symbols, padded: the most frequent symbol, and whether the last symbol occurred before | `historyencode` |
+| `best_of.olang` | best-of-N by energy (`nn/bestof`, `dyn/energy.Of`): a continuous Hopfield memory on `dyn` settled from N random states, the lowest energy kept, against one settle and against any of N | `bestof` |
 | `mnist_learn.olang` | MNIST by a settling system of `dyn`, taught by equilibrium propagation | `mnistlearn` |
 | `xor_settle.olang`, `xor_spiking.olang` | XOR by rate and by spiking `dyn` systems | `xor`, `spiking` |
 | `prune_settle.olang` | a settling system learning XOR of two coordinates beside noise inputs, pruned while it runs by `dyn/learn`'s `Prune` rule toward a fraction of its weights (on a linear or cubic schedule; optionally with a skip connection into the readout), then stored as sparse rows (`System.Sparsify`): accuracy on unseen points and multiply-adds a sweep and a settle at each fraction | `prune` |

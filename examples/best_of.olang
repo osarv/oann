@@ -1,0 +1,123 @@
+# Best-of-N by a model's own energy (nn/bestof) on an associative memory with many fixed points: a dyn system of 64
+# tanh units, all connected reciprocally by Hebbian weights storing random +-1 patterns (a Hopfield network in
+# continuous time), its input a corrupted pattern (a fraction of the signs flipped) given as a weak drive. One settle
+# from a random starting state may fall into a spurious state or a wrong pattern; N settles from N starting states,
+# each scored by the system's energy (dyn/energy.Of), keep the lowest. Reported: a query answered right (every sign of
+# the stored pattern) by the first settle, by the lowest energy of N, and by any of the N (an oracle no model has),
+# over batches of 64 queries. Arguments, all optional: patterns stored (4), signs flipped in a cue (0.2), the cue's
+# drive (0.3), the weights' gain (4), batches (8), seed (1).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/json"
+import "../dyn/system"
+import "../dyn/settle"
+import "../dyn/neuron"
+import "../dyn/conn"
+import "../dyn/energy"
+import "../nn/bestof"
+
+Units I64 = 64
+Batch I64 = 64
+Tries I64 = 16
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
+    if i >= args.Len(): return fallback
+    return try json.Json.Parse(args[i]).AsNum()
+}
+
+fn main() ? io.Error, json.Error, energy.EnergyError {
+    args := os.Args()
+    count := I64(try number(args, 1, 4))
+    flip := try number(args, 2, 0.2)
+    drive := try number(args, 3, 0.3)
+    gain := try number(args, 4, 4.0)
+    batches := I64(try number(args, 5, 8))
+    r := rand.Rand(U64(try number(args, 6, 1)))
+
+    s := system.System<F64>(Batch, 1)
+    x := s.Population(s.Root(), "cue", Units, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(s.Root(), "memory", Units, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    into := s.Connect(x, h, conn.Wiring.Dense)
+    within := s.Connect(h, h, conn.Wiring.Dense, reciprocal = true)
+    try s.Plan(r) catch e { unreachable "the memory's plan: " + $e }
+
+    # the patterns, stored by Hebb's rule: W = gain / (2 n) sum p p^T, no self-coupling (read both ways: W + W^T)
+    patterns := Array<F64>(count * Units)
+    for i in range patterns.Len(): patterns[i] = 1.0 if r.Below(2) == 0 else -1.0
+    w := s.Weights(within).Flat()!
+    for i in range Units {
+        for j in range Units {
+            sum F64 = 0.0
+            if i != j {
+                for p in range count: sum += patterns[p * Units + i] * patterns[p * Units + j]
+            }
+            w[i * Units + j] = gain / F64(2 * Units) * sum
+        }
+    }
+    cue := s.Weights(into).Flat()!
+    for i in range Units * Units: cue[i] = drive if i / Units == i % Units else 0.0
+    s.Bias(h).Fill(0.0)
+
+    best := bestof.BestOf<F64>(Batch, Units)
+    answers := Array<F64>(Batch * Units)
+    energies := Array<F64>(Batch)
+    which := Array<I64>(Batch)
+    first, chosen, someone := Array<I64>(Tries + 1), Array<I64>(Tries + 1), Array<I64>(Tries + 1)
+    right := Array<Bool>(Batch)
+    unsettled I64 = 0
+    for _ in range batches {
+        for b in range Batch {
+            which[b] = r.Below(count)
+            for j in range Units {
+                bit := patterns[which[b] * Units + j]
+                s.Pop(x).Drive[b * Units + j] = -bit if r.Uniform(0.0, 1.0) < flip else bit
+            }
+        }
+        best.Reset()
+        for b in range Batch: right[b] = false
+        for k in range Tries {
+            start(s, h, r)
+            out := s.Settle(settle.Phase.Free, settle.Budget(2000, 1e-6, 0.5))
+            if not out.Converged: unsettled += 1
+            u := s.State<neuron.RateCell<F64>>(h).S
+            for b in range Batch {
+                for j in range Units: answers[b * Units + j] = 1.0 if u[b * Units + j] >= 0.0 else -1.0
+                energies[b] = try energy.Of(s, settle.Phase.Free, b)
+            }
+            best.OfferRows(k, answers, energies)
+            # after k + 1 tries: the first try's answer, the lowest energy's, any right
+            for b in range Batch {
+                right[b] = right[b] or recalled(answers, b, patterns, which[b])
+                if recalled(best.Best, b, patterns, which[b]): chosen[k + 1] += 1
+                if right[b]: someone[k + 1] += 1
+                if k == 0 and right[b]: first[1] += 1
+            }
+        }
+    }
+    total := F64(batches * Batch)
+    try io.PutLn($count + " patterns of " + $Units + " units, " + $(100.0 * flip).Fixed(0) + "% of a cue's signs flipped, drive " + $drive + ", gain " + $gain + ", " + $(batches * Batch) + " queries; " + $unsettled + " of " + $(batches * Tries) + " settles not within the tolerance")
+    try io.PutLn("one settle: " + $(100.0 * F64(first[1]) / total).Fixed(1) + "% recalled")
+    for n in Array<I64>[2, 4, 8, 16] {
+        try io.PutLn("best of " + $n + " by energy: " + $(100.0 * F64(chosen[n]) / total).Fixed(1) + "%, any of " + $n + ": " + $(100.0 * F64(someone[n]) / total).Fixed(1) + "%")
+    }
+}
+
+# every row's memory potentials drawn uniform in -1 .. 1 (activities their tanh): a random starting state
+fn start(s mut system.System<F64>&, h system.Pop, r mut rand.Rand&) {
+    c := s.State<neuron.RateCell<F64>>(h)
+    for i in range Batch * Units {
+        u := r.Uniform(-1.0, 1.0)
+        c.U[i] = u
+        c.S[i] = u.Tanh()
+    }
+}
+
+# whether row b of answers is stored pattern p, every sign
+fn recalled(answers Array<F64>&, b I64, patterns Array<F64>&, p I64) Bool {
+    for j in range Units {
+        if answers[b * Units + j] != patterns[p * Units + j]: return false
+    }
+    return true
+}
