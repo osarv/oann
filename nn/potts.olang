@@ -15,8 +15,9 @@
 #
 # Search: `Sampler` - Chains chains over the same graph, each a full assignment. A sweep visits the cells by colour
 # class (a greedy colouring of the graph: no two cells of a class are neighbours, so a class's cells are conditionally
-# independent - chromatic Gibbs; a chain takes them in turn, the chains run in parallel), each cell drawing its value
-# from softmax(-L_i / T), its pair energies kept as a field updated only where a neighbour moves; T falls geometrically from
+# independent - chromatic Gibbs), each cell drawing its value from softmax(-L_i / T), its pair energies kept as a field
+# updated only where a neighbour moves. Sixteen chains are swept in step, one to a vector lane (F32), and groups of
+# them run on tasks; T falls geometrically from
 # T0 to T1 over the annealing sweeps, then zero-temperature sweeps (each cell its lowest-energy value) until no cell
 # moves. A chain stops on its own once a sweep at T <= Tstop moves nothing. Chains run on up to Threads tasks, each
 # chain with its own generator, so a result does not depend on the thread count. `Langevin` is the continuous
@@ -139,10 +140,12 @@ type Sampler struct(cells I64, chains I64, k I64, threads I64 = 1) {
     classes mut Array<I64>& = Array<I64>(cells + 1)    # class q's cells: order[classes[q] .. classes[q + 1]]
     Colours I64 = 0
     seeds mut Array<U64>& = Array<U64>(chains)         # each chain's generator (xorshift)
-    scratch mut Array<F64>& = Array<F64>(chains * k)
     theta mut Array<F64>& = Array<F64>(0)              # Langevin's logits, chains x cells x K
     unary mut Array<F64>& = Array<F64>(cells * k)      # each cell's unary energies, made once a search
-    field mut Array<F64>& = Array<F64>(chains * cells * k)   # each chain's cells' pair energies, kept current
+    lfield mut Array<F32>& = Array<F32>((chains + Lanes - 1) / Lanes * Lanes * cells * k)   # the same, chains in lanes
+    lx mut Array<I32>& = Array<I32>((chains + Lanes - 1) / Lanes * Lanes * cells)         # the assignments, chains in lanes
+    lscratch mut Array<F32>& = Array<F32>((chains + Lanes - 1) / Lanes * k * Lanes)
+    w32 mut Array<F32>& = Array<F32>(k * k)
 }
 
 # a greedy colouring of e's graph (each cell the lowest colour no neighbour has, in order of falling degree): the
@@ -213,93 +216,155 @@ fn (s mut Sampler&) Anneal(m Potts&, e message.Edges&, f Array<F64>&, sched Sche
             for v in range k: s.unary[i * k + v] += fv * m.B[q * k + v]
         }
     }
-    tasks := s.Threads.Min(s.Chains)
+    for i in range k * k: s.w32[i] = F32(m.W[i])
+    groups := (s.Chains + Lanes - 1) / Lanes
+    tasks := s.Threads.Min(groups)
     if tasks <= 1 {
-        s.chains(m, e, f, sched, 0, s.Chains)
+        for g in range groups: s.group(m, e, f, sched, g)
         return
     }
-    share := (s.Chains + tasks - 1) / tasks
+    share := (groups + tasks - 1) / tasks
     join {
         for t in range tasks {
             lo := t * share
-            hi := (lo + share).Min(s.Chains)
-            if lo < hi: spawn s.chains(m, e, f, sched, lo, hi)
+            hi := (lo + share).Min(groups)
+            if lo < hi: spawn s.groups(m, e, f, sched, lo, hi)
         }
     }
 }
 
-fn (s mut Sampler&) chains(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, c0 I64, c1 I64) {
-    for c in range c0, c1: s.chain(m, e, f, sched, c)
+fn (s mut Sampler&) groups(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, g0 I64, g1 I64) {
+    for g in range g0, g1: s.group(m, e, f, sched, g)
 }
 
-# chain c: its sweeps, then its energy. Each cell's pair energies are kept as a field, changed only where a neighbour
-# changes value (the edges are both ways with one weight, as an undirected graph's are), so a sweep costs a cell's K
-# values plus its neighbours' updates only where it moves
-fn (s mut Sampler&) chain(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, c I64) {
-    k := s.K
-    n := s.Cells
-    xo := c * n
-    fo := c * n * k
-    lo := c * k
-    X, field, L, unary, order, seeds, W := s.X, s.field, s.scratch, s.unary, s.order, s.seeds, m.W
+# the chains a sweep takes in step, one to a vector lane
+Lanes I64 = 16
+
+# chains g Lanes .. (g + 1) Lanes - 1 swept in step: every cell's local energies, draws and moves computed for all of
+# them at once, a lane each (F32), a stopped chain's lane left as it is; a group's chains past Chains are run and
+# dropped. Each chain draws from its own generator, so its answer does not depend on how the chains are grouped
+# over tasks
+fn (s mut Sampler&) group(m Potts&, e message.Edges&, f Array<F64>&, sched Schedule, g I64) {
+    k, n := s.K, s.Cells
+    fo := g * n * k * Lanes
+    xo := g * n * Lanes
+    lo := g * k * Lanes
+    field, X, L, unary, order, W := s.lfield, s.lx, s.lscratch, s.unary, s.order, s.w32
+    seeds := Array<U64>(Lanes)
+    for l in range Lanes: seeds[l] = s.seeds[(g * Lanes + l).Min(s.Chains - 1)] ^ U64(l + 1)
+    for l in range Lanes {
+        c := g * Lanes + l
+        for i in range n: X[xo + i * Lanes + l] = s.X[c * n + i] if c < s.Chains else I32(0)
+    }
+    for x in range n * k * Lanes: field[fo + x] = 0.0
     for i in range n {
-        for v in range k: field[fo + i * k + v] = 0.0
         for a in range e.First(i), e.First(i + 1) {
-            w := F64(e.Weight(a))
-            col := I64(X[xo + e.Source(a)])
-            for v in range k: field[fo + i * k + v] += w * W[v * k + col]
-        }
-    }
-    total := sched.Sweeps + sched.Polish
-    s.Sweeps[c] = total
-    for sweep in range total {
-        t := sched.At(sweep)
-        moved I64 = 0
-        for at in range n {
-            i := order[at]
-            for v in range k: L[lo + v] = unary[i * k + v] + field[fo + i * k + v]
-            v := draw(L, lo, k, t, seeds, c) if t > 0.0 else lowest(L, lo, k)
-            was := I64(X[xo + i])
-            if v == was: continue
-            moved++
-            X[xo + i] = I32(v)
-            for a in range e.First(i), e.First(i + 1) {
-                w := F64(e.Weight(a))
-                u := e.Source(a)
-                for x in range k: field[fo + u * k + x] += w * (W[x * k + v] - W[x * k + was])
+            w := F32(e.Weight(a))
+            u := e.Source(a)
+            for v in range k {
+                at := fo + (i * k + v) * Lanes
+                for l in range Lanes: field[at + l] += w * W[v * k + I64(X[xo + u * Lanes + l])]
             }
         }
-        if moved == 0 and t <= sched.Tstop {
-            s.Sweeps[c] = sweep + 1
-            break
+    }
+    stopped := Array<Bool>(Lanes)
+    moved := Array<I64>(Lanes)
+    pick := Array<I64>(Lanes)
+    low, z, u := Array<F32>(Lanes), Array<F32>(Lanes), Array<F32>(Lanes)
+    D := Array<F32>(k * Lanes)
+    sweeps := Array<I64>(Lanes, sched.Sweeps + sched.Polish)
+    for sweep in range sched.Sweeps + sched.Polish {
+        t := sched.At(sweep)
+        for l in range Lanes: moved[l] = 0
+        for at in range n {
+            i := order[at]
+            for v in range k {
+                for l in range Lanes: L[lo + v * Lanes + l] = F32(unary[i * k + v]) + field[fo + (i * k + v) * Lanes + l]
+            }
+            if t > 0.0 { drawLanes(L, lo, k, F32(1.0 / t), low, z, u, pick, seeds) } else { lowestLanes(L, lo, k, low, pick) }
+            some := false
+            for l in range Lanes {
+                old := I64(X[xo + i * Lanes + l])
+                if stopped[l]: pick[l] = old
+                if pick[l] == old: continue
+                some = true
+                moved[l] += 1
+            }
+            if not some: continue
+            # each lane's change of W's row, gathered once: D[x, l] = W[x, new] - W[x, old]
+            for x in range k {
+                for l in range Lanes: D[x * Lanes + l] = W[x * k + pick[l]] - W[x * k + I64(X[xo + i * Lanes + l])]
+            }
+            for a in range e.First(i), e.First(i + 1) {
+                w := F32(e.Weight(a))
+                at2 := fo + e.Source(a) * k * Lanes
+                for x in range k * Lanes: field[at2 + x] += w * D[x]
+            }
+            for l in range Lanes: X[xo + i * Lanes + l] = I32(pick[l])
+        }
+        all := true
+        for l in range Lanes {
+            if not stopped[l] and moved[l] == 0 and t <= sched.Tstop {
+                stopped[l] = true
+                sweeps[l] = sweep + 1
+            }
+            all = all and stopped[l]
+        }
+        if all: break
+    }
+    for l in range Lanes {
+        c := g * Lanes + l
+        if c >= s.Chains: continue
+        for i in range n: s.X[c * n + i] = X[xo + i * Lanes + l]
+        s.Sweeps[c] = sweeps[l]
+        s.Energies[c] = m.Energy(e, f, s.X, c * n)
+    }
+}
+
+# every lane's value drawn from softmax(-L / t) (inv = 1 / t): L[lo + v Lanes + l] lane l's energies
+fn drawLanes(L mut Array<F32>&, lo I64, k I64, inv F32, low mut Array<F32>&, z mut Array<F32>&, u mut Array<F32>&, pick mut Array<I64>&, seeds mut Array<U64>&) {
+    for l in range Lanes: low[l] = L[lo + l]
+    for v in range 1, k {
+        for l in range Lanes: low[l] = low[l].Min(L[lo + v * Lanes + l])
+    }
+    for l in range Lanes: z[l] = 0.0
+    for v in range k {
+        for l in range Lanes {
+            w := elem.FastExp((low[l] - L[lo + v * Lanes + l]) * inv)
+            L[lo + v * Lanes + l] = w
+            z[l] += w
         }
     }
-    s.Energies[c] = m.Energy(e, f, s.X, xo)
-}
-
-# a value drawn from softmax(-L / t) over L[lo .. lo + k] (L overwritten by the unnormalized weights)
-fn draw(L mut Array<F64>&, lo I64, k I64, t F64, seeds mut Array<U64>&, c I64) I64 {
-    low := L[lo]
-    for v in range 1, k: low = low.Min(L[lo + v])
-    inv := 1.0 / t
-    for v in range k: L[lo + v] = F64(elem.FastExp(F32((low - L[lo + v]) * inv)))      # one vectorizable pass, in F32
-    z F64 = 0.0
-    for v in range k: z += L[lo + v]
-    u := nextUniform(seeds, c) * z
+    for l in range Lanes {
+        x := seeds[l]
+        x ^= x >> 12
+        x ^= x << 25
+        x ^= x >> 27
+        seeds[l] = x
+        u[l] = F32((x * 2685821657736338717) >> 40) * F32(5.9604645e-08) * z[l]
+        pick[l] = k - 1
+    }
     for v in range k - 1 {
-        u -= L[lo + v]
-        if u <= 0.0: return v
+        for l in range Lanes {
+            u[l] -= L[lo + v * Lanes + l]
+            pick[l] = v if u[l] <= 0.0 and pick[l] == k - 1 and v < k - 1 else pick[l]
+        }
     }
-    return k - 1
 }
 
-# the value of lowest local energy (the first of equals)
-fn lowest(L Array<F64>&, lo I64, k I64) I64 {
-    best I64 = 0
-    for v in range 1, k {
-        if L[lo + v] < L[lo + best]: best = v
+# every lane's lowest-energy value (the first of equals)
+fn lowestLanes(L Array<F32>&, lo I64, k I64, low mut Array<F32>&, pick mut Array<I64>&) {
+    for l in range Lanes {
+        low[l] = L[lo + l]
+        pick[l] = 0
     }
-    return best
+    for v in range 1, k {
+        for l in range Lanes {
+            x := L[lo + v * Lanes + l]
+            pick[l] = v if x < low[l] else pick[l]
+            low[l] = x if x < low[l] else low[l]
+        }
+    }
 }
 
 # the value of largest theta (the first of equals)

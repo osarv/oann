@@ -1861,4 +1861,11 @@ skips zero features (Sudoku 394 -> 338 ns a cell). 32 chains of 300 annealing sw
 
 Where an update goes (colouring, 1024 cells): about 22 ns at zero temperature (no draw), 74 at T 1 (a draw and most
 cells moving, each move updating its neighbours' fields). What would buy more: chains in vector lanes - a cell's
-fields laid out across chains and the class swept for all chains at once - not done.
+fields laid out across chains and the class swept for all chains at once - done next, below.
+
+Chains in lanes: sixteen chains swept in step, a cell's fields, energies, draws (F32 FastExp) and moves computed for all
+sixteen at once, each chain its own generator; a moving cell's change of W's row gathered once per lane and added to
+every neighbour's fields as one vector multiply-add. The per-chain path is gone. Same bench, ns a cell update, one
+thread: Sudoku 147 -> 40.7 (3.6x), colouring 256 49 -> 11.2, 1024 54 -> 11.4, 2048 53 -> 11.5 (4.7x); 4 threads (32
+chains: two groups) Sudoku 25.5, colouring 9.0. Solved shares as before within the noise of 8 rounds (colouring 1024:
+3/8 against 5/8, the chains' random streams now different).
