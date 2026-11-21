@@ -106,10 +106,11 @@ fn (d mut Descent<T>&) SetTarget(t Array<F64>&) {
 # ---- the graph at a point ----
 
 # x into the state, a Forward, a Backward from E: gx = dE/dx (+ beta dC/dx, a second Backward from C where beta is not
-# 0), gp = dE/dtheta; the largest |gx|. Of two Backwards after one Forward, the one from the node recorded later runs
+# 0), gp = dE/dtheta (params: a settle's steps leave it out - the graph's Backward computes the state's gradient
+# alone - and a trainer asks for it at the fixed point it needs it at); the largest |gx|. Of two Backwards after one Forward, the one from the node recorded later runs
 # first: the plan places buffers by a backward from the last node, so that one's gradients never overwrite a value the
 # other's backward reads
-fn (d mut Descent<T>&) at(x Array<F64>&, beta F64) F64 {
+fn (d mut Descent<T>&) at(x Array<F64>&, beta F64, params Bool = true) F64 {
     g := d.G
     s := g.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
@@ -117,12 +118,14 @@ fn (d mut Descent<T>&) at(x Array<F64>&, beta F64) F64 {
     d.Forwards++
     nudged := beta != 0.0
     if nudged and d.C > d.E: d.fromCost()
-    g.Backward(d.E)
+    g.Backward(d.E, false, params)
     d.Backwards++
     dx := g.Grad(d.X).Flat()!
     for i in range d.n: d.gx[i] = F64(dx[i])
-    pg := g.ParamGrads().Flat()!
-    for i in range d.p: d.gp[i] = F64(pg[i])
+    if params {
+        pg := g.ParamGrads().Flat()!
+        for i in range d.p: d.gp[i] = F64(pg[i])
+    }
     if nudged and d.C < d.E: d.fromCost()
     for i in range d.n: d.gx[i] += beta * d.cx[i]
     worst := 0.0
@@ -174,7 +177,7 @@ fn (d mut Descent<T>&) along(x Array<F64>&, v Array<F64>&) {
 # ---- settling ----
 
 # the state settled from its current value, nudged by beta toward the cost (0: the free phase); the state and C's value
-# are the settled ones after it
+# are the settled ones after it. Its steps compute the state's gradient alone: the graph's ParamGrads is left as it was
 fn (d mut Descent<T>&) Settle(beta F64 = 0.0) Settled {
     s := d.G.Value(d.X).Flat()!
     for i in range d.n: d.x[i] = F64(s[i])
@@ -189,7 +192,7 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
     rate := d.Rate
     last := 0.0
     for k in range most + 1 {
-        res := d.at(d.x, beta)
+        res := d.at(d.x, beta, false)
         out.Steps = k
         if d.Adaptive {
             now := d.objective(beta)
@@ -199,7 +202,7 @@ fn (d mut Descent<T>&) settle(beta F64, keep I64) Settled {
                 if d.Sphere > 0: d.project()
                 if k < most: continue
                 for i in range d.n: d.x[i] = d.prev[i]
-                out.Residual = d.at(d.x, beta)
+                out.Residual = d.at(d.x, beta, false)
                 break
             }
             last = now
@@ -346,6 +349,7 @@ fn (d mut Descent<T>&) implicit(tol F64, iterations I64) {
 # the nudged settles from the free fixed point and their contrast
 fn (d mut Descent<T>&) ep(beta F64, centered Bool) {
     d.Nudged = d.settle(beta, 0)
+    d.at(d.x, beta)
     for i in range d.p: d.acc[i] = d.gp[i]
     if not centered {
         d.at(d.free, 0.0)
@@ -354,6 +358,7 @@ fn (d mut Descent<T>&) ep(beta F64, centered Bool) {
     }
     for i in range d.n: d.x[i] = d.free[i]
     d.Nudged = d.settle(-beta, 0)
+    d.at(d.x, -beta)
     for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / (2.0 * beta)
 }
 

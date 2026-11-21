@@ -491,12 +491,14 @@ fn tiling.choose(m I64, n I64, mr I64, wideCols I64, thinCols I64, mayExchange B
 # where it reads op(A): a packed panel (element (i, k) at k MR + i), or the operand where it is, by rows (i ld + k)
 type packedA struct() { }
 type rowsA struct() { }
+type colsA struct() { }         # op(A) transposed, read in place: a step's rows contiguous (i + k ld)
 
 # the steps between the elements of one step's rows, and between one step's and the next's
 fn aSteps<A, L>(z A, lay L, ld I64) I64, I64 {
     match L {
         case packedA: return 1, microRows
         case rowsA: return ld, 1
+        case colsA: return 1, ld
     }
 }
 
@@ -576,7 +578,7 @@ fn storeTileT<A, S>(acc tile<A>&, nr I64, alpha A, beta A, c mut Array<S>&, co I
 # transposed one strides across its rows, which the caches do not prefetch - packing it measured 1.5x as fast)
 fn readsInPlace<SA, A>(sa SA, ta Bool, z A) Bool {
     return match SA {
-        case operand<A>: not ta
+        case operand<A>: true
         case _: false
     }
 }
@@ -595,6 +597,20 @@ fn tileInPlace<A, H, S>(x operand<A>&, ti I64, tr I64, p0 I64, ks I64, ke I64, l
     full I64 = clampI(ti + diag + 1 - p0, ks, ke) if lower else ke
     if full < ke: x.pack(false, ti, p0 + full, microRows, ke - full, aPanel(), sh, true, diag, ap)
     micro(full - ks, x.d, ti * x.ld + p0 + ks, x.ld, rowsA(), ke - full, ap, 0, bp, bo + ks * nr, sh, alpha, beta, c, co, ldc, rows, cols, lim, exchanged)
+}
+
+# the same for a transposed operand (op(A) = x^T, never triangular here): a step's rows are a run of x's row p, read
+# where they are (colsA) - a product with few rows and a long depth (a weight's gradient, dy^T x) then packs none of
+# op(A), which would cost as much as its multiply-adds. The last rows, fewer than the tile's, are packed
+fn tileInPlaceT<A, H, S>(x operand<A>&, ti I64, tr I64, p0 I64, ks I64, ke I64, ap mut Array<A>&, bp Array<A>&, bo I64, sh H, alpha A, beta A, c mut Array<S>&, co I64, ldc I64, rows I64, cols I64, lim I64, exchanged Bool) {
+    z A
+    nr := tileColsOf(z, sh)
+    if tr < microRows {
+        x.pack(true, ti, p0 + ks, tr, ke - ks, aPanel(), sh, false, 0, ap)
+        micro(ke - ks, ap, 0, 0, packedA(), 0, ap, 0, bp, bo + ks * nr, sh, alpha, beta, c, co, ldc, rows, cols, lim, exchanged)
+        return
+    }
+    micro(ke - ks, x.d, (p0 + ks) * x.ld + ti, x.ld, colsA(), 0, ap, 0, bp, bo + ks * nr, sh, alpha, beta, c, co, ldc, rows, cols, lim, exchanged)
 }
 
 # what a block of rows needs besides its operands: the panels, the block of op(B) and the triangle
@@ -619,7 +635,7 @@ type block<A> struct(p0 I64, depth I64, k I64, cols I64, j0 I64, bp Array<A>&, a
 fn gemmRows<SA, A, S, H>(sa SA, ta Bool, i0 I64, i1 I64, bk block<A>&, ap mut Array<A>&, c mut Array<S>&, ldc I64, sh H, ep Epilogue) {
     z A
     mc := blockRows(z)
-    inPlace Bool = readsInPlace(sa, ta, z) and bk.cols <= 2 * tileColsOf(z, sh)
+    inPlace Bool = readsInPlace(sa, ta, z) and bk.cols <= 2 * tileColsOf(z, sh) and not (ta and bk.lower)
     last Bool = bk.p0 + bk.depth == bk.k
     for ic in range i0, i1, mc {
         rows I64 = lesser(mc, i1 - ic)
@@ -649,7 +665,7 @@ fn tilesOf<SA, A, S, H>(sa SA, ta Bool, inPlace Bool, ic I64, rows I64, lo I64, 
             ks, ke := tileDepth(bk, ta, ti, tr)
             if ks < 0: continue                                 # nothing to add: the first block applied beta
             co I64 = tj * ldc + ti if bk.exchanged else ti * ldc + tj
-            computeTile(sa, inPlace, ti, tr, bk.p0, ks, ke, bk.lower, bk.diag, ap, ir * (hi - lo) - lo * microRows, bk.bp, jr * bk.depth, sh, bk.alpha, bk.beta, c, co, ldc, tr, tc, lim, bk.exchanged)
+            computeTile(sa, ta, inPlace, ti, tr, bk.p0, ks, ke, bk.lower, bk.diag, ap, ir * (hi - lo) - lo * microRows, bk.bp, jr * bk.depth, sh, bk.alpha, bk.beta, c, co, ldc, tr, tc, lim, bk.exchanged)
         }
     }
 }
@@ -666,12 +682,13 @@ fn tileDepth<A>(bk block<A>&, ta Bool, ti I64, tr I64) I64, I64 {
 
 # a tile computed and stored: by tileInPlace where op(A) is read in place, from the packed panel otherwise - its rows
 # from ao, the depth from ks
-fn computeTile<SA, A, H, S>(sa SA, inPlace Bool, ti I64, tr I64, p0 I64, ks I64, ke I64, lower Bool, diag I64, ap mut Array<A>&, ao I64, bp Array<A>&, bo I64, sh H, alpha A, beta A, c mut Array<S>&, co I64, ldc I64, rows I64, cols I64, lim I64, exchanged Bool) {
+fn computeTile<SA, A, H, S>(sa SA, ta Bool, inPlace Bool, ti I64, tr I64, p0 I64, ks I64, ke I64, lower Bool, diag I64, ap mut Array<A>&, ao I64, bp Array<A>&, bo I64, sh H, alpha A, beta A, c mut Array<S>&, co I64, ldc I64, rows I64, cols I64, lim I64, exchanged Bool) {
     z A
     match SA {
         case operand<A> {
             if inPlace {
-                tileInPlace(sa, ti, tr, p0, ks, ke, lower, diag, ap, bp, bo, sh, alpha, beta, c, co, ldc, rows, cols, lim, exchanged)
+                if ta: tileInPlaceT(sa, ti, tr, p0, ks, ke, ap, bp, bo, sh, alpha, beta, c, co, ldc, rows, cols, lim, exchanged)
+                else: tileInPlace(sa, ti, tr, p0, ks, ke, lower, diag, ap, bp, bo, sh, alpha, beta, c, co, ldc, rows, cols, lim, exchanged)
                 return
             }
         }

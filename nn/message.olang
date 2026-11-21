@@ -31,6 +31,7 @@ type Edges struct(nodes I64, most I64) {
     Count I64 = 0
     ptr mut Array<I64>& = Array<I64>(nodes + 1)
     src mut Array<I32>& = Array<I32>(most)
+    val mut Array<F32>& = Array<F32>(most)          # each edge's weight (1 from Set)
     next mut Array<I64>& = Array<I64>(nodes)        # Set's cursor per node
 }
 
@@ -47,8 +48,36 @@ fn (e mut Edges&) Set(src Array<I32>&, dst Array<I32>&, count I64) {
     for i in range count {
         d := I64(dst[i])
         e.src[e.next[d]] = src[i]
+        e.val[e.next[d]] = 1.0
         e.next[d] += 1
     }
+}
+
+# the edges of a batch of graphs given as dense adjacency matrices: graphs of n nodes each, graph q's matrix at
+# adj[q n n ..] - entry (v, u) nonzero for an edge u -> v of that weight, as a product A x reads it (row v of A x is
+# the sum over u of A[v, u] x[u]). The nodes are the graphs' in turn (graph q's node v is row q n + v), as many as
+# Nodes. So message passing with Agg.Sum over these edges is the batched product A x, its work the edges'. Allocates
+# nothing; the edges must fit the room made
+fn (e mut Edges&) SetDense(adj Array<F32>&, graphs I64, n I64) {
+    if graphs * n != e.Nodes: unreachable "message.Edges.SetDense: " + $graphs + " graphs of " + $n + " nodes and room for " + $e.Nodes
+    k I64 = 0
+    for q in range graphs {
+        for v in range n {
+            row := q * n + v
+            e.ptr[row] = k
+            at := row * n
+            for u in range n {
+                a := adj[at + u]
+                if a == 0.0: continue
+                if k >= e.src.Len(): unreachable "message.Edges.SetDense: more edges than the room for " + $e.src.Len()
+                e.src[k] = I32(q * n + u)
+                e.val[k] = a
+                k += 1
+            }
+        }
+    }
+    e.ptr[e.Nodes] = k
+    e.Count = k
 }
 
 # node v's in-degree
@@ -63,13 +92,14 @@ fn (e Edges&) weight(v I64, agg Agg) F32 {
 
 # out = A x (sum) or D^-1 A x (mean), x and out nodes x width, A the adjacency (row v: v's in-neighbours)
 fn (e Edges&) Spread(out mut Array<F32>&, x Array<F32>&, width I64, agg Agg) {
+    ptr, src, val := e.ptr, e.src, e.val
     for v in range e.Nodes {
         o := v * width
         for j in range width: out[o + j] = 0.0
         w := e.weight(v, agg)
-        for k in range e.ptr[v], e.ptr[v + 1] {
-            s := I64(e.src[k]) * width
-            for j in range width: out[o + j] += w * x[s + j]
+        for k in range ptr[v], ptr[v + 1] {
+            s := I64(src[k]) * width
+            out[o:o + width] += (w * val[k]) * x[s:s + width]
         }
     }
 }
@@ -77,12 +107,13 @@ fn (e Edges&) Spread(out mut Array<F32>&, x Array<F32>&, width I64, agg Agg) {
 # dx = A^T dout (with the mean's weights): every edge u -> v hands v's gradient back to u
 fn (e Edges&) Gather(dx mut Array<F32>&, dout Array<F32>&, width I64, agg Agg) {
     for i in range e.Nodes * width: dx[i] = 0.0
+    ptr, src, val := e.ptr, e.src, e.val
     for v in range e.Nodes {
         o := v * width
         w := e.weight(v, agg)
-        for k in range e.ptr[v], e.ptr[v + 1] {
-            s := I64(e.src[k]) * width
-            for j in range width: dx[s + j] += w * dout[o + j]
+        for k in range ptr[v], ptr[v + 1] {
+            s := I64(src[k]) * width
+            dx[s:s + width] += (w * val[k]) * dout[o:o + width]
         }
     }
 }
@@ -128,6 +159,7 @@ fn (l Layer&) Apply(g mut graph.Graph<F32>&, p mut Passing&, x graph.Var) graph.
 }
 
 assert not Edges.Set.Allocates, "setting a batch's edges allocates"
+assert not Edges.SetDense.Allocates, "setting a batch's edges from dense matrices allocates"
 assert not Passing.Forward.Allocates, "message passing allocates"
 assert not Passing.Backward.Allocates, "message passing's backward allocates"
 
@@ -200,3 +232,35 @@ test Edges "set again for another batch, the pattern is the new one and nothing 
     e.Set(Array<I32>[3, 3, 3, 3, 0, 1], Array<I32>[1, 1, 2, 2, 2, 2], 6)
     assert e.Degree(3) == 0 and e.Degree(1) == 2 and e.Degree(2) == 4 and e.Count == 6
 }
+
+test Edges.SetDense "edges from dense batched adjacency: Agg.Sum is the batched product A x, values and gradient, weights included" {
+    r := rand.Rand(7)
+    graphs, n, width := 3, 6, 4
+    adj := Array<F32>(graphs * n * n)
+    for i in range adj.Len(): adj[i] = F32(r.Uniform(0.5, 2.0)) if r.Below(3) == 0 else 0.0
+    e := Edges(graphs * n, graphs * n * n)
+    e.SetDense(adj, graphs, n)
+    x := Array<F32>(graphs * n * width)
+    for i in range x.Len(): x[i] = F32(r.Uniform(-1.0, 1.0))
+    out := Array<F32>(x.Len())
+    e.Spread(out, x, width, Agg.Sum)
+    dout := Array<F32>(x.Len())
+    for i in range dout.Len(): dout[i] = F32(r.Uniform(-1.0, 1.0))
+    dx := Array<F32>(x.Len())
+    e.Gather(dx, dout, width, Agg.Sum)
+    for q in range graphs {
+        for v in range n {
+            for j in range width {
+                want F64 = 0.0
+                back F64 = 0.0
+                for u in range n {
+                    want += F64(adj[(q * n + v) * n + u]) * F64(x[(q * n + u) * width + j])
+                    back += F64(adj[(q * n + u) * n + v]) * F64(dout[(q * n + u) * width + j])
+                }
+                assert (F64(out[(q * n + v) * width + j]) - want).Abs() < 1e-5
+                assert (F64(dx[(q * n + v) * width + j]) - back).Abs() < 1e-5
+            }
+        }
+    }
+}
+

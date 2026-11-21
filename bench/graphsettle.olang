@@ -1,0 +1,103 @@
+# where a settle step on graph-structured states goes: an energy over node states z [batch, n, D] - a hidden layer
+# silu(z Wz^T + (A z) Wa^T + x Wx^T + b) read out to one number a node, plus a quadratic - with A each graph's
+# adjacency, dense [batch, n, n]; a step is a Forward and the Backward from the energy (dE/dz and dE/dtheta), as a
+# descent settle runs it. Per size: us a step and the time in each kind of operation. Arguments: steps (20), batch
+# (32), D (16), hidden (32), then the node counts (32 128 256). Graphs: each node joined to 3 others at random. Each
+# size twice: A z as the dense batched product (MatMul), and as message passing over A's edges (nn/message, SetDense
+# once a batch - its time given apart), and the second again with the state's gradient alone (Backward's params
+# false, a settle step's).
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../kernels/mat"
+import "../nn/message"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn sumAll(g mut graph.Graph<F32>&, v graph.Var, rank I64) graph.Var {
+    r := v
+    for _ in range rank: r = g.Sum(r)
+    return r
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    steps := try number(args, 1, 20)
+    batch := try number(args, 2, 32)
+    D := try number(args, 3, 16)
+    H := try number(args, 4, 32)
+    sizes := Vec<I64>()
+    for i in range 5, args.Len(): sizes.Push(try args[i].ParseInt())
+    if sizes.Len() == 0 {
+        sizes.Push(32)
+        sizes.Push(128)
+        sizes.Push(256)
+    }
+    for n in sizes {
+        try one(steps, batch, D, H, n, false, true)
+        try one(steps, batch, D, H, n, true, true)
+        try one(steps, batch, D, H, n, true, false)
+    }
+}
+
+fn one(steps I64, batch I64, D I64, H I64, n I64, sparse Bool, params Bool) ? io.Error {
+    {
+        r := rand.Rand(1)
+        edges := message.Edges(batch * n, batch * n * 8)
+        pass := message.Passing(edges, message.Agg.Sum)
+        g := graph.Graph<F32>(batch)
+        z := g.Input(n, D)
+        x := g.Input(n, 8)
+        a := g.Input(n, n)
+        g.Watch(z)
+        wz := g.Param(graph.Init.Normal(0.0, 0.25), true, H, D)
+        wa := g.Param(graph.Init.Normal(0.0, 0.1), true, H, D)
+        wx := g.Param(graph.Init.Normal(0.0, 0.3), true, H, 8)
+        b := g.Param(graph.Init.Zeros, false, H)
+        w := g.Param(graph.Init.Normal(0.0, 0.2), true, 1, H)
+        az := g.Custom(pass, z) if sparse else g.MatMul(a, z)
+        h := g.Act(g.Add(g.Add(g.Linear(z, wz), g.Linear(az, wa)), g.Linear(x, wx, b)), mat.Act.Silu)
+        e := g.Add(sumAll(g, g.Linear(h, w), 3), g.Scale(sumAll(g, g.Mul(z, z), 3), 0.05))
+        try g.Plan(r) catch er { unreachable "shapes: " + $er }
+        zs := g.Value(z).Flat()!
+        for i in range zs.Len(): zs[i] = F32(r.Uniform(-1.0, 1.0))
+        xs := g.Value(x).Flat()!
+        for i in range xs.Len(): xs[i] = F32(r.Uniform(0.0, 1.0))
+        adj := g.Value(a).Flat()!
+        for i in range adj.Len(): adj[i] = 0.0
+        for q in range batch {
+            for v in range n {
+                for _ in range 3 {
+                    u := r.Below(n)
+                    adj[(q * n + v) * n + u] = 1.0
+                    adj[(q * n + u) * n + v] = 1.0
+                }
+            }
+        }
+        t1 := time.Now()
+        edges.SetDense(adj, batch, n)
+        dense := F64(time.Since(t1)) * 1e-3
+        g.Forward(batch)
+        g.Backward(e)
+        g.Profiling = true
+        for i in range g.Times.Len(): g.Times[i] = 0
+        t0 := time.Now()
+        for _ in range steps {
+            g.Forward(batch)
+            g.Backward(e, false, params)
+        }
+        each := F64(time.Since(t0)) / F64(steps) * 1e-3
+        line := "n " + $n + (" sparse (SetDense " + $dense.Fixed(0) + " us)" if sparse else " dense") + ("" if params else ", the state's gradient alone") + ": " + $each.Fixed(0) + " us a step |"
+        for k in range graph.KindNames.Len() {
+            t := g.Times[2 * k] + g.Times[2 * k + 1]
+            if t * 50 < I64(each * 1000.0) * I64(steps): continue
+            line = line + " " + graph.KindNames[k] + " " + $(F64(g.Times[2 * k]) / F64(steps) * 1e-3).Fixed(0) + "/" + $(F64(g.Times[2 * k + 1]) / F64(steps) * 1e-3).Fixed(0)
+        }
+        try io.PutLn(line)
+    }
+}

@@ -1570,3 +1570,39 @@ ParamGrads holds, so it serves as a fine-tuning term beside Unrolled, Implicit o
 term is weight times the summed hinge's derivative (central differences, within 1e-6) added to the gradient already
 there, and its steps put every right state m below the wrong one.
 
+## Recorded higher-order autodiff: deferred
+
+Decided 2026-11-21: a graph's backward stays its hand-written kernels; recording it as nodes (a derivative per
+operation, plus a scalar-node broadcast the graph lacks) waits until an experiment needs exact second derivatives.
+ad/descent's central differences (H v, (d g/dtheta)^T v) serve the trainers meanwhile, exact for quadratic energies.
+
+## Faster settles on graph-structured states (wt-settlespeed, 2026-11-21)
+
+`bench/graphsettle` (`make graphsettle`): a settle step on node states z [32, n, 16] - silu(z Wz^T + (A z) Wa^T + x Wx^T
++ b) read out to one number a node, plus a quadratic, A each graph's adjacency (3 random partners a node, both ways);
+a step is a Forward and the Backward from the energy. One thread, us a step, medians of runs taken while the machine
+was shared:
+
+| n | dense A z, every gradient | message passing (SetDense) | and the state's gradient alone |
+|---|---|---|---|
+| 32 | 265-271 | 244-268 | 174 |
+| 128 | 1563-2003 | 1099-1455 | 849-1078 |
+| 256 | 4715-4874 | 2472-2660 | 1998-2037 |
+
+1. `nn/message.Edges.SetDense(adj, graphs, n)`: the edges of a batch of dense adjacency matrices (weights kept,
+   `Edges` now carries a weight per edge), so `Passing` with `Agg.Sum` is the batched product A z with work in the
+   edges, not n^2: the dense product took 57% of a step at n = 256 (2.8 ms). SetDense scans the matrices once a batch
+   (1.6 ms at n 256, batch 32: a settle of 16+ steps amortizes it; an edge list's `Set` is cheaper). Message passing
+   itself is memory-bound at about 5 ns an edge on random graphs (lane operators measured level with the loop).
+2. `Graph.Backward(loss, accumulate, params = false)`: only the watched state's gradient - the weights' products and
+   column sums skipped, ParamGrads left as it was (tested bit for bit against a full Backward). `ad/descent` settles
+   this way and asks for dE/dtheta once at the fixed point a trainer needs (EP's nudged phases); a settle step is 20-25%
+   cheaper on its own.
+3. kernels/gemm reads a transposed left operand in place when the result is narrow (`colsA`): a weight's gradient
+   dy^T x with few outputs and a long depth no longer packs dy, which cost as much as its multiply-adds - 8192 x 32 x
+   16 183 -> 140-152 us (46 -> 55-60 GFLOPS), Linear's backward at n 256 844-896 -> 761-776 us; wide products level.
+
+For small transformers on the CPU (bench/lm, 4 x 128, ctx 64) nothing moved: the products run at 110-150 GFLOPS (near
+a core's peak), attention at context 64 is 15% of a step at 9 GMAC/s (its tiny batched products and softmax - the next
+target), and 4 threads were the lever (wt-gemmjoin).
+

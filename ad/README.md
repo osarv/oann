@@ -44,3 +44,7 @@ Tests: `olang test ad/graph.olang`, `olang test ad/descent.olang` (the graph's o
 in F64). Measures: `bench/mlp_ad.olang` (MNIST MLP), `bench/arena_ad.olang` (the transformer's arena and
 resident memory per step), `bench/smallgraph.olang` (a small recurrence where the cost per node dominates) - `make mlpad`,
 `make arenaad`.
+
+A settle's steps need only the state's gradient: `Backward(loss, accumulate, params = false)` skips every parameter's
+gradient (the weights' products and column sums) and leaves `ParamGrads` as it was; `descent.Descent`'s settles step this
+way and take dE/dtheta once, at the fixed point a trainer needs it.

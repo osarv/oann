@@ -393,6 +393,7 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     Pos I64 = 0                     # the first position of the step (Positions, Rope; decoding)
     Rng rand.Rand = rand.Rand(0)    # dropout's generator, seeded from the one Plan is given
     draw rand.Rand = rand.Rand(0)   # an eager graph's parameters' generator
+    stateOnly Bool = false          # the running Backward computes no parameter's gradient (Backward's params false)
     Profiling Bool = false          # with it set, Times collects where Forward and Backward spend their time:
     Times mut Array<I64>& = Array<I64>(2 * KindNames.Len())   # ns, Times[2 k] forward, Times[2 k + 1] backward
     Int8 Bool = false               # once QuantizeLinear has run: every Linear's product in 8-bit integers
@@ -1611,6 +1612,7 @@ fn (g Graph<T>&) gradRaw(v Var) tensor.Tensor<T> {
 # v's gradient to contribute to, or an empty tensor where v has none
 fn (g Graph<T>&) gradOf(v I64) tensor.Tensor<T> {
     if v < 0: return g.empty()
+    if g.stateOnly and g.nodes[v].Kind == Op.Param: return g.empty()
     if g.viewsN == g.N: return g.gradViews[v]
     return g.gradView(v)
 }
@@ -2086,8 +2088,11 @@ fn (g mut Graph<T>&) customForward(i I64, f mut any Function&, first I64, count 
 
 # the gradients of loss - a one-element node - with respect to every node it depends on, parameters included, after a
 # Forward. A parameter's gradient is written afresh (zero where the loss does not depend on it); with accumulate set it
-# is added to the one already there instead, summing several batches' gradients before one update
-fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false) {
+# is added to the one already there instead, summing several batches' gradients before one update. params false: no
+# parameter's gradient is computed - only the gradients of what is watched (Watch: a state descended on), their
+# products and column sums for the weights skipped - and ParamGrads is left as it was; a settle's steps need no more
+# (on the GPU every gradient is computed all the same)
+fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false, params Bool = true) {
     top := g.nodes[loss]
     if g.Decode or g.NoGrad or top.Dims.Count() != 1 or top.GradOffset < 0 {
         unreachable "oann: Backward from a node that is no scalar depending on a parameter, or while decoding or on a NoGrad graph"
@@ -2099,6 +2104,7 @@ fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false) {
             return
         }
     }
+    g.stateOnly = not params
     for i in range count: g.written[i] = accumulate and g.nodes[i].Kind == Op.Param
     one := g.Grad(loss)
     one.Fill(T(1.0))
@@ -2114,6 +2120,10 @@ fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false) {
         t0 := time.Now()
         g.backwardNode(i)
         g.Times[2 * KindOf(nd.Kind) + 1] += time.Since(t0)
+    }
+    if g.stateOnly {
+        g.stateOnly = false
+        return
     }
     for i in range count {
         if g.nodes[i].Kind == Op.Param and not g.written[i] {
@@ -2844,7 +2854,7 @@ type cursor struct(at I64) {
 
 # a gradient to give a kernel that writes every gradient: the real one, or (not wanted) scratch of x's shape from c
 fn (g Graph<T>&) gradOrScratch(i I64, x Var, c mut cursor&) tensor.Tensor<T> {
-    if x >= 0 and g.nodes[x].GradOffset >= 0: return g.Grad(x)
+    if x >= 0 and g.nodes[x].GradOffset >= 0 and not (g.stateOnly and g.nodes[x].Kind == Op.Param): return g.Grad(x)
     xn := g.nodes[x]
     d := g.inUse(xn)
     t := g.scratchTensor(i, c.at, d)
@@ -3638,4 +3648,36 @@ test Graph "one parameter set used by two graphs: copied in, the gradients added
         ps[i] = old
         assert (gr[i] - (up - down) / (2.0 * h)).Abs() < 1e-6, "parameter " + $i
     }
+}
+
+test Graph.Backward "params false: the watched state's gradient bit for bit as a full Backward gives it, and every parameter's gradient left as it was" {
+    r := rand.Rand(11)
+    g := Graph<F32>(6)
+    z := g.Input(5, 4)
+    g.Watch(z)
+    x := g.Input(5, 3)
+    w1 := g.Param(Init.Normal(0.0, 0.5), true, 8, 4)
+    w2 := g.Param(Init.Normal(0.0, 0.5), true, 8, 3)
+    b := g.Param(Init.Normal(0.0, 0.1), false, 8)
+    w3 := g.Param(Init.Normal(0.0, 0.5), true, 1, 8)
+    h := g.Act(g.Add(g.Linear(z, w1), g.Linear(x, w2, b)), mat.Act.Tanh)
+    e := g.Sum(g.Sum(g.Sum(g.Linear(g.Norm(h, g.Param(Init.Uniform(1.0, 1.0), false, 8)), w3))))
+    try g.Plan(r)
+    for v in Array<Var>[z, x] {
+        d := g.Value(v).Flat()!
+        for i in range d.Len(): d[i] = F32(r.Uniform(-1.0, 1.0))
+    }
+    g.Forward(6)
+    g.Backward(e)
+    full := g.Grad(z).Clone()
+    params := g.ParamGrads().Clone()
+    pg := g.ParamGrads().Flat()!
+    for i in range pg.Len(): pg[i] = 7.0
+    g.Forward(6)
+    g.Backward(e, false, false)
+    assert g.Grad(z).Flat()! == full.Flat()!, "the state's gradient differs"
+    for i in range pg.Len(): assert pg[i] == 7.0, "a parameter's gradient was written"
+    g.Forward(6)
+    g.Backward(e)
+    assert g.ParamGrads().Flat()! == params.Flat()!
 }
