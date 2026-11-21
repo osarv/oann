@@ -1,0 +1,138 @@
+# kernels/ternary - ternary weights: every weight -1, 0 or +1 times a scale per output row (BitNet b1.58's 1.58-bit
+# weights, Ma et al. 2024), and the matrix-vector product over them. A row is two bit-planes - bit j of plus set where
+# weight j is +1, of minus where it is -1 - 64 columns to a U64 word: 2 bits a weight, a sixteenth of F32's bytes, so a
+# product that streams its weights reads a sixteenth of the memory, and needs no multiplication by a weight: each
+# column's activation is added, subtracted or skipped. The form an FPGA's adder trees take directly.
+#
+#     t := ternary.Ternary.Quantize(w)       # w rows x cols F32: scale = mean |w| per row, weights round(w / scale)
+#     ternary.MatVec(y, t, x)                # y = W x, W the ternary weights times their row's scale
+
+import "mat"
+
+type Ternary struct(rows I64, cols I64) {
+    Rows I64 = rows
+    Cols I64 = cols
+    Words I64 = (cols + 63) / 64                        # a row's words in each plane
+    Plus mut Array<U64>& = Array<U64>(rows * ((cols + 63) / 64))
+    Minus mut Array<U64>& = Array<U64>(rows * ((cols + 63) / 64))
+    Scale mut Array<F32>& = Array<F32>(rows)
+}
+
+# w's ternary form by absmean quantization: each row's scale the mean of its |w| (1 for an all-zero row), each weight
+# w / scale rounded to the nearest of -1, 0 and +1
+fn Ternary.Quantize(w mat.Mat<F32>&) Ternary {
+    t := Ternary(w.Rows, w.Cols)
+    for r in range w.Rows {
+        sum F64 = 0.0
+        for c in range w.Cols: sum += F64(w[r, c]).Abs()
+        scale := sum / F64(w.Cols) if sum > 0.0 else 1.0
+        t.Scale[r] = F32(scale)
+        for c in range w.Cols: t.Set(r, c, I64((F64(w[r, c]) / scale).Round().Max(-1.0).Min(1.0)))
+    }
+    return t
+}
+
+# weight (r, c) set to v, one of -1, 0 and +1 (the scale untouched)
+fn (t mut Ternary&) Set(r I64, c I64, v I64) {
+    i := r * t.Words + c / 64
+    bit := U64(1) << U64(c % 64)
+    t.Plus[i] = t.Plus[i] | bit if v > 0 else t.Plus[i] & ~bit
+    t.Minus[i] = t.Minus[i] | bit if v < 0 else t.Minus[i] & ~bit
+}
+
+# weight (r, c): -1, 0 or +1
+fn (t Ternary&) Get(r I64, c I64) I64 {
+    i := r * t.Words + c / 64
+    s := U64(c % 64)
+    return I64((t.Plus[i] >> s) & 1) - I64((t.Minus[i] >> s) & 1)
+}
+
+# y = W x (+ beta y): x Cols long, y Rows long; each row's sum over its columns of +x, -x or nothing, times its scale.
+# Whole words of 64 columns a step, sixteen lanes of partial sums
+fn MatVec(y mut Array<F32>&, t Ternary&, x Array<F32>&, beta F32 = 0.0) {
+    for r in range t.Rows: y[r] = t.Scale[r] * rowSum(t, r, x) + (beta * y[r] if beta != 0.0 else F32(0.0))
+}
+
+# Y = X W^T (+ beta Y) for a batch of rows of x (rows x Cols, y rows x Rows): MatVec a row
+fn MatMul(y mut mat.Mat<F32>&, x mat.Mat<F32>&, t Ternary&, beta F32 = 0.0) {
+    for b in range x.Rows {
+        xo := x.Off + b * x.Ld
+        yo := y.Off + b * y.Ld
+        for r in range t.Rows {
+            s := t.Scale[r] * rowSumAt(t, r, x.Data, xo)
+            y.Data[yo + r] = s + (beta * y.Data[yo + r] if beta != 0.0 else F32(0.0))
+        }
+    }
+}
+
+fn rowSum(t Ternary&, r I64, x Array<F32>&) F32 { return rowSumAt(t, r, x, 0) }
+
+# each byte's eight bits as eight 0/1 lanes: a plane's byte read as the eight columns' indicators in one load
+bits Array<F32> = bitLanes()
+
+fn bitLanes() Array<F32> {
+    t := Array<F32>(256 * 8)
+    for b in range 256 {
+        for k in range 8: t[b * 8 + k] = F32((b >> k) & 1)
+    }
+    return t
+}
+
+# row r's signed sum of x[xo ..]: a byte of each plane at a time, its eight columns' signs (plus's lanes less minus's)
+# times eight of x into eight lanes of partial sums
+fn rowSumAt(t Ternary&, r I64, x Array<F32>&, xo I64) F32 {
+    lanes := Array<F32>(8)
+    base := r * t.Words
+    whole := t.Cols / 64
+    for w in range whole {
+        p, m := t.Plus[base + w], t.Minus[base + w]
+        at := xo + w * 64
+        for i in range 8 {
+            pb := I64((p >> U64(8 * i)) & 255) * 8
+            mb := I64((m >> U64(8 * i)) & 255) * 8
+            for k in range 8: lanes[k] += (bits[pb + k] - bits[mb + k]) * x[at + 8 * i + k]
+        }
+    }
+    total F32 = 0.0
+    for j in range 8: total += lanes[j]
+    for c in range whole * 64, t.Cols: total += F32(t.Get(r, c)) * x[xo + c]
+    return total
+}
+
+assert not MatVec.Allocates, "a ternary product allocates"
+
+# ---- tests ----
+
+import "std/rand"
+
+test Ternary "absmean quantization, the weights read back, and MatVec and MatMul equal the product of the dequantized matrix" {
+    r := rand.Rand(3)
+    dims := Array<I64>[7, 1, 5, 64, 33, 200, 16, 129]
+    for i in range 0, dims.Len(), 2 {
+        rows, cols := dims[i], dims[i + 1]
+        w := mat.Mat<F32>(Array<F32>(rows * cols), 0, rows, cols, cols)
+        for e in range rows * cols: w.Data[e] = F32(r.Normal())
+        t := Ternary.Quantize(w)
+        for q in range rows {
+            for c in range cols {
+                v := t.Get(q, c)
+                assert v == I64((F64(w[q, c]) / F64(t.Scale[q])).Round().Max(-1.0).Min(1.0))
+            }
+        }
+        x := Array<F32>(3 * cols)
+        for e in range x.Len(): x[e] = F32(r.Uniform(-1.0, 1.0))
+        y := Array<F32>(rows, 2.0)
+        MatVec(y, t, x, 0.5)
+        ym := mat.Mat<F32>(Array<F32>(3 * rows), 0, 3, rows, rows)
+        MatMul(ym, mat.Mat<F32>(x, 0, 3, cols, cols), t)
+        for q in range rows {
+            for b in range 3 {
+                want F64 = 0.0
+                for c in range cols: want += F64(t.Get(q, c)) * F64(x[b * cols + c])
+                want *= F64(t.Scale[q])
+                assert (F64(ym[b, q]) - want).Abs() < 1e-4 * F64(cols).Sqrt(), "row " + $q
+                if b == 0: assert (F64(y[q]) - (want + 1.0)).Abs() < 1e-4 * F64(cols).Sqrt()
+            }
+        }
+    }
+}

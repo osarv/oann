@@ -5,7 +5,7 @@
 OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
-TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang \
+TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang \
 	ad/graph.olang ad/descent.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -204,6 +204,12 @@ sweepbench:
 flashbench:
 	$(OLANG) build -output build/bench_flash bench/flash.olang
 	./build/bench_flash $(ARGS)
+
+# kernels/ternary's matrix-vector product (2-bit weights) against gemm's F32 Gemv on the same weights, one thread
+# (bench/ternary.olang) - ARGS: rounds
+ternarybench:
+	$(OLANG) build -output build/bench_ternary bench/ternary.olang
+	./build/bench_ternary $(ARGS)
 
 graphsettle:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_graphsettle bench/graphsettle.olang

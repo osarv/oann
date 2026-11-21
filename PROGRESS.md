@@ -1767,3 +1767,23 @@ an element in F32 against 0.66 for the tanh form. `elem.FastErfc` is Numerical R
 polynomial in t), relative error below 1.2e-7) on FastExp in F32 - within 1e-6 of the library's erfc in F64 for |z| <=
 2, the error growing as z^2 beyond (exp(-z^2) of a rounded z, where GELU reads x times a number below 1e-3) - and the
 library's erfc still in F64. GELU and its slope use it: 8.5 -> 1.5 ns an element.
+
+## Ternary weights (wt-ternary, 2026-11-21)
+
+Item 4 of the kernel list, for the FPGA stage. kernels/ternary: weights -1, 0 or +1 times a scale per output row
+(BitNet b1.58's absmean quantization: scale the row's mean |w|, weights round(w / scale) clipped), stored as two
+bit-planes of U64 words - 2 bits a weight, a sixteenth of F32 - and `MatVec` / `MatMul` that add, subtract or skip each
+column's activation. The sum reads a byte of each plane at a time through a 256 x 8 table of 0/1 lanes (plus's less
+minus's, times eight of x into eight lanes); reading bit by bit did not vectorize (0.25x of F32), and two sets of
+lanes ran slower than one. Tested against the dequantized product. bench/ternary, one thread, us a product:
+
+| rows x cols | F32 Gemv (weights MB) | ternary (MB) | ternary / F32 speed |
+|---|---|---|---|
+| 256 x 256 | 4.1 (0.3) | 8.8 (0.02) | 0.47 |
+| 1024 x 1024 | 155.8 (4.2) | 121.5 (0.26) | 1.28 |
+| 2048 x 2048 | 662.3 (16.8) | 462.1 (1.05) | 1.43 |
+| 4096 x 4096 | 2876 (67.1) | 1841 (4.19) | 1.56 |
+
+On the CPU it wins once F32's weights leave the caches (from about 1024 x 1024) and holds 16x the weights in the
+same memory; in cache, F32's FMAs are faster. The form is the FPGA's: adder trees over selected activations.
+Not yet: a ternary layer in ad/graph (training by the straight-through estimator) and 8-bit activations.

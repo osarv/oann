@@ -1,0 +1,36 @@
+# kernels/ternary's MatVec against kernels/gemm's F32 matrix-vector product (Gemv) on the same weights, one thread, us
+# a product (the best of rounds) and the weights' bytes each reads. From the repository's root:
+#     make ternarybench ARGS="rounds"    (50)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/mat"
+import "../kernels/gemm"
+import "../kernels/ternary"
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try args[1].ParseInt() if args.Len() > 1 else 50
+    r := rand.Rand(1)
+    try io.PutLn("rows x cols | F32 Gemv us (MB) | ternary us (MB) | x")
+    for n in Array<I64>[256, 1024, 2048, 4096] {
+        w := mat.Mat<F32>(Array<F32>(n * n), 0, n, n, n)
+        for e in range n * n: w.Data[e] = F32(r.Normal())
+        t := ternary.Ternary.Quantize(w)
+        x := Array<F32>(n)
+        for e in range n: x[e] = F32(r.Uniform(-1.0, 1.0))
+        y := Array<F32>(n)
+        a, b := 1e30, 1e30
+        for _ in range rounds {
+            t0 := time.Now()
+            gemm.Gemv(y, w, false, x)
+            a = a.Min(F64(time.Since(t0)) * 1e-3)
+            t0 = time.Now()
+            ternary.MatVec(y, t, x)
+            b = b.Min(F64(time.Since(t0)) * 1e-3)
+        }
+        try io.PutLn($n + " x " + $n + " | " + $a.Fixed(1) + " (" + $(F64(4 * n * n) / 1e6).Fixed(1) + ") | " + $b.Fixed(1) + " (" + $(F64(n * n) / 4e6).Fixed(2) + ") | " + $(a / b).Fixed(2))
+    }
+}
