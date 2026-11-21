@@ -369,6 +369,7 @@ type NsWork<A> struct(elems I64, side I64) {
     t mut Array<A>& = Array<A>(elems)
     gram mut Array<A>& = Array<A>(side * side)
     poly mut Array<A>& = Array<A>(side * side)
+    ws mut gemm.Workspace<A>& = gemm.Workspace<A>(1, elems)    # the steps' products (kernels/gemm)
 }
 
 # w (rows x cols, row-major) replaced by the nearest-to-orthogonal matrix Newton-Schulz's five quintic steps reach: its
@@ -386,7 +387,7 @@ fn Orthogonalize<A>(w mut Array<A>&, rows I64, cols I64, work mut NsWork<A>&) {
     for i in range r {
         for j in range c: x[i * c + j] = (w[j * cols + i] if tall else w[i * cols + j]) * inv
     }
-    for _ in range 5: nsStep(x, work.t, work.gram, work.poly, r, c)
+    for _ in range 5: nsStep(x, work.t, work.gram, work.poly, r, c, work.ws)
     for i in range r {
         for j in range c {
             if tall: w[j * cols + i] = x[i * c + j]
@@ -395,32 +396,17 @@ fn Orthogonalize<A>(w mut Array<A>&, rows I64, cols I64, work mut NsWork<A>&) {
     }
 }
 
-# one quintic step on x (r x c, r <= c): x <- a x + (b G + c G G) x with G = x x^T
-fn nsStep<A>(x mut Array<A>&, t mut Array<A>&, gram mut Array<A>&, poly mut Array<A>&, r I64, c I64) {
-    a A = A(NsA)
-    b A = A(NsB)
-    k A = A(NsC)
-    for i in range r {
-        for j in range r {
-            s A = 0.0
-            for q in range c: s += x[i * c + q] * x[j * c + q]
-            gram[i * r + j] = s
-        }
-    }
-    for i in range r {
-        for j in range r {
-            s A = 0.0
-            for q in range r: s += gram[i * r + q] * gram[q * r + j]
-            poly[i * r + j] = b * gram[i * r + j] + k * s
-        }
-    }
-    for i in range r {
-        for j in range c {
-            s A = a * x[i * c + j]
-            for q in range r: s += poly[i * r + q] * x[q * c + j]
-            t[i * c + j] = s
-        }
-    }
+# one quintic step on x (r x c, r <= c): x <- a x + (b G + c G G) x with G = x x^T - three products by kernels/gemm
+fn nsStep<A>(x mut Array<A>&, t mut Array<A>&, gram mut Array<A>&, poly mut Array<A>&, r I64, c I64, ws mut gemm.Workspace<A>&) {
+    xm := mat.Mat<A>(x, 0, r, c, c)
+    gm := mat.Mat<A>(gram, 0, r, r, r)
+    pm := mat.Mat<A>(poly, 0, r, r, r)
+    tm := mat.Mat<A>(t, 0, r, c, c)
+    gemm.Gemm(ws, gm, xm, false, xm, true)
+    for q in range r * r: poly[q] = A(NsB) * gram[q]
+    gemm.Gemm(ws, pm, gm, false, gm, false, A(NsC), A(1.0))
+    for q in range r * c: t[q] = A(NsA) * x[q]
+    gemm.Gemm(ws, tm, pm, false, xm, false, A(1.0), A(1.0))
     for q in range r * c: x[q] = t[q]
 }
 
@@ -538,6 +524,14 @@ assert not sgdOf.Allocates, "a step of Sgd allocates"
 assert not sgdMixedOf.Allocates, "a step of Sgd on masters allocates"
 assert not scaleOf.Allocates, "scaling the gradients allocates"
 assert not trainOf.Allocates, "a training step allocates"
+
+fn muonOf(o mut Muon<F32, F32>&) { o.Step() }
+fn emaOf(e mut Ema<F32>&) {
+    e.Update()
+    e.Swap()
+}
+assert not muonOf.Allocates, "a step of Muon allocates"
+assert not emaOf.Allocates, "a weight average's update allocates"
 assert not trainMixedOf.Allocates, "a BF16 training step on masters allocates"
 
 # ---- the input projection ----

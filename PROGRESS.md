@@ -1616,3 +1616,12 @@ at a time; File.Parse over bytes in memory and Writer.Bytes stay. The API is unc
 the scratch back) and Discard (a writer given up without a Save). A test pins it: 64 MB of F32 saved and read back
 raise the peak address space by 0 pages now, against 73732 pages (288 MB) with the old writer and loader.
 
+
+## Muon's Newton-Schulz on kernels/gemm (wt-optfast, 2026-11-21)
+
+Muon orthogonalized each matrix's step with hand-written triple loops (one walking a column stride), about 2 G
+multiply-adds a second: a 128 x 128 matrix took 16.7 ms and a 512 x 512 one 1.37 s - several times a whole training
+step of the models it is used on. Its three products a step (G = x x^T, b G + c G G, a x + P x) are now kernels/gemm's,
+with the workspace in NsWork: 128 x 128 0.60 ms (28x), 512 x 128 1.78 ms (38x), 128 x 512 1.55 ms (39x), 512 x 512 27 ms
+(50x), 1024 x 256 13 ms (35x), one thread. Muon's tests hold; a step of Muon and an Ema update and swap are now pinned
+allocation-free (`assert not ... .Allocates`), beside AdamW's and Sgd's.
