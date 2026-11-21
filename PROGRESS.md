@@ -1741,3 +1741,14 @@ is memory-bound at these widths). bench/graphsettle, one thread, us a step (ener
 | 256 | 4305 | 2214 | 1789 |
 
 What is left of a sparse step is the per-node dense layers (Linear about half), which no adjacency form changes.
+
+## Weights packed once a descent settle: measured, not kept (2026-11-21)
+
+The settle sweep's gain (dyn: weights packed once, 1.7-9.7x) does not carry to ad/descent's graph-energy settles.
+Tried: every Linear's weights packed once per settle (forward and input-gradient forms, gemm.GemmPacked), a settle
+step being a Forward and a state-only Backward. bench/graphsettle, one thread, us a step: n 32 x batch 32, D 16, H 32
+(8192 rows, 32 x 16 weights) 182 -> 175, n 128 821 -> 842, n 256 2001 -> 1997; D 128, H 512, 64 rows 372 -> 336,
+162 rows 822 -> 794; D 256, H 1024, 16 rows 365 -> 399. Packing is a small share of a product once it has 16 or more
+rows, and those settles have many rows (nodes x batch); dyn's large gain came from sweeps of 8 rows and from merging
+W^T + W. The step's cost there is the thin per-node products (k 16, n 32: about 26 GMAC/s) and the elementwise
+operations, not the weights' packing. Reverted.
