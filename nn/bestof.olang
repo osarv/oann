@@ -68,6 +68,19 @@ fn (b mut BestOf<T>&) Search(n I64, make fn&(k I64, x mut Array<T>&, scores mut 
     }
 }
 
+# hybrid ranking: n candidates of every row proposed by one model - propose(k, x) writes candidate k's rows into x (Rows x
+# Width) - and scored by another - score(x, scores) writes each row's score of the candidates in x (an energy, a
+# verifier's loss) - the best kept per row (after a Reset). The proposer need not score and the scorer need not
+# propose: a fast sampler and a slow energy, or a recurrent net's guesses ranked by a settling system's energy
+fn (b mut BestOf<T>&) Rank(n I64, propose fn&(k I64, x mut Array<T>&), score fn&(x Array<T>&, scores mut Array<F64>&)) {
+    b.Reset()
+    for k in range n {
+        propose(k, b.x)
+        score(b.x, b.s)
+        b.OfferRows(k, b.x, b.s)
+    }
+}
+
 assert not BestOf<F32>.OfferRows.Allocates, "offering candidates allocates"
 
 test BestOf "lowest and highest: each row keeps its best candidate, the first of equals, never a NaN" {
@@ -84,4 +97,18 @@ test BestOf "lowest and highest: each row keeps its best candidate, the first of
         s[0] = F64((k * 7) % 4)
     })
     assert h.Index[0] == 1 and h.Best[0] == 1.0 and h.Score[0] == 3.0
+}
+
+test BestOf.Rank "one function proposes, another scores: each row keeps the proposal the scorer ranks lowest" {
+    # rows want their candidate near a target; the proposer walks k = 0 .. 5, the scorer is the squared distance
+    targets := Array<F64>[2.0, 4.6, -1.0]
+    b := BestOf<F64>(3, 1)
+    proposed mut Array<I64>& = Array<I64>(1)
+    b.Rank(6, fn(k, x) {
+        for r in range 3: x[r] = F64(k)
+        proposed[0] += 1
+    }, fn(x, s) {
+        for r in range 3: s[r] = (x[r] - targets[r]) * (x[r] - targets[r])
+    })
+    assert proposed[0] == 6 and b.Best == Array<F64>[2.0, 5.0, 0.0] and b.Index == Array<I64>[2, 5, 0] and b.Offered == 6
 }

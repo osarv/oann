@@ -1546,3 +1546,20 @@ bit", bench/storage).
 repro/ re-checked against olang f73ca3c4f: every repro but `tempref` (still +72 kB over 100 000 calls) is fixed, and the
 fixed ones are removed (git keeps them); `fieldname` stays as the record of a deliberate rule. Comments that named a
 removed repro now say it was fixed.
+
+## A two-start margin trainer and hybrid ranking (wt-rank, 2026-11-21)
+
+`ad/descent`'s `Trainer.Margin(m)`: the state settled from two starts - where it is (the free fixed point) and from the
+caller's target (`SetTarget`) - and, for every row whose two fixed points differ (by more than `Apart`) while its
+energies are less than m apart, the hinge max(0, m + E_r(target's) - E_r(free)) stepped: dE/dtheta at the target's
+fixed point less at the free one, averaged over the batch. Rows that do not step are given the same state in both
+passes, so they cancel exactly; it needs the energy row by row (`RowEnergy`). Tested on a batch of tilted double
+wells, each started in the wrong well: the gradient is the batch's mean hinge differentiated by central differences
+(within 1e-6), and plain steps of it (rate 0.1) put the target's well m = 0.5 below the other in every row after 3
+steps (the tilt 0.05 -> 0.45). It is the contrastive counterpart of EP for energies with several basins, where the
+free settle's own fixed point is the wrong answer.
+
+`nn/bestof`'s `BestOf.Rank(n, propose, score)`: one model proposes n candidates of every row, another scores them (an
+energy, a verifier), the best kept per row - a fast proposer ranked by a slower energy. Tested on a proposer walking a
+grid and a squared-distance scorer.
+

@@ -14,7 +14,13 @@
 #   H lambda = dC/dx (H = d2E/dx2, solved by conjugate gradients: H symmetric positive definite at a strict minimum);
 # - Ep(beta, centered): equilibrium propagation - the free settle, then a nudged one from it (E + beta C; centered, also
 #   one at -beta), dL/dtheta = (dE/dtheta(x+beta) - dE/dtheta(x-beta)) / (2 beta) (uncentered: x* for x-beta, beta for
-#   2 beta). Only first derivatives, each dE/dtheta by the graph's Backward.
+#   2 beta). Only first derivatives, each dE/dtheta by the graph's Backward;
+# - Margin(m): a contrastive step from two starts - the state settled from where it is (the free fixed point) and from
+#   the caller's target (SetTarget); every row whose two fixed points differ (by more than Apart) and whose energies
+#   are not yet m apart, E_r(target's) + m > E_r(free), takes the hinge's gradient dE_r/dtheta(target's) -
+#   dE_r/dtheta(free), averaged over the batch: the answer reached from the target pushed down, the one reached from the
+#   other start pushed up, until the target's basin is the deeper by m. It needs the energy row by row (RowEnergy: a
+#   node of one value a row summing to E), and no cost; Active says how many rows took the step.
 # The first two need second derivatives the graph does not record: H v and (d g/dtheta)^T v are central differences of
 # the first derivatives along v, (dE/dx, dE/dtheta)(x +- eps v) / (2 eps) with eps = Eps / |v| - two Forward and
 # Backward passes per product, exact for an energy quadratic in x up to rounding, O(Eps^2) otherwise.
@@ -26,7 +32,7 @@
 import "graph"
 import "std/rand"
 
-type Trainer enum { Unrolled(h I64), Implicit(tol F64, iterations I64), Ep(beta F64, centered Bool) }
+type Trainer enum { Unrolled(h I64), Implicit(tol F64, iterations I64), Ep(beta F64, centered Bool), Margin(m F64) }
 
 # how a settle (or the adjoint's solve) ended: the steps taken, the last residual (the largest |step direction|, or the
 # solve's residual norm) and whether it got below the tolerance
@@ -57,6 +63,9 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     Grow F64 = 8.0                  # Adaptive: the step grows to at most Grow Rate (1: it only shrinks from Rate)
     Eps F64 = 1e-4                  # the central differences' step, in the state's units (1e-2 or so for F32)
     Last Settled = Settled()        # the last settle (the free one, after a trainer)
+    RowEnergy graph.Var = graph.None    # Margin: a node of the energy row by row (Batch values summing to E), kept
+    Apart F64 = 1e-6                # Margin: two fixed points of a row differ where some element differs by more
+    Active I64 = 0                  # Margin: the rows that took its last step
     Adjoint Settled = Settled()     # the last implicit solve
     Nudged Settled = Settled()      # EP's last nudged settle
     Forwards I64 = 0                # the graph's Forward and Backward passes run so far, the compute a caller counts
@@ -79,6 +88,15 @@ type Descent<T> struct(g mut graph.Graph<T>&, state graph.Var, energy graph.Var,
     trail mut Array<F64>& = Array<F64>(0)                           # Unrolled's last h states, a ring
     prev mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())   # Adaptive: the last accepted point and its step
     prevStep mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())
+    target mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())     # Margin's second start
+    other mut Array<F64>& = Array<F64>(g.Info(state).Dims.Count())      # and its two fixed points' mix
+    eT mut Array<F64>& = Array<F64>(g.Batch)                            # each row's energy at the target's fixed point
+    eF mut Array<F64>& = Array<F64>(g.Batch)                            # and at the free one
+}
+
+# Margin's second start: the state the target answer is (as the state is laid out)
+fn (d mut Descent<T>&) SetTarget(t Array<F64>&) {
+    for i in range d.n: d.target[i] = t[i]
 }
 
 # ---- the graph at a point ----
@@ -258,6 +276,7 @@ fn (d mut Descent<T>&) Train(how Trainer) Settled {
     }
     ep := match how {
         case Trainer.Ep(_, _): true
+        case Trainer.Margin(_): true
         case _: false
     }
     if d.Sphere > 0 and not ep: unreachable "oann: Descent.Train Unrolled or Implicit with a Sphere state - they differentiate the steps"
@@ -269,6 +288,7 @@ fn (d mut Descent<T>&) Train(how Trainer) Settled {
         case Trainer.Unrolled(h): d.unrolled(h.Max(1).Min(d.Last.Steps))
         case Trainer.Implicit(tol, iterations): d.implicit(tol, iterations)
         case Trainer.Ep(beta, centered): d.ep(beta, centered)
+        case Trainer.Margin(m): d.margin(m)
     }
     d.put(d.free)
     pg := d.G.ParamGrads().Flat()!
@@ -331,6 +351,42 @@ fn (d mut Descent<T>&) ep(beta F64, centered Bool) {
     for i in range d.n: d.x[i] = d.free[i]
     d.Nudged = d.settle(-beta, 0)
     for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / (2.0 * beta)
+}
+
+# the settle from the target, the rows' energies at both fixed points, and the hinge's gradient over the rows that take
+# it: the state at the target's fixed point against the state with those rows at the free fixed point (every other
+# row the same in both, so it cancels)
+fn (d mut Descent<T>&) margin(m F64) {
+    if d.RowEnergy == graph.None: unreachable "oann: Descent.Train Margin needs RowEnergy, the energy row by row"
+    for i in range d.n: d.x[i] = d.target[i]
+    d.Nudged = d.settle(0.0, 0)
+    d.rowsAt(d.x, d.eT)
+    d.rowsAt(d.free, d.eF)
+    rows := d.G.Batch
+    per := d.n / rows
+    d.Active = 0
+    for r in range rows {
+        apart := false
+        for i in range r * per, (r + 1) * per: apart = apart or (d.x[i] - d.free[i]).Abs() > d.Apart
+        take := apart and d.eT[r] + m > d.eF[r]
+        if take: d.Active++
+        for i in range r * per, (r + 1) * per: d.other[i] = d.free[i] if take else d.x[i]
+    }
+    d.at(d.x, 0.0)
+    for i in range d.p: d.acc[i] = d.gp[i]
+    d.at(d.other, 0.0)
+    for i in range d.p: d.acc[i] = (d.acc[i] - d.gp[i]) / F64(rows)
+}
+
+# each row's energy at the state x (a Forward) into out
+fn (d mut Descent<T>&) rowsAt(x Array<F64>&, out mut Array<F64>&) {
+    g := d.G
+    s := g.Value(d.X).Flat()!
+    for i in range d.n: s[i] = T(x[i])
+    g.Forward(g.Batch)
+    d.Forwards++
+    e := g.Value(d.RowEnergy).Flat()!
+    for r in range g.Batch: out[r] = F64(e[r])
 }
 
 fn dot(a Array<F64>&, b Array<F64>&) F64 {
@@ -526,3 +582,75 @@ test Descent.Train "a few steps of gradient descent on the parameters by EP lowe
     after := costAt(d)
     assert after < 0.5 * before, $before + " -> " + $after
 }
+
+# a double well a row, tilted by w u: E_r = (x_r^2 - 1)^2 - w u_r x_r, the state's start in the well opposite to the
+# sign of u, the target the well u points to. Gives the graph, the state, the row energies and the energy
+fn wells(rows I64, w0 F64) graph.Graph<F64>, graph.Var, graph.Var, graph.Var, graph.Var {
+    g := graph.Graph<F64>(rows)
+    x := g.Input(1)
+    g.Watch(x)
+    u := g.Input(1)
+    w := g.Param(graph.Init.Uniform(w0, w0), false, 1, 1)
+    a := g.AddScalar(g.Mul(x, x), -1.0)
+    rowE := g.Sum(g.Sub(g.Mul(a, a), g.Mul(g.Linear(u, w), x)))
+    e := g.Sum(rowE)
+    c := g.Sum(g.Sum(g.Mul(x, x)))
+    g.Keep(rowE)
+    g.Keep(e)
+    g.Keep(c)
+    g.Plan(rand.Rand(1))!
+    us := g.Value(u).Flat()!
+    xs := g.Value(x).Flat()!
+    for r in range rows {
+        us[r] = 1.0 if r % 2 == 0 else -1.0
+        xs[r] = -us[r]
+    }
+    return g, x, rowE, e, c
+}
+
+# the batch's mean hinge max(0, m + E_r(yt) - E_r(yf)) at the parameters as they are
+fn hingeAt(d mut Descent<F64>&, yt Array<F64>&, yf Array<F64>&, m F64) F64 {
+    d.rowsAt(yt, d.eT)
+    d.rowsAt(yf, d.eF)
+    total F64 = 0.0
+    for r in range d.G.Batch: total += (m + d.eT[r] - d.eF[r]).Max(0.0)
+    return total / F64(d.G.Batch)
+}
+
+test Descent.Train "Margin: the hinge between the target's well and the other start's is the gradient of the batch's mean hinge, and steps of it deepen the target's well until every row is m apart" {
+    rows, m := 8, 0.5
+    g, x, rowE, e, c := wells(rows, 0.05)
+    d := Descent<F64>(g, x, e, c)
+    d.RowEnergy = rowE
+    d.Rate = 0.05
+    t := Array<F64>(rows)
+    for r in range rows: t[r] = 1.0 if r % 2 == 0 else -1.0
+    d.SetTarget(t)
+    out := d.Train(Trainer.Margin(m))
+    assert out.Converged and d.Nudged.Converged and d.Active == rows
+    got := g.ParamGrads().Flat()![0]
+    # the hinge's derivative in w at the two fixed points (stationary in x, so re-settling adds nothing to first order)
+    yt := Array<F64>(rows)
+    for r in range rows: yt[r] = d.x[r]
+    yf := Array<F64>(rows)
+    for r in range rows: yf[r] = d.free[r]
+    ws := g.Params().Flat()!
+    w := ws[0]
+    ws[0] = w + 1e-6
+    up := hingeAt(d, yt, yf, m)
+    ws[0] = w - 1e-6
+    want := (up - hingeAt(d, yt, yf, m)) / 2e-6
+    ws[0] = w
+    assert (got - want).Abs() < 1e-6 * (1.0 + want.Abs()), "Margin's gradient " + $got + " against " + $want
+    # descending the hinge: w grows until the target's well is the deeper by m in every row
+    steps I64 = 0
+    for d.Active > 0 and steps < 500 {
+        for r in range rows: g.Value(x).Flat()![r] = -t[r]
+        d.Train(Trainer.Margin(m))
+        ws[0] -= 0.1 * g.ParamGrads().Flat()![0]
+        steps++
+    }
+    assert d.Active == 0 and steps < 500, $steps + " steps, " + $d.Active + " rows still within the margin"
+    for r in range rows: assert d.eT[r] + m <= d.eF[r] + 1e-9 or (d.x[r] - d.free[r]).Abs() <= d.Apart
+}
+
