@@ -21,6 +21,66 @@ fn main() ? io.Error, ParseError {
     r := rand.Rand(1)
     try run("sudoku 81 x 9", 81, 9, chains, sweeps, threads, r, true)
     for n in Array<I64>[256, 1024, 2048]: try run("colouring " + $n + " x 3", n, 3, chains, sweeps, threads, r, false)
+    for n in Array<I64>[256, 1024] {
+        for hidden in Array<Bool>[false, true]: try nae(n, chains, sweeps, threads, r, hidden)
+    }
+}
+
+# planted not-all-equal instances of n two-valued cells and 2 n clauses of 3 as 3-cell factors (all equal costs 1),
+# and the same with two hidden units a clause beside them (small random tables: what units cost a sweep); ms a search,
+# ns a cell update, searches whose best chain satisfies every clause
+fn nae(n I64, chains I64, sweeps I64, threads I64, r mut rand.Rand&, hidden Bool) ? io.Error {
+    rounds := 4
+    total, updates := 0.0, 0.0
+    solved := 0
+    for _ in range rounds {
+        y := Array<I32>(n)
+        for i in range n: y[i] = I32(r.Below(2))
+        count := 2 * n
+        f := potts.Factors(2, 3, 1, count, n)
+        q I64 = 0
+        for q < count {
+            a, b, c := r.Below(n), r.Below(n), r.Below(n)
+            if a == b or b == c or a == c or (y[a] == y[b] and y[b] == y[c]): continue
+            f.At[3 * q], f.At[3 * q + 1], f.At[3 * q + 2] = a, b, c
+            q++
+        }
+        f.T[0], f.T[7] = 1.0, 1.0
+        f.Index()
+        m := potts.Potts(2, 1)
+        m.Fac = f
+        if hidden {
+            # beside the clauses, two units a clause over the same cells with small random tables: their cost
+            h := potts.Hidden(2, 3, 2, 2 * count, n)
+            for j in range count {
+                for a in range 3 {
+                    h.At[3 * (2 * j) + a] = f.At[3 * j + a]
+                    h.At[3 * (2 * j + 1) + a] = f.At[3 * j + a]
+                }
+                h.Type[2 * j], h.Type[2 * j + 1] = 0, 1
+            }
+            for x in range h.H.Len(): h.H[x] = r.Uniform(-0.05, 0.05)
+            h.Index()
+            m.Hid = h
+        }
+        e := message.Edges(n, 1)
+        e.Set(Array<I32>(0), Array<I32>(0), 0)
+        s := potts.Sampler(n, chains, 2, threads)
+        s.ColourFor(e, m)
+        s.Start(r)
+        t0 := time.Now()
+        s.Anneal(m, e, Array<F64>(n), potts.Schedule(sweeps, 1.0, 0.03))
+        total += F64(time.Since(t0)) * 1e-6
+        for c in range chains: updates += F64(s.Sweeps[c] * n)
+        b := s.Best()
+        bad I64 = 0
+        for j in range count {
+            a0, a1, a2 := s.X[b * n + f.At[3 * j]], s.X[b * n + f.At[3 * j + 1]], s.X[b * n + f.At[3 * j + 2]]
+            if a0 == a1 and a1 == a2: bad++
+        }
+        if bad == 0: solved += 1
+    }
+    try io.PutLn("not-all-equal " + $n + " x 2, " + ("3-cell factors and hidden units" if hidden else "3-cell factors") + " | " + $(total / F64(rounds)).Fixed(1) + " | " + $(total * 1e6 / updates).Fixed(1) + " | " + $solved + "/" + $rounds + " | -")
 }
 
 fn run(name String&, n I64, k I64, chains I64, sweeps I64, threads I64, r mut rand.Rand&, sudoku Bool) ? io.Error {

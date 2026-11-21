@@ -1905,3 +1905,24 @@ problems; it is kept for continuous relaxations, not made faster.
 `potts.ClueFeatures`: a constraint problem's cell features (a clue one-hot with a no-clue slot, the degree / 4) - with
 them a Potts' B holds per-clue unary tables and a per-value degree term, the model e.g. a planted-colouring solver
 fits; tested against the local energies written out.
+
+## k-ary factors and hidden units in nn/potts (wt-pottsfactors, 2026-11-21)
+
+`Factors`: factors over Arity cells, each a table of K^Arity energies (several tables, one per factor kind); `Hidden`:
+binary hidden units joined to Arity cells each, an input C + sum of per-slot tables, summed out in the energy
+(-softplus: Energy is the free energy at T 1) and in each cell's pseudo-conditional. Pseudolikelihood fits their tables
+too (Fitter), the sampler draws every unit for all sixteen lanes before each sweep of the cells (block Gibbs: given
+the units the cells couple only through pairs and factors), and `ColourFor` keeps a factor's cells in different
+colour classes. Tested: the gradient of every table against central differences; the free energy against the sum over
+the units' states; planted not-all-equal instances satisfied through 3-cell factors; hidden units fitted to
+not-all-equal answers (the loss falls) and block-sampled. bench/potts, planted not-all-equal, 2 n clauses of 3, one
+thread, 32 chains of 300 sweeps, ms a search / ns a cell update / satisfied:
+
+| n | 3-cell factors | with two hidden units a clause beside them |
+|---|---|---|
+| 256 | 36.6 / 14.8 / 4 of 4 | 79.4 / 32.4 / 4 of 4 |
+| 1024 | 166 / 16.7 / 2 of 4 | 331 / 33.5 / 0 of 4 |
+
+(The units there carry small random tables: their cost, not a rule. A hand-set unit cannot penalize a clause: a unit
+only lowers the free energy, so a not-all-equal rule through units has to reward the satisfied patterns - what a
+fit finds.)

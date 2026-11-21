@@ -3,6 +3,12 @@
 #
 #     E(x) = sum over edges u -> v of w_uv W[x_v, x_u] / 2  +  sum over cells i of sum_f F[i, f] B[f, x_i]
 #
+# Beyond pairs: `Factors` - k-ary factors, each a table of K^k energies over its cells (a not-all-equal clause, a
+# parity) - and `Hidden` - binary hidden units, each joined to a few cells with a table per slot, summed out in the
+# energy (-softplus of its input) and drawn as a block before the cells in every sweep (block Gibbs). Attach them by
+# setting the model's Fac and Hid; every part - local energies, energy, pseudolikelihood and its gradients, the
+# sampler - takes them in. Cells sharing a factor are coloured apart (ColourFor).
+#
 # The graph is message.Edges (each undirected edge given both ways, so every pair is counted once through the half;
 # a batch of graphs laid out as one graph whose parts share no edge, as there). W is a K x K table shared by every edge,
 # symmetric when fitted with `Symmetric`; the unary term is linear in each cell's features F (a clue one-hot, a degree,
@@ -34,7 +40,114 @@ type Potts struct(k I64, features I64) {
     Features I64 = features
     W mut Array<F64>& = Array<F64>(k * k)
     B mut Array<F64>& = Array<F64>(features * k)
+    Fac mut Factors?& = null        # k-ary factors over the cells (Attach), or none
+    Hid mut Hidden?& = null         # binary hidden units over the cells (Attach), or none
 }
+
+# ---- factors over several cells ----
+
+# Count factors of Arity cells each (cells of a K-valued model of Cells cells), factor q's cells At[q Arity ..], its
+# table Table[q] of Tables tables, each K^Arity energies indexed by the cells' values in order (the first the most
+# significant): a not-all-equal clause, a parity, any rule over a few cells. Index() after At and Table are set; G is
+# PseudoGrad's gradient for T
+type Factors struct(k I64, arity I64, tables I64, count I64, cells I64) {
+    K I64 = k
+    Arity I64 = arity
+    Tables I64 = tables
+    Count I64 = count
+    Cells I64 = cells
+    Size I64 = powOf(k, arity)
+    At mut Array<I64>& = Array<I64>(count * arity)
+    Table mut Array<I64>& = Array<I64>(count)
+    T mut Array<F64>& = Array<F64>(tables * powOf(k, arity))
+    G mut Array<F64>& = Array<F64>(tables * powOf(k, arity))
+    ptr mut Array<I64>& = Array<I64>(cells + 1)     # cell i's (factor, slot)s: fid / slot[ptr[i] .. ptr[i + 1]]
+    fid mut Array<I64>& = Array<I64>(count * arity)
+    slot mut Array<I64>& = Array<I64>(count * arity)
+}
+
+fn powOf(k I64, n I64) I64 {
+    p I64 = 1
+    for _ in range n: p *= k
+    return p
+}
+
+# each cell's factors and its slot in each (after At is set)
+fn (f mut Factors&) Index() {
+    for i in range f.Cells + 1: f.ptr[i] = 0
+    for e in range f.Count * f.Arity: f.ptr[f.At[e] + 1] += 1
+    for i in range f.Cells: f.ptr[i + 1] += f.ptr[i]
+    next := Array<I64>(f.Cells)
+    for i in range f.Cells: next[i] = f.ptr[i]
+    for q in range f.Count {
+        for a in range f.Arity {
+            c := f.At[q * f.Arity + a]
+            f.fid[next[c]] = q
+            f.slot[next[c]] = a
+            next[c] += 1
+        }
+    }
+}
+
+# factor q's table entry with its cells at x[xo ..] but slot a's set to v
+fn (f Factors&) entry(q I64, a I64, v I64, x Array<I32>&, xo I64) I64 {
+    idx I64 = 0
+    for b in range f.Arity: idx = idx * f.K + (v if b == a else I64(x[xo + f.At[q * f.Arity + b]]))
+    return f.Table[q] * f.Size + idx
+}
+
+# ---- hidden units ----
+
+# Units binary hidden units, each joined to Arity cells (unit j's at At[j Arity ..]) and of one of Types types: with
+# h_j in {0, 1} the energy adds -h_j a_j, a_j = C[t] + sum over its slots s of H[(t Arity + s) K + x_cell]. Given the
+# cells the units are independent (P(h_j = 1) = sigmoid(a_j / T)); given the units the cells couple only through the
+# pairs and factors - so a sweep draws every unit, then the cells (block Gibbs). Summed out (T 1), a unit adds
+# -softplus(a_j) to the cells' energy: what Energy and PseudoGrad use. Index() after At is set; GH and GC PseudoGrad's
+# gradients
+type Hidden struct(k I64, arity I64, types I64, units I64, cells I64) {
+    K I64 = k
+    Arity I64 = arity
+    Types I64 = types
+    Units I64 = units
+    Cells I64 = cells
+    At mut Array<I64>& = Array<I64>(units * arity)
+    Type mut Array<I64>& = Array<I64>(units)
+    H mut Array<F64>& = Array<F64>(types * arity * k)
+    C mut Array<F64>& = Array<F64>(types)
+    GH mut Array<F64>& = Array<F64>(types * arity * k)
+    GC mut Array<F64>& = Array<F64>(types)
+    ptr mut Array<I64>& = Array<I64>(cells + 1)
+    uid mut Array<I64>& = Array<I64>(units * arity)
+    slot mut Array<I64>& = Array<I64>(units * arity)
+}
+
+fn (h mut Hidden&) Index() {
+    for i in range h.Cells + 1: h.ptr[i] = 0
+    for e in range h.Units * h.Arity: h.ptr[h.At[e] + 1] += 1
+    for i in range h.Cells: h.ptr[i + 1] += h.ptr[i]
+    next := Array<I64>(h.Cells)
+    for i in range h.Cells: next[i] = h.ptr[i]
+    for j in range h.Units {
+        for a in range h.Arity {
+            c := h.At[j * h.Arity + a]
+            h.uid[next[c]] = j
+            h.slot[next[c]] = a
+            next[c] += 1
+        }
+    }
+}
+
+# unit j's input a_j with its cells at x[xo ..]
+fn (h Hidden&) input(j I64, x Array<I32>&, xo I64) F64 {
+    t := h.Type[j]
+    a := h.C[t]
+    for s in range h.Arity: a += h.H[(t * h.Arity + s) * h.K + I64(x[xo + h.At[j * h.Arity + s]])]
+    return a
+}
+
+fn softplus(a F64) F64 { return a + (-a).Exp().Log1p() if a > 0.0 else a.Exp().Log1p() }
+
+fn sigmoid(a F64) F64 { return 1.0 / (1.0 + (-a).Exp()) }
 
 # the graph-colouring rule as an energy (no features): an edge of equal values costs 1
 fn Potts.Colouring(k I64) Potts {
@@ -57,9 +170,24 @@ fn (m Potts&) Local(e message.Edges&, f Array<F64>&, x Array<I32>&, xo I64, i I6
         col := I64(x[xo + e.Source(a)])
         for c in range k: L[lo + c] += w * m.W[c * k + col]
     }
+    if m.Fac != null {
+        fc := m.Fac!
+        for r in range fc.ptr[i], fc.ptr[i + 1] {
+            for c in range k: L[lo + c] += fc.T[fc.entry(fc.fid[r], fc.slot[r], c, x, xo)]
+        }
+    }
+    if m.Hid != null {
+        h := m.Hid!
+        for r in range h.ptr[i], h.ptr[i + 1] {
+            j, sl := h.uid[r], h.slot[r]
+            row := (h.Type[j] * h.Arity + sl) * k
+            rest := h.input(j, x, xo) - h.H[row + I64(x[xo + i])]
+            for c in range k: L[lo + c] -= softplus(rest + h.H[row + c])
+        }
+    }
 }
 
-# the energy of the assignment x[xo .. xo + cells]
+# the energy of the assignment x[xo .. xo + cells] (with hidden units, its free energy: the units summed out at T 1)
 fn (m Potts&) Energy(e message.Edges&, f Array<F64>&, x Array<I32>&, xo I64) F64 {
     k := m.K
     total F64 = 0.0
@@ -67,6 +195,14 @@ fn (m Potts&) Energy(e message.Edges&, f Array<F64>&, x Array<I32>&, xo I64) F64
         xi := I64(x[xo + i])
         for q in range m.Features: total += f[i * m.Features + q] * m.B[q * k + xi]
         for a in range e.First(i), e.First(i + 1): total += 0.5 * F64(e.Weight(a)) * m.W[xi * k + I64(x[xo + e.Source(a)])]
+    }
+    if m.Fac != null {
+        fc := m.Fac!
+        for q in range fc.Count: total += fc.T[fc.entry(q, -1, 0, x, xo)]
+    }
+    if m.Hid != null {
+        h := m.Hid!
+        for j in range h.Units: total -= softplus(h.input(j, x, xo))
     }
     return total
 }
@@ -95,8 +231,36 @@ fn (m Potts&) PseudoGrad(e message.Edges&, f Array<F64>&, y Array<I32>&, gw mut 
             col := I64(y[e.Source(a)])
             for c in range k: gw[c * k + col] += L[c] * w
         }
+        if m.Fac != null {
+            fc := m.Fac!
+            for r in range fc.ptr[i], fc.ptr[i + 1] {
+                for c in range k: fc.G[fc.entry(fc.fid[r], fc.slot[r], c, y, 0)] += L[c]
+            }
+        }
+        if m.Hid != null: m.hiddenGrad(m.Hid!, y, i, L)
     }
     return nll
+}
+
+# cell i's hidden units' part of the gradient, g (in L) dNLL / dL_c: L_c holds -softplus(a_j(c)) for each unit j
+# of the cell, a_j(c) its input with the cell at c - so each of a_j(c)'s terms gets -g_c sigmoid(a_j(c))
+fn (m Potts&) hiddenGrad(h mut Hidden&, y Array<I32>&, i I64, g Array<F64>&) {
+    k := m.K
+    for r in range h.ptr[i], h.ptr[i + 1] {
+        j, sl := h.uid[r], h.slot[r]
+        t := h.Type[j]
+        row := (t * h.Arity + sl) * k
+        rest := h.input(j, y, 0) - h.H[row + I64(y[i])]
+        for c in range k {
+            d := -g[c] * sigmoid(rest + h.H[row + c])
+            h.GC[t] += d
+            h.GH[row + c] += d
+            for s2 in range h.Arity {
+                if s2 == sl: continue
+                h.GH[(t * h.Arity + s2) * k + I64(y[h.At[j * h.Arity + s2]])] += d
+            }
+        }
+    }
 }
 
 # a gradient of W made symmetric: each pair's two entries replaced by their mean (a W kept symmetric stays so)
@@ -127,7 +291,8 @@ fn ClueFeatureCount(k I64) I64 { return k + 2 }
 
 # pseudolikelihood fitting by Adam: Add each example of a batch (a graph, its cells' features, a known answer), then
 # Step - the mean gradient over the batch's cells taken, W's made symmetric where Symmetrize, one Adam step at rate;
-# Loss the batch's mean negative log-pseudolikelihood a cell
+# Loss the batch's mean negative log-pseudolikelihood a cell. The factor tables and hidden units the model has when
+# the Fitter is made are fitted too
 type Fitter struct(m mut Potts&) {
     M mut Potts& = m
     Symmetrize Bool = true
@@ -140,6 +305,12 @@ type Fitter struct(m mut Potts&) {
     mb mut Array<F64>& = Array<F64>(m.Features * m.K)
     vb mut Array<F64>& = Array<F64>(m.Features * m.K)
     L mut Array<F64>& = Array<F64>(m.K)
+    mt mut Array<F64>& = Array<F64>(m.Fac!.T.Len() if m.Fac != null else 0)    # Adam's moments of the factor tables
+    vt mut Array<F64>& = Array<F64>(m.Fac!.T.Len() if m.Fac != null else 0)
+    mh mut Array<F64>& = Array<F64>(m.Hid!.H.Len() if m.Hid != null else 0)    # and of the hidden units' tables
+    vh mut Array<F64>& = Array<F64>(m.Hid!.H.Len() if m.Hid != null else 0)
+    mc mut Array<F64>& = Array<F64>(m.Hid!.C.Len() if m.Hid != null else 0)
+    vc mut Array<F64>& = Array<F64>(m.Hid!.C.Len() if m.Hid != null else 0)
     nll F64 = 0.0
     cells I64 = 0
 }
@@ -156,6 +327,11 @@ fn (t mut Fitter&) Step(rate F64) F64 {
     n := F64(t.cells)
     adam(t.M.W, t.gw, t.mw, t.vw, n, rate, t.Steps)
     adam(t.M.B, t.gb, t.mb, t.vb, n, rate, t.Steps)
+    if t.M.Fac != null: adam(t.M.Fac!.T, t.M.Fac!.G, t.mt, t.vt, n, rate, t.Steps)
+    if t.M.Hid != null {
+        adam(t.M.Hid!.H, t.M.Hid!.GH, t.mh, t.vh, n, rate, t.Steps)
+        adam(t.M.Hid!.C, t.M.Hid!.GC, t.mc, t.vc, n, rate, t.Steps)
+    }
     t.Loss = t.nll / n
     t.nll, t.cells = 0.0, 0
     return t.Loss
@@ -214,7 +390,10 @@ type Sampler struct(cells I64, chains I64, k I64, threads I64 = 1) {
 
 # a greedy colouring of e's graph (each cell the lowest colour no neighbour has, in order of falling degree): the
 # classes a sweep takes in turn
-fn (s mut Sampler&) Colour(e message.Edges&) {
+fn (s mut Sampler&) Colour(e message.Edges&) { s.ColourFor(e, Potts(1, 0)) }
+
+# the same where m has factors: cells sharing a factor are neighbours too (they must not be drawn at once)
+fn (s mut Sampler&) ColourFor(e message.Edges&, m Potts&) {
     n := s.Cells
     colour := Array<I64>(n, -1)
     byDegree := Array<I64>(n)
@@ -223,18 +402,12 @@ fn (s mut Sampler&) Colour(e message.Edges&) {
     used := Array<Bool>(n + 1)
     most I64 = 0
     for i in byDegree {
-        for a in range e.First(i), e.First(i + 1) {
-            c := colour[e.Source(a)]
-            if c >= 0: used[c] = true
-        }
+        mark(e, m, i, colour, used, true)
         c I64 = 0
         for used[c]: c++
         colour[i] = c
         most = most.Max(c + 1)
-        for a in range e.First(i), e.First(i + 1) {
-            u := colour[e.Source(a)]
-            if u >= 0: used[u] = false
-        }
+        mark(e, m, i, colour, used, false)
     }
     s.Colours = most
     for q in range most + 1: s.classes[q] = 0
@@ -245,6 +418,23 @@ fn (s mut Sampler&) Colour(e message.Edges&) {
     for i in range n {
         s.order[next[colour[i]]] = i
         next[colour[i]] += 1
+    }
+}
+
+# the colours of cell i's neighbours (by edge, and by a shared factor) set in used, or cleared
+fn mark(e message.Edges&, m Potts&, i I64, colour Array<I64>&, used mut Array<Bool>&, on Bool) {
+    for a in range e.First(i), e.First(i + 1) {
+        c := colour[e.Source(a)]
+        if c >= 0: used[c] = on
+    }
+    if m.Fac == null: return
+    f := m.Fac!
+    for r in range f.ptr[i], f.ptr[i + 1] {
+        q := f.fid[r]
+        for b in range f.Arity {
+            c := colour[f.At[q * f.Arity + b]]
+            if c >= 0: used[c] = on
+        }
     }
 }
 
@@ -337,14 +527,20 @@ fn (s mut Sampler&) group(m Potts&, e message.Edges&, f Array<F64>&, sched Sched
     low, z, u := Array<F32>(Lanes), Array<F32>(Lanes), Array<F32>(Lanes)
     D := Array<F32>(k * Lanes)
     sweeps := Array<I64>(Lanes, sched.Sweeps + sched.Polish)
+    part := Array<I64>(Lanes)
+    units := m.Hid!.Units if m.Hid != null else 0
+    hl := Array<F32>(units * Lanes)
     for sweep in range sched.Sweeps + sched.Polish {
         t := sched.At(sweep)
         for l in range Lanes: moved[l] = 0
+        if units > 0: drawUnits(m.Hid!, X, xo, hl, F32(t), u, seeds)
         for at in range n {
             i := order[at]
             for v in range k {
                 for l in range Lanes: L[lo + v * Lanes + l] = F32(unary[i * k + v]) + field[fo + (i * k + v) * Lanes + l]
             }
+            if m.Fac != null: factorLanes(m.Fac!, i, X, xo, L, lo, part)
+            if units > 0: unitLanes(m.Hid!, i, hl, L, lo)
             if t > 0.0 { drawLanes(L, lo, k, F32(1.0 / t), low, z, u, pick, seeds) } else { lowestLanes(L, lo, k, low, pick) }
             some := false
             for l in range Lanes {
@@ -382,6 +578,71 @@ fn (s mut Sampler&) group(m Potts&, e message.Edges&, f Array<F64>&, sched Sched
         for i in range n: s.X[c * n + i] = X[xo + i * Lanes + l]
         s.Sweeps[c] = sweeps[l]
         s.Energies[c] = m.Energy(e, f, s.X, c * n)
+    }
+}
+
+# cell i's factors' energies added to every lane's: each factor's table row for the lane's other cells, one entry a value
+fn factorLanes(f Factors&, i I64, X Array<I32>&, xo I64, L mut Array<F32>&, lo I64, part mut Array<I64>&) {
+    k := f.K
+    for r in range f.ptr[i], f.ptr[i + 1] {
+        q, a := f.fid[r], f.slot[r]
+        stride := powOf(k, f.Arity - 1 - a)
+        for l in range Lanes: part[l] = f.Table[q] * f.Size
+        for b in range f.Arity {
+            if b == a: continue
+            sb := powOf(k, f.Arity - 1 - b)
+            cell := f.At[q * f.Arity + b]
+            for l in range Lanes: part[l] += I64(X[xo + cell * Lanes + l]) * sb
+        }
+        for v in range k {
+            for l in range Lanes: L[lo + v * Lanes + l] += F32(f.T[part[l] + v * stride])
+        }
+    }
+}
+
+# every unit's state drawn for every lane given the lanes' cells: 1 with probability sigmoid(a / t) (t > 0), or where
+# a > 0 (t = 0)
+fn drawUnits(h Hidden&, X Array<I32>&, xo I64, hl mut Array<F32>&, t F32, u mut Array<F32>&, seeds mut Array<U64>&) {
+    k := h.K
+    for j in range h.Units {
+        ty := h.Type[j]
+        for l in range Lanes: hl[j * Lanes + l] = F32(h.C[ty])
+        for s2 in range h.Arity {
+            row := (ty * h.Arity + s2) * k
+            cell := h.At[j * h.Arity + s2]
+            for l in range Lanes: hl[j * Lanes + l] += F32(h.H[row + I64(X[xo + cell * Lanes + l])])
+        }
+        if t <= 0.0 {
+            for l in range Lanes: hl[j * Lanes + l] = F32(1.0) if hl[j * Lanes + l] > 0.0 else F32(0.0)
+            continue
+        }
+        uniformLanes(u, seeds)
+        for l in range Lanes: hl[j * Lanes + l] = F32(1.0) if u[l] < 1.0 / (1.0 + elem.FastExp(-hl[j * Lanes + l] / t)) else F32(0.0)
+    }
+}
+
+# the drawn units' part of cell i's energies: -h_j H[slot row, v] for each of its units
+fn unitLanes(h Hidden&, i I64, hl Array<F32>&, L mut Array<F32>&, lo I64) {
+    k := h.K
+    for r in range h.ptr[i], h.ptr[i + 1] {
+        j := h.uid[r]
+        row := (h.Type[j] * h.Arity + h.slot[r]) * k
+        for v in range k {
+            w := F32(h.H[row + v])
+            for l in range Lanes: L[lo + v * Lanes + l] -= hl[j * Lanes + l] * w
+        }
+    }
+}
+
+# a uniform in [0, 1) a lane, each lane's generator stepped
+fn uniformLanes(u mut Array<F32>&, seeds mut Array<U64>&) {
+    for l in range Lanes {
+        x := seeds[l]
+        x ^= x >> 12
+        x ^= x << 25
+        x ^= x >> 27
+        seeds[l] = x
+        u[l] = F32((x * 2685821657736338717) >> 40) * F32(5.9604645e-08)
     }
 }
 
@@ -671,4 +932,150 @@ test ClueFeatures "a cell's clue one-hot (or the no-clue slot) and its degree / 
             assert (L[c] - want).Abs() < 1e-12
         }
     }
+}
+
+# a planted not-all-equal instance: n two-valued cells, count clauses of 3 distinct cells, none all equal under the
+# planted answer; the factors (one table: all equal costs 1) and the answer
+fn naeCase(n I64, count I64, r mut rand.Rand&) Factors, Array<I32> {
+    y := Array<I32>(n)
+    for i in range n: y[i] = I32(r.Below(2))
+    f := Factors(2, 3, 1, count, n)
+    q I64 = 0
+    for q < count {
+        a, b, c := r.Below(n), r.Below(n), r.Below(n)
+        if a == b or b == c or a == c or (y[a] == y[b] and y[b] == y[c]): continue
+        f.At[3 * q], f.At[3 * q + 1], f.At[3 * q + 2] = a, b, c
+        q++
+    }
+    f.T[0], f.T[7] = 1.0, 1.0
+    f.Index()
+    return f, y
+}
+
+test Factors "annealed chromatic Gibbs over 3-cell factors satisfies a planted not-all-equal instance; no colour class holds two cells of a factor" {
+    r := rand.Rand(21)
+    f, _ := naeCase(80, 160, r)
+    m := Potts(2, 1)
+    m.Fac = f
+    e := message.Edges(80, 1)
+    e.Set(Array<I32>(0), Array<I32>(0), 0)
+    s := Sampler(80, 16, 2, 2)
+    s.ColourFor(e, m)
+    for q in range 160 {
+        for a in range 3 {
+            for b in range a + 1, 3: assert colourOf(s, f.At[3 * q + a]) != colourOf(s, f.At[3 * q + b])
+        }
+    }
+    s.Start(rand.Rand(4))
+    s.Anneal(m, e, Array<F64>(80), Schedule(300, 1.0, 0.03))
+    assert s.Energies[s.Best()] == 0.0, $s.Energies[s.Best()]
+}
+
+fn colourOf(s Sampler&, i I64) I64 {
+    for q in range s.Colours {
+        for at in range s.classes[q], s.classes[q + 1] {
+            if s.order[at] == i: return q
+        }
+    }
+    return -1
+}
+
+test Potts.PseudoGrad "with factors and hidden units: the pseudolikelihood's gradient for every table equals its central differences, and Energy is the free energy summed over the units" {
+    r := rand.Rand(22)
+    f, y := naeCase(12, 15, r)
+    for i in range f.T.Len(): f.T[i] = r.Uniform(-1.0, 1.0)
+    h := Hidden(2, 3, 2, 6, 12)
+    for j in range 6 {
+        for a in range 3: h.At[3 * j + a] = (j * 2 + a * 5) % 12
+        h.Type[j] = j % 2
+    }
+    for i in range h.H.Len(): h.H[i] = r.Uniform(-1.0, 1.0)
+    h.C[0], h.C[1] = 0.3, -0.4
+    h.Index()
+    m := Potts(2, 1)
+    m.Fac = f
+    m.Hid = h
+    e := message.Edges(12, 1)
+    e.Set(Array<I32>(0), Array<I32>(0), 0)
+    fz := Array<F64>(12)
+    gw, gb, L := Array<F64>(4), Array<F64>(2), Array<F64>(2)
+    m.PseudoGrad(e, fz, y, gw, gb, L)
+    tables := Array<mut Array<F64>&>[f.T, h.H, h.C]
+    grads := Array<mut Array<F64>&>[f.G, h.GH, h.GC]
+    hstep := 1e-6
+    for t in range 3 {
+        tab := tables[t]
+        want := Array<F64>(tab.Len())
+        for j in range tab.Len() {
+            keep := tab[j]
+            tab[j] = keep + hstep
+            up := m.PseudoGrad(e, fz, y, gw, gb, L)
+            tab[j] = keep - hstep
+            down := m.PseudoGrad(e, fz, y, gw, gb, L)
+            tab[j] = keep
+            want[j] = (up - down) / (2.0 * hstep)
+        }
+        for j in range 3 {
+            gj := grads[j]
+            for x in range gj.Len(): gj[x] = 0.0
+        }
+        m.PseudoGrad(e, fz, y, gw, gb, L)
+        for j in range tab.Len(): assert (grads[t][j] - want[j]).Abs() < 1e-5 * (1.0 + want[j].Abs()), "table " + $t + " entry " + $j
+    }
+    # the free energy: -log of the sum over every unit's state of exp(-E(x, h))
+    brute F64 = 0.0
+    for q in range f.Count: brute += f.T[f.entry(q, -1, 0, y, 0)]
+    z F64 = 1.0
+    for j in range h.Units: z *= 1.0 + h.input(j, y, 0).Exp()
+    assert (m.Energy(e, fz, y, 0) - (brute - z.Log())).Abs() < 1e-10
+}
+
+test Fitter "hidden units fitted by pseudolikelihood to not-all-equal answers, no pairs: the loss falls, and block Gibbs over units and cells runs to a low free energy" {
+    r := rand.Rand(23)
+    n := 40
+    first F64 = 0.0
+    m := Potts(2, 1)
+    h := Hidden(2, 3, 1, 80, n)
+    for i in range h.H.Len(): h.H[i] = r.Uniform(-0.1, 0.1)
+    m.Hid = h
+    f0, _ := naeCase(n, 80, r)
+    for j in range 80 {
+        for a in range 3: h.At[3 * j + a] = f0.At[3 * j + a]
+    }
+    h.Index()
+    e := message.Edges(n, 1)
+    e.Set(Array<I32>(0), Array<I32>(0), 0)
+    fz := Array<F64>(n)
+    t := Fitter(m)
+    for step in range 200 {
+        # answers satisfying the same clauses: the planted one or its complement, and random other satisfying ones
+        y := Array<I32>(n)
+        for i in range n: y[i] = I32(r.Below(2))
+        for {
+            ok := true
+            for j in range 80 {
+                a, b, c := h.At[3 * j], h.At[3 * j + 1], h.At[3 * j + 2]
+                if y[a] == y[b] and y[b] == y[c]: ok = false
+            }
+            if ok: break
+            # flip one cell of each violated clause at random (WalkSAT-like) until satisfied
+            for j in range 80 {
+                a, b, c := h.At[3 * j], h.At[3 * j + 1], h.At[3 * j + 2]
+                if y[a] == y[b] and y[b] == y[c] {
+                    v := h.At[3 * j + r.Below(3)]
+                    y[v] = 1 - y[v]
+                }
+            }
+        }
+        t.Add(e, fz, y)
+        loss := t.Step(0.05)
+        if step == 0: first = loss
+    }
+    assert t.Loss < 0.9 * first, $first + " -> " + $t.Loss
+    s := Sampler(n, 16, 2)
+    s.Colour(e)
+    s.Start(r)
+    s.Anneal(m, e, fz, Schedule(200, 1.0, 0.05))
+    best := s.Best()
+    assert s.Energies[best] == m.Energy(e, fz, s.X, best * n)
 }
