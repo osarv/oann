@@ -1434,3 +1434,27 @@ gain at 128 rows. Left: the workers' wake itself (an olang runtime matter: spinn
 split to a few microseconds), and duplicate packing of the narrower operand, which caps 64-128-row products.
 
 Also re-checked repro/ against olang 3b47ad852: every bug but `tempref` is fixed (repro/README.md).
+
+## Halting on a stable answer (wt-stable, 2026-11-21)
+
+`dyn/halt.Stable` is a general stop rule for any loop that refines an answer step by step: a row holds once its answer
+(one or more integers - a class per readout group, an index, a token) has been unchanged for k steps; allocation-free,
+usable beside a residual-based stop. The settle takes it as `settle.Budget.Stable` (k > 0): after each sweep every row's
+answer is read (each readout group's largest unit); with per-row stops (a Euclidean budget, Jacobi, no Anderson) a row
+that holds stops at that sweep as a converged row does, and the settle ends once every row has stopped one way or the
+other (`Settlement.Halted`; a rate system on the CPU - the GPU's settle refuses it by name). Tested on a chain whose
+inputs are turned round after a first settle (dyn/system): a damped settle to 1e-12 takes 51 sweeps, halting at k = 3
+takes 9 with all 130 answers the converged state's, and the turned rows stop at their own sweeps while the unturned
+ones stop on the tolerance at once.
+
+`examples/mnist_learn` takes a 17th argument, halt: after training, the test set is answered again for each k up to it.
+Seed 1, 3 epochs, 784-128-10, batches of 32 (the test answers settle as they do in training, at the lesson tolerance):
+
+| certificate | tolerance only | k = 1 | k = 2 | k = 3 | k = 4 | k = 5 |
+|---|---|---|---|---|---|---|
+| none (sup) | 96.71%, 14.7 sweeps | 95.86%, 2.0 | 96.56%, 3.8 | 96.57%, 4.8 | 96.64%, 6.0 | 96.65%, 7.0 |
+| spectral (rows stop on their own) | 96.89%, 10.7 | 96.56%, 2.1 | 96.65%, 3.3 | 96.82%, 4.4 | 96.87%, 5.5 | 96.87%, 6.6 |
+
+So an answer needs a third to a half of the sweeps the residual asks for at a cost of 0.02-0.14 points (k 3-5); one
+seed. Reproduce: `make mnistlearn ARGS="3 60000 128 32 1 0.001 0.5 1 1 0.1 200 1 0 plain spectral 5"`.
+

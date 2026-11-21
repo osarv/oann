@@ -37,6 +37,7 @@ import "../kernels/device"
 import "neuron"
 import "conn"
 import "settle"
+import "halt"
 
 Gpu Bool = false
 
@@ -1171,6 +1172,69 @@ fn System<T>.mixed(batch I64, threads I64) System<T> {
     s.Bound = Norm.Sup                  # Gauss-Seidel's rate is proven under the sup-norm certificate (redesign 1.4)
     s.Certify(0.9)
     return s
+}
+
+# x (8 inputs) -> h (32 tanh) <-> y (4, cross-entropy): a chain whose answers follow its inputs, certified at 0.9
+fn System<T>.chain(batch I64) System<T> {
+    r := rand.Rand(9)
+    s := System<T>(batch, 1)
+    root := s.Root()
+    x := s.Population(root, "x", 8, neuron.Neuron.Rate(neuron.Rho.Linear), neuron.Role.Input)
+    h := s.Population(root, "h", 32, neuron.Neuron.Rate(neuron.Rho.Tanh))
+    y := s.Population(root, "y", 4, neuron.Neuron.Rate(neuron.Rho.Tanh), neuron.Role.Readout(neuron.Cost.CrossEntropy(0.25, 1)))
+    s.Connect(x, h, conn.Wiring.Dense)
+    s.Connect(h, y, conn.Wiring.Symmetric)
+    s.Plan(r)!
+    for i in range batch * 8: s.Pop(x).Drive[i] = T(r.Uniform(-3.0, 3.0))
+    s.Bound = Norm.Sup
+    s.Certify(0.9)
+    return s
+}
+
+# the chain settled, then the drive of every other row turned round: a warm start whose answers move
+fn System<T>.turned(rows I64) System<T> {
+    s := System<T>.chain(rows)
+    s.Settle(settle.Phase.Free, settle.Budget(400, 1e-12))
+    for r in range 0, rows, 2 {
+        for i in range 8: s.Pop(Pop(0)).Drive[r * 8 + i] = -s.Pop(Pop(0)).Drive[r * 8 + i]
+    }
+    return s
+}
+
+# the readout's answers (its largest unit) in the free phase's rows that agree between two chains
+fn sameAnswers<T>(p System<T>&, q System<T>&, rows I64) I64 {
+    u := p.State<neuron.RateCell<T>>(Pop(2)).S
+    v := q.State<neuron.RateCell<T>>(Pop(2)).S
+    same I64 = 0
+    for r in range rows {
+        if halt.ArgMax(u, r * 4, 4) == halt.ArgMax(v, r * 4, 4): same += 1
+    }
+    return same
+}
+
+test System.Settle "a stable answer stops a settle (Budget.Stable): fewer sweeps than the tolerance needs, nearly every answer the converged state's; with per-row stops each row at its own sweep" {
+    full := System<F64>.turned(130)
+    f := full.Settle(settle.Phase.Free, settle.Budget(2000, 1e-12, 0.5))
+    assert f.Converged and not f.Halted
+    for euclid in Array<Bool>[false, true] {
+        s := System<F64>.turned(130)
+        h := s.Settle(settle.Phase.Free, settle.Budget(2000, 1e-12, 0.5, settle.Sweeping(), euclid, 3))
+        assert h.Halted and not h.Converged and h.Sweeps < f.Sweeps, $h + " against " + $f
+        assert sameAnswers(full, s, 130) >= 125, $sameAnswers(full, s, 130) + " of 130 answers"
+        if not euclid: continue
+        early I64 = 0
+        for r in range 130 {
+            # a row left as it was is at its fixed point and stops on the tolerance at once; a turned one on its answer
+            if r % 2 == 1: assert s.E.RowStop[r] == 0, "row " + $r + " stopped at " + $s.E.RowStop[r]
+            if r % 2 == 1: continue
+            assert s.E.RowStop[r] >= 3 and s.E.RowStop[r] <= h.Sweeps, "row " + $r + " stopped at " + $s.E.RowStop[r]
+            if s.E.RowStop[r] < h.Sweeps: early += 1
+        }
+        assert early > 0, "every turned row stopped at sweep " + $h.Sweeps
+    }
+    # a budget without it never halts
+    t := System<F64>.turned(130)
+    assert not t.Settle(settle.Phase.Free, settle.Budget(2000, 1e-12, 0.5)).Halted
 }
 
 # a and b's state, every phase, against another's: the same bit for bit

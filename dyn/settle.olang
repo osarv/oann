@@ -44,6 +44,7 @@ import "../kernels/gemm"
 import "../kernels/sparse"
 import "neuron"
 import "conn"
+import "halt"
 
 # the rows of a unit of work, at most
 Chunk I64 = 128
@@ -69,22 +70,26 @@ type Sweeping struct(Anderson I64 = 0, GaussSeidel Bool = false) {
 # what a settle may take: at most Sweeps sweeps (time steps, spiking), stopping when every residual is at most Tol; a
 # step shortened by the factor 1 - Damping; the sweeps of Scheme. Euclid: the residual tested is each row's Euclidean
 # norm over its relaxing units (the norm of the spectral certificate), not each unit's; a rate system of built-in
-# models only (a spiking or custom one is tested unit by unit)
-type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Scheme Sweeping = Sweeping(), Euclid Bool = false) {
+# models only (a spiking or custom one is tested unit by unit). Stable (k > 0): a row also stops once its answer - the
+# class each readout group's largest unit names - has been the same for k sweeps (dyn/halt), and the settle once every
+# row has stopped either way; a rate system on the CPU
+type Budget struct(Sweeps I64 = 128, Tol F64 = 1.25e-3, Damping F64 = 0, Scheme Sweeping = Sweeping(), Euclid Bool = false, Stable I64 = 0) {
     Sweeps
     Tol
     Damping
     Scheme
     Euclid
+    Stable
 }
 
 # how a settle went: the sweeps it took, the residual's norm at the end (the sup norm, or the largest row's Euclidean
 # norm under Budget.Euclid) (NaN or infinite where it diverged), and
-# whether it is within the tolerance
-type Settlement struct(Sweeps I64 = 0, Residual F64 = 0, Converged Bool = false) {
+# whether it is within the tolerance; Halted: it stopped on stable answers (Budget.Stable) before the tolerance
+type Settlement struct(Sweeps I64 = 0, Residual F64 = 0, Converged Bool = false, Halted Bool = false) {
     Sweeps
     Residual
     Converged
+    Halted
 }
 
 # whether the settle diverged: a residual that is not finite
@@ -198,6 +203,7 @@ type Engine<T> struct(batch I64, phases I64, threads I64) {
     idle I64 = 0                                    # the row-sweeps of the planned units' populations left out, rows stopped
     Skipped I64 = 0                                 # every population's row-sweeps not run because their rows had stopped
     acc mut History<T>& = History<T>(0, 0)        # Anderson's history
+    answers mut halt.Stable& = halt.Stable(0, 1)  # each row's answer, its readouts' groups' classes (Budget.Stable)
     spec mut Vec<mut Array<T>&>& = Vec<mut Array<T>&>()    # Spectral's vector (zero until drawn), kept to warm-start the next call
     specW mut Vec<mut Array<T>&>& = Vec<mut Array<T>&>()   # its product with the coupling
 }
@@ -268,6 +274,11 @@ fn (e mut Engine<T>&) Ready() {
         e.Window = model.window
     }
     e.sweepOrder()
+    width I64 = 0
+    for p in e.Pops {
+        if p.Role == neuron.Role.Readout: width += GroupsOf(p.Role).Max(1)
+    }
+    e.answers = halt.Stable(e.Rows, 1, width)
     e.groups = Array<I64>(e.Pops.Len() + 1)
     e.fresh = Array<Bool>(e.Pops.Len())
     for p in e.Pops {
@@ -701,6 +712,8 @@ fn (e mut Engine<T>&) Settle(lo I64, hi I64, b Budget, fold Bool) Settlement {
 # the state its sweep wrote)
 fn (e mut Engine<T>&) relax(b Budget, r0 I64, r1 I64, m I64) Settlement {
     rows := b.Euclid and e.builtIn()
+    e.answers.K = b.Stable.Max(1)
+    if b.Stable > 0: e.answers.Clear(r0, r1)
     for k in range b.Sweeps + 1 {
         e.sweep = k
         worst := F64(e.sweepOnce())
@@ -709,11 +722,47 @@ fn (e mut Engine<T>&) relax(b Budget, r0 I64, r1 I64, m I64) Settlement {
         out := Settlement(k, worst, worst <= b.Tol)
         if e.stopping and not out.Converged and worst == worst and e.stopRows(r0, r1, b.Tol, k): e.plan(r0 / e.Batch, r1 / e.Batch)
         if out.Converged and e.seidel: e.cur = 1 - e.cur
+        if not out.Converged and b.Stable > 0 and worst == worst and e.answered(r0, r1, k) {
+            out.Halted = true
+            return out
+        }
         if out.Converged or out.Diverged() or k == b.Sweeps: return out
         if m > 0: e.accelerate(r0, r1, worst, m)
         e.cur = 1 - e.cur
     }
     unreachable
+}
+
+# after sweep k: each row's answer read from the state the sweep wrote - every readout group's largest unit - and
+# recorded (Budget.Stable); a row whose answer has held for the budget's sweeps stops where rows may stop on their own,
+# as stopRows does. Whether every row of r0 .. r1 has stopped, or holds its answer
+fn (e mut Engine<T>&) answered(r0 I64, r1 I64, k I64) Bool {
+    all := true
+    stopped := false
+    for r in range r0, r1 {
+        if e.stopping and e.RowDone[r]: continue
+        g I64 = 0
+        for p in e.Pops {
+            if p.Role != neuron.Role.Readout: continue
+            groups := GroupsOf(p.Role).Max(1)
+            n := p.Size / groups
+            for q in range groups {
+                e.answers.Mark(r, g, halt.ArgMax(p.readout(1 - e.cur), r * p.Size + q * n, n))
+                g += 1
+            }
+        }
+        held := e.answers.Step(r)
+        all = all and held
+        if not held or not e.stopping: continue
+        stopped = true
+        e.RowDone[r] = true
+        e.RowStop[r] = k
+        for p in e.Pops {
+            if p.Role != neuron.Role.Input: copyRows(p.rate(1 - e.cur), p.rate(e.cur), r * p.Size, r * p.Size, p.Size)
+        }
+    }
+    if stopped and not all: e.plan(r0 / e.Batch, r1 / e.Batch)
+    return all
 }
 
 # whether every relaxing population is a built-in rate model (its residual readable from its two buffers)

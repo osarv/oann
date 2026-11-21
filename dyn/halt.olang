@@ -1,0 +1,106 @@
+# dyn/halt - halting on a stable answer. A loop that refines an answer step by step - a settle's sweeps, a descent's
+# steps, a recurrence's ticks, a decoder's revisions - may stop a row once its answer has stayed the same for k steps
+# in a row, beside (or instead of) a stop on the residual: the state may still be moving while what is read from it no
+# longer changes. A row's answer is one or more integers (a class per group, an index, a token), compared exactly.
+#
+#     st := halt.Stable(rows, 3)
+#     for step in range most {
+#         ...one step of every row...
+#         done := true
+#         for r in range rows: done = st.See(r, halt.ArgMax(scores, r * classes, classes)) and done
+#         if done: break
+#     }
+#
+# Allocation-free once made: a settle keeps one, reserved for its rows and its readouts' groups.
+
+# rows rows, each answering width integers; a row holds once its answer has been unchanged for K steps (K >= 1)
+type Stable struct(rows I64, k I64, width I64 = 1) {
+    K I64 = k.Max(1)
+    Width I64 = width.Max(1)
+    last mut Array<I64>& = Array<I64>(rows * width.Max(1))
+    run mut Array<I64>& = Array<I64>(rows)
+    seen mut Array<Bool>& = Array<Bool>(rows)
+    marked mut Array<Bool>& = Array<Bool>(rows)
+}
+
+# rows r0 .. r1 forget their answers: the next step is their first
+fn (s mut Stable&) Clear(r0 I64, r1 I64) {
+    for r in range r0, r1 {
+        s.seen[r] = false
+        s.run[r] = 0
+        s.marked[r] = false
+    }
+}
+
+# every row forgets its answer
+fn (s mut Stable&) Reset() { s.Clear(0, s.run.Len()) }
+
+# part g of row r's answer at this step is a - recorded, the row marked changed where it differs from the last step's
+# (Step then closes the step)
+fn (s mut Stable&) Mark(r I64, g I64, a I64) {
+    i := r * s.Width + g
+    if s.last[i] != a: s.marked[r] = true
+    s.last[i] = a
+}
+
+# closes row r's step (its parts given by Mark): whether its answer has now been unchanged for K steps. A row's first
+# step starts its count at 0, whatever it answers
+fn (s mut Stable&) Step(r I64) Bool {
+    same := s.seen[r] and not s.marked[r]
+    s.run[r] = s.run[r] + 1 if same else 0
+    s.seen[r] = true
+    s.marked[r] = false
+    return s.run[r] >= s.K
+}
+
+# row r answered a (one part) at this step: whether its answer has now been unchanged for K steps
+fn (s mut Stable&) See(r I64, a I64) Bool {
+    s.Mark(r, 0, a)
+    return s.Step(r)
+}
+
+# whether row r's answer has been unchanged for K steps, as of its last step
+fn (s Stable&) Holds(r I64) Bool { return s.run[r] >= s.K }
+
+# the steps row r's answer has been unchanged for
+fn (s Stable&) Run(r I64) I64 { return s.run[r] }
+
+# part g of row r's last answer
+fn (s Stable&) Answer(r I64, g I64 = 0) I64 { return s.last[r * s.Width + g] }
+
+# the index of the largest of x[off] .. x[off + n - 1] (the first of equals; a NaN is never the largest) - a
+# classifier's answer
+fn ArgMax<T>(x Array<T>&, off I64, n I64) I64 {
+    best I64 = 0
+    for i in range 1, n {
+        if x[off + i] > x[off + best]: best = i
+    }
+    return best
+}
+
+assert not Stable.See.Allocates, "a step of the stable-answer test allocates"
+
+test Stable "a row holds once its answer is unchanged for k steps; a change starts the count again; rows apart" {
+    s := Stable(2, 2)
+    assert not s.See(0, 4) and not s.See(1, 1)
+    assert not s.See(0, 4) and not s.See(1, 2)
+    assert s.See(0, 4) and not s.See(1, 2)
+    assert s.Run(0) == 2 and s.Holds(0) and not s.Holds(1)
+    assert not s.See(0, 5) and s.See(1, 2)
+    assert s.Answer(0) == 5 and s.Answer(1) == 2
+    s.Clear(0, 1)
+    assert not s.See(0, 5) and s.Run(0) == 0
+}
+
+test Stable "an answer in parts: a change in any part is a change" {
+    s := Stable(1, 1, 3)
+    for g in range 3: s.Mark(0, g, g)
+    assert not s.Step(0)
+    for g in range 3: s.Mark(0, g, g)
+    assert s.Step(0)
+    s.Mark(0, 0, 0)
+    s.Mark(0, 1, 7)
+    s.Mark(0, 2, 2)
+    assert not s.Step(0) and s.Answer(0, 1) == 7
+    assert ArgMax(Array<F32>[0.1, 0.9, 0.9, -1.0], 0, 4) == 1 and ArgMax(Array<F64>[3.0, 1.0, 5.0, 4.0], 1, 3) == 1
+}

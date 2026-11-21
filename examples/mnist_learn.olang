@@ -14,8 +14,10 @@
 # the epochs (0: a control with as many lessons as a pruned run took), and the sweeps: plain (Jacobi, the default), anderson
 # (Anderson's acceleration, depth 5; andersonN for depth N), seidel (Gauss-Seidel) or both (Gauss-Seidel, Anderson depth 5),
 # and the certificate: none (certified in the sup norm when made, then free; the default), sup or spectral (certified in
-# that norm and restrained into it after every step, System.Restrain). On the GPU the sweeps are plain and nothing is
-# pruned (dyn/mirror refuses both).
+# that norm and restrained into it after every step, System.Restrain), and halt: after the epochs the test set is
+# answered again for each k from 1 to halt with settles that also stop once every answer has held for k sweeps
+# (settle.Budget.Stable; 0, the default: not done). On the GPU the sweeps are plain and nothing is pruned (dyn/mirror
+# refuses both).
 
 import "std/io"
 import "std/json"
@@ -69,6 +71,7 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     between := I64(try number(args, 11, 200))
     relearn := I64(try number(args, 12, 1))
     extra := I64(try number(args, 13, 0))
+    halts := I64(try number(args, 16, 0))
     if gpu {
         if not device.GpuAvailable() {
             try io.Put("no GPU: this build has none (-define Gpu=true) or CUDA finds no device\n")
@@ -114,6 +117,10 @@ fn main() ? io.Error, os.Error, mnist.MnistError, idx.IdxError, json.Error, lear
     }
     if keep >= 1.0 {
         if extra > 0: try epoch(s, l, opt, trainSet, testSet, pixels, digits, tol, beta, labels, "extra " + $extra, extra, restrain)
+        for k in range 1, halts + 1 {
+            accuracy, answer := evaluate(s, testSet, pixels, digits, tol, labels, k)
+            try io.Put("halted on answers stable for " + $k + " sweeps: test accuracy " + $(100.0 * accuracy).Fixed(2) + "%, " + $answer.Fixed(1) + " sweeps an answer\n")
+        }
         return
     }
     m := s.Macs()
@@ -195,17 +202,18 @@ fn show<D>(s mut system.System<F32>&, testSet mut loader.Loader<D>&, pixels syst
 }
 
 # the fraction of l's samples whose free settle answers their class, and the mean sweeps an answer took; a settle that
-# does not converge counts as wrong
-fn evaluate<D>(s mut system.System<F32>&, l mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, labels mut Array<I32>&) F64, F64 {
+# does not converge (or halt on answers stable for stable sweeps, where stable > 0) counts as wrong
+fn evaluate<D>(s mut system.System<F32>&, l mut loader.Loader<D>&, pixels system.Pop, digits system.Pop, tol F64, labels mut Array<I32>&, stable I64 = 0) F64, F64 {
     l.Epoch()
     predicted := Array<I32>(s.Batch)
     right, seen, sweeps, settles := 0, 0, 0, 0
     b := s.BudgetFor(tol)
+    b.Stable = stable
     for k in range l.Batches() {
         n := l.Fill(k, s.Pop(pixels).Drive, labels)
         seen += n
         out := s.Settle(settle.Phase.Free, b)
-        if not out.Converged: continue
+        if not out.Converged and not out.Halted: continue
         sweeps += out.Sweeps
         settles++
         s.Predict(settle.Phase.Free, digits, predicted)
