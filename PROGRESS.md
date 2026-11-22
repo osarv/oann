@@ -2087,3 +2087,13 @@ random until at most one cycle remains among the free cells, then one cycle cell
 forest solved by ForestMin (cycle-cutset conditioning). x itself is a candidate, so the energy never rises. Tests: on a
 6-ring with two pendants (K = 3) every start reaches the brute-force minimum over 3^8; on a 5 x 5 grid, 200 moves over
 random 9-cell regions and the whole grid never raise the energy.
+
+## Factors by their cells' sum, and block pseudolikelihood (wt-blockpl, 2026-11-22)
+
+nn/potts `Factors.BySum`: a table indexed by the sum of its cells' values (each slot's step 1, `Stride` kept by Index;
+`Width` the entries used), so Anneal, Focus and the fitters take it unchanged (bench/focus: every case's moves, solved
+and checksums equal). `Fitter.AddBlocks`: block pseudolikelihood - each factor's scope (K^Arity joint assignments,
+energies by changing its cells one at a time through Local) conditioned on the rest, cells in no factor alone; the
+gradient is the scope's statistics at the data less their expectation (`scopeStats`, each term once). Test: 28
+overlapping 3-cell sums over 30 cells (K = 3, 2.0 off the sum 3), 640 samples at T 1 - 300 steps of 8 examples
+recover the gaps at 1.7-2.4, and 16 chains x 3000 sweeps on the fitted model satisfy every sum.
