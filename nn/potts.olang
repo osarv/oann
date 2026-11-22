@@ -811,13 +811,21 @@ fn (s Sampler&) Best() I64 {
 # weight w becomes 1 + Decay (w - 1) (breakout / clause weighting: the energy reshaped where the search sits). A
 # constraint counts as violated when its energy is more than Slack above its table's lowest: for a rule's exact tables
 # any change, for learned (soft) tables the margin that separates a broken pair from a kept one
-type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000, Slack F64 = 1e-9) {
+# Cap (with Bump): every Every moves the weights decay by Decay, or further if their mean is above 1 + Cap, so that it
+# is 1 + Cap (0: no cap) - a decay that acts only once the weights have grown, so one setting serves graphs that want
+# a long memory (structured) and graphs that want a short one (random). Hold: each move puts a bias Hold on the
+# (cell, value) it leaves, decaying as exp(-age / Tenure) moves (Tenure < 0: -Tenure x the violated constraints + 10,
+# Tabucol's tenure as a decay time) - a metadynamics bias on recently visited states, a soft no-undo memory (0: off)
+type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000, Slack F64 = 1e-9, Cap F64 = 0.0, Hold F64 = 0.0, Tenure F64 = -0.6) {
     Moves
     T
     Bump
     Decay
     Every
     Slack
+    Cap
+    Hold
+    Tenure
 }
 
 # the constraints a focused search picks from: the factors (ids 0 .. Fac.Count) and the undirected edges (ids after
@@ -954,6 +962,7 @@ type focusState struct(n I64, k I64, nc I64) {
     pos mut Array<I64>& = Array<I64>(nc, -1)        # q's place in viol, -1 if satisfied
     nv I64 = 0
     slack F64 = 1e-9
+    sumw F64 = F64(nc)                              # the weights' sum (for Cap)
 }
 
 # constraint q into or out of the violated set
@@ -994,6 +1003,7 @@ fn (st mut focusState&) refresh(m Potts&, e message.Edges&, x focusIndex&, unary
 # every weight w to 1 + d (w - 1); the local energies follow as (1 - d) L1 + d L (each is unary + sum w_q t_q)
 fn (st mut focusState&) decay(d F64) {
     for q in range st.wt.Len(): st.wt[q] = 1.0 + d * (st.wt[q] - 1.0)
+    st.sumw = F64(st.wt.Len()) + d * (st.sumw - F64(st.wt.Len()))
     for j in range st.L.Len(): st.L[j] = (1.0 - d) * st.L1[j] + d * st.L[j]
 }
 
@@ -1039,6 +1049,7 @@ fn (st mut focusState&) move(m Potts&, e message.Edges&, x focusIndex&, X Array<
 fn (st mut focusState&) bump(m Potts&, e message.Edges&, x focusIndex&, X Array<I32>&, xo I64, q I64, d F64) {
     k := m.K
     st.wt[q] += d
+    st.sumw += d
     if q < x.nf {
         fc := m.Fac!
         for a in range fc.Arity {
@@ -1077,8 +1088,16 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
     ci, cv := Array<I64>(arity.Max(2) * k), Array<I64>(arity.Max(2) * k)
     cw := Array<F64>(arity.Max(2) * k)
     moves I64 = 0
+    hb := Array<F64>(n * k if sched.Hold != 0.0 else 0)  # Hold: the bias on (cell, value) at its deposit, and when
+    ht := Array<I64>(n * k if sched.Hold != 0.0 else 0)
     for moves < sched.Moves and st.nv > 0 {
-        if sched.Bump > 0.0 and sched.Decay < 1.0 and moves > 0 and moves % sched.Every == 0: st.decay(sched.Decay)
+        if sched.Bump > 0.0 and moves > 0 and moves % sched.Every == 0 {
+            d := sched.Decay
+            ex := st.sumw / F64(nc) - 1.0
+            if sched.Cap > 0.0 and ex > sched.Cap: d = d.Min(sched.Cap / ex)
+            if d < 1.0: st.decay(d)
+        }
+        tenure := sched.Tenure if sched.Tenure > 0.0 else -sched.Tenure * F64(st.nv) + 10.0
         if moves > 0 and moves % every == 0: st.refresh(m, e, x, s.unary, X, xo)
         q := st.viol[nextBelow(s.seeds, c, st.nv)]
         if sched.Bump > 0.0: st.bump(m, e, x, X, xo, q, sched.Bump)
@@ -1100,6 +1119,7 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
             for v in range k {
                 if v == old: continue
                 ci[cand], cv[cand], cw[cand] = i, v, st.L[i * k + v] - st.L[i * k + old]
+                if hb.Len() > 0 and hb[i * k + v] != 0.0: cw[cand] += hb[i * k + v] * (-F64(moves - ht[i * k + v]) / tenure).Exp()
                 low = low.Min(cw[cand])
                 cand++
             }
@@ -1119,6 +1139,11 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
             }
         }
         i := ci[pick]
+        if hb.Len() > 0 {
+            o := i * k + I64(X[xo + i])
+            hb[o] = hb[o] * (-F64(moves - ht[o]) / tenure).Exp() + sched.Hold
+            ht[o] = moves
+        }
         st.move(m, e, x, X, xo, i, cv[pick])
         X[xo + i] = I32(cv[pick])
         moves++
@@ -1979,14 +2004,14 @@ test focusState "local energies kept by differences through random moves, weight
     for i in range kept.Len(): assert (kept[i] - st.L[i]).Abs() < 1e-9 and (kept1[i] - st.L1[i]).Abs() < 1e-9, $i
 }
 
-test Sampler.Focus "the focused heat bath solves a planted 3-SAT instance (factors) and a planted 3-colourable graph (edges), with and without weights; Left 0 means energy 0, and the chains do not depend on the thread count" {
+test Sampler.Focus "the focused heat bath solves a planted 3-SAT instance (factors) and a planted 3-colourable graph (edges), with and without weights, the weight cap and the decaying bias on left states; Left 0 means energy 0, and the chains do not depend on the thread count" {
     r := rand.Rand(31)
     fs := Factors.sat3(200, 800, r)
     ms := Potts(2, 1)
     ms.Fac = fs
     es := message.Edges(200, 1)
     es.Set(Array<I32>(0), Array<I32>(0), 0)
-    for sched in Array<FocusSchedule>[FocusSchedule(200000, 0.5), FocusSchedule(200000, 0.5, 0.1, 0.5, 1000)] {
+    for sched in Array<FocusSchedule>[FocusSchedule(200000, 0.5), FocusSchedule(200000, 0.5, 0.1, 0.5, 1000), FocusSchedule(200000, 0.5, 0.1, 1.0, 1000, 1e-9, 1.0, 1.0)] {
         s := Sampler(200, 4, 2)
         s.Start(rand.Rand(5))
         s.Focus(ms, es, Array<F64>(200), sched)
@@ -1998,7 +2023,7 @@ test Sampler.Focus "the focused heat bath solves a planted 3-SAT instance (facto
     for threads in Array<I64>[1, 3] {
         s := Sampler(150, 4, 3, threads)
         s.Start(rand.Rand(6))
-        s.Focus(m, e, Array<F64>(150), FocusSchedule(200000, 0.5, 0.1, 0.5, 1000))
+        s.Focus(m, e, Array<F64>(150), FocusSchedule(200000, 0.5, 0.1, 0.5, 1000, 1e-9, 1.0, 1.0))
         for c in range 4: assert (s.Left[c] == 0) == (s.Energies[c] == 0.0)
         assert s.Energies[s.Best()] == 0.0, $s.Energies[s.Best()]
         answers.Push(s.X)
