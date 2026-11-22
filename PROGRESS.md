@@ -2016,3 +2016,17 @@ backward messages cached. Tested against brute force over the hidden chain (free
 and central differences (the gradient). Addition (contexts a_i b_i, H = 2, batch 64 x 4000 steps, lowest PL loss of 3
 starts, 3.9 s for the test): 32 / 32 12-digit sums exact after training on 1..4 digits, as the experiment that
 introduced it (100 % at 12). Single starts can stall at PL 0.04 a digit (the latent half found), hence the restarts.
+
+## A cheaper focused heat bath (wt-focusfast, 2026-11-22)
+
+`Sampler.Focus` priced each move through the factor tables, walking every slot of every factor of a cell for each of
+its values. Each chain now keeps every factor's table index with each slot open (`focusBase`), shifted on each move
+(`focusMoved`): a cell's local energies read one entry a factor and value, and a factor's violation one entry. The
+arithmetic is unchanged, so the results are bit-identical under a seed (`make focusbench`: every case's moves, solved
+chains and answer checksum equal before and after). One thread, 4 chains: planted 3-SAT, 1000 and 4000 cells at clause
+ratios 4.0 and 4.2, unweighted, 390-454 -> 260-295 ns a move (1.5-1.7x); with breakout weights 600-845 -> 355-433
+(those runs are short, so setup counts); 3-colouring unchanged at ~110 ns (edges were already one read). Tried and
+dropped: each cell's local energies cached until a neighbour moves (invalidation cost more than reuse: +5-15 %);
+precomputed open indices per membership (no gain). Lanes do not pay at K = 2 (one value to price per cell). What is
+left needs exact arithmetic dropped: per-cell energies updated by differences on each move (WalkSAT's break counts)
+reorder the sums, so results would match only up to rounding.
