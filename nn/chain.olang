@@ -1,0 +1,413 @@
+# nn/chain - a chain of hidden units summed out exactly by forward-backward. Visible cells s_0 .. s_{n-1} of K values,
+# each with a hidden state z_i of H values and a context c_i (what the position is given - an input pair, a token);
+# the tables are shared by every position and indexed by its context:
+#   E(s, z) = B[z_0] + sum_i U[c_i][z_i][s_i] + sum_{i < n-1} V[c_i][z_i][z_{i+1}]
+# The hidden chain is never labelled: the visible cells' energy is the free energy F(s) = -log sum_z exp(-E(s, z)),
+# exact by one forward pass. A rule no pairwise energy over the visible cells holds (a carry, a running state) is
+# learnt as the chain's meaning.
+#
+# - `FreeEnergy(ctx, s, n, t)`: -log sum_z exp(-E / t).
+# - `Conditionals(ctx, s, n, t, out)`: every cell's free energy at each of its K values, the others held - one forward
+#   and one backward pass for all n x K of them (p(s_i = v | s_-i) is proportional to exp(-out[i K + v])).
+# - `PseudoGrad(ctx, s, n)`: the pseudolikelihood loss of every cell given the others, the chain summed out, and its
+#   exact gradient added into GU, GV, GB - reverse mode through the forward-backward pass, O(n H (H + K)); `Step`
+#   takes an Adam step.
+# - `Anneal(ctx, n, sweeps, t0, t1, r, s)`: Gibbs over the cells with the chain summed out, ordered scans (backward
+#   messages from one pass, the forward message carried along the scan), annealed from t0 to t1 and then greedy
+#   until nothing moves; returns the free energy at t = 1.
+
+import "std/rand"
+
+type Chain struct(k I64, h I64, contexts I64, longest I64) {
+    K I64 = k
+    H I64 = h
+    C I64 = contexts
+    Max I64 = longest
+    U mut Array<F64>& = Array<F64>(contexts * h * k)      # U[c][z][s]
+    V mut Array<F64>& = Array<F64>(contexts * h * h)      # V[c][z][z2]
+    B mut Array<F64>& = Array<F64>(h)
+    GU mut Array<F64>& = Array<F64>(contexts * h * k)
+    GV mut Array<F64>& = Array<F64>(contexts * h * h)
+    GB mut Array<F64>& = Array<F64>(h)
+    Steps I64 = 0
+    mu mut Array<F64>& = Array<F64>(contexts * h * k)
+    vu mut Array<F64>& = Array<F64>(contexts * h * k)
+    mv mut Array<F64>& = Array<F64>(contexts * h * h)
+    vv mut Array<F64>& = Array<F64>(contexts * h * h)
+    mb mut Array<F64>& = Array<F64>(h)
+    vb mut Array<F64>& = Array<F64>(h)
+    ta mut Array<F64>& = Array<F64>(longest * h)          # into z_i: everything left of i, i's own term excluded
+    a mut Array<F64>& = Array<F64>(longest * h)           # ta plus i's own term
+    b mut Array<F64>& = Array<F64>(longest * h)           # everything right of i, given z_i
+    ga mut Array<F64>& = Array<F64>(longest * h)          # adjoints
+    gb mut Array<F64>& = Array<F64>(longest * h)
+    lv mut Array<F64>& = Array<F64>(longest * k)
+    w mut Array<F64>& = Array<F64>(h)
+}
+
+# small random tables
+fn (c mut Chain&) Init(r mut rand.Rand&, scale F64) {
+    for i in range c.U.Len(): c.U[i] = r.Normal() * scale
+    for i in range c.V.Len(): c.V[i] = r.Normal() * scale
+    for i in range c.H: c.B[i] = r.Normal() * scale
+}
+
+fn (c Chain&) u(ctx I32, z I64, s I64) F64 { return c.U[(I64(ctx) * c.H + z) * c.K + s] }
+fn (c Chain&) v(ctx I32, z I64, z2 I64) F64 { return c.V[(I64(ctx) * c.H + z) * c.H + z2] }
+
+# log sum exp of x[o .. o + n]
+fn lse(x Array<F64>&, o I64, n I64) F64 {
+    m := x[o]
+    for i in range 1, n: m = m.Max(x[o + i])
+    z F64 = 0.0
+    for i in range n: z += (x[o + i] - m).Exp()
+    return m + z.Log()
+}
+
+# ta and a from position `from` to n - 1 (a[from - 1] already holds)
+fn (c mut Chain&) forward(ctx Array<I32>&, s Array<I32>&, n I64, t F64, from I64) {
+    h := c.H
+    for i in range from, n {
+        for z in range h {
+            if i == 0 {
+                c.ta[z] = -c.B[z] / t
+            } else {
+                for y in range h: c.w[y] = c.a[(i - 1) * h + y] - c.v(ctx[i - 1], y, z) / t
+                c.ta[i * h + z] = lse(c.w, 0, h)
+            }
+            c.a[i * h + z] = c.ta[i * h + z] - c.u(ctx[i], z, I64(s[i])) / t
+        }
+    }
+}
+
+fn (c mut Chain&) backward(ctx Array<I32>&, s Array<I32>&, n I64, t F64) {
+    h := c.H
+    for z in range h: c.b[(n - 1) * h + z] = 0.0
+    for q in range n - 1 {
+        i := n - 2 - q
+        for z in range h {
+            for y in range h: c.w[y] = -c.v(ctx[i], z, y) / t - c.u(ctx[i + 1], y, I64(s[i + 1])) / t + c.b[(i + 1) * h + y]
+            c.b[i * h + z] = lse(c.w, 0, h)
+        }
+    }
+}
+
+fn (c mut Chain&) FreeEnergy(ctx Array<I32>&, s Array<I32>&, n I64, t F64) F64 {
+    c.forward(ctx, s, n, t, 0)
+    return -lse(c.a, (n - 1) * c.H, c.H)
+}
+
+# cell i's log Z at each value into lv[i K ..] (ta and b current)
+fn (c mut Chain&) cell(ctx Array<I32>&, i I64, t F64) {
+    h := c.H
+    for v in range c.K {
+        for z in range h: c.w[z] = c.ta[i * h + z] - c.u(ctx[i], z, v) / t + c.b[i * h + z]
+        c.lv[i * c.K + v] = lse(c.w, 0, h)
+    }
+}
+
+fn (c mut Chain&) Conditionals(ctx Array<I32>&, s Array<I32>&, n I64, t F64, out mut Array<F64>&) {
+    c.forward(ctx, s, n, t, 0)
+    c.backward(ctx, s, n, t)
+    for i in range n {
+        c.cell(ctx, i, t)
+        for v in range c.K: out[i * c.K + v] = -c.lv[i * c.K + v]
+    }
+}
+
+# the pseudolikelihood loss of s (every cell given the others) and its gradient into GU, GV, GB
+fn (c mut Chain&) PseudoGrad(ctx Array<I32>&, s Array<I32>&, n I64) F64 {
+    h, k := c.H, c.K
+    c.forward(ctx, s, n, 1.0, 0)
+    c.backward(ctx, s, n, 1.0)
+    nll F64 = 0.0
+    for i in range n * h: c.ga[i], c.gb[i] = 0.0, 0.0
+    # d loss / d log Z(s with s_i = v) = p(v) - [v = s_i]; through log Z into U directly, ta_i and b_i
+    for i in range n {
+        c.cell(ctx, i, 1.0)
+        lz := lse(c.lv, i * k, k)
+        nll += lz - c.lv[i * k + I64(s[i])]
+        for v in range k: c.cellGrad(ctx, i, v, (c.lv[i * k + v] - lz).Exp() - (1.0 if v == I64(s[i]) else 0.0))
+    }
+    c.forwardGrad(ctx, s, n)
+    c.backwardGrad(ctx, s, n)
+    return nll
+}
+
+# weight wt on log Z(s with s_i = v): its posterior over z_i into ga, gb and U
+fn (c mut Chain&) cellGrad(ctx Array<I32>&, i I64, v I64, wt F64) {
+    h := c.H
+    lz := c.lv[i * c.K + v]
+    for z in range h {
+        q := wt * (c.ta[i * h + z] - c.u(ctx[i], z, v) + c.b[i * h + z] - lz).Exp()
+        c.ga[i * h + z] += q
+        c.gb[i * h + z] += q
+        c.GU[(I64(ctx[i]) * h + z) * c.K + v] -= q
+    }
+}
+
+# reverse through the forward pass: ga holds d/d ta; right to left
+fn (c mut Chain&) forwardGrad(ctx Array<I32>&, s Array<I32>&, n I64) {
+    h := c.H
+    for q in range n {
+        i := n - 1 - q
+        # a_i = ta_i - U[c_i][.][s_i]: a_i's adjoint is ta_{i+1}'s, sent back through the softmax over z
+        if i < n - 1 {
+            for z in range h {
+                g F64 = 0.0
+                for y in range h {
+                    p := (c.a[i * h + z] - c.v(ctx[i], z, y) - c.ta[(i + 1) * h + y]).Exp() * c.ga[(i + 1) * h + y]
+                    c.GV[(I64(ctx[i]) * h + z) * h + y] -= p
+                    g += p
+                }
+                c.ga[i * h + z] += g
+                c.GU[(I64(ctx[i]) * h + z) * c.K + I64(s[i])] -= g
+            }
+        }
+    }
+    for z in range h: c.GB[z] -= c.ga[z]
+}
+
+# reverse through the backward pass: gb holds d/d b; left to right
+fn (c mut Chain&) backwardGrad(ctx Array<I32>&, s Array<I32>&, n I64) {
+    h := c.H
+    for i in range n - 1 {
+        for z in range h {
+            for y in range h {
+                p := (-c.v(ctx[i], z, y) - c.u(ctx[i + 1], y, I64(s[i + 1])) + c.b[(i + 1) * h + y] - c.b[i * h + z]).Exp() * c.gb[i * h + z]
+                c.GV[(I64(ctx[i]) * h + z) * h + y] -= p
+                c.GU[(I64(ctx[i + 1]) * h + y) * c.K + I64(s[i + 1])] -= p
+                c.gb[(i + 1) * h + y] += p
+            }
+        }
+    }
+}
+
+# one Adam step from the gradients summed over count cells (gradients cleared)
+fn (c mut Chain&) Step(rate F64, count F64) {
+    c.Steps += 1
+    adam(c.U, c.GU, c.mu, c.vu, count, rate, c.Steps)
+    adam(c.V, c.GV, c.mv, c.vv, count, rate, c.Steps)
+    adam(c.B, c.GB, c.mb, c.vb, count, rate, c.Steps)
+}
+
+fn adam(p mut Array<F64>&, g mut Array<F64>&, m mut Array<F64>&, v mut Array<F64>&, n F64, rate F64, step I64) {
+    c1 := 1.0 - 0.9.Pow(F64(step))
+    c2 := 1.0 - 0.999.Pow(F64(step))
+    for i in range p.Len() {
+        gi := g[i] / n
+        m[i] = 0.9 * m[i] + 0.1 * gi
+        v[i] = 0.999 * v[i] + 0.001 * gi * gi
+        p[i] -= rate * (m[i] / c1) / ((v[i] / c2).Sqrt() + 1e-8)
+        g[i] = 0.0
+    }
+}
+
+# annealed Gibbs over s (started at random), the chain summed out; t from t0 to t1 geometrically over sweeps, then
+# greedy scans until none moves; the free energy at t = 1
+fn (c mut Chain&) Anneal(ctx Array<I32>&, n I64, sweeps I64, t0 F64, t1 F64, r mut rand.Rand&, s mut Array<I32>&) F64 {
+    for i in range n: s[i] = I32(r.Below(c.K))
+    for sw in range sweeps + 20 {
+        t := t0 * (t1 / t0).Pow(F64(sw) / F64((sweeps - 1).Max(1))) if sw < sweeps else 0.0
+        if c.scan(ctx, s, n, t, r) == 0 and t == 0.0: break
+    }
+    return c.FreeEnergy(ctx, s, n, 1.0)
+}
+
+# one ordered scan at temperature t (0: greedy); the number of cells changed
+fn (c mut Chain&) scan(ctx Array<I32>&, s mut Array<I32>&, n I64, t F64, r mut rand.Rand&) I64 {
+    tt := t.Max(0.02)
+    c.backward(ctx, s, n, tt)
+    moved I64 = 0
+    for i in range n {
+        c.forward(ctx, s, i + 1, tt, i)
+        c.cell(ctx, i, tt)
+        pick := c.choose(i, t, r)
+        if pick != I64(s[i]): moved += 1
+        s[i] = I32(pick)
+        # a_i at the new value for the next position's forward step
+        for z in range c.H: c.a[i * c.H + z] = c.ta[i * c.H + z] - c.u(ctx[i], z, pick) / tt
+    }
+    return moved
+}
+
+fn (c Chain&) choose(i I64, t F64, r mut rand.Rand&) I64 {
+    k := c.K
+    best I64 = 0
+    for v in range 1, k {
+        if c.lv[i * k + v] > c.lv[i * k + best]: best = v
+    }
+    if t == 0.0: return best
+    z F64 = 0.0
+    for v in range k: z += (c.lv[i * k + v] - c.lv[i * k + best]).Exp()
+    u := r.Uniform(0.0, 1.0) * z
+    for v in range k {
+        u -= (c.lv[i * k + v] - c.lv[i * k + best]).Exp()
+        if u <= 0.0: return v
+    }
+    return best
+}
+
+# ---- tests ----
+
+# brute force: -log sum over every z of exp(-E / t)
+fn brute(c Chain&, ctx Array<I32>&, s Array<I32>&, n I64, t F64) F64 {
+    total I64 = 1
+    for _ in range n: total *= c.H
+    es := Array<F64>(total)
+    for code in range total {
+        rest := code
+        e := 0.0
+        prev I64 = -1
+        for i in range n {
+            z := rest % c.H
+            rest /= c.H
+            e += c.B[z] if i == 0 else c.v(ctx[i - 1], prev, z)
+            e += c.u(ctx[i], z, I64(s[i]))
+            prev = z
+        }
+        es[code] = -e / t
+    }
+    return -lse(es, 0, total)
+}
+
+fn Chain.small(r mut rand.Rand&) Chain {
+    c := Chain(4, 3, 2, 6)
+    c.Init(r, 1.0)
+    return c
+}
+
+test Chain "the free energy and every conditional match brute force over the hidden chain" {
+    r := rand.Rand(3)
+    c := Chain.small(r)
+    ctx := Array<I32>[0, 1, 1, 0, 1]
+    s := Array<I32>[2, 0, 3, 1, 1]
+    for t in Array<F64>[1.0, 0.4] {
+        assert (c.FreeEnergy(ctx, s, 5, t) - brute(c, ctx, s, 5, t)).Abs() < 1e-9
+        out := Array<F64>(5 * 4)
+        c.Conditionals(ctx, s, 5, t, out)
+        for i in range 5 {
+            keep := s[i]
+            for v in range 4 {
+                s[i] = I32(v)
+                assert (out[i * 4 + v] - brute(c, ctx, s, 5, t)).Abs() < 1e-9, $i + " " + $v
+            }
+            s[i] = keep
+        }
+    }
+}
+
+# the pseudolikelihood loss by brute force
+fn plBrute(c Chain&, ctx Array<I32>&, s mut Array<I32>&, n I64) F64 {
+    nll := 0.0
+    lv := Array<F64>(c.K)
+    for i in range n {
+        keep := s[i]
+        for v in range c.K {
+            s[i] = I32(v)
+            lv[v] = -brute(c, ctx, s, n, 1.0)
+        }
+        s[i] = keep
+        nll += lse(lv, 0, c.K) - lv[I64(keep)]
+    }
+    return nll
+}
+
+test Chain "the pseudolikelihood gradient matches central differences of the brute-force loss" {
+    r := rand.Rand(5)
+    c := Chain.small(r)
+    ctx := Array<I32>[1, 0, 1, 1, 0]
+    s := Array<I32>[3, 3, 0, 2, 1]
+    loss := c.PseudoGrad(ctx, s, 5)
+    assert (loss - plBrute(c, ctx, s, 5)).Abs() < 1e-9
+    h := 1e-5
+    for tbl in range 3 {
+        p := c.U if tbl == 0 else (c.V if tbl == 1 else c.B)
+        g := c.GU if tbl == 0 else (c.GV if tbl == 1 else c.GB)
+        for j in range p.Len() {
+            keep := p[j]
+            p[j] = keep + h
+            up := plBrute(c, ctx, s, 5)
+            p[j] = keep - h
+            down := plBrute(c, ctx, s, 5)
+            p[j] = keep
+            assert (g[j] - (up - down) / (2.0 * h)).Abs() < 1e-6, $tbl + " " + $j
+        }
+    }
+}
+
+# decimal addition, least significant digit first: cells the sum digits (n + 1 of them), context a_i * 10 + b_i
+fn addition(n I64, r mut rand.Rand&, ctx mut Array<I32>&, s mut Array<I32>&) {
+    carry I64 = 0
+    for i in range n + 1 {
+        a := r.Below(10) if i < n else 0
+        b := r.Below(10) if i < n else 0
+        ctx[i] = I32(a * 10 + b)
+        s[i] = I32((a + b + carry) % 10)
+        carry = (a + b + carry) / 10
+    }
+}
+
+# pseudolikelihood fits of the carry chain on 1..4 digits from a start of its own (as e41a: batch 64, 4000 steps,
+# cosine rate)
+fn Chain.addition(seed U64) Chain {
+    r := rand.Rand(seed)
+    c := Chain(10, 2, 100, 13)
+    c.Init(r, 0.1)
+    ctx, s := Array<I32>(13), Array<I32>(13)
+    for it in range 4000 {
+        cells := 0.0
+        for _ in range 64 {
+            n := 1 + r.Below(4)
+            addition(n, r, ctx, s)
+            c.PseudoGrad(ctx, s, n + 1)
+            cells += F64(n + 1)
+        }
+        c.Step(0.05 * 0.5 * (1.0 + (3.14159265358979 * F64(it) / 4000.0).Cos()), cells)
+    }
+    return c
+}
+
+# the pseudolikelihood loss a cell on 256 problems of 1..4 digits
+fn (c mut Chain&) plLoss(r mut rand.Rand&) F64 {
+    ctx, s := Array<I32>(13), Array<I32>(13)
+    nll, cells := 0.0, 0.0
+    for _ in range 256 {
+        n := 1 + r.Below(4)
+        addition(n, r, ctx, s)
+        nll += c.PseudoGrad(ctx, s, n + 1)
+        cells += F64(n + 1)
+    }
+    for i in range c.GU.Len(): c.GU[i] = 0.0
+    for i in range c.GV.Len(): c.GV[i] = 0.0
+    for i in range c.GB.Len(): c.GB[i] = 0.0
+    return nll / cells
+}
+
+test Chain "addition: the carry is learnt as a binary hidden chain by pseudolikelihood on 1..4 digits (the lowest loss of 3 starts) and 12-digit sums are found by annealing" {
+    r := rand.Rand(1)
+    c := Chain.addition(11)
+    loss := c.plLoss(r)
+    for seed in Array<U64>[12, 13] {
+        d := Chain.addition(seed)
+        l := d.plLoss(r)
+        if l >= loss: continue
+        c, loss = d, l
+    }
+    assert loss < 0.01, $loss
+    ctx, s := Array<I32>(13), Array<I32>(13)
+    right I64 = 0
+    got, pick := Array<I32>(13), Array<I32>(13)
+    for _ in range 32 {
+        addition(12, r, ctx, s)
+        best := 1e300
+        for _ in range 8 {
+            f := c.Anneal(ctx, 13, 100, 2.0, 0.05, r, got)
+            if f >= best: continue
+            best = f
+            for i in range 13: pick[i] = got[i]
+        }
+        right += 1 if pick == s else 0
+    }
+    assert right == 32, $right
+}
