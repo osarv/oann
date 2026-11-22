@@ -76,6 +76,10 @@ Answers are found by searching for low energy, and new rules are learnt from sol
     given could break.
 - **`Pairs.ForestMin(clamp, x)`** is exact when the free cells' pairs form a forest (edges = cells - components). It
   runs min-sum from the leaves up, then reads the best values back down. Otherwise it returns `NotForest.Cycle`.
+- **`Pairs.CutsetMove(x, region, count, r)`** re-solves a region of cells exactly, with every other cell held. Held
+  cells are cut from the region at random until its free cells have at most one cycle. One cell on that cycle is then
+  conditioned on each of its values, and the forest left is solved by `ForestMin`. x takes the best completion, so
+  the energy never rises; repeated over windows or random regions, it is a large-neighbourhood search.
 
 `examples/potts_latin.olang` runs the whole pipeline: Latin squares, then screen, fit and prune, then held-out puzzles
 solved by `Anneal` and by `Focus`.

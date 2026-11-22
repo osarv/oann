@@ -2079,3 +2079,11 @@ givens. One thread, 50 held-out puzzles, 40 % givens:
 |---|---|---|---|---|
 | 6 | 270 / 197 / 180 | 0.35 s | 50/50, 6.4 ms | 47/50, 5.5 ms |
 | 8 | 672 / 584 / 448 | 1.1 s | 42/50, 21 ms | 29/50, 86 ms |
+
+## An exact large-neighbourhood move (wt-cutset, 2026-11-22)
+
+nn/potts `Pairs.CutsetMove(x, region, count, r)`: the region's cells re-solved with the rest held - held cells cut at
+random until at most one cycle remains among the free cells, then one cycle cell conditioned on each value and the
+forest solved by ForestMin (cycle-cutset conditioning). x itself is a candidate, so the energy never rises. Tests: on a
+6-ring with two pendants (K = 3) every start reaches the brute-force minimum over 3^8; on a 5 x 5 grid, 200 moves over
+random 9-cell regions and the whole grid never raise the energy.
