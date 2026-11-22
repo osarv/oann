@@ -1,0 +1,175 @@
+# nn/diffusion - discrete diffusion over cells of K values (Austin et al. 2021; masked: Sahoo et al. 2024, Shi et al.
+# 2024): the forward process corrupts an answer x0 toward noise - each cell, at level t in [0, 1], masked (Masked:
+# replaced by the mask value K) or replaced by a uniform draw (Uniform) with probability t - and a denoiser learns
+# p(x0 | x_t). Sampling runs the reverse process from pure noise: Levels steps, each asking the denoiser for every
+# cell's p(x0 | x_t) and drawing x_s (s = t - 1 / Levels) from the posterior q(x_s | x_t, x0) - a masked cell
+# unmasked with probability (t - s) / t, a uniform one through the K-way posterior of its two transitions. Nothing here
+# knows the denoiser: any model that gives each cell's distribution over K (a graph network reading the noisy answer
+# and t, a lookup) drives it.
+#
+# Propose and rank: N samples (a sampler draws different answers each time) ranked by an energy - nn/bestof's
+# Rank(n, propose, score), with Sample as the proposer and an energy (nn/potts' Energy, a score-matched energy of
+# ad/score) as the score - is the pipeline: diffusion supplies diverse candidates, the energy verifies them.
+
+import "std/rand"
+
+type Kind enum { Masked, Uniform }
+
+type Diffusion struct(cells I64, k I64, levels I64, kind Kind) {
+    Cells I64 = cells
+    K I64 = k
+    Levels I64 = levels
+    Noise Kind = kind
+    Xt mut Array<I32>& = Array<I32>(cells)          # the noisy answer the denoiser reads (K: masked)
+    Probs mut Array<F64>& = Array<F64>(cells * k)   # what it writes: each cell's p(x0 = v | x_t), cells x K
+    w mut Array<F64>& = Array<F64>(k)
+}
+
+# x0 corrupted to level t into out: a training example for the denoiser (x0's values where out keeps them)
+fn (d Diffusion&) Corrupt(x0 Array<I32>&, t F64, r mut rand.Rand&, out mut Array<I32>&) {
+    for i in range d.Cells {
+        out[i] = x0[i]
+        if r.Uniform(0.0, 1.0) >= t: continue
+        out[i] = I32(d.K) if d.Noise == Kind.Masked else I32(r.Below(d.K))
+    }
+}
+
+# a sample from pure noise into out: denoise(Xt, t, Probs) fills Probs with p(x0 | x_t) for the current Xt; a cell
+# masked at the end (none, by the schedule) keeps its most likely value
+fn (d mut Diffusion&) Sample(denoise fn&(xt Array<I32>&, t F64, probs mut Array<F64>&), r mut rand.Rand&, out mut Array<I32>&) {
+    k := d.K
+    for i in range d.Cells: d.Xt[i] = I32(k) if d.Noise == Kind.Masked else I32(r.Below(k))
+    l := d.Levels
+    for l >= 1 {
+        t, s := F64(l) / F64(d.Levels), F64(l - 1) / F64(d.Levels)
+        denoise(d.Xt, t, d.Probs)
+        for i in range d.Cells {
+            if d.Noise == Kind.Masked {
+                if d.Xt[i] != I32(k) or r.Uniform(0.0, 1.0) >= (t - s) / t: continue
+                d.Xt[i] = I32(d.draw(i, r))
+                continue
+            }
+            x0 := d.draw(i, r)
+            if s == 0.0 {
+                d.Xt[i] = I32(x0)
+                continue
+            }
+            # q(x_s = v | x_t, x0) proportional to q(x_t | x_s = v) q(x_s = v | x0)
+            a := 1.0 - (1.0 - t) / (1.0 - s)
+            z F64 = 0.0
+            for v in range k {
+                d.w[v] = ((1.0 - a) * (1.0 if I64(d.Xt[i]) == v else 0.0) + a / F64(k)) * ((1.0 - s) * (1.0 if v == x0 else 0.0) + s / F64(k))
+                z += d.w[v]
+            }
+            u := r.Uniform(0.0, 1.0) * z
+            pick := k - 1
+            for v in range k {
+                u -= d.w[v]
+                if u > 0.0: continue
+                pick = v
+                break
+            }
+            d.Xt[i] = I32(pick)
+        }
+        l -= 1
+    }
+    for i in range d.Cells {
+        if d.Xt[i] == I32(k): d.Xt[i] = I32(d.likeliest(i))
+        out[i] = d.Xt[i]
+    }
+}
+
+# a value drawn from cell i's p(x0 | x_t)
+fn (d Diffusion&) draw(i I64, r mut rand.Rand&) I64 {
+    z F64 = 0.0
+    for v in range d.K: z += d.Probs[i * d.K + v]
+    u := r.Uniform(0.0, 1.0) * z
+    for v in range d.K {
+        u -= d.Probs[i * d.K + v]
+        if u <= 0.0: return v
+    }
+    return d.K - 1
+}
+
+fn (d Diffusion&) likeliest(i I64) I64 {
+    best I64 = 0
+    for v in range 1, d.K {
+        if d.Probs[i * d.K + v] > d.Probs[i * d.K + best]: best = v
+    }
+    return best
+}
+
+# ---- tests ----
+
+import "bestof"
+import "potts"
+import "message"
+
+test Diffusion "corruption at level t touches a share t of the cells; sampling with a perfect denoiser returns the answer, both kinds" {
+    r := rand.Rand(2)
+    x0 := Array<I32>(2000)
+    for i in range 2000: x0[i] = I32(r.Below(4))
+    for kind in Array<Kind>[Kind.Masked, Kind.Uniform] {
+        d := Diffusion(2000, 4, 8, kind)
+        out := Array<I32>(2000)
+        d.Corrupt(x0, 0.3, r, out)
+        changed I64 = 0
+        for i in range 2000: changed += 1 if out[i] != x0[i] else 0
+        # masked: every touched cell changes; uniform: three quarters of them
+        want := 600.0 if kind == Kind.Masked else 450.0
+        assert (F64(changed) - want).Abs() < 60.0, $kind + ": " + $changed
+        d.Sample(fn(xt, t, probs) {
+            for i in range 2000 {
+                for v in range 4: probs[i * 4 + v] = 1.0 if I32(v) == x0[i] else 0.0
+            }
+        }, r, out)
+        assert out == x0, $kind
+    }
+}
+
+test Diffusion "propose and rank: uniform diffusion with a noisy denoiser proposes colourings, a Potts energy ranks them, and the lowest-energy proposal is kept" {
+    r := rand.Rand(7)
+    n := 60
+    colour := Array<I32>(n)
+    for i in range n: colour[i] = I32(r.Below(3))
+    src, dst := Array<I32>(4 * n), Array<I32>(4 * n)
+    count I64 = 0
+    for i in range n {
+        for _ in range 2 {
+            j := r.Below(n)
+            if j == i or colour[j] == colour[i]: continue
+            src[count], dst[count] = I32(i), I32(j)
+            src[count + 1], dst[count + 1] = I32(j), I32(i)
+            count += 2
+        }
+    }
+    e := message.Edges(n, 4 * n)
+    e.Set(src, dst, count)
+    m := potts.Potts.Colouring(3)
+    f := Array<F64>(n)
+    d := Diffusion(n, 3, 16, Kind.Uniform)
+    # a denoiser that knows the answer only half the time
+    noisy := fn(xt Array<I32>&, t F64, probs mut Array<F64>&) {
+        for i in range n {
+            for v in range 3: probs[i * 3 + v] = 0.5 / 3.0 + (0.5 if I32(v) == colour[i] else 0.0)
+        }
+    }
+    # diffusion proposes 16 answers; Rank scores each by the Potts energy and keeps the lowest
+    proposals := Array<I32>(16 * n)
+    out := Array<I32>(n)
+    energies := Array<F64>(16)
+    for k in range 16 {
+        d.Sample(noisy, r, out)
+        for i in range n: proposals[k * n + i] = out[i]
+        energies[k] = m.Energy(e, f, out, 0)
+    }
+    best := bestof.BestOf<I32>(1, n)
+    best.Rank(16, fn(k, x) {
+        for i in range n: x[i] = proposals[k * n + i]
+    }, fn(x, s) {
+        s[0] = m.Energy(e, f, x, 0)
+    })
+    low := energies[0]
+    for k in range 16: low = low.Min(energies[k])
+    assert best.Score[0] == low and m.Energy(e, f, best.Best, 0) == low
+}

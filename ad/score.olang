@@ -1,0 +1,134 @@
+# ad/score - denoising score matching (Vincent 2011) for an energy recorded on the graph: the energy E(z) of a
+# watched state z is trained so that its gradient is the score of the data blurred by Gaussian noise -
+#
+#     z = clean + sigma eps,   loss = sum over the state's elements of (sigma dE/dz - eps)^2   (eps ~ N(0, 1))
+#
+# - so -dE/dz points from the noisy state back toward the data, at every noise level sigma a row is given. The
+# parameters' gradient of that loss needs dE/dz's own gradient (a mixed second derivative the graph does not record):
+# it is the central difference of the parameters' first gradient along the loss's direction in z,
+#     dloss/dtheta = sum u . d(dE/dz)/dtheta = (dE/dtheta(z + h u) - dE/dtheta(z - h u)) / (2 h),   u = 2 sigma (sigma dE/dz - eps),
+# h scaled so the largest step is Fd (three Forward and Backward passes a step). An energy that is to depend on sigma
+# reads it from an input the caller fills per row. A trained energy ranks candidates by E (nn/bestof's Rank), or
+# samples by annealed Langevin descent (ad/descent's Temperature).
+
+import "graph"
+import "std/rand"
+
+# one step's gradient into g's ParamGrads (the mean over the batch's rows, as Backward leaves its gradients summed):
+# z is filled from clean (Batch rows of the state) plus sigma[row] times fresh noise drawn from r, and left so; returns
+# the loss, the mean over rows of each row's sum. scratch arrays are the state's size (eps, u) and the parameters' (g0)
+fn ScoreMatch<T>(g mut graph.Graph<T>&, z graph.Var, energy graph.Var, clean Array<F64>&, sigma Array<F64>&, r mut rand.Rand&, eps mut Array<F64>&, u mut Array<F64>&, g0 mut Array<F64>&, fd F64 = 0.01) F64 {
+    zs := g.Value(z).Flat()!
+    rows := g.Batch
+    per := zs.Len() / rows
+    for row in range rows {
+        for i in range per {
+            q := row * per + i
+            eps[q] = r.Normal(0.0, 1.0)
+            zs[q] = T(clean[q] + sigma[row] * eps[q])
+        }
+    }
+    g.Forward(rows)
+    g.Backward(energy)
+    gz := g.Grad(z).Flat()!
+    loss F64 = 0.0
+    big F64 = 1e-12
+    for row in range rows {
+        for i in range per {
+            q := row * per + i
+            res := sigma[row] * F64(gz[q]) - eps[q]
+            loss += res * res
+            u[q] = 2.0 * sigma[row] * res
+            big = big.Max(u[q].Abs())
+        }
+    }
+    h := fd / big
+    pg := g.ParamGrads().Flat()!
+    for side in range 2 {
+        sgn := 1.0 if side == 0 else -1.0
+        for row in range rows {
+            for i in range per {
+                q := row * per + i
+                zs[q] = T(clean[q] + sigma[row] * eps[q] + sgn * h * u[q])
+            }
+        }
+        g.Forward(rows)
+        g.Backward(energy)
+        pg = g.ParamGrads().Flat()!
+        if side == 0 {
+            for i in range pg.Len(): g0[i] = F64(pg[i])
+        }
+    }
+    k := 1.0 / (2.0 * h * F64(rows))
+    for i in range pg.Len(): pg[i] = T((g0[i] - F64(pg[i])) * k)
+    for row in range rows {
+        for i in range per {
+            q := row * per + i
+            zs[q] = T(clean[q] + sigma[row] * eps[q])
+        }
+    }
+    return loss / F64(rows)
+}
+
+# ---- tests ----
+
+# the loss alone at the current parameters, from noise drawn by a generator seeded seed
+fn lossAt(g mut graph.Graph<F64>&, z graph.Var, e graph.Var, clean Array<F64>&, sigma Array<F64>&, seed U64) F64 {
+    zs := g.Value(z).Flat()!
+    rows := g.Batch
+    per := zs.Len() / rows
+    r := rand.Rand(seed)
+    eps := Array<F64>(zs.Len())
+    for row in range rows {
+        for i in range per {
+            q := row * per + i
+            eps[q] = r.Normal(0.0, 1.0)
+            zs[q] = clean[q] + sigma[row] * eps[q]
+        }
+    }
+    g.Forward(rows)
+    g.Backward(e)
+    gz := g.Grad(z).Flat()!
+    loss F64 = 0.0
+    for row in range rows {
+        for i in range per {
+            q := row * per + i
+            res := sigma[row] * gz[q] - eps[q]
+            loss += res * res
+        }
+    }
+    return loss / F64(rows)
+}
+
+test ScoreMatch "the parameters' gradient equals the central differences of the score-matching loss" {
+    # E(z) = |h|^2 / 2 + v . h^3, h = W z + b: W, b and v parameters
+    g := graph.Graph<F64>(3)
+    z := g.Input(4)
+    g.Watch(z)
+    w := g.Param(graph.Init.Normal(0.0, 0.5), false, 4, 4)
+    b := g.Param(graph.Init.Normal(0.0, 0.5), false, 4)
+    v := g.Param(graph.Init.Normal(0.0, 0.1), false, 1, 4)
+    h := g.Linear(z, w, b)
+    hh := g.Mul(h, h)
+    e := g.Add(g.Sum(g.Sum(g.Scale(hh, 0.5))), g.Sum(g.Sum(g.Linear(g.Mul(hh, h), v))))
+    g.Keep(e)
+    g.Plan(rand.Rand(3))!
+    clean := Array<F64>(12)
+    r := rand.Rand(4)
+    for i in range 12: clean[i] = r.Uniform(-1.0, 1.0)
+    sigma := Array<F64>[0.3, 0.6, 1.0]
+    eps, u, g0 := Array<F64>(12), Array<F64>(12), Array<F64>(g.Params().Count())
+    ScoreMatch(g, z, e, clean, sigma, rand.Rand(9), eps, u, g0, 1e-4)
+    got := g.ParamGrads().Flat()!.Copy()
+    ps := g.Params().Flat()!
+    for i in range ps.Len() {
+        keep := ps[i]
+        ps[i] = keep + 1e-5
+        up := lossAt(g, z, e, clean, sigma, 9)
+        ps[i] = keep - 1e-5
+        down := lossAt(g, z, e, clean, sigma, 9)
+        ps[i] = keep
+        want := (up - down) / 2e-5
+        assert (got[i] - want).Abs() < 1e-3 * (1.0 + want.Abs()), $i + ": " + $got[i] + " against " + $want
+    }
+}
