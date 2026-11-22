@@ -56,6 +56,11 @@ Answers are found by searching for low energy, and new rules are learnt from sol
   - Pseudolikelihood: each cell's value is predicted from its local energies given the others. `Fitter` does this for
     `Potts`; `PairFitter` does it for `Pairs`, with Adam and L1 soft thresholds that drive an uncoupled pair's table
     to zero.
+  - Block pseudolikelihood (`Fitter.AddBlocks`) predicts each factor's whole scope jointly from the rest; cells in
+    no factor are predicted on their own. Per-cell pseudolikelihood falls into a redundancy trap when cells are
+    pinned by several constraints: each cell is explained by its other constraints, so none is learnt. A block cannot
+    be explained away. A factor's table can be indexed by the sum of its cells' values (`Factors.BySum`), K x arity
+    entries instead of K^arity.
   - `Pairs.Screen` picks which pairs to fit: those whose values share the most mutual information across the
     examples.
   - `Pairs.Pruned` drops the pairs whose coupling stays small. The coupling is a table's largest entry once its row

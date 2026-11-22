@@ -66,6 +66,8 @@ type Factors struct(k I64, arity I64, tables I64, count I64, cells I64) {
     ptr mut Array<I64>& = Array<I64>(cells + 1)     # cell i's (factor, slot)s: fid / slot[ptr[i] .. ptr[i + 1]]
     fid mut Array<I64>& = Array<I64>(count * arity)
     slot mut Array<I64>& = Array<I64>(count * arity)
+    BySum Bool = false                              # a table indexed by its cells' sum (set before Index)
+    Stride mut Array<I64>& = Array<I64>(arity)      # slot a's step in a table's index (Index sets it)
 }
 
 fn powOf(k I64, n I64) I64 {
@@ -74,8 +76,11 @@ fn powOf(k I64, n I64) I64 {
     return p
 }
 
-# each cell's factors and its slot in each (after At is set)
+# each cell's factors and its slot in each, and the slots' steps (after At is set, and BySum where wanted: then a
+# table is indexed by the sum of its cells' values - entries 0 .. Width - 1 - a rule on a count or a total at K x
+# Arity entries instead of K^Arity)
 fn (f mut Factors&) Index() {
+    for a in range f.Arity: f.Stride[a] = 1 if f.BySum else powOf(f.K, f.Arity - 1 - a)
     for i in range f.Cells + 1: f.ptr[i] = 0
     for e in range f.Count * f.Arity: f.ptr[f.At[e] + 1] += 1
     for i in range f.Cells: f.ptr[i + 1] += f.ptr[i]
@@ -91,10 +96,13 @@ fn (f mut Factors&) Index() {
     }
 }
 
+# the entries a table uses: every index, or the sums 0 .. Arity (K - 1) when BySum
+fn (f Factors&) Width() I64 { return f.Arity * (f.K - 1) + 1 if f.BySum else f.Size }
+
 # factor q's table entry with its cells at x[xo ..] but slot a's set to v
 fn (f Factors&) entry(q I64, a I64, v I64, x Array<I32>&, xo I64) I64 {
     idx I64 = 0
-    for b in range f.Arity: idx = idx * f.K + (v if b == a else I64(x[xo + f.At[q * f.Arity + b]]))
+    for b in range f.Arity: idx += (v if b == a else I64(x[xo + f.At[q * f.Arity + b]])) * f.Stride[b]
     return f.Table[q] * f.Size + idx
 }
 
@@ -320,6 +328,116 @@ type Fitter struct(m mut Potts&) {
 fn (t mut Fitter&) Add(e message.Edges&, f Array<F64>&, y Array<I32>&) {
     t.nll += t.M.PseudoGrad(e, f, y, t.gw, t.gb, t.L)
     t.cells += e.Nodes
+}
+
+# block pseudolikelihood on one example: each factor's whole scope predicted jointly from the rest (its K^Arity
+# assignments scored with every other cell held), and every cell in no factor on its own. Per-cell pseudolikelihood
+# falls into a redundancy trap when cells are pinned by several constraints: each cell is explained by its neighbours,
+# so no single constraint is learnt; conditioning a constraint's cells together cannot be explained away. Counted as
+# one example a block. No hidden units; W is taken symmetric (the Fitter's default)
+fn (t mut Fitter&) AddBlocks(e message.Edges&, f Array<F64>&, y Array<I32>&) {
+    m := t.M
+    if m.Hid != null: unreachable "potts.Fitter.AddBlocks: hidden units are not supported"
+    n, k := e.Nodes, m.K
+    ar := m.Fac!.Arity if m.Fac != null else 1
+    scope := Array<I64>(ar)
+    x := Array<I32>(n)
+    for i in range n: x[i] = y[i]
+    joint := Array<F64>(powOf(k, ar))
+    for q in range (m.Fac!.Count if m.Fac != null else 0) {
+        for a in range ar: scope[a] = m.Fac!.At[q * ar + a]
+        t.block(e, f, x, scope, ar, joint)
+    }
+    for i in range n {
+        if m.Fac != null and m.Fac!.ptr[i + 1] > m.Fac!.ptr[i]: continue
+        scope[0] = i
+        t.block(e, f, x, scope, 1, joint)
+    }
+}
+
+# one block: the scope's joint assignments' energies (relative to x's, by changing its cells one at a time through
+# Local), their softmax, the loss at x's values and the gradient - the scope's statistics at x less their expectation
+fn (t mut Fitter&) block(e message.Edges&, f Array<F64>&, x mut Array<I32>&, scope Array<I64>&, size I64, joint mut Array<F64>&) {
+    m := t.M
+    k := m.K
+    count := powOf(k, size)
+    keep := Array<I32>(size)
+    for a in range size: keep[a] = x[scope[a]]
+    low := 1e300
+    at I64 = 0
+    for c in range count {
+        de := 0.0
+        rest := c
+        for a in range size {
+            v := rest % k
+            rest /= k
+            m.Local(e, f, x, 0, scope[a], t.L, 0)
+            de += t.L[v] - t.L[I64(x[scope[a]])]
+            x[scope[a]] = I32(v)
+        }
+        for a in range size: x[scope[a]] = keep[a]
+        joint[c] = de
+        low = low.Min(de)
+        same := true
+        rest = c
+        for a in range size {
+            same = same and I32(rest % k) == keep[a]
+            rest /= k
+        }
+        if same: at = c
+    }
+    z := 0.0
+    for c in range count: z += (low - joint[c]).Exp()
+    t.nll += joint[at] - low + z.Log()
+    t.cells += 1
+    m.scopeStats(e, f, x, scope, size, 1.0, t.gw, t.gb)
+    for c in range count {
+        p := (low - joint[c]).Exp() / z
+        if p < 1e-12: continue
+        rest := c
+        for a in range size {
+            x[scope[a]] = I32(rest % k)
+            rest /= k
+        }
+        m.scopeStats(e, f, x, scope, size, -p, t.gw, t.gb)
+    }
+    for a in range size: x[scope[a]] = keep[a]
+}
+
+# the derivative of the terms that touch the scope's cells at x, times scale (Stats' conventions, each term once):
+# a cell's features, its pairs (both halves with a cell outside, its own half with one inside), its factors (shared
+# among the scope's cells in them)
+fn (m Potts&) scopeStats(e message.Edges&, f Array<F64>&, x Array<I32>&, scope Array<I64>&, size I64, scale F64, gw mut Array<F64>&, gb mut Array<F64>&) {
+    k := m.K
+    for s in range size {
+        i := scope[s]
+        xi := I64(x[i])
+        for q in range m.Features {
+            fv := f[i * m.Features + q]
+            if fv != 0.0: gb[q * k + xi] += scale * fv
+        }
+        for a in range e.First(i), e.First(i + 1) {
+            j := e.Source(a)
+            w := scale * 0.5 * F64(e.Weight(a))
+            gw[xi * k + I64(x[j])] += w
+            if not inScope(scope, size, j): gw[I64(x[j]) * k + xi] += w
+        }
+        if m.Fac == null: continue
+        fc := m.Fac!
+        for r in range fc.ptr[i], fc.ptr[i + 1] {
+            q := fc.fid[r]
+            shared I64 = 0
+            for b in range fc.Arity: shared += 1 if inScope(scope, size, fc.At[q * fc.Arity + b]) else 0
+            fc.G[fc.entry(q, -1, 0, x, 0)] += scale / F64(shared)
+        }
+    }
+}
+
+fn inScope(scope Array<I64>&, size I64, j I64) Bool {
+    for a in range size {
+        if scope[a] == j: return true
+    }
+    return false
 }
 
 # a contrast of statistics: the mean over the chains of a (chains a, cells e.Nodes each, from x a's 0) less the mean
@@ -682,11 +800,11 @@ fn factorLanes(f Factors&, i I64, X Array<I32>&, xo I64, L mut Array<F32>&, lo I
     k := f.K
     for r in range f.ptr[i], f.ptr[i + 1] {
         q, a := f.fid[r], f.slot[r]
-        stride := powOf(k, f.Arity - 1 - a)
+        stride := f.Stride[a]
         for l in range Lanes: part[l] = f.Table[q] * f.Size
         for b in range f.Arity {
             if b == a: continue
-            sb := powOf(k, f.Arity - 1 - b)
+            sb := f.Stride[b]
             cell := f.At[q * f.Arity + b]
             for l in range Lanes: part[l] += I64(X[xo + cell * Lanes + l]) * sb
         }
@@ -867,7 +985,7 @@ fn focusIndex.of(m Potts&, e message.Edges&) focusIndex {
         f := m.Fac!
         x.tmin = Array<F64>(f.Tables, 1e300)
         for t in range f.Tables {
-            for i in range f.Size: x.tmin[t] = x.tmin[t].Min(f.T[t * f.Size + i])
+            for i in range f.Width(): x.tmin[t] = x.tmin[t].Min(f.T[t * f.Size + i])
         }
     }
     return x
@@ -986,7 +1104,7 @@ fn focusState.of(m Potts&, x focusIndex&, n I64, X Array<I32>&, xo I64) focusSta
     if m.Fac == null: return st
     fc := m.Fac!
     st.base, st.stride = Array<I64>(fc.Count * fc.Arity), Array<I64>(fc.Arity)
-    for a in range fc.Arity: st.stride[a] = powOf(fc.K, fc.Arity - 1 - a)
+    for a in range fc.Arity: st.stride[a] = fc.Stride[a]
     for q in range fc.Count {
         for a in range fc.Arity: st.base[q * fc.Arity + a] = fc.entry(q, a, 0, X, xo)
     }
@@ -2271,4 +2389,56 @@ test Pairs.CutsetMove "on a ring with pendant cells (one cycle) the move from an
         assert after <= e + 1e-12 and (g.Energy(z, 0) - after).Abs() < 1e-12
         e = after
     }
+}
+
+test Fitter.AddBlocks "a planted model of overlapping 3-cell sums (a table by the sum) is recovered by block pseudolikelihood from its samples, and annealing the fitted model satisfies every sum" {
+    r := rand.Rand(53)
+    n := 30
+    truth := Potts(3, 1)
+    fac := Factors(3, 3, 1, n - 2, n)
+    for q in range n - 2 {
+        for a in range 3: fac.At[q * 3 + a] = q + a
+    }
+    fac.BySum = true
+    for s in range 7: fac.T[s] = 0.0 if s == 3 else 2.0
+    fac.Index()
+    truth.Fac = fac
+    e := message.Edges(n, 1)
+    e.Set(Array<I32>(0), Array<I32>(0), 0)
+    feats := Array<F64>(n)
+    # samples at T 1: 40 rounds of 16 chains, 300 sweeps each, no greedy finish
+    data := Array<I32>(640 * n)
+    s := Sampler(n, 16, 3)
+    s.ColourFor(e, truth)
+    for round in range 40 {
+        s.Start(r)
+        s.Anneal(truth, e, feats, Schedule(300, 1.0, 1.0, -1.0, 0))
+        for c in range 16 {
+            for i in range n: data[(round * 16 + c) * n + i] = s.X[c * n + i]
+        }
+    }
+    m := Potts(3, 1)
+    fm := Factors(3, 3, 1, n - 2, n)
+    for t in range fac.At.Len(): fm.At[t] = fac.At[t]
+    fm.BySum = true
+    fm.Index()
+    m.Fac = fm
+    fit := Fitter(m)
+    y := Array<I32>(n)
+    for _ in range 300 {
+        for _ in range 8 {
+            o := r.Below(640) * n
+            for i in range n: y[i] = data[o + i]
+            fit.AddBlocks(e, feats, y)
+        }
+        fit.Step(0.05)
+    }
+    # the sums' energies against the sum 3's: 2 in the planted table
+    for v in range 7 {
+        if v == 3: continue
+        assert (fm.T[v] - fm.T[3] - 2.0).Abs() < 0.5, $v + ": " + $(fm.T[v] - fm.T[3])
+    }
+    s.Start(r)
+    s.Anneal(m, e, feats, Schedule(3000, 2.0, 0.05))
+    assert truth.Energy(e, feats, s.X, s.Best() * n) == 0.0
 }
