@@ -24,6 +24,40 @@ fn main() ? io.Error, ParseError {
     for n in Array<I64>[256, 1024] {
         for hidden in Array<Bool>[false, true]: try nae(n, chains, sweeps, threads, r, hidden)
     }
+    try gridCase(33, 11, chains, sweeps, threads, r)
+}
+
+# an l x l grid of K-valued cells, each horizontal pair one shared 2-cell factor table and each vertical pair another
+# (random in [0, 2): a glass, so moves thin out as T falls); ms a search, ns a cell update, lowest energy
+fn gridCase(l I64, k I64, chains I64, sweeps I64, threads I64, r mut rand.Rand&) ? io.Error {
+    n := l * l
+    f := potts.Factors(k, 2, 2, 2 * l * (l - 1), n)
+    q I64 = 0
+    for i in range n {
+        if i % l < l - 1 {
+            f.At[2 * q], f.At[2 * q + 1], f.Table[q] = i, i + 1, 0
+            q++
+        }
+        if i / l < l - 1 {
+            f.At[2 * q], f.At[2 * q + 1], f.Table[q] = i, i + l, 1
+            q++
+        }
+    }
+    for x in range f.T.Len(): f.T[x] = r.Uniform(0.0, 2.0)
+    f.Index()
+    m := potts.Potts(k, 1)
+    m.Fac = f
+    e := message.Edges(n, 1)
+    e.Set(Array<I32>(0), Array<I32>(0), 0)
+    s := potts.Sampler(n, chains, k, threads)
+    s.ColourFor(e, m)
+    s.Start(r)
+    t0 := time.Now()
+    s.Anneal(m, e, Array<F64>(n), potts.Schedule(sweeps, 2.0, 0.05))
+    total := F64(time.Since(t0)) * 1e-6
+    updates := 0.0
+    for c in range chains: updates += F64(s.Sweeps[c] * n)
+    try io.PutLn("grid " + $l + " x " + $l + " x " + $k + ", 2-cell factors | " + $total.Fixed(1) + " | " + $(total * 1e6 / updates).Fixed(1) + " | " + $s.Energies[s.Best()].Fixed(3) + " (lowest energy) | -")
 }
 
 # planted not-all-equal instances of n two-valued cells and 2 n clauses of 3 as 3-cell factors (all equal costs 1),

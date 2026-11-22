@@ -2040,3 +2040,15 @@ decays the kept energies match a full recompute within 1e-9. ns a move, unweight
 Unweighted answers are unchanged under the seed; the weighted colouring runs differ by rounding. A recompute every
 max(n, 1024) moves cost half of each move, hence 64 n. What remains (~200 ns, about 3 x 12 factor memberships a move)
 is mostly scattered reads of the partner cells' energies and the factors' indices.
+
+## Where Sampler.Anneal spends a factor-path sweep (wt-annealprof, 2026-11-22)
+
+bench/potts gains a maze-shaped case: a 33 x 33 grid of 11-valued cells, horizontal and vertical pairs as two shared
+2-cell factor tables (random, a glass). 37 ns a chain-cell update (32 chains x 2000 sweeps, one thread). Timed by
+switching parts off: factorLanes (the table gathers) ~2 ns, the exponentials ~3 ns, the softmax draw with its pick
+~23 ns together with the move bookkeeping. Fixed: a move computed each lane's change of W's row (k x 16 gathers) even
+for a cell with no pairs - skipped now (37 -> 33.5 ns, same answers). Tried and dropped: an F32 copy of the factor
+tables with I32 indices (44-47 ns); factor energies folded into the incremental field and updated lane by lane on
+moves (52 ns: 35 % of lane visits move on this glass, so the scalar updates outweigh the gathers); the pick as a
+branch-free count of running totals (50 ns) or as an F32 select (105 ns - the compiler's code for that loop, not the
+work).
