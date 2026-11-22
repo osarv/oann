@@ -933,36 +933,146 @@ fn focusLocal(m Potts&, e message.Edges&, x focusIndex&, base Array<I64>&, strid
     }
 }
 
+# one chain's focused search state: the constraints' weights, every factor's open table indices (base, stride - see
+# focusExcess) and each cell's local energies L (cells x K, the weighted energy at each of its values, the others held),
+# kept by differences on each move and weight change and recomputed exactly by refresh
+type focusState struct(n I64, k I64, nc I64) {
+    wt mut Array<F64>& = Array<F64>(nc, 1.0)
+    L mut Array<F64>& = Array<F64>(n * k)
+    L1 mut Array<F64>& = Array<F64>(0)              # with weights (Bump > 0): the local energies at weight 1, for decay
+    ones mut Array<F64>& = Array<F64>(0)
+    base mut Array<I64>& = Array<I64>(0)
+    stride mut Array<I64>& = Array<I64>(0)
+    viol mut Array<I64>& = Array<I64>(nc)           # the violated constraints (above their lowest energy), in any order
+    pos mut Array<I64>& = Array<I64>(nc, -1)        # q's place in viol, -1 if satisfied
+    nv I64 = 0
+}
+
+# constraint q into or out of the violated set
+fn (st mut focusState&) mark(q I64, bad Bool) {
+    if bad and st.pos[q] < 0 {
+        st.pos[q] = st.nv
+        st.viol[st.nv] = q
+        st.nv++
+        return
+    }
+    if bad or st.pos[q] < 0: return
+    last := st.viol[st.nv - 1]
+    st.viol[st.pos[q]] = last
+    st.pos[last] = st.pos[q]
+    st.pos[q] = -1
+    st.nv--
+}
+
+fn focusState.of(m Potts&, x focusIndex&, n I64, X Array<I32>&, xo I64) focusState {
+    st := focusState(n, m.K, x.nf + x.ne)
+    if m.Fac == null: return st
+    fc := m.Fac!
+    st.base, st.stride = Array<I64>(fc.Count * fc.Arity), Array<I64>(fc.Arity)
+    for a in range fc.Arity: st.stride[a] = powOf(fc.K, fc.Arity - 1 - a)
+    for q in range fc.Count {
+        for a in range fc.Arity: st.base[q * fc.Arity + a] = fc.entry(q, a, 0, X, xo)
+    }
+    return st
+}
+
+# every cell's local energies recomputed from the tables
+fn (st mut focusState&) refresh(m Potts&, e message.Edges&, x focusIndex&, unary Array<F64>&, X Array<I32>&, xo I64) {
+    for i in range st.L.Len() / m.K: focusLocal(m, e, x, st.base, st.stride, unary, st.wt, X, xo, i, st.L, i * m.K)
+    if st.L1.Len() == 0: return
+    for i in range st.L.Len() / m.K: focusLocal(m, e, x, st.base, st.stride, unary, st.ones, X, xo, i, st.L1, i * m.K)
+}
+
+# every weight w to 1 + d (w - 1); the local energies follow as (1 - d) L1 + d L (each is unary + sum w_q t_q)
+fn (st mut focusState&) decay(d F64) {
+    for q in range st.wt.Len(): st.wt[q] = 1.0 + d * (st.wt[q] - 1.0)
+    for j in range st.L.Len(): st.L[j] = (1.0 - d) * st.L1[j] + d * st.L[j]
+}
+
+# cell i to value v (X not yet changed): its neighbours' and factor partners' local energies follow, its factors'
+# open indices shift, and its constraints move into or out of the violated set
+fn (st mut focusState&) move(m Potts&, e message.Edges&, x focusIndex&, X Array<I32>&, xo I64, i I64, v I64) {
+    k := m.K
+    old := I64(X[xo + i])
+    for a in range e.First(i), e.First(i + 1) {
+        j := e.Source(a)
+        w := st.wt[x.nf + x.eid[a]] * F64(e.Weight(a))
+        for c in range k: st.L[j * k + c] += w * (m.W[c * k + v] - m.W[c * k + old])
+        if st.L1.Len() > 0 {
+            for c in range k: st.L1[j * k + c] += F64(e.Weight(a)) * (m.W[c * k + v] - m.W[c * k + old])
+        }
+        d := x.eid[a]
+        low := x.ew[d] * x.wmin if x.ew[d] >= 0.0 else x.ew[d] * x.wmax
+        st.mark(x.nf + d, x.ew[d] * m.W[v * k + I64(X[xo + j])] - low > 1e-9)
+    }
+    if m.Fac == null: return
+    fc := m.Fac!
+    ar := fc.Arity
+    T, At, fid, slot, tab := fc.T, fc.At, fc.fid, fc.slot, fc.Table
+    L, base, stride, wt, tmin := st.L, st.base, st.stride, st.wt, x.tmin
+    for r in range fc.ptr[i], fc.ptr[i + 1] {
+        q, a := fid[r], slot[r]
+        step := (v - old) * stride[a]
+        w := wt[q]
+        for b in range ar {
+            if b == a: continue
+            j, o, sb := At[q * ar + b], base[q * ar + b], stride[b]
+            for c in range k: L[j * k + c] += w * (T[o + step + c * sb] - T[o + c * sb])
+            if st.L1.Len() > 0 {
+                for c in range k: st.L1[j * k + c] += T[o + step + c * sb] - T[o + c * sb]
+            }
+            base[q * ar + b] = o + step
+        }
+        st.mark(q, T[base[q * ar + a] + v * stride[a]] - tmin[tab[q]] > 1e-9)
+    }
+}
+
+# constraint q's weight raised by d: its cells' local energies follow
+fn (st mut focusState&) bump(m Potts&, e message.Edges&, x focusIndex&, X Array<I32>&, xo I64, q I64, d F64) {
+    k := m.K
+    st.wt[q] += d
+    if q < x.nf {
+        fc := m.Fac!
+        for a in range fc.Arity {
+            j, o, sa := fc.At[q * fc.Arity + a], st.base[q * fc.Arity + a], st.stride[a]
+            for c in range k: st.L[j * k + c] += d * fc.T[o + c * sa]
+        }
+        return
+    }
+    u, v := x.eu[q - x.nf], x.ev[q - x.nf]
+    w := d * x.ew[q - x.nf]
+    xu, xv := I64(X[xo + u]), I64(X[xo + v])
+    for c in range k {
+        st.L[u * k + c] += w * m.W[c * k + xv]
+        st.L[v * k + c] += w * m.W[c * k + xu]
+    }
+}
+
 fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched FocusSchedule, x focusIndex&, c I64) {
     n, k := s.Cells, s.K
     xo := c * n
     X := s.X
     nc := x.nf + x.ne
     eps := 1e-9
-    wt := Array<F64>(nc, 1.0)
-    base, stride := focusBase(m, X, xo)
-    viol := Array<I64>(nc)
-    pos := Array<I64>(nc, -1)
-    nv I64 = 0
-    for q in range nc {
-        if focusExcess(m, x, base, stride, q, X, xo) > eps {
-            pos[q] = nv
-            viol[nv] = q
-            nv++
-        }
+    st := focusState.of(m, x, n, X, xo)
+    if sched.Bump > 0.0 {
+        st.L1, st.ones = Array<F64>(n * k), Array<F64>(nc, 1.0)
     }
+    st.refresh(m, e, x, s.unary, X, xo)
+    # the local energies are recomputed exactly this often, so rounding cannot build up (a recompute costs about n
+    # moves' updates: 1 / 64 of the time)
+    every := 64 * n.Max(1024)
+    for q in range nc: st.mark(q, focusExcess(m, x, st.base, st.stride, q, X, xo) > eps)
     arity := m.Fac!.Arity if m.Fac != null else 2
     cells := Array<I64>(arity.Max(2))
-    L := Array<F64>(arity.Max(2) * k)
     ci, cv := Array<I64>(arity.Max(2) * k), Array<I64>(arity.Max(2) * k)
     cw := Array<F64>(arity.Max(2) * k)
     moves I64 = 0
-    for moves < sched.Moves and nv > 0 {
-        if sched.Bump > 0.0 and sched.Decay < 1.0 and moves > 0 and moves % sched.Every == 0 {
-            for q in range nc: wt[q] = 1.0 + sched.Decay * (wt[q] - 1.0)
-        }
-        q := viol[nextBelow(s.seeds, c, nv)]
-        if sched.Bump > 0.0: wt[q] += sched.Bump
+    for moves < sched.Moves and st.nv > 0 {
+        if sched.Bump > 0.0 and sched.Decay < 1.0 and moves > 0 and moves % sched.Every == 0: st.decay(sched.Decay)
+        if moves > 0 and moves % every == 0: st.refresh(m, e, x, s.unary, X, xo)
+        q := st.viol[nextBelow(s.seeds, c, st.nv)]
+        if sched.Bump > 0.0: st.bump(m, e, x, X, xo, q, sched.Bump)
         nq I64 = 0
         if q < x.nf {
             fc := m.Fac!
@@ -977,11 +1087,10 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
         low := 1e300
         for a in range nq {
             i := cells[a]
-            focusLocal(m, e, x, base, stride, s.unary, wt, X, xo, i, L, a * k)
             old := I64(X[xo + i])
             for v in range k {
                 if v == old: continue
-                ci[cand], cv[cand], cw[cand] = i, v, L[a * k + v] - L[a * k + old]
+                ci[cand], cv[cand], cw[cand] = i, v, st.L[i * k + v] - st.L[i * k + old]
                 low = low.Min(cw[cand])
                 cand++
             }
@@ -1001,63 +1110,13 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
             }
         }
         i := ci[pick]
-        focusMoved(m, base, stride, i, cv[pick] - I64(X[xo + i]))
+        st.move(m, e, x, X, xo, i, cv[pick])
         X[xo + i] = I32(cv[pick])
         moves++
-        # the constraints of the moved cell: in or out of the violated set
-        for a in range e.First(i), e.First(i + 1) {
-            r := x.nf + x.eid[a]
-            nv = focusRecheck(m, x, base, stride, r, X, xo, viol, pos, nv, eps)
-        }
-        if m.Fac != null {
-            fc := m.Fac!
-            for r in range fc.ptr[i], fc.ptr[i + 1]: nv = focusRecheck(m, x, base, stride, fc.fid[r], X, xo, viol, pos, nv, eps)
-        }
     }
     s.Sweeps[c] = moves
-    s.Left[c] = nv
+    s.Left[c] = st.nv
     s.Energies[c] = m.Energy(e, f, X, xo)
-}
-
-# every factor's table index with each slot open (base) and the slots' steps (stride), at chain X[xo ..]: a cell's
-# local energies then read one entry a value, with no walk over the factor's other cells
-fn focusBase(m Potts&, X Array<I32>&, xo I64) Array<I64>, Array<I64> {
-    if m.Fac == null: return Array<I64>(0), Array<I64>(0)
-    fc := m.Fac!
-    base, stride := Array<I64>(fc.Count * fc.Arity), Array<I64>(fc.Arity)
-    for a in range fc.Arity: stride[a] = powOf(fc.K, fc.Arity - 1 - a)
-    for q in range fc.Count {
-        for a in range fc.Arity: base[q * fc.Arity + a] = fc.entry(q, a, 0, X, xo)
-    }
-    return base, stride
-}
-
-# cell i moved by d values: its factors' open indices for the other slots shift by d steps of i's slot
-fn focusMoved(m Potts&, base mut Array<I64>&, stride Array<I64>&, i I64, d I64) {
-    if m.Fac == null: return
-    fc := m.Fac!
-    for r in range fc.ptr[i], fc.ptr[i + 1] {
-        o, a := fc.fid[r] * fc.Arity, fc.slot[r]
-        step := d * stride[a]
-        for b in range fc.Arity: base[o + b] += step if b != a else 0
-    }
-}
-
-fn focusRecheck(m Potts&, x focusIndex&, base Array<I64>&, stride Array<I64>&, q I64, X Array<I32>&, xo I64, viol mut Array<I64>&, pos mut Array<I64>&, nv I64, eps F64) I64 {
-    bad := focusExcess(m, x, base, stride, q, X, xo) > eps
-    if bad and pos[q] < 0 {
-        pos[q] = nv
-        viol[nv] = q
-        return nv + 1
-    }
-    if not bad and pos[q] >= 0 {
-        last := viol[nv - 1]
-        viol[pos[q]] = last
-        pos[last] = pos[q]
-        pos[q] = -1
-        return nv - 1
-    }
-    return nv
 }
 
 # the relaxed search: each chain's cells as softmax(theta) over their K values (theta drawn small at random), steps
@@ -1554,6 +1613,37 @@ fn Factors.sat3(n I64, count I64, r mut rand.Rand&) Factors {
     for sg in range 8: f.T[sg * 8 + sg] = 1.0
     f.Index()
     return f
+}
+
+test focusState "local energies kept by differences through random moves, weight bumps and decays match a full recompute, on factors and edges" {
+    r := rand.Rand(9)
+    m := Potts.Colouring(3)
+    m.Fac = Factors(3, 3, 2, 60, 40)
+    for q in range 60 {
+        for a in range 3: m.Fac!.At[q * 3 + a] = (q + a * 7) % 40
+        m.Fac!.Table[q] = q % 2
+    }
+    for i in range 2 * 27: m.Fac!.T[i] = r.Normal()
+    m.Fac!.Index()
+    e, _ := planted(40, 3, 2, r)
+    x := focusIndex.of(m, e)
+    s := Sampler(40, 1, 3)
+    s.Start(rand.Rand(4))
+    for i in range s.unary.Len(): s.unary[i] = r.Normal()
+    st := focusState.of(m, x, 40, s.X, 0)
+    st.L1, st.ones = Array<F64>(40 * 3), Array<F64>(x.nf + x.ne, 1.0)
+    st.refresh(m, e, x, s.unary, s.X, 0)
+    for step in range 2000 {
+        if step % 3 == 0: st.bump(m, e, x, s.X, 0, r.Below(x.nf + x.ne), 0.1)
+        if step % 500 == 499: st.decay(0.5)
+        i, v := r.Below(40), r.Below(3)
+        st.move(m, e, x, s.X, 0, i, v)
+        s.X[i] = I32(v)
+    }
+    kept, kept1 := Array<F64>(st.L.Len()), Array<F64>(st.L.Len())
+    for i in range kept.Len(): kept[i], kept1[i] = st.L[i], st.L1[i]
+    st.refresh(m, e, x, s.unary, s.X, 0)
+    for i in range kept.Len(): assert (kept[i] - st.L[i]).Abs() < 1e-9 and (kept1[i] - st.L1[i]).Abs() < 1e-9, $i
 }
 
 test Sampler.Focus "the focused heat bath solves a planted 3-SAT instance (factors) and a planted 3-colourable graph (edges), with and without weights; Left 0 means energy 0, and the chains do not depend on the thread count" {

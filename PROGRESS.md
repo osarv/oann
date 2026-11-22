@@ -2030,3 +2030,13 @@ dropped: each cell's local energies cached until a neighbour moves (invalidation
 precomputed open indices per membership (no gain). Lanes do not pay at K = 2 (one value to price per cell). What is
 left needs exact arithmetic dropped: per-cell energies updated by differences on each move (WalkSAT's break counts)
 reorder the sums, so results would match only up to rounding.
+
+Then (the Orchestrator agreed to results equal only up to rounding): each chain keeps every cell's local energies by
+differences (`focusState`: a move updates its neighbours' and factor partners' energies and its constraints' place in
+the violated set in one pass; a weight bump its cells'; a decay blends the energies with a copy kept at weight 1,
+(1 - d) L1 + d L), recomputed exactly every 64 n moves (at least 65536). Test: after 2000 random moves, bumps and
+decays the kept energies match a full recompute within 1e-9. ns a move, unweighted: 3-SAT 1000 x 4.0 / 4.2 207 / 208,
+4000 x 4.0 / 4.2 276 / 249 (from 450 / 391 / 444 / 454 through the tables: 1.6-2.2x); colouring ~100 (from ~110-127).
+Unweighted answers are unchanged under the seed; the weighted colouring runs differ by rounding. A recompute every
+max(n, 1024) moves cost half of each move, hence 64 n. What remains (~200 ns, about 3 x 12 factor memberships a move)
+is mostly scattered reads of the partner cells' energies and the factors' indices.
