@@ -39,6 +39,9 @@ type SettleSeq struct(rows I64, tmax I64, n I64, heads I64, sweeps I64, warm Boo
     bt mut Array<F32>& = Array<F32>(n * rows)                        # a token's drive, [i][b]
     cs mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)              # the carry's cos and sin, [t][j][b]
     sn mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)
+    gl mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)              # the gains, the same way
+    dgl mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)             # the backward's gain and angle gradients, the same way
+    dpl mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)
     gs mut Array<F32>& = Array<F32>(n * rows)
     gv mut Array<F32>& = Array<F32>(n * rows)
     gb mut Array<F32>& = Array<F32>(n * rows)
@@ -89,11 +92,14 @@ fn (s mut SettleSeq&) carry(gam Array<F32>&, phi Array<F32>&, t I64, T I64, B I6
     st, bt, cs, sn := s.st, s.bt, s.cs, s.sn
     for j in range half {
         at := (t * half + j) * B
-        for b in range B: cs[at + b] = phi[(b * T + t) * half + j]
+        for b in range B {
+            cs[at + b] = phi[(b * T + t) * half + j]
+            s.gl[at + b] = gam[(b * T + t) * half + j]
+        }
         sinCos(cs, sn, at, B)
         a, c := p0 + 2 * j * T * B, p0 + (2 * j + 1) * T * B
         for b in range B {
-            g := gam[(b * T + t) * half + j]
+            g := s.gl[at + b]
             co, si := cs[at + b], sn[at + b]
             sa, sb := st[a + b], st[c + b]
             bt[2 * j * B + b] += g * (co * sa - si * sb)
@@ -102,21 +108,32 @@ fn (s mut SettleSeq&) carry(gam Array<F32>&, phi Array<F32>&, t I64, T I64, B I6
     }
 }
 
-# one sweep: state cur = tanh(W state prev + drive), every lane at once
+# one sweep: state cur = tanh(W state prev + drive), every lane at once - sixteen lanes at a time, each row's sum in a
+# tile of registers over the row's weights, stored once
 fn (s mut SettleSeq&) sweep(w Array<F32>&, prev I64, cur I64, B I64, rs I64) {
     m := s.M
     st, bt := s.st, s.bt
+    whole := B - B % 16
     for h in range s.H {
         for i in range m {
             r := cur + (h * m + i) * rs
             d := (h * m + i) * B
-            for b in range B: st[r + b] = bt[d + b]
-            for j in range m {
-                wij := w[(h * m + i) * m + j]
-                q := prev + (h * m + j) * rs
-                for b in range B: st[r + b] += wij * st[q + b]
+            wr := (h * m + i) * m
+            for b0 in range 0, whole, 16 {
+                acc := Array<F32>(16)
+                for l in range 16: acc[l] = bt[d + b0 + l]
+                for j in range m {
+                    wij := w[wr + j]
+                    q := prev + (h * m + j) * rs + b0
+                    for l in range 16: acc[l] += wij * st[q + l]
+                }
+                for l in range 16: st[r + b0 + l] = elem.FastTanh(acc[l])
             }
-            for b in range B: st[r + b] = elem.FastTanh(st[r + b])
+            for b in range whole, B {
+                v := bt[d + b]
+                for j in range m: v += w[wr + j] * st[prev + (h * m + j) * rs + b]
+                st[r + b] = elem.FastTanh(v)
+            }
         }
     }
 }
@@ -177,9 +194,10 @@ fn (s mut SettleSeq&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Ten
             row := (b * T + t) * n
             for i in range n: du[row + i] = gb[i * B + b]
         }
-        if s.Carry: s.carryBack(inputs[1].Flat()!, dinputs[1].Flat()!, dinputs[2].Flat()!, t, T, B)
+        if s.Carry and t > 0: s.carryBack(t, T, B)
         t -= 1
     }
+    if s.Carry: s.carryOut(dinputs[1].Flat()!, dinputs[2].Flat()!, T, B)
     # dW, a head and a sweep at a time: the potentials' gradients (M x T B) times the states they read, transposed
     m := s.M
     for h in range s.H {
@@ -192,52 +210,72 @@ fn (s mut SettleSeq&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Ten
     }
 }
 
-# a sweep's backward from gv (the potentials' gradient): gs = W^T gv, a head at a time (dW is taken at the end)
+# a sweep's backward from gv (the potentials' gradient): gs = W^T gv, a head at a time, sixteen lanes at a time with
+# each column's sum in a tile of registers (dW is taken at the end)
 fn (s mut SettleSeq&) sweepBack(w Array<F32>&, B I64) {
     m := s.M
-    gs, gv, acc := s.gs, s.gv, s.gw
+    gs, gv := s.gs, s.gv
+    whole := B - B % 16
     for h in range s.H {
         for j in range m {
-            r := (h * m + j) * B
-            for b in range B: acc[r + b] = 0.0
-        }
-        for i in range m {
-            g := (h * m + i) * B
-            for j in range m {
-                q := (h * m + j) * B
-                wij := w[(h * m + i) * m + j]
-                for b in range B: acc[q + b] += wij * gv[g + b]
+            q := (h * m + j) * B
+            for b0 in range 0, whole, 16 {
+                acc := Array<F32>(16)
+                for i in range m {
+                    wij := w[(h * m + i) * m + j]
+                    g := (h * m + i) * B + b0
+                    for l in range 16: acc[l] += wij * gv[g + l]
+                }
+                for l in range 16: gs[q + b0 + l] = acc[l]
+            }
+            for b in range whole, B {
+                v F32 = 0.0
+                for i in range m: v += w[(h * m + i) * m + j] * gv[(h * m + i) * B + b]
+                gs[q + b] = v
             }
         }
     }
-    for x in range s.N * B: gs[x] = acc[x]
 }
 
 # the carry's backward at token t (gb the drive's gradient): gam's and phi's gradients, and the previous state's
 # share into gn
-fn (s mut SettleSeq&) carryBack(gam Array<F32>&, dg mut Array<F32>&, dp mut Array<F32>&, t I64, T I64, B I64) {
+fn (s mut SettleSeq&) carryBack(t I64, T I64, B I64) {
     half := s.N / 2
-    st, gb, gn, cs, sn := s.st, s.gb, s.gn, s.cs, s.sn
+    st, gb, gn, cs, sn, gl, dgl, dpl := s.st, s.gb, s.gn, s.cs, s.sn, s.gl, s.dgl, s.dpl
     p0 := s.at(t - 1, s.K, B, T)
     rs := T * B
     for j in range half {
         at := (t * half + j) * B
         a, c := 2 * j * B, (2 * j + 1) * B
+        pa, pc := p0 + 2 * j * rs, p0 + (2 * j + 1) * rs
         for b in range B {
-            q := (b * T + t) * half + j
-            if t == 0 {
-                dg[q], dp[q] = 0.0, 0.0
-                continue
-            }
-            g := gam[q]
+            g := gl[at + b]
             co, si := cs[at + b], sn[at + b]
-            sa, sb := st[p0 + 2 * j * rs + b], st[p0 + (2 * j + 1) * rs + b]
+            sa, sb := st[pa + b], st[pc + b]
             ra, rb := co * sa - si * sb, si * sa + co * sb
             ga, gbb := gb[a + b], gb[c + b]
-            dg[q] = ga * ra + gbb * rb
-            dp[q] = g * (gbb * ra - ga * rb)
+            dgl[at + b] = ga * ra + gbb * rb
+            dpl[at + b] = g * (gbb * ra - ga * rb)
             gn[a + b] += g * (co * ga + si * gbb)
             gn[c + b] += g * (co * gbb - si * ga)
+        }
+    }
+}
+
+# the gains' and angles' gradients from their lane layout into dg and dp [B, T, N / 2] (nothing at token 0, which
+# has no carry)
+fn (s mut SettleSeq&) carryOut(dg mut Array<F32>&, dp mut Array<F32>&, T I64, B I64) {
+    half := s.N / 2
+    for b in range B {
+        for j in range half {
+            dg[b * T * half + j], dp[b * T * half + j] = 0.0, 0.0
+        }
+        for t in range 1, T {
+            o := (b * T + t) * half
+            for j in range half {
+                dg[o + j] = s.dgl[(t * half + j) * B + b]
+                dp[o + j] = s.dpl[(t * half + j) * B + b]
+            }
         }
     }
 }

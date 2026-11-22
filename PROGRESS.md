@@ -1973,3 +1973,10 @@ and warm, with and without the carry, one and three sweeps, angles to +-40): out
 Against the same layer as scalar loops (an experiment's operation, run in the same harness): forward 6-7x faster
 (N 256, K 1: 17.5 -> 2.8 us; K 4: 45 -> 7.2), backward about even (it was already lean; what is left is the strided
 transposes in and out and the carry's backward).
+
+Then (wt-seqsettle2): both sweeps' inner products in tiles of sixteen lanes held in registers over a row's weights (the
+rows of st and gs had been loaded and stored for every weight); the carry's gains kept in the lane layout from the
+forward and its gradients written there, transposed out once after the backward (they were strided gathers and
+scatters every token, with a branch for token 0). Best of 3, us a token forward / backward: N 64, K 1 0.32 / 0.43;
+K 4 0.59 / 1.11; N 256, K 1 2.06 / 2.74; K 4 4.67 / 6.50. Against the scalar loops in one harness: forward 7-12x,
+backward 1.1-1.8x (the scalar backward was already about a quarter of its forward; ours is 1.3-1.9x our forward).
