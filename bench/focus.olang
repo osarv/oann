@@ -1,0 +1,91 @@
+# nn/potts: the focused heat bath (Sampler.Focus), timed. Planted 3-SAT (n two-valued cells, clauses as 3-cell factors,
+# a table per sign pattern; clause/cell ratio 4.0 and 4.2) and planted 3-colouring (each cell joined to about 6
+# others), plain and with breakout weights. Per case: ms a run of all chains, moves, ns a move, chains solved, and a
+# checksum of the answers (to check a faster Focus changes nothing). From the repository's root:
+#     make focusbench ARGS="chains moves threads"    (4 2000000 1)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn/message"
+import "../nn/potts"
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    chains := try args[1].ParseInt() if args.Len() > 1 else 4
+    moves := try args[2].ParseInt() if args.Len() > 2 else 2000000
+    threads := try args[3].ParseInt() if args.Len() > 3 else 1
+    try io.PutLn("case | weights | ms | moves | ns a move | solved | checksum")
+    r := rand.Rand(1)
+    for n in Array<I64>[1000, 4000] {
+        for ratio in Array<F64>[4.0, 4.2] {
+            m := potts.Potts(2, 1)
+            m.Fac = sat3(n, I64(ratio * F64(n)), r)
+            e := message.Edges(n, 1)
+            e.Set(Array<I32>(0), Array<I32>(0), 0)
+            try run("3-SAT " + $n + " x " + $ratio, m, e, n, 2, chains, moves, threads)
+        }
+    }
+    for n in Array<I64>[1000, 4000] {
+        e := colouring(n, r)
+        try run("colouring " + $n + " x 3", potts.Potts.Colouring(3), e, n, 3, chains, moves, threads)
+    }
+}
+
+fn run(name String&, m potts.Potts&, e message.Edges&, n I64, k I64, chains I64, moves I64, threads I64) ? io.Error {
+    for bump in Array<F64>[0.0, 0.1] {
+        s := potts.Sampler(n, chains, k, threads)
+        s.Start(rand.Rand(5))
+        t0 := time.Now()
+        s.Focus(m, e, Array<F64>(n), potts.FocusSchedule(moves, 0.5, bump, 0.5, 1000))
+        ms := F64(time.Since(t0)) * 1e-6
+        total, solved I64 = 0, 0
+        for c in range chains {
+            total += s.Sweeps[c]
+            solved += 1 if s.Left[c] == 0 else 0
+        }
+        sum U64 = 0
+        for i in range s.X.Len(): sum = sum * 31 + U64(s.X[i] + 1)
+        try io.PutLn(name + " | " + $bump + " | " + $ms.Fixed(1) + " | " + $total + " | " + $(ms * 1e6 / F64(total.Max(1))).Fixed(1) + " | " + $solved + "/" + $chains + " | " + $sum)
+    }
+}
+
+# planted 3-SAT: clause signs drawn until the planted answer satisfies it; table sg is 1 on its one violating value
+fn sat3(n I64, count I64, r mut rand.Rand&) potts.Factors {
+    y := Array<I32>(n)
+    for i in range n: y[i] = I32(r.Below(2))
+    f := potts.Factors(2, 3, 8, count, n)
+    q I64 = 0
+    for q < count {
+        a, b, c := r.Below(n), r.Below(n), r.Below(n)
+        if a == b or b == c or a == c: continue
+        sg := r.Below(8)
+        if I64(y[a]) == (sg >> 2) & 1 and I64(y[b]) == (sg >> 1) & 1 and I64(y[c]) == sg & 1: continue
+        f.At[3 * q], f.At[3 * q + 1], f.At[3 * q + 2] = a, b, c
+        f.Table[q] = sg
+        q++
+    }
+    for sg in range 8: f.T[sg * 8 + sg] = 1.0
+    f.Index()
+    return f
+}
+
+fn colouring(n I64, r mut rand.Rand&) message.Edges {
+    colour := Array<I32>(n)
+    for i in range n: colour[i] = I32(r.Below(3))
+    src, dst := Array<I32>(6 * n), Array<I32>(6 * n)
+    count I64 = 0
+    for i in range n {
+        for _ in range 3 {
+            j := r.Below(n)
+            if j == i or colour[j] == colour[i]: continue
+            src[count], dst[count] = I32(i), I32(j)
+            src[count + 1], dst[count + 1] = I32(j), I32(i)
+            count += 2
+        }
+    }
+    e := message.Edges(n, 6 * n)
+    e.Set(src, dst, count)
+    return e
+}

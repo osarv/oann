@@ -899,12 +899,14 @@ fn (s mut Sampler&) focusChains(m Potts&, e message.Edges&, f Array<F64>&, sched
     for c in range c0, c1: s.focusChain(m, e, f, sched, x, c)
 }
 
-# constraint q's energy above its lowest, with chain c's cells at X[xo ..]
-fn focusExcess(m Potts&, x focusIndex&, q I64, X Array<I32>&, xo I64) F64 {
+# constraint q's energy above its lowest, with chain c's cells at X[xo ..]; base[q A + a] is factor q's table index
+# with slot a at value 0 (the other slots at their cells' values), stride[a] slot a's step - kept by focusMoved
+fn focusExcess(m Potts&, x focusIndex&, base Array<I64>&, stride Array<I64>&, q I64, X Array<I32>&, xo I64) F64 {
     k := m.K
     if q < x.nf {
         fc := m.Fac!
-        return fc.T[fc.entry(q, -1, 0, X, xo)] - x.tmin[fc.Table[q]]
+        o := q * fc.Arity
+        return fc.T[base[o] + I64(X[xo + fc.At[o]]) * stride[0]] - x.tmin[fc.Table[q]]
     }
     d := q - x.nf
     w := x.ew[d]
@@ -913,7 +915,7 @@ fn focusExcess(m Potts&, x focusIndex&, q I64, X Array<I32>&, xo I64) F64 {
 }
 
 # cell i's local energies into L[lo ..] with each constraint's energy times its weight wt
-fn focusLocal(m Potts&, e message.Edges&, x focusIndex&, unary Array<F64>&, wt Array<F64>&, X Array<I32>&, xo I64, i I64, L mut Array<F64>&, lo I64) {
+fn focusLocal(m Potts&, e message.Edges&, x focusIndex&, base Array<I64>&, stride Array<I64>&, unary Array<F64>&, wt Array<F64>&, X Array<I32>&, xo I64, i I64, L mut Array<F64>&, lo I64) {
     k := m.K
     for c in range k: L[lo + c] = unary[i * k + c]
     for a in range e.First(i), e.First(i + 1) {
@@ -924,8 +926,9 @@ fn focusLocal(m Potts&, e message.Edges&, x focusIndex&, unary Array<F64>&, wt A
     if m.Fac != null {
         fc := m.Fac!
         for r in range fc.ptr[i], fc.ptr[i + 1] {
-            q := fc.fid[r]
-            for c in range k: L[lo + c] += wt[q] * fc.T[fc.entry(q, fc.slot[r], c, X, xo)]
+            q, a := fc.fid[r], fc.slot[r]
+            o, st := base[q * fc.Arity + a], stride[a]
+            for c in range k: L[lo + c] += wt[q] * fc.T[o + c * st]
         }
     }
 }
@@ -937,11 +940,12 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
     nc := x.nf + x.ne
     eps := 1e-9
     wt := Array<F64>(nc, 1.0)
+    base, stride := focusBase(m, X, xo)
     viol := Array<I64>(nc)
     pos := Array<I64>(nc, -1)
     nv I64 = 0
     for q in range nc {
-        if focusExcess(m, x, q, X, xo) > eps {
+        if focusExcess(m, x, base, stride, q, X, xo) > eps {
             pos[q] = nv
             viol[nv] = q
             nv++
@@ -973,7 +977,7 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
         low := 1e300
         for a in range nq {
             i := cells[a]
-            focusLocal(m, e, x, s.unary, wt, X, xo, i, L, a * k)
+            focusLocal(m, e, x, base, stride, s.unary, wt, X, xo, i, L, a * k)
             old := I64(X[xo + i])
             for v in range k {
                 if v == old: continue
@@ -997,16 +1001,17 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
             }
         }
         i := ci[pick]
+        focusMoved(m, base, stride, i, cv[pick] - I64(X[xo + i]))
         X[xo + i] = I32(cv[pick])
         moves++
         # the constraints of the moved cell: in or out of the violated set
         for a in range e.First(i), e.First(i + 1) {
             r := x.nf + x.eid[a]
-            nv = focusRecheck(m, x, r, X, xo, viol, pos, nv, eps)
+            nv = focusRecheck(m, x, base, stride, r, X, xo, viol, pos, nv, eps)
         }
         if m.Fac != null {
             fc := m.Fac!
-            for r in range fc.ptr[i], fc.ptr[i + 1]: nv = focusRecheck(m, x, fc.fid[r], X, xo, viol, pos, nv, eps)
+            for r in range fc.ptr[i], fc.ptr[i + 1]: nv = focusRecheck(m, x, base, stride, fc.fid[r], X, xo, viol, pos, nv, eps)
         }
     }
     s.Sweeps[c] = moves
@@ -1014,8 +1019,32 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
     s.Energies[c] = m.Energy(e, f, X, xo)
 }
 
-fn focusRecheck(m Potts&, x focusIndex&, q I64, X Array<I32>&, xo I64, viol mut Array<I64>&, pos mut Array<I64>&, nv I64, eps F64) I64 {
-    bad := focusExcess(m, x, q, X, xo) > eps
+# every factor's table index with each slot open (base) and the slots' steps (stride), at chain X[xo ..]: a cell's
+# local energies then read one entry a value, with no walk over the factor's other cells
+fn focusBase(m Potts&, X Array<I32>&, xo I64) Array<I64>, Array<I64> {
+    if m.Fac == null: return Array<I64>(0), Array<I64>(0)
+    fc := m.Fac!
+    base, stride := Array<I64>(fc.Count * fc.Arity), Array<I64>(fc.Arity)
+    for a in range fc.Arity: stride[a] = powOf(fc.K, fc.Arity - 1 - a)
+    for q in range fc.Count {
+        for a in range fc.Arity: base[q * fc.Arity + a] = fc.entry(q, a, 0, X, xo)
+    }
+    return base, stride
+}
+
+# cell i moved by d values: its factors' open indices for the other slots shift by d steps of i's slot
+fn focusMoved(m Potts&, base mut Array<I64>&, stride Array<I64>&, i I64, d I64) {
+    if m.Fac == null: return
+    fc := m.Fac!
+    for r in range fc.ptr[i], fc.ptr[i + 1] {
+        o, a := fc.fid[r] * fc.Arity, fc.slot[r]
+        step := d * stride[a]
+        for b in range fc.Arity: base[o + b] += step if b != a else 0
+    }
+}
+
+fn focusRecheck(m Potts&, x focusIndex&, base Array<I64>&, stride Array<I64>&, q I64, X Array<I32>&, xo I64, viol mut Array<I64>&, pos mut Array<I64>&, nv I64, eps F64) I64 {
+    bad := focusExcess(m, x, base, stride, q, X, xo) > eps
     if bad and pos[q] < 0 {
         pos[q] = nv
         viol[nv] = q
