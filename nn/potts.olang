@@ -1559,6 +1559,99 @@ fn (p Pairs&) ForestMin(clamp Array<I32>&, x mut Array<I32>&) ? NotForest {
     }
 }
 
+# the free cells' pair graph's independent cycles (free edges - free cells + components; 0 for a forest)
+fn (p Pairs&) cycles(clamp Array<I32>&, seen mut Array<Bool>&, stack mut Array<I64>&) I64 {
+    n := p.Cells
+    edges, free, comps I64 = 0, 0, 0
+    for q in range p.Count: edges += 1 if clamp[p.I[q]] < 0 and clamp[p.J[q]] < 0 else 0
+    for i in range n: seen[i] = false
+    for root in range n {
+        if clamp[root] >= 0 or seen[root]: continue
+        comps++
+        seen[root] = true
+        top I64 = 1
+        stack[0] = root
+        for top > 0 {
+            top--
+            i := stack[top]
+            free++
+            for r in range p.ptr[i], p.ptr[i + 1] {
+                j := p.nb[r]
+                if clamp[j] >= 0 or seen[j]: continue
+                seen[j] = true
+                stack[top] = j
+                top++
+            }
+        }
+    }
+    return edges - free + comps
+}
+
+# a free cell on a cycle when the free graph has cycles: the 2-core (free cells left after peeling those of free degree
+# at most 1), its first cell; -1 for a forest
+fn (p Pairs&) onCycle(clamp Array<I32>&, deg mut Array<I64>&, stack mut Array<I64>&) I64 {
+    n := p.Cells
+    top I64 = 0
+    for i in range n {
+        deg[i] = -1
+        if clamp[i] >= 0: continue
+        deg[i] = 0
+        for r in range p.ptr[i], p.ptr[i + 1]: deg[i] += 1 if clamp[p.nb[r]] < 0 else 0
+        if deg[i] > 1: continue
+        stack[top] = i
+        top++
+    }
+    for top > 0 {
+        top--
+        i := stack[top]
+        deg[i] = -1
+        for r in range p.ptr[i], p.ptr[i + 1] {
+            j := p.nb[r]
+            if deg[j] < 0: continue
+            deg[j]--
+            if deg[j] != 1: continue
+            stack[top] = j
+            top++
+        }
+    }
+    for i in range n {
+        if deg[i] >= 0: return i
+    }
+    return -1
+}
+
+# an exact large-neighbourhood move: the cells region[0 .. count] re-solved together with every other cell held at x.
+# Held cells are cut from the region at random (held at their values) until its free cells' pairs have at most one
+# cycle; then one cell on that cycle is conditioned on each of its values and the forest left is solved exactly
+# (ForestMin) - cycle-cutset conditioning, exact over the region left. x takes the best completion, so its energy never
+# rises (x itself is a candidate). Returns the energy after the move
+fn (p Pairs&) CutsetMove(x mut Array<I32>&, region Array<I64>&, count I64, r mut rand.Rand&) F64 {
+    n, k := p.Cells, p.K
+    clamp := Array<I32>(n)
+    for i in range n: clamp[i] = x[i]
+    for t in range count: clamp[region[t]] = -1
+    seen, stack, deg := Array<Bool>(n), Array<I64>(n), Array<I64>(n)
+    left := count
+    for left > 0 and p.cycles(clamp, seen, stack) > 1 {
+        t := region[r.Below(count)]
+        if clamp[t] >= 0: continue
+        clamp[t] = x[t]
+        left--
+    }
+    best := p.Energy(x, 0)
+    y := Array<I32>(n)
+    cut := p.onCycle(clamp, deg, stack)
+    for v in range (k if cut >= 0 else 1) {
+        if cut >= 0: clamp[cut] = I32(v)
+        try p.ForestMin(clamp, y) catch { continue }
+        e := p.Energy(y, 0)
+        if e >= best: continue
+        best = e
+        for i in range n: x[i] = y[i]
+    }
+    return best
+}
+
 # ---- tests ----
 
 # a planted k-colourable graph of n cells: each cell joined to `links` others of another colour, both ways; its
@@ -2122,4 +2215,60 @@ test Pairs.ForestMin "exact on a tree of free cells with clamped partners (brute
     refused := false
     try p.ForestMin(clamp, x) catch { refused = true }
     assert refused
+}
+
+test Pairs.CutsetMove "on a ring with pendant cells (one cycle) the move from any start is the brute-force minimum; on a grid (many cycles) random regions never raise the energy" {
+    r := rand.Rand(41)
+    # a ring 0..5 with pendants 6 (on 0) and 7 (on 3)
+    links := Array<I64>[0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 0, 0, 6, 3, 7]
+    p := Pairs(3, 8, 8)
+    for q in range 8 {
+        p.I[q], p.J[q] = links[2 * q], links[2 * q + 1]
+        for t in range 9: p.W[q * 9 + t] = r.Uniform(-1.0, 1.0)
+    }
+    for t in range p.B.Len(): p.B[t] = r.Uniform(-1.0, 1.0)
+    p.Index()
+    low := 1e300
+    y := Array<I32>(8)
+    for code in range 6561 {
+        c := code
+        for i in range 8 {
+            y[i] = I32(c % 3)
+            c /= 3
+        }
+        low = low.Min(p.Energy(y, 0))
+    }
+    all := Array<I64>[0, 1, 2, 3, 4, 5, 6, 7]
+    x := Array<I32>(8)
+    for _ in range 20 {
+        for i in range 8: x[i] = I32(r.Below(3))
+        e := p.CutsetMove(x, all, 8, r)
+        assert (e - low).Abs() < 1e-12 and (p.Energy(x, 0) - e).Abs() < 1e-12
+    }
+    # a 5 x 5 grid: regions of 9 random cells, and the whole grid
+    g := Pairs(3, 25, 40)
+    q I64 = 0
+    for i in range 25 {
+        if i % 5 < 4 {
+            g.I[q], g.J[q] = i, i + 1
+            q++
+        }
+        if i / 5 < 4 {
+            g.I[q], g.J[q] = i, i + 5
+            q++
+        }
+    }
+    for t in range g.W.Len(): g.W[t] = r.Uniform(-1.0, 1.0)
+    g.Index()
+    z := Array<I32>(25)
+    for i in range 25: z[i] = I32(r.Below(3))
+    e := g.Energy(z, 0)
+    region := Array<I64>(25)
+    for step in range 200 {
+        m := 25 if step % 10 == 0 else 9
+        for t in range m: region[t] = t if m == 25 else r.Below(25)
+        after := g.CutsetMove(z, region, m, r)
+        assert after <= e + 1e-12 and (g.Energy(z, 0) - after).Abs() < 1e-12
+        e = after
+    }
 }
