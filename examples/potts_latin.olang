@@ -1,0 +1,108 @@
+# Latin squares learnt from solved examples and solved by search, with nn/potts end to end. An n x n Latin square has
+# each of n symbols once in every row and column; the rule is never given. Solved squares (a cyclic square with its
+# rows, columns and symbols shuffled) train a pairwise energy: the pairs of cells screened by mutual information over
+# the examples (Pairs.Screen), a table per pair fitted by pseudolikelihood with L1 (PairFitter), the uncoupled pairs
+# pruned (Pruned). Held-out puzzles keep each cell with probability clue; the search runs on the blanks with the givens
+# held by a bias - annealed chromatic Gibbs over 16 chains (Sampler.Anneal) and the focused heat bath (Sampler.Focus).
+# An answer is right when it is a Latin square keeping the givens. From the repository's root:
+#     make potts_latin ARGS="n examples puzzles clue seed"    (6 400 50 0.4 1)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn/message"
+import "../nn/potts"
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    n := try args[1].ParseInt() if args.Len() > 1 else 6
+    examples := try args[2].ParseInt() if args.Len() > 2 else 400
+    puzzles := try args[3].ParseInt() if args.Len() > 3 else 50
+    clue := try args[4].ParseFloat() if args.Len() > 4 else 0.4
+    seed := try args[5].ParseInt() if args.Len() > 5 else 1
+    r := rand.Rand(U64(seed))
+    cells := n * n
+    data := Array<I32>(examples * cells)
+    sq := Array<I32>(cells)
+    for e in range examples {
+        latin(n, r, sq)
+        for i in range cells: data[e * cells + i] = sq[i]
+    }
+    # each cell's peers: 2 (n - 1), so n^2 (n - 1) coupled pairs; the screen keeps half again as many
+    t0 := time.Now()
+    p := potts.Pairs.Screen(n, cells, data, examples, cells * (n - 1) * 3 / 2)
+    f := potts.PairFitter(p)
+    loss := 0.0
+    for _ in range 800 {
+        for _ in range 32: f.Add(data, r.Below(examples) * cells)
+        loss = f.Step(0.05, 0.01)
+    }
+    q := p.Pruned(0.5)
+    try io.PutLn("n " + $n + ": screened " + $p.Count + " pairs, kept " + $q.Count + " (the rule couples " + $(cells * (n - 1)) + "), PL loss a cell " + $loss.Fixed(4) + ", fit " + $(F64(time.Since(t0)) * 1e-9).Fixed(2) + " s")
+    m := q.Model()
+    e := message.Edges(cells, 1)
+    e.Set(Array<I32>(0), Array<I32>(0), 0)
+    feats := Array<F64>(cells)
+    right, rightF := 0, 0
+    tA, tF := 0.0, 0.0
+    clamp := Array<I32>(cells)
+    for _ in range puzzles {
+        latin(n, r, sq)
+        for i in range cells: clamp[i] = sq[i] if r.Uniform(0.0, 1.0) < clue else I32(-1)
+        s := potts.Sampler(cells, 16, n)
+        s.ColourFor(e, m)
+        # the hold must outweigh every pair a given could break, or a given yields to its free peers
+        s.Bias = q.Bias(clamp, 100.0)
+        s.Start(r)
+        t1 := time.Now()
+        s.Anneal(m, e, feats, potts.Schedule(400, 2.0, 0.05))
+        tA += F64(time.Since(t1)) * 1e-6
+        right += 1 if valid(n, s.X, s.Best() * cells, clamp) else 0
+        # Focus moves only the cells of violated pairs, and the givens are a bias, not a pair: start them right
+        s.Start(r)
+        for c in range 16 {
+            for i in range cells: s.X[c * cells + i] = clamp[i] if clamp[i] >= 0 else s.X[c * cells + i]
+        }
+        t2 := time.Now()
+        s.Focus(m, e, feats, potts.FocusSchedule(20000, 0.3, 0.1, 0.5, 500, 1.0))
+        tF += F64(time.Since(t2)) * 1e-6
+        rightF += 1 if valid(n, s.X, s.Best() * cells, clamp) else 0
+    }
+    try io.PutLn("Anneal: " + $right + "/" + $puzzles + " right, " + $(tA / F64(puzzles)).Fixed(2) + " ms a puzzle (16 chains x 400 sweeps)")
+    try io.PutLn("Focus:  " + $rightF + "/" + $puzzles + " right, " + $(tF / F64(puzzles)).Fixed(2) + " ms a puzzle (16 chains, at most 20000 moves)")
+}
+
+# a random n x n Latin square into sq: the cyclic square (i + j) mod n with rows, columns and symbols permuted
+fn latin(n I64, r mut rand.Rand&, sq mut Array<I32>&) {
+    rows, cols, syms := shuffled(n, r), shuffled(n, r), shuffled(n, r)
+    for i in range n {
+        for j in range n: sq[i * n + j] = I32(syms[(rows[i] + cols[j]) % n])
+    }
+}
+
+fn shuffled(n I64, r mut rand.Rand&) Array<I64> {
+    a := Array<I64>(n)
+    for i in range n: a[i] = i
+    for i in range n - 1 {
+        j := i + r.Below(n - i)
+        a[i], a[j] = a[j], a[i]
+    }
+    return a
+}
+
+# x[xo ..] a Latin square keeping the givens
+fn valid(n I64, x Array<I32>&, xo I64, clamp Array<I32>&) Bool {
+    for i in range n * n {
+        if clamp[i] >= 0 and x[xo + i] != clamp[i]: return false
+    }
+    for a in range n {
+        seenR, seenC := Array<Bool>(n), Array<Bool>(n)
+        for b in range n {
+            vr, vc := I64(x[xo + a * n + b]), I64(x[xo + b * n + a])
+            if seenR[vr] or seenC[vc]: return false
+            seenR[vr], seenC[vc] = true, true
+        }
+    }
+    return true
+}

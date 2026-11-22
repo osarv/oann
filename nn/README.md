@@ -41,3 +41,41 @@ asserts the process's resident memory did not grow.
 
 Test with `olang test nn/FILE.olang`; `make test` runs them all. `make charlm` trains the character transformer
 through them (`examples/charlm.olang`, the model is `models/gpt`).
+
+## Energy models over discrete cells (`potts.olang`)
+
+A model gives every assignment of K-valued cells an energy; low energy means the cells obey the rule it learnt.
+Answers are found by searching for low energy, and new rules are learnt from solved examples. The pieces:
+
+- **Energies.** `Potts` has one K x K table W shared by the edges of a graph (each edge with a weight), per-cell terms
+  linear in the cells' features (B), and optional `Factors` (a table over several cells) and `Hidden` units. `Pairs`
+  gives every listed pair its own K x K table plus a bias per cell. `Pairs.Model()` turns it into a Potts model whose
+  factors are the pairs, and `Pairs.Bias(clamp, hold)` gives the matching sampler bias. A cell's local energies, the
+  energy of each of its values with the others held, are what every search and fitter reads.
+- **Learning from solved examples.**
+  - Pseudolikelihood: each cell's value is predicted from its local energies given the others. `Fitter` does this for
+    `Potts`; `PairFitter` does it for `Pairs`, with Adam and L1 soft thresholds that drive an uncoupled pair's table
+    to zero.
+  - `Pairs.Screen` picks which pairs to fit: those whose values share the most mutual information across the
+    examples.
+  - `Pairs.Pruned` drops the pairs whose coupling stays small. The coupling is a table's largest entry once its row
+    and column means are taken out, because the biases could absorb those means.
+  - The local rules (`Stats`, `CD`, `EP`) fit the same `Potts` tables by contrasting the energy's derivatives at the
+    data with those at the sampler's states.
+- **`Sampler.Anneal`** runs many chains at once, 16 to a vector lane. A sweep visits the cells colour class by colour
+  class: cells of one class share no edge or factor, so they can be redrawn together. Each cell is redrawn from
+  softmax(-local / T) as T falls, then zero-temperature sweeps run until nothing moves. Clamped cells (the givens) go
+  in through `Bias`. Each chain's answer is in `X`, and `Best()` names the chain of lowest energy.
+- **`Sampler.Focus`** is the focused counterpart, for energies made of constraints.
+  - A move picks a violated constraint at random and redraws one of its cells. A constraint is violated when its
+    energy is more than `Slack` above its table's lowest.
+  - Optional weights (`Bump`, `Decay`) grow on constraints the search keeps breaking.
+  - Each chain stops once no constraint is violated. Each cell's local energies are kept up to date by differences
+    on every move.
+  - Only cells in violated constraints move, so start the chains at the givens. A hold must outweigh every pair a
+    given could break.
+- **`Pairs.ForestMin(clamp, x)`** is exact when the free cells' pairs form a forest (edges = cells - components). It
+  runs min-sum from the leaves up, then reads the best values back down. Otherwise it returns `NotForest.Cycle`.
+
+`examples/potts_latin.olang` runs the whole pipeline: Latin squares, then screen, fit and prune, then held-out puzzles
+solved by `Anneal` and by `Focus`.
