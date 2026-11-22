@@ -320,6 +320,59 @@ fn (t mut Fitter&) Add(e message.Edges&, f Array<F64>&, y Array<I32>&) {
     t.cells += e.Nodes
 }
 
+# a contrast of statistics: the mean over the chains of a (chains a, cells e.Nodes each, from x a's 0) less the mean
+# over the chains of b, times scale - the gradient a contrastive rule steps along (data less samples, or a nudged phase
+# less another). Counted as e's cells, as Add's examples are
+fn (t mut Fitter&) AddContrast(e message.Edges&, f Array<F64>&, xa Array<I32>&, a I64, xb Array<I32>&, b I64, scale F64) {
+    n := e.Nodes
+    for c in range a: t.M.Stats(e, f, xa, c * n, scale / F64(a), t.gw, t.gb)
+    for c in range b: t.M.Stats(e, f, xb, c * n, -scale / F64(b), t.gw, t.gb)
+    t.cells += n
+}
+
+# contrastive divergence on one example (graph, features, answer y): every chain of s started at y (fromData) or
+# uniformly at random, k Gibbs sweeps at T 1 (block Gibbs with hidden units), the answer's statistics less the chains'.
+# With persist the chains go on from where the last call left them (persistent CD: s kept a graph's own, Start once)
+fn (t mut Fitter&) CD(e message.Edges&, f Array<F64>&, y Array<I32>&, s mut Sampler&, k I64, fromData Bool = true, persist Bool = false, r mut rand.Rand& = rand.Rand(1)) {
+    n := e.Nodes
+    if not persist {
+        if fromData {
+            for c in range s.Chains {
+                for i in range n: s.X[c * n + i] = y[i]
+            }
+        } else {
+            s.Start(r)
+        }
+    }
+    s.Anneal(t.M, e, f, Schedule(k, 1.0, 1.0, -1.0, 0))
+    t.AddContrast(e, f, y, 1, s.X, s.Chains, 1.0)
+}
+
+# equilibrium propagation's contrast on one example: a free phase of k sweeps at T 1 from random starts, then from
+# its end two nudged phases of kn sweeps each with every cell's energy lowered by beta at its answer's value (+beta)
+# and raised by it (-beta); the gradient is the two nudged phases' statistics' difference over 2 beta. s.Bias is used
+# and left empty
+fn (t mut Fitter&) EP(e message.Edges&, f Array<F64>&, y Array<I32>&, s mut Sampler&, k I64, kn I64, beta F64, r mut rand.Rand&) {
+    n, kk := e.Nodes, t.M.K
+    s.Start(r)
+    s.Bias = Array<F64>(0)
+    s.Anneal(t.M, e, f, Schedule(k, 1.0, 1.0, -1.0, 0))
+    free := Array<I32>(s.X.Len())
+    for i in range free.Len(): free[i] = s.X[i]
+    plus := Array<I32>(s.X.Len())
+    s.Bias = Array<F64>(n * kk)
+    for sign in Array<F64>[1.0, -1.0] {
+        for i in range n: s.Bias[i * kk + I64(y[i])] = -sign * beta
+        for i in range free.Len(): s.X[i] = free[i]
+        s.Anneal(t.M, e, f, Schedule(kn, 1.0, 1.0, -1.0, 0))
+        if sign > 0.0 {
+            for i in range plus.Len(): plus[i] = s.X[i]
+        }
+    }
+    s.Bias = Array<F64>(0)
+    t.AddContrast(e, f, plus, s.Chains, s.X, s.Chains, 1.0 / (2.0 * beta))
+}
+
 fn (t mut Fitter&) Step(rate F64) F64 {
     if t.cells == 0: return 0.0
     if t.Symmetrize: Symmetric(t.gw, t.M.K)
@@ -350,6 +403,38 @@ fn adam(p mut Array<F64>&, g mut Array<F64>&, m mut Array<F64>&, v mut Array<F64
     }
 }
 
+# ---- local learning: statistics at assignments ----
+
+# the energy's derivative for every table at the assignment x[xo ..] (the hidden units summed out), added times scale
+# into gw, gb and the factors' and units' gradients (G, GH, GC): for the pairs half an edge's weight at its two values
+# (each pair's edges come both ways), for B the cell's features at its value, for a factor 1 at its entry, for a unit
+# -sigmoid(a) at C and at each of its slots' values. A table entry sees only the cells it joins: contrasting this at
+# data against it at samples is a local rule (contrastive Hebbian or Boltzmann learning)
+fn (m Potts&) Stats(e message.Edges&, f Array<F64>&, x Array<I32>&, xo I64, scale F64, gw mut Array<F64>&, gb mut Array<F64>&) {
+    k := m.K
+    for i in range e.Nodes {
+        xi := I64(x[xo + i])
+        for q in range m.Features {
+            fv := f[i * m.Features + q]
+            if fv != 0.0: gb[q * k + xi] += scale * fv
+        }
+        for a in range e.First(i), e.First(i + 1): gw[xi * k + I64(x[xo + e.Source(a)])] += scale * 0.5 * F64(e.Weight(a))
+    }
+    if m.Fac != null {
+        fc := m.Fac!
+        for q in range fc.Count: fc.G[fc.entry(q, -1, 0, x, xo)] += scale
+    }
+    if m.Hid != null {
+        h := m.Hid!
+        for j in range h.Units {
+            t := h.Type[j]
+            d := -scale * sigmoid(h.input(j, x, xo))
+            h.GC[t] += d
+            for sl in range h.Arity: h.GH[(t * h.Arity + sl) * k + I64(x[xo + h.At[j * h.Arity + sl]])] += d
+        }
+    }
+}
+
 # how a search anneals: Sweeps sweeps at T falling geometrically from T0 to T1, then zero-temperature sweeps until
 # no cell moves (at most Polish); a chain stops once a sweep at T <= Tstop moves nothing
 type Schedule struct(Sweeps I64 = 200, T0 F64 = 2.0, T1 F64 = 0.05, Tstop F64 = 0.1, Polish I64 = 50) {
@@ -374,6 +459,7 @@ type Sampler struct(cells I64, chains I64, k I64, threads I64 = 1) {
     K I64 = k
     Threads I64 = threads if threads > 0 else 1
     X mut Array<I32>& = Array<I32>(chains * cells)
+    Bias mut Array<F64>& = Array<F64>(0)               # cells x K energies added to every chain's unary terms (empty: none) - a nudge
     Sweeps mut Array<I64>& = Array<I64>(chains)
     Energies mut Array<F64>& = Array<F64>(chains)
     order mut Array<I64>& = Array<I64>(cells)          # the cells by colour class
@@ -468,6 +554,9 @@ fn (s mut Sampler&) Anneal(m Potts&, e message.Edges&, f Array<F64>&, sched Sche
             fv := f[i * m.Features + q]
             if fv == 0.0: continue
             for v in range k: s.unary[i * k + v] += fv * m.B[q * k + v]
+        }
+        if s.Bias.Len() > 0 {
+            for v in range k: s.unary[i * k + v] += s.Bias[i * k + v]
         }
     }
     for i in range k * k: s.w32[i] = F32(m.W[i])
@@ -1078,4 +1167,108 @@ test Fitter "hidden units fitted by pseudolikelihood to not-all-equal answers, n
     s.Anneal(m, e, fz, Schedule(200, 1.0, 0.05))
     best := s.Best()
     assert s.Energies[best] == m.Energy(e, fz, s.X, best * n)
+}
+
+test Potts.Stats "the statistics are the energy's derivative for every table (pairs, unary terms, factors, hidden units)" {
+    r := rand.Rand(31)
+    e, y := planted(12, 2, 2, r)
+    f, _ := naeCase(12, 10, r)
+    for i in range f.T.Len(): f.T[i] = r.Uniform(-1.0, 1.0)
+    h := Hidden(2, 3, 2, 4, 12)
+    for j in range 4 {
+        for a in range 3: h.At[3 * j + a] = (j * 3 + a * 4) % 12
+        h.Type[j] = j % 2
+    }
+    for i in range h.H.Len(): h.H[i] = r.Uniform(-1.0, 1.0)
+    h.Index()
+    m := Potts(2, 2)
+    m.Fac = f
+    m.Hid = h
+    for i in range 4: m.W[i] = r.Uniform(-1.0, 1.0)
+    for i in range 4: m.B[i] = r.Uniform(-1.0, 1.0)
+    fz := Array<F64>(24)
+    for i in range 24: fz[i] = r.Uniform(0.0, 1.0)
+    gw, gb := Array<F64>(4), Array<F64>(4)
+    m.Stats(e, fz, y, 0, 1.0, gw, gb)
+    tables := Array<mut Array<F64>&>[m.W, m.B, f.T, h.H, h.C]
+    grads := Array<Array<F64>&>[gw, gb, f.G, h.GH, h.GC]
+    for t in range 5 {
+        tab := tables[t]
+        for j in range tab.Len() {
+            keep := tab[j]
+            tab[j] = keep + 1e-6
+            up := m.Energy(e, fz, y, 0)
+            tab[j] = keep - 1e-6
+            down := m.Energy(e, fz, y, 0)
+            tab[j] = keep
+            want := (up - down) / 2e-6
+            assert (grads[t][j] - want).Abs() < 1e-6 * (1.0 + want.Abs()), "table " + $t + " entry " + $j + ": " + $grads[t][j] + " against " + $want
+        }
+    }
+}
+
+# a planted 3-colourable graph of n cells with a share of clues, its features and answer
+fn cluedCase(n I64, clue F64, r mut rand.Rand&) message.Edges, Array<F64>, Array<I32> {
+    e, y := planted(n, 3, 2, r)
+    clues := Array<I32>(n, -1)
+    for i in range n {
+        if r.Uniform(0.0, 1.0) < clue: clues[i] = y[i]
+    }
+    f := Array<F64>(n * ClueFeatureCount(3))
+    ClueFeatures(e, clues, 3, f)
+    return e, f, y
+}
+
+test Fitter.CD "CD-1, persistent CD-1 and EP each learn the colouring rule from planted answers (40 % clues): the fitted energy's chains solve new graphs of 128 cells" {
+    for rule in range 3 {
+        r := rand.Rand(U64(40 + rule))
+        m := Potts(3, ClueFeatureCount(3))
+        t := Fitter(m)
+        s := Sampler(32, 16, 3)
+        pool := Vec<Sampler>()
+        graphs := Vec<message.Edges>()
+        feats := Vec<Array<F64>>()
+        ys := Vec<Array<I32>>()
+        if rule == 1 {
+            # persistent chains: a fixed pool of graphs, each with its own chains
+            for _ in range 16 {
+                e, f, y := cluedCase(32, 0.4, r)
+                ps := Sampler(32, 16, 3)
+                ps.Colour(e)
+                ps.Start(r)
+                pool.Push(ps)
+                graphs.Push(e)
+                feats.Push(f)
+                ys.Push(y)
+            }
+        }
+        for step in range 150 {
+            for b in range 4 {
+                if rule == 1 {
+                    q := (step * 4 + b) % 16
+                    t.CD(graphs[q], feats[q], ys[q], pool[q], 1, true, true)
+                    continue
+                }
+                e, f, y := cluedCase(32, 0.4, r)
+                s.Colour(e)
+                if rule == 0 { t.CD(e, f, y, s, 1) } else { t.EP(e, f, y, s, 5, 1, 1.0, r) }
+            }
+            t.Step(0.05)
+        }
+        solved I64 = 0
+        for _ in range 4 {
+            e, f, _ := cluedCase(128, 0.4, r)
+            q := Sampler(128, 16, 3)
+            q.Colour(e)
+            q.Start(r)
+            q.Anneal(m, e, f, Schedule(300, 2.0, 0.05))
+            # proper and keeping every clue: the rule's energy 0 and the clue term matched
+            ok := Potts.Colouring(3).Energy(e, Array<F64>(128), q.X, q.Best() * 128) == 0.0
+            for i in range 128 {
+                if f[i * 5 + 3] == 0.0 and f[i * 5 + I64(q.X[q.Best() * 128 + i])] == 0.0: ok = false
+            }
+            if ok: solved += 1
+        }
+        assert solved >= 3, "rule " + $rule + ": " + $solved + " of 4"
+    }
 }

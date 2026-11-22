@@ -1,0 +1,117 @@
+# nn/potts' fitters on planted 3-colourings with clues (each cell joined to about 4 others, a share of the cells
+# showing their colour): pseudolikelihood (Add), CD-1 (CD from the answer), persistent CD-1 (a pool of 256 graphs, each
+# with its own chains) and EP (5 free sweeps, then 1 sweep nudged by +-1), each with Adam over the same updates of the
+# same batches; then 20 chains of 400 annealing sweeps on new graphs of 128 and 256 cells. Reported: training seconds
+# and the share of test graphs whose lowest-energy chain is a proper colouring keeping every clue. Arguments: updates
+# (300), the clues' share (0.2), test graphs (16), seed (1). From the repository's root:
+#     olang build -output build/bench_pottsfit bench/pottsfit.olang && build/bench_pottsfit
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "std/json"
+import "../nn/message"
+import "../nn/potts"
+
+fn number(args Array<String&>&, i I64, fallback F64) F64 ? json.Error {
+    if i >= args.Len(): return fallback
+    return try json.Json.Parse(args[i]).AsNum()
+}
+
+type Case struct(e message.Edges, f Array<F64>, y Array<I32>) {
+    e
+    f
+    y
+}
+
+fn Case.Draw(n I64, clue F64, r mut rand.Rand&) Case {
+    y := Array<I32>(n)
+    for i in range n: y[i] = I32(r.Below(3))
+    src, dst := Array<I32>(4 * n), Array<I32>(4 * n)
+    count I64 = 0
+    for i in range n {
+        for _ in range 2 {
+            j := r.Below(n)
+            if j == i or y[j] == y[i]: continue
+            src[count], dst[count] = I32(i), I32(j)
+            src[count + 1], dst[count + 1] = I32(j), I32(i)
+            count += 2
+        }
+    }
+    e := message.Edges(n, 4 * n)
+    e.Set(src, dst, count)
+    clues := Array<I32>(n, -1)
+    for i in range n {
+        if r.Uniform(0.0, 1.0) < clue: clues[i] = y[i]
+    }
+    f := Array<F64>(n * potts.ClueFeatureCount(3))
+    potts.ClueFeatures(e, clues, 3, f)
+    return Case(e, f, y)
+}
+
+fn main() ? io.Error, json.Error {
+    args := os.Args()
+    updates := I64(try number(args, 1, 300))
+    clue := try number(args, 2, 0.2)
+    tests := I64(try number(args, 3, 16))
+    seed := U64(try number(args, 4, 1))
+    names := Array<String>["PL", "CD-1", "PCD-1", "EP 5 + 1"]
+    try io.PutLn($updates + " updates of 32 graphs of 32 cells, " + $(100.0 * clue).Fixed(0) + "% clues; test " + $tests + " graphs a size")
+    for rule in range 4 {
+        r := rand.Rand(seed)
+        m := potts.Potts(3, potts.ClueFeatureCount(3))
+        t := potts.Fitter(m)
+        s := potts.Sampler(32, 16, 3)
+        pool := Vec<potts.Sampler>()
+        cases := Vec<Case>()
+        if rule == 2 {
+            for _ in range 256 {
+                c := Case.Draw(32, clue, r)
+                ps := potts.Sampler(32, 16, 3)
+                ps.Colour(c.e)
+                ps.Start(r)
+                pool.Push(ps)
+                cases.Push(c)
+            }
+        }
+        t0 := time.Now()
+        for step in range updates {
+            for b in range 32 {
+                if rule == 2 {
+                    q := (step * 32 + b) % 256
+                    t.CD(cases[q].e, cases[q].f, cases[q].y, pool[q], 1, true, true)
+                    continue
+                }
+                c := Case.Draw(32, clue, r)
+                if rule == 0 {
+                    t.Add(c.e, c.f, c.y)
+                    continue
+                }
+                s.Colour(c.e)
+                if rule == 1 { t.CD(c.e, c.f, c.y, s, 1) } else { t.EP(c.e, c.f, c.y, s, 5, 1, 1.0, r) }
+            }
+            t.Step(0.05 * 0.5 * (1.0 + (3.141592653589793 * F64(step) / F64(updates)).Cos()))
+        }
+        train := F64(time.Since(t0)) * 1e-9
+        line := names[rule] + ": train " + $train.Fixed(2) + " s;"
+        for n in Array<I64>[128, 256] {
+            solved I64 = 0
+            for _ in range tests {
+                c := Case.Draw(n, clue, r)
+                q := potts.Sampler(n, 20, 3)
+                q.Colour(c.e)
+                q.Start(r)
+                q.Anneal(m, c.e, c.f, potts.Schedule(400, 2.0, 0.05))
+                b := q.Best()
+                ok := potts.Potts.Colouring(3).Energy(c.e, Array<F64>(n), q.X, b * n) == 0.0
+                for i in range n {
+                    if c.f[i * 5 + 3] == 0.0 and c.f[i * 5 + I64(q.X[b * n + i])] == 0.0: ok = false
+                }
+                if ok: solved += 1
+            }
+            line = line + " " + $n + " cells " + $(100.0 * F64(solved) / F64(tests)).Fixed(1) + "%"
+        }
+        try io.PutLn(line)
+    }
+}

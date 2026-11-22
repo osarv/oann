@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -216,6 +216,12 @@ ternarybench:
 pottsbench:
 	$(OLANG) build -output build/bench_potts bench/potts.olang
 	./build/bench_potts $(ARGS)
+
+# nn/potts' fitters - pseudolikelihood, CD-1, persistent CD-1, EP - on planted colourings with clues, then annealed
+# search on new graphs of 128 and 256 cells (bench/pottsfit.olang) - ARGS: updates, clues' share, test graphs, seed
+pottsfitbench:
+	$(OLANG) build -output build/bench_pottsfit bench/pottsfit.olang
+	./build/bench_pottsfit $(ARGS)
 
 graphsettle:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_graphsettle bench/graphsettle.olang

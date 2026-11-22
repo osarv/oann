@@ -1980,3 +1980,17 @@ forward and its gradients written there, transposed out once after the backward 
 scatters every token, with a branch for token 0). Best of 3, us a token forward / backward: N 64, K 1 0.32 / 0.43;
 K 4 0.59 / 1.11; N 256, K 1 2.06 / 2.74; K 4 4.67 / 6.50. Against the scalar loops in one harness: forward 7-12x,
 backward 1.1-1.8x (the scalar backward was already about a quarter of its forward; ours is 1.3-1.9x our forward).
+
+## Local learning rules for nn/potts (wt-pottslocal, 2026-11-22)
+
+`Potts.Stats`: the energy's derivative for every table at an assignment (pairs, unary terms, factors, hidden units
+summed out) - each entry sees only the cells it joins - tested against central differences of Energy. On it:
+`Fitter.AddContrast` (the mean statistics of one set of chains less another's, times a scale), `Fitter.CD` (k Gibbs
+sweeps at T 1 from the answer, from noise, or persistent chains a graph's own) and `Fitter.EP` (k free sweeps from
+noise, then kn sweeps nudged toward the answer by +beta and by -beta through the sampler's new `Bias`, their contrast
+over 2 beta); Step as for pseudolikelihood. Tested: CD-1, persistent CD-1 and EP each learn the colouring rule from
+planted answers (40 % clues) and solve new graphs of 128 cells. bench/pottsfit, an experiment's colouring setting
+(degree about 4, 20 % clues, 300 updates of 32 graphs of 32 cells, Adam 0.05 on a cosine, 16 chains a fit; tests of
+20 chains x 400 sweeps, 16 graphs a size, seed 1): PL 0.07 s, CD-1 0.25 s, PCD-1 (a pool of 256) 0.19 s, EP (5 + 1
+sweeps, beta 1) 0.82 s of training, and every rule 100 % of graphs at 128 and at 256 cells (the experiment's: PL
+98-100, CD-1 97-99, PCD-1 85-87, EP 99-100 at 256).
