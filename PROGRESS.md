@@ -2052,3 +2052,15 @@ tables with I32 indices (44-47 ns); factor energies folded into the incremental 
 moves (52 ns: 35 % of lane visits move on this glass, so the scalar updates outweigh the gathers); the pick as a
 branch-free count of running totals (50 ns) or as an F32 select (105 ns - the compiler's code for that loop, not the
 work).
+
+## A table for every pair, and exact search on forests (wt-pairs, 2026-11-22)
+
+nn/potts `Pairs`: E(x) = sum_p W_p[x_I][x_J] + sum_i B_i[x_i], a K x K table per listed pair (`Pairs.All`, or
+`Pairs.Screen`: the pairs whose cells' values share the most mutual information over solved examples). `PairFitter`
+fits it by pseudolikelihood (Adam, L1 soft thresholds on tables and biases); `Pruned(thr)` keeps the pairs whose
+table, with its row and column means taken out (what biases absorb), has an entry above thr. `ForestMin(clamp, x)`:
+the exact lowest-energy free cells given the clamped ones by min-sum over the free cells' pair graph, refused
+(`NotForest.Cycle`) unless edges = cells - components. Tests: 8 planted pairs among 45 over 10 three-valued cells,
+3000 Gibbs samples - after 600 steps the planted couplings measure 1.50-1.84 and every other pair 0.05-0.30, so
+`Pruned(0.5)` returns exactly the planted 8, and `Screen(8)` ranks them first; `ForestMin` equals brute force over
+3^7 assignments on a tree tied to two clamped cells, and refuses once a cycle is freed.

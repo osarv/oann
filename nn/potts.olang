@@ -1205,6 +1205,307 @@ fn softmaxAll(theta Array<F64>&, base I64, p mut Array<F64>&, n I64, k I64) {
 
 assert not Potts.PseudoGrad.Allocates, "a pseudolikelihood gradient allocates"
 
+# ---- a table for every pair ----
+
+# Pairs: a pairwise energy with a K x K table of its own for each listed pair of cells and a bias per cell,
+#   E(x) = sum_p W_p[x_I(p)][x_J(p)] + sum_i B_i[x_i]
+# - the rule a model of solved examples learns when no two pairs need share a table. Listed pairs: `All` (every
+# pair) or `Screen` (the pairs whose values carry the most mutual information over solved examples); fitted by
+# `PairFitter` (pseudolikelihood with L1 soft thresholds, Adam), thinned by `Pruned`; searched exactly by `ForestMin`
+# where the free cells' graph is a forest. Index() after I and J are set
+type Pairs struct(k I64, cells I64, count I64) {
+    K I64 = k
+    Cells I64 = cells
+    Count I64 = count
+    I mut Array<I64>& = Array<I64>(count)
+    J mut Array<I64>& = Array<I64>(count)
+    W mut Array<F64>& = Array<F64>(count * k * k)   # W[p][a][b]: a the value of I(p), b of J(p)
+    B mut Array<F64>& = Array<F64>(cells * k)
+    ptr mut Array<I64>& = Array<I64>(cells + 1)     # cell i's pairs: pid / nb[ptr[i] .. ptr[i + 1]]
+    pid mut Array<I64>& = Array<I64>(2 * count)
+    nb mut Array<I64>& = Array<I64>(2 * count)
+}
+
+# every unordered pair of cells
+fn Pairs.All(k I64, cells I64) Pairs {
+    p := Pairs(k, cells, cells * (cells - 1) / 2)
+    q I64 = 0
+    for i in range cells {
+        for j in range i + 1, cells {
+            p.I[q], p.J[q] = i, j
+            q++
+        }
+    }
+    p.Index()
+    return p
+}
+
+# the keep pairs of highest mutual information between their cells' values over examples solved examples (example e
+# at data[e cells ..]): a screen before fitting, since a pair the rule couples shows dependence in the solutions
+fn Pairs.Screen(k I64, cells I64, data Array<I32>&, examples I64, keep I64) Pairs {
+    all := cells * (cells - 1) / 2
+    info := Array<F64>(all)
+    marg := Array<F64>(cells * k)
+    for e in range examples {
+        for i in range cells: marg[i * k + I64(data[e * cells + i])] += 1.0
+    }
+    joint := Array<F64>(k * k)
+    q I64 = 0
+    for i in range cells {
+        for j in range i + 1, cells {
+            for t in range k * k: joint[t] = 0.0
+            for e in range examples: joint[I64(data[e * cells + i]) * k + I64(data[e * cells + j])] += 1.0
+            info[q] = mutualInfo(joint, marg, i * k, j * k, k, F64(examples))
+            q++
+        }
+    }
+    # the keep largest by a threshold found by sorting a copy
+    sorted := Array<F64>(all)
+    for t in range all: sorted[t] = info[t]
+    sorted.Sort(fn(a F64, b F64) Bool: return a < b)
+    cut := sorted[(all - keep).Max(0)] if keep > 0 else 1e300
+    p := Pairs(k, cells, keep.Min(all))
+    q = 0
+    r I64 = 0
+    for i in range cells {
+        for j in range i + 1, cells {
+            if info[q] >= cut and r < p.Count {
+                p.I[r], p.J[r] = i, j
+                r++
+            }
+            q++
+        }
+    }
+    p.Index()
+    return p
+}
+
+# I(a; b) in nats from the joint counts and the marginal counts (at ma, mb), n examples
+fn mutualInfo(joint Array<F64>&, marg Array<F64>&, ma I64, mb I64, k I64, n F64) F64 {
+    s F64 = 0.0
+    for a in range k {
+        for b in range k {
+            c := joint[a * k + b]
+            if c == 0.0: continue
+            s += c / n * (c * n / (marg[ma + a] * marg[mb + b])).Log()
+        }
+    }
+    return s
+}
+
+fn (p mut Pairs&) Index() {
+    for i in range p.Cells + 1: p.ptr[i] = 0
+    for q in range p.Count {
+        p.ptr[p.I[q] + 1]++
+        p.ptr[p.J[q] + 1]++
+    }
+    for i in range p.Cells: p.ptr[i + 1] += p.ptr[i]
+    fill := Array<I64>(p.Cells)
+    for q in range p.Count {
+        a, b := p.I[q], p.J[q]
+        p.pid[p.ptr[a] + fill[a]], p.nb[p.ptr[a] + fill[a]] = q, b
+        fill[a]++
+        p.pid[p.ptr[b] + fill[b]], p.nb[p.ptr[b] + fill[b]] = q, a
+        fill[b]++
+    }
+}
+
+# pair q's entry with cell i at value a and its partner at b
+fn (p Pairs&) entry(q I64, i I64, a I64, b I64) I64 {
+    k := p.K
+    return q * k * k + (a * k + b if p.I[q] == i else b * k + a)
+}
+
+# cell i's energy at each value, the others held, into L[lo ..]
+fn (p Pairs&) Local(x Array<I32>&, xo I64, i I64, L mut Array<F64>&, lo I64) {
+    for c in range p.K: L[lo + c] = p.B[i * p.K + c]
+    for r in range p.ptr[i], p.ptr[i + 1] {
+        q, j := p.pid[r], p.nb[r]
+        for c in range p.K: L[lo + c] += p.W[p.entry(q, i, c, I64(x[xo + j]))]
+    }
+}
+
+fn (p Pairs&) Energy(x Array<I32>&, xo I64) F64 {
+    e F64 = 0.0
+    for i in range p.Cells: e += p.B[i * p.K + I64(x[xo + i])]
+    for q in range p.Count: e += p.W[(q * p.K + I64(x[xo + p.I[q]])) * p.K + I64(x[xo + p.J[q]])]
+    return e
+}
+
+# the pairs whose coupling (strongest: the table's largest entry once row and column means are out) is above thr,
+# with their tables, and the same biases
+fn (p Pairs&) Pruned(thr F64) Pairs {
+    kk := p.K * p.K
+    keep I64 = 0
+    for q in range p.Count: keep += 1 if p.strongest(q) > thr else 0
+    o := Pairs(p.K, p.Cells, keep)
+    r I64 = 0
+    for q in range p.Count {
+        if p.strongest(q) <= thr: continue
+        o.I[r], o.J[r] = p.I[q], p.J[q]
+        for t in range kk: o.W[r * kk + t] = p.W[q * kk + t]
+        r++
+    }
+    for t in range p.B.Len(): o.B[t] = p.B[t]
+    o.Index()
+    return o
+}
+
+# pair q's coupling: its table's largest entry in size once each row's and column's mean is taken out (what the
+# biases could absorb is no coupling)
+fn (p Pairs&) strongest(q I64) F64 {
+    k := p.K
+    o := q * k * k
+    all F64 = 0.0
+    for t in range k * k: all += p.W[o + t]
+    all /= F64(k * k)
+    mx F64 = 0.0
+    for a in range k {
+        for b in range k {
+            ra, cb := 0.0, 0.0
+            for c in range k {
+                ra += p.W[o + a * k + c]
+                cb += p.W[o + c * k + b]
+            }
+            mx = mx.Max((p.W[o + a * k + b] - ra / F64(k) - cb / F64(k) + all).Abs())
+        }
+    }
+    return mx
+}
+
+# pseudolikelihood for Pairs: Add an example's cells (each given the others), then Step - Adam on W and B with L1
+# soft thresholds l1 (tables) and l1b (biases) after each step, which drive the tables of uncoupled pairs to zero
+type PairFitter struct(p mut Pairs&) {
+    M mut Pairs& = p
+    gw mut Array<F64>& = Array<F64>(p.W.Len())
+    gb mut Array<F64>& = Array<F64>(p.B.Len())
+    mw mut Array<F64>& = Array<F64>(p.W.Len())
+    vw mut Array<F64>& = Array<F64>(p.W.Len())
+    mb mut Array<F64>& = Array<F64>(p.B.Len())
+    vb mut Array<F64>& = Array<F64>(p.B.Len())
+    L mut Array<F64>& = Array<F64>(p.K)
+    Steps I64 = 0
+    nll F64 = 0.0
+    cells F64 = 0.0
+}
+
+# every cell of x[xo ..] given the others: the loss added, its gradient into the fitter's sums
+fn (f mut PairFitter&) Add(x Array<I32>&, xo I64) {
+    p := f.M
+    k := p.K
+    for i in range p.Cells {
+        p.Local(x, xo, i, f.L, 0)
+        mn := f.L[0]
+        for c in range 1, k: mn = mn.Min(f.L[c])
+        z F64 = 0.0
+        for c in range k: z += (mn - f.L[c]).Exp()
+        y := I64(x[xo + i])
+        f.nll += f.L[y] - mn + z.Log()
+        for c in range k {
+            g := (1.0 if c == y else 0.0) - (mn - f.L[c]).Exp() / z
+            f.gb[i * k + c] += g
+            for r in range p.ptr[i], p.ptr[i + 1]: f.gw[p.entry(p.pid[r], i, c, I64(x[xo + p.nb[r]]))] += g
+        }
+    }
+    f.cells += F64(p.Cells)
+}
+
+# one step from the examples added since the last (the mean loss a cell returned)
+fn (f mut PairFitter&) Step(rate F64, l1 F64 = 0.0, l1b F64 = 0.0) F64 {
+    f.Steps++
+    n := f.cells.Max(1.0)
+    adamShrink(f.M.W, f.gw, f.mw, f.vw, n, rate, f.Steps, l1)
+    adamShrink(f.M.B, f.gb, f.mb, f.vb, n, rate, f.Steps, l1b)
+    loss := f.nll / n
+    f.nll, f.cells = 0.0, 0.0
+    return loss
+}
+
+fn adamShrink(p mut Array<F64>&, g mut Array<F64>&, m mut Array<F64>&, v mut Array<F64>&, n F64, rate F64, step I64, l1 F64) {
+    adam(p, g, m, v, n, rate, step)
+    if l1 <= 0.0: return
+    for i in range p.Len(): p[i] = (p[i].Abs() - rate * l1).Max(0.0) * (1.0 if p[i] > 0.0 else -1.0)
+}
+
+type NotForest error { Cycle }
+
+# the exact lowest-energy x for the free cells (clamp[i] < 0) with the clamped cells held at their values: dynamic
+# programming over the free cells' pair graph (min-sum, leaves first), an error unless that graph is a forest (edges =
+# cells - components). x gets every cell, the clamped ones copied
+fn (p Pairs&) ForestMin(clamp Array<I32>&, x mut Array<I32>&) ? NotForest {
+    n, k := p.Cells, p.K
+    order := Array<I64>(n)
+    parent := Array<I64>(n, -2)
+    up := Array<I64>(n)                 # the pair joining a cell to its parent
+    count, comps, free, edges I64 = 0, 0, 0, 0
+    for q in range p.Count: edges += 1 if clamp[p.I[q]] < 0 and clamp[p.J[q]] < 0 else 0
+    for root in range n {
+        if clamp[root] >= 0 or parent[root] != -2: continue
+        parent[root] = -1
+        comps++
+        head := count
+        order[count] = root
+        count++
+        for head < count {
+            i := order[head]
+            head++
+            for r in range p.ptr[i], p.ptr[i + 1] {
+                j := p.nb[r]
+                if clamp[j] >= 0 or parent[j] != -2: continue
+                parent[j], up[j] = i, p.pid[r]
+                order[count] = j
+                count++
+            }
+        }
+    }
+    free = count
+    if edges != free - comps: error NotForest.Cycle
+    # each free cell's own energy with its clamped partners folded in, then each child's best summed into its parent
+    cost := Array<F64>(n * k)
+    arg := Array<I64>(n * k)
+    for at in range count {
+        i := order[at]
+        for v in range k {
+            e := p.B[i * k + v]
+            for r in range p.ptr[i], p.ptr[i + 1] {
+                j := p.nb[r]
+                if clamp[j] >= 0: e += p.W[p.entry(p.pid[r], i, v, I64(clamp[j]))]
+            }
+            cost[i * k + v] = e
+        }
+    }
+    for at in range count {
+        c := order[count - 1 - at]
+        par := parent[c]
+        if par < 0: continue
+        for a in range k {
+            best := 1e300
+            bv I64 = 0
+            for b in range k {
+                t := p.W[p.entry(up[c], par, a, b)] + cost[c * k + b]
+                if t >= best: continue
+                best, bv = t, b
+            }
+            cost[par * k + a] += best
+            arg[c * k + a] = bv
+        }
+    }
+    for i in range n: x[i] = clamp[i]
+    for at in range count {
+        i := order[at]
+        par := parent[i]
+        if par >= 0 {
+            x[i] = I32(arg[i * k + I64(x[par])])
+            continue
+        }
+        bv I64 = 0
+        for v in range 1, k {
+            if cost[i * k + v] < cost[i * k + bv]: bv = v
+        }
+        x[i] = I32(bv)
+    }
+}
+
 # ---- tests ----
 
 # a planted k-colourable graph of n cells: each cell joined to `links` others of another colour, both ways; its
@@ -1675,4 +1976,97 @@ test Sampler.Focus "the focused heat bath solves a planted 3-SAT instance (facto
         answers.Push(s.X)
     }
     assert answers[0] == answers[1]
+}
+
+# solved examples from a planted Pairs by Gibbs sampling (burn-in, then one example every few sweeps)
+fn pairSamples(p Pairs&, count I64, r mut rand.Rand&) Array<I32> {
+    n, k := p.Cells, p.K
+    x := Array<I32>(n)
+    L := Array<F64>(k)
+    out := Array<I32>(count * n)
+    for t in range 200 + 5 * count {
+        for i in range n {
+            p.Local(x, 0, i, L, 0)
+            z F64 = 0.0
+            for c in range k: z += (-L[c]).Exp()
+            u := r.Uniform(0.0, 1.0) * z
+            v := k - 1
+            for c in range k {
+                u -= (-L[c]).Exp()
+                if u > 0.0: continue
+                v = c
+                break
+            }
+            x[i] = I32(v)
+        }
+        if t < 200 or (t - 200) % 5 != 0: continue
+        e := (t - 200) / 5
+        for i in range n: out[e * n + i] = x[i]
+    }
+    return out
+}
+
+test Pairs "a planted pairwise model is recovered from its samples: pseudolikelihood with L1 then pruning keeps exactly the planted pairs, and the mutual-information screen ranks them first" {
+    r := rand.Rand(17)
+    truth := Pairs(3, 10, 8)
+    links := Array<I64>[0, 1, 1, 2, 2, 3, 0, 4, 4, 5, 6, 7, 7, 8, 3, 9]
+    for q in range 8 {
+        truth.I[q], truth.J[q] = links[2 * q], links[2 * q + 1]
+        for t in range 9: truth.W[q * 9 + t] = 1.5 if t % 4 == 0 else -0.75
+    }
+    for t in range truth.B.Len(): truth.B[t] = r.Uniform(-0.3, 0.3)
+    truth.Index()
+    data := pairSamples(truth, 3000, r)
+    p := Pairs.All(3, 10)
+    f := PairFitter(p)
+    for _ in range 600 {
+        for _ in range 100: f.Add(data, r.Below(3000) * 10)
+        f.Step(0.05, 0.02)
+    }
+    got := p.Pruned(0.5)
+    assert got.Count == 8, $got.Count
+    found I64 = 0
+    for q in range 8 {
+        for s in range 8: found += 1 if got.I[s] == truth.I[q] and got.J[s] == truth.J[q] else 0
+    }
+    assert found == 8
+    screen := Pairs.Screen(3, 10, data, 3000, 8)
+    hits I64 = 0
+    for q in range 8 {
+        for s in range screen.Count: hits += 1 if screen.I[s] == truth.I[q] and screen.J[s] == truth.J[q] else 0
+    }
+    assert hits == 8, $hits
+}
+
+test Pairs.ForestMin "exact on a tree of free cells with clamped partners (brute force over every assignment), and a cycle is refused" {
+    r := rand.Rand(23)
+    links := Array<I64>[0, 1, 1, 2, 1, 3, 3, 4, 0, 5, 5, 6, 2, 7, 6, 8, 7, 8, 4, 7]
+    p := Pairs(3, 9, 10)
+    for q in range 10 {
+        p.I[q], p.J[q] = links[2 * q], links[2 * q + 1]
+        for t in range 9: p.W[q * 9 + t] = r.Uniform(-1.0, 1.0)
+    }
+    for t in range p.B.Len(): p.B[t] = r.Uniform(-1.0, 1.0)
+    p.Index()
+    # cells 7 and 8 clamped: the free pairs 0-1 1-2 1-3 3-4 0-5 5-6 form a tree; 4-7 2-7 6-8 tie it to the clamps
+    clamp := Array<I32>[-1, -1, -1, -1, -1, -1, -1, 2, 0]
+    x := Array<I32>(9)
+    try p.ForestMin(clamp, x) catch { assert false }
+    best := 1e300
+    y := Array<I32>(9)
+    for code in range 2187 {
+        c := code
+        for i in range 7 {
+            y[i] = I32(c % 3)
+            c /= 3
+        }
+        y[7], y[8] = 2, 0
+        best = best.Min(p.Energy(y, 0))
+    }
+    assert (p.Energy(x, 0) - best).Abs() < 1e-12 and x[7] == 2 and x[8] == 0
+    # 7 freed too: 1-2-7-4-3-1 is a cycle
+    clamp[7] = -1
+    refused := false
+    try p.ForestMin(clamp, x) catch { refused = true }
+    assert refused
 }
