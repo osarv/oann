@@ -2064,3 +2064,18 @@ the exact lowest-energy free cells given the clamped ones by min-sum over the fr
 3000 Gibbs samples - after 600 steps the planted couplings measure 1.50-1.84 and every other pair 0.05-0.30, so
 `Pruned(0.5)` returns exactly the planted 8, and `Screen(8)` ranks them first; `ForestMin` equals brute force over
 3^7 assignments on a tree tied to two clamped cells, and refuses once a cycle is freed.
+
+## The energy pipeline as a public example (wt-pottslatin, 2026-11-22)
+
+`examples/potts_latin.olang` (`make potts_latin`): Latin squares from solved examples, end to end on nn/potts; nn's
+README gains a section on how the pieces work. Added for it: `Pairs.Model()` (the pairs as 2-cell factors for
+Sampler) and `Pairs.Bias(clamp, hold)`; `FocusSchedule.Slack` (a constraint violated only when more than Slack above
+its table's lowest - learnt tables are soft, so any excess counted every pair as violated and Focus never stopped:
+0/50 before). Found on the way: a given held by too weak a bias (10 against pair costs of ~3.5 a conflict) yields to
+three conflicting peers, and Focus never moves a cell outside a violated constraint, so its chains start at the
+givens. One thread, 50 held-out puzzles, 40 % givens:
+
+| n | pairs screened / kept / the rule's | fit | Anneal (16 chains x 400 sweeps) | Focus (16 chains, <= 20000 moves, Slack 1) |
+|---|---|---|---|---|
+| 6 | 270 / 197 / 180 | 0.35 s | 50/50, 6.4 ms | 47/50, 5.5 ms |
+| 8 | 672 / 584 / 448 | 1.1 s | 42/50, 21 ms | 29/50, 86 ms |

@@ -808,13 +808,16 @@ fn (s Sampler&) Best() I64 {
 
 # how a focused search runs: at most Moves moves a chain at temperature T; with Bump > 0 every constraint (a factor, an
 # edge) has a weight, 1 at the start, that grows by Bump each time the constraint is picked, and every Every moves each
-# weight w becomes 1 + Decay (w - 1) (breakout / clause weighting: the energy reshaped where the search sits)
-type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000) {
+# weight w becomes 1 + Decay (w - 1) (breakout / clause weighting: the energy reshaped where the search sits). A
+# constraint counts as violated when its energy is more than Slack above its table's lowest: for a rule's exact tables
+# any change, for learned (soft) tables the margin that separates a broken pair from a kept one
+type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000, Slack F64 = 1e-9) {
     Moves
     T
     Bump
     Decay
     Every
+    Slack
 }
 
 # the constraints a focused search picks from: the factors (ids 0 .. Fac.Count) and the undirected edges (ids after
@@ -950,6 +953,7 @@ type focusState struct(n I64, k I64, nc I64) {
     viol mut Array<I64>& = Array<I64>(nc)           # the violated constraints (above their lowest energy), in any order
     pos mut Array<I64>& = Array<I64>(nc, -1)        # q's place in viol, -1 if satisfied
     nv I64 = 0
+    slack F64 = 1e-9
 }
 
 # constraint q into or out of the violated set
@@ -1007,7 +1011,7 @@ fn (st mut focusState&) move(m Potts&, e message.Edges&, x focusIndex&, X Array<
         }
         d := x.eid[a]
         low := x.ew[d] * x.wmin if x.ew[d] >= 0.0 else x.ew[d] * x.wmax
-        st.mark(x.nf + d, x.ew[d] * m.W[v * k + I64(X[xo + j])] - low > 1e-9)
+        st.mark(x.nf + d, x.ew[d] * m.W[v * k + I64(X[xo + j])] - low > st.slack)
     }
     if m.Fac == null: return
     fc := m.Fac!
@@ -1027,7 +1031,7 @@ fn (st mut focusState&) move(m Potts&, e message.Edges&, x focusIndex&, X Array<
             }
             base[q * ar + b] = o + step
         }
-        st.mark(q, T[base[q * ar + a] + v * stride[a]] - tmin[tab[q]] > 1e-9)
+        st.mark(q, T[base[q * ar + a] + v * stride[a]] - tmin[tab[q]] > st.slack)
     }
 }
 
@@ -1057,8 +1061,9 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
     xo := c * n
     X := s.X
     nc := x.nf + x.ne
-    eps := 1e-9
+    eps := sched.Slack
     st := focusState.of(m, x, n, X, xo)
+    st.slack = sched.Slack
     if sched.Bump > 0.0 {
         st.L1, st.ones = Array<F64>(n * k), Array<F64>(nc, 1.0)
     }
@@ -1425,6 +1430,29 @@ fn adamShrink(p mut Array<F64>&, g mut Array<F64>&, m mut Array<F64>&, v mut Arr
     adam(p, g, m, v, n, rate, step)
     if l1 <= 0.0: return
     for i in range p.Len(): p[i] = (p[i].Abs() - rate * l1).Max(0.0) * (1.0 if p[i] > 0.0 else -1.0)
+}
+
+# the same energy as a Potts model for Sampler (Anneal, Focus): each pair a 2-cell factor with its own table; the
+# biases go in through Bias (the sampler's Bias field)
+fn (p Pairs&) Model() Potts {
+    m := Potts(p.K, 1)
+    f := Factors(p.K, 2, p.Count.Max(1), p.Count, p.Cells)
+    for q in range p.Count {
+        f.At[2 * q], f.At[2 * q + 1], f.Table[q] = p.I[q], p.J[q], q
+    }
+    for t in range p.W.Len(): f.T[t] = p.W[t]
+    f.Index()
+    m.Fac = f
+    return m
+}
+
+# the biases as a Sampler's Bias, with every clamped cell (clamp[i] >= 0) held by a cost of hold on its other values
+fn (p Pairs&) Bias(clamp Array<I32>&, hold F64) Array<F64> {
+    b := Array<F64>(p.Cells * p.K)
+    for i in range p.Cells {
+        for v in range p.K: b[i * p.K + v] = p.B[i * p.K + v] + (hold if clamp[i] >= 0 and I64(clamp[i]) != v else 0.0)
+    }
+    return b
 }
 
 type NotForest error { Cycle }
