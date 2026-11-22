@@ -1994,3 +1994,14 @@ planted answers (40 % clues) and solve new graphs of 128 cells. bench/pottsfit, 
 20 chains x 400 sweeps, 16 graphs a size, seed 1): PL 0.07 s, CD-1 0.25 s, PCD-1 (a pool of 256) 0.19 s, EP (5 + 1
 sweeps, beta 1) 0.82 s of training, and every rule 100 % of graphs at 128 and at 256 cells (the experiment's: PL
 98-100, CD-1 97-99, PCD-1 85-87, EP 99-100 at 256).
+
+## Propose and rank: discrete diffusion and a score-matched energy (wt-ebmrank, 2026-11-22)
+
+Two generic pieces for the propose-and-rank pipeline. `nn/diffusion` - masked or uniform discrete diffusion over cells
+of K values: `Corrupt` (a denoiser's training example at level t) and `Sample` (the reverse process in `Levels` steps,
+with the exact posterior q(x_s | x_t, x0) for uniform noise and unmasking at rate (t - s)/t for masked), driven by any
+denoiser callback; tested: corruption touches a share t of the cells, a perfect denoiser returns the answer, and
+diffusion proposals ranked by a Potts energy through `bestof.Rank` keep the lowest-energy one. `ad/score` -
+`ScoreMatch`, denoising score matching for an energy written on the graph: the parameter gradient of
+sum |sigma dE/dz - eps|^2 as a central difference of dE/dtheta along u = 2 sigma (sigma dE/dz - eps) (two extra passes,
+no second-order backward), tested against central differences of the loss.

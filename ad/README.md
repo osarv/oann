@@ -36,11 +36,17 @@ an optimizer then steps as after `Backward`. Each step is one `Forward` and `Bac
 `Unrolled` and `Implicit` take the second derivatives they need - H v and (d dE/dx / dtheta)^T v - as central
 differences of the first along v, two passes each, since the graph records no second-order backward; EP needs none.
 
+Score matching (`score.olang`): `ScoreMatch(g, z, energy, clean, sigma, r, ...)` trains an energy E(z) written on
+the graph so that its gradient in z matches the denoising score (Vincent 2011): z = clean + sigma eps, the loss
+sum |sigma dE/dz - eps|^2 per row, and its parameter gradient - which needs d(dE/dz)/dtheta - as a central difference
+of dE/dtheta along the residual, two passes, no second-order backward. The energy then ranks candidates (lower is
+more plausible) or drives Langevin descent.
+
 Two Backwards after one Forward (two losses of one graph): run the one from the node recorded later first. The plan
 places buffers by a backward from the last node, so the earlier loss's gradients may overwrite a value the later one's
 backward still reads.
 
-Tests: `olang test ad/graph.olang`, `olang test ad/descent.olang` (the graph's own), `olang test tools/gradcheck.olang` (a gradient check per operation
+Tests: `olang test ad/graph.olang`, `olang test ad/descent.olang`, `olang test ad/score.olang` (the graph's own), `olang test tools/gradcheck.olang` (a gradient check per operation
 in F64). Measures: `bench/mlp_ad.olang` (MNIST MLP), `bench/arena_ad.olang` (the transformer's arena and
 resident memory per step), `bench/smallgraph.olang` (a small recurrence where the cost per node dominates) - `make mlpad`,
 `make arenaad`.
