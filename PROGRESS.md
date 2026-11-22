@@ -1952,3 +1952,24 @@ rounded per block of `StateBlock` elements - 0: a batch row - with a scale of it
 energy reading it rounded). Straight through: the unrolled gradient ignores the rounding. Tested: after a settle every
 block lies on its levels (4 bits: whole multiples of its top / 7; 1 bit: plus or minus one value), and read-rounded
 leaves the state off them.
+
+## The settle as a sequence layer, fused (wt-seqsettle, 2026-11-22)
+
+nn/seqsettle.SettleSeq: per token, K sweeps of s = tanh(W s + b_t) (W block-diagonal in heads), b_t = u_t + gam_t
+Rot(phi_t) s_{t-1} pair by pair; cold or warm, carry or not; a graph operation with its exact backward through every
+sweep (inputs u, gam, phi, W). The batch's sequences are vector lanes: states kept [sweep][neuron][token][sequence], a
+sweep one broadcast multiply-add per weight over every sequence; tanh by FastTanh; the carry's sines and cosines a
+polynomial after reduction to a quarter turn, the quadrant chosen by float arithmetic (with integer selects the loop
+stayed scalar: 20 ns a pair); W's gradient one product a head and sweep at the end over every token and sequence (as
+lane-wise sums inside the loop it ran at 3.4 GMAC/s). Tested against the layer written out token by token in F64 (cold
+and warm, with and without the carry, one and three sweeps, angles to +-40): outputs within 2e-5, every gradient within
+1e-4 relative. bench/seqsettle, batch 32, context 64, heads of N / 8, one thread, us a token forward / backward:
+
+| N | K 1 | K 4 |
+|---|---|---|
+| 64 | 0.40 / 0.70 | 0.91 / 1.58 |
+| 256 | 2.61 / 3.77 | 7.29 / 10.47 |
+
+Against the same layer as scalar loops (an experiment's operation, run in the same harness): forward 6-7x faster
+(N 256, K 1: 17.5 -> 2.8 us; K 4: 45 -> 7.2), backward about even (it was already lean; what is left is the strided
+transposes in and out and the carry's backward).

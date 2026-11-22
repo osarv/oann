@@ -1,0 +1,52 @@
+# nn/seqsettle: the settle sequence layer's forward and backward at batch 32, context 64, heads of N / 8, cold, with
+# the carry, one thread: us a token (the best of rounds). From the repository's root:
+#     olang build -output build/bench_seqsettle bench/seqsettle.olang && build/bench_seqsettle
+
+import "std/io"
+import "std/rand"
+import "std/time"
+import "../tensor"
+import ss "../nn/seqsettle"
+
+fn arr(n I64, r mut rand.Rand&, lo F64, hi F64) Array<F32> {
+    a := Array<F32>(n)
+    for i in range n: a[i] = F32(r.Uniform(lo, hi))
+    return a
+}
+
+fn main() ? io.Error {
+    B, T, heads := 32, 64, 8
+    r := rand.Rand(1)
+    for n in Array<I64>[64, 256] {
+        m := n / heads
+        u, gam, phi := arr(B * T * n, r, -1.0, 1.0), arr(B * T * n / 2, r, 0.3, 0.95), arr(B * T * n / 2, r, -3.0, 3.0)
+        w, dy := arr(heads * m * m, r, -0.3, 0.3), arr(B * T * n, r, -1.0, 1.0)
+        du, dg, dp, dw := Array<F32>(u.Len()), Array<F32>(gam.Len()), Array<F32>(gam.Len()), Array<F32>(w.Len())
+        iv, ov := Vec<tensor.Tensor<F32>>(), Vec<tensor.Tensor<F32>>()
+        iv.Push(tensor.Tensor<F32>.Over(u, 0, B, T, n)!)
+        iv.Push(tensor.Tensor<F32>.Over(gam, 0, B, T, n / 2)!)
+        iv.Push(tensor.Tensor<F32>.Over(phi, 0, B, T, n / 2)!)
+        iv.Push(tensor.Tensor<F32>.Over(w, 0, heads, m, m)!)
+        ov.Push(tensor.Tensor<F32>.Over(du, 0, B, T, n)!)
+        ov.Push(tensor.Tensor<F32>.Over(dg, 0, B, T, n / 2)!)
+        ov.Push(tensor.Tensor<F32>.Over(dp, 0, B, T, n / 2)!)
+        ov.Push(tensor.Tensor<F32>.Over(dw, 0, heads, m, m)!)
+        ins, outs := iv.ToArray(), ov.ToArray()
+        y := tensor.Tensor<F32>.Over(Array<F32>(u.Len()), 0, B, T, n)!
+        dyt := tensor.Tensor<F32>.Over(dy, 0, B, T, n)!
+        for K in Array<I64>[1, 4] {
+            op := ss.SettleSeq(B, T, n, heads, K)
+            fw, bw := 1e30, 1e30
+            for _ in range 5 {
+                t0 := time.Now()
+                op.Forward(y, ins)
+                fw = fw.Min(F64(time.Since(t0)))
+                t0 = time.Now()
+                op.Backward(dyt, ins, outs)
+                bw = bw.Min(F64(time.Since(t0)))
+            }
+            tok := F64(B * T) * 1e3
+            try io.PutLn("N " + $n + ", K " + $K + ": forward " + $(fw / tok).Fixed(2) + " us a token, backward " + $(bw / tok).Fixed(2))
+        }
+    }
+}

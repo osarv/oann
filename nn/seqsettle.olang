@@ -1,0 +1,417 @@
+# nn/seqsettle - a settle as a sequence layer: N neurons in H heads of M (recurrent weights W block-diagonal, one M x M
+# block a head), each token's state the settle of a drive that carries the previous token's state forward:
+#
+#     b_t = u_t + c_t,   c_t = gam_t Rot(phi_t) s_{t-1}    (pair by pair: (s_2j, s_2j+1) rotated by phi and scaled by gam)
+#     K sweeps of  v = W s + b_t,  s = tanh(v)   from s = tanh(b_t) (cold) or s_{t-1} (warm);  output s_t
+#
+# The carry's transitions have any phase (negative and complex eigenvalues) and modulus gam; with W symmetric and its
+# incoming mass below 1 each sweep is a contraction (docs/settling.md 1.2). Without the carry, warm and K = 1 it is the
+# bounded recurrent loop s_t = tanh(W s_{t-1} + u_t). An operation of the autodiff graph (Custom): its inputs u [B, T, N],
+# with the carry gam and phi [B, T, N / 2], and W [H, M, M]; its backward exact through every sweep (BPTT), giving all of
+# them their gradients.
+#
+# Computed with the batch's sequences as vector lanes: the states are kept neuron-major, [sweep][neuron][token][sequence],
+# so a sweep is one broadcast multiply-add per weight over every sequence at once - heads of 8 to 64 neurons are too
+# small for a blocked product to pay - tanh is elem.FastTanh, and the carry's sines and cosines a polynomial after
+# reduction to a quarter turn, all vectorized across the sequences. W's gradient is one product a head and a sweep at
+# the end, over every token and sequence at once (the layout makes each a matrix of T B columns).
+#
+#     op := seqsettle.SettleSeq(batch, ctx, N, H, K)            # cold, with the carry; .Warm, .Carry to change
+#     y := g.Custom(op, u, gam, phi, w)                          # w a Param [H, M, M]
+
+import "../tensor"
+import "../kernels/elem"
+import "../kernels/gemm"
+import "../kernels/mat"
+
+type SettleSeq struct(rows I64, tmax I64, n I64, heads I64, sweeps I64, warm Bool = false, carry Bool = true) {
+    Rows I64 = rows
+    Tmax I64 = tmax
+    N I64 = n
+    H I64 = heads
+    M I64 = n / heads
+    K I64 = sweeps
+    Warm Bool = warm
+    Carry Bool = carry
+    st mut Array<F32>& = Array<F32>(tmax * (sweeps + 1) * n * rows)   # [k][i][t][b]: a sweep's neuron a row of T B
+    gvs mut Array<F32>& = Array<F32>(tmax * sweeps * n * rows)        # the backward's potential gradients, the same way (sweeps 1 .. K)
+    ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(1, (tmax * rows).Max(n))
+    bt mut Array<F32>& = Array<F32>(n * rows)                        # a token's drive, [i][b]
+    cs mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)              # the carry's cos and sin, [t][j][b]
+    sn mut Array<F32>& = Array<F32>(tmax * n / 2 * rows)
+    gs mut Array<F32>& = Array<F32>(n * rows)
+    gv mut Array<F32>& = Array<F32>(n * rows)
+    gb mut Array<F32>& = Array<F32>(n * rows)
+    gn mut Array<F32>& = Array<F32>(n * rows)
+    gw mut Array<F32>& = Array<F32>(n * rows)
+}
+
+fn (s SettleSeq&) Shape(inputs Array<tensor.Shape>&) tensor.Shape { return inputs[0] }
+
+# state (t, k)'s first element: its neuron i's B lanes at i T B from there
+fn (s SettleSeq&) at(t I64, k I64, B I64, T I64) I64 { return (k * s.N * T + t) * B }
+
+fn (s mut SettleSeq&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) {
+    u := inputs[0].Flat()!
+    o := out.Flat()!
+    B, T := inputs[0].Dims[0], inputs[0].Dims[1]
+    n := s.N
+    w := inputs[3 if s.Carry else 1].Flat()!
+    st, bt := s.st, s.bt
+    for t in range T {
+        for b in range B {
+            row := (b * T + t) * n
+            for i in range n: bt[i * B + b] = u[row + i]
+        }
+        rs := T * B
+        p0 := s.at(t - 1, s.K, B, T)
+        if s.Carry and t > 0: s.carry(inputs[1].Flat()!, inputs[2].Flat()!, t, T, B, p0)
+        a0 := s.at(t, 0, B, T)
+        for i in range n {
+            if s.Warm {
+                for b in range B: st[a0 + i * rs + b] = st[p0 + i * rs + b] if t > 0 else F32(0.0)
+            } else {
+                for b in range B: st[a0 + i * rs + b] = elem.FastTanh(bt[i * B + b])
+            }
+        }
+        for kk in range 1, s.K + 1: s.sweep(w, s.at(t, kk - 1, B, T), s.at(t, kk, B, T), B, rs)
+        last := s.at(t, s.K, B, T)
+        for b in range B {
+            row := (b * T + t) * n
+            for i in range n: o[row + i] = st[last + i * rs + b]
+        }
+    }
+}
+
+# the drive gains the carry: each pair of the previous state rotated by phi and scaled by gam (cos and sin kept)
+fn (s mut SettleSeq&) carry(gam Array<F32>&, phi Array<F32>&, t I64, T I64, B I64, p0 I64) {
+    half := s.N / 2
+    st, bt, cs, sn := s.st, s.bt, s.cs, s.sn
+    for j in range half {
+        at := (t * half + j) * B
+        for b in range B: cs[at + b] = phi[(b * T + t) * half + j]
+        sinCos(cs, sn, at, B)
+        a, c := p0 + 2 * j * T * B, p0 + (2 * j + 1) * T * B
+        for b in range B {
+            g := gam[(b * T + t) * half + j]
+            co, si := cs[at + b], sn[at + b]
+            sa, sb := st[a + b], st[c + b]
+            bt[2 * j * B + b] += g * (co * sa - si * sb)
+            bt[(2 * j + 1) * B + b] += g * (si * sa + co * sb)
+        }
+    }
+}
+
+# one sweep: state cur = tanh(W state prev + drive), every lane at once
+fn (s mut SettleSeq&) sweep(w Array<F32>&, prev I64, cur I64, B I64, rs I64) {
+    m := s.M
+    st, bt := s.st, s.bt
+    for h in range s.H {
+        for i in range m {
+            r := cur + (h * m + i) * rs
+            d := (h * m + i) * B
+            for b in range B: st[r + b] = bt[d + b]
+            for j in range m {
+                wij := w[(h * m + i) * m + j]
+                q := prev + (h * m + j) * rs
+                for b in range B: st[r + b] += wij * st[q + b]
+            }
+            for b in range B: st[r + b] = elem.FastTanh(st[r + b])
+        }
+    }
+}
+
+fn (s mut SettleSeq&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
+    dy := dout.Flat()!
+    B, T := inputs[0].Dims[0], inputs[0].Dims[1]
+    n := s.N
+    wi := 3 if s.Carry else 1
+    w := inputs[wi].Flat()!
+    du := dinputs[0].Flat()!
+    dw := dinputs[wi].Flat()!
+    for i in range dw.Len(): dw[i] = 0.0
+    st, gs, gv, gb, gn, gvs := s.st, s.gs, s.gv, s.gb, s.gn, s.gvs
+    rs := T * B
+    for x in range n * B: gn[x] = 0.0
+    t := T - 1
+    for t >= 0 {
+        for b in range B {
+            row := (b * T + t) * n
+            for i in range n: gs[i * B + b] = dy[row + i]
+        }
+        for x in range n * B {
+            gs[x] += gn[x]
+            gn[x] = 0.0
+            gb[x] = 0.0
+        }
+        kk := s.K
+        for kk >= 1 {
+            cur := s.at(t, kk, B, T)
+            keep := s.at(t, kk - 1, B, T)          # gv kept at sweep kk's place among 0 .. K - 1, for dW
+            for i in range n {
+                for b in range B {
+                    sv := st[cur + i * rs + b]
+                    x := i * B + b
+                    gv[x] = gs[x] * (1.0 - sv * sv)
+                    gb[x] += gv[x]
+                    gvs[keep + i * rs + b] = gv[x]
+                }
+            }
+            s.sweepBack(w, B)
+            kk -= 1
+        }
+        a0 := s.at(t, 0, B, T)
+        if s.Warm {
+            if t > 0 {
+                for x in range n * B: gn[x] += gs[x]
+            }
+        } else {
+            for i in range n {
+                for b in range B {
+                    sv := st[a0 + i * rs + b]
+                    gb[i * B + b] += gs[i * B + b] * (1.0 - sv * sv)
+                }
+            }
+        }
+        for b in range B {
+            row := (b * T + t) * n
+            for i in range n: du[row + i] = gb[i * B + b]
+        }
+        if s.Carry: s.carryBack(inputs[1].Flat()!, dinputs[1].Flat()!, dinputs[2].Flat()!, t, T, B)
+        t -= 1
+    }
+    # dW, a head and a sweep at a time: the potentials' gradients (M x T B) times the states they read, transposed
+    m := s.M
+    for h in range s.H {
+        dwh := mat.Mat<F32>(dw, h * m * m, m, m, m)
+        for kk in range s.K {
+            gvm := mat.Mat<F32>(gvs, s.at(0, kk, B, T) + h * m * rs, m, rs, rs)
+            sm := mat.Mat<F32>(st, s.at(0, kk, B, T) + h * m * rs, m, rs, rs)
+            gemm.Gemm(s.ws, dwh, gvm, false, sm, true, F32(1.0), F32(1.0))
+        }
+    }
+}
+
+# a sweep's backward from gv (the potentials' gradient): gs = W^T gv, a head at a time (dW is taken at the end)
+fn (s mut SettleSeq&) sweepBack(w Array<F32>&, B I64) {
+    m := s.M
+    gs, gv, acc := s.gs, s.gv, s.gw
+    for h in range s.H {
+        for j in range m {
+            r := (h * m + j) * B
+            for b in range B: acc[r + b] = 0.0
+        }
+        for i in range m {
+            g := (h * m + i) * B
+            for j in range m {
+                q := (h * m + j) * B
+                wij := w[(h * m + i) * m + j]
+                for b in range B: acc[q + b] += wij * gv[g + b]
+            }
+        }
+    }
+    for x in range s.N * B: gs[x] = acc[x]
+}
+
+# the carry's backward at token t (gb the drive's gradient): gam's and phi's gradients, and the previous state's
+# share into gn
+fn (s mut SettleSeq&) carryBack(gam Array<F32>&, dg mut Array<F32>&, dp mut Array<F32>&, t I64, T I64, B I64) {
+    half := s.N / 2
+    st, gb, gn, cs, sn := s.st, s.gb, s.gn, s.cs, s.sn
+    p0 := s.at(t - 1, s.K, B, T)
+    rs := T * B
+    for j in range half {
+        at := (t * half + j) * B
+        a, c := 2 * j * B, (2 * j + 1) * B
+        for b in range B {
+            q := (b * T + t) * half + j
+            if t == 0 {
+                dg[q], dp[q] = 0.0, 0.0
+                continue
+            }
+            g := gam[q]
+            co, si := cs[at + b], sn[at + b]
+            sa, sb := st[p0 + 2 * j * rs + b], st[p0 + (2 * j + 1) * rs + b]
+            ra, rb := co * sa - si * sb, si * sa + co * sb
+            ga, gbb := gb[a + b], gb[c + b]
+            dg[q] = ga * ra + gbb * rb
+            dp[q] = g * (gbb * ra - ga * rb)
+            gn[a + b] += g * (co * ga + si * gbb)
+            gn[c + b] += g * (co * gbb - si * ga)
+        }
+    }
+}
+
+# x[at .. at + n] replaced by cos(x), sin(x) into s: the angle reduced to r in [-pi/4, pi/4] by quarter turns q, short
+# polynomials for sin r and cos r (within 2e-7), the quadrant choosing and signing them - any angle, vectorized
+fn sinCos(x mut Array<F32>&, s mut Array<F32>&, at I64, n I64) {
+    for e in range n {
+        a := x[at + e]
+        q := (a * F32(0.6366197723675814)).Round()
+        r := ((a - q * F32(1.5703125)) - q * F32(0.0004838267923332751)) - q * F32(2.5632829192545614e-12)
+        r2 := r * r
+        sr := r * (1.0 + r2 * (F32(-0.16666667) + r2 * (F32(0.008333331) + r2 * F32(-0.00019840874))))
+        cr := 1.0 + r2 * (F32(-0.5) + r2 * (F32(0.041666664) + r2 * (F32(-0.0013888378) + r2 * F32(2.4390449e-5))))
+        # the quadrant k = q mod 4 by float arithmetic, so the loop stays vectorized: odd quadrants swap sin and cos,
+        # quadrants 1 and 2 negate cos, 2 and 3 negate sin
+        k := q - 4.0 * (q * 0.25).Floor()
+        odd := k - 2.0 * (k * 0.5).Floor()
+        cneg := ((k + 1.0) * 0.5).Floor() - 2.0 * ((k + 1.0) * 0.25).Floor()
+        sneg := (k * 0.5).Floor()
+        x[at + e] = (1.0 - 2.0 * cneg) * ((1.0 - odd) * cr + odd * sr)
+        s[at + e] = (1.0 - 2.0 * sneg) * ((1.0 - odd) * sr + odd * cr)
+    }
+}
+
+assert not SettleSeq.Forward.Allocates, "the settle sequence layer's forward allocates"
+assert not SettleSeq.Backward.Allocates, "the settle sequence layer's backward allocates"
+
+# ---- tests ----
+
+import "std/rand"
+
+# the layer written out sequence by sequence, token by token, in F64 (the scalar loops it replaces): its output y and,
+# from dy, the gradients du, dgam, dphi, dw
+fn reference(u Array<F64>&, gam Array<F64>&, phi Array<F64>&, w Array<F64>&, dy Array<F64>&, B I64, T I64, n I64, heads I64, K I64, warm Bool, carry Bool, y mut Array<F64>&, du mut Array<F64>&, dg mut Array<F64>&, dp mut Array<F64>&, dw mut Array<F64>&) {
+    m, half := n / heads, n / 2
+    st := Array<F64>(B * T * (K + 1) * n)
+    at := fn(b I64, t I64, k I64): return ((b * T + t) * (K + 1) + k) * n
+    bt := Array<F64>(n)
+    for b in range B {
+        for t in range T {
+            for i in range n: bt[i] = u[(b * T + t) * n + i]
+            if carry and t > 0 {
+                p0 := at(b, t - 1, K)
+                for j in range half {
+                    q := (b * T + t) * half + j
+                    c, s := phi[q].Cos(), phi[q].Sin()
+                    sa, sb := st[p0 + 2 * j], st[p0 + 2 * j + 1]
+                    bt[2 * j] += gam[q] * (c * sa - s * sb)
+                    bt[2 * j + 1] += gam[q] * (s * sa + c * sb)
+                }
+            }
+            a0 := at(b, t, 0)
+            for i in range n: st[a0 + i] = (st[at(b, t - 1, K) + i] if t > 0 else 0.0) if warm else bt[i].Tanh()
+            for k in range 1, K + 1 {
+                pr, cu := at(b, t, k - 1), at(b, t, k)
+                for i in range n {
+                    h := i / m
+                    v := bt[i]
+                    for j in range m: v += w[(h * m + i % m) * m + j] * st[pr + h * m + j]
+                    st[cu + i] = v.Tanh()
+                }
+            }
+            for i in range n: y[(b * T + t) * n + i] = st[at(b, t, K) + i]
+        }
+    }
+    gs, gv, gb, gn, nx := Array<F64>(n), Array<F64>(n), Array<F64>(n), Array<F64>(n), Array<F64>(n)
+    for b in range B {
+        for i in range n: gn[i] = 0.0
+        t := T - 1
+        for t >= 0 {
+            for i in range n {
+                gs[i] = dy[(b * T + t) * n + i] + gn[i]
+                gn[i], gb[i] = 0.0, 0.0
+            }
+            k := K
+            for k >= 1 {
+                cu, pr := at(b, t, k), at(b, t, k - 1)
+                for i in range n {
+                    gv[i] = gs[i] * (1.0 - st[cu + i] * st[cu + i])
+                    gb[i] += gv[i]
+                }
+                for i in range n: nx[i] = 0.0
+                for i in range n {
+                    h := i / m
+                    for j in range m {
+                        dw[(h * m + i % m) * m + j] += gv[i] * st[pr + h * m + j]
+                        nx[h * m + j] += w[(h * m + i % m) * m + j] * gv[i]
+                    }
+                }
+                for i in range n: gs[i] = nx[i]
+                k -= 1
+            }
+            a0 := at(b, t, 0)
+            if warm {
+                if t > 0 {
+                    for i in range n: gn[i] += gs[i]
+                }
+            } else {
+                for i in range n: gb[i] += gs[i] * (1.0 - st[a0 + i] * st[a0 + i])
+            }
+            for i in range n: du[(b * T + t) * n + i] = gb[i]
+            if carry and t > 0 {
+                p0 := at(b, t - 1, K)
+                for j in range half {
+                    q := (b * T + t) * half + j
+                    c, s := phi[q].Cos(), phi[q].Sin()
+                    sa, sb := st[p0 + 2 * j], st[p0 + 2 * j + 1]
+                    ra, rb := c * sa - s * sb, s * sa + c * sb
+                    ga, gc := gb[2 * j], gb[2 * j + 1]
+                    dg[q] = ga * ra + gc * rb
+                    dp[q] = gam[q] * (gc * ra - ga * rb)
+                    gn[2 * j] += gam[q] * (c * ga + s * gc)
+                    gn[2 * j + 1] += gam[q] * (c * gc - s * ga)
+                }
+            }
+            t -= 1
+        }
+    }
+}
+
+fn narrow(a Array<F64>&) Array<F32> {
+    out := Array<F32>(a.Len())
+    for i in range a.Len(): out[i] = F32(a[i])
+    return out
+}
+
+test SettleSeq "forward and backward equal the layer written out token by token (cold and warm, with and without the carry, one and three sweeps), the carry's sines and cosines for any angle" {
+    r := rand.Rand(5)
+    B, T, n, heads := 5, 9, 16, 2
+    m := n / heads
+    for form in range 4 {
+        warm, carry := form % 2 == 1, form < 2
+        for K in Array<I64>[1, 3] {
+            u, gam, phi := Array<F64>(B * T * n), Array<F64>(B * T * n / 2), Array<F64>(B * T * n / 2)
+            w, dy := Array<F64>(heads * m * m), Array<F64>(B * T * n)
+            for i in range u.Len(): u[i] = r.Uniform(-1.0, 1.0)
+            for i in range gam.Len(): gam[i] = r.Uniform(0.3, 0.95)
+            for i in range phi.Len(): phi[i] = r.Uniform(-40.0, 40.0)
+            for i in range w.Len(): w[i] = r.Uniform(-0.3, 0.3)
+            for i in range dy.Len(): dy[i] = r.Uniform(-1.0, 1.0)
+            y, du, dg, dp, dw := Array<F64>(u.Len()), Array<F64>(u.Len()), Array<F64>(gam.Len()), Array<F64>(gam.Len()), Array<F64>(w.Len())
+            reference(u, gam, phi, w, dy, B, T, n, heads, K, warm, carry, y, du, dg, dp, dw)
+            uf, gf, pf, wf, dyf := narrow(u), narrow(gam), narrow(phi), narrow(w), narrow(dy)
+            ins := Vec<tensor.Tensor<F32>>()
+            ins.Push(tensor.Tensor<F32>.Over(uf, 0, B, T, n)!)
+            if carry {
+                ins.Push(tensor.Tensor<F32>.Over(gf, 0, B, T, n / 2)!)
+                ins.Push(tensor.Tensor<F32>.Over(pf, 0, B, T, n / 2)!)
+            }
+            ins.Push(tensor.Tensor<F32>.Over(wf, 0, heads, m, m)!)
+            outs := Vec<tensor.Tensor<F32>>()
+            du32, dg32, dp32, dw32 := Array<F32>(u.Len()), Array<F32>(gam.Len()), Array<F32>(gam.Len()), Array<F32>(w.Len())
+            outs.Push(tensor.Tensor<F32>.Over(du32, 0, B, T, n)!)
+            if carry {
+                outs.Push(tensor.Tensor<F32>.Over(dg32, 0, B, T, n / 2)!)
+                outs.Push(tensor.Tensor<F32>.Over(dp32, 0, B, T, n / 2)!)
+            }
+            outs.Push(tensor.Tensor<F32>.Over(dw32, 0, heads, m, m)!)
+            op := SettleSeq(B, T, n, heads, K, warm, carry)
+            y32 := Array<F32>(u.Len())
+            yt := tensor.Tensor<F32>.Over(y32, 0, B, T, n)!
+            insA, outsA := ins.ToArray(), outs.ToArray()
+            op.Forward(yt, insA)
+            op.Backward(tensor.Tensor<F32>.Over(dyf, 0, B, T, n)!, insA, outsA)
+            tag := "form " + $form + " K " + $K
+            for i in range y.Len(): assert (F64(y32[i]) - y[i]).Abs() < 2e-5, tag + " y " + $i
+            for i in range du.Len(): assert (F64(du32[i]) - du[i]).Abs() < 1e-4 * (1.0 + du[i].Abs()), tag + " du " + $i
+            for i in range dw.Len(): assert (F64(dw32[i]) - dw[i]).Abs() < 1e-4 * (1.0 + dw[i].Abs()), tag + " dw " + $i
+            if not carry: continue
+            for i in range dg.Len() {
+                assert (F64(dg32[i]) - dg[i]).Abs() < 1e-4 * (1.0 + dg[i].Abs()), tag + " dgam " + $i
+                assert (F64(dp32[i]) - dp[i]).Abs() < 1e-4 * (1.0 + dp[i].Abs()), tag + " dphi " + $i
+            }
+        }
+    }
+}
