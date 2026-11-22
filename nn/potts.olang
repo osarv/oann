@@ -26,7 +26,9 @@
 # them run on tasks; T falls geometrically from
 # T0 to T1 over the annealing sweeps, then zero-temperature sweeps (each cell its lowest-energy value) until no cell
 # moves. A chain stops on its own once a sweep at T <= Tstop moves nothing. Chains run on up to Threads tasks, each
-# chain with its own generator, so a result does not depend on the thread count. `Langevin` is the continuous
+# chain with its own generator, so a result does not depend on the thread count. `Focus` is the focused counterpart:
+# each move picks a violated factor or edge (above its table's minimum) and heat-baths one change of its cells, with
+# optional constraint weights that grow where the search sits and decay (breakout). `Langevin` is the continuous
 # counterpart: each cell's values relaxed to softmax(theta_i), theta descended on the relaxed energy with noise of
 # temperature T (annealed), the answer each cell's largest.
 
@@ -462,6 +464,7 @@ type Sampler struct(cells I64, chains I64, k I64, threads I64 = 1) {
     Bias mut Array<F64>& = Array<F64>(0)               # cells x K energies added to every chain's unary terms (empty: none) - a nudge
     Sweeps mut Array<I64>& = Array<I64>(chains)
     Energies mut Array<F64>& = Array<F64>(chains)
+    Left mut Array<I64>& = Array<I64>(chains)          # Focus: each chain's constraints left above their lowest energy
     order mut Array<I64>& = Array<I64>(cells)          # the cells by colour class
     classes mut Array<I64>& = Array<I64>(cells + 1)    # class q's cells: order[classes[q] .. classes[q + 1]]
     Colours I64 = 0
@@ -797,6 +800,235 @@ fn (s Sampler&) Best() I64 {
         if s.Energies[c] < s.Energies[best]: best = c
     }
     return best
+}
+
+# how a focused search runs: at most Moves moves a chain at temperature T; with Bump > 0 every constraint (a factor, an
+# edge) has a weight, 1 at the start, that grows by Bump each time the constraint is picked, and every Every moves each
+# weight w becomes 1 + Decay (w - 1) (breakout / clause weighting: the energy reshaped where the search sits)
+type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000) {
+    Moves
+    T
+    Bump
+    Decay
+    Every
+}
+
+# the constraints a focused search picks from: the factors (ids 0 .. Fac.Count) and the undirected edges (ids after
+# them), each cell's edge slots mapped to their edge, and each constraint's lowest energy (its table's minimum; an
+# edge's W times its weight)
+type focusIndex struct(nf I64, slots I64) {
+    nf
+    ne I64 = 0
+    eid mut Array<I64>& = Array<I64>(slots)         # edge slot -> undirected edge
+    eu mut Array<I64>& = Array<I64>(slots / 2 + 1)
+    ev mut Array<I64>& = Array<I64>(slots / 2 + 1)
+    ew mut Array<F64>& = Array<F64>(slots / 2 + 1)  # the edge's weight (its slots')
+    tmin mut Array<F64>& = Array<F64>(0)            # each factor table's minimum
+    wmin F64 = 0.0
+    wmax F64 = 0.0
+}
+
+fn focusIndex.of(m Potts&, e message.Edges&) focusIndex {
+    nf := m.Fac!.Count if m.Fac != null else 0
+    x := focusIndex(nf, e.First(e.Nodes))
+    for v in range e.Nodes {
+        for a in range e.First(v), e.First(v + 1) {
+            u := e.Source(a)
+            if u >= v: continue
+            x.eu[x.ne], x.ev[x.ne], x.ew[x.ne] = u, v, F64(e.Weight(a))
+            x.eid[a] = x.ne
+            for b in range e.First(u), e.First(u + 1) {
+                if e.Source(b) == v: x.eid[b] = x.ne
+            }
+            x.ne++
+        }
+    }
+    x.wmin, x.wmax = m.W[0], m.W[0]
+    for i in range m.K * m.K {
+        x.wmin = x.wmin.Min(m.W[i])
+        x.wmax = x.wmax.Max(m.W[i])
+    }
+    if m.Fac != null {
+        f := m.Fac!
+        x.tmin = Array<F64>(f.Tables, 1e300)
+        for t in range f.Tables {
+            for i in range f.Size: x.tmin[t] = x.tmin[t].Min(f.T[t * f.Size + i])
+        }
+    }
+    return x
+}
+
+# a focused heat bath on every chain (after Start; Colour is not needed): a move picks a constraint above its lowest
+# energy (a violated factor or edge) at random, and draws one change of one of its cells - (cell, new value), over all
+# of its cells and values - with probability ~ exp(-dE / T), dE the change of the (weighted) energy. Only cells where
+# the energy can fall are touched, as WalkSAT / probSAT pick an unsatisfied clause and min-conflicts a vertex in
+# conflict. A chain stops once no constraint is violated (every factor and edge at its table's minimum: for a rule
+# energy, a solution) or after sched.Moves moves. Sweeps holds each chain's moves, Left its violated constraints at
+# the end, Energies its (unweighted) energy. No hidden units
+fn (s mut Sampler&) Focus(m Potts&, e message.Edges&, f Array<F64>&, sched FocusSchedule) {
+    if m.Hid != null: unreachable "potts.Sampler.Focus: hidden units are not supported"
+    k := s.K
+    for i in range s.Cells {
+        for v in range k: s.unary[i * k + v] = 0.0
+        for q in range m.Features {
+            fv := f[i * m.Features + q]
+            if fv == 0.0: continue
+            for v in range k: s.unary[i * k + v] += fv * m.B[q * k + v]
+        }
+        if s.Bias.Len() > 0 {
+            for v in range k: s.unary[i * k + v] += s.Bias[i * k + v]
+        }
+    }
+    x := focusIndex.of(m, e)
+    tasks := s.Threads.Min(s.Chains)
+    if tasks <= 1 {
+        for c in range s.Chains: s.focusChain(m, e, f, sched, x, c)
+        return
+    }
+    share := (s.Chains + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo := t * share
+            hi := (lo + share).Min(s.Chains)
+            if lo < hi: spawn s.focusChains(m, e, f, sched, x, lo, hi)
+        }
+    }
+}
+
+fn (s mut Sampler&) focusChains(m Potts&, e message.Edges&, f Array<F64>&, sched FocusSchedule, x focusIndex&, c0 I64, c1 I64) {
+    for c in range c0, c1: s.focusChain(m, e, f, sched, x, c)
+}
+
+# constraint q's energy above its lowest, with chain c's cells at X[xo ..]
+fn focusExcess(m Potts&, x focusIndex&, q I64, X Array<I32>&, xo I64) F64 {
+    k := m.K
+    if q < x.nf {
+        fc := m.Fac!
+        return fc.T[fc.entry(q, -1, 0, X, xo)] - x.tmin[fc.Table[q]]
+    }
+    d := q - x.nf
+    w := x.ew[d]
+    low := w * x.wmin if w >= 0.0 else w * x.wmax
+    return w * m.W[I64(X[xo + x.ev[d]]) * k + I64(X[xo + x.eu[d]])] - low
+}
+
+# cell i's local energies into L[lo ..] with each constraint's energy times its weight wt
+fn focusLocal(m Potts&, e message.Edges&, x focusIndex&, unary Array<F64>&, wt Array<F64>&, X Array<I32>&, xo I64, i I64, L mut Array<F64>&, lo I64) {
+    k := m.K
+    for c in range k: L[lo + c] = unary[i * k + c]
+    for a in range e.First(i), e.First(i + 1) {
+        w := wt[x.nf + x.eid[a]] * F64(e.Weight(a))
+        col := I64(X[xo + e.Source(a)])
+        for c in range k: L[lo + c] += w * m.W[c * k + col]
+    }
+    if m.Fac != null {
+        fc := m.Fac!
+        for r in range fc.ptr[i], fc.ptr[i + 1] {
+            q := fc.fid[r]
+            for c in range k: L[lo + c] += wt[q] * fc.T[fc.entry(q, fc.slot[r], c, X, xo)]
+        }
+    }
+}
+
+fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched FocusSchedule, x focusIndex&, c I64) {
+    n, k := s.Cells, s.K
+    xo := c * n
+    X := s.X
+    nc := x.nf + x.ne
+    eps := 1e-9
+    wt := Array<F64>(nc, 1.0)
+    viol := Array<I64>(nc)
+    pos := Array<I64>(nc, -1)
+    nv I64 = 0
+    for q in range nc {
+        if focusExcess(m, x, q, X, xo) > eps {
+            pos[q] = nv
+            viol[nv] = q
+            nv++
+        }
+    }
+    arity := m.Fac!.Arity if m.Fac != null else 2
+    cells := Array<I64>(arity.Max(2))
+    L := Array<F64>(arity.Max(2) * k)
+    ci, cv := Array<I64>(arity.Max(2) * k), Array<I64>(arity.Max(2) * k)
+    cw := Array<F64>(arity.Max(2) * k)
+    moves I64 = 0
+    for moves < sched.Moves and nv > 0 {
+        if sched.Bump > 0.0 and sched.Decay < 1.0 and moves > 0 and moves % sched.Every == 0 {
+            for q in range nc: wt[q] = 1.0 + sched.Decay * (wt[q] - 1.0)
+        }
+        q := viol[nextBelow(s.seeds, c, nv)]
+        if sched.Bump > 0.0: wt[q] += sched.Bump
+        nq I64 = 0
+        if q < x.nf {
+            fc := m.Fac!
+            for a in range fc.Arity: cells[a] = fc.At[q * fc.Arity + a]
+            nq = fc.Arity
+        } else {
+            cells[0], cells[1] = x.eu[q - x.nf], x.ev[q - x.nf]
+            nq = 2
+        }
+        # every (cell, new value) of the constraint, weighted exp(-dE / T)
+        cand I64 = 0
+        low := 1e300
+        for a in range nq {
+            i := cells[a]
+            focusLocal(m, e, x, s.unary, wt, X, xo, i, L, a * k)
+            old := I64(X[xo + i])
+            for v in range k {
+                if v == old: continue
+                ci[cand], cv[cand], cw[cand] = i, v, L[a * k + v] - L[a * k + old]
+                low = low.Min(cw[cand])
+                cand++
+            }
+        }
+        z F64 = 0.0
+        for j in range cand {
+            cw[j] = ((low - cw[j]) / sched.T).Exp()
+            z += cw[j]
+        }
+        u := nextUniform(s.seeds, c) * z
+        pick := cand - 1
+        for j in range cand - 1 {
+            u -= cw[j]
+            if u <= 0.0 {
+                pick = j
+                break
+            }
+        }
+        i := ci[pick]
+        X[xo + i] = I32(cv[pick])
+        moves++
+        # the constraints of the moved cell: in or out of the violated set
+        for a in range e.First(i), e.First(i + 1) {
+            r := x.nf + x.eid[a]
+            nv = focusRecheck(m, x, r, X, xo, viol, pos, nv, eps)
+        }
+        if m.Fac != null {
+            fc := m.Fac!
+            for r in range fc.ptr[i], fc.ptr[i + 1]: nv = focusRecheck(m, x, fc.fid[r], X, xo, viol, pos, nv, eps)
+        }
+    }
+    s.Sweeps[c] = moves
+    s.Left[c] = nv
+    s.Energies[c] = m.Energy(e, f, X, xo)
+}
+
+fn focusRecheck(m Potts&, x focusIndex&, q I64, X Array<I32>&, xo I64, viol mut Array<I64>&, pos mut Array<I64>&, nv I64, eps F64) I64 {
+    bad := focusExcess(m, x, q, X, xo) > eps
+    if bad and pos[q] < 0 {
+        pos[q] = nv
+        viol[nv] = q
+        return nv + 1
+    }
+    if not bad and pos[q] >= 0 {
+        last := viol[nv - 1]
+        viol[pos[q]] = last
+        pos[last] = pos[q]
+        pos[q] = -1
+        return nv - 1
+    }
+    return nv
 }
 
 # the relaxed search: each chain's cells as softmax(theta) over their K values (theta drawn small at random), steps
@@ -1271,4 +1503,53 @@ test Fitter.CD "CD-1, persistent CD-1 and EP each learn the colouring rule from 
         }
         assert solved >= 3, "rule " + $rule + ": " + $solved + " of 4"
     }
+}
+
+fn Factors.sat3(n I64, count I64, r mut rand.Rand&) Factors {
+    # a planted 3-SAT instance: clause signs drawn until the planted answer satisfies it; a table per sign pattern, 1
+    # on the pattern's one violating assignment
+    y := Array<I32>(n)
+    for i in range n: y[i] = I32(r.Below(2))
+    f := Factors(2, 3, 8, count, n)
+    q I64 = 0
+    for q < count {
+        a, b, c := r.Below(n), r.Below(n), r.Below(n)
+        if a == b or b == c or a == c: continue
+        sg := r.Below(8)
+        # literal j negated if bit (2 - j) of sg is set; violating value of cell j is that bit
+        if I64(y[a]) == (sg >> 2) & 1 and I64(y[b]) == (sg >> 1) & 1 and I64(y[c]) == sg & 1: continue
+        f.At[3 * q], f.At[3 * q + 1], f.At[3 * q + 2] = a, b, c
+        f.Table[q] = sg
+        q++
+    }
+    for sg in range 8: f.T[sg * 8 + sg] = 1.0
+    f.Index()
+    return f
+}
+
+test Sampler.Focus "the focused heat bath solves a planted 3-SAT instance (factors) and a planted 3-colourable graph (edges), with and without weights; Left 0 means energy 0, and the chains do not depend on the thread count" {
+    r := rand.Rand(31)
+    fs := Factors.sat3(200, 800, r)
+    ms := Potts(2, 1)
+    ms.Fac = fs
+    es := message.Edges(200, 1)
+    es.Set(Array<I32>(0), Array<I32>(0), 0)
+    for sched in Array<FocusSchedule>[FocusSchedule(200000, 0.5), FocusSchedule(200000, 0.5, 0.1, 0.5, 1000)] {
+        s := Sampler(200, 4, 2)
+        s.Start(rand.Rand(5))
+        s.Focus(ms, es, Array<F64>(200), sched)
+        assert s.Left[s.Best()] == 0 and s.Energies[s.Best()] == 0.0, $s.Energies[s.Best()]
+    }
+    e, _ := planted(150, 3, 2, r)
+    m := Potts.Colouring(3)
+    answers := Vec<Array<I32>>()
+    for threads in Array<I64>[1, 3] {
+        s := Sampler(150, 4, 3, threads)
+        s.Start(rand.Rand(6))
+        s.Focus(m, e, Array<F64>(150), FocusSchedule(200000, 0.5, 0.1, 0.5, 1000))
+        for c in range 4: assert (s.Left[c] == 0) == (s.Energies[c] == 0.0)
+        assert s.Energies[s.Best()] == 0.0, $s.Energies[s.Best()]
+        answers.Push(s.X)
+    }
+    assert answers[0] == answers[1]
 }
