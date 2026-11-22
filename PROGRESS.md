@@ -2005,3 +2005,14 @@ diffusion proposals ranked by a Potts energy through `bestof.Rank` keep the lowe
 `ScoreMatch`, denoising score matching for an energy written on the graph: the parameter gradient of
 sum |sigma dE/dz - eps|^2 as a central difference of dE/dtheta along u = 2 sigma (sigma dE/dz - eps) (two extra passes,
 no second-order backward), tested against central differences of the loss.
+
+## Hidden chains summed out by forward-backward (wt-hchain, 2026-11-22)
+
+`nn/chain`: visible cells with one hidden state each, linked along a chain, energy B[z_0] + sum U[c_i][z_i][s_i] +
+sum V[c_i][z_i][z_{i+1}] with tables indexed by each position's context. The free energy, all n x K conditionals (one
+forward, one backward pass), and the pseudolikelihood gradient exactly - reverse mode through forward-backward,
+O(n H (H + K)) where recomputing per cell and value costs O(n^2 K H^2) - and annealed ordered Gibbs scans with the
+backward messages cached. Tested against brute force over the hidden chain (free energy, every conditional, the loss)
+and central differences (the gradient). Addition (contexts a_i b_i, H = 2, batch 64 x 4000 steps, lowest PL loss of 3
+starts, 3.9 s for the test): 32 / 32 12-digit sums exact after training on 1..4 digits, as the experiment that
+introduced it (100 % at 12). Single starts can stall at PL 0.04 a digit (the latent half found), hence the restarts.
