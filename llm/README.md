@@ -45,24 +45,24 @@ a step never reads another row, so a completion does not depend on the batch it 
 | `--batch B` | sequences decoded at once (64) |
 | `--ctx C` | positions a sequence may have, prompt and completion (default: the longest prompt and M) |
 | `--kv-gb G` | memory for the key-value cache (default 90% of what is free after loading, less 1 GB) |
-| `--int8` | 8-bit weights (a scale per output), half the memory; the 8B models need it on 16 GB |
+| `--int8` | 8-bit weights, a scale per 32 inputs (the head stays BF16): 0.56 of the memory, needs AMX (BF16 without it); the 8B models need it on 16 GB |
 | `--exact` | F32 activations and cache: slow, for checking against a reference |
 
 ## How it works
 
 A **step** takes any set of rows - each a token of some sequence at its position - and runs them through the model
 together: every product of the step is shared by all its rows, so the weights are read from memory once a step whatever
-the batch. Decoding is bound by that read (the weights of a 1.5B model are 3 GB), so a step of 64 sequences costs
-little more than a step of one. Prompts are read in the same steps, up to 256 rows a step beside the sequences being
+the batch. Decoding is bound by that read (the weights of a 1.5B model are 3.4 GB), so a step of 64 sequences costs
+little more than a step of one - until the contexts grow, when reading the key-value cache takes over. Prompts are read in the same steps, up to 256 rows a step beside the sequences being
 decoded, so a new sequence starts the moment another finishes (continuous batching).
 
 **Products.** On a CPU with AMX (`TargetHasTileDot`), the weights stay BF16 and are packed once, as they are loaded,
 into the pair layout of std/tile's `AddDot`, in blocks of 32 outputs: a step rounds its activations to BF16 and each
-task adds `X W^T` into its blocks of the result, summing in F32. With `--int8` each block is widened from 8 bits as it
-is used (exactly: an integer of 8 bits is a BF16) and scaled after. Without AMX, or with `--exact`, the activations stay
+task adds `X W^T` into its blocks of the result, summing in F32. With `--int8` the layers' weights are 8 bits with a
+scale per 32 inputs (symmetric), widened to BF16 512 inputs of a block at a time into the L1 cache as they are used. Without AMX, or with `--exact`, the activations stay
 F32 and kernels/gemm multiplies them by the weights widened.
 
-**Attention** reads a paged key-value cache: pages of 32 positions, BF16, taken from a pool as a sequence grows and
+**Attention** reads a paged key-value cache: pages of 64 positions, BF16, taken from a pool as a sequence grows and
 given back when it ends. A page's keys for a head are kept in AddDot's pair layout over the head's dimensions and its
 values over the positions, so a row's scores against a page (its head group's queries, padded to 16 rows, times the
 page's keys) and the page's share of the output (the weights in BF16 times the values) are one AddDot each, the softmax

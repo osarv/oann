@@ -47,7 +47,7 @@ fetched into `data/` on first use.
 
 `llm/` loads Hugging Face checkpoints of the Qwen2 and Qwen3 architectures (Qwen3-0.6B to 8B, DeepSeek-R1-Distill-Qwen-1.5B
 and 7B, Qwen2.5) and runs them in batches on the CPU - BF16 weights on AMX tiles where the CPU has them, F32 elsewhere;
-`--int8` halves the weights. `oann-gen` writes completions of a JSON-lines file of prompts as they finish, and picks up
+`--int8` stores the layers' weights in 8 bits. `oann-gen` writes completions of a JSON-lines file of prompts as they finish, and picks up
 where it left off when run again:
 
 ```

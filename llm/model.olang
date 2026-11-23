@@ -11,15 +11,17 @@
 # than a batch of one.
 #
 # Products. Where the target has AMX (TargetHasTileDot) the weights stay BF16 and are packed once, at load, into the
-# pair layout of std/tile's AddDot in blocks of Nb output columns: a step rounds its activations to BF16 and each task
-# adds X . W^T into its blocks of the result with AddDot (F32 sums) - no packing per step, a block of the weights read
-# once per 16 or 32 rows of the batch from L2. Elsewhere, or with Exact set, the activations stay F32 and kernels/gemm
-# multiplies them by the BF16 weights widened (bit for bit the product of the widened weights).
+# pair layout of std/tile's AddDot in blocks of Nb (32) output columns: a step rounds its activations to BF16 and each
+# task adds X . W^T into its blocks of the result with AddDot (F32 sums) - no packing per step. Elsewhere, or with Exact
+# set, the activations stay F32 and kernels/gemm multiplies them by the BF16 weights widened (bit for bit the product of
+# the widened weights). INT8 weights (Load's int8, on AMX): 8 bits and a scale per 32 inputs of an output, symmetric,
+# widened to BF16 (times the scale, rounded to nearest) 512 inputs of a block at a time into the L1 cache and added
+# from there; the head stays BF16.
 #
-# Attention reads a paged key-value cache (Cache): pages of 32 positions of one sequence, BF16, the keys of a page and
+# Attention reads a paged key-value cache (Cache): pages of 64 positions of one sequence, BF16, the keys of a page and
 # head held in AddDot's pair layout over the positions and the values over the head's dimensions, so a row's scores
 # against a page (its head group's queries, 16 rows padded, times the page's keys) and the page's share of the output
-# (the weights times the values, 32 positions deep) are each one AddDot; a sequence's pages are wherever the pool had
+# (the weights times the values, 64 positions deep) are each one AddDot; a sequence's pages are wherever the pool had
 # them (llm/engine allocates and frees them). The exact path computes the same in F32 loops.
 #
 # Nothing in a step allocates: every buffer is made for the largest step (State) and the cache for its pages up front.
@@ -132,16 +134,17 @@ type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8
     Out
     Nb
     Packed
-    Int8                                                        # Q and Scale hold W: W[o, i] = Scale[o] Q[o, i]
+    Int8                                                        # Q and Scale hold W: W[o, i] = Scale[o, i / Group] Q[o, i]
+    Group I64 = 32                      # inputs to a scale
     W mut Array<BF16>& = Array<BF16>(0 if Int8 else In * Out)
     Q mut Array<I8>& = Array<I8>(In * Out if Int8 else 0)
-    Scale mut Array<F32>& = Array<F32>(Out if Int8 else 0)
+    Scale mut Array<F32>& = Array<F32>(Out * In / Group if Int8 else 0)   # row o's at o In / Group
     Bias mut Array<F32>& = Array<F32>(Out if bias else 0)
 }
 
 # element (o, i) of W
 fn (w Linear&) Get(o I64, i I64) F32 {
-    if w.Int8: return F32(w.Q[w.at(o, i)]) * w.Scale[o]
+    if w.Int8: return F32(w.Q[w.at(o, i)]) * w.Scale[(o * w.In + i) / w.Group]
     return F32(w.W[w.at(o, i)])
 }
 
@@ -281,18 +284,20 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64) ? Mode
         for r in range n {
             o := from + r0 + r
             if l.Int8 {
-                # symmetric, per output: the row's largest magnitude is 127
-                top F32 = 0.0
-                for i in range l.In {
-                    v := valueAt(b, r * l.In + i, e.Type)
-                    top = v if v > top else (-v if -v > top else top)
-                }
-                sc := top / 127.0 if top > 0.0 else F32(1.0)
-                l.Scale[o] = sc
-                inv := 1.0 / sc
-                for i in range l.In {
-                    v := (valueAt(b, r * l.In + i, e.Type) * inv).Round()
-                    l.Q[l.at(o, i)] = I8(v if v < 127.0 and v > -127.0 else (F32(127.0) if v > 0.0 else F32(-127.0)))
+                # symmetric, a scale per Group inputs of an output: the group's largest magnitude is 127
+                for g0 in range 0, l.In, l.Group {
+                    top F32 = 0.0
+                    for i in range g0, g0 + l.Group {
+                        v := valueAt(b, r * l.In + i, e.Type)
+                        top = v if v > top else (-v if -v > top else top)
+                    }
+                    sc := top / 127.0 if top > 0.0 else F32(1.0)
+                    l.Scale[(o * l.In + g0) / l.Group] = sc
+                    inv := 1.0 / sc
+                    for i in range g0, g0 + l.Group {
+                        v := (valueAt(b, r * l.In + i, e.Type) * inv).Round()
+                        l.Q[l.at(o, i)] = I8(v if v < 127.0 and v > -127.0 else (F32(127.0) if v > 0.0 else F32(-127.0)))
+                    }
                 }
             } else if l.Packed {
                 base := (o / l.Nb) * l.In * l.Nb + (o % l.Nb) * 2
@@ -318,12 +323,12 @@ fn (w mut Weights&) vector(dst mut Array<F32>&, name String&, from I64, n I64) ?
 type Model struct(C Config, Tile Bool, Int8 Bool = false) {
     C                                       # the configuration
     Tile                                    # AddDot's products (BF16 activations); else F32 activations and gemm
-    Int8                                    # the products' weights in 8 bits, a scale per output (the embedding's not)
+    Int8                                    # the layers' weights in 8 bits, a scale per 32 inputs (the head and embedding BF16)
     made := Vec<Layer>()
     for _ in range C.Layers: made.Push(Layer(C, Tile, Int8))
     Layers mut Array<Layer>& = made.ToArray()
     Embed Linear = Linear(C.Dim, C.Vocab if not C.Tied else 0, 16, false)   # row-major; empty when tied
-    Head Linear = Linear(C.Dim, C.Vocab, blockOf([C.Vocab]), Tile, Int8 = Int8)
+    Head Linear = Linear(C.Dim, C.Vocab, blockOf([C.Vocab]), Tile)
     Final mut Array<F32>& = Array<F32>(C.Dim)
     Threads I64 = gemm.Cores()
 }
@@ -333,7 +338,7 @@ type Model struct(C Config, Tile Bool, Int8 Bool = false) {
 fn Model.Load(dir String&, exact Bool = false, int8 Bool = false) Model ? ModelError, os.Error {
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
     if exact and int8: error ModelError.Unsupported("exact products of 8-bit weights")
-    m := Model(c, TargetHasTileDot and not exact, int8)
+    m := Model(c, TargetHasTileDot and not exact, int8 and TargetHasTileDot)
     w := try Weights.Open(dir)
     q := c.Heads * c.HeadDim
     kv := c.KvHeads * c.HeadDim
@@ -384,9 +389,9 @@ fn (m Model&) Bytes() I64 {
 
 # ---- the key-value cache ----
 
-PageSize I64 = 32
+PageSize I64 = 64
 
-# Pages pages of 32 positions for every layer and key-value head, keys and values in BF16; Slots sequences of at most
+# Pages pages of 64 positions for every layer and key-value head, keys and values in BF16; Slots sequences of at most
 # MaxPages pages each, Table[slot MaxPages + i] its i-th page. A page's keys for a head: position n's dimension d at
 # ((d / 2) 32 + n) 2 + d % 2 (AddDot's pairs over the head's dimensions); its values: at ((n / 2) HeadDim + d) 2 + n % 2
 type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = false) {
@@ -456,6 +461,7 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     y mut Array<F32>& = Array<F32>(roundUp(Rows, 16) * 2 * m.C.Ffn)
     xb mut Array<BF16>& = Array<BF16>(roundUp(Rows, 16) * widest(m.C) if m.Tile else 0)
     deq mut Array<BF16>& = Array<BF16>(m.Threads * widest(m.C) * 64 if m.Tile and m.Int8 else 0)   # each task's widened block
+    scs mut Array<F32>& = Array<F32>(m.Threads * 128)                                             # and its scales
     cos mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2)
     sin mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2)
     freq Array<F64>& = Array<F64>[m.C.Theta.Pow(-2.0 * F64(i) / F64(m.C.HeadDim)) for i in range m.C.HeadDim / 2]
@@ -516,7 +522,7 @@ fn rmsNorm(y mut Array<F32>&, yo I64, x Array<F32>&, xo I64, n I64, d I64, ld I6
 }
 
 # dst[: rows, : w.Out] = src[: rows, : w.In] W^T + b, rows of src w.In apart and of dst w.Out apart
-fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Linear&) {
+fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F32>&, ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Linear&) {
     if rows == 0: return
     if m.Tile {
         rp := roundUp(rows, 16)
@@ -526,21 +532,13 @@ fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, ws mut gemm.Work
         tasks := m.Threads.Min(blocks)
         per := deq.Len() / m.Threads
         join {
-            for t in range tasks: spawn mmBlocks(dst, xb, w, rp, t * blocks / tasks, (t + 1) * blocks / tasks, deq[t * per:(t + 1) * per])
+            for t in range tasks: spawn mmBlocks(dst, xb, w, rp, t * blocks / tasks, (t + 1) * blocks / tasks, deq[t * per:(t + 1) * per], scs[t * 128:(t + 1) * 128])
         }
     } else {
         c := mat.Mat<F32>(dst, 0, rows, w.Out, w.Out)
         a := mat.Mat<F32>(src, 0, rows, w.In, w.In)
-        if w.Int8 {
-            b := mat.Mat<I8>(w.Q, 0, w.Out, w.In, w.In)
-            gemm.Gemm(ws, c, a, false, b, true)
-            for r in range rows {
-                for o in range w.Out: dst[r * w.Out + o] *= w.Scale[o]
-            }
-        } else {
-            b := mat.Mat<BF16>(w.W, 0, w.Out, w.In, w.In)
-            gemm.Gemm(ws, c, a, false, b, true)
-        }
+        b := mat.Mat<BF16>(w.W, 0, w.Out, w.In, w.In)
+        gemm.Gemm(ws, c, a, false, b, true)
     }
     if w.Bias.Len() > 0 {
         for r in range rows {
@@ -549,9 +547,9 @@ fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, ws mut gemm.Work
     }
 }
 
-# blocks b0 .. b1 of dst = x W^T (rp rows) by AddDot; 8-bit weights widened a block at a time into deq (exactly: an
-# integer of 8 bits is a BF16) and each output scaled after
-fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I64, deq mut Array<BF16>&) {
+# blocks b0 .. b1 of dst = x W^T (rp rows) by AddDot; 8-bit weights widened a part of a block at a time into deq, each
+# times its group's scale and rounded to BF16 (to nearest, even), the scales of a pair row of the block in deq's tail
+fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I64, deq mut Array<BF16>&, sc mut Array<F32>&) {
     span := w.In * w.Nb
     for b in range b0, b1 {
         c0 := b * w.Nb
@@ -561,16 +559,30 @@ fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I
         if w.Int8 {
             # widened 512 deep at a time, into the L1 cache, and added from there (a batch of many rows: the whole
             # block at once, its C tiles loaded once)
-            step := 512 if rp <= 16 else w.In
+            step := 512
+            row := 2 * w.Nb
+            ng := w.In / w.Group
             for k0 in range 0, w.In, step {
                 depth := (w.In - k0).Min(step)
                 o := b * span + k0 * w.Nb
-                n := depth * w.Nb
-                for i in range n: deq[i] = BF16.FromBits(U16(F32(w.Q[o + i]).Bits() >> 16))   # exact: the low bits are 0
-                stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:n])!
-            }
-            for r in range rp {
-                for j in range w.Nb: dst[r * w.Out + c0 + j] *= w.Scale[c0 + j]
+                for p in range depth / 2 {
+                    k := k0 + 2 * p
+                    if k % w.Group == 0 {
+                        g := k / w.Group
+                        for n in range w.Nb {
+                            v := w.Scale[(c0 + n) * ng + g]
+                            sc[2 * n] = v
+                            sc[2 * n + 1] = v
+                        }
+                    }
+                    q := o + p * row
+                    d := p * row
+                    for j in range row {
+                        bits := (F32(w.Q[q + j]) * sc[j]).Bits()
+                        deq[d + j] = BF16.FromBits(U16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16))
+                    }
+                }
+                stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:depth * w.Nb])!
             }
         } else {
             stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x, w.In, w.In, w.W[b * span:(b + 1) * span])!
@@ -626,7 +638,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         l := m.Layers[li]
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm1, c.Eps)
         t1 = time.Now()
-        m.linear(s.xb, s.deq, s.ws, s.qkv, s.h, n, l.Qkv)
+        m.linear(s.xb, s.deq, s.scs, s.ws, s.qkv, s.h, n, l.Qkv)
         tm += time.Since(t1)
         # QK-norm, rotation, and the keys and values into the cache
         tasks := m.Threads.Min(n / 8)
@@ -641,12 +653,12 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         m.attention(s, k, li)
         ta += time.Since(t2)
         t1 = time.Now()
-        m.linear(s.xb, s.deq, s.ws, s.y, s.att, n, l.O)
+        m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.att, n, l.O)
         tm += time.Since(t1)
         for i in range n * d: s.x[i] += s.y[i]
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm2, c.Eps)
         t1 = time.Now()
-        m.linear(s.xb, s.deq, s.ws, s.y, s.h, n, l.GateUp)
+        m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.h, n, l.GateUp)
         tm += time.Since(t1)
         if tasks <= 1 {
             swiglu(s.h, s.y, c.Ffn, 0, n)
@@ -656,7 +668,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
             }
         }
         t1 = time.Now()
-        m.linear(s.xb, s.deq, s.ws, s.y, s.h, n, l.Down)
+        m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.h, n, l.Down)
         tm += time.Since(t1)
         for i in range n * d: s.x[i] += s.y[i]
     }
@@ -667,7 +679,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         rmsNorm(s.h, j * d, s.x, r * d, 1, d, d, m.Final, c.Eps)
     }
     t1 = time.Now()
-    m.linear(s.xb, s.deq, s.ws, s.Logits, s.h, s.NOut, m.Head)
+    m.linear(s.xb, s.deq, s.scs, s.ws, s.Logits, s.h, s.NOut, m.Head)
     tm += time.Since(t1)
     all := time.Since(t0)
     s.Times[0] += tm
@@ -783,17 +795,12 @@ fn attendItems(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
                 }
             }
         }
-        # the softmax of each query's scores over positions 0 .. p
+        # the softmax of each query's scores over positions 0 .. p (each pass a loop of lanes, the sums 8 at a time)
         for j in range g {
             so := j * stride
-            top := a.s[so] * scale
-            for t in range 1, p + 1: top = top.Max(a.s[so + t] * scale)
-            total F32 = 0.0
-            for t in range p + 1 {
-                e := elem.FastExp(a.s[so + t] * scale - top)
-                a.s[so + t] = e
-                total += e
-            }
+            top := elem.MaxIn<F32, F32>(a.s, so, p + 1) * scale
+            for t in range p + 1: a.s[so + t] = elem.FastExp(a.s[so + t] * scale - top)
+            total := elem.SumIn<F32, F32>(a.s, so, p + 1)
             for t in range p + 1, np * PageSize: a.s[so + t] = 0.0
             a.qf[j] = 1.0 / total
         }
@@ -887,7 +894,7 @@ fn put(w mut checkpoint.Writer&, r mut rand.Rand&, name String&, rows I64, cols 
     w.AddAs(name, t, checkpoint.Dtype.BF16)!
 }
 
-# a cache with pages for "slots" sequences of up to 128 positions, its pages handed out in a scattered order
+# a cache with pages for "slots" sequences of up to 256 positions, its pages handed out in a scattered order
 fn Cache.scattered(m Model&, slots I64, exact Bool) Cache {
     k := Cache(m.C, slots * 4 + 3, slots, 4, exact)
     k.Take()
@@ -898,7 +905,7 @@ fn Cache.scattered(m Model&, slots I64, exact Bool) Cache {
 # the logits of a prompt's every position, all at once, in a cache of its own
 fn prefill(m Model&, toks Array<I32>&, exact Bool) Array<F32> {
     k := Cache.scattered(m, 1, exact)
-    s := State(m, toks.Len(), toks.Len(), 128)
+    s := State(m, toks.Len(), toks.Len(), 256)
     for i, t in toks: s.Add(t, I64(i), 0, true)
     m.Step(s, k)
     return s.Logits[:toks.Len() * m.C.Vocab].Copy()
@@ -937,14 +944,26 @@ test Model "loads Qwen2's and Qwen3's checkpoints: the AMX path's logits are the
     }
 }
 
+test Model "8-bit weights, a scale per 32 inputs: the logits within a few percent of the BF16 weights' (where AMX runs them)" {
+    dir := Tiny(false, 13)
+    bf := Model.Load(dir)!
+    q := Model.Load(dir, false, true)!
+    assert q.Int8 == TargetHasTileDot and q.Bytes() < bf.Bytes() * 7 / 10 or not TargetHasTileDot
+    toks := tokens(40, 3)
+    a := prefill(bf, toks, false)
+    b := prefill(q, toks, false)
+    assert worst(a, b) < 0.06 * biggest(a), $worst(a, b) + " of " + $biggest(a)
+    os.RemoveAll(dir)!
+}
+
 test Model "decoding through the cache a token a step gives the logits of reading the prompt at once, over three pages" {
     dir := Tiny(true, 7)
     for exact in [true, false] {
         m := Model.Load(dir, exact)!
-        toks := tokens(70, 9)
+        toks := tokens(150, 9)
         want := prefill(m, toks, exact)
         k := Cache.scattered(m, 1, exact)
-        s := State(m, 1, 1, 128)
+        s := State(m, 1, 1, 256)
         got := Array<F32>(toks.Len() * m.C.Vocab)
         for i, t in toks {
             s.Reset()
@@ -964,7 +983,7 @@ test Model "a row's logits do not depend on the other rows of its step: two sequ
     b := tokens(25, 2)
     alone := prefill(m, a, false)
     k := Cache.scattered(m, 2, false)
-    s := State(m, 65, 65, 128)
+    s := State(m, 65, 65, 256)
     for i in range 40 {
         s.Add(a[i], I64(i), 1, true)
         if i < 25: s.Add(b[i], I64(i), 0, false)

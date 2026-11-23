@@ -57,6 +57,16 @@ fn available() I64 {
     return 0
 }
 
+# the peak resident memory in MB (VmHWM)
+fn peak() I64 {
+    status := try os.ReadFile("/proc/self/status") catch default ""
+    for line in status.Lines() {
+        if not line.StartsWith("VmHWM:"): continue
+        return (try line[6:].Trim().Split(" ")[0].ParseInt() catch default 0) / 1024
+    }
+    return 0
+}
+
 fn fail(msg String&) noreturn {
     try io.PutErrLn("oann-gen: " + msg) catch { }
     os.Exit(1)
@@ -89,7 +99,7 @@ fn main() {
     noThink := p.Bool("no-think", 0, "Qwen3: answer without thinking")
     kvGb := p.Float("kv-gb", 0, 0.0, "memory for the key-value cache (default: most of what is free)")
     exact := p.Bool("exact", 0, "F32 activations and cache (slow; to check against a reference)")
-    int8 := p.Bool("int8", 0, "8-bit weights, a scale per output: half the memory")
+    int8 := p.Bool("int8", 0, "8-bit weights, a scale per 32 inputs (the head stays BF16): about 0.56 of the memory; needs AMX")
     try p.Parse(os.Args()) catch flags.Error.Help {
         try io.Put(p.Help()) catch { }
         return
@@ -188,7 +198,7 @@ fn main() {
             last = time.Now()
             secs := F64(time.Since(start)) / 1e9
             say($done + "/" + $jobs.Len() + " done, " + $e.Running() + " running, " + $e.Waiting() + " waiting, " +
-                $e.Tokens + " tokens in " + secs.Fixed(0) + " s: " + (F64(e.Tokens) / secs).Fixed(1) + " tokens/s" +
+                $e.Tokens + " tokens in " + secs.Fixed(0) + " s: " + (F64(e.Tokens) / secs).Fixed(1) + " tokens/s, peak " + $peak() + " MB" +
                 (", " + $e.Preempted + " preempted" if e.Preempted > 0 else ""))
         }
     }
