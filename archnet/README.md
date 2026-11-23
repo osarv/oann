@@ -99,7 +99,28 @@ Genome-only ranking is data-limited. Trained on 1000 observations instead of 300
 | with screening and forecast halving | 0.35 |
 
 At these budgets (about 800 observations) the predictor saves no compute, and forecast halving costs quality.
-`Forecast` is therefore off by default.
+`Forecast` is therefore off by default. On 8 seeds the picture is the same: evolution 0.20, screening 0.23. Every arm
+stalls on the toy's plateaus, where the best genome is 0.15, 0.30 or 0.45 above the optimum. Each plateau is a
+depth change that shifts every layer's position in the operation table, a trap no model of single moves gets out of.
+On mutants of the final population the predictor still ranks with tau 0.54 to 0.72.
+
+## Measured on a chain landscape
+
+`toy.Chain(n)` is a search where the order of evaluation matters. It has n choice genes of 4 options each. Its loss
+sums one cost per gene and one per pair of neighbours (an NK landscape with K = 1), and `OptimumOf` gives the optimum
+exactly. Most mutations there are neutral or bad. `ARCH_CHAIN=n make archsearch ARGS="60 8"` runs it, with the same
+search as above, over 8 seeds:
+
+| arm | n = 16: mean final gap | seeds within 0.1 | n = 32: mean final gap |
+|---|---|---|---|
+| evolution | 0.169 | 3 of 8 | 0.88 |
+| with screening | 0.065 | 7 of 8 | 0.54 |
+| with screening and proposals | 0.061 | 7 of 8 | 0.54 |
+| with screening and forecast halving | 0.118 | 6 of 8 | 0.67 |
+
+Here the predictor earns its keep. With screening, the seeds that came within 0.1 of the optimum did so after a mean
+budget of 812, against 1101 for the three seeds of evolution that got there at all. The held-out tau on the genome
+alone is 0.66 (n = 16) and 0.45 (n = 32).
 
 **The generator:**
 
