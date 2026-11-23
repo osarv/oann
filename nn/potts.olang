@@ -962,6 +962,8 @@ type focusIndex struct(nf I64, slots I64) {
     tmin mut Array<F64>& = Array<F64>(0)            # each factor table's minimum
     wmin F64 = 0.0
     wmax F64 = 0.0
+    wptr mut Array<I64>& = Array<I64>(0)            # W's nonzero rows by column: wrow[wptr[col] .. wptr[col + 1]]
+    wrow mut Array<I64>& = Array<I64>(0)
 }
 
 fn focusIndex.of(m Potts&, e message.Edges&) focusIndex {
@@ -977,6 +979,18 @@ fn focusIndex.of(m Potts&, e message.Edges&) focusIndex {
                 if e.Source(b) == v: x.eid[b] = x.ne
             }
             x.ne++
+        }
+    }
+    # a move changes a neighbour's energies only where W's column at the old or the new value is nonzero: a colouring's
+    # W touches one value of each, not K
+    k := m.K
+    x.wptr, x.wrow = Array<I64>(k + 1), Array<I64>(k * k)
+    for col in range k {
+        x.wptr[col + 1] = x.wptr[col]
+        for c in range k {
+            if m.W[c * k + col] == 0.0: continue
+            x.wrow[x.wptr[col + 1]] = c
+            x.wptr[col + 1]++
         }
     }
     x.wmin, x.wmax = m.W[0], m.W[0]
@@ -1136,9 +1150,16 @@ fn (st mut focusState&) move(m Potts&, e message.Edges&, x focusIndex&, X Array<
     for a in range e.First(i), e.First(i + 1) {
         j := e.Source(a)
         w := st.wt[x.nf + x.eid[a]] * F64(e.Weight(a))
-        for c in range k: st.L[j * k + c] += w * (m.W[c * k + v] - m.W[c * k + old])
-        if st.L1.Len() > 0 {
-            for c in range k: st.L1[j * k + c] += F64(e.Weight(a)) * (m.W[c * k + v] - m.W[c * k + old])
+        ew := F64(e.Weight(a))
+        for t in range x.wptr[v], x.wptr[v + 1] {
+            c := x.wrow[t]
+            st.L[j * k + c] += w * m.W[c * k + v]
+            if st.L1.Len() > 0: st.L1[j * k + c] += ew * m.W[c * k + v]
+        }
+        for t in range x.wptr[old], x.wptr[old + 1] {
+            c := x.wrow[t]
+            st.L[j * k + c] -= w * m.W[c * k + old]
+            if st.L1.Len() > 0: st.L1[j * k + c] -= ew * m.W[c * k + old]
         }
         d := x.eid[a]
         low := x.ew[d] * x.wmin if x.ew[d] >= 0.0 else x.ew[d] * x.wmax
@@ -1182,10 +1203,8 @@ fn (st mut focusState&) bump(m Potts&, e message.Edges&, x focusIndex&, X Array<
     u, v := x.eu[q - x.nf], x.ev[q - x.nf]
     w := d * x.ew[q - x.nf]
     xu, xv := I64(X[xo + u]), I64(X[xo + v])
-    for c in range k {
-        st.L[u * k + c] += w * m.W[c * k + xv]
-        st.L[v * k + c] += w * m.W[c * k + xu]
-    }
+    for t in range x.wptr[xv], x.wptr[xv + 1]: st.L[u * k + x.wrow[t]] += w * m.W[x.wrow[t] * k + xv]
+    for t in range x.wptr[xu], x.wptr[xu + 1]: st.L[v * k + x.wrow[t]] += w * m.W[x.wrow[t] * k + xu]
 }
 
 # the share of cell pairs joined by an edge or by sharing a factor (at most 1)
@@ -1248,14 +1267,14 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
             for v in range k {
                 if v == old: continue
                 ci[cand], cv[cand], cw[cand] = i, v, st.L[i * k + v] - st.L[i * k + old]
-                if hb.Len() > 0 and hb[i * k + v] != 0.0: cw[cand] += hb[i * k + v] * (-F64(moves - ht[i * k + v]) / tenure).Exp()
+                if hb.Len() > 0 and hb[i * k + v] != 0.0: cw[cand] += hb[i * k + v] * elem.FastExp(-F64(moves - ht[i * k + v]) / tenure)
                 low = low.Min(cw[cand])
                 cand++
             }
         }
         z F64 = 0.0
         for j in range cand {
-            cw[j] = ((low - cw[j]) / sched.T).Exp()
+            cw[j] = elem.FastExp((low - cw[j]) / sched.T)
             z += cw[j]
         }
         u := nextUniform(s.seeds, c) * z
@@ -1270,7 +1289,7 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
         i := ci[pick]
         if hb.Len() > 0 {
             o := i * k + I64(X[xo + i])
-            hb[o] = hb[o] * (-F64(moves - ht[o]) / tenure).Exp() + sched.Hold
+            hb[o] = hb[o] * elem.FastExp(-F64(moves - ht[o]) / tenure) + sched.Hold
             ht[o] = moves
         }
         st.move(m, e, x, X, xo, i, cv[pick])
