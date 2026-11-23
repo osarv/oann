@@ -2176,3 +2176,11 @@ prep 300`, 4 x 128 decoder, batch 16 x 128, 600 s, one thread each, the four run
 steps, validation loss 2.8064 / 2.8063 (seeds 1 / 2); BF16 3948 / 4003 steps, 2.5898 / 2.5781; BF16 for 350 s
 (2327 / 2314 steps, the F32 runs' count) 2.7930 / 2.8008 - no loss from BF16 at equal steps, 0.22 nats better at equal
 time.
+
+BF16 round two (wt-bf16attn): GemmBatch (attention's per-head products) takes the tile path too, causal triangles
+kept (a lower-triangular left operand masked as it is packed, a result's triangle stored alone); stores with beta 0
+in one vectorizable loop; packPairs zeroes only its padding. At attention's shapes (128 x 32 x 128 a head) the
+products are small next to their packing and stores (AddDot 2.2 us of ~13 us a head): 64 heads 0.93 -> 0.83 ms. No
+further single fix reaches 10 % of the BF16 step (148-159 ms, noisy): cross-entropy 15 ms, attention ~31 (mostly not
+products), rope 10, norm 8; the products' remaining cost is packing and the BF16 stores (about 0.25 ns an element,
+as much as the tiles' arithmetic).
