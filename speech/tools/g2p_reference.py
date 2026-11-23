@@ -8,7 +8,8 @@
 # Word lists are counted from public-domain books (Project Gutenberg, fetched from its mirror into OUT/texts): English
 # from Pride and Prejudice, The Adventures of Sherlock Holmes, Tom Sawyer and Moby Dick - the 2000 most frequent words,
 # and 200 more frequent ones that CMUdict lacks; Swedish from Lagerlof's Bannlyst (1918), Soderberg's Forvillelser
-# (1895) and Gertrud Almqvist's I tolfte timmen - the 1000 most frequent. Each file is a line a word or sentence:
+# (1895) and Gertrud Almqvist's I tolfte timmen - the 1000 most frequent, and the next 1000 (sv_heldout: the rules
+# were written looking at the first thousand only). Each file is a line a word or sentence:
 # "text<TAB>phonemes".
 
 import collections
@@ -85,16 +86,16 @@ def counts(out, lang):
     return c
 
 
-def frequent(c, n, keep):
+def frequent(c, n, keep, skip=0):
     words = []
     for w, k in c.most_common():
         if w.startswith("^") or c["^" + w] > k:
             continue
         if keep(w):
             words.append(w)
-        if len(words) == n:
+        if len(words) == skip + n:
             break
-    return words
+    return words[skip:]
 
 
 def write(backend, path, texts):
@@ -117,7 +118,9 @@ def main():
     write(en, os.path.join(out, "en_sentences.tsv"), SENTENCES["en"])
     sv = EspeakBackend("sv", preserve_punctuation=True, with_stress=True)
     c = counts(out, "sv")
-    write(sv, os.path.join(out, "sv_words.tsv"), frequent(c, 1000, lambda w: "qv" not in w and "'" not in w))
+    modern = lambda w: "qv" not in w and "'" not in w
+    write(sv, os.path.join(out, "sv_words.tsv"), frequent(c, 1000, modern))
+    write(sv, os.path.join(out, "sv_heldout.tsv"), frequent(c, 1000, modern, 1000))
     write(sv, os.path.join(out, "sv_sentences.tsv"), SENTENCES["sv"])
 
 

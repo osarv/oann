@@ -52,6 +52,7 @@ type G2p struct() {
     cmu Map<String, String> = Map<String, String>()        # word -> ARPAbet, space-separated
     alone Map<String, String> = Map<String, String>()      # function words: alone
     inPhrase Map<String, String> = Map<String, String>()   # ... and inside a phrase
+    svTable Map<String, String> = Map<String, String>()    # Swedish words the rules do not reach
 }
 
 # CMUdict fetched once into Cache()/g2p and read
@@ -72,6 +73,10 @@ fn G2p.Parse(dict String&) G2p {
         if '(' in word: continue
         end := try line.Find(" #") catch default line.Len()
         g.cmu.Put(word, line[sp + 1:end])
+    }
+    for line in svWords.Lines() {
+        f := line.Split(" ")
+        g.svTable.Put(f[0], f[1])
     }
     for line in enFunction.Lines() {
         f := line.Split(" ")
@@ -823,10 +828,281 @@ enFunction := "mr m'IstR m'IstR\nmrs m'IsIz m'IsIz\ndr d'A:ktR d'A:ktR\nit's Its
     "billion b'Ili@n b'Ili@n\npoint p'OInt pOInt"
 
 # ---- Swedish ----
+#
+# A word's letters are ASCII here: å 1, ä 2, ö 3, é 4 (ü y, à and á a, è and ê e). The vowels are long where
+# stressed and open (one consonant and then a vowel or the end, or the stop and liquid of a stem: segla, högre) and
+# short before two consonants, a double one, ck, ng, x and a last m; espeak's unstressed vowels are mostly e ə, ä ə, o
+# uː in an open syllable, i iː in an open one. The primary stress is on the first syllable, but after be- and on
+# -tion and -sion; a secondary on the second vowel after it in words of three or more, not on an e.
 
-fn (g G2p&) svPhrase(ws Vec<String>&) String { return "" }
+svVowels := "aeiouy1234"
+svFront := "eiy234"
 
-fn svNumber(t String&) String { return t }
+# the word's letters in the ASCII form
+fn svLetters(w String&) String {
+    out := StringBuilder()
+    i I64 = 0
+    for i < w.Len() {
+        c := w[i]
+        if c < 128 {
+            out.PushChar(c)
+            i++
+            continue
+        }
+        two := w[i:i + 2] if i + 1 < w.Len() else ""
+        out.PushChar(svLetter(two))
+        i += 2 if c >= 0xC0 and c < 0xE0 else 1
+    }
+    return out.ToString()
+}
+
+fn svLetter(two String&) Char {
+    return match two {
+        case "\u{E5}": '1'
+        case "\u{E4}", "\u{E6}": '2'
+        case "\u{F6}", "\u{F8}": '3'
+        case "\u{E9}": '4'
+        case "\u{FC}": 'y'
+        case "\u{E0}", "\u{E1}": 'a'
+        case "\u{E8}", "\u{EA}": 'e'
+        case _: ' '
+    }
+}
+
+fn (g G2p&) svPhrase(ws Vec<String>&) String { return Vec<String>[g.svWord(w) for w in ws.View()].Join(" ") }
+
+fn (g G2p&) svWord(word String&) String {
+    if '+' in word or '~' in word: return g.svJoined(word)
+    w := String(Array<Char>[c for c in svLetters(word) if c != ' ' and c != '#'])
+    if word.StartsWith("#"): return try g.svTable.Get("#" + w) catch default svRules(w)
+    if g.svTable.Has(w): return g.svTable.Get(w)!
+    return svRules(w)
+}
+
+# number words joined: a+b as they are, a~b with a's stress made secondary (tjugo~ett ɕˌʉɡɔˈɛt)
+fn (g G2p&) svJoined(word String&) String {
+    out := StringBuilder()
+    for part in word.Split("+") {
+        tilde := try part.FindByte('~') catch default -1
+        if tilde < 0 {
+            out.Push(g.svWord(part))
+            continue
+        }
+        out.Push(g.svWord(part[:tilde]).Replace("'", ","))
+        out.Push(g.svWord(part[tilde + 1:]))
+    }
+    return out.ToString()
+}
+
+fn svVowel(c Char) Bool { return c in svVowels }
+
+type SvWord struct(w String&, vs Array<I64>&, stress I64) {
+    w
+    vs              # the vowels' places
+    stress          # which vowel takes the primary stress
+}
+
+fn (x SvWord&) at(i I64) Char { return x.w[i] if i >= 0 and i < x.w.Len() else ' ' }
+
+# whether the vowel at i takes the primary stress, not on the first syllable
+fn (x SvWord&) stressedLater(i I64) Bool { return x.stress > 0 and i < x.w.Len() and x.vs.Has(i) and x.vs[x.stress] == i }
+
+fn svStress(w String&, vs Array<I64>&) I64 {
+    for sf in ["tion", "sion"] {
+        k := try w.Find(sf) catch { continue }
+        if k == 0: continue
+        for v in range vs.Len() {
+            if vs[v] >= k + 2: return v
+        }
+    }
+    if vs.Len() > 1 and w.StartsWith("be") and w.Len() > 2 and not svVowel(w[2]): return 1
+    return 0
+}
+
+fn svRules(w String&) String {
+    vs := Array<I64>[i for i in range w.Len() if svVowel(w[i])]
+    x := SvWord(w, vs, svStress(w, vs))
+    out := StringBuilder()
+    v I64 = 0
+    i I64 = 0
+    for i < w.Len() {
+        if svVowel(w[i]) {
+            out.Push(x.vowel(i, v))
+            v++
+            i++
+            continue
+        }
+        sound, n := x.consonant(i)
+        out.Push(sound)
+        for k in range i, i + n {
+            if svVowel(w[k]): v++
+        }
+        i += n
+    }
+    return out.ToString()
+}
+
+svLong := ["a A:", "e e:", "i i:", "o u:", "u }", "y y:", "1 o:", "2 E:", "3 2:", "4 e:"]
+svShort := ["a a", "e E", "i I", "o O", "u 8", "y y", "1 O", "2 E", "3 9", "4 E"]
+
+fn svSound(table Array<String>&, c Char) String {
+    for m in table {
+        if m[0] == c: return m[2:]
+    }
+    return ""
+}
+
+# the consonant letters after the vowel at i
+fn (x SvWord&) following(i I64) String& {
+    j := i + 1
+    for j < x.w.Len() and not svVowel(x.w[j]): j++
+    return x.w[i + 1:j]
+}
+
+# whether the vowel at i is long when stressed
+fn (x SvWord&) open(i I64) Bool {
+    w := x.w
+    c := w[i]
+    cs := x.following(i)
+    last := i + 1 + cs.Len() == w.Len()
+    two := cs[:2] if cs.Len() >= 2 else cs
+    if c == 'e' and cs.StartsWith("j"): return false
+    if i == 0 and (w.StartsWith("av") or w.StartsWith("ut")) and w.Len() > 3 and not svVowel(w[2]): return true
+    if cs.Len() == 2 and cs[0] in "ptkbdg" and cs[1] in "lnrj": return true
+    if (c == 'o' or c == '1') and (two == "rd" or two == "rn"): return true
+    if (c == '1' and two == "rt") or (c == 'a' and (two == "rn" or two == "rt")): return true
+    if c == '2' and (two == "rd" or cs.StartsWith("rld")): return true
+    if c == '3' and cs.StartsWith("g") and cs.Len() > 1: return true
+    if c == '1' and (two == "nd" or two == "ld"): return true
+    if c == 'u' and cs == "n" and last: return false
+    if cs == "m" and last: return false
+    if cs.Len() == 2 and cs[0] in "pkfs" and cs[1] == 't' and w[i + 3:] == "e": return true
+    return cs.Len() <= 1 and cs != "x"
+}
+
+fn (x SvWord&) vowel(i I64, v I64) String {
+    w := x.w
+    c := w[i]
+    cs := x.following(i)
+    last := i + 1 + cs.Len() == w.Len()
+    final := i + 1 == w.Len()
+    if i >= 2 and (w[i - 2:].StartsWith("tion") or w[i - 2:].StartsWith("sion")): return ("'" if v == x.stress else "") + "u:"
+    het := i > 0 and w[i - 1:].StartsWith("het")
+    secondary := v == x.stress + 2 and x.vs.Len() >= 3 and (c != 'e' or het or (w.EndsWith("ligen") and v == x.vs.Len() - 1))
+    if v == x.stress or secondary {
+        long := x.open(i)
+        if secondary and (c == 'a' or c == 'e' or (c == 'i' and not (cs.Len() <= 1 and not last))): long = false
+        return ("'" if v == x.stress else ",") + svSound(svLong if long else svShort, c)
+    }
+    return x.unstressed(i, c, cs, last, final, het)
+}
+
+fn (x SvWord&) unstressed(i I64, c Char, cs String&, last Bool, final Bool, het Bool) String {
+    w := x.w
+    single := cs.Len() == 1 and not last
+    if c == 'e': return "e:" if het else "@"
+    if c == 'o' and last and cs == "m": return "O"
+    if c == 'o' and last and cs == "n": return "O" if w[i - 1] == 'g' else "u:"
+    if c == 'o': return "u:" if final or single or cs.StartsWith("r") else "O"
+    if c == '1' and (final or (cs.Len() <= 1 and i + 1 + cs.Len() >= w.Len() - 1)): return "o:"
+    if c == '2': return "E:" if cs.Len() == 1 and last else "@"
+    if c == '3' and cs.Len() == 1 and last: return "2:"
+    if c == 'i' and (final or ((cs == "t" or cs == "d" or cs == "s") and last) or single or (cs.Len() == 0 and not final)): return "i:"
+    if c == 'u' and (final or single): return "}"
+    return svSound(svShort, c)
+}
+
+# the sound of the consonant letters at i, and how many letters it takes
+fn (x SvWord&) consonant(i I64) String, I64 {
+    w := x.w
+    c := w[i]
+    next := x.at(i + 1)
+    prev := x.at(i - 1)
+    rest := w[i:]
+    start := i == 0
+    if rest.StartsWith("sch") or rest.StartsWith("stj"): return "sx", 3
+    if rest.StartsWith("skj"): return "C", 3
+    if rest.StartsWith("sk") and x.at(i + 2) in svFront and (start or x.stressedLater(i + 2)): return "sx", 2
+    if rest.StartsWith("sk") and i >= 2 and w[i - 2:].StartsWith("nisk"): return "sx", 2
+    if rest.StartsWith("sj") or rest.StartsWith("ch"): return "sx", 2
+    if rest.StartsWith("tj") or rest.StartsWith("kj"): return "C", 2
+    if start and c in "dghl" and next == 'j': return "j", 2
+    if rest.StartsWith("tion") or rest.StartsWith("sion"): return "sx", 2
+    if rest.StartsWith("ssion"): return "sx", 3
+    soft := next in svFront and next != ' ' and (start or x.stressedLater(i + 1))
+    if c == 'k' and soft: return "C", 1
+    if c == 'g' and soft: return "j", 1
+    if c == 'g' and (prev == 'r' or prev == 'l') and (i == w.Len() - 1 or next in svFront): return "j", 1
+    if c == 'g' and rest == "gel" and svVowel(prev): return "j", 1
+    if rest.StartsWith("ng"): return "N", 2
+    if c == 'n' and next == 'k': return "N", 1
+    if c == 'g' and next == 'n' and svVowel(prev): return "N", 1
+    if rest.StartsWith("ck"): return ("k:" if svVowel(x.at(i + 2)) else "k"), 2
+    if rest.StartsWith("rs"): return "Q", 2
+    if c == 'r' and next == 't' and prev in "a123o" and not (prev == 'o' and i == w.Len() - 2): return "", 1
+    if c == 'l' and prev == 'r' and next == 'd': return "", 1
+    if c == 'g' and next == 't' and (prev == 'i' or prev == 'a'): return "k", 1
+    if c == next: return svConsonant(c, ' ') + (":" if c == 't' and svVowel(x.at(i + 2)) else ""), 2
+    return svConsonant(c, next), 1
+}
+
+fn svConsonant(c Char, next Char) String {
+    return match c {
+        case 'x': "ks"
+        case 'z': "s"
+        case 'c': "s" if next in "eiy" and next != ' ' else "k"
+        case 'q': "k"
+        case 'w': "v"
+        case _: $c
+    }
+}
+
+# ---- Swedish numbers, as espeak reads them ----
+
+svOnes := "noll ett tv1 tre fyra fem sex sju 1tta nio tio elva tolv tretton fjorton femton sexton sjutton arton nitton"
+svTens := "_ _ tjugo trettio fyrtio femtio sextio sjuttio 1ttio nittio"
+
+# digits as words, each marked # (the words of numbers as espeak reads digits, not as it reads the word: 8 is ˈɔta,
+# åtta ˈɔtːa): tens and ones joined, the tens' stress secondary (a ~), "hundra" joined to the word before it (a +)
+fn svNumber(t String&) String {
+    dot := t.Len()
+    for k in range t.Len() {
+        if t[k] == ',' or t[k] == '.' {
+            dot = k
+            break
+        }
+    }
+    ones := svOnes.Split(" ")
+    whole := t[:dot]
+    out := Vec<String>[$ones[I64(c - '0')] for c in whole].Join(" ") if whole.Len() > 1 and whole[0] == '0' else svInt(try whole.ParseInt() catch default 0)
+    if dot < t.Len(): out = out + " punkt " + Vec<String>[$ones[I64(c - '0')] for c in t[dot + 1:]].Join(" ")
+    return Vec<String>["#" + x for x in out.Split(" ")].Join(" ").Replace("~", "~#").Replace("+", "+#")
+}
+
+fn svInt(n I64) String {
+    ones := svOnes.Split(" ")
+    tens := svTens.Split(" ")
+    if n < 20: return ones[n]
+    if n < 100: return tens[n / 10] + ("" if n % 10 == 0 else "~" + ones[n % 10])
+    if n < 1000: return ones[n / 100] + "+hundra" + ("" if n % 100 == 0 else " " + svInt(n % 100))
+    if n >= 1900 and n < 2000: return "nitton+hundra" + ("" if n % 100 == 0 else " " + svInt(n % 100))
+    if n < 1000000: return svInt(n / 1000) + " tusen" + ("" if n % 1000 == 0 else " " + svInt(n % 1000))
+    millions := "miljon" if n / 1000000 == 1 else svInt(n / 1000000) + " miljoner"
+    return millions + ("" if n % 1000000 == 0 else " " + svInt(n % 1000000))
+}
+
+# Swedish words as espeak gives them where the rules do not: function words, the words of numbers
+svWords := "och Ok\natt at\ndet de:t\ni i:\nsom sOm\nhan han\nen En\njag jA:g\np1 po:\nvar vA:r\nhade h,adE\ninte 'IntE\n" +
+    "hon hUn\nmed me:d\n2r E:r\nf3r f2:r\nden dEn\nsig s'Ej\ntill tIl\ns1 s'o:\nom Om\nav A:v\nhar hA:r\nett 'Et\n" +
+    "mig m'Ej\nde de:\nhonom h'OnOm\nskulle sk,8l@\nsade s'A:dE\nmen m'En\ndu d}\nn1got n,o:gOt\nkunde k,8nd@\n" +
+    "sin s'In\nman man\nfr1n fro:n\n2n En\ndem d'Em\nkan kan\nin 'In\nvi vi:\nni ni:\nvad vA:d\nvid vi:d\n" +
+    "n1gon n,o:gOn\neller ,El@r\nska skA:\ndig d'Ej\nmin m'In\nmycket m'yk@t\nmot mu:t\nville v,Il@\nvill vIl\n" +
+    "din d'In\nn1gra n,o:gra\nborde b,u:rdE\nb3r b2:r\ns2ga s'Eja\ns2ger s'Ej@r\nkanske k'ansx@\n#noll n'Ol\n" +
+    "#ett 'Et\n#tv1 tv'o:\n#tre tr'e:\n#fyra f'y:ra\n#fem f'Em\n#sex s'Eks\n#sju sx'}\n#1tta 'Ota\n#nio n'i:u:\n" +
+    "#tio t'i:u:\n#elva 'Elva\n#tolv t'Olv\n#tretton tr'EtOn\n#fjorton fj'u:rtOn\n#femton f'EmtOn\n#sexton s'EkstOn\n" +
+    "#sjutton sx'8tOn\n#arton 'A:rtOn\n#nitton n'ItOn\n#tjugo C'}gO\n#trettio tr'EtI\n#fyrtio f'9rtI\n" +
+    "#femtio f'EmtI\n#sextio s'EkstI\n#sjuttio sx'8tI\n#1ttio 'OtI\n#nittio n'ItI\n#hundra h'8ndra\n#tusen t'}sEn\n" +
+    "#miljon mIlj'u:n\n#miljoner mIlj'u:nEr\n#punkt p'8Nkt"
 
 # ---- IPA ----
 
@@ -911,6 +1187,15 @@ fn agreement(g G2p&, path String&, lang String&, show Bool) F64, F64 ? os.Error,
 
 fn refDir() String { return Cache() + "/ref/g2p" }
 
+test G2p "Swedish numbers and punctuation as espeak reads them" {
+    g := G2p.Parse("")
+    assert g.Phonemes("Jag har 23 \u{E4}pplen.", "sv")! == "j\u{251}\u{2D0}\u{261} h\u{251}\u{2D0}r \u{255}\u{2CC}\u{289}\u{261}\u{254}tr\u{2C8}e\u{2D0} \u{2C8}\u{25B}pl\u{259}n."
+    assert g.Phonemes("Sju sj\u{F6}sjuka sj\u{F6}m\u{E4}n", "sv")! == ipa("sx'} sx'9sx}k,a sx'2:mE:n", true)
+    assert g.Phonemes("1999; 3,5 station!", "sv")! == ipa("n'ItOnh'8ndra n,ItIn'i:u:; tr'e: p'8Nkt f'Em stasx'u:n!", true)
+    unknown := try g.Phonemes("x", "de") catch default "unknown"
+    assert unknown == "unknown"
+}
+
 test G2p "English: words, words CMUdict lacks and sentences against espeak (where the reference files are)" {
     if not os.Exists(refDir() + "/en_words.tsv") {
         Println("skipped: no reference")
@@ -931,4 +1216,15 @@ fn check(g G2p&, name String&, lang String&, exact F64, near F64) {
     e, n := agreement(g, refDir() + "/" + name + ".tsv", lang, os.Exists(refDir() + "/show"))!
     Println(name + ": " + $e + " exact, " + $n + " by edit distance")
     assert e >= exact and n >= near, name
+}
+
+test G2p "Swedish: words, held-out words and sentences against espeak (where the reference files are)" {
+    if not os.Exists(refDir() + "/sv_words.tsv") {
+        Println("skipped: no reference")
+        return
+    }
+    g := G2p.Parse("")
+    check(g, "sv_words", "sv", 0.88, 0.96)
+    check(g, "sv_heldout", "sv", 0.81, 0.94)
+    check(g, "sv_sentences", "sv", 0.58, 0.98)
 }

@@ -12,7 +12,9 @@ committed, as in `llm/`.
 | `transcribe.olang` | `Whisper`: the prompt and language detection, the logit rules (suppressed tokens, timestamp rules), greedy and beam decoding, `Cut` (segments), `Transcribe` (clips of any length), `Stream` (sound as it comes) |
 | `kws.olang` | the wake word: features, the network (`Spotter`), `Train`, `Detector` (a threshold over smoothed scores, a refractory second) |
 | `listen.olang` | `oann-listen`, the command |
+| `g2p.olang` | `G2p.Load`, `Phonemes(text, "en" or "sv")`: text to the IPA espeak-ng gives the VITS voices (below) |
 | `tools/reference.py` | the reference the tests are held to: transformers, F32, on CPU |
+| `tools/g2p_reference.py` | espeak-ng's phonemes (through phonemizer) for word lists and sentences, what `g2p.olang` is measured against |
 
 ## Using it
 
@@ -153,7 +155,56 @@ hold an implementation to a reference before reading Piper's ONNX files. Two pie
 1 GFLOP a second of speech): reading Piper's weights (ONNX protobuf, or converted once to safetensors) and a
 grapheme-to-phoneme step - espeak-ng, which every candidate here was trained with, is GPL-3, so it would be our own,
 matching espeak-ng's IPA for these voices: CMUdict (BSD-2) and rules for English, a lexicon and Swedish's fairly regular
-spelling rules for Swedish. Not built yet.
+spelling rules for Swedish: `g2p.olang`, below.
+
+## Grapheme to phoneme
+
+`G2p.Load()` (CMUdict, fetched once into `~/.cache/oann/g2p`), then `g.Phonemes(text, "en")` or `"sv"`: the IPA
+string phonemizer gives with backend espeak, en-us or sv, `preserve_punctuation=True`, `with_stress=True` - words
+separated by a space, the stress marks before the vowel, the punctuation phonemizer keeps kept where it was, numbers
+spelled out as espeak reads them ("1999" is nineteen hundred ninety nine, "23" in Swedish ɕˌʉɡɔtrˈeː). No code or data
+of espeak-ng is in it (GPL-3); espeak only writes the reference it is measured against.
+
+**English.** A word is CMUdict's, or a suffix (-s, -ed, -ing, -ly, -ness ...), a prefix or a British spelling of a word
+it has, or a compound of two; failing those, letter-to-sound rules (graphemes, long and short vowels by the consonants
+after them, the stress by prefixes and endings). The ARPAbet is then written as espeak writes en-us: espeak's stresses
+(a secondary next to the primary goes), the stressed vowels by ARPAbet and the unstressed ones mostly by the spelling
+(each vowel phone aligned with its letters: "a-" ɐ, "-ed" after t or d ᵻd, "-ity" ᵻɾi, i ɪ), flapped t (ɾ), a glottal
+before a last "-en" (ʔn̩), r-coloured vowels (oːɹ in "more", iə in "period"). Function words and the words of numbers
+have espeak's forms, alone and in a phrase ("a" ˈeɪ alone, ɐ in a phrase; "in the" one word, ɪnðə), and a final ɚ
+links to a vowel (ɚɹ).
+
+**Swedish.** Spelling rules: k, g and sk soft before a front vowel at a stressed syllable's start (ɕ, j, ɧ - espeak
+writes it sx), sj, stj, skj, tj, dj, gj, hj, lj, ng, nk, gn (ŋn), rs ʂ, rt t after a, å, ä, ö; a stressed vowel long
+when one consonant follows (and before some r clusters, a stop and a liquid, av- and ut-), short before two, a double
+one, ck, x or a last m; espeak's unstressed vowels (e and ä ə, o uː in an open syllable, i iː); the stress on the
+first syllable, after be-, on -tion; a secondary on the second vowel after the primary in longer words, as espeak puts
+it; and a table of 60 function words and the words of numbers. A pronunciation lexicon was surveyed: NST's Swedish
+lexicon (Språkbanken, nb.no; 927 000 words in SAMPA) is CC0 and would serve, but it gives true pronunciations, and
+espeak's sv rules often do not (sjösjuka is sxˈœsxʉkˌa, kort kˈɔt, bord bˈuːrd), so agreeing with espeak - what the
+voice was trained on - is better served by rules aimed at its output; Wiktionary's pronunciations (CC BY-SA) were not
+used.
+
+**Agreement with espeak-ng 1.51 / phonemizer 3.6** (`python3 -I speech/tools/g2p_reference.py`, then `make test`; a file
+`show` in `~/.cache/oann/ref/g2p` prints every line that differs). Word lists are counted from public-domain books
+(Project Gutenberg): English from Pride and Prejudice, The Adventures of Sherlock Holmes, Tom Sawyer and Moby Dick,
+Swedish from Lagerlöf's Bannlyst, Söderberg's Förvillelser and Gertrud Almqvist's I tolfte timmen. Exact: the share of
+words (or sentences) the same as espeak's string; by edit distance: one less the edit distance over espeak's length, in
+code points (phonemes, stress and length marks, spaces, punctuation):
+
+| list | exact | by edit distance |
+|---|---|---|
+| English, the 2000 most frequent words | 90.4% | 97.8% |
+| English, 200 frequent words CMUdict lacks (rules, suffixes, compounds) | 48.5% | 84.1% |
+| English, 12 sentences (numbers, punctuation, abbreviations) | 8 of 12 | 99.3% |
+| Swedish, the 1000 most frequent words (the rules were written looking at these) | 88.5% | 96.4% |
+| Swedish, the next 1000 (held out) | 81.8% | 94.8% |
+| Swedish, 12 sentences | 7 of 12 | 98.2% |
+
+Most of what differs is espeak's own lexicon and rules: English stress in words espeak knows otherwise (address,
+perfect), homographs (read, lead, wind), its FORCE and NORTH vowels (oːɹ, ɔːɹ) where the spelling does not tell them
+apart, syncopes (every ˈɛvɹi, different dˈɪfɹənt); Swedish long vowels of inflected forms (köpte ɕˈøːptə), secondary
+stresses and loanwords with a late stress (precis prəsˈiːs).
 
 ## Models, data and licences
 
@@ -166,6 +217,11 @@ Weights and clips are fetched by whoever runs the code; none are in this reposit
 | LibriVox, Aesop's Fables vol. 1, sections 1-2 (archive.org `aesop_fables_volume_one_librivox`), cut to 24, 20 and 67 s | test clips | public domain (LibriVox) |
 | the synthetic word of the kws test | wake-word test | made by the test |
 | transformers, torch (reference.py only) | the reference | Apache 2.0, BSD-3; not vendored, not needed to run |
+| CMUdict (cmusphinx/cmudict, `cmudict.dict`, fetched at run time) | English pronunciations (g2p) | BSD-2 |
+| espeak-ng 1.51, phonemizer (g2p_reference.py only) | the g2p reference | GPL-3; run offline to measure, not vendored or linked, not needed to run |
+| Project Gutenberg books 1342, 1661, 74, 2701, 39147, 21862, 77571 (fetched by g2p_reference.py) | g2p word lists | public domain (in the US) |
+| NST Swedish pronunciation lexicon (Språkbanken, nb.no) | surveyed for g2p, not used | CC0 |
+| Wiktionary pronunciations | not used | CC BY-SA |
 
 The clips are made by `ffmpeg -i IN.mp3 -ss S -t T -ar 16000 -ac 1 -c:a pcm_s16le OUT.wav` from
 `https://archive.org/download/aesop_fables_volume_one_librivox/fables_01_0{1,2}_aesop_64kb.mp3` (jfk.wav from
