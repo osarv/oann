@@ -61,7 +61,10 @@ type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 =
     Stops mut Vec<I32>& = Vec<I32>()
     Cache mut model.Cache& = model.Cache(m.C, Pages, Batch, MaxCtx / model.PageSize + 1, Exact)
     State mut model.State& = model.State(m, Batch + Chunk, Batch, MaxCtx + model.PageSize)
-    queue mut Vec<Request>& = Vec<Request>()        # waiting, the next at the end
+    queue mut Vec<Request>& = Vec<Request>()        # waiting, in order, from head
+    head I64 = 0
+    retry mut Vec<Request>& = Vec<Request>()        # preempted, before the queue, the last first
+    refused mut Vec<Done>& = Vec<Done>()            # requests with no room to generate, given by the next Step
     running mut Vec<seq>& = Vec<seq>()
     slots mut Vec<I64>& = Vec<I64>()
     for i in range Batch: slots.Push(Batch - 1 - i)
@@ -79,28 +82,45 @@ type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 =
 fn PagesFor(c model.Config&, budget I64) I64 { return budget / model.PageBytes(c) }
 
 # r queued (to run after those queued before it)
-fn (e mut Engine&) Submit(r Request) { e.queue.Insert(0, r)! }
+fn (e mut Engine&) Submit(r Request) { e.queue.Push(r) }
 
-fn (e Engine&) Idle() Bool { return e.queue.Len() == 0 and e.running.Len() == 0 }
+fn (e Engine&) Idle() Bool { return e.Waiting() == 0 and e.running.Len() == 0 and e.refused.Len() == 0 }
 
 fn (e Engine&) Running() I64 { return e.running.Len() }
 
-fn (e Engine&) Waiting() I64 { return e.queue.Len() }
+fn (e Engine&) Waiting() I64 { return e.queue.Len() - e.head + e.retry.Len() }
+
+# the next request waiting
+fn (e Engine&) next() Request { return e.retry.Last()! if e.retry.Len() > 0 else e.queue[e.head] }
+
+fn (e mut Engine&) taken() {
+    if e.retry.Len() > 0 {
+        e.retry.Pop()!
+        return
+    }
+    e.head++
+    if e.head == e.queue.Len() {
+        e.queue.Clear()
+        e.head = 0
+    }
+}
 
 fn pagesOf(positions I64) I64 { return (positions + model.PageSize - 1) / model.PageSize }
 
 # requests from the queue while there is a slot and room
 fn (e mut Engine&) admit() {
     for i in range e.Batch: e.ran[i] = 0
-    for e.queue.Len() > 0 and e.slots.Len() > 0 {
-        r := e.queue.Last()!
-        need := pagesOf(r.Prompt.Len().Min(e.MaxCtx)) + e.running.Len() + 1
-        if need > e.Cache.Free() and e.running.Len() > 0: return
-        if r.Prompt.Len() == 0 or r.Prompt.Len() >= e.MaxCtx {
+    for e.Waiting() > 0 and e.slots.Len() > 0 {
+        r := e.next()
+        if r.Prompt.Len() == 0 or r.Prompt.Len() >= e.MaxCtx or pagesOf(r.Prompt.Len() + 1) > e.Cache.Pages {
             # nothing to read, or no room to generate: done as it is
-            return
+            e.refused.Push(Done(r.Id, Array<I32>(0), false, r.Prompt.Len()))
+            e.taken()
+            continue
         }
-        e.queue.Pop()!
+        need := pagesOf(r.Prompt.Len()) + e.running.Len() + 1
+        if need > e.Cache.Free() and e.running.Len() > 0: return
+        e.taken()
         slot := e.slots.Pop()!
         s := seq(r, slot)
         e.rngs[slot] = rand.Rand(r.Seed)
@@ -132,7 +152,7 @@ fn (e mut Engine&) grow(i I64, n I64) Bool {
             }
             if v < 0: return false
             e.release(v)
-            e.queue.Push(e.running[v].req)
+            e.retry.Push(e.running[v].req)
             e.Preempted++
             e.running.RemoveAt(v)!
             if v < i: i--
@@ -150,6 +170,8 @@ fn (e mut Engine&) grow(i I64, n I64) Bool {
 fn (e mut Engine&) Step() Array<Done> {
     finished := Vec<Done>()
     e.admit()
+    for d in e.refused.View(): finished.Push(d)
+    e.refused.Clear()
     st := e.State
     st.Reset()
     budget := e.Chunk
@@ -333,6 +355,21 @@ test Engine "with too few pages for the batch, sequences are preempted and run a
     got, preempted := greedyRuns(m, ps, 6, 3, 256, Array<I32>(0))
     assert preempted > 0
     for i in range ps.Len(): assert got[i] == want[i], "request " + $i
+    os.RemoveAll(dir)!
+}
+
+test Engine "a prompt with no room to generate in is given back at once, empty, and the others run" {
+    dir := model.Tiny(true, 27)
+    m := model.Model.Load(dir)!
+    e := Engine(m, 2, 64, 8)
+    e.Sampling = Sampler(0.0, 1.0, 0)
+    e.Submit(Request(0, Array<I32>[I32(i % 90) for i in range 70], 5, 1))
+    e.Submit(Request(1, Array<I32>[1, 2, 3], 5, 2))
+    got := Array<I64>(2, -1)
+    for not e.Idle() {
+        for d in e.Step(): got[d.Id] = d.Tokens.Len()
+    }
+    assert got[0] == 0 and got[1] == 5
     os.RemoveAll(dir)!
 }
 

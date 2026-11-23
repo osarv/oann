@@ -92,7 +92,30 @@ greedy tokens the same - and the AMX path to the same tokens. On the whole vocab
 within 1e-4 of transformers' for both models; the AMX path's (BF16 activations and cache) within 0.12 for Qwen3-0.6B
 and 0.36 for the distilled 1.5B, whose keys carry large biases - the same greedy tokens either way.
 
-`make llmbench ARGS="DIR 512 16 bf16 1 16 64"` times decoding (bench/llm.olang).
+## Speed
+
+Decoding on a 4-core cloud VM with AMX (Xeon, 15 GB, about 25 GB/s from memory in practice), tokens a second for every
+sequence of the batch at a context of 512 positions (`make llmbench ARGS="DIR 512 16 bf16 1 16 64"`, bench/llm.olang),
+and the process's peak memory at batch 64:
+
+| model | weights | batch 1 | batch 16 | batch 64 | peak |
+|---|---|---|---|---|---|
+| DeepSeek-R1-Distill-Qwen-1.5B | BF16, 3.4 GB | 5.3 | 86 | 228 | 4.0 GB |
+| DeepSeek-R1-Distill-Qwen-1.5B | INT8, 2.3 GB | 5.0 | 73 | 197 | 2.9 GB |
+| DeepSeek-R1-Distill-Qwen-1.5B, context 2048 | BF16 | | 89 | 183 | 5.4 GB |
+| Qwen3-4B | BF16, 7.7 GB | 3.2 | 40 | 89 | 10.7 GB |
+| Qwen3-4B | INT8, 4.6 GB | 1.9 | 31 | 71 | 7.7 GB |
+| Qwen3-8B | INT8, 9.8 GB | 1.1 | 14 | 43 | 12.9 GB |
+
+A step's time goes mostly to the products, which read the weights from memory: a batch of 64 costs about 1.3 to 1.6
+times a batch of one. The rest is attention, which reads the cache and grows with the context - at 2048 positions and
+batch 64 it is as long as the products for the 1.5B model, sooner for models with more key-value heads (Qwen3's 8). INT8
+saves memory, not time here: widening the weights costs what reading half the bytes saves. Qwen3-8B in BF16 (16 GB)
+does not fit in 15 GB. `oann-gen` on 64 prompts with the 1.5B model, batch 64, at most 1024 tokens: 60194 tokens in
+301 s, 200 tokens a second, peak 5.2 GB. Measurements on a shared VM vary by 10-20% from run to run.
+
+A prompt is read in the same steps, each of its positions a row with attention of its own; that suits prompts of
+hundreds of tokens, not of many thousands.
 
 ## Models and licences
 
