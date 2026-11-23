@@ -1,0 +1,401 @@
+# speech/kws - a wake word: a small convolutional network over the last second of sound says whether it held the word,
+# and a Detector runs it on sound as it comes, firing where the score stays above a threshold.
+#
+# Features. 40 log-mel bands (speech/mel's filters and frames: 25 ms every 10 ms), log10 of the power, the window's
+# mean taken from each band (so a louder or quieter voice, or another microphone, gives the same features); a window
+# is Frames (96) frames, 0.96 s. The network is the image classifier of models/cnn on that [Frames x Mels] image:
+# stages of a 3x3 convolution, ReLU and 2x2 max pooling (8, 16 and 32 channels), then a dense layer to two classes,
+# "other" and "wake" - about 10 000 parameters, under a million multiply-adds a window.
+#
+# Training (Train) takes clips of the word (positives) and clips of anything else (negatives: other speech, noise,
+# silence), each a 16 kHz sound of any length: a positive's window is placed so the word's loudest part falls in it,
+# shifted at random by up to Shift frames and mixed with a stretch of a negative at a random level; a negative's
+# windows are taken anywhere. The data are whatever one records or synthesises (speech/README.md); the weights are
+# saved as safetensors (Save) with the configuration beside them, and loaded by Spotter.Load.
+#
+# Detection (Detector): every Every frames (100 ms) the last window is scored, the scores averaged over the last Smooth,
+# and a detection reported where the average reaches the threshold; none for Refractory frames after one.
+
+import "std/rand"
+import "std/os"
+import "../ad/graph"
+import "../io/checkpoint"
+import "../kernels/conv"
+import "../kernels/mat"
+import "../nn/layers"
+import "../nn/optim"
+import "../nn/train"
+import "mel"
+
+type Config struct() {
+    Mels I64 = 40
+    Frames I64 = 96             # frames a window (each 10 ms)
+    C1 I64 = 8                  # the stages' channels
+    C2 I64 = 16
+    C3 I64 = 32
+}
+
+# ---- features ----
+
+# the log-mel frames of x, [frames x Mels]: frame f centred on sample f Hop, for every frame whose samples are all in x
+# (the first mirrored at x's start)
+fn LogMel(s mut mel.Mel&, x Array<F32>&) Array<F32>, I64 {
+    n := ((x.Len() - mel.Window / 2) / mel.Hop + 1).Max(0)
+    out := Array<F32>(n * s.Mels)
+    for f0 in range 0, n, s.Frames: s.Log(out[f0 * s.Mels:], x, x.Len(), f0, s.Frames.Min(n - f0))
+    return out, n
+}
+
+# the window of frames f0 .. f0 + c.Frames of frames ([n x Mels]) as the network reads it: each band less its mean
+fn Window(c Config&, frames Array<F32>&, f0 I64, dst mut Array<F32>&) {
+    for m in range c.Mels {
+        sum F32 = 0.0
+        for f in range c.Frames: sum += frames[(f0 + f) * c.Mels + m]
+        mean := sum / F32(c.Frames)
+        for f in range c.Frames: dst[f * c.Mels + m] = frames[(f0 + f) * c.Mels + m] - mean
+    }
+}
+
+# ---- the network ----
+
+type Spotter struct(C Config, G graph.Graph<F32>, Task train.Classifier) {
+    C
+    G
+    Task
+}
+
+# the network on a graph of `batch` windows, its weights drawn from seed
+fn Spotter.New(c Config, batch I64, seed U64 = 1) Spotter ? conv.GeometryError {
+    g mut graph.Graph<F32>& = graph.Graph<F32>(batch)
+    x := g.Input(c.Frames, c.Mels, 1)
+    h := x
+    hh := c.Frames
+    ww := c.Mels
+    inC I64 = 1
+    for outC in [c.C1, c.C2, c.C3] {
+        k := layers.Conv.New(g, try conv.Shape(inC, hh, ww, outC, 3, 1, 1))
+        h = g.MaxPool2d(g.Act(k.Apply(g, h), mat.Act.Relu), try conv.Pool(outC, hh, ww, 2, 2))
+        hh /= 2
+        ww /= 2
+        inC = outC
+    }
+    head := layers.Dense.New(g, hh * ww * inC, 2)
+    logits := head.Apply(g, g.Reshape(h, hh * ww * inC))
+    t := train.Classifier.On(g, x, g.Classes(), logits)
+    try g.Plan(rand.Rand(seed)) catch { error conv.GeometryError.Invalid("the graph does not plan") }
+    return Spotter(c, g, t)
+}
+
+# the probability of "wake" of each of the first n windows in the graph's input (each Frames x Mels)
+fn (s mut Spotter&) Scores(n I64, out mut Array<F32>&) {
+    s.G.Forward(n)
+    z := s.G.Value(s.Task.Logits)
+    for i in range n {
+        a := F64(z.Get(i, 0))
+        b := F64(z.Get(i, 1))
+        out[i] = F32(1.0 / (1.0 + (a - b).Exp()))
+    }
+}
+
+# the weights and the configuration saved as safetensors
+fn (s Spotter&) Save(path String&) ? os.Error {
+    w := checkpoint.Writer()
+    w.Meta("mels", $s.C.Mels)
+    w.Meta("frames", $s.C.Frames)
+    w.Meta("channels", $s.C.C1 + "," + $s.C.C2 + "," + $s.C.C3)
+    try w.Add("params", s.G.Params()) catch { error os.Error.Failed("params") }
+    try w.Save(path)
+}
+
+# a saved network, on a graph of `batch` windows
+fn Spotter.Load(path String&, batch I64 = 1) Spotter ? os.Error {
+    f := try checkpoint.File.Load(path) catch checkpoint.SafetensorsError { error os.Error.Failed(path + " is not safetensors") }
+    c := Config()
+    c.Mels = try (try f.Meta.Get("mels") catch { error os.Error.Failed("mels") }).ParseInt() catch { error os.Error.Failed("mels") }
+    c.Frames = try (try f.Meta.Get("frames") catch { error os.Error.Failed("frames") }).ParseInt() catch { error os.Error.Failed("frames") }
+    ch := (try f.Meta.Get("channels") catch { error os.Error.Failed("channels") }).Split(",")
+    if ch.Len() != 3: error os.Error.Failed("channels")
+    c.C1 = try ch[0].ParseInt() catch { error os.Error.Failed("channels") }
+    c.C2 = try ch[1].ParseInt() catch { error os.Error.Failed("channels") }
+    c.C3 = try ch[2].ParseInt() catch { error os.Error.Failed("channels") }
+    s := try Spotter.New(c, batch) catch conv.GeometryError { error os.Error.Failed("a configuration that does not build") }
+    try f.Read("params", s.G.Params()) catch { error os.Error.Failed(path + "'s params do not fit") }
+    s.G.SyncParams()
+    return s
+}
+
+# ---- training ----
+
+type TrainOptions struct() {
+    Epochs I64 = 20
+    Batch I64 = 32
+    Rate F64 = 0.003
+    PerClip I64 = 8             # windows drawn from each clip an epoch
+    Shift I64 = 20              # frames a positive's window moves at random
+    Mix F64 = 0.5               # the largest level of a negative mixed under a positive (of its own level)
+    Seed U64 = 1
+}
+
+# the frame of x's loudest stretch of 30 frames, its centre
+fn loudest(frames Array<F32>&, n I64, mels I64) I64 {
+    best I64 = 0
+    top F32 = -1e30
+    for f in range n {
+        e F32 = 0.0
+        for g in range (f - 15).Max(0), (f + 15).Min(n) {
+            for m in range mels: e += frames[g * mels + m]
+        }
+        if e > top {
+            top = e
+            best = f
+        }
+    }
+    return best
+}
+
+# the sample of each clip its loudest stretch is centred on
+fn centres(s mut mel.Mel&, xs Array<Array<F32>&>&) Array<I64> {
+    out := Array<I64>(xs.Len())
+    for i, x in xs {
+        f, n := LogMel(s, x)
+        out[i] = loudest(f, n, s.Mels) * mel.Hop
+    }
+    return out
+}
+
+# `span` samples of x around sample centre (shifted by up to `shift` frames at random) added into dst, times gain
+fn place(dst mut Array<F32>&, x Array<F32>&, centre I64, shift I64, gain F32, r mut rand.Rand&) {
+    span := dst.Len()
+    start := centre - span / 2 + (I64(r.Below(2 * shift + 1)) - shift) * mel.Hop
+    for i in range span {
+        j := start + i
+        if j >= 0 and j < x.Len(): dst[i] += x[j] * gain
+    }
+}
+
+# the training set's clips and where each is loudest
+type sounds struct(Pos Array<Array<F32>&>&, Neg Array<Array<F32>&>&, PosAt Array<I64>&, NegAt Array<I64>&) {
+    Pos
+    Neg
+    PosAt
+    NegAt
+}
+
+# a sample of the training set: a positive placed around its loudest stretch and mixed with a negative under it, or a
+# negative - half the time around its own loudest stretch (other words, where they are), else anywhere
+fn example(c Config&, s mut mel.Mel&, d sounds&, wake Bool, o TrainOptions&, r mut rand.Rand&, dst mut Array<F32>&) {
+    span := (c.Frames + 4) * mel.Hop
+    x := Array<F32>(span)
+    k := r.Below(d.Neg.Len())
+    n := d.Neg[k]
+    level := F32(1.0 if not wake else o.Mix * r.Float())
+    if not wake and r.Below(2) == 0 {
+        place(x, n, d.NegAt[k], o.Shift, level, r)
+    } else if n.Len() > span {
+        at := I64(r.Below(n.Len() - span))
+        for i in range span: x[i] = n[at + i] * level
+    }
+    if wake {
+        j := r.Below(d.Pos.Len())
+        place(x, d.Pos[j], d.PosAt[j], o.Shift, F32(0.3 + 0.7 * r.Float()), r)
+    }
+    f, nf := LogMel(s, x)
+    Window(c, f, nf - c.Frames, dst)
+}
+
+# a network trained on positives and negatives; the last epoch's loss beside it
+fn Train(c Config, pos Array<Array<F32>&>&, neg Array<Array<F32>&>&, o TrainOptions&) Spotter, F64 ? conv.GeometryError {
+    s := try Spotter.New(c, o.Batch, o.Seed)
+    opt := optim.AdamW(s.G.Params(), s.G.ParamGrads(), rate = o.Rate, spans = optim.Spans(s.G))
+    r := rand.Rand(o.Seed + 1)
+    m := mel.Mel(c.Mels, 256)
+    d := sounds(pos, neg, centres(m, pos), centres(m, neg))
+    xs := s.G.Data(s.Task.X).Flat()!
+    ys := s.G.Ints(s.Task.Y).Flat()!
+    per := c.Frames * c.Mels
+    batches := ((pos.Len() + neg.Len()) * o.PerClip / o.Batch).Max(1)
+    loss F64 = 0.0
+    for _ in range o.Epochs {
+        loss = 0.0
+        for _ in range batches {
+            for i in range o.Batch {
+                wake := r.Below(2) == 0
+                example(c, m, d, wake, o, r, xs[i * per:(i + 1) * per])
+                ys[i] = I32(1 if wake else 0)
+            }
+            s.G.Forward(o.Batch)
+            s.G.Backward(s.Task.Loss)
+            opt.Step()
+            s.G.SyncParams()
+            loss += s.G.Scalar(s.Task.Loss)
+        }
+        loss /= F64(batches)
+    }
+    return s, loss
+}
+
+# ---- detection ----
+
+type Detection struct(Time F64, Score F64) {
+    Time                        # seconds from the first sample pushed to the window's end
+    Score                       # the smoothed probability
+}
+
+type Detector struct(S mut Spotter&, Threshold F64 = 0.8) {
+    S
+    Threshold
+    Every I64 = 10              # frames between scorings (100 ms)
+    Smooth I64 = 3              # scorings averaged
+    Refractory I64 = 100        # frames after a detection with none (1 s)
+    m mut mel.Mel& = mel.Mel(S.C.Mels, 64)
+    buf mut Vec<F32>& = Vec<F32>()
+    base I64 = 0                # samples dropped before buf[0]
+    frames mut Vec<F32>& = Vec<F32>()   # log-mel frames, from frame f0
+    f0 I64 = 0
+    next I64 = 0                # the frame the next scoring ends at
+    recent mut Array<F32>& = Array<F32>(64)   # the last scores, a ring
+    scored I64 = 0
+    quiet I64 = 0               # the frame before which nothing fires
+    win mut Array<F32>& = Array<F32>(S.C.Frames * S.C.Mels)
+    one mut Array<F32>& = Array<F32>(1)
+}
+
+# the detections in sound x, appended to what came before
+fn (d mut Detector&) Push(x Array<F32>&) Array<Detection> {
+    c := d.S.C
+    for v in x: d.buf.Push(v)
+    # every frame whose samples have all come (frame f centred on sample f Hop)
+    have := d.f0 + d.frames.Len() / c.Mels
+    upto := ((d.base + d.buf.Len() - mel.Window / 2) / mel.Hop + 1).Max(0)
+    if upto > have {
+        out := Array<F32>((upto - have) * c.Mels)
+        all := d.buf.ToArray()
+        d.m.Log(out, all, all.Len(), have - d.base / mel.Hop, upto - have)
+        for v in out: d.frames.Push(v)
+    }
+    found := Vec<Detection>()
+    if d.next == 0: d.next = c.Frames
+    for d.next <= d.f0 + d.frames.Len() / c.Mels {
+        Window(c, d.frames.ToArray(), d.next - c.Frames - d.f0, d.win)
+        xs := d.S.G.Data(d.S.Task.X).Flat()!
+        for i in range d.win.Len(): xs[i] = d.win[i]
+        d.S.Scores(1, d.one)
+        d.recent[d.scored % 64] = d.one[0]
+        d.scored += 1
+        k := d.Smooth.Min(d.scored).Min(64)
+        sum F64 = 0.0
+        for i in range k: sum += F64(d.recent[(d.scored - 1 - i) % 64])
+        avg := sum / F64(k)
+        if avg >= d.Threshold and d.next >= d.quiet {
+            found.Push(Detection(F64(d.next * mel.Hop) / F64(mel.Rate), avg))
+            d.quiet = d.next + d.Refractory
+        }
+        d.next += d.Every
+    }
+    d.trim()
+    return found.ToArray()
+}
+
+# frames and samples no scoring will read again let go of
+fn (d mut Detector&) trim() {
+    c := d.S.C
+    keepFrom := d.next - c.Frames
+    drop := keepFrom - d.f0
+    if drop > 256 {
+        rest := Vec<F32>()
+        for i in range drop * c.Mels, d.frames.Len(): rest.Push(d.frames[i])
+        d.frames = rest
+        d.f0 += drop
+    }
+    # samples: those before the first frame still to be computed, less a window
+    first := d.f0 + d.frames.Len() / c.Mels
+    sdrop := first * mel.Hop - mel.Window - d.base
+    if sdrop > 16000 {
+        rest := Vec<F32>()
+        for i in range sdrop, d.buf.Len(): rest.Push(d.buf[i])
+        d.buf = rest
+        d.base += sdrop
+    }
+}
+
+# ---- checks ----
+
+# a synthetic word at 16 kHz: a rising chirp, a pause, a tone - pitch and length varied by the generator (rising false:
+# a falling chirp and a higher tone, a decoy)
+fn word(r mut rand.Rand&, rising Bool) Array<F32> {
+    p := 0.9 + 0.2 * r.Float()
+    t := 0.9 + 0.2 * r.Float()
+    amp := 0.3 + 0.5 * r.Float()
+    a := I64(0.25 * t * 16000.0)
+    gap := I64(0.12 * t * 16000.0)
+    b := I64(0.2 * t * 16000.0)
+    out := Array<F32>(a + gap + b)
+    phase F64 = 0.0
+    for i in range a {
+        u := F64(i) / F64(a)
+        f := p * (500.0 + 1000.0 * (u if rising else 1.0 - u))
+        phase += 2.0 * Pi * f / 16000.0
+        out[i] = F32(amp * phase.Sin() * (1.0 - (2.0 * u - 1.0).Pow(8.0)))
+    }
+    tone := p * (800.0 if rising else 1300.0)
+    for i in range b {
+        u := F64(i) / F64(b)
+        out[a + gap + i] = F32(amp * (2.0 * Pi * tone * F64(i) / 16000.0).Sin() * (1.0 - (2.0 * u - 1.0).Pow(8.0)))
+    }
+    return out
+}
+
+# n seconds of noise at level l, with a stray tone now and then
+fn noise(r mut rand.Rand&, n F64, l F64) Array<F32> {
+    out := Array<F32>(I64(n * 16000.0))
+    f := 300.0 + 2000.0 * r.Float()
+    for i in range out.Len() {
+        out[i] = F32(l * r.Normal())
+        if (i / 8000) % 3 == 1: out[i] += F32(0.1 * (2.0 * Pi * f * F64(i) / 16000.0).Sin())
+    }
+    return out
+}
+
+test Detector "a network trained on a synthetic word finds it in a stream of noise and decoys, saved and loaded" {
+    r := rand.Rand(7)
+    ps := Vec<Array<F32>&>()
+    for _ in range 24: ps.Push(word(r, true))
+    ns := Vec<Array<F32>&>()
+    for i in range 24 {
+        if i % 2 != 0 {
+            ns.Push(noise(r, 3.0, 0.002 + 0.05 * r.Float()))
+            continue
+        }
+        bg := noise(r, 2.0, 0.01)
+        w := word(r, false)
+        for j in range w.Len(): bg[4000 + j] += w[j]
+        ns.Push(bg)
+    }
+    pos := ps.ToArray()
+    neg := ns.ToArray()
+    o := TrainOptions()
+    o.Epochs = 15
+    s, loss := Train(Config(), pos, neg, o)!
+    assert loss < 0.1, $loss
+    dir := os.MkTemp()!
+    s.Save(dir + "/wake.safetensors")!
+    loaded := Spotter.Load(dir + "/wake.safetensors")!
+    os.RemoveAll(dir)!
+    # 9 s of noise: the word at 1.5, 4.5 and 7 s, a decoy at 3 s
+    x := noise(r, 9.0, 0.01)
+    for at in [1.5, 4.5, 7.0, 3.0] {
+        w := word(r, at != 3.0)
+        for j in range w.Len(): x[I64(at * 16000.0) + j] += w[j]
+    }
+    d := Detector(loaded, 0.8)
+    found := Vec<Detection>()
+    for c0 in range 0, x.Len(), 1600 {
+        for f in d.Push(x[c0:(c0 + 1600).Min(x.Len())]): found.Push(f)
+    }
+    shown := ""
+    for f in found: shown = shown + " " + $f.Time + ":" + $f.Score
+    assert found.Len() == 3, shown
+    for i, at in [1.5, 4.5, 7.0] {
+        assert found[i].Time > at and found[i].Time < at + 1.5, $found[i].Time
+    }
+}

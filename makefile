@@ -15,7 +15,8 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang \
 	archnet/encode.olang archnet/offline.olang archnet/toy.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
 	surgery/model.olang surgery/ops.olang \
-	llm/bpe.olang llm/model.olang llm/engine.olang
+	llm/bpe.olang llm/model.olang llm/engine.olang \
+	speech/mel.olang speech/whisper.olang speech/transcribe.olang speech/kws.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers

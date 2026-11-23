@@ -1,0 +1,571 @@
+# speech/whisper - OpenAI's Whisper (tiny, base, small, medium, large; the .en models alike) run for inference as Hugging
+# Face publishes it: config.json and model.safetensors. An encoder reads 30 s of log-mel (speech/mel) - two
+# convolutions of width 3 (the second of stride 2), GELU after each, sinusoidal positions, then pre-norm transformer
+# blocks - into 1500 positions; a decoder of the same blocks with cross-attention to them writes tokens, a position at a
+# time, through a cache of its keys and values. Every LayerNorm has a bias; the key projections have none.
+#
+# Products. Every linear map and the encoder's attention are kernels/gemm products: F32 throughout by default (the
+# reference's arithmetic, its logits within 1e-4), or BF16 operands summed in F32 (Bf: AMX tiles, where the target has
+# them; gemm widens elsewhere), the weights rounded to BF16 once at load. The decoder's attention stays F32.
+#
+# Shorter windows. The encoder runs over any n <= 1500 positions (2n frames of log-mel): the positions' first n
+# embeddings, attention over those n - whisper.cpp's audio context. It is not what the model was trained on (30 s
+# padded with silence), so it is an option for speed on short commands, and the 30 s window is the reference.
+
+import "std/json"
+import "std/os"
+import "../io/checkpoint"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../tensor"
+import "mel"
+
+type ModelError error {
+    Unsupported(what String)
+    Malformed(what String)
+}
+
+# ---- the configuration ----
+
+type Config struct() {
+    Dim I64                 # d_model
+    EncLayers I64
+    EncHeads I64
+    DecLayers I64
+    DecHeads I64
+    Ffn I64                 # encoder_ffn_dim (the decoder's is the same in every Whisper)
+    Vocab I64
+    Mels I64                # num_mel_bins
+    Positions I64           # max_source_positions: 1500
+    Text I64                # max_target_positions: 448
+}
+
+fn intOf(j json.Json&, key String&) I64 ? ModelError {
+    v := try j[key] catch { error ModelError.Malformed("config.json has no " + key) }
+    return try v.AsInt() catch { error ModelError.Malformed("config.json's " + key) }
+}
+
+fn Config.Parse(text String&) Config ? ModelError {
+    j := try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
+    kind := try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
+    if kind != "whisper": error ModelError.Unsupported("model_type " + kind + " (whisper runs)")
+    c := Config()
+    c.Dim = try intOf(j, "d_model")
+    c.EncLayers = try intOf(j, "encoder_layers")
+    c.EncHeads = try intOf(j, "encoder_attention_heads")
+    c.DecLayers = try intOf(j, "decoder_layers")
+    c.DecHeads = try intOf(j, "decoder_attention_heads")
+    c.Ffn = try intOf(j, "encoder_ffn_dim")
+    if (try intOf(j, "decoder_ffn_dim")) != c.Ffn: error ModelError.Unsupported("an encoder and a decoder of different widths")
+    c.Vocab = try intOf(j, "vocab_size")
+    c.Mels = try intOf(j, "num_mel_bins")
+    c.Positions = try intOf(j, "max_source_positions")
+    c.Text = try intOf(j, "max_target_positions")
+    if c.Dim % c.EncHeads != 0 or c.Dim % c.DecHeads != 0: error ModelError.Malformed("heads that do not divide d_model")
+    return c
+}
+
+# ---- weights ----
+
+# y = x W^T + b of In inputs and Out outputs: W row-major [Out x In], F32 or (Bf) BF16
+type Lin struct(In I64, Out I64, Bf Bool) {
+    In
+    Out
+    Bf
+    W mut Array<F32>& = Array<F32>(0)
+    H mut Array<BF16>& = Array<BF16>(0)
+    Bias mut Array<F32>& = Array<F32>(Out)
+}
+
+type Norm struct(n I64) {
+    G mut Array<F32>& = Array<F32>(n)
+    B mut Array<F32>& = Array<F32>(n)
+}
+
+# a transformer block: self-attention (Qkv, the keys' bias zero), cross-attention (decoder: CQ, and CKv the keys and
+# values of the encoder's positions), a perceptron of GELU
+type Block struct(c Config&, cross Bool, bf Bool) {
+    Ln1 Norm = Norm(c.Dim)
+    Qkv Lin = Lin(c.Dim, 3 * c.Dim, bf)
+    O Lin = Lin(c.Dim, c.Dim, bf)
+    Cross Bool = cross
+    Ln2 Norm = Norm(c.Dim if cross else 0)
+    CQ Lin = Lin(c.Dim, c.Dim if cross else 0, bf)
+    CKv Lin = Lin(c.Dim, 2 * c.Dim if cross else 0, bf)
+    CO Lin = Lin(c.Dim, c.Dim if cross else 0, bf)
+    Ln3 Norm = Norm(c.Dim)
+    Fc1 Lin = Lin(c.Dim, c.Ffn, bf)
+    Fc2 Lin = Lin(c.Ffn, c.Dim, bf)
+}
+
+type reader struct(f checkpoint.File&) {
+    f
+}
+
+# tensor "name" (n elements) into dst from at
+fn (r reader&) into(dst mut Array<F32>&, at I64, name String&, n I64) ? ModelError {
+    e := try r.f.Find(name) catch { error ModelError.Malformed("no tensor " + name) }
+    count I64 = 1
+    for d in e.Shape: count *= d
+    if count != n: error ModelError.Malformed(name + " is " + $e.Shape + ", not " + $n + " elements")
+    t := try tensor.Tensor<F32>.Over(dst, at, ...e.Shape) catch { error ModelError.Malformed(name) }
+    try r.f.Read(name, t) catch { error ModelError.Malformed(name) }
+}
+
+# rows from..from + rows of l's weights from "name.weight" ([rows, In], or a convolution's [rows, channels, width]),
+# its bias from "name.bias" where there is one (zero otherwise)
+fn (r reader&) lin(l mut Lin&, name String&, from I64 = 0, rows I64 = -1) ? ModelError {
+    n := l.Out if rows < 0 else rows
+    if l.W.Len() == 0: l.W = Array<F32>(l.In * l.Out)
+    try r.into(l.W, from * l.In, name + ".weight", n * l.In)
+    if r.f.Has(name + ".bias"): try r.into(l.Bias, from, name + ".bias", n)
+}
+
+fn (r reader&) norm(n mut Norm&, name String&) ? ModelError {
+    try r.into(n.G, 0, name + ".weight", n.G.Len())
+    try r.into(n.B, 0, name + ".bias", n.B.Len())
+}
+
+# l's weights rounded to BF16 where it runs so, the F32 ones dropped
+fn (l mut Lin&) settle() {
+    if not l.Bf: return
+    l.H = Array<BF16>[BF16(v) for v in l.W]
+    l.W = Array<F32>(0)
+}
+
+fn (r reader&) block(b mut Block&, p String&, d I64) ? ModelError {
+    try r.norm(b.Ln1, p + "self_attn_layer_norm")
+    try r.lin(b.Qkv, p + "self_attn.q_proj", 0, d)
+    try r.lin(b.Qkv, p + "self_attn.k_proj", d, d)
+    try r.lin(b.Qkv, p + "self_attn.v_proj", 2 * d, d)
+    try r.lin(b.O, p + "self_attn.out_proj")
+    if b.Cross {
+        try r.norm(b.Ln2, p + "encoder_attn_layer_norm")
+        try r.lin(b.CQ, p + "encoder_attn.q_proj")
+        try r.lin(b.CKv, p + "encoder_attn.k_proj", 0, d)
+        try r.lin(b.CKv, p + "encoder_attn.v_proj", d, d)
+        try r.lin(b.CO, p + "encoder_attn.out_proj")
+    }
+    try r.norm(b.Ln3, p + "final_layer_norm")
+    try r.lin(b.Fc1, p + "fc1")
+    try r.lin(b.Fc2, p + "fc2")
+    b.Qkv.settle()
+    b.O.settle()
+    b.CQ.settle()
+    b.CKv.settle()
+    b.CO.settle()
+    b.Fc1.settle()
+    b.Fc2.settle()
+}
+
+# ---- the model ----
+
+type Model struct(C Config, Bf Bool) {
+    C
+    Bf                                      # BF16 operands (AMX where the target has it); else F32
+    Conv1 Lin = Lin(3 * C.Mels, C.Dim, Bf)  # [Dim x Mels x 3]: input (c, k) at c 3 + k
+    Conv2 Lin = Lin(3 * C.Dim, C.Dim, Bf)
+    EncPos mut Array<F32>& = Array<F32>(C.Positions * C.Dim)
+    encs := Vec<Block>()
+    for _ in range C.EncLayers: encs.Push(Block(C, false, Bf))
+    Enc mut Array<Block>& = encs.ToArray()
+    EncLn Norm = Norm(C.Dim)
+    Embed mut Array<F32>& = Array<F32>(C.Vocab * C.Dim)   # the tokens' embeddings, also the head (tied)
+    HeadB mut Array<BF16>& = Array<BF16>(0)               # Bf: the head in BF16
+    DecPos mut Array<F32>& = Array<F32>(C.Text * C.Dim)
+    decs := Vec<Block>()
+    for _ in range C.DecLayers: decs.Push(Block(C, true, Bf))
+    Dec mut Array<Block>& = decs.ToArray()
+    DecLn Norm = Norm(C.Dim)
+    Threads I64 = gemm.Cores()
+}
+
+# the model in directory dir (config.json, model.safetensors): BF16 operands where bf is set
+fn Model.Load(dir String&, bf Bool = false) Model ? ModelError, os.Error {
+    c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
+    f := try checkpoint.File.Load(dir + "/model.safetensors") catch checkpoint.SafetensorsError { error ModelError.Malformed(dir + "/model.safetensors") }
+    r := reader(f)
+    m := Model(c, bf)
+    try r.lin(m.Conv1, "model.encoder.conv1")
+    try r.lin(m.Conv2, "model.encoder.conv2")
+    m.Conv1.settle()
+    m.Conv2.settle()
+    try r.into(m.EncPos, 0, "model.encoder.embed_positions.weight", c.Positions * c.Dim)
+    for i in range c.EncLayers: try r.block(m.Enc[i], "model.encoder.layers." + $i + ".", c.Dim)
+    try r.norm(m.EncLn, "model.encoder.layer_norm")
+    try r.into(m.Embed, 0, "model.decoder.embed_tokens.weight", c.Vocab * c.Dim)
+    if bf: m.HeadB = Array<BF16>[BF16(v) for v in m.Embed]
+    try r.into(m.DecPos, 0, "model.decoder.embed_positions.weight", c.Text * c.Dim)
+    for i in range c.DecLayers: try r.block(m.Dec[i], "model.decoder.layers." + $i + ".", c.Dim)
+    try r.norm(m.DecLn, "model.decoder.layer_norm")
+    return m
+}
+
+# the parameters
+fn (m Model&) Params() I64 {
+    c := m.C
+    enc := c.EncLayers * (4 * c.Dim * c.Dim + 2 * c.Dim * c.Ffn)
+    dec := c.DecLayers * (8 * c.Dim * c.Dim + 2 * c.Dim * c.Ffn)
+    return enc + dec + 3 * c.Dim * (c.Mels + c.Dim) + (c.Vocab + c.Text + c.Positions) * c.Dim
+}
+
+# ---- the arithmetic every part shares ----
+
+# the products of one caller: gemm's workspace and room for an operand rounded to BF16
+type Arith struct(threads I64, dim I64, room I64) {
+    ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(threads, dim)
+    xb mut Array<BF16>& = Array<BF16>(room)
+    yb mut Array<BF16>& = Array<BF16>(room)
+}
+
+# dst[: rows, : w.Out] = src[: rows, : w.In] W^T + b, rows of src w.In apart and of dst w.Out apart
+fn (a mut Arith&) Lin(dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Lin&) {
+    if rows == 0 or w.Out == 0: return
+    c := mat.Mat<F32>(dst, 0, rows, w.Out, w.Out)
+    if w.Bf {
+        for i in range rows * w.In: a.xb[i] = BF16(src[i])
+        gemm.Gemm(a.ws, c, mat.Mat<BF16>(a.xb, 0, rows, w.In, w.In), false, mat.Mat<BF16>(w.H, 0, w.Out, w.In, w.In), true, epi = gemm.Epilogue.Bias(w.Bias))
+        return
+    }
+    gemm.Gemm(a.ws, c, mat.Mat<F32>(src, 0, rows, w.In, w.In), false, mat.Mat<F32>(w.W, 0, w.Out, w.In, w.In), true, epi = gemm.Epilogue.Bias(w.Bias))
+}
+
+# LayerNorm of rows r0 .. r1 of x (n wide) into y, statistics in F64
+fn layerNorm(y mut Array<F32>&, x Array<F32>&, n I64, r0 I64, r1 I64, g Norm&) {
+    for r in range r0, r1 {
+        o := r * n
+        s F64 = 0.0
+        for i in range n: s += F64(x[o + i])
+        mean := s / F64(n)
+        v F64 = 0.0
+        for i in range n: v += (F64(x[o + i]) - mean) * (F64(x[o + i]) - mean)
+        inv := 1.0 / (v / F64(n) + 1e-5).Sqrt()
+        for i in range n: y[o + i] = F32((F64(x[o + i]) - mean) * inv) * g.G[i] + g.B[i]
+    }
+}
+
+# GELU (erf's) of x[from .. to]
+fn gelu(x mut Array<F32>&, from I64, to I64) {
+    for i in range from, to {
+        v := F64(x[i])
+        x[i] = F32(0.5 * v * (1.0 + (v * 0.7071067811865476).Erf()))
+    }
+}
+
+# each of rows r0 .. r1 of s (n wide) the softmax of itself
+fn softmax(s mut Array<F32>&, n I64, r0 I64, r1 I64) {
+    for r in range r0, r1 {
+        o := r * n
+        top := s[o]
+        for i in range 1, n: top = top.Max(s[o + i])
+        sum F64 = 0.0
+        for i in range n {
+            e := F64(s[o + i] - top).Exp()
+            s[o + i] = F32(e)
+            sum += e
+        }
+        inv := F32(1.0 / sum)
+        for i in range n: s[o + i] *= inv
+    }
+}
+
+# f(rows r0 .. r1) over the threads, rows split evenly
+fn (m Model&) rows(n I64, f fn&(r0 I64, r1 I64)) {
+    t := m.Threads.Min(n).Max(1)
+    join {
+        for i in range t: spawn f(i * n / t, (i + 1) * n / t)
+    }
+}
+
+# ---- the encoder ----
+
+# the encoder's buffers for up to n positions
+type Encoder struct(m Model&, n I64) {
+    N I64 = n
+    a mut Arith& = Arith(m.Threads, (2 * n).Max(m.C.Ffn).Max(3 * m.C.Dim), (2 * n * 3 * m.C.Dim).Max(n * m.C.Ffn).Max(n * n))
+    col mut Array<F32>& = Array<F32>(2 * n * 3 * m.C.Dim.Max(m.C.Mels))
+    x mut Array<F32>& = Array<F32>(2 * n * m.C.Dim)       # the states (the first convolution's 2n rows at first)
+    h mut Array<F32>& = Array<F32>(n * m.C.Dim)
+    qkv mut Array<F32>& = Array<F32>(n * 3 * m.C.Dim)
+    att mut Array<F32>& = Array<F32>(n * m.C.Dim)
+    f mut Array<F32>& = Array<F32>(n * m.C.Ffn)
+    s mut Array<F32>& = Array<F32>(n * n)
+    Out mut Array<F32>& = Array<F32>(n * m.C.Dim)          # the encoded positions, [n x Dim]
+}
+
+# the n positions of mel ([Mels x 2n], a mel's frames in a row) into e.Out
+fn (m Model&) Encode(e mut Encoder&, spec Array<F32>&, n I64) {
+    c := m.C
+    d := c.Dim
+    t := 2 * n
+    # the first convolution: frame i's patch (channel ch, tap k) is mel[ch, i + k - 1], zero outside
+    for i in range t {
+        for ch in range c.Mels {
+            for k in range 3 {
+                j := i + k - 1
+                e.col[i * 3 * c.Mels + ch * 3 + k] = spec[ch * t + j] if j >= 0 and j < t else F32(0.0)
+            }
+        }
+    }
+    e.a.Lin(e.x, e.col, t, m.Conv1)
+    m.rows(t * d, fn(r0 I64, r1 I64) { gelu(e.x, r0, r1) })
+    # the second, stride 2: position i's patch is frames 2i - 1 .. 2i + 1
+    for i in range n {
+        for ch in range d {
+            for k in range 3 {
+                j := 2 * i + k - 1
+                e.col[i * 3 * d + ch * 3 + k] = e.x[j * d + ch] if j >= 0 and j < t else F32(0.0)
+            }
+        }
+    }
+    e.a.Lin(e.h, e.col, n, m.Conv2)
+    m.rows(n * d, fn(r0 I64, r1 I64) { gelu(e.h, r0, r1) })
+    for i in range n * d: e.x[i] = e.h[i] + m.EncPos[i]
+    for b in m.Enc: m.encBlock(e, b, n)
+    m.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.Out, e.x, d, r0, r1, m.EncLn) })
+}
+
+fn (m Model&) encBlock(e mut Encoder&, b Block&, n I64) {
+    d := m.C.Dim
+    m.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, b.Ln1) })
+    e.a.Lin(e.qkv, e.h, n, b.Qkv)
+    m.attend(e, n)
+    e.a.Lin(e.h, e.att, n, b.O)
+    for i in range n * d: e.x[i] += e.h[i]
+    m.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, b.Ln3) })
+    e.a.Lin(e.f, e.h, n, b.Fc1)
+    m.rows(n * m.C.Ffn, fn(r0 I64, r1 I64) { gelu(e.f, r0, r1) })
+    e.a.Lin(e.h, e.f, n, b.Fc2)
+    for i in range n * d: e.x[i] += e.h[i]
+}
+
+# e.att = the heads' attention over all n positions of e.qkv (the queries scaled by head^-1/2 first)
+fn (m Model&) attend(e mut Encoder&, n I64) {
+    d := m.C.Dim
+    hd := d / m.C.EncHeads
+    scale := F32(1.0 / F64(hd).Sqrt())
+    for r in range n {
+        for i in range d: e.qkv[r * 3 * d + i] *= scale
+    }
+    sm := mat.Mat<F32>(e.s, 0, n, n, n)
+    if m.Bf {
+        for i in range n * 3 * d: e.a.yb[i] = BF16(e.qkv[i])
+    }
+    for h in range m.C.EncHeads {
+        o := mat.Mat<F32>(e.att, h * hd, n, hd, d)
+        if m.Bf {
+            gemm.Gemm(e.a.ws, sm, mat.Mat<BF16>(e.a.yb, h * hd, n, hd, 3 * d), false, mat.Mat<BF16>(e.a.yb, d + h * hd, n, hd, 3 * d), true)
+            m.rows(n, fn(r0 I64, r1 I64) { softmax(e.s, n, r0, r1) })
+            for i in range n * n: e.a.xb[i] = BF16(e.s[i])
+            gemm.Gemm(e.a.ws, o, mat.Mat<BF16>(e.a.xb, 0, n, n, n), false, mat.Mat<BF16>(e.a.yb, 2 * d + h * hd, n, hd, 3 * d), false)
+            continue
+        }
+        gemm.Gemm(e.a.ws, sm, mat.Mat<F32>(e.qkv, h * hd, n, hd, 3 * d), false, mat.Mat<F32>(e.qkv, d + h * hd, n, hd, 3 * d), true)
+        m.rows(n, fn(r0 I64, r1 I64) { softmax(e.s, n, r0, r1) })
+        gemm.Gemm(e.a.ws, o, mat.Mat<F32>(e.s, 0, n, n, n), false, mat.Mat<F32>(e.qkv, 2 * d + h * hd, n, hd, 3 * d), false)
+    }
+}
+
+# ---- the decoder ----
+
+# the decoder's state: Slots sequences (a beam each) of up to C.Text positions in a cache of their keys and values,
+# the cross-attention's keys and values of the encoded positions, the buffers of a step of up to Rows rows
+type Decoder struct(m Model&, Slots I64, Rows I64, Outs I64) {
+    Slots
+    Rows
+    Outs
+    a mut Arith& = Arith(m.Threads, m.C.Vocab.Max(m.C.Positions).Max(m.C.Ffn), (Rows * m.C.Ffn.Max(3 * m.C.Dim)).Max(m.C.Positions * m.C.Dim))
+    K mut Array<F32>& = Array<F32>(m.C.DecLayers * Slots * m.C.Text * m.C.Dim)
+    V mut Array<F32>& = Array<F32>(m.C.DecLayers * Slots * m.C.Text * m.C.Dim)
+    N I64 = 0                                                # encoded positions crossed to
+    ckv mut Array<F32>& = Array<F32>(m.C.DecLayers * m.C.Positions * 2 * m.C.Dim)
+    x mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
+    h mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
+    qkv mut Array<F32>& = Array<F32>(Rows * 3 * m.C.Dim)
+    att mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
+    f mut Array<F32>& = Array<F32>(Rows * m.C.Ffn)
+    s mut Array<F32>& = Array<F32>(Rows * m.C.Positions.Max(m.C.Text))
+    Logits mut Array<F32>& = Array<F32>(Outs * m.C.Vocab)   # the logits of a step's last Outs rows at most, in order
+    tok mut Array<I32>& = Array<I32>(Rows)
+    pos mut Array<I64>& = Array<I64>(Rows)
+    slot mut Array<I64>& = Array<I64>(Rows)
+    n I64 = 0                                                # rows of the step being made
+}
+
+# the cross-attention's keys and values of every layer over enc's n positions ([n x Dim])
+fn (m Model&) Cross(k mut Decoder&, enc mut Array<F32>&, n I64) {
+    k.N = n
+    span := m.C.Positions * 2 * m.C.Dim
+    for l, b in m.Dec: k.a.Lin(k.ckv[l * span:], enc, n, b.CKv)
+}
+
+# the step being made emptied
+fn (k mut Decoder&) Reset() { k.n = 0 }
+
+# a row: token tok of sequence slot at position pos
+fn (k mut Decoder&) Add(tok I32, pos I64, slot I64) {
+    k.tok[k.n] = tok
+    k.pos[k.n] = pos
+    k.slot[k.n] = slot
+    k.n += 1
+}
+
+# sequence from's first n positions of the cache copied to slot to (a beam taking another's place)
+fn (k mut Decoder&) Copy(from I64, to I64, n I64, c Config&) {
+    if from == to: return
+    for l in range c.DecLayers {
+        a := ((l * k.Slots + from) * c.Text) * c.Dim
+        b := ((l * k.Slots + to) * c.Text) * c.Dim
+        for i in range n * c.Dim {
+            k.K[b + i] = k.K[a + i]
+            k.V[b + i] = k.V[a + i]
+        }
+    }
+}
+
+# the step's rows through the decoder: each row's keys and values cached at its position, and the logits of the
+# last `out` rows into k.Logits (row j of them at j Vocab)
+fn (m Model&) Step(k mut Decoder&, out I64) {
+    c := m.C
+    d := c.Dim
+    n := k.n
+    for r in range n {
+        t := I64(k.tok[r])
+        for i in range d: k.x[r * d + i] = m.Embed[t * d + i] + m.DecPos[k.pos[r] * d + i]
+    }
+    for l, b in m.Dec {
+        layerNorm(k.h, k.x, d, 0, n, b.Ln1)
+        k.a.Lin(k.qkv, k.h, n, b.Qkv)
+        m.selfAttend(k, l)
+        k.a.Lin(k.h, k.att, n, b.O)
+        for i in range n * d: k.x[i] += k.h[i]
+        layerNorm(k.h, k.x, d, 0, n, b.Ln2)
+        k.a.Lin(k.qkv, k.h, n, b.CQ)
+        m.crossAttend(k, l)
+        k.a.Lin(k.h, k.att, n, b.CO)
+        for i in range n * d: k.x[i] += k.h[i]
+        layerNorm(k.h, k.x, d, 0, n, b.Ln3)
+        k.a.Lin(k.f, k.h, n, b.Fc1)
+        gelu(k.f, 0, n * c.Ffn)
+        k.a.Lin(k.h, k.f, n, b.Fc2)
+        for i in range n * d: k.x[i] += k.h[i]
+    }
+    if out == 0: return
+    first := n - out
+    layerNorm(k.h, k.x, d, first, n, m.DecLn)
+    lg := mat.Mat<F32>(k.Logits, 0, out, c.Vocab, c.Vocab)
+    if m.Bf {
+        for i in range out * d: k.a.xb[i] = BF16(k.h[first * d + i])
+        gemm.Gemm(k.a.ws, lg, mat.Mat<BF16>(k.a.xb, 0, out, d, d), false, mat.Mat<BF16>(m.HeadB, 0, c.Vocab, d, d), true)
+        return
+    }
+    gemm.Gemm(k.a.ws, lg, mat.Mat<F32>(k.h, first * d, out, d, d), false, mat.Mat<F32>(m.Embed, 0, c.Vocab, d, d), true)
+}
+
+# each row's self-attention over its sequence's positions up to its own, its keys and values cached first
+fn (m Model&) selfAttend(k mut Decoder&, l I64) {
+    c := m.C
+    d := c.Dim
+    hd := d / c.DecHeads
+    scale := F32(1.0 / F64(hd).Sqrt())
+    for r in range k.n {
+        at := ((l * k.Slots + k.slot[r]) * c.Text + k.pos[r]) * d
+        for i in range d {
+            k.K[at + i] = k.qkv[r * 3 * d + d + i]
+            k.V[at + i] = k.qkv[r * 3 * d + 2 * d + i]
+        }
+    }
+    for r in range k.n {
+        base := ((l * k.Slots + k.slot[r]) * c.Text) * d
+        p := k.pos[r] + 1
+        for h in range c.DecHeads {
+            q := r * 3 * d + h * hd
+            s := k.s[r * c.Positions.Max(c.Text):]
+            for j in range p {
+                dot F32 = 0.0
+                for i in range hd: dot += k.qkv[q + i] * k.K[base + j * d + h * hd + i]
+                s[j] = dot * scale
+            }
+            softmax(s, p, 0, 1)
+            for i in range hd: k.att[r * d + h * hd + i] = 0.0
+            for j in range p {
+                w := s[j]
+                for i in range hd: k.att[r * d + h * hd + i] += w * k.V[base + j * d + h * hd + i]
+            }
+        }
+    }
+}
+
+# each row's cross-attention over the encoded positions
+fn (m Model&) crossAttend(k mut Decoder&, l I64) {
+    c := m.C
+    d := c.Dim
+    hd := d / c.DecHeads
+    n := k.N
+    scale := F32(1.0 / F64(hd).Sqrt())
+    for i in range k.n * d: k.qkv[i] *= scale
+    base := l * c.Positions * 2 * d
+    sm := mat.Mat<F32>(k.s, 0, k.n, n, n)
+    for h in range c.DecHeads {
+        gemm.Gemm(k.a.ws, sm, mat.Mat<F32>(k.qkv, h * hd, k.n, hd, d), false, mat.Mat<F32>(k.ckv, base + h * hd, n, hd, 2 * d), true)
+        softmax(k.s, n, 0, k.n)
+        o := mat.Mat<F32>(k.att, h * hd, k.n, hd, d)
+        gemm.Gemm(k.a.ws, o, mat.Mat<F32>(k.s, 0, k.n, n, n), false, mat.Mat<F32>(k.ckv, base + d + h * hd, n, hd, 2 * d), false)
+    }
+}
+
+# ---- checks against the reference ----
+
+# the integers of key's array in object sub of a JSON file
+fn Ints(path String&, sub String&, key String&) Array<I32> ? os.Error, json.Error {
+    j := try json.Json.Parse(try os.ReadFile(path))
+    a := try (try (try j[sub])[key]).AsArr()
+    return Array<I32>[I32(try v.AsInt() catch default 0) for v in a]
+}
+
+# the greatest difference of logits of a model and clip from the reference's, over the greedy sequence read at once
+fn logitsGap(name String&, clip String&, bf Bool, exact Bool = false) F64 {
+    dir := mel.Cache() + "/models/openai--whisper-" + name
+    ref := mel.Cache() + "/ref/" + name + "/" + clip
+    want := try mel.F32s(ref + (".logits64.f32" if exact else ".logits.f32")) catch { return -1.0 }
+    m := Model.Load(dir, bf)!
+    toks := Ints(ref + ".json", "greedy", "tokens")!
+    e := Encoder(m, 1500)
+    m.Encode(e, mel.F32s(ref + ".mel.f32")!, 1500)
+    k := Decoder(m, 1, toks.Len(), toks.Len())
+    m.Cross(k, e.Out, 1500)
+    for i, t in toks: k.Add(t, I64(i), 0)
+    m.Step(k, toks.Len())
+    worst F64 = 0.0
+    for i in range want.Len(): worst = worst.Max((F64(k.Logits[i]) - F64(want[i])).Abs())
+    return worst
+}
+
+test Model "tiny's logits over the greedy sequence of a clip within 1e-4 of transformers' in F32 and in F64, where the files are" {
+    for clip in ["jfk", "aesop1"] {
+        for exact in [false, true] {
+            gap := logitsGap("tiny", clip, false, exact)
+            if gap < 0.0 {
+                Println("skipped: no reference")
+                continue
+            }
+            Println(clip + (" F64: " if exact else " F32: ") + $gap)
+            assert gap < 1e-4, clip + ": " + $gap
+        }
+    }
+}
+
+test Model "base's and small's logits within 1e-4 of transformers' (F32); BF16 products within 0.5 (where the files are)" {
+    for name in ["base", "small"] {
+        gap := logitsGap(name, "jfk", false)
+        if gap < 0.0: continue
+        Println(name + " F32: " + $gap)
+        assert gap < 1e-4, name + ": " + $gap
+    }
+    for name in ["tiny", "base", "small"] {
+        gap := logitsGap(name, "jfk", true)
+        if gap < 0.0: continue
+        Println(name + " BF16: " + $gap)
+        assert gap < 0.5, name + ": " + $gap
+    }
+}

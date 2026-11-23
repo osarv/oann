@@ -1,0 +1,592 @@
+# speech/transcribe - speech to text by a Whisper model (speech/whisper): the language detected or given, greedy or
+# beam decoding, timestamps, a clip longer than 30 s read window after window, and a Stream that takes sound as it
+# comes. The decoding is Hugging Face transformers' generate for Whisper, step for step, so a transcript is the
+# reference's token for token:
+#
+# - the prompt is <|startoftranscript|> <|lang|> <|transcribe|> (or <|translate|>), then <|notimestamps|> unless
+#   timestamps are asked for; the language, when not given, is the language token the model finds likeliest after
+#   <|startoftranscript|> alone;
+# - every step suppresses generation_config's suppress_tokens, the first step also its begin_suppress_tokens (a blank,
+#   the end); with timestamps, the timestamp rules: timestamps come in pairs (after a lone one, text cannot follow; after
+#   a pair, a timestamp cannot), never go back, the first is at most max_initial_timestamp_index (1 s), and where the
+#   timestamps together are likelier than any one text token the next token is a timestamp;
+# - greedy takes the likeliest token; beam search (Beams > 1) is transformers' (length penalty 1, early stopping off):
+#   2 Beams candidates a step from every beam's log-probabilities plus its score, the best Beams that do not end kept
+#   running, those of the first Beams that end (or reach the length) offered to the finished set by their score over
+#   their length, until no running beam can beat the worst finished one.
+#
+# Long clips (Transcribe): OpenAI's sequential reading - a window of 30 s from `seek`, decoded with timestamps, its
+# segments the stretches between pairs of timestamps; the next window starts at the last pair's time, or after the
+# whole window where it ends with a lone timestamp (the speech went on to its end) or has no pairs.
+
+import "std/json"
+import "std/os"
+import "../llm/bpe"
+import "mel"
+import "whisper"
+
+# ---- the tokens ----
+
+type Tokens struct(Bpe bpe.Bpe) {
+    Bpe
+    Sot I32 = 0                     # <|startoftranscript|>
+    Eot I32 = 0                     # <|endoftext|>
+    Transcribe I32 = 0
+    Translate I32 = 0
+    NoTimestamps I32 = 0
+    TsBegin I32 = 0                 # <|0.00|>; <|0.02|> after it, ...
+    Langs mut Array<I32>& = Array<I32>(0)
+    Names mut Array<String>& = Array<String>(0)   # the language codes, Langs' order
+    Suppress mut Array<I32>& = Array<I32>(0)
+    Begin mut Array<I32>& = Array<I32>(0)
+    MaxInitial I64 = 50
+}
+
+fn intAt(j json.Json&, key String&) I32 ? whisper.ModelError {
+    v := try j[key] catch { error whisper.ModelError.Malformed("generation_config.json has no " + key) }
+    return I32(try v.AsInt() catch { error whisper.ModelError.Malformed(key) })
+}
+
+fn intsAt(j json.Json&, key String&) Array<I32> {
+    v := try j[key] catch { return Array<I32>(0) }
+    a := try v.AsArr() catch { return Array<I32>(0) }
+    return Array<I32>[I32(try x.AsInt() catch default 0) for x in a]
+}
+
+# the tokens of a model directory: tokenizer.json and generation_config.json
+fn Tokens.Load(dir String&) Tokens ? whisper.ModelError, os.Error {
+    b := try bpe.Bpe.Load(dir + "/tokenizer.json") catch { error whisper.ModelError.Malformed(dir + "/tokenizer.json") }
+    t := Tokens(b)
+    j := try json.Json.Parse(try os.ReadFile(dir + "/generation_config.json")) catch json.Error { error whisper.ModelError.Malformed("generation_config.json") }
+    t.Sot = try intAt(j, "decoder_start_token_id")
+    t.Eot = try intAt(j, "eos_token_id")
+    t.NoTimestamps = try intAt(j, "no_timestamps_token_id")
+    t.TsBegin = t.NoTimestamps + 1
+    t.Suppress = intsAt(j, "suppress_tokens")
+    t.Begin = intsAt(j, "begin_suppress_tokens")
+    if j.Has("max_initial_timestamp_index"): t.MaxInitial = I64(try intAt(j, "max_initial_timestamp_index"))
+    if j.Has("task_to_id") {
+        tasks := try j["task_to_id"] catch { unreachable }
+        t.Transcribe = try intAt(tasks, "transcribe")
+        t.Translate = try intAt(tasks, "translate")
+    }
+    if j.Has("lang_to_id") {
+        m := try (try j["lang_to_id"] catch { unreachable }).AsObj() catch { error whisper.ModelError.Malformed("lang_to_id") }
+        t.Langs = Array<I32>[I32(try v.AsInt() catch default 0) for v in m.Values]
+        t.Names = Array<String>[k[2:k.Len() - 2] for k in m.Keys]
+    }
+    return t
+}
+
+# the text of tokens, the special ones (the end and every token after it) left out
+fn (t Tokens&) Text(ids Array<I32>&) String {
+    keep := Array<I32>[i for i in ids if i < t.Eot]
+    return try t.Bpe.Decode(keep) catch default ""
+}
+
+# a language's token, or -1
+fn (t Tokens&) Lang(code String&) I32 {
+    for i, n in t.Names {
+        if n == code: return t.Langs[i]
+    }
+    return -1
+}
+
+# ---- options and results ----
+
+type Options struct() {
+    Language String = ""        # a code (en, de, sv, ...); detected where empty (multilingual models)
+    Translate Bool = false      # to English
+    Timestamps Bool = false
+    Beams I64 = 1               # 1: greedy
+    MaxTokens I64 = 224         # tokens a window may have after its prompt
+    Positions I64 = 1500        # the encoder's positions (fewer: a shorter window, faster and not the reference)
+}
+
+type Segment struct(Start F64, End F64, Text String) {
+    Start                       # seconds from the clip's start
+    End
+    Text
+}
+
+# ---- a model ready to transcribe ----
+
+type Whisper struct(M whisper.Model, T Tokens, beams I64 = 5) {
+    M
+    T
+    Mel mut mel.Mel& = mel.Mel(M.C.Mels, 1000, M.Threads)
+    Enc mut whisper.Encoder& = whisper.Encoder(M, M.C.Positions)
+    Dec mut whisper.Decoder& = whisper.Decoder(M, 2 * beams, beams.Max(32), beams)
+    Language I32 = -1                         # the last window's language token
+    logp mut Array<F32>& = Array<F32>(M.C.Vocab)
+}
+
+# the model and tokens in dir, BF16 products where bf is set; room for beam searches of up to `beams`
+fn Whisper.Load(dir String&, bf Bool = false, beams I64 = 5) Whisper ? whisper.ModelError, os.Error {
+    m := try whisper.Model.Load(dir, bf)
+    t := try Tokens.Load(dir)
+    return Whisper(m, t, beams.Max(1))
+}
+
+# the window of a clip's log-mel (mel.Clip's, `frames` long) from frame seek, `take` frames of it and zeros after, n
+# positions (2n frames), encoded and crossed to
+fn (w mut Whisper&) Window(clip Array<F32>&, frames I64, seek I64 = 0, take I64 = 3000, n I64 = 1500) {
+    spec := mel.Slice(clip, w.M.C.Mels, frames, seek, take, 2 * n)
+    w.M.Encode(w.Enc, spec, n)
+    w.M.Cross(w.Dec, w.Enc.Out, n)
+}
+
+# the first window of samples x (at most 30 s of it)
+fn (w mut Whisper&) Clip(x Array<F32>&, n I64 = 1500) {
+    clip, frames := w.Mel.Clip(x[:x.Len().Min(30 * mel.Rate)])
+    w.Window(clip, frames, 0, 2 * n, n)
+}
+
+# the likeliest language token of the window
+fn (w mut Whisper&) Detect() I32 {
+    if w.T.Langs.Len() == 0: return -1
+    w.Dec.Reset()
+    w.Dec.Add(w.T.Sot, 0, 0)
+    w.M.Step(w.Dec, 1)
+    best := w.T.Langs[0]
+    for l in w.T.Langs {
+        if w.Dec.Logits[I64(l)] > w.Dec.Logits[I64(best)]: best = l
+    }
+    return best
+}
+
+# the prompt of a window under o
+fn (w mut Whisper&) Prompt(o Options&) Array<I32> {
+    p := Vec<I32>()
+    p.Push(w.T.Sot)
+    if w.T.Langs.Len() > 0 {
+        lang := w.T.Lang(o.Language) if o.Language.Len() > 0 else w.Detect()
+        if lang < 0: lang = w.Detect()
+        w.Language = lang
+        p.Push(lang)
+        p.Push(w.T.Translate if o.Translate else w.T.Transcribe)
+    }
+    if not o.Timestamps: p.Push(w.T.NoTimestamps)
+    return p.ToArray()
+}
+
+# the rules of a step applied to row (Vocab wide; logits or log-probabilities), gen the tokens decoded after the prompt
+fn (w Whisper&) rules(row mut Array<F32>&, gen Array<I32>&, o Options&) {
+    t := w.T
+    v := w.M.C.Vocab
+    ninf := F32(-1.0) / F32(0.0)
+    if gen.Len() == 0 {
+        for i in t.Begin: row[I64(i)] = ninf
+    }
+    for i in t.Suppress: row[I64(i)] = ninf
+    if not o.Timestamps: return
+    tb := I64(t.TsBegin)
+    row[I64(t.NoTimestamps)] = ninf
+    n := gen.Len()
+    last := n >= 1 and gen[n - 1] >= t.TsBegin
+    penult := n < 2 or gen[n - 2] >= t.TsBegin
+    if last and penult {
+        for i in range tb, v: row[i] = ninf
+    } else if last {
+        for i in range I64(t.Eot): row[i] = ninf
+    }
+    top I64 = -1
+    for g in gen {
+        if g >= t.TsBegin: top = I64(g)
+    }
+    if top >= 0 {
+        upto := top if last and not penult else top + 1
+        for i in range tb, upto: row[i] = ninf
+    }
+    if n == 0 {
+        for i in range tb: row[i] = ninf
+        for i in range tb + t.MaxInitial + 1, v: row[i] = ninf
+    }
+    # the timestamps' probability together against the likeliest text token's
+    big := row[0]
+    for i in range v: big = big.Max(row[i])
+    sum F64 = 0.0
+    for i in range v: sum += F64(row[i] - big).Exp()
+    lse := F64(big) + sum.Log()
+    tsTop F64 = -1e300
+    for i in range tb, v: tsTop = tsTop.Max(F64(row[i]))
+    ts F64 = 0.0
+    if tsTop > -1e300 {
+        for i in range tb, v: ts += (F64(row[i]) - tsTop).Exp()
+    }
+    tsLog := (tsTop + ts.Log() if tsTop > -1e300 else -1e300) - lse
+    textTop F64 = -1e300
+    for i in range tb: textTop = textTop.Max(F64(row[i]))
+    if tsLog > textTop - lse {
+        for i in range tb: row[i] = ninf
+    }
+}
+
+# log_softmax of row in place, in F32 as torch computes it
+fn logSoftmax(row mut Array<F32>&) {
+    big := row[0]
+    for x in row: big = big.Max(x)
+    sum F64 = 0.0
+    for x in row: sum += F64(x - big).Exp()
+    l := F32(sum.Log())
+    for i in range row.Len(): row[i] = row[i] - big - l
+}
+
+# the tokens of the window after prompt: greedy or by beam search
+fn (w mut Whisper&) Decode(prompt Array<I32>&, o Options&) Array<I32> {
+    if o.Beams > 1: return w.beam(prompt, o)
+    k := w.Dec
+    k.Reset()
+    for i, t in prompt: k.Add(t, I64(i), 0)
+    w.M.Step(k, 1)
+    gen := Vec<I32>()
+    limit := o.MaxTokens.Min(w.M.C.Text - prompt.Len())
+    for gen.Len() < limit {
+        row := k.Logits[:w.M.C.Vocab]
+        w.rules(row, gen.ToArray(), o)
+        best I64 = 0
+        for i in range row.Len() {
+            if row[i] > row[best]: best = i
+        }
+        gen.Push(I32(best))
+        if I32(best) == w.T.Eot: break
+        k.Reset()
+        k.Add(I32(best), I64(prompt.Len() + gen.Len() - 1), 0)
+        w.M.Step(k, 1)
+    }
+    return gen.ToArray()
+}
+
+# a candidate of a beam step: its score, the beam it extends, its token
+type cand struct(Score F32, Beam I64, Tok I32) {
+    Score
+    Beam
+    Tok
+}
+
+# transformers' beam search (length penalty 1, early_stopping false) over o.Beams beams in slots of half `half`
+fn (w mut Whisper&) beam(prompt Array<I32>&, o Options&) Array<I32> {
+    nb := o.Beams.Min(w.Dec.Slots / 2)
+    v := w.M.C.Vocab
+    pl := prompt.Len()
+    limit := o.MaxTokens.Min(w.M.C.Text - pl)
+    k := w.Dec
+    k.Reset()
+    for i, t in prompt: k.Add(t, I64(i), 0)
+    w.M.Step(k, 1)
+    for b in range 1, nb: k.Copy(0, b, pl, w.M.C)
+    # every beam's logits are the prompt's at first
+    # the running beams' tokens: beam b's step tokens at b limit
+    run := Array<I32>(nb * limit)
+    next := Array<I32>(nb * limit)
+    score := Array<F32>(nb, F32(-1e9))
+    score[0] = 0.0
+    done := Vec<Array<I32>>()
+    doneScore := Vec<F32>()
+    half I64 = 0
+    rows := Array<I64>(nb, 0)
+    from := Array<I64>(nb)
+    cands := Vec<cand>()
+    for step in range limit {
+        cands.Clear()
+        for b in range nb {
+            row := w.logp
+            for i in range v: row[i] = k.Logits[rows[b] * v + i]
+            logSoftmax(row)
+            w.rules(row, run[b * limit:b * limit + step], o)
+            for i in range v: keepTop(cands, cand(row[i] + score[b], b, I32(i)), 2 * nb)
+        }
+        last := step + 1 == limit
+        # the finished: those of the first nb that end, scored over their length
+        for j, c in cands {
+            if j >= nb or not (c.Tok == w.T.Eot or last): continue
+            seq := Array<I32>(step + 1)
+            for i in range step: seq[i] = run[c.Beam * limit + i]
+            seq[step] = c.Tok
+            offer(done, doneScore, seq, c.Score / F32(step + 1), nb)
+        }
+        if last: break
+        # the running: the best nb that do not end
+        got I64 = 0
+        for c in cands {
+            if got == nb or c.Tok == w.T.Eot: continue
+            for i in range step: next[got * limit + i] = run[c.Beam * limit + i]
+            next[got * limit + step] = c.Tok
+            score[got] = c.Score
+            from[got] = c.Beam
+            got += 1
+        }
+        # can a running beam still beat the worst finished?
+        if doneScore.Len() == nb {
+            worst := doneScore[0]
+            for x in doneScore: worst = worst.Min(x)
+            if score[0] / F32(step + 1) <= worst: break
+        }
+        # the caches follow their beams into the other half of the slots
+        other := nb - half
+        k.Reset()
+        for b in range nb {
+            k.Copy(half + from[b], other + b, pl + step, w.M.C)
+            k.Add(next[b * limit + step], I64(pl + step), other + b)
+            rows[b] = b
+        }
+        half = other
+        run, next = next, run
+        w.M.Step(k, nb)
+    }
+    best I64 = 0
+    for i in range doneScore.Len() {
+        if doneScore[i] > doneScore[best]: best = i
+    }
+    return done[best] if done.Len() > 0 else run[:limit]
+}
+
+# c kept among the best n of cs, in order (an earlier equal stays first)
+fn keepTop(cs mut Vec<cand>&, c cand, n I64) {
+    if cs.Len() == n and c.Score <= cs[n - 1].Score: return
+    if cs.Len() < n: cs.Push(c)
+    i := cs.Len() - 1
+    for i > 0 and cs[i - 1].Score < c.Score {
+        cs[i] = cs[i - 1]
+        i -= 1
+    }
+    cs[i] = c
+}
+
+# seq offered to the finished set of at most n by its score
+fn offer(done mut Vec<Array<I32>>&, scores mut Vec<F32>&, seq Array<I32>&, s F32, n I64) {
+    if done.Len() < n {
+        done.Push(seq)
+        scores.Push(s)
+        return
+    }
+    worst I64 = 0
+    for i in range scores.Len() {
+        if scores[i] < scores[worst]: worst = i
+    }
+    if s <= scores[worst]: return
+    done[worst] = seq
+    scores[worst] = s
+}
+
+# ---- segments and long clips ----
+
+# the segments of a window's tokens (offset: the window's start in seconds; frames: its length) and the frames the
+# next window starts after it: segments run between pairs of timestamps, and the next window from the last pair; a
+# window ending in a lone timestamp ends its last segment there and is read whole, as is one with no pairs (one
+# segment, to its last timestamp or its end). Text after the last pair, unclosed, is read again by the next window
+fn (w Whisper&) Cut(gen Array<I32>&, offset F64, frames I64) Array<Segment>, I64 {
+    tb := w.T.TsBegin
+    n := gen.Len()
+    if n > 0 and gen[n - 1] == w.T.Eot: n -= 1
+    lone := n >= 2 and gen[n - 1] >= tb and gen[n - 2] < tb
+    out := Vec<Segment>()
+    last I64 = 0
+    for i in range 1, n + 1 {
+        closes := (i < n and gen[i] >= tb and gen[i - 1] >= tb) or (i == n and lone and last > 0)
+        if not closes: continue
+        seg := gen[last:i]
+        out.Push(Segment(offset + F64(seg[0] - tb) * 0.02, offset + F64(seg[seg.Len() - 1] - tb) * 0.02, w.T.Text(seg)))
+        last = i
+    }
+    if last > 0: return out.ToArray(), (frames if lone else I64(gen[last - 1] - tb) * 2)
+    span := F64(frames) / 100.0
+    for i in range n {
+        if gen[i] > tb: span = F64(gen[i] - tb) * 0.02
+        else if gen[i] == tb: span = F64(frames) / 100.0
+    }
+    out.Push(Segment(offset, offset + span, w.T.Text(gen[:n])))
+    return out.ToArray(), frames
+}
+
+# o with timestamps
+fn (o Options&) timed() Options {
+    t := Options()
+    t.Language = o.Language
+    t.Translate = o.Translate
+    t.Timestamps = true
+    t.Beams = o.Beams
+    t.MaxTokens = o.MaxTokens
+    t.Positions = o.Positions
+    return t
+}
+
+# every segment of a log-mel (mel.Clip's) from frame seek to `frames`, read window after window; the frame it stopped at
+fn (w mut Whisper&) segments(clip Array<F32>&, frames I64, seek I64, o Options&, final Bool, out mut Vec<Segment>&, base F64) I64 {
+    window := 2 * o.Positions
+    at := seek
+    for at < frames and (final or at + window <= frames) {
+        take := window.Min(frames - at)
+        w.Window(clip, frames, at, take, o.Positions)
+        gen := w.Decode(w.Prompt(o), o)
+        segs, adv := w.Cut(gen, base + F64(at) / 100.0, take)
+        for g in segs {
+            if g.Text.Trim().Len() > 0: out.Push(g)
+        }
+        at += adv.Max(1)
+    }
+    return at
+}
+
+# every segment of a clip of any length (with timestamps, whatever o says)
+fn (w mut Whisper&) Transcribe(x Array<F32>&, given Options&) Array<Segment> {
+    o := given.timed()
+    clip, frames := w.Mel.Clip(x)
+    out := Vec<Segment>()
+    w.segments(clip, frames, 0, o, true, out, 0.0)
+    return out.ToArray()
+}
+
+# the text of a clip of at most 30 s
+fn (w mut Whisper&) Text(x Array<F32>&, o Options&) String {
+    w.Clip(x, o.Positions)
+    return w.T.Text(w.Decode(w.Prompt(o), o))
+}
+
+# ---- streaming ----
+
+# sound taken as it comes (Push): each full window of 30 s from the last settled segment decoded as soon as it is there
+# (Settled), and what is past the last settled point decoded on demand (Partial) - a dictation's running text, or a
+# command once the speaker stops
+type Stream struct(w mut Whisper&, o Options) {
+    w
+    o
+    buf mut Vec<F32>& = Vec<F32>()
+    seek I64 = 0                # samples of buf settled
+    base I64 = 0                # samples dropped before buf[0]
+}
+
+fn (s mut Stream&) Push(x Array<F32>&) {
+    for v in x: s.buf.Push(v)
+}
+
+# the segments of every full window now there, settled: the next window starts where the last pair of timestamps
+# closed (final: the rest too, however short). Each window's log-mel is normalised on its own
+fn (s mut Stream&) Settled(final Bool = false) Array<Segment> {
+    out := Vec<Segment>()
+    o := s.o.timed()
+    window := 2 * o.Positions * mel.Hop
+    for s.seek + window <= s.buf.Len() or (final and s.seek < s.buf.Len()) {
+        x := Array<F32>[s.buf[i] for i in range s.seek, (s.seek + window).Min(s.buf.Len())]
+        clip, frames := s.w.Mel.Clip(x)
+        take := (x.Len() / mel.Hop).Min(frames)
+        end := s.w.segments(clip, frames.Min(take), 0, o, true, out, F64(s.base + s.seek) / F64(mel.Rate))
+        s.seek += (end.Min(take) * mel.Hop).Max(mel.Hop)
+        if not final and end < take: continue
+    }
+    s.drop()
+    return out.ToArray()
+}
+
+# the text of what is past the last settled point, decoded now (unsettled: a later call may differ)
+fn (s mut Stream&) Partial() String {
+    if s.seek >= s.buf.Len(): return ""
+    x := Array<F32>[s.buf[i] for i in range s.seek, s.buf.Len().Min(s.seek + 30 * mel.Rate)]
+    return s.w.Text(x, s.o)
+}
+
+# the settled samples let go of
+fn (s mut Stream&) drop() {
+    if s.seek == 0: return
+    rest := Vec<F32>()
+    for i in range s.seek, s.buf.Len(): rest.Push(s.buf[i])
+    s.base += s.seek.Min(s.buf.Len())
+    s.seek = 0
+    s.buf = rest
+}
+
+# ---- checks against the reference ----
+
+# the reference's tokens of a decoding after its prompt, and its text
+fn reference(name String&, clip String&, kind String&) Array<I32>, String {
+    path := mel.Cache() + "/ref/" + name + "/" + clip + ".json"
+    j := json.Json.Parse(os.ReadFile(path)!)!
+    toks := whisper.Ints(path, kind, "tokens")!
+    text := (j[kind]!)["text"]!.AsStr()!
+    return toks, text
+}
+
+# the reference's segments of a clip
+fn segmentsOf(name String&, clip String&) Array<Segment> {
+    j := json.Json.Parse(os.ReadFile(mel.Cache() + "/ref/" + name + "/" + clip + ".json")!)!
+    out := Vec<Segment>()
+    for g in j["segments"]!.AsArr()! {
+        out.Push(Segment(g["start"]!.AsNum()!, g["end"]!.AsNum()!, g["text"]!.AsStr()!))
+    }
+    return out.ToArray()
+}
+
+# whether segments are the reference's: their texts, and their times to the 20 ms of a timestamp
+fn sameSegments(got Array<Segment>&, want Array<Segment>&) Bool {
+    if got.Len() != want.Len(): return false
+    for i, g in got {
+        if g.Text != want[i].Text or (g.Start - want[i].Start).Abs() > 0.011 or (g.End - want[i].End).Abs() > 0.011: return false
+    }
+    return true
+}
+
+fn shown(ss Array<Segment>&) String {
+    out := ""
+    for g in ss: out = out + "\n  [" + $g.Start + " - " + $g.End + "]" + g.Text
+    return out
+}
+
+# a model's transcripts of the clips held to the reference's: greedy and beam sequences token for token, segments
+fn holds(name String&) {
+    dir := mel.Cache() + "/models/openai--whisper-" + name
+    if not os.Exists(mel.Cache() + "/ref/" + name + "/jfk.json") or not os.Exists(dir) {
+        Println("skipped: no reference for " + name)
+        return
+    }
+    w := Whisper.Load(dir)!
+    for clip in ["jfk", "aesop1", "aesop2"] {
+        x := mel.Wav(mel.Cache() + "/audio/" + clip + ".wav")!
+        w.Clip(x)
+        for kind in ["greedy", "beam"] {
+            o := Options()
+            o.MaxTokens = 200
+            o.Beams = 5 if kind == "beam" else 1
+            p := w.Prompt(o)
+            got := w.Decode(p, o)
+            want, text := reference(name, clip, kind)
+            all := Vec<I32>()
+            for t in p: all.Push(t)
+            for t in got: all.Push(t)
+            seq := all.ToArray()
+            if seq.Len() > 0 and seq[seq.Len() - 1] == w.T.Eot and (want.Len() == 0 or want[want.Len() - 1] != w.T.Eot): seq = seq[:seq.Len() - 1]
+            assert seq == want, name + " " + clip + " " + kind + ":\n got  " + $seq + "\n want " + $want
+            assert w.T.Text(got) == text, w.T.Text(got)
+        }
+    }
+    for clip in ["jfk", "aesop1", "aesop2", "aesop2_long"] {
+        x := mel.Wav(mel.Cache() + "/audio/" + clip + ".wav")!
+        o := Options()
+        o.MaxTokens = 200
+        got := w.Transcribe(x, o)
+        want := segmentsOf(name, clip)
+        assert sameSegments(got, want), name + " " + clip + ":\n got" + shown(got) + "\n want" + shown(want)
+    }
+}
+
+test Whisper "tiny: greedy and beam transcripts the reference's token for token, segments the same (where the files are)" {
+    holds("tiny")
+}
+
+test Whisper "base and small: greedy and beam transcripts the reference's token for token, segments the same (where the files are)" {
+    holds("base")
+    holds("small")
+}
+
+test Whisper "BF16 products (AMX where there is): every model's greedy transcripts the F32 ones' (where the files are)" {
+    for name in ["tiny", "base", "small"] {
+        dir := mel.Cache() + "/models/openai--whisper-" + name
+        if not os.Exists(dir) or not os.Exists(mel.Cache() + "/audio/jfk.wav"): continue
+        f := Whisper.Load(dir)!
+        b := Whisper.Load(dir, true)!
+        for clip in ["jfk", "aesop1", "aesop2"] {
+            x := mel.Wav(mel.Cache() + "/audio/" + clip + ".wav")!
+            o := Options()
+            assert f.Text(x, o) == b.Text(x, o), name + " " + clip + ": " + b.Text(x, o)
+        }
+    }
+}

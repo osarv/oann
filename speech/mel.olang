@@ -1,0 +1,256 @@
+# speech/mel - sound into the log-mel spectrogram speech models read: 16 kHz samples, a Hann window of 400 (25 ms)
+# every 160 (10 ms), the power of each of its 201 frequencies, 80 triangular mel filters over 0 .. 8 kHz (Slaney's mel
+# scale and area normalisation, as librosa and Whisper make them) and log10. Whisper's front end, computed as Hugging
+# Face's WhisperFeatureExtractor computes it: the clip padded with zeros to 30 s, mirrored by 200 samples at each end
+# (a frame centred on each hop), the last frame dropped, each value at least the window's largest less 8, then (x + 4)
+# / 4. The spectrum of a frame is one matrix product: the windowed frames times the 402 rows of cos and sin of the
+# discrete Fourier transform (kernels/gemm), then the filters as another.
+#
+# Wav reads a RIFF WAVE file of 16-bit PCM (mono, or the channels averaged) at any rate, resampled to 16 kHz by linear
+# interpolation where it is not.
+
+import "std/os"
+import "../kernels/gemm"
+import "../kernels/mat"
+
+type AudioError error {
+    Malformed(what String)    # a file that is not the WAVE this reads
+}
+
+Rate I64 = 16000            # samples a second
+Window I64 = 400            # samples a frame (n_fft)
+Hop I64 = 160               # samples between frames
+Bins I64 = 201              # frequencies of a frame (n_fft / 2 + 1)
+
+fn u16At(b String&, i I64) I64 { return I64(U8(b[i])) | (I64(U8(b[i + 1])) << 8) }
+fn u32At(b String&, i I64) I64 { return u16At(b, i) | (u16At(b, i + 2) << 16) }
+
+# the samples of a WAVE file of 16-bit PCM, in -1 .. 1 at 16 kHz
+fn Wav(path String&) Array<F32> ? AudioError, os.Error {
+    b := try os.ReadFile(path)
+    if b.Len() < 12 or b[0:4] != "RIFF" or b[8:12] != "WAVE": error AudioError.Malformed(path + " is not a RIFF WAVE file")
+    channels I64 = 0
+    rate I64 = 0
+    at I64 = 12
+    for at + 8 <= b.Len() {
+        id := b[at:at + 4]
+        n := u32At(b, at + 4)
+        body := at + 8
+        if id == "fmt " {
+            if u16At(b, body) != 1 or u16At(b, body + 14) != 16: error AudioError.Malformed(path + " is not 16-bit PCM")
+            channels = u16At(b, body + 2)
+            rate = u32At(b, body + 4)
+        } else if id == "data" {
+            if channels == 0: error AudioError.Malformed(path + ": data before fmt")
+            n = n.Min(b.Len() - body)
+            return resample(pcm(b, body, n / (2 * channels), channels), rate)
+        }
+        at = body + n + n % 2
+    }
+    error AudioError.Malformed(path + " has no data")
+}
+
+# frames of 16-bit samples from byte at, the channels averaged
+fn pcm(b String&, at I64, frames I64, channels I64) Array<F32> {
+    out := Array<F32>(frames)
+    for i in range frames {
+        s I64 = 0
+        for c in range channels {
+            v := u16At(b, at + 2 * (i * channels + c))
+            s += v - 65536 if v >= 32768 else v
+        }
+        out[i] = F32(F64(s) / F64(channels) / 32768.0)
+    }
+    return out
+}
+
+# x at rate, linearly interpolated to 16 kHz
+fn resample(x Array<F32>&, rate I64) Array<F32> {
+    if rate == Rate or x.Len() == 0: return x
+    n := x.Len() * Rate / rate
+    out := Array<F32>(n)
+    for i in range n {
+        t := F64(i) * F64(rate) / F64(Rate)
+        j := I64(t)
+        f := F32(t - F64(j))
+        k := (j + 1).Min(x.Len() - 1)
+        out[i] = x[j] * (1.0 - f) + x[k] * f
+    }
+    return out
+}
+
+# ---- the mel filters ----
+
+fn hzToMel(f F64) F64 {
+    if f < 1000.0: return 3.0 * f / 200.0
+    return 15.0 + 27.0 * (f / 1000.0).Log() / 6.4.Log()
+}
+
+fn melToHz(m F64) F64 {
+    if m < 15.0: return 200.0 * m / 3.0
+    return 1000.0 * (6.4.Log() / 27.0 * (m - 15.0)).Exp()
+}
+
+# n triangular filters over 0 .. top Hz, Slaney-normalised: [n x Bins], row-major
+fn Filters(n I64, top F64 = 8000.0) Array<F32> {
+    hz := Array<F64>(n + 2)
+    lo := hzToMel(0.0)
+    hi := hzToMel(top)
+    for i in range n + 2: hz[i] = melToHz(lo + (hi - lo) * F64(i) / F64(n + 1))
+    out := Array<F32>(n * Bins)
+    for m in range n {
+        norm := 2.0 / (hz[m + 2] - hz[m])
+        for k in range Bins {
+            f := F64(Rate / 2) * F64(k) / F64(Bins - 1)
+            down := (f - hz[m]) / (hz[m + 1] - hz[m])
+            up := (hz[m + 2] - f) / (hz[m + 2] - hz[m + 1])
+            out[m * Bins + k] = F32(down.Min(up).Max(0.0) * norm)
+        }
+    }
+    return out
+}
+
+# ---- the spectrogram ----
+
+# what a spectrogram of up to Frames frames needs, made once: the window, the transform's rows, the filters and the
+# buffers of a call
+type Mel struct(Mels I64, Frames I64, threads I64 = 1) {
+    Mels
+    Frames
+    window mut Array<F32>& = Array<F32>[F32(0.5 - 0.5 * (2.0 * Pi * F64(i) / F64(Window)).Cos()) for i in range Window]
+    dft mut Array<F32>& = basis()                        # [2 Bins x Window]: row 2k cos, 2k + 1 -sin of frequency k
+    filters mut Array<F32>& = Filters(Mels)
+    frames mut Array<F32>& = Array<F32>(Frames * Window)
+    spec mut Array<F32>& = Array<F32>(Frames * 2 * Bins)
+    power mut Array<F32>& = Array<F32>(Frames * Bins)
+    mel mut Array<F32>& = Array<F32>(Frames * Mels)
+    ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(threads, Window.Max(Frames))
+}
+
+# the transform's rows, the angles reduced exactly (k n mod Window) before the cosine
+fn basis() Array<F32> {
+    out := Array<F32>(2 * Bins * Window)
+    for k in range Bins {
+        for n in range Window {
+            a := 2.0 * Pi * F64((k * n) % Window) / F64(Window)
+            out[(2 * k) * Window + n] = F32(a.Cos())
+            out[(2 * k + 1) * Window + n] = F32(-a.Sin())
+        }
+    }
+    return out
+}
+
+# log10 of the mel power of frames f0 .. f0 + n of x: frame f centred on sample f Hop, x mirrored at its ends (the
+# sample before the first is x[1], ...) and zero past `end` (where the clip stops: Whisper pads with zeros, then
+# mirrors). out[(f - f0) Mels + m] for mel m; at most Frames frames
+fn (s mut Mel&) Log(out mut Array<F32>&, x Array<F32>&, end I64, f0 I64, n I64) {
+    half := Window / 2
+    for f in range n {
+        c := (f0 + f) * Hop - half
+        for i in range Window {
+            t := c + i
+            if t < 0: t = -t
+            if t >= end: t = 2 * (end - 1) - t
+            s.frames[f * Window + i] = (x[t] if t >= 0 and t < x.Len() else F32(0.0)) * s.window[i]
+        }
+    }
+    sp := mat.Mat<F32>(s.spec, 0, n, 2 * Bins, 2 * Bins)
+    gemm.Gemm(s.ws, sp, mat.Mat<F32>(s.frames, 0, n, Window, Window), false, mat.Mat<F32>(s.dft, 0, 2 * Bins, Window, Window), true)
+    for f in range n {
+        for k in range Bins {
+            re := s.spec[f * 2 * Bins + 2 * k]
+            im := s.spec[f * 2 * Bins + 2 * k + 1]
+            s.power[f * Bins + k] = re * re + im * im
+        }
+    }
+    ml := mat.Mat<F32>(s.mel, 0, n, s.Mels, s.Mels)
+    gemm.Gemm(s.ws, ml, mat.Mat<F32>(s.power, 0, n, Bins, Bins), false, mat.Mat<F32>(s.filters, 0, s.Mels, Bins, Bins), true)
+    for i in range n * s.Mels: out[i] = F32(F64(s.mel[i]).Max(1e-10).Log10())
+}
+
+# Whisper's log-mel of a clip, as Hugging Face's feature extractor makes it: [Mels x frames], each mel's frames in a
+# row. A clip of at most 30 s is padded with zeros to 30 s (3000 frames, mirrored into the zeros); a longer one is
+# taken as it is (len / Hop frames, mirrored at its end). One normalisation over the whole: each value at least the
+# largest less 8, then (x + 4) / 4
+fn (s mut Mel&) Clip(x Array<F32>&) Array<F32>, I64 {
+    end := x.Len().Max(30 * Rate)
+    frames := 3000 if x.Len() <= 30 * Rate else x.Len() / Hop
+    if x.Len() > 30 * Rate: end = x.Len()
+    logs := Array<F32>(frames * s.Mels)
+    for f0 in range 0, frames, s.Frames: s.Log(logs[f0 * s.Mels:], x, end, f0, s.Frames.Min(frames - f0))
+    top F32 = -1e30
+    for v in logs: top = top.Max(v)
+    out := Array<F32>(s.Mels * frames)
+    for f in range frames {
+        for m in range s.Mels: out[m * frames + f] = (logs[f * s.Mels + m].Max(top - 8.0) + 4.0) / 4.0
+    }
+    return out, frames
+}
+
+# frames seek .. seek + n of a clip's log-mel (Clip's, `frames` long), zeros past min(seek + take, frames): a window
+fn Slice(clip Array<F32>&, mels I64, frames I64, seek I64, take I64, n I64) Array<F32> {
+    out := Array<F32>(mels * n)
+    upto := (seek + take).Min(frames)
+    for m in range mels {
+        for f in range seek, upto: out[m * n + f - seek] = clip[m * frames + f]
+    }
+    return out
+}
+
+test Filters "Slaney's filters: each a triangle of area 2 / width, peaks rising, none negative" {
+    f := Filters(80)
+    for m in range 80 {
+        best I64 = 0
+        for k in range Bins {
+            assert f[m * Bins + k] >= 0.0
+            if f[m * Bins + k] > f[m * Bins + best]: best = k
+        }
+        assert m == 0 or best >= 1
+    }
+    assert (F64(f[1]) - 0.02486259490251541).Abs() < 1e-7, $f[1]
+}
+
+test Wav "a WAVE file of 16-bit stereo at 8 kHz: the channels averaged and resampled to 16 kHz" {
+    dir := os.MkTemp()!
+    b := Vec<U8>()
+    head := "RIFF....WAVEfmt "
+    for c in head: b.Push(U8(c))
+    for v in [16, 0, 0, 0, 1, 0, 2, 0, 0x40, 0x1F, 0, 0, 0, 0x7D, 0, 0, 4, 0, 16, 0] : b.Push(U8(v))
+    for c in "data": b.Push(U8(c))
+    for v in [8, 0, 0, 0, 0, 0x40, 0, 0x40, 0, 0xC0, 0, 0xC0]: b.Push(U8(v))
+    os.WriteFile(dir + "/a.wav", b.ToArray())!
+    x := Wav(dir + "/a.wav")!
+    assert x.Len() == 4 and x[0] == 0.5 and x[1] == 0.0 and x[2] == -0.5, $x
+    os.RemoveAll(dir)!
+}
+
+# ---- checks against the reference (speech/tools/reference.py), where its files are ----
+
+# $OANN_SPEECH (default ~/.cache/oann): audio/ holds the clips, ref/MODEL/ what the reference wrote
+fn Cache() String {
+    root := try os.Env("OANN_SPEECH") catch default ""
+    return root if root.Len() > 0 else (try os.Env("HOME") catch default "/tmp") + "/.cache/oann"
+}
+
+# a file of little-endian F32s
+fn F32s(path String&) Array<F32> ? os.Error {
+    b := try os.ReadFile(path)
+    out := Array<F32>(b.Len() / 4)
+    for i in range out.Len(): out[i] = F32.FromBits(U32(u32At(b, 4 * i)))
+    return out
+}
+
+test Mel "Whisper's log-mel of three clips within 1e-4 of Hugging Face's (its torch path is 4.4e-5 from its numpy F64 one)" {
+    for clip in ["jfk", "aesop1", "aesop2"] {
+        want := try F32s(Cache() + "/ref/tiny/" + clip + ".mel.f32") catch {
+            Println("skipped: no reference for " + clip)
+            continue
+        }
+        s := Mel(80, 1000, 4)
+        got, _ := s.Clip(Wav(Cache() + "/audio/" + clip + ".wav")!)
+        assert got.Len() == want.Len()
+        worst F64 = 0.0
+        for i in range got.Len(): worst = worst.Max((F64(got[i]) - F64(want[i])).Abs())
+        assert worst < 1e-4, clip + ": " + $worst
+    }
+}
