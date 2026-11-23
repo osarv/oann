@@ -136,6 +136,20 @@ With `Workers > 1`, the program runs each trial in a new process of itself, star
 
 A trial's seed depends only on the run's seed, the trial id and the rung. Results are taken in id order, so a run gives the same result for any number of workers.
 
+## Advice
+
+`RunWith(space, fit, split, adv, rounds)` runs the same search with an advisor: archnet's `Advisor`, or any type with
+`Ready`, `Observe(g, rung, curve, loss)`, `Acquire(g)`, `Forecast(g, curve)` and `Propose(r)`. Three settings turn
+its parts on:
+
+- `Config.Screen`: each child is the most promising of this many candidates, outside the `Explore` share.
+- `Config.Proposals`: this share of children comes from the advisor's generator.
+- `Config.Forecast`: halving ranks by forecast final loss.
+
+Every result at every rung is passed to the advisor, and each member records how it was made in `From` (drawn,
+mutated, crossed or proposed). evo has no other dependency on archnet: `Run` passes a no-op advisor. After `Resume`,
+`Replay(adv)` rebuilds an advisor from the history.
+
 ## Example
 
 `make evomlp ARGS="rounds workers seed dir"` runs `examples/evo_mlp.olang`. It searches multilayer perceptrons for a synthetic regression and uses every part of the package. It prints the best genome, its test loss (the only time the test set is read), the loss-against-MACs front, and a digest of the history that is equal for any number of workers.

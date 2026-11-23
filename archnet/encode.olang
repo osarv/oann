@@ -1,0 +1,211 @@
+# archnet/encode - genomes as fixed-length feature vectors, the input of archnet's networks.
+#
+# SchemaCode encodes evo/schema genomes from the schema alone. A choice is one-hot. A number is its place in its range,
+# on a log scale where the gene is a size or a log-scale real. A repeat is its count, then the encoding of each of its
+# first Slots instances (with a flag saying the instance is there), then the mean over all its instances. An inactive
+# gene is all zeros. Repeats nested deeper than two levels give their count alone.
+#
+# NetCode encodes evo/neat networks by path encoding (White et al. 2021, BANANAS): for every path from an input to an
+# output through enabled edges, the sequence of hidden operations on it (up to three) counts towards one feature,
+# log(1 + count). It also counts hidden nodes, enabled edges and the longest path, keeps a histogram of hidden
+# operations, and takes the mean log width.
+
+import "std/rand"
+import "toy"
+import "../evo/neat"
+import "../evo/schema"
+
+# evo/schema genomes as features
+type SchemaCode struct(space schema.Schema) {
+    Space schema.Schema = space
+    Slots I64 = 4                   # the instances of a repeat encoded one by one
+}
+
+# the length of the encoding
+fn (c SchemaCode&) Dim() I64 { return c.blockDim(schema.Root, 0) }
+
+fn (c SchemaCode&) blockDim(b I64, depth I64) I64 {
+    n I64 = 0
+    for g in c.Space.Blocks[b].Genes {
+        n += match g.Holds {
+            case schema.Kind.Choice(options): options.Len()
+            case schema.Kind.Repeat(of, _, _): 1 + (c.Slots * (1 + c.blockDim(of, depth + 1)) + c.blockDim(of, depth + 1) if depth < 2 else 0)
+            case _: 1
+        }
+    }
+    return n
+}
+
+# g's features
+fn (c SchemaCode&) Encode(g schema.Genome&) Array<F64> {
+    out := Array<F64>(c.Dim())
+    c.put(g, 0, 0, out, 0)
+    return out
+}
+
+# instance i's features (of depth `depth` in the encoding) written at out[at ...]; where they end
+fn (c SchemaCode&) put(g schema.Genome&, i I64, depth I64, out mut Array<F64>&, at I64) I64 {
+    inst := g.Insts[i]
+    genes := c.Space.Blocks[inst.Of].Genes
+    p := at
+    for j in range genes.Len() {
+        on := c.Space.Active(g, i, j)
+        v := inst.Values[j]
+        match genes[j].Holds {
+            case schema.Kind.Choice(options) {
+                if on: out[p + I64(v)] = 1.0
+                p += options.Len()
+            }
+            case schema.Kind.Int(lo, hi) {
+                if on: out[p] = place(v, F64(lo), F64(hi), genes[j].Width and lo > 0)
+                p += 1
+            }
+            case schema.Kind.Float(lo, hi, log) {
+                if on: out[p] = place(v, lo, hi, log)
+                p += 1
+            }
+            case schema.Kind.Repeat(of, min, max) {
+                if on: out[p] = place(v, F64(min), F64(max), false)
+                p += 1
+                if depth >= 2: continue
+                d := c.blockDim(of, depth + 1)
+                kids := g.Kids(i, j)
+                for s in range c.Slots {
+                    if on and s < kids.Len() {
+                        out[p] = 1.0
+                        c.put(g, kids[s], depth + 1, out, p + 1)
+                    }
+                    p += 1 + d
+                }
+                if on and kids.Len() > 0 {
+                    tmp := Array<F64>(d)
+                    for k in kids {
+                        one := Array<F64>(d)
+                        c.put(g, k, depth + 1, one, 0)
+                        for x in range d: tmp[x] += one[x] / F64(kids.Len())
+                    }
+                    for x in range d: out[p + x] = tmp[x]
+                }
+                p += d
+            }
+        }
+    }
+    return p
+}
+
+# v's place in [lo, hi], 0 to 1 (on a log scale where log)
+fn place(v F64, lo F64, hi F64, log Bool) F64 {
+    if hi <= lo: return 0.0
+    if log: return (v.Log() - lo.Log()) / (hi.Log() - lo.Log())
+    return (v - lo) / (hi - lo)
+}
+
+# evo/neat networks as features
+type NetCode struct(space neat.Space) {
+    Space neat.Space = space
+    Depth I64 = 3           # paths with up to this many hidden nodes are told apart
+}
+
+fn (c NetCode&) Dim() I64 {
+    k := c.Space.Ops.Len()
+    paths I64 = 0
+    p I64 = 1
+    for _ in range c.Depth + 1 {
+        paths += p
+        p *= k
+    }
+    return 4 + k + paths
+}
+
+# n's features
+fn (c NetCode&) Encode(n neat.Net&) Array<F64> {
+    out := Array<F64>(c.Dim())
+    k := c.Space.Ops.Len()
+    hidden I64 = 0
+    logw F64 = 0.0
+    for x in n.Nodes {
+        if x.Id < c.Space.Inputs + c.Space.Outputs: continue
+        hidden += 1
+        out[4 + x.Op] += 1.0
+        logw += F64(x.Width).Log2()
+    }
+    edges I64 = 0
+    for e in n.Edges {
+        if e.On: edges += 1
+    }
+    out[0] = F64(hidden) / 10.0
+    out[1] = F64(edges) / 20.0
+    out[3] = logw / F64(hidden) / 10.0 if hidden > 0 else 0.0
+    counts := Array<F64>(c.Dim() - 4 - k)
+    longest I64 = 0
+    for i in range c.Space.Inputs {
+        l := c.walk(n, i, 0, 0, 0, counts)
+        longest = l if l > longest else longest
+    }
+    out[2] = F64(longest) / 10.0
+    for j in range counts.Len(): out[4 + k + j] = (1.0 + counts[j]).Log()
+    return out
+}
+
+# the paths from node id `id` to an output, `hops` hidden nodes on them so far, code `code` (their ops in base k) at
+# level offset `base`: counted; the longest number of hidden nodes to an output
+fn (c NetCode&) walk(n neat.Net&, id I64, hops I64, code I64, base I64, counts mut Array<F64>&) I64 {
+    if id >= c.Space.Inputs and id < c.Space.Inputs + c.Space.Outputs {
+        if hops <= c.Depth: counts[base + code] += 1.0
+        return hops
+    }
+    if hops > 2 * c.Depth + 4: return hops           # a bound on the walk; deeper paths count as one beyond Depth
+    longest := -1
+    for e in n.Edges {
+        if not e.On or e.From != id: continue
+        h := hops
+        nextCode, nextBase := code, base
+        if e.To >= c.Space.Inputs + c.Space.Outputs {
+            op := n.Nodes[n.Find(e.To)].Op
+            h = hops + 1
+            if h <= c.Depth {
+                nextBase = base + pow(c.Space.Ops.Len(), hops)
+                nextCode = code * c.Space.Ops.Len() + op
+            }
+        }
+        l := c.walk(n, e.To, h, nextCode, nextBase, counts)
+        longest = l if l > longest else longest
+    }
+    return longest
+}
+
+fn pow(k I64, e I64) I64 {
+    p I64 = 1
+    for _ in range e: p *= k
+    return p
+}
+
+# ---- tests ----
+
+test SchemaCode "genomes that decode alike encode alike; the encoding has the length Dim gives" {
+    s := toy.Space()
+    code := SchemaCode(s)
+    r := rand.Rand(1)
+    for _ in range 100 {
+        a := s.Random(r)
+        b := s.Mutate(a, r)
+        x, y := code.Encode(a), code.Encode(b)
+        assert x.Len() == code.Dim()
+        if s.Key(a) == s.Key(b): assert x == y
+    }
+}
+
+test NetCode "path encoding counts the paths through each sequence of operations" {
+    sp := neat.Space(1, 1, Array<String>["a", "b"], 4, 64)
+    r := rand.Rand(2)
+    n := sp.Random(r)
+    n = sp.Apply(n, neat.Mutation.AddNode, r)         # 0 -> h -> 1, the direct edge off
+    code := NetCode(sp)
+    x := code.Encode(n)
+    h := n.Nodes[2].Op
+    assert x[0] == 0.1 and x[2] == 0.1                  # one hidden node, a path through one
+    assert x[4 + h] == 1.0
+    assert x[4 + 2 + 1 + h] == 2.0.Log()                # one path whose hidden ops are [h]: log(1 + 1)
+    assert x[4 + 2] == 0.0                              # no direct path
+}
+

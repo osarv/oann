@@ -66,6 +66,10 @@ type Config struct(method Algorithm, seed U64) {
     Workers I64 = 1                         # trials run at once, each in its own process (1: in this one)
     Dir String = ""                         # weights and checkpoints ("": neither)
     Objectives I64 = 2                      # NSGA-II's: the loss, then the first Objectives - 1 costs
+    Screen I64 = 1                          # with an advisor: candidates made per child, the most promising kept
+    Proposals F64 = 0.0                     # with an advisor: the share of children its generator proposes
+    Explore F64 = 0.25                      # the share of children taken unscreened, whatever the advisor says
+    Forecast Bool = false                   # with an advisor: halving ranks by its forecast final loss, not the loss so far
 }
 
 # one evaluation of a genome
@@ -98,12 +102,36 @@ type Member<G> struct(Id I64, Genome G, Res Result, Parent I64, Born I64) {
     Id
     Genome
     Res
-    Parent          # -1: drawn afresh
+    Parent          # -1: drawn afresh or proposed
     Born            # the round it was made in
+    From Origin = Origin.Drawn
+    Curve Vec<F64> = Vec<F64>()     # its loss at each rung it reached, the last its Res.Loss
 }
+
+# how a member was made
+type Origin enum { Drawn, Mutated, Crossed, Proposed }
+
+fn originIndex(o Origin) I64 {
+    return match o {
+        case Origin.Drawn: 0
+        case Origin.Mutated: 1
+        case Origin.Crossed: 2
+        case Origin.Proposed: 3
+    }
+}
+
+# no advice: what Run passes as the advisor
+type NoAdvice<G> struct() { }
+
+fn (n NoAdvice<G>&) Ready() Bool { return false }
+fn (n mut NoAdvice<G>&) Observe(g G&, rung I64, curve Array<F64>&, loss F64) { }
+fn (n mut NoAdvice<G>&) Acquire(g G&) F64 { return 0.0 }
+fn (n mut NoAdvice<G>&) Forecast(g G&, curve Array<F64>&) F64 { return 0.0 }
+fn (n mut NoAdvice<G>&) Propose(r mut rand.Rand&) G ? SearchError { error SearchError.NoProposal }
 
 type SearchError error {
     State(why String)       # a checkpoint that cannot be read back
+    NoProposal              # no advisor to propose
 }
 
 # a search's state
@@ -136,19 +164,32 @@ fn Split<Array<T>>.Carve(items Array<T>&, val F64, seed U64) Split<Array<T>> {
 
 # rounds more rounds: the first draws and evaluates the population, each later one makes and keeps children
 fn (e mut Evolution<G>&) Run<S, F, D>(space mut S&, fit mut F&, data Split<D>&, rounds I64) {
-    for _ in range rounds: e.Step(space, fit, data)
+    none := NoAdvice<G>()
+    for _ in range rounds: e.StepWith(space, fit, data, none)
+}
+
+# rounds more rounds, advised by adv (archnet's Advisor, or any type with its methods): children screened by its
+# acquisition, some proposed by its generator, halving ranked by its forecasts, every finished member observed
+fn (e mut Evolution<G>&) RunWith<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&, rounds I64) {
+    for _ in range rounds: e.StepWith(space, fit, data, adv)
 }
 
 # one round
 fn (e mut Evolution<G>&) Step<S, F, D>(space mut S&, fit mut F&, data Split<D>&) {
+    none := NoAdvice<G>()
+    e.StepWith(space, fit, data, none)
+}
+
+# one round, advised by adv
+fn (e mut Evolution<G>&) StepWith<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&) {
     if e.Population.Len() == 0 {
-        e.start(space, fit, data)
+        e.start(space, fit, data, adv)
     } else {
         match e.Settings.Method {
-            case Algorithm.Regularized(size, sample): e.regularized(space, fit, data, size, sample)
-            case Algorithm.Tournament(size, k, elite): e.tournament(space, fit, data, size, k, elite)
-            case Algorithm.MuPlusLambda(mu, lambda): e.muPlusLambda(space, fit, data, mu, lambda)
-            case Algorithm.Nsga2(size): e.nsga2(space, fit, data, size)
+            case Algorithm.Regularized(size, sample): e.regularized(space, fit, data, adv, size, sample)
+            case Algorithm.Tournament(size, k, elite): e.tournament(space, fit, data, adv, size, k, elite)
+            case Algorithm.MuPlusLambda(mu, lambda): e.muPlusLambda(space, fit, data, adv, mu, lambda)
+            case Algorithm.Nsga2(size): e.nsga2(space, fit, data, adv, size)
         }
     }
     e.Round += 1
@@ -167,29 +208,56 @@ fn (e Evolution<G>&) size() I64 {
 }
 
 # the first population, drawn uniformly and evaluated at the full budget
-fn (e mut Evolution<G>&) start<S, F, D>(space mut S&, fit mut F&, data Split<D>&) {
+fn (e mut Evolution<G>&) start<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&) {
     kids := Vec<Member<G>>()
-    for _ in range e.size(): kids.Push(e.member(space.Random(e.rng), -1))
-    for m in e.evaluate(space, fit, data, kids, false): e.Population.Push(m)
+    for _ in range e.size(): kids.Push(e.member(space.Random(e.rng), -1, Origin.Drawn))
+    for m in e.evaluate(space, fit, data, adv, kids, false): e.Population.Push(m)
 }
 
 # a new member of genome g, not yet evaluated
-fn (e mut Evolution<G>&) member(g G, parent I64) Member<G> {
+fn (e mut Evolution<G>&) member(g G, parent I64, from Origin) Member<G> {
     e.nextId += 1
-    return Member<G>(e.nextId - 1, g, Result(F64.Inf), parent, e.Round)
+    m := Member<G>(e.nextId - 1, g, Result(F64.Inf), parent, e.Round)
+    m.From = from
+    return m
 }
 
-# a child of a (and b, by crossover with probability Crossover where b is given), mutated
-fn (e mut Evolution<G>&) child<S>(space mut S&, a Member<G>&, b Member<G>&, cross Bool) Member<G> {
+# one candidate child: a proposal from the advisor at the Proposals rate (a mutation where it has none), else a's
+# mutation, or a crossover of a and b (the fitter first) at the Crossover rate where cross, then mutated
+fn (e mut Evolution<G>&) candidate<S, A>(space mut S&, adv mut A&, a Member<G>&, b Member<G>&, cross Bool, proposing Bool) Member<G> {
+    if proposing {
+        g := try adv.Propose(e.rng) catch { return e.member(space.Mutate(a.Genome, e.rng), a.Id, Origin.Mutated) }
+        return e.member(g, -1, Origin.Proposed)
+    }
     if cross and e.Settings.Crossover > 0.0 and e.rng.Float() < e.Settings.Crossover {
         first, second := a, b
         if better(b, a) {
             first = b
             second = a
         }
-        return e.member(space.Mutate(space.Cross(first.Genome, second.Genome, e.rng), e.rng), first.Id)
+        return e.member(space.Mutate(space.Cross(first.Genome, second.Genome, e.rng), e.rng), first.Id, Origin.Crossed)
     }
-    return e.member(space.Mutate(a.Genome, e.rng), a.Id)
+    return e.member(space.Mutate(a.Genome, e.rng), a.Id, Origin.Mutated)
+}
+
+# a child: once the advisor is Ready and outside the Explore share, the most promising (lowest Acquire) of Screen
+# candidates, a genome already evaluated at the full budget passed over where another is new; else one candidate
+fn (e mut Evolution<G>&) child<S, A>(space mut S&, adv mut A&, a Member<G>&, b Member<G>&, cross Bool) Member<G> {
+    proposing := e.Settings.Proposals > 0.0 and e.rng.Float() < e.Settings.Proposals
+    n := e.Settings.Screen if adv.Ready() and e.Settings.Screen > 1 and e.rng.Float() >= e.Settings.Explore else 1
+    best := e.candidate(space, adv, a, b, cross, proposing)
+    if n == 1: return best
+    full := "@" + $(e.Settings.Rungs.Len() - 1)
+    score := adv.Acquire(best.Genome) + (F64.Inf if e.cache.Has(space.Key(best.Genome) + full) else 0.0)
+    for _ in range n - 1 {
+        c := e.candidate(space, adv, a, b, cross, proposing)
+        s := adv.Acquire(c.Genome) + (F64.Inf if e.cache.Has(space.Key(c.Genome) + full) else 0.0)
+        if s < score {
+            best = c
+            score = s
+        }
+    }
+    return best
 }
 
 # whether a scored better than b (lower loss, then the older)
@@ -215,7 +283,7 @@ fn (e Evolution<G>&) bestOf(idx Array<I64>&) I64 {
 
 # aging evolution: Batch children, each the mutation of the best of `sample` members drawn at random (crossed with the
 # sample's second best at the Crossover rate); the oldest leave once there are more than `size`
-fn (e mut Evolution<G>&) regularized<S, F, D>(space mut S&, fit mut F&, data Split<D>&, size I64, sample I64) {
+fn (e mut Evolution<G>&) regularized<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&, size I64, sample I64) {
     kids := Vec<Member<G>>()
     for _ in range e.Settings.Batch {
         idx := e.draw(sample)
@@ -224,9 +292,9 @@ fn (e mut Evolution<G>&) regularized<S, F, D>(space mut S&, fit mut F&, data Spl
         for i in idx {
             if i != b and (second == b or better(e.Population[i], e.Population[second])): second = i
         }
-        kids.Push(e.child(space, e.Population[b], e.Population[second], second != b))
+        kids.Push(e.child(space, adv, e.Population[b], e.Population[second], second != b))
     }
-    for m in e.evaluate(space, fit, data, kids, true): e.Population.Push(m)
+    for m in e.evaluate(space, fit, data, adv, kids, true): e.Population.Push(m)
     for e.Population.Len() > size {
         try e.Population.RemoveAt(0) catch { unreachable }
     }
@@ -234,17 +302,17 @@ fn (e mut Evolution<G>&) regularized<S, F, D>(space mut S&, fit mut F&, data Spl
 
 # generational: size - elite children of tournament winners (crossed with a second winner at the Crossover rate); the
 # elite and the children make the next population, the best of the rest filling places children failed to take
-fn (e mut Evolution<G>&) tournament<S, F, D>(space mut S&, fit mut F&, data Split<D>&, size I64, k I64, elite I64) {
+fn (e mut Evolution<G>&) tournament<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&, size I64, k I64, elite I64) {
     e.sortPopulation()
     kids := Vec<Member<G>>()
     for _ in range size - elite {
         a := e.bestOf(e.draw(k))
         b := e.bestOf(e.draw(k))
-        kids.Push(e.child(space, e.Population[a], e.Population[b], a != b))
+        kids.Push(e.child(space, adv, e.Population[a], e.Population[b], a != b))
     }
     next := Vec<Member<G>>()
     for i in range elite if elite < e.Population.Len() else e.Population.Len(): next.Push(e.Population[i])
-    for m in e.evaluate(space, fit, data, kids, true): next.Push(m)
+    for m in e.evaluate(space, fit, data, adv, kids, true): next.Push(m)
     for i in range elite, e.Population.Len() {
         if next.Len() < size: next.Push(e.Population[i])
     }
@@ -252,13 +320,13 @@ fn (e mut Evolution<G>&) tournament<S, F, D>(space mut S&, fit mut F&, data Spli
 }
 
 # (mu + lambda): lambda children of parents drawn uniformly, the best mu of parents and children kept
-fn (e mut Evolution<G>&) muPlusLambda<S, F, D>(space mut S&, fit mut F&, data Split<D>&, mu I64, lambda I64) {
+fn (e mut Evolution<G>&) muPlusLambda<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&, mu I64, lambda I64) {
     kids := Vec<Member<G>>()
     for _ in range lambda {
         idx := e.draw(2)
-        kids.Push(e.child(space, e.Population[idx[0]], e.Population[idx[idx.Len() - 1]], idx.Len() > 1))
+        kids.Push(e.child(space, adv, e.Population[idx[0]], e.Population[idx[idx.Len() - 1]], idx.Len() > 1))
     }
-    for m in e.evaluate(space, fit, data, kids, true): e.Population.Push(m)
+    for m in e.evaluate(space, fit, data, adv, kids, true): e.Population.Push(m)
     e.sortPopulation()
     for e.Population.Len() > mu {
         try e.Population.Pop() catch { unreachable }
@@ -279,15 +347,15 @@ fn (e Evolution<G>&) objectives(m Member<G>&, out mut Array<F64>&, at I64) {
 # NSGA-II: size children of binary tournaments by front then crowding (crossed with a second winner at the Crossover
 # rate); parents and children sorted into fronts, the next population filled front by front, the last front cut by
 # crowding
-fn (e mut Evolution<G>&) nsga2<S, F, D>(space mut S&, fit mut F&, data Split<D>&, size I64) {
+fn (e mut Evolution<G>&) nsga2<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&, size I64) {
     rank, crowd := e.fronts()
     kids := Vec<Member<G>>()
     for _ in range size {
         a := e.crowdedWinner(rank, crowd)
         b := e.crowdedWinner(rank, crowd)
-        kids.Push(e.child(space, e.Population[a], e.Population[b], a != b))
+        kids.Push(e.child(space, adv, e.Population[a], e.Population[b], a != b))
     }
-    for m in e.evaluate(space, fit, data, kids, true): e.Population.Push(m)
+    for m in e.evaluate(space, fit, data, adv, kids, true): e.Population.Push(m)
     rank2, crowd2 := e.fronts()
     order := Vec<I64>()
     for i in range e.Population.Len(): order.Push(i)
@@ -361,18 +429,39 @@ fn (e Evolution<G>&) tidy() {
 }
 
 # kids evaluated - through every rung of successive halving where ladder, else at the full budget alone - those that
-# reach it added to the history and given back
-fn (e mut Evolution<G>&) evaluate<S, F, D>(space mut S&, fit mut F&, data Split<D>&, kids mut Vec<Member<G>>&, ladder Bool) Vec<Member<G>> {
+# reach it added to the history and given back. The advisor observes every result at every rung. Between rungs they are
+# ranked by their loss so far, or, once the advisor is Ready, by the final loss it forecasts from their curves
+fn (e mut Evolution<G>&) evaluate<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&, kids mut Vec<Member<G>>&, ladder Bool) Vec<Member<G>> {
     rungs := e.Settings.Rungs.Len()
     alive := kids
     for k in range 0 if ladder else rungs - 1, rungs {
         e.rung(space, fit, data, alive, k)
         kept := Vec<Member<G>>()
         for m in alive {
-            if m.Res.Loss < F64.Inf: kept.Push(m)
+            if m.Res.Loss == F64.Inf: continue
+            adv.Observe(m.Genome, k, m.Curve.ToArray(), m.Res.Loss)
+            m.Curve.Push(m.Res.Loss)
+            kept.Push(m)
         }
         alive = kept
         if k == rungs - 1 or alive.Len() == 0: break
+        if e.Settings.Forecast and adv.Ready() {
+            ranked := Vec<Member<G>>()
+            for m in alive {
+                f := m
+                f.Res = Result(adv.Forecast(m.Genome, m.Curve.ToArray()))
+                ranked.Push(f)
+            }
+            ranked.Sort(fn(a, b): return better(a, b))
+            keepIds := Vec<I64>()
+            for q in range (ranked.Len() + e.Settings.Eta - 1) / e.Settings.Eta: keepIds.Push(ranked[q].Id)
+            chosen := Vec<Member<G>>()
+            for m in alive {
+                if m.Id in keepIds: chosen.Push(m)
+            }
+            alive = chosen
+            continue
+        }
         alive.Sort(fn(a, b): return better(a, b))
         keep := (alive.Len() + e.Settings.Eta - 1) / e.Settings.Eta
         for alive.Len() > keep {
@@ -536,6 +625,21 @@ fn failed() noreturn {
     os.Exit(1)
 }
 
+# every member of the history shown to adv again, rung by rung, in the order they were made: an advisor's state is not
+# in the checkpoint, so after Resume this rebuilds it from what the search kept (the final members' curves; candidates
+# halving dropped are not in the history)
+fn (e Evolution<G>&) Replay<A>(adv mut A&) {
+    rungs := e.Settings.Rungs.Len()
+    for m in e.History {
+        first := rungs - m.Curve.Len()
+        for k in range m.Curve.Len() {
+            curve := Array<F64>(k)
+            for j in range k: curve[j] = m.Curve[j]
+            adv.Observe(m.Genome, first + k, curve, m.Curve[k])
+        }
+    }
+}
+
 # ---- results ----
 
 # the best member evaluated at the full budget (the lowest loss, then the oldest)
@@ -560,7 +664,9 @@ fn (e Evolution<G>&) Front() Vec<Member<G>> {
 # ---- checkpoints ----
 
 fn memberLine<S, G>(space S&, tag String&, m Member<G>&) String {
-    t := tag + " " + $m.Id + " " + $m.Parent + " " + $m.Born + " " + $m.Res.Loss + " " + $m.Res.Costs.Len()
+    t := tag + " " + $m.Id + " " + $m.Parent + " " + $m.Born + " " + $originIndex(m.From) + " " + $m.Curve.Len()
+    for c in m.Curve: t += " " + $c
+    t += " " + $m.Res.Loss + " " + $m.Res.Costs.Len()
     for c in m.Res.Costs: t += " " + $c
     return t + "\t" + space.Encode(m.Genome) + "\n"
 }
@@ -630,12 +736,17 @@ fn (e mut Evolution<G>&) Resume<S>(space mut S&, text String&) ? SearchError {
             e.cache.Put($parts[1], try Result.read(f, 1))
             continue
         }
-        if f.Len() < 6 or (f[0] != "P" and f[0] != "H"): error SearchError.State("a line: " + $line)
+        if f.Len() < 8 or (f[0] != "P" and f[0] != "H"): error SearchError.State("a line: " + $line)
         id := try f[1].ParseInt() catch { error SearchError.State("an id") }
         parent := try f[2].ParseInt() catch { error SearchError.State("a parent") }
         born := try f[3].ParseInt() catch { error SearchError.State("a round") }
+        from := try f[4].ParseInt() catch { error SearchError.State("an origin") }
+        nc := try f[5].ParseInt() catch { error SearchError.State("a curve") }
+        if from < 0 or from > 3 or nc < 0 or f.Len() < 8 + nc: error SearchError.State("a line: " + $line)
         g := try space.Decode(parts[1]) catch { error SearchError.State("a genome") }
-        m := Member<G>(id, g, try Result.read(f, 4), parent, born)
+        m := Member<G>(id, g, try Result.read(f, 6 + nc), parent, born)
+        m.From = Array<Origin>[Origin.Drawn, Origin.Mutated, Origin.Crossed, Origin.Proposed][from]
+        for k in range nc: m.Curve.Push(try f[6 + k].ParseFloat() catch { error SearchError.State("a curve") })
         if f[0] == "P" {
             e.Population.Push(m)
         } else {

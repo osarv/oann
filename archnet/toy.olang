@@ -1,0 +1,95 @@
+# archnet/toy - a synthetic architecture benchmark with a known optimum, for testing searches and archnet. The space:
+# 1 to 6 layers, each an operation (5 kinds) and a width (8 to 256); a normalization (none, batch, layer); a learning
+# rate (1e-4 to 1e-1, log scale).
+#
+# A genome's final loss is a known function, which Truth gives. The terms are:
+# - each layer's operation, scored by a table that depends on its position (mod 3);
+# - each width's distance (in octaves) from 32 x 2^position, capped at 256;
+# - the distance of the depth from 4;
+# - the distance of log10 of the learning rate from -2.5;
+# - the normalization.
+# Optimum gives the lowest final loss.
+#
+# Training curves mislead on purpose. At budget b a genome's loss is its final loss plus A exp(-b / Tau). Large
+# networks (A grows with total width) and timid learning rates (Tau grows as the rate falls) start slowly, so ranking by
+# the loss at a small budget prefers small, fast-starting networks over the best ones. Every evaluation adds
+# Normal(0, Noise), seeded by the trial.
+
+import "std/rand"
+import "../evo/schema"
+import "../evo/search"
+
+Full F64 = 9.0      # the full budget the curves converge by
+
+fn Space() schema.Schema {
+    s := schema.Schema()
+    layer := s.Block("layer")
+    s.Choice(layer, "op", Array<String>["conv", "attention", "mlp", "ssm", "identity"])
+    s.Int(layer, "width", 8, 256, true)
+    s.Choice(schema.Root, "norm", Array<String>["none", "batch", "layer"])
+    s.Float(schema.Root, "lr", 1e-4, 1e-1, true)
+    s.Repeat(schema.Root, "layers", layer, 1, 6)
+    return s
+}
+
+# what each operation costs at a position (mod 3)
+Quality Array<F64> = Array<F64>[0.00, 0.20, 0.10,  0.25, 0.00, 0.15,  0.10, 0.15, 0.00,  0.05, 0.10, 0.20,  0.30, 0.30, 0.30]
+
+fn target(p I64) F64 { return (32.0 * F64(1 << p)).Min(256.0) }
+
+# the final loss of g
+fn Truth(s schema.Schema&, g schema.Genome&) F64 {
+    layers := s.Children(g, schema.Root, "layers")
+    loss := 0.15 * (F64(layers.Len()) - 4.0).Abs()
+    for p in range layers.Len() {
+        i := layers[p]
+        loss += Quality[I64(s.Num(g, i, "op")) * 3 + p % 3]
+        d := (s.Num(g, i, "width") / target(p)).Log2()
+        loss += 0.05 * d * d
+    }
+    lr := s.Num(g, schema.Root, "lr").Log10() + 2.5
+    loss += 0.3 * lr * lr
+    norm := s.Pick(g, schema.Root, "norm")
+    if norm == "none": loss += 0.2
+    if norm == "batch": loss += 0.05 if layers.Len() > 3 else 0.12
+    return loss
+}
+
+# the lowest final loss of the space
+fn Optimum() F64 {
+    best := F64.Inf
+    for depth in range 1, 7 {
+        loss := 0.15 * (F64(depth) - 4.0).Abs()
+        for p in range depth {
+            q := F64.Inf
+            for op in range 5: q = q.Min(Quality[op * 3 + p % 3])
+            loss += q
+        }
+        best = best.Min(loss)
+    }
+    return best
+}
+
+# the loss at budget b: the final loss plus a slow start, larger for wide networks and small learning rates
+fn Curve(s schema.Schema&, g schema.Genome&, b F64) F64 {
+    width F64 = 0.0
+    for i in s.Children(g, schema.Root, "layers"): width += s.Num(g, i, "width")
+    a := 0.2 + 1.0 * width / 512.0
+    tau := 1.0 + 1.5 * (-2.0 - s.Num(g, schema.Root, "lr").Log10()).Max(0.0)
+    return Truth(s, g) + a * (-b / tau).Exp()
+}
+
+# the benchmark as a fitness: the curve at the trial's budget, with noise
+type Fit struct(space schema.Schema) {
+    Schema schema.Schema = space
+    Noise F64 = 0.01
+    Spent F64 = 0.0             # the budget of every evaluation summed (resumed ones counted from where they resumed)
+}
+
+type ToyError error { Never }
+
+fn (f mut Fit&) Evaluate(g schema.Genome&, t search.Trial&, data search.Split<I64>&) search.Result ? ToyError {
+    f.Spent += t.Budget - t.Spent
+    r := rand.Rand(t.Seed)
+    return search.Result(Curve(f.Schema, g, t.Budget) + r.Normal(0.0, f.Noise))
+}

@@ -12,7 +12,8 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/holo.olang dyn/store.olang dyn/recur.olang dyn/sleep.olang dyn/halt.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
 	bayes/dense.olang bayes/gauss.olang bayes/quadrature.olang bayes/laplace.olang bayes/state.olang bayes/target.olang bayes/vi.olang \
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang \
-	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang
+	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang \
+	archnet/encode.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers
@@ -29,7 +30,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help evomlp potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -265,6 +266,12 @@ graphsettle:
 samplebench:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_sample bench/sample.olang
 	./build/bench_sample $(ARGS)
+
+# archnet on its toy benchmark: the predictor's held-out rank correlation, and evolution alone against screening,
+# proposals and forecast halving (bench/archsearch.olang) - ARGS: rounds, seeds, gap
+archsearch:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_archsearch bench/archsearch.olang
+	./build/bench_archsearch $(ARGS)
 
 # architecture search with evo: regularized evolution over MLPs for a synthetic regression, successive halving, weight
 # inheritance, checkpoints, worker processes (examples/evo_mlp.olang) - ARGS: rounds, workers, seed, directory

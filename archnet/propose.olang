@@ -1,0 +1,217 @@
+# archnet/propose - a generator of evo/schema genomes learned online: an estimation-of-distribution model (the
+# cross-entropy method) fitted to the best genomes seen, weighted by rank.
+#
+#     g := propose.Proposer(space)
+#     g.Observe(genome, loss)              # every evaluated genome
+#     child := try g.Sample(r)             # a new genome drawn from the model
+#
+# The model has a distribution per gene and position. A position is a gene of a block together with its place in the
+# genome: the repeat it sits in, its index among its siblings (beyond Slots - 1 they share one) and its depth. A choice
+# and a repeat's count have categorical weights; an integer or a real has a mean and spread, on a log scale where the
+# gene is a size or a log-scale real. Sampling walks the schema as drawing a random genome does, each value drawn from
+# its position's distribution. So proposals keep the structure of the good genomes - their depth, the operation at
+# each place - rather than one genome's values.
+#
+# Fitting takes the best Elite share of what was seen (at least Least genomes), weighted from the top down. Every draw
+# mixes Smooth of the uniform distribution into the model, so nothing is ever ruled out.
+
+import "std/rand"
+import "toy"
+import "../evo/schema"
+
+type NoProposal error {
+    NotYet          # too little seen to fit a model
+    Unsupported     # this genome type has no generator
+}
+
+# what a position's values were, weighted
+type stats struct() {
+    Weights Vec<F64> = Vec<F64>()   # per option, or per count of a repeat
+    Sum F64 = 0.0                   # a number's weighted sum, square sum and total weight (on its scale)
+    Sq F64 = 0.0
+    Total F64 = 0.0
+}
+
+# a learned generator of a schema's genomes
+type Proposer struct(space schema.Schema) {
+    Space schema.Schema = space
+    Elite F64 = 0.25
+    Least I64 = 8
+    Smooth F64 = 0.1
+    Slots I64 = 4
+    seen Vec<schema.Genome> = Vec<schema.Genome>()
+    losses Vec<F64> = Vec<F64>()
+    model Map<String, stats> = Map<String, stats>()
+    fitted I64 = -1                 # how many were seen when the model was fitted
+}
+
+# a genome evaluated to loss
+fn (p mut Proposer&) Observe(g schema.Genome&, loss F64) {
+    p.seen.Push(g)
+    p.losses.Push(loss)
+}
+
+# the position of gene j of instance i: its block, gene, depth, and its place among its siblings
+fn (p Proposer&) address(g schema.Genome&, i I64, j I64, pos I64) String {
+    inst := g.Insts[i]
+    return $inst.Of + "/" + $j + "/" + $inst.Depth + "/" + $(pos if pos < p.Slots else p.Slots - 1)
+}
+
+# the model fitted to the best Elite share, weighted by rank
+fn (p mut Proposer&) fit() {
+    p.model.Clear()
+    n := p.losses.Len()
+    order := Vec<I64>()
+    for i in range n: order.Push(i)
+    order.Sort(fn(a, b): return p.losses[a] < p.losses[b] or (p.losses[a] == p.losses[b] and a < b))
+    top := I64(p.Elite * F64(n))
+    top = p.Least if top < p.Least else top
+    top = n if top > n else top
+    for rank in range top: p.add(p.seen[order[rank]], 0, 0, F64(top - rank))
+    p.fitted = n
+}
+
+# instance i of g (the pos-th among its siblings) added to the model with weight w, with its subtree
+fn (p mut Proposer&) add(g schema.Genome&, i I64, pos I64, w F64) {
+    inst := g.Insts[i]
+    genes := p.Space.Blocks[inst.Of].Genes
+    for j in range genes.Len() {
+        if not p.Space.Active(g, i, j): continue
+        key := p.address(g, i, j, pos)
+        st := try p.model.Get(key) catch default stats()
+        v := inst.Values[j]
+        match genes[j].Holds {
+            case schema.Kind.Choice(options): bump(st, I64(v), options.Len(), w)
+            case schema.Kind.Repeat(_, min, max) {
+                bump(st, I64(v) - min, max - min + 1, w)
+                kids := g.Kids(i, j)
+                for k in range kids.Len(): p.add(g, kids[k], k, w)
+            }
+            case _ {
+                x := scaleOf(genes[j], v)
+                st.Sum += w * x
+                st.Sq += w * x * x
+                st.Total += w
+            }
+        }
+        p.model.Put(key, st)
+    }
+}
+
+fn bump(st mut stats&, k I64, n I64, w F64) {
+    for st.Weights.Len() < n: st.Weights.Push(0.0)
+    st.Weights[k] += w
+    st.Total += w
+}
+
+# whether a number gene is drawn on a log scale
+fn logScale(g schema.Gene&) Bool {
+    return match g.Holds {
+        case schema.Kind.Int(lo, _): g.Width and lo > 0
+        case schema.Kind.Float(lo, _, log): log and lo > 0.0
+        case _: false
+    }
+}
+
+fn scaleOf(g schema.Gene&, v F64) F64 { return v.Log() if logScale(g) else v }
+
+# a genome drawn from the model (refitted first when more has been seen); NotYet before Least genomes
+fn (p mut Proposer&) Sample(r mut rand.Rand&) schema.Genome ? NoProposal {
+    if p.losses.Len() < p.Least: error NoProposal.NotYet
+    if p.fitted != p.losses.Len(): p.fit()
+    g := schema.Genome()
+    p.grow(g, schema.Root, 0, -1, 0, r)
+    return g
+}
+
+# a drawn instance of block b appended to g, with its subtree
+fn (p Proposer&) grow(g mut schema.Genome&, b I64, depth I64, slot I64, pos I64, r mut rand.Rand&) {
+    genes := p.Space.Blocks[b].Genes
+    at := g.Insts.Len()
+    g.Insts.Push(schema.Inst(b, depth, slot, Array<F64>(genes.Len())))
+    for j in range genes.Len() {
+        key := $b + "/" + $j + "/" + $depth + "/" + $(pos if pos < p.Slots else p.Slots - 1)
+        st := try p.model.Get(key) catch default stats()
+        v := p.draw(genes[j], st, r)
+        inst := g.Insts[at]
+        inst.Values[j] = v
+        g.Insts[at] = inst
+        match genes[j].Holds {
+            case schema.Kind.Repeat(of, _, _) {
+                for k in range I64(v): p.grow(g, of, depth + 1, j, k, r)
+            }
+            case _ { }
+        }
+    }
+}
+
+# a value of gene g drawn from st, Smooth of the uniform distribution mixed in
+fn (p Proposer&) draw(g schema.Gene&, st stats&, r mut rand.Rand&) F64 {
+    uniform := st.Total <= 0.0 or r.Float() < p.Smooth
+    match g.Holds {
+        case schema.Kind.Choice(options): return F64(pick(st, options.Len(), uniform, r))
+        case schema.Kind.Repeat(_, min, max): return F64(min + pick(st, max - min + 1, uniform, r))
+        case schema.Kind.Int(lo, hi) {
+            if uniform: return F64(lo + r.Below(hi - lo + 1))
+            x := p.normal(g, st, F64(lo), F64(hi), r)
+            return x.Round().Max(F64(lo)).Min(F64(hi))
+        }
+        case schema.Kind.Float(lo, hi, log) {
+            if uniform: return (lo.Log() + r.Float() * (hi.Log() - lo.Log())).Exp() if log else lo + r.Float() * (hi - lo)
+            return p.normal(g, st, lo, hi, r).Max(lo).Min(hi)
+        }
+    }
+}
+
+# a draw from the normal of st's mean and spread (on g's scale), its spread at least a twentieth of the range
+fn (p Proposer&) normal(g schema.Gene&, st stats&, lo F64, hi F64, r mut rand.Rand&) F64 {
+    a, b := scaleOf(g, lo), scaleOf(g, hi)
+    mean := st.Sum / st.Total
+    sd := (st.Sq / st.Total - mean * mean).Max(0.0).Sqrt().Max((b - a) / 20.0)
+    x := r.Normal(mean, sd)
+    return x.Exp() if logScale(g) else x
+}
+
+# an index below n drawn by st's weights (uniformly where uniform)
+fn pick(st stats&, n I64, uniform Bool, r mut rand.Rand&) I64 {
+    if uniform: return r.Below(n)
+    total F64 = 0.0
+    for k in range n: total += st.Weights[k] if k < st.Weights.Len() else 0.0
+    if total <= 0.0: return r.Below(n)
+    u := r.Float() * total
+    for k in range n {
+        u -= st.Weights[k] if k < st.Weights.Len() else 0.0
+        if u < 0.0: return k
+    }
+    return n - 1
+}
+
+# no generator: Sample always fails with Unsupported (for genome types without a model, such as evo/neat's)
+type NoProposer<G> struct() { }
+
+fn (n mut NoProposer<G>&) Observe(g G&, loss F64) { }
+
+fn (n mut NoProposer<G>&) Sample(r mut rand.Rand&) G ? NoProposal { error NoProposal.Unsupported }
+
+# ---- tests ----
+
+test Proposer "proposals fitted to the best genomes seen are better than random ones" {
+    s := toy.Space()
+    p := Proposer(s)
+    r := rand.Rand(3)
+    random F64 = 0.0
+    for _ in range 200 {
+        g := s.Random(r)
+        loss := toy.Truth(s, g)
+        random += loss / 200.0
+        p.Observe(g, loss)
+    }
+    proposed F64 = 0.0
+    for _ in range 200 {
+        g := try p.Sample(r) catch { unreachable }
+        assert s.Valid(g)
+        proposed += toy.Truth(s, g) / 200.0
+    }
+    assert proposed < 0.75 * random, "proposed " + $proposed + ", random " + $random
+}
+

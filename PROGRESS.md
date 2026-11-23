@@ -2229,3 +2229,32 @@ Tests, all against known optima:
   loss of 6.8e-5 read once.
 - The weights first went to text files, whose string building made a run 7x slower and dominated the time; safetensors
   (io/checkpoint) fixed it.
+
+## archnet: a network for architectures (wt-archnet)
+
+archnet/ (README there) learns about architectures online while a search runs:
+
+- **encode:** schema genomes as one-hot choices and placed numbers with repeat slots; graph genomes by path encoding.
+- **predict:** an MLP ensemble giving a mean and spread. It is multi-fidelity: it predicts the loss at any rung from any
+  prefix of the curve, so every rung's result trains it.
+- **propose:** a rank-weighted estimation-of-distribution model per gene and position.
+- **archnet.Advisor:** the three behind Ready, Observe, Acquire, Forecast and Propose.
+
+evo/search takes an advisor through RunWith, and three settings turn its parts on:
+
+- Screen: the best of N candidates by mean - K sd, outside an Explore share.
+- Proposals: a share of children from the generator.
+- Forecast: halving ranked by forecast final loss.
+
+Members record their origin and their curve. `Replay` rebuilds an advisor after a Resume.
+
+Measured on archnet/toy (a known optimum, deliberately misleading early curves), with bench/archsearch at 60 rounds and
+5 seeds:
+
+- **Held-out Kendall tau:** genome only 0.57, +1 curve point 0.77, +2 points 0.82; the raw loss at budget 1 gives 0.75.
+  Genome-only tau is data-limited: 0.53 at 300 observations, 0.75 at 1000.
+- **Mean final gap to the optimum:** evolution 0.19, with screening 0.24, with screening and proposals 0.19, with
+  forecast halving 0.35. So at about 800 observations the predictor saves no compute on this toy, and forecast halving
+  hurts. It is kept, but off by default.
+- **Proposals:** 48% beat the median mutated child, and 452 of 455 genomes evaluated were distinct. Fitted to 200
+  random genomes, the generator's proposals score below 0.75 of the random mean (a test).

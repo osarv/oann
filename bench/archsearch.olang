@@ -1,0 +1,128 @@
+# archnet on archnet/toy: how well the predictor ranks unseen genomes (Kendall tau, held out), and what it saves in a
+# search. Evolution alone; with the predictor screening children (the best of 8 by mean - K sd); with screening and the
+# generator's proposals (30%); with screening and halving ranked by forecast final losses - on the same seeds. For each arm: the budget spent until the best loss came
+# within Gap of the optimum, and the best gap after Rounds. For the arm with proposals: the share of proposals that beat
+# the median mutated child, and the distinct genomes among those evaluated. Arguments, all optional: rounds (60),
+# seeds (3), gap (0.1).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "../archnet/archnet"
+import "../archnet/encode"
+import "../archnet/predict"
+import "../archnet/propose"
+import "../archnet/toy"
+import "../evo/schema"
+import "../evo/search"
+
+fn config(seed U64) search.Config {
+    c := search.Config(search.Algorithm.Regularized(32, 8), seed)
+    c.Rungs = Vec<F64>[1.0, 3.0, 9.0]
+    c.Batch = 9
+    return c
+}
+
+type Arm struct(name String) {
+    Name String = name
+    ToGap Vec<F64> = Vec<F64>()     # per seed: the budget spent until within the gap (Inf where never)
+    Final Vec<F64> = Vec<F64>()     # per seed: the best gap after the rounds
+}
+
+# the gap of the best true loss among the history to the optimum, after each round, and the budget then
+fn track(e search.Evolution<schema.Genome>&, s schema.Schema&) F64 {
+    best := F64.Inf
+    for m in e.History: best = best.Min(toy.Truth(s, m.Genome))
+    return best - toy.Optimum()
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try args[1].ParseInt() if args.Len() > 1 else 60
+    seeds := try args[2].ParseInt() if args.Len() > 2 else 3
+    gap := try args[3].ParseFloat() if args.Len() > 3 else 0.1
+    s := toy.Space()
+    try io.PutLn("optimum " + $toy.Optimum())
+
+    # the predictor's ranking of held-out genomes, after 300 observations
+    r := rand.Rand(77)
+    adv := archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(s), propose.Proposer(s), 2)
+    for _ in range 300 {
+        g := s.Random(r)
+        adv.Observe(g, 2, Array<F64>[toy.Curve(s, g, 1.0), toy.Curve(s, g, 3.0)], toy.Truth(s, g))
+    }
+    truth := Vec<F64>()
+    guesses := Array<Vec<F64>>[Vec<F64>(), Vec<F64>(), Vec<F64>()]
+    for _ in range 300 {
+        g := s.Random(r)
+        truth.Push(toy.Truth(s, g))
+        guesses[0].Push(adv.Forecast(g, Array<F64>(0)))
+        guesses[1].Push(adv.Forecast(g, Array<F64>[toy.Curve(s, g, 1.0)]))
+        guesses[2].Push(adv.Forecast(g, Array<F64>[toy.Curve(s, g, 1.0), toy.Curve(s, g, 3.0)]))
+    }
+    try io.PutLn("held-out Kendall tau: genome only " + $predict.Kendall(truth.ToArray(), guesses[0].ToArray()).Fixed(3) + ", +1 curve point " + $predict.Kendall(truth.ToArray(), guesses[1].ToArray()).Fixed(3) + ", +2 points " + $predict.Kendall(truth.ToArray(), guesses[2].ToArray()).Fixed(3))
+    r2 := rand.Rand(78)
+    early, earlyTruth := Vec<F64>(), Vec<F64>()
+    for _ in range 300 {
+        g := s.Random(r2)
+        early.Push(toy.Curve(s, g, 1.0))
+        earlyTruth.Push(toy.Truth(s, g))
+    }
+    try io.PutLn("for comparison, the loss at budget 1 alone: tau " + $predict.Kendall(earlyTruth.ToArray(), early.ToArray()).Fixed(3))
+
+    arms := Array<Arm>[Arm("evolution"), Arm("+ predictor screening"), Arm("+ screening + proposals"), Arm("+ screening + forecast halving")]
+    wins, proposed, distinct, evaluated := 0, 0, 0, 0
+    for a in range 4 {
+        for seed in range 1, seeds + 1 {
+            c := config(U64(seed))
+            if a >= 1: c.Screen = 8
+            if a == 2: c.Proposals = 0.3
+            if a == 3: c.Forecast = true
+            e := search.Evolution<schema.Genome>(c)
+            fit := toy.Fit(s)
+            ad := archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(s), propose.Proposer(s), 2)
+            reached := F64.Inf
+            for _ in range rounds {
+                if a == 0 {
+                    e.Step(s, fit, search.Split<I64>(0, 0))
+                } else {
+                    e.StepWith(s, fit, search.Split<I64>(0, 0), ad)
+                }
+                if reached == F64.Inf and track(e, s) <= gap: reached = fit.Spent
+            }
+            arms[a].ToGap.Push(reached)
+            arms[a].Final.Push(track(e, s))
+            if a != 2: continue
+            mutated := Vec<F64>()
+            for m in e.History {
+                if m.From == search.Origin.Mutated: mutated.Push(m.Res.Loss)
+            }
+            mutated.Sort(fn(x, y): return x < y)
+            median := mutated[mutated.Len() / 2] if mutated.Len() > 0 else F64.Inf
+            keys := Vec<String>()
+            for m in e.History {
+                evaluated += 1
+                k := s.Key(m.Genome)
+                if not (k in keys) {
+                    keys.Push(k)
+                    distinct += 1
+                }
+                if m.From != search.Origin.Proposed: continue
+                proposed += 1
+                if m.Res.Loss < median: wins += 1
+            }
+        }
+    }
+    for arm in arms {
+        line := arm.Name + ": budget to within " + $gap + ":"
+        total F64 = 0.0
+        for x in arm.ToGap {
+            line += " " + $x
+            total += x
+        }
+        line += " (mean " + $(total / F64(arm.ToGap.Len())).Fixed(0) + "); final gap:"
+        for x in arm.Final: line += " " + $x.Fixed(3)
+        try io.PutLn(line)
+    }
+    try io.PutLn("proposals reaching the full budget: " + $proposed + ", beating the median mutated child: " + $(100.0 * F64(wins) / F64(proposed if proposed > 0 else 1)).Fixed(1) + "%; distinct genomes " + $distinct + " of " + $evaluated)
+}

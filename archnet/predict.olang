@@ -1,0 +1,251 @@
+# archnet/predict - a performance predictor learned online: an ensemble of small multilayer perceptrons from a genome's
+# features (archnet/encode) and the points of its training curve so far to its loss at a later budget - the final one
+# above all. The mean over the
+# ensemble is the prediction and its spread the uncertainty (Lakshminarayanan et al. 2017; each member sees its own
+# bootstrap of the data from its own starting weights).
+#
+#     p := predict.Predictor(code.Dim(), 2)          # features; 2 rungs before the final (rungs 0, 1, 2)
+#     p.Observe(x, rung, curve, loss)                # loss reached at rung, after curve at the rungs below it
+#     mean, sd := p.Predict(x, curve)                # at the final rung; curve may be shorter, or empty
+#
+# A curve is the losses a candidate reached at the earlier rungs of its training. It enters the network one point at a
+# time, each with a flag saying it is there, beside a one-hot of the rung being predicted. Every rung's result is
+# training data: the predictor is multi-fidelity, and what it learns at cheap rungs carries to the final one. Training
+# draws a random prefix of each curve, so the network learns to predict from any number of points, including none:
+# that is learning-curve extrapolation. Losses are standardized by
+# the mean and spread of those seen. Hidden, Members, Rate and Steps make up the predictor's own architecture: they are
+# plain settings, which a search may also set.
+
+import "std/rand"
+
+# a multilayer perceptron with tanh hidden layers and one linear output, trained by Adam one sample at a time
+type Mlp struct(sizes Array<I64>, count I64) {
+    Sizes Array<I64> = sizes
+    w Array<F64> = Array<F64>(count)
+    m Array<F64> = Array<F64>(count)
+    v Array<F64> = Array<F64>(count)
+    t I64 = 0
+    acts Vec<Array<F64>> = Vec<Array<F64>>()
+}
+
+fn Mlp.Make(sizes Array<I64>, seed U64) Mlp {
+    count I64 = 0
+    for l in range sizes.Len() - 1: count += (sizes[l] + 1) * sizes[l + 1]
+    n := Mlp(sizes, count)
+    r := rand.Rand(seed)
+    at I64 = 0
+    for l in range sizes.Len() - 1 {
+        scale := (1.0 / F64(sizes[l])).Sqrt()
+        for _ in range sizes[l] * sizes[l + 1] {
+            n.w[at] = r.Uniform(-scale, scale)
+            at += 1
+        }
+        at += sizes[l + 1]                          # biases start at zero
+    }
+    for l in range sizes.Len(): n.acts.Push(Array<F64>(sizes[l]))
+    return n
+}
+
+# the output for input x, every layer's activations kept for Train
+fn (n mut Mlp&) Forward(x Array<F64>&) F64 {
+    a := n.acts[0]
+    for i in range x.Len(): a[i] = x[i]
+    n.acts[0] = a
+    at I64 = 0
+    last := n.Sizes.Len() - 1
+    for l in range last {
+        ins, outs := n.Sizes[l], n.Sizes[l + 1]
+        prev := n.acts[l]
+        out := n.acts[l + 1]
+        for o in range outs {
+            s := n.w[at + ins * outs + o]
+            for i in range ins: s += n.w[at + o * ins + i] * prev[i]
+            out[o] = s if l == last - 1 else s.Tanh()
+        }
+        n.acts[l + 1] = out
+        at += (ins + 1) * outs
+    }
+    return n.acts[last][0]
+}
+
+# one Adam step on the squared error of input x against target y, at learning rate rate
+fn (n mut Mlp&) Train(x Array<F64>&, y F64, rate F64) {
+    pred := n.Forward(x)
+    last := n.Sizes.Len() - 1
+    grad := Array<F64>(n.w.Len())
+    delta := Array<F64>[pred - y]
+    ends := Array<I64>(last + 1)
+    for l in range last: ends[l + 1] = ends[l] + (n.Sizes[l] + 1) * n.Sizes[l + 1]
+    l := last - 1
+    for l >= 0 {
+        ins, outs := n.Sizes[l], n.Sizes[l + 1]
+        at := ends[l]
+        prev := n.acts[l]
+        back := Array<F64>(ins)
+        for o in range outs {
+            grad[at + ins * outs + o] = delta[o]
+            for i in range ins {
+                grad[at + o * ins + i] = delta[o] * prev[i]
+                back[i] += delta[o] * n.w[at + o * ins + i]
+            }
+        }
+        if l > 0 {
+            for i in range ins: back[i] *= 1.0 - prev[i] * prev[i]
+        }
+        delta = back
+        l -= 1
+    }
+    n.t += 1
+    b1, b2 := 0.9, 0.999
+    c1, c2 := 1.0 - b1.Pow(F64(n.t)), 1.0 - b2.Pow(F64(n.t))
+    for k in range n.w.Len() {
+        n.m[k] = b1 * n.m[k] + (1.0 - b1) * grad[k]
+        n.v[k] = b2 * n.v[k] + (1.0 - b2) * grad[k] * grad[k]
+        n.w[k] -= rate * (n.m[k] / c1) / ((n.v[k] / c2).Sqrt() + 1e-8)
+    }
+}
+
+# the predictor: Members networks of Hidden layers
+type Predictor struct(inputs I64, curve I64) {
+    Inputs I64 = inputs                 # the features of a genome
+    Curve I64 = curve                   # the rungs before the final one: the points of a curve it reads
+    Hidden Vec<I64> = Vec<I64>[48, 48]
+    Members I64 = 5
+    Rate F64 = 0.003
+    Steps I64 = 48                      # training steps a member takes per observation
+    Least I64 = 8                       # observations before it is Ready
+    Seed U64 = 1
+    nets Vec<Mlp> = Vec<Mlp>()
+    xs Vec<Array<F64>> = Vec<Array<F64>>()
+    curves Vec<Array<F64>> = Vec<Array<F64>>()
+    rungs Vec<I64> = Vec<I64>()
+    ys Vec<F64> = Vec<F64>()
+    rng rand.Rand = rand.Rand(0)
+    mu F64 = 0.0
+    sd F64 = 1.0
+}
+
+# the network members made at the first observation, from the settings as they are then
+fn (p mut Predictor&) make() {
+    sizes := Vec<I64>[p.width()]
+    for h in p.Hidden: sizes.Push(h)
+    sizes.Push(1)
+    for k in range p.Members: p.nets.Push(Mlp.Make(sizes.ToArray(), p.Seed * 1000 + U64(k)))
+    p.rng = rand.Rand(p.Seed)
+}
+
+# whether it has seen enough to predict
+fn (p Predictor&) Ready() Bool { return p.ys.Len() >= p.Least }
+
+# how many observations it has seen
+fn (p Predictor&) Seen() I64 { return p.ys.Len() }
+
+fn (p Predictor&) width() I64 { return p.Inputs + 2 * p.Curve + p.Curve + 1 }
+
+# the network input for features x, the first n points of curve, predicting rung
+fn (p Predictor&) input(x Array<F64>&, curve Array<F64>&, n I64, rung I64) Array<F64> {
+    row := Array<F64>(p.width())
+    for i in range p.Inputs: row[i] = x[i]
+    row[p.Inputs + 2 * p.Curve + rung] = 1.0
+    for k in range n if n < p.Curve else p.Curve {
+        row[p.Inputs + 2 * k] = (curve[k] - p.mu) / p.sd
+        row[p.Inputs + 2 * k + 1] = 1.0
+    }
+    return row
+}
+
+# a genome of features x reached loss y at rung (0 .. Curve), its losses at the rungs below that being curve (fewer
+# where it skipped them): kept, and every member trained Steps steps on all kept so far (each on its own bootstrap
+# draws, each draw a random prefix of its curve)
+fn (p mut Predictor&) Observe(x Array<F64>&, rung I64, curve Array<F64>&, y F64) {
+    if p.nets.Len() == 0: p.make()
+    p.xs.Push(x)
+    p.curves.Push(curve)
+    p.rungs.Push(rung)
+    p.ys.Push(y)
+    n := p.ys.Len()
+    sum, sq := 0.0, 0.0
+    for v in p.ys {
+        sum += v
+        sq += v * v
+    }
+    p.mu = sum / F64(n)
+    spread := (sq / F64(n) - p.mu * p.mu).Max(0.0).Sqrt()
+    p.sd = spread if spread > 1e-12 else 1.0
+    for k in range p.nets.Len() {
+        net := p.nets[k]
+        for _ in range p.Steps {
+            i := p.rng.Below(n)
+            c := p.curves[i]
+            m := p.rng.Below(c.Len() + 1)
+            net.Train(p.input(p.xs[i], c, m, p.rungs[i]), (p.ys[i] - p.mu) / p.sd, p.Rate)
+        }
+        p.nets[k] = net
+    }
+}
+
+# the predicted final loss of features x after the points of curve given, and the members' spread
+fn (p mut Predictor&) Predict(x Array<F64>&, curve Array<F64>&) F64, F64 { return p.PredictAt(x, curve, p.Curve) }
+
+# the predicted loss at rung, and the members' spread
+fn (p mut Predictor&) PredictAt(x Array<F64>&, curve Array<F64>&, rung I64) F64, F64 {
+    if p.nets.Len() == 0: return p.mu, p.sd
+    row := p.input(x, curve, curve.Len(), rung)
+    sum, sq := 0.0, 0.0
+    for k in range p.nets.Len() {
+        net := p.nets[k]
+        v := net.Forward(row) * p.sd + p.mu
+        p.nets[k] = net
+        sum += v
+        sq += v * v
+    }
+    m := F64(p.nets.Len())
+    mean := sum / m
+    return mean, (sq / m - mean * mean).Max(0.0).Sqrt()
+}
+
+# Kendall's rank correlation of a and b (tau-a: the share of concordant pairs less that of discordant ones)
+fn Kendall(a Array<F64>&, b Array<F64>&) F64 {
+    n := a.Len()
+    s F64 = 0.0
+    for i in range n {
+        for j in range i + 1, n {
+            x, y := a[i] - a[j], b[i] - b[j]
+            if x * y > 0.0: s += 1.0
+            if x * y < 0.0: s -= 1.0
+        }
+    }
+    return s / F64(n * (n - 1) / 2) if n > 1 else 0.0
+}
+
+test Predictor "learns a smooth function of its features online; the curve's points sharpen it; held-out rank correlation high" {
+    r := rand.Rand(3)
+    p := Predictor(4, 1)
+    f := fn(x Array<F64>&) F64: return (x[0] - 0.3) * (x[0] - 0.3) + 0.5 * x[1] + 0.2 * (6.0 * x[2]).Sin()
+    for _ in range 150 {
+        x := Array<F64>[r.Float() for _ in range 4]
+        y := f(x)
+        p.Observe(x, 1, Array<F64>[y + 0.3 * x[3]], y)
+    }
+    truth, guess, guessCurve := Vec<F64>(), Vec<F64>(), Vec<F64>()
+    err, errCurve := 0.0, 0.0
+    for _ in range 100 {
+        x := Array<F64>[r.Float() for _ in range 4]
+        y := f(x)
+        m, _ := p.Predict(x, Array<F64>(0))
+        mc, _ := p.Predict(x, Array<F64>[y + 0.3 * x[3]])
+        truth.Push(y)
+        guess.Push(m)
+        guessCurve.Push(mc)
+        err += (m - y).Abs()
+        errCurve += (mc - y).Abs()
+    }
+    tau := Kendall(truth.ToArray(), guess.ToArray())
+    assert tau > 0.6, "tau " + $tau
+    assert errCurve < err, "with the curve " + $errCurve + ", without " + $err
+}
+
+test Kendall "1 for one order, -1 for the reverse" {
+    assert Kendall(Array<F64>[1.0, 2.0, 3.0], Array<F64>[10.0, 20.0, 30.0]) == 1.0
+    assert Kendall(Array<F64>[1.0, 2.0, 3.0], Array<F64>[3.0, 2.0, 1.0]) == -1.0
+}

@@ -1,0 +1,83 @@
+# archnet - one network for architectures, learned online during a search: a genome encoder (encode), a performance
+# head giving a mean and an uncertainty and extrapolating training curves (predict), and a generator of new genomes
+# (propose). An Advisor puts the three together behind the methods evo/search asks of an advisor:
+#
+#     Ready() Bool                              enough seen to be trusted
+#     Observe(g, rung, curve, loss)             g reached loss at rung, after the losses in curve at earlier rungs
+#     Acquire(g) F64                            how promising g is before training, lower better: mean - K sd
+#     Forecast(g, curve) F64                    its final loss predicted from the first points of its curve
+#     Propose(r) G ? NoProposal                 a new genome from the generator
+#
+#     adv := archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(space), propose.Proposer(space), 2)
+#     e.RunWith(space, fit, data, adv, rounds)
+#
+# Graph genomes take encode.NetCode and propose.NoProposer<neat.Net> (prediction without proposals). Nothing here
+# knows evo/search: any search that calls these methods can use an Advisor.
+
+import "std/rand"
+import "encode"
+import "predict"
+import "propose"
+import "toy"
+import "../evo/schema"
+import "../evo/search"
+
+# the advisor: features by C, proposals by P, curves of up to `curve` points
+type Advisor<G, C, P> struct(code C, gen P, curve I64) {
+    Code C = code
+    Gen P = gen
+    Net predict.Predictor = predict.Predictor(code.Dim(), curve)
+    K F64 = 0.5                     # Acquire's weight on the uncertainty: mean - K sd
+}
+
+fn (a Advisor<G, C, P>&) Ready() Bool { return a.Net.Ready() }
+
+# every rung's result trains the predictor; the generator learns from final results alone
+fn (a mut Advisor<G, C, P>&) Observe(g G&, rung I64, curve Array<F64>&, loss F64) {
+    a.Net.Observe(a.Code.Encode(g), rung, curve, loss)
+    if rung == a.Net.Curve: a.Gen.Observe(g, loss)
+}
+
+fn (a mut Advisor<G, C, P>&) Acquire(g G&) F64 {
+    mean, sd := a.Net.Predict(a.Code.Encode(g), Array<F64>(0))
+    return mean - a.K * sd
+}
+
+fn (a mut Advisor<G, C, P>&) Forecast(g G&, curve Array<F64>&) F64 {
+    mean, _ := a.Net.Predict(a.Code.Encode(g), curve)
+    return mean
+}
+
+# the predicted loss and its uncertainty, before training
+fn (a mut Advisor<G, C, P>&) Predict(g G&) F64, F64 {
+    return a.Net.Predict(a.Code.Encode(g), Array<F64>(0))
+}
+
+fn (a mut Advisor<G, C, P>&) Propose(r mut rand.Rand&) G ? propose.NoProposal {
+    return try a.Gen.Sample(r)
+}
+
+# ---- tests ----
+
+
+test Advisor "an advised search screens and proposes; the advisor sees every rung's result; Replay rebuilds it after a resume" {
+    s := toy.Space()
+    c := search.Config(search.Algorithm.Regularized(16, 4), 5)
+    c.Rungs = Vec<F64>[1.0, 3.0, 9.0]
+    c.Batch = 9
+    c.Screen = 4
+    c.Proposals = 0.3
+    e := search.Evolution<schema.Genome>(c)
+    fit := toy.Fit(s)
+    adv := Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(s), propose.Proposer(s), 2)
+    e.RunWith(s, fit, search.Split<I64>(0, 0), adv, 12)
+    assert adv.Net.Seen() == e.Evaluations + e.Hits
+    proposed I64 = 0
+    for m in e.History {
+        if m.From == search.Origin.Proposed: proposed += 1
+    }
+    assert proposed > 0
+    again := Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(s), propose.Proposer(s), 2)
+    e.Replay(again)
+    assert again.Net.Seen() == 16 + 3 * 11
+}

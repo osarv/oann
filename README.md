@@ -74,6 +74,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `io/` | safetensors checkpoints, JSON-lines run records |
 | `bayes/` | Bayesian inference: Gaussian beliefs, Laplace / assumed-density updates for normal, logit, probit, binomial, Poisson and ordered likelihoods, drift, Kalman filter and smoother, quadrature, ADVI and HMC on `ad`, empirical Bayes, calibration (`bayes/README.md`) |
 | `evo/` | evolutionary architecture search: schema and NEAT graph genomes, regularized evolution, tournament, (mu + lambda), NSGA-II, successive halving, weight inheritance, checkpoints, worker processes (`evo/README.md`) |
+| `archnet/` | a network for architectures, learned online: genome encoders, a performance predictor with uncertainty and curve extrapolation, a generator of genomes; the advisor evo's searches take (`archnet/README.md`) |
 | `board/` | the FPGA engine simulated in integers, lowered from a `dyn` system (`board/README.md`) |
 | `tools/` | gradient checks per operation (`tools/README.md`) |
 | `examples/` | the programs the makefile runs: MNIST, transformers, settling systems, INT8, the board (`examples/README.md`) |
