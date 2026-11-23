@@ -3,7 +3,8 @@
 # generator's proposals (30%); with screening and halving ranked by forecast final losses - on the same seeds. For each arm: the budget spent until the best loss came
 # within Gap of the optimum, and the best gap after Rounds. For the arm with proposals: the share of proposals that beat
 # the median mutated child, and the distinct genomes among those evaluated. Arguments, all optional: rounds (60),
-# seeds (3), gap (0.1).
+# seeds (3), gap (0.1). Also printed: the predictor's Kendall tau on mutants of each screened search's final population
+# (where screening needs it). ARCH_SLOTS, ARCH_STEPS, ARCH_K, ARCH_SCREEN and ARCH_PROPOSALS override the settings.
 
 import "std/io"
 import "std/os"
@@ -36,6 +37,21 @@ fn track(e search.Evolution<schema.Genome>&, s schema.Schema&) F64 {
     return best - toy.Optimum()
 }
 
+fn knob(name String&, base F64) F64 {
+    t := try os.Env(name) catch { return base }
+    return try t.ParseFloat() catch default base
+}
+
+# an advisor with the settings ARCH_SLOTS, ARCH_STEPS, ARCH_K may override
+fn advisor(s schema.Schema&) archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer> {
+    code := encode.SchemaCode(s)
+    code.Slots = I64(knob("ARCH_SLOTS", F64(code.Slots)))
+    ad := archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(code, propose.Proposer(s), 2)
+    ad.Net.Steps = I64(knob("ARCH_STEPS", F64(ad.Net.Steps)))
+    ad.K = knob("ARCH_K", ad.K)
+    return ad
+}
+
 fn main() ? io.Error, ParseError {
     args := os.Args()
     rounds := try args[1].ParseInt() if args.Len() > 1 else 60
@@ -46,7 +62,7 @@ fn main() ? io.Error, ParseError {
 
     # the predictor's ranking of held-out genomes, after 300 observations
     r := rand.Rand(77)
-    adv := archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(s), propose.Proposer(s), 2)
+    adv := advisor(s)
     for _ in range 300 {
         g := s.Random(r)
         adv.Observe(g, 2, Array<F64>[toy.Curve(s, g, 1.0), toy.Curve(s, g, 3.0)], toy.Truth(s, g))
@@ -75,12 +91,12 @@ fn main() ? io.Error, ParseError {
     for a in range 4 {
         for seed in range 1, seeds + 1 {
             c := config(U64(seed))
-            if a >= 1: c.Screen = 8
-            if a == 2: c.Proposals = 0.3
+            if a >= 1: c.Screen = I64(knob("ARCH_SCREEN", 8.0))
+            if a == 2: c.Proposals = knob("ARCH_PROPOSALS", 0.3)
             if a == 3: c.Forecast = true
             e := search.Evolution<schema.Genome>(c)
             fit := toy.Fit(s)
-            ad := archnet.Advisor<schema.Genome, encode.SchemaCode, propose.Proposer>(encode.SchemaCode(s), propose.Proposer(s), 2)
+            ad := advisor(s)
             reached := F64.Inf
             for _ in range rounds {
                 if a == 0 {
@@ -92,6 +108,19 @@ fn main() ? io.Error, ParseError {
             }
             arms[a].ToGap.Push(reached)
             arms[a].Final.Push(track(e, s))
+            if a == 1 {
+                # the ranking where screening needs it: mutants of the final population
+                lr := rand.Rand(U64(seed) + 500)
+                pr := Vec<F64>()
+                tr := Vec<F64>()
+                for _ in range 200 {
+                    g := s.Mutate(e.Population[lr.Below(e.Population.Len())].Genome, lr)
+                    mean, _ := ad.Predict(g)
+                    pr.Push(mean)
+                    tr.Push(toy.Truth(s, g))
+                }
+                try io.PutLn("local tau (mutants of the population, seed " + $seed + "): " + $predict.Kendall(pr.ToArray(), tr.ToArray()))
+            }
             if a != 2: continue
             mutated := Vec<F64>()
             for m in e.History {
