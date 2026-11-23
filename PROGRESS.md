@@ -2117,3 +2117,11 @@ on planted 3-SAT and 3-colouring, CutsetMove on grid distance fields, BySum cage
 is in examples/README.md. Found on the way: olang accepts a parameter typed by a member a module lacks
 (repro/unknowntype). A soft pair penalty (5) made the distance energy's optimum not the BFS field (raising many
 cells outweighed it); the example uses 1000.
+
+## Density-scaled bumps for Focus (wt-densebump, 2026-11-23)
+
+`FocusSchedule.Dense` p (0: off, bit-identical on bench/focus): Bump times (1 - d)^p, d the graph's edge density (its
+pairs and the pairs within factors over n (n - 1) / 2). Test: the density counts a dense planted 3-colouring's pairs
+exactly (90 cells, 40 % of cross-colour pairs), and Focus at T 0.15 with Cap, Hold and Dense 8 reaches energy 0.
+energybench gains the U1 row (T 0.15, breakout, Cap 1, Hold 1, Dense 8): 3-SAT 4/4 at 3.0 ms, 3-colouring 4/4 at
+13 ms (41261 moves) - the fewest moves of the variants on both.

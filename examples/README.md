@@ -39,9 +39,9 @@ Focus moves, CutsetMove calls, or chain-sweeps for Anneal (all chains together).
 | Latin 6 x 6 learnt from 400 solved squares (Pairs, PairFitter, Pruned), Anneal 16 x 400 | 50/50 | 6-9 | 6400 chain-sweeps |
 | the same, Focus 16 chains, Slack 1 | 47/50 | 5-9 | at most 20000 a chain |
 | planted 3-SAT, 2000 cells, clauses 4.2 n: Focus plain | 4/4 | 56 | 174731 |
-| the same, breakout (Bump 0.1, Decay 0.5) / + Cap 1 / + Hold 1 | 4/4 each | 3.1 / 3.6 / 3.5 | 4291 / 5183 / 4374 |
-| planted 3-colouring, 1500 cells, mean degree 6: Focus plain (400000 moves) | 0/4 | 96 | 400000 |
-| the same, breakout / + Cap / + Hold | 4/4 each | 29 / 12 / 14 | 94664 / 53115 / 42207 |
+| the same, breakout (Bump 0.1, Decay 0.5) / + Cap 1 / + Hold 1 / U1 (T 0.15, Cap, Hold, Dense 8) | 4/4 each | 3.2 / 3.6 / 3.5 / 3.0 | 4291 / 5183 / 4374 / 3521 |
+| planted 3-colouring, 1500 cells, mean degree 6: Focus plain (at most 400000 moves) | 1/4 | 85 | 358253 |
+| the same, breakout / + Cap / + Hold / U1 | 2/4, 4/4, 4/4, 4/4 | 83 / 18 / 31 / 13 | 251283 / 66648 / 97583 / 41261 |
 | distances from a source on a 10 x 10 grid, 20 % walls (loops), 40 values: CutsetMove on 3 x 3 windows | 8/8 | 227 | 825 |
 | the same energy, Anneal 16 x 2000 | 0/8 | 506 | 32000 chain-sweeps |
 | 6 x 6 Latin squares with 12 cages of 3 told their sums (BySum): Anneal 16 x 2000 | 1/12 | 30 | 26011 chain-sweeps |
