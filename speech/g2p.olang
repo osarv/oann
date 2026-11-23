@@ -1,0 +1,934 @@
+# speech/g2p - grapheme to phoneme for the VITS voices: English or Swedish text to the IPA string espeak-ng gives
+# through the phonemizer package (backend espeak, en-us or sv, preserve_punctuation=True, with_stress=True), what
+# kakao-enterprise/vits-ljs and Piper's sv_SE-nst-medium were trained on. espeak-ng is GPL-3 and none of it is here:
+# this is our own, and speech/tools/g2p_reference.py runs espeak offline to measure how far the two agree.
+#
+# English. A word is CMUdict's (BSD-2, fetched at run time into ~/.cache/oann/g2p), or a suffix or a compound of its
+# words, or failing those letter-to-sound rules; then its ARPAbet is written as espeak writes en-us. The stress marks
+# stand before the vowel, as espeak puts them; a secondary stress right after the primary goes, as does one on a
+# word's last "-y"; the stressed vowels are ARPAbet's, the unstressed ones mostly the spelling's (espeak reduces by
+# letters: "a-" is ɐ, "-ed" after t or d is ᵻd, "-ity" ᵻɾi, i stays ɪ); t between a vowel and an unstressed vowel is
+# flapped (ɾ), and before a final unstressed "-en" glottal (ʔn̩). To find a vowel's letters each word's vowel phones are
+# aligned with its groups of vowel letters (fewest skipped or doubled groups). Function words have espeak's forms, one
+# alone and one inside a phrase ("a" is ˈeɪ alone, ɐ in a phrase).
+#
+# Swedish. Spelling rules: k, g, sk soft before front vowels (ɕ, j, ɧ written sx as espeak writes it), sj, stj, skj,
+# tj, ch, long vowels before one consonant and short before two, rs (ʂ), stress on the first syllable unless a prefix
+# or a foreign ending takes it. NST's Swedish lexicon (CC0) gives true pronunciations, which espeak's own rules often
+# do not; agreeing with espeak is the aim, so it is not used (see speech/README.md).
+#
+# Text. Numbers are spelled out as espeak reads them; the punctuation phonemizer keeps (;:,.!?¡¿—…"«»“”(){}[]) is kept
+# with the spaces it had, everything else between words is a space, and each stretch between marks is a phrase.
+
+import "std/os"
+
+type G2pError error {
+    Language(lang String)   # neither "en" nor "sv"
+    Fetch(url String)       # CMUdict could not be fetched
+}
+
+cmuUrl := "https://raw.githubusercontent.com/cmusphinx/cmudict/master/cmudict.dict"
+
+# $OANN_SPEECH (default ~/.cache/oann)
+fn Cache() String {
+    root := try os.Env("OANN_SPEECH") catch default ""
+    return root if root.Len() > 0 else (try os.Env("HOME") catch default "/tmp") + "/.cache/oann"
+}
+
+# url into path over HTTPS (curl), unless path is there; whether it is there after
+fn fetch(url String&, path String&) Bool {
+    if os.Exists(path): return true
+    part := path + ".part"
+    out := try os.Output.Exec("curl", "-sfL", "--retry", "4", "-o", part, url, capture = false) catch { return false }
+    if out.Status != 0 {
+        try os.Remove(part) catch { }
+        return false
+    }
+    try os.Rename(part, path) catch { return false }
+    return true
+}
+
+type G2p struct() {
+    cmu Map<String, String> = Map<String, String>()        # word -> ARPAbet, space-separated
+    alone Map<String, String> = Map<String, String>()      # function words: alone
+    inPhrase Map<String, String> = Map<String, String>()   # ... and inside a phrase
+}
+
+# CMUdict fetched once into Cache()/g2p and read
+fn G2p.Load() G2p ? G2pError, os.Error {
+    dir := Cache() + "/g2p"
+    try os.MkDirAll(dir)
+    path := dir + "/cmudict.dict"
+    if not fetch(cmuUrl, path): error G2pError.Fetch(cmuUrl)
+    return G2p.Parse(try os.ReadFile(path))
+}
+
+# from CMUdict's text: a line a word, "word PH ON ES", variants "word(2)" (left out) and "# comments"
+fn G2p.Parse(dict String&) G2p {
+    g := G2p()
+    for line in dict.Lines() {
+        sp := try line.FindByte(' ') catch { continue }
+        word := line[:sp]
+        if '(' in word: continue
+        end := try line.Find(" #") catch default line.Len()
+        g.cmu.Put(word, line[sp + 1:end])
+    }
+    for line in enFunction.Lines() {
+        f := line.Split(" ")
+        g.alone.Put(f[0], f[1])
+        g.inPhrase.Put(f[0], f[2])
+    }
+    return g
+}
+
+# ---- text ----
+
+marks := ";:,.!?¡¿—…\"«»“”(){}[]"
+
+# the IPA of text in lang ("en" or "sv"): words separated by a space, the punctuation phonemizer keeps where it was
+fn (g G2p&) Phonemes(text String&, lang String&) String ? G2pError {
+    if lang != "en" and lang != "sv": error G2pError.Language(lang)
+    sv := lang == "sv"
+    out := StringBuilder()
+    phrase := Vec<String>()
+    i I64 = 0
+    for i < text.Len() {
+        m := markAt(text, i)
+        if m == 0 {
+            j := i
+            for j < text.Len() and markAt(text, j) == 0: j++
+            phrase.Clear()
+            for w in words(text[i:j], sv): phrase.Push(w)
+            out.Push(ipa(g.svPhrase(phrase) if sv else g.enPhrase(phrase), sv))
+            i = j
+            continue
+        }
+        # a run of marks with the spaces in it, and one space either side where the text had one
+        j := i
+        for j < text.Len() and (markAt(text, j) > 0 or text[j].IsSpace()): j += markAt(text, j).Max(1)
+        if i > 0 and text[i - 1].IsSpace() and out.Len() > 0: out.PushChar(' ')
+        for k in range i, j {
+            if text[k].IsSpace() and (k + 1 == j or text[k + 1].IsSpace()): continue
+            out.PushChar(' ' if text[k].IsSpace() else text[k])
+        }
+        if j < text.Len() and text[j - 1].IsSpace() and out.Len() > 0: out.PushChar(' ')
+        i = j
+    }
+    return out.ToString().Trim().Replace("  ", " ")
+}
+
+# the length of the punctuation mark at i (a UTF-8 sequence for the long dash, ellipsis, quotes and inverted marks), 0
+# where there is none or where it is a number's comma or point
+fn markAt(text String&, i I64) I64 {
+    if text[i] in ",." and i > 0 and i + 1 < text.Len() and text[i - 1].IsDigit() and text[i + 1].IsDigit(): return 0
+    for m in ["—", "…", "«", "»", "“", "”", "¡", "¿"] {
+        if text[i:].StartsWith(m): return m.Len()
+    }
+    return 1 if text[i] < 128 and text[i] in marks else 0
+}
+
+# the words of a stretch of text, lower case: letters (and an apostrophe inside a word, in English), numbers spelled
+# out, anything else a space
+fn words(t String&, sv Bool) Iterator<String> {
+    i I64 = 0
+    for i < t.Len() {
+        if t[i].IsDigit() {
+            j := i
+            for j < t.Len() and (t[j].IsDigit() or (t[j] in ",." and j + 1 < t.Len() and t[j + 1].IsDigit())): j++
+            for w in (svNumber(t[i:j]) if sv else enNumber(t[i:j])).Split(" "): yield w
+            i = j
+            continue
+        }
+        if not letter(t, i) {
+            i++
+            continue
+        }
+        j := i
+        for j < t.Len() and (letter(t, j) or (not sv and t[j] == '\'' and j + 1 < t.Len() and letter(t, j + 1))): j++
+        yield lower(t[i:j])
+        i = j
+    }
+}
+
+# an ASCII letter, or a byte of a UTF-8 sequence (å, ä, ö, é, æ ...)
+fn letter(t String&, i I64) Bool { return t[i].IsLetter() or t[i] >= 128 }
+
+# lower case, the Latin-1 capitals of UTF-8 (Å Ä Ö É ...) too
+fn lower(t String&) String {
+    out := StringBuilder()
+    for i in range t.Len() {
+        c := t[i]
+        if i > 0 and t[i - 1] == 0xC3 and c >= 0x80 and c < 0xA0 and c != 0x97 {
+            out.PushChar(c + 32)
+            continue
+        }
+        out.PushChar(c.ToLower())
+    }
+    return out.ToString()
+}
+
+# ---- English numbers, as espeak reads them ----
+
+enOnes := "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen"
+enTens := "_ _ twenty thirty forty fifty sixty seventy eighty ninety"
+
+# digits (with thousands' commas or a decimal point) as words; "hundred" joined to the word before it, as espeak does,
+# and so are the digits of a number written with a leading zero (a + joins words)
+fn enNumber(t String&) String {
+    dot := try t.FindByte('.') catch default t.Len()
+    whole := t[:dot].Replace(",", "")
+    out := enDigits(whole).Replace(" ", "+") if whole.Len() > 1 and whole[0] == '0' else enInt(try whole.ParseInt() catch default 0)
+    if dot == t.Len(): return out
+    return out + " point " + enDigits(t[dot + 1:])
+}
+
+fn enDigits(t String&) String {
+    ones := enOnes.Split(" ")
+    return Vec<String>[$ones[I64(c - '0')] for c in t].Join(" ")
+}
+
+fn enInt(n I64) String {
+    ones := enOnes.Split(" ")
+    tens := enTens.Split(" ")
+    if n < 20: return ones[n]
+    if n < 100: return tens[n / 10] + ("" if n % 10 == 0 else " " + ones[n % 10])
+    if n < 1000: return ones[n / 100] + "+hundred" + ("" if n % 100 == 0 else " " + enInt(n % 100))
+    if n >= 1900 and n < 2000: return "nineteen+hundred" + ("" if n % 100 == 0 else " " + enInt(n % 100))
+    for scale in [I64(1000000000), 1000000, 1000] {
+        if n < scale: continue
+        name := "billion" if scale == 1000000000 else "million" if scale == 1000000 else "thousand"
+        return enInt(n / scale) + " " + name + ("" if n % scale == 0 else " " + enInt(n % scale))
+    }
+    unreachable
+}
+
+# ---- English words ----
+
+# a phrase's words: function words in their phrase forms ("the" is DI before a vowel), some pairs as one word ("in
+# the" InD@), a t flapped and an r linked before a vowel; a word alone in its form alone
+fn (g G2p&) enPhrase(ws Vec<String>&) String {
+    out := Vec<String>()
+    k I64 = 0
+    for k < ws.Len() {
+        w := ws.At(k)
+        next := ws.At(k + 1) if k + 1 < ws.Len() else ""
+        nextIpa := g.enWord(next) if next.Len() > 0 else ""
+        pair := enPairs.Has(w + " " + next)
+        if pair: nextIpa = g.enWord(ws.At(k + 2)) if k + 2 < ws.Len() else ""
+        x := enPairs.Get(w + " " + next)! if pair else g.enWord(w)
+        if ws.Len() > 1 and not pair and g.inPhrase.Has(w): x = g.inPhrase.Get(w)!
+        if startsVowel(nextIpa) {
+            if x.EndsWith("D@"): x = x[:x.Len() - 1] + "I"
+            if w == "to": x = "tU"
+            if w == "it": x = "I4"
+            if x.EndsWith("R"): x = x + "r"
+        }
+        out.Push(x)
+        k += 2 if pair else 1
+    }
+    return out.Join(" ")
+}
+
+enPairs := Map<String, String>["in the": "InD@", "on the": "OnD@", "of the": "VvD@", "for the": "fRD@"
+    "with the": "wIDD@", "from the": "frVmD@", "there were": "DErw,3:", "there was": "DErw,Vz", "of a": "@v@"]
+
+fn startsVowel(t String&) Bool {
+    for c in t {
+        if c != '\'' and c != ',': return c in "aeiouAO{VE3IU@R6X"
+    }
+    return false
+}
+
+# a word alone
+fn (g G2p&) enWord(w String&) String {
+    if g.alone.Has(w): return g.alone.Get(w)!
+    if '+' in w: return Vec<String>[g.enWord(part) for part in w.Split("+")].Join("")
+    letters := String(Array<Char>[c for c in w if c.IsLower() or c == '\''])
+    if letters.Len() == 0: return ""
+    return espeak(letters, g.arpabet(letters))
+}
+
+# the word's ARPAbet: CMUdict's, a British spelling's, a suffix or a prefix on a word it has, a compound of two, or
+# the letter rules'
+fn (g G2p&) arpabet(w String&) Vec<String> {
+    return try g.known(w, 0) catch default lts(w)
+}
+
+type Unknown error { Word }
+
+voiceless := " P T K F TH "
+sibilant := " S Z SH ZH CH JH "
+
+fn (g G2p&) known(w String&, depth I64) Vec<String> ? Unknown {
+    if g.cmu.Has(w): return phones(g.cmu.Get(w)!)
+    if depth > 2: error Unknown.Word
+    for b in british(w) {
+        if g.cmu.Has(b): return phones(g.cmu.Get(b)!)
+    }
+    for s in ["less", "ness", "ment", "like", "ward", "some", "ing", "ful", "est", "ish", "eth", "n't", "'s", "ed", "es", "ly", "er"] {
+        if not w.EndsWith(s) or w.Len() - s.Len() < 2: continue
+        for stem in stems(w[:w.Len() - s.Len()]) {
+            p := try g.known(stem, depth + 1) catch { continue }
+            return suffixed(p, s)
+        }
+    }
+    if w.EndsWith("ed") and g.cmu.Has(w[:w.Len() - 1]): return suffixed(phones(g.cmu.Get(w[:w.Len() - 1])!), "ed")
+    for pre in ["over", "dis", "mis", "un", "in", "re"] {
+        if not w.StartsWith(pre) or w.Len() - pre.Len() < 3: continue
+        p := try g.known(w[pre.Len():], depth + 1) catch { continue }
+        return phones(prefixArpa(pre) + " " + p.Join(" "))
+    }
+    for back in range w.Len() - 5 {
+        i := w.Len() - 3 - back
+        if not g.cmu.Has(w[:i]): continue
+        p := try g.known(w[i:], depth + 1) catch { continue }
+        first := phones(g.cmu.Get(w[:i])!)
+        for x in p: first.Push(x[:x.Len() - 1] + "2" if x.EndsWith("1") else x)
+        return first
+    }
+    if w.EndsWith("s") and w.Len() > 3 {
+        for stem in stems(w[:w.Len() - 1]) {
+            p := try g.known(stem, depth + 1) catch { continue }
+            return suffixed(p, "s")
+        }
+    }
+    error Unknown.Word
+}
+
+fn phones(t String&) Vec<String> { return Vec<String>[x for x in t.Split(" ") if x.Len() > 0] }
+
+fn prefixArpa(pre String&) String {
+    return match pre {
+        case "over": "OW2 V ER0"
+        case "dis": "D IH0 S"
+        case "mis": "M IH0 S"
+        case "un": "AH0 N"
+        case "in": "IH0 N"
+        case _: "R IY0"
+    }
+}
+
+# what a stem may have been before a suffix: itself, without a doubled last consonant, with a silent e, y for i
+fn stems(base String&) Iterator<String> {
+    yield base
+    n := base.Len()
+    if n > 2 and base[n - 1] == base[n - 2] and not (base[n - 1] in "aeiouls"): yield base[:n - 1]
+    yield base + "e"
+    if base.EndsWith("i"): yield base[:n - 1] + "y"
+}
+
+fn british(w String&) Iterator<String> {
+    if w.Contains("our"): yield w.Replace("our", "or")
+    if w.EndsWith("re"): yield w[:w.Len() - 2] + "er"
+    if w.Contains("ll"): yield w.Replace("ll", "l")
+    if w.Contains("ise"): yield w.Replace("ise", "ize")
+    if w.EndsWith("ce"): yield w[:w.Len() - 2] + "se"
+}
+
+# a stem's ARPAbet with a suffix's
+fn suffixed(p Vec<String>&, s String&) Vec<String> {
+    last := " " + p.At(p.Len() - 1) + " "
+    out := Vec<String>[x for x in p]
+    add := match s {
+        case "s", "es", "'s": "IH0 Z" if sibilant.Contains(last) else "S" if voiceless.Contains(last) else "Z"
+        case "ed": "IH0 D" if last == " T " or last == " D " else "T" if voiceless.Contains(last) or last == " SH " or last == " CH " or last == " S " else "D"
+        case "ing": "IH0 NG"
+        case "ly": "L IY0"
+        case "ness": "N AH0 S"
+        case "less": "L AH0 S"
+        case "ful": "F AH0 L"
+        case "ment": "M AH0 N T"
+        case "est": "AH0 S T"
+        case "er": "ER0"
+        case "ish": "IH0 SH"
+        case "like": "L AY2 K"
+        case "eth": "IH0 TH"
+        case "ward": "W ER0 D"
+        case "some": "S AH0 M"
+        case _: "AH0 N T"
+    }
+    if (s == "ly" or s == "est") and last == " IY0 ": out.SetAt(out.Len() - 1, "AH0" if s == "ly" else "IY0")
+    for x in add.Split(" "): out.Push(x)
+    return out
+}
+
+# ---- English letters to sounds, for words CMUdict has no part of ----
+
+# a word's letters to ARPAbet: graphemes left to right, a vowel long when stressed and open (one consonant and a vowel
+# after it, or a silent e), short when stressed and closed, reduced when not; the stress on the first syllable, the
+# second after a prefix, before -ity, -ic, -ical, -ian, -ia, -tion, -sion, -ous
+fn lts(w String&) Vec<String> {
+    for sf in ["tion", "sion", "ness", "less", "ful", "ment", "ous", "ing", "ly"] {
+        if not w.EndsWith(sf) or w.Len() - sf.Len() < 3: continue
+        p := lts(w[:w.Len() - sf.Len()])
+        if sf in ["tion", "sion", "ous"]: stressLast(p, w[w.Len() - sf.Len() - 1])
+        for x in suffixArpa(sf).Split(" "): p.Push(x)
+        return p
+    }
+    units := letterUnits(w)
+    vowels := I64(0)
+    for u in units {
+        if u.Vowel: vowels++
+    }
+    s := stressAt(w, vowels)
+    out := Vec<String>()
+    v I64 = 0
+    for u in units {
+        if not u.Vowel {
+            for x in u.Phones.Split(" "): out.Push(x)
+            continue
+        }
+        out.Push(u.Spoken(v == s) + ("1" if v == s else "0"))
+        v++
+    }
+    return out
+}
+
+fn suffixArpa(sf String&) String {
+    return match sf {
+        case "tion": "SH AH0 N"
+        case "sion": "ZH AH0 N"
+        case "ness": "N AH0 S"
+        case "less": "L AH0 S"
+        case "ful": "F AH0 L"
+        case "ment": "M AH0 N T"
+        case "ous": "AH0 S"
+        case "ing": "IH0 NG"
+        case _: "L IY0"
+    }
+}
+
+# the primary stress moved to the last vowel, an a long and an i short there (-ation, -ition)
+fn stressLast(p mut Vec<String>&, before Char) {
+    last I64 = -1
+    for k in range p.Len() {
+        x := p.At(k)
+        if not vowelPhone(x): continue
+        p.SetAt(k, x[:x.Len() - 1] + "0")
+        last = k
+    }
+    if last < 0: return
+    p.SetAt(last, "EY1" if before == 'a' else "IH1" if before == 'i' else p.At(last)[:p.At(last).Len() - 1] + "1")
+}
+
+ltsPrefixes := ["fore", "con", "com", "dis", "pre", "pro", "per", "sub", "sup", "mis", "be", "de", "re", "ex", "en", "em"
+    "in", "im", "un", "ob", "ad", "ac", "af", "ap", "as", "at", "a"]
+
+# which vowel (from 0) takes the stress
+fn stressAt(w String&, vowels I64) I64 {
+    s I64 = 0
+    for pre in ltsPrefixes {
+        if w.StartsWith(pre) and vowels > 1 and w.Len() > pre.Len() + 2 {
+            s = 1
+            break
+        }
+    }
+    for sf in ["ical", "ity", "ian", "ic", "ia"] {
+        back := 3 if sf == "ical" or sf == "ity" else 2
+        if w.EndsWith(sf) and vowels >= back: return vowels - back
+    }
+    return s
+}
+
+# a vowel (its letters, its sound where the letters decide it, whether it is open) or consonants' phones
+type Unit struct(Vowel Bool, Letters String, Sound String, Open Bool, Phones String) {
+    Vowel
+    Letters
+    Sound
+    Open
+    Phones
+}
+
+fn (u Unit&) Spoken(stressed Bool) String {
+    if u.Sound.Len() > 0: return u.Sound
+    c := u.Letters[0]
+    if stressed and u.Open: return ["EY", "IY", "AY", "OW", "UW", "AY"][vowelIndex(c)]
+    if stressed: return ["AE", "EH", "IH", "AA", "AH", "IH"][vowelIndex(c)]
+    return "IH" if c in "iye" and not u.Open else "AH"
+}
+
+fn vowelIndex(c Char) I64 { return try "aeiouy".FindByte(c) catch default 0 }
+
+ltsDigraphs := ["eau OW", "augh AO", "ough AO", "igh AY", "ai EY", "ay EY", "ea IY", "ee IY", "ei EY", "ey EY", "ie IY"
+    "oa OW", "oe OW", "oi OY", "oy OY", "oo UW", "ou AW", "ow OW", "au AO", "aw AO", "ew UW", "ue UW", "ui UW"]
+
+ltsConsonants := ["tch CH", "sch S K", "ght T", "ph F", "sh SH", "ch CH", "th TH", "ck K", "ng NG", "wh W", "qu K W"
+    "kn N", "wr R", "gn N", "dg JH", "x K S", "j JH", "q K", "c K", "g G", "s S", "y Y", "w W", "h HH", "b B", "d D"
+    "f F", "k K", "l L", "m M", "n N", "p P", "r R", "t T", "v V", "z Z"]
+
+fn ltsLetter(w String&, i I64) Bool { return w[i] in "aeiou" or (w[i] == 'y' and i > 0 and not (i + 1 < w.Len() and w[i + 1] in "aeiou")) }
+
+fn letterUnits(w String&) Vec<Unit> {
+    out := Vec<Unit>()
+    vowels I64 = 0
+    i I64 = 0
+    for i < w.Len() {
+        if ltsLetter(w, i) {
+            u, n := vowelUnit(w, i, vowels > 0)
+            if n > 0: out.Push(u)
+            if n > 0 and u.Vowel: vowels++
+            if n > 0 and u.Letters.Len() == 2 and u.Letters[1] == 'r' and u.Letters[0] in "ao": out.Push(Unit(false, "", "", false, "R"))
+            i += n.Max(1)
+            continue
+        }
+        # a last "-n", "-le", "-re" after a consonant is a syllable of its own
+        end := w[i:]
+        if i > 0 and not ltsLetter(w, i - 1) and end in ["n", "le", "re"] {
+            out.Push(Unit(true, "", "ER" if end == "re" else "AH", false, ""))
+            if end == "re": break
+        }
+        u, n := consonantUnit(w, i)
+        out.Push(u)
+        i += n
+    }
+    return out
+}
+
+# the vowel at i: a digraph, an r-coloured vowel, or a single letter open or closed; a silent e is no unit (n 1,
+# Vowel false and no phones)
+fn vowelUnit(w String&, i I64, after Bool) Unit, I64 {
+    n := w.Len()
+    for d in ltsDigraphs {
+        g := d[:d.FindByte(' ')!]
+        final := i + g.Len() == n and (g == "ie" or g == "ue")
+        if w[i:].StartsWith(g) and not final: return Unit(true, g, d[g.Len() + 1:], true, ""), g.Len()
+    }
+    c := w[i]
+    silentEnd := after and c == 'e' and (i == n - 1 or (i == n - 2 and w[n - 1] in "sd" and not (w[i - 1] in "tdgcszx")))
+    if silentEnd: return Unit(false, "", "", false, ""), 1
+    j := i + 1
+    for j < n and not ltsLetter(w, j): j++
+    cons := w[i + 1:j]
+    if c == 'y' and i == n - 1: return Unit(true, "y", "IY", true, ""), 1
+    if cons.StartsWith("r") and (cons.Len() > 1 or j == n) {
+        sound := "AA" if c == 'a' else "AO" if c == 'o' else "ER"
+        return Unit(true, w[i:i + 2], sound, true, ""), 2
+    }
+    open := (cons.Len() == 1 and j < n) or cons in ["th", "ch", "sh", "ph"] or (j == n and cons.Len() == 0) or (cons.Len() == 1 and j == n - 1 and w[n - 1] == 'e')
+    return Unit(true, w[i:i + 1], "", open, ""), 1
+}
+
+# the consonant letters at i
+fn consonantUnit(w String&, i I64) Unit, I64 {
+    n := w.Len()
+    for d in ltsConsonants {
+        g := d[:d.FindByte(' ')!]
+        if not w[i:].StartsWith(g): continue
+        k := i + g.Len()
+        double := g.Len() == 1 and k < n and w[k] == w[i]
+        return Unit(false, "", "", false, consonantSound(w, i, g, d[g.Len() + 1:])), k + (1 if double else 0) - i
+    }
+    return Unit(false, "", "", false, ""), 1
+}
+
+fn consonantSound(w String&, i I64, g String&, sound String&) String {
+    n := w.Len()
+    next := w[i + 1] if i + 1 < n else ' '
+    if g == "c" and next in "eiy": return "S"
+    if g == "g" and next in "eiy": return "JH"
+    if g == "s" and i > 0 and i < n - 1 and ltsLetter(w, i - 1) and ltsLetter(w, i + 1): return "Z"
+    if g == "s" and i == n - 1 and i > 0 and not (w[i - 1] in "ptkfs"): return "Z"
+    if g == "d" and i == n - 1 and n > 2 and w[i - 1] == 'e' and w[i - 2] in "pkfsx": return "T"
+    if g == "d" and i == n - 1 and n > 2 and w[i - 1] == 'e' and w[i - 2] in "td": return "IH0 D"
+    return sound
+}
+
+# ---- ARPAbet as espeak writes en-us ----
+#
+# Words are written in an ASCII alphabet until the end, where ipa() makes them IPA: ' and , are the stress marks, :
+# the length mark, and A ɑ, { æ, V ʌ, O ɔ, E ɛ, 3 ɜ, I ɪ, U ʊ, @ ə, R ɚ, 6 ɐ, X ᵻ, 2 ø, 9 œ, } ʉ, 8 ɵ, g ɡ, r ɹ in
+# English (r in Swedish), T θ, D ð, S ʃ, Z ʒ, N ŋ, 4 ɾ, ? ʔ, C ɕ, Q ʂ, = syllabic; every other letter is itself.
+
+fn arpaVowel(b String&) String {
+    return match b {
+        case "AA": "A:"
+        case "AE": "{"
+        case "AH": "V"
+        case "AO": "O:"
+        case "AW": "aU"
+        case "AY": "aI"
+        case "EH": "E"
+        case "ER": "3:"
+        case "EY": "eI"
+        case "IH": "I"
+        case "IY": "i:"
+        case "OW": "oU"
+        case "OY": "OI"
+        case "UH": "U"
+        case _: "u:"
+    }
+}
+
+fn arpaConsonant(p String&) String {
+    return match p {
+        case "CH": "tS"
+        case "DH": "D"
+        case "HH": "h"
+        case "JH": "dZ"
+        case "NG": "N"
+        case "SH": "S"
+        case "TH": "T"
+        case "Y": "j"
+        case "ZH": "Z"
+        case _: p.ToLower()
+    }
+}
+
+fn vowelPhone(p String&) Bool { return p.Len() > 0 and p[p.Len() - 1].IsDigit() }
+
+# whether w[i] is a vowel letter: a, e, i, o, u; y but before a vowel; w after a vowel but before one
+fn vowelLetter(w String&, i I64) Bool {
+    c := w[i]
+    if c in "aeiou": return true
+    next := w[i + 1] if i + 1 < w.Len() else ' '
+    if c == 'y': return i > 0 and not (next in "aeiou")
+    if c == 'w': return i > 0 and w[i - 1] in "aeiou" and not (next in "aeiouy")
+    return false
+}
+
+# each vowel phone's letters: phone k is w[al[2k]:al[2k + 1]] (-1 where none, or for a consonant). The vowel phones
+# go to the groups of vowel letters in order, a group taking none (cheap for a silent e), one or two
+fn align(w String&, ph Array<String>&) Array<I64> {
+    gs := Vec<I64>()
+    i I64 = 0
+    for i < w.Len() {
+        if not vowelLetter(w, i) {
+            i++
+            continue
+        }
+        j := i
+        for j < w.Len() and vowelLetter(w, j): j++
+        gs.Push(i)
+        gs.Push(j)
+        i = j
+    }
+    vs := Vec<I64>[k for k in range ph.Len() if vowelPhone(ph[k])]
+    m := gs.Len() / 2
+    n := vs.Len()
+    al := Array<I64>(2 * ph.Len(), -1)
+    cost := Array<F64>((m + 1) * (n + 1), 1e9)
+    took := Array<I64>((m + 1) * (n + 1))
+    cost[0] = 0.0
+    for a in range 1, m + 1 {
+        from := gs.At(2 * a - 2)
+        to := gs.At(2 * a - 1)
+        silent := to - from == 1 and w[from] == 'e' and (to == w.Len() or w[to:] == "d" or w[to:] == "s")
+        for b in range n + 1 {
+            at := a * (n + 1) + b
+            cost[at] = cost[at - n - 1] + (0.3 if silent else 1.0)
+            if b >= 1 and cost[at - n - 2] < cost[at] {
+                cost[at] = cost[at - n - 2]
+                took[at] = 1
+            }
+            two := cost[at - n - 3] + (1.0 if to - from > 1 else 1.5) if b >= 2 else 1e9
+            if two < cost[at] {
+                cost[at] = two
+                took[at] = 2
+            }
+        }
+    }
+    if cost[m * (n + 1) + n] >= 1e9: return al
+    b := n
+    for up in range m {
+        a := m - up
+        for t in range took[a * (n + 1) + b] {
+            al[2 * vs.At(b - 1 - t)] = gs.At(2 * a - 2)
+            al[2 * vs.At(b - 1 - t) + 1] = gs.At(2 * a - 1)
+        }
+        b -= took[a * (n + 1) + b]
+    }
+    return al
+}
+
+# a word being written: its letters, phones, each phone's stress ('1', '2', '0', ' ' for a consonant) and letters
+type Word struct(w String&, ph Array<String>&, st mut Array<Char>&, al Array<I64>&) {
+    w
+    ph
+    st
+    al
+}
+
+fn (x Word&) vowel(k I64) Bool { return k >= 0 and k < x.ph.Len() and x.st[k] != ' ' }
+fn (x Word&) at(k I64) String& { return x.ph[k] if k >= 0 and k < x.ph.Len() else "" }
+fn (x Word&) letters(k I64) String& { return x.w[x.al[2 * k]:x.al[2 * k + 1]] if x.vowel(k) and x.al[2 * k] >= 0 else "" }
+fn (x Word&) start(k I64) I64 { return x.al[2 * k] if x.vowel(k) else -1 }
+fn (x Word&) after(k I64) String& { return x.w[x.al[2 * k + 1]:] if x.vowel(k) and x.al[2 * k] >= 0 else "" }
+
+# espeak's stresses from ARPAbet's: one primary; a secondary right after it goes, as does a word's first secondary
+# right before it and a secondary on a last IY
+fn restress(ph Array<String>&) Array<Char> {
+    st := Array<Char>[(p[p.Len() - 1] if vowelPhone(p) else ' ') for p in ph]
+    vs := Vec<I64>[k for k in range ph.Len() if vowelPhone(ph[k])]
+    seen := false
+    for k in vs {
+        if st[k] != '1': continue
+        if seen: st[k] = '2'
+        seen = true
+    }
+    for i in range vs.Len() - 1 {
+        if st[vs.At(i)] == '1' and st[vs.At(i + 1)] == '2': st[vs.At(i + 1)] = '0'
+    }
+    if vs.Len() > 1 and st[vs.At(0)] == '2' and st[vs.At(1)] == '1': st[vs.At(0)] = '0'
+    if vs.Len() > 0 and ph[vs.At(vs.Len() - 1)] == "IY2": st[vs.At(vs.Len() - 1)] = '0'
+    return st
+}
+
+# a word's ARPAbet as espeak writes it
+fn espeak(w String&, arpa Vec<String>&) String {
+    ph := Array<String>[p for p in arpa.View()]
+    st := restress(ph)
+    x := Word(w, ph, st, align(w, ph))
+    out := StringBuilder()
+    k I64 = 0
+    for k < ph.Len() {
+        if x.vowel(k) {
+            k = x.writeVowel(k, out)
+            continue
+        }
+        out.Push(x.consonant(k))
+        k++
+    }
+    return out.ToString().Replace("?@n", "?n=")
+}
+
+fn (x Word&) consonant(k I64) String {
+    p := x.ph[k]
+    next := x.at(k + 1)
+    if p == "N" and (next == "K" or next == "G"): return "N"
+    if p == "Y" and x.vowel(k + 1) and x.st[k + 1] == '0' and x.letters(k + 1).Len() == 2 and x.letters(k + 1)[0] == 'i' {
+        return "I" if next == "ER0" else "i"
+    }
+    if p != "T" or not x.vowel(k + 1) or x.st[k + 1] != '0': return arpaConsonant(p)
+    if not (x.vowel(k - 1) or x.at(k - 1) == "R"): return "t"
+    # t before an unstressed vowel: glottal before a last "-en", flapped after a stressed vowel or r
+    stressedBefore := x.at(k - 1) == "R" or x.st[k - 1] != '0'
+    if next == "AH0" and x.at(k + 2) == "N" {
+        end := k + 3 == x.ph.Len() or x.at(k + 3) in ["D", "Z", "IY0", "L"]
+        return "?" if end and stressedBefore else "t"
+    }
+    return "4" if stressedBefore or (next == "IY0" and k + 2 == x.ph.Len()) else "t"
+}
+
+# the vowel phone k (and an r after it, where they go together) written into out; the next phone's index
+fn (x Word&) writeVowel(k I64, out mut StringBuilder&) I64 {
+    p := x.ph[k]
+    b := p[:p.Len() - 1]
+    s := x.st[k]
+    next := x.at(k + 1)
+    mark := "'" if s == '1' else "," if s == '2' else ""
+    if b == "AY" and next == "R" and not x.vowel(k + 2) {
+        out.Push(mark + "aIR")
+        return k + 2
+    }
+    v := x.reduced(k) if s == '0' else arpaVowel(b)
+    v = x.coloured(k, b, v)
+    if b == "ER" and x.vowel(k + 1): v = v + "r"
+    out.Push(mark + v)
+    if next == "R" and (b == "UW" or b == "UH") and x.vowel(k + 2): out.Push("r")
+    return k + 1
+}
+
+# an unstressed vowel: mostly the spelling's
+fn (x Word&) reduced(k I64) String {
+    b := x.ph[k][:x.ph[k].Len() - 1]
+    g := x.letters(k)
+    at := x.start(k)
+    after := x.after(k)
+    prev := x.at(k - 1)
+    if b == "ER": return "R"
+    if b == "AE" and g == "a" and at == 0: return "6"
+    if b == "IY" {
+        if g == "e" and prefixed(x.w, at) and not x.vowel(k + 1): return prefixE(x.w, at)
+        return "I" if g == "y" and after.Len() > 0 else "i"
+    }
+    if b != "AH" and b != "IH": return arpaVowel(b)
+    if g == "a" and at == 0: return "6"
+    if g == "u" and at == 0: return "V"
+    if g == "i" and (after.StartsWith("ble") or after == "ty" or after == "ties"): return "X"
+    if g == "i" and after == "ly": return "i"
+    if g == "i" or g == "y": return "I"
+    if g == "a" and after in ["ge", "ges", "ged"]: return "I"
+    if g == "u" and prev == "Y" and after.StartsWith("l"): return "U"
+    if g == "e" and (after == "d" or after == "s") and prev in ["T", "D", "S", "Z", "CH", "JH", "SH", "ZH"]: return "X"
+    if g == "e" and after in ["st", "t", "sts", "ts"]: return "I"
+    if g == "e" and at == 0: return "E" if after.StartsWith("x") or (after.StartsWith("n") and after.Len() > 1 and not (after[1] in "aeiouy")) else "I"
+    if g == "e" and prefixed(x.w, at) and not x.vowel(k + 1): return prefixE(x.w, at)
+    if x.at(k + 1) == "N" and x.at(k - 1) == "T" and k >= 2 and x.at(k - 2) != "" and k + 2 == x.ph.Len(): return "@"
+    return "@" if b == "AH" else "I"
+}
+
+# an e after be-, re-, de-, pre-
+fn prefixed(w String&, at I64) Bool { return at > 0 and w[:at] in ["b", "r", "d", "pr"] }
+
+fn prefixE(w String&, at I64) String {
+    next := w[at + 1] if at + 1 < w.Len() else ' '
+    return "I" if next in "gcsz" or (w[:at] == "d" and next == 't') else "X"
+}
+
+# the vowels espeak gives by the letters around them: wa- ɔ, au ɔː, r-coloured ones
+fn (x Word&) coloured(k I64, b String&, v String&) String {
+    g := x.letters(k)
+    at := x.start(k)
+    after := x.after(k)
+    next := x.at(k + 1)
+    following := x.at(k + 2)
+    if b == "AO" and next != "R" and g == "o": return "O"
+    if b == "AA" and g == "a" and at > 0 and x.w[at - 1] == 'w' and after.StartsWith("n"): return "O"
+    if b == "AA" and (g == "au" or g == "aw" or (g == "a" and next == "L")): return "O:"
+    if next != "R": return x.diphthong(k, b, v)
+    if b == "AO" and (g in ["oa", "oo", "ou"] or after in ["re", "res", "red"] or rVowel(after)): return "o:"
+    if b == "IY": return "i@" if (g == "e" or g == "i") and x.vowel(k + 2) else "I"
+    if b == "UW" or b == "UH": return "U"
+    if b == "EH" and g == "a" and (after.StartsWith("rr") or (after.Len() > 2 and after[1] in "ai" and not (after[2] in "aeiou"))): return "{"
+    if following == "" or x.st[k] != '0': return v
+    return v
+}
+
+# "r" and a vowel after it, not "rr"
+fn rVowel(after String&) Bool { return after.Len() > 1 and after[0] == 'r' and after[1] in "aeiouy" }
+
+# iː before another vowel of the same letters (idea) is i; an unstressed IY after iə ɹ is ɪ
+fn (x Word&) diphthong(k I64, b String&, v String&) String {
+    if b != "IY" or x.st[k] == '0': return v
+    if x.vowel(k + 1) and x.letters(k).Len() == 2 and x.letters(k) != "ee" and x.start(k + 1) == x.start(k): return "i"
+    return v
+}
+
+# function words and the words of numbers as espeak gives them: the word, its form alone, its form inside a phrase
+enFunction := "mr m'IstR m'IstR\nmrs m'IsIz m'IsIz\ndr d'A:ktR d'A:ktR\nit's Its Its\na 'eI 6\nan {n {n\nthe D@ D@\nand {nd {nd\nor O:r O:r\nbut b,Vt b,Vt\nof Vv Vv\nto tu: t@\nin 'In In\n" +
+    "on 'On ,On\nat {t {t\nby b'aI baI\nfor fO:r fO:r\nwith wID wID\nfrom frVm frVm\nas {z {z\nis Iz Iz\nit It It\n" +
+    "its Its Its\nwas wVz wVz\nwere w3: w3:\nbe b'i: bi:\nbeen b,In b,In\nare A:r A:r\nam {m {m\nhas h'{z h6z\n" +
+    "have h'{v h{v\nhad h,{d h{d\ndo d'u: d'u:\ndoes d'Vz d'Vz\ndid d'Id d'Id\nnot n'A:t n,A:t\nno n'oU n'oU\n" +
+    "so s'oU s,oU\nif If If\nthan D6n D6n\nthat D'{t D{t\nthis D'Is DIs\nthese D'i:z Di:z\nthose D'oUz DoUz\n" +
+    "there D'Er DEr\ntheir DEr DEr\nthey DeI DeI\nthem D,Em D,Em\nhe hi: hi:\nhim h,Im h,Im\nhis h'Iz hIz\n" +
+    "she Si: Si:\nher h3: h3:\nhers h'3:z h3:z\nwe wi: wi:\nus ,Vs ,Vs\nour ,aUR ,aUR\nours aURz aURz\nyou ju: ju:\n" +
+    "your jUr jUr\nyours j'o:rz j'o:rz\ni 'aI aI\nme m'i: m,i:\nmy m'aI maI\nwho h'u: h,u:\nwhom h'u:m h'u:m\n" +
+    "whose h,u:z h,u:z\nwhich w'ItS w,ItS\nwhat w,Vt wVt\nwhen w,En wEn\nwhere w'Er w,Er\nwhy w'aI w,aI\n" +
+    "how h'aU h,aU\nall 'O:l 'O:l\nany ,Eni ,Eni\nsome s,Vm s,Vm\ncan k'{n k{n\ncould k'Ud kUd\nwill w'Il wIl\n" +
+    "would w'Ud wUd\nshall S'{l S,{l\nshould S'Ud S,Ud\nmay m'eI m'eI\nmight m'aIt m,aIt\nmust m'Vst m'Vst\n" +
+    "into ,IntU ,IntU\nonto 'A:ntU ,A:ntU\nupon @p,A:n @p,A:n\nabout 6b'aUt 6b,aUt\nover 'oUvR ,oUvR\n" +
+    "under 'VndR ,VndR\nup 'Vp ,Vp\ndown d'aUn d,aUn\nout 'aUt 'aUt\noff 'Of 'Of\nthen D'En D'En\ntoo t'u: t'u:\n" +
+    "very v'Eri v'Eri\njust dZ'Vst dZ'Vst\nalso 'O:lsoU 'O:lsoU\nonly 'oUnli 'oUnli\nsuch s'VtS s'VtS\n" +
+    "each 'i:tS 'i:tS\nboth b'oUT b'oUT\neither 'i:DR 'i:DR\nneither n'i:DR n'i:DR\nnor n'O:r n'O:r\nyet j'Et j'Et\n" +
+    "while w'aIl w,aIl\nthough D,oU D,oU\nalthough O:lD'oU O:lD'oU\nbecause bIk'Vz bIk'Vz\nbefore bXf'o:r bXf,o:r\n" +
+    "after '{ftR '{ftR\nsince s'Ins s'Ins\nuntil Vnt'Il Vnt'Il\nunless Vnl'Es Vnl'Es\none w'Vn w'Vn\nsir s,3: s,3:\n" +
+    "thy D,aI D,aI\nthee D'i: Di:\nthou D'aU D'aU\nye j'i: ji:\nre r,i: r,i:\nde d@ d@\netc Ets'Etr@ Ets'Etr@\n" +
+    "zero z'i@roU z'i@roU\none w'Vn w'Vn\ntwo t'u: t'u:\nthree Tr'i: Tr'i:\nfour f'o:r f'o:r\nfive f'aIv f'aIv\n" +
+    "six s'Iks s'Iks\nseven s'Ev@n s'Ev@n\neight 'eIt 'eIt\nnine n'aIn n'aIn\nten t'En t'En\neleven Xl'Ev@n Xl'Ev@n\n" +
+    "twelve tw'Elv tw'Elv\nthirteen T'3:ti:n T'3:ti:n\nfourteen f'o:rti:n f'o:rti:n\nfifteen f'Ifti:n f'Ifti:n\n" +
+    "sixteen s'Iksti:n s'Iksti:n\nseventeen s'Ev@nt,i:n s'Ev@nt,i:n\neighteen 'eIti:n 'eIti:n\n" +
+    "nineteen n'aInti:n n'aInti:n\ntwenty tw'Enti tw'Enti\nthirty T'3:4i T'3:4i\nforty f'O:r4i f'O:r4i\n" +
+    "fifty f'Ifti f'Ifti\nsixty s'Iksti s'Iksti\nseventy s'Ev@nti s'Ev@nti\neighty 'eI4i 'eI4i\n" +
+    "ninety n'aInti n'aInti\nhundred h'VndrId h'VndrId\nthousand T'aUz@nd T'aUz@nd\nmillion m'Ili@n m'Ili@n\n" +
+    "billion b'Ili@n b'Ili@n\npoint p'OInt pOInt"
+
+# ---- Swedish ----
+
+fn (g G2p&) svPhrase(ws Vec<String>&) String { return "" }
+
+fn svNumber(t String&) String { return t }
+
+# ---- IPA ----
+
+asciiIpa := ["A \u{251}", ": \u{2D0}", "{ \u{E6}", "V \u{28C}", "O \u{254}", "E \u{25B}", "3 \u{25C}", "I \u{26A}"
+    "U \u{28A}", "@ \u{259}", "R \u{25A}", "6 \u{250}", "X \u{1D7B}", "2 \u{F8}", "9 \u{153}", "} \u{289}", "8 \u{275}"
+    "g \u{261}", "T \u{3B8}", "D \u{F0}", "S \u{283}", "Z \u{292}", "N \u{14B}", "4 \u{27E}", "? \u{294}", "C \u{255}"
+    "Q \u{282}", "= \u{329}", "' \u{2C8}", ", \u{2CC}"]
+
+# the ASCII alphabet made IPA (r is ɹ in English)
+fn ipa(t String&, sv Bool) String {
+    out := StringBuilder()
+    for c in t {
+        if c == 'r' and not sv {
+            out.Push("\u{279}")
+            continue
+        }
+        out.Push(ipaOf(c))
+    }
+    return out.ToString()
+}
+
+fn ipaOf(c Char) String {
+    for m in asciiIpa {
+        if m[0] == c: return m[2:]
+    }
+    return $c
+}
+
+# ---- checks against espeak (speech/tools/g2p_reference.py), where its files are ----
+
+# code points, for the edit distance
+fn points(t String&) Array<I64> {
+    out := Vec<I64>()
+    i I64 = 0
+    for i < t.Len() {
+        c := I64(t[i])
+        n := 1 if c < 0x80 else 2 if c < 0xE0 else 3 if c < 0xF0 else 4
+        cp := c if n == 1 else c & (0xFF >> (n + 1))
+        for k in range 1, n: cp = (cp << 6) | (I64(t[i + k]) & 0x3F)
+        out.Push(cp)
+        i += n
+    }
+    return out.ToArray()
+}
+
+fn distance(a Array<I64>&, b Array<I64>&) I64 {
+    row := Array<I64>[j for j in range b.Len() + 1]
+    for i in range a.Len() {
+        diag := row[0]
+        row[0] = i + 1
+        for j in range b.Len() {
+            up := row[j + 1]
+            row[j + 1] = (up + 1).Min(row[j] + 1).Min(diag + (0 if a[i] == b[j] else 1))
+            diag = up
+        }
+    }
+    return row[b.Len()]
+}
+
+# over a reference file (a line "text<TAB>espeak's IPA"): the share of lines exactly espeak's, and one less the edit
+# distance over espeak's length (in code points: phonemes, stress and length marks, spaces, punctuation)
+fn agreement(g G2p&, path String&, lang String&, show Bool) F64, F64 ? os.Error, G2pError {
+    same I64 = 0
+    lines I64 = 0
+    dist I64 = 0
+    total I64 = 0
+    for line in (try os.ReadFile(path)).Lines() {
+        tab := try line.FindByte('\t') catch { continue }
+        got := try g.Phonemes(line[:tab], lang)
+        want := line[tab + 1:]
+        lines++
+        total += points(want).Len()
+        if got == want {
+            same++
+            continue
+        }
+        dist += distance(points(got), points(want))
+        if show: Println(line[:tab] + "  " + got + "  " + want)
+    }
+    return F64(same) / F64(lines.Max(1)), 1.0 - F64(dist) / F64(total.Max(1))
+}
+
+fn refDir() String { return Cache() + "/ref/g2p" }
+
+test G2p "English: words, words CMUdict lacks and sentences against espeak (where the reference files are)" {
+    if not os.Exists(refDir() + "/en_words.tsv") {
+        Println("skipped: no reference")
+        return
+    }
+    g := try G2p.Load() catch {
+        Println("skipped: no CMUdict")
+        return
+    }
+    check(g, "en_words", "en", 0.90, 0.975)
+    check(g, "en_oov", "en", 0.48, 0.84)
+    check(g, "en_sentences", "en", 0.66, 0.99)
+}
+
+# a reference file's agreement printed and held to at least what was reached; a file "show" beside the references
+# prints every line that differs
+fn check(g G2p&, name String&, lang String&, exact F64, near F64) {
+    e, n := agreement(g, refDir() + "/" + name + ".tsv", lang, os.Exists(refDir() + "/show"))!
+    Println(name + ": " + $e + " exact, " + $n + " by edit distance")
+    assert e >= exact and n >= near, name
+}
