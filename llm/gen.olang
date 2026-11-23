@@ -1,7 +1,7 @@
 # llm/gen - oann-gen, completions of many prompts by an open-weight model, as one long job:
 #
 #     oann-gen MODEL prompts.jsonl out.jsonl [--n K] [--temp T] [--top-p P] [--top-k K] [--max-tokens M] [--batch B]
-#              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--exact]
+#              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--kv8] [--exact]
 #
 # MODEL is a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors or its shards)
 # or a repository's name ("Qwen/Qwen3-4B"), fetched once into $OANN_MODELS (by default ~/.cache/oann/models). Each line
@@ -99,6 +99,7 @@ fn main() {
     noThink := p.Bool("no-think", 0, "Qwen3: answer without thinking")
     kvGb := p.Float("kv-gb", 0, 0.0, "memory for the key-value cache (default: most of what is free)")
     exact := p.Bool("exact", 0, "F32 activations and cache (slow; to check against a reference)")
+    kv8 := p.Bool("kv8", 0, "keys and values in 8 bits, a scale per position and head: about half the cache (AMX)")
     int8 := p.Bool("int8", 0, "8-bit weights, a scale per 32 inputs (the head stays BF16): about 0.56 of the memory; needs AMX")
     try p.Parse(os.Args()) catch flags.Error.Help {
         try io.Put(p.Help()) catch { }
@@ -164,16 +165,16 @@ fn main() {
     maxCtx := ctx.Get() if ctx.Get() > 0 else longest + maxNew.Get()
     maxCtx = maxCtx.Min(m.C.MaxPos)
     budget := I64(kvGb.Get() * 1073741824.0) if kvGb.Get() > 0.0 else (available() - 1073741824) * 9 / 10
-    pages := engine.PagesFor(m.C, budget).Min(batch.Get() * (maxCtx / model.PageSize + 1))
+    pages := engine.PagesFor(m.C, budget, kv8.Get() and m.Tile).Min(batch.Get() * (maxCtx / model.PageSize + 1))
     if pages < maxCtx / model.PageSize + 1: fail("no room for one sequence of " + $maxCtx + " positions in " + $(budget / 1048576) + " MB")
-    e := engine.Engine(m, batch.Get(), maxCtx, pages, Exact = exact.Get())
+    e := engine.Engine(m, batch.Get(), maxCtx, pages, Exact = exact.Get(), Kv8 = kv8.Get())
     tt := ch.Temp if temp.Get() < 0.0 else temp.Get()
     tp := ch.TopP if topP.Get() < 0.0 else topP.Get()
     tk := ch.TopK if topK.Get() < 0 else topK.Get()
     e.Sampling = engine.Sampler(tt, tp, tk)
     for t in ch.Stops: e.Stops.Push(t)
     say($jobs.Len() + " completions, batch " + $batch.Get() + ", context " + $maxCtx + ", cache " + $pages + " pages (" +
-        $(pages * model.PageBytes(m.C) / 1048576) + " MB), temperature " + $e.Sampling.Temp + ", top-p " + $e.Sampling.TopP +
+        $(pages * model.PageBytes(m.C, kv8.Get() and m.Tile) / 1048576) + " MB), temperature " + $e.Sampling.Temp + ", top-p " + $e.Sampling.TopP +
         ", top-k " + $e.Sampling.TopK)
     for i, jb in jobs.View() {
         s := mix(U64(seed.Get()) ^ mix(hash(jb.id)) ^ mix(U64(jb.sample) + 0x51ED))

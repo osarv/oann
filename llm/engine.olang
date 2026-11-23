@@ -52,14 +52,14 @@ type seq struct(req Request, slot I64) {
     for t in req.Prompt: toks.Push(t)
 }
 
-type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 = 256, Exact Bool = false) {
+type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 = 256, Exact Bool = false, Kv8 Bool = false) {
     m
     Batch                   # sequences at once
     MaxCtx                  # positions a sequence may have, prompt and completion
     Chunk                   # prompt rows a step
     Sampling Sampler = Sampler()
     Stops mut Vec<I32>& = Vec<I32>()
-    Cache mut model.Cache& = model.Cache(m.C, Pages, Batch, MaxCtx / model.PageSize + 1, Exact)
+    Cache mut model.Cache& = model.Cache(m.C, Pages, Batch, MaxCtx / model.PageSize + 1, Exact, Kv8 and m.Tile)
     State mut model.State& = model.State(m, Batch + Chunk, Batch, MaxCtx + model.PageSize)
     queue mut Vec<Request>& = Vec<Request>()        # waiting, in order, from head
     head I64 = 0
@@ -79,7 +79,7 @@ type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 =
 }
 
 # the pages for a context of n positions with the cache's memory: weights aside, budget bytes
-fn PagesFor(c model.Config&, budget I64) I64 { return budget / model.PageBytes(c) }
+fn PagesFor(c model.Config&, budget I64, kv8 Bool = false) I64 { return budget / model.PageBytes(c, kv8) }
 
 # r queued (to run after those queued before it)
 fn (e mut Engine&) Submit(r Request) { e.queue.Push(r) }

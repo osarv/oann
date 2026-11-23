@@ -394,15 +394,18 @@ PageSize I64 = 64
 # Pages pages of 64 positions for every layer and key-value head, keys and values in BF16; Slots sequences of at most
 # MaxPages pages each, Table[slot MaxPages + i] its i-th page. A page's keys for a head: position n's dimension d at
 # ((d / 2) 32 + n) 2 + d % 2 (AddDot's pairs over the head's dimensions); its values: at ((n / 2) HeadDim + d) 2 + n % 2
-type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = false) {
+type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = false, Kv8 Bool = false) {
     Pages
     Slots
     MaxPages
+    Kv8                     # values in 8 bits, a scale per position and head (V8, VS); else BF16. Keys are BF16 always
     Layers I64 = c.Layers
     KvHeads I64 = c.KvHeads
     HeadDim I64 = c.HeadDim
     K mut Array<BF16>& = Array<BF16>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
-    V mut Array<BF16>& = Array<BF16>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
+    V mut Array<BF16>& = Array<BF16>(0 if Kv8 else c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
+    V8 mut Array<I8>& = Array<I8>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize if Kv8 else 0)
+    VS mut Array<F32>& = Array<F32>(c.Layers * Pages * c.KvHeads * PageSize if Kv8 else 0)   # position n's at at() / HeadDim + n
     KF mut Array<F32>& = Array<F32>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize if exact else 0)  # exact: F32 too
     VF mut Array<F32>& = Array<F32>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize if exact else 0)
     Table mut Array<I32>& = Array<I32>(Slots * MaxPages, -1)
@@ -410,16 +413,21 @@ type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = fa
     nfree I64 = Pages
 }
 
-# the bytes one page takes over every layer
-fn PageBytes(c Config&) I64 { return c.Layers * c.KvHeads * c.HeadDim * PageSize * 2 * 2 }
+# the bytes one page takes over every layer: BF16 keys and values, or values of 8 bits and a scale a position
+fn PageBytes(c Config&, kv8 Bool = false) I64 {
+    if kv8: return c.Layers * c.KvHeads * PageSize * (3 * c.HeadDim + 4)
+    return c.Layers * c.KvHeads * c.HeadDim * PageSize * 2 * 2
+}
 
 fn (k Cache&) Free() I64 { return k.nfree }
 
-# a page off the free list, its values zeroed (a weight of zero times a stale NaN would be one); -1 when none is left
+# a page off the free list, its values zeroed (a weight of zero times a stale NaN would be one; 8 bits and their scales
+# are never one); -1 when none is left
 fn (k mut Cache&) Take() I32 {
     if k.nfree == 0: return -1
     k.nfree--
     p := k.free[k.nfree]
+    if k.Kv8: return p
     span := k.KvHeads * k.HeadDim * PageSize
     for l in range k.Layers {
         o := (l * k.Pages + I64(p)) * span
@@ -453,6 +461,9 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     Out mut Array<I64>& = Array<I64>(Rows, -1)      # and where its logits go (-1: none)
     NOut I64 = 0
     Times mut Array<I64>& = Array<I64>(4)           # ns in products, attention, the rest, steps
+    SplitK Bool = true                              # a few rows' attention split by pages over the tasks
+    part mut Array<F32>& = Array<F32>(maxUnits(m.C, Rows, MaxCtx) * partWidth(m.C))   # split items' partial softmaxes
+    uoff mut Array<I64>& = Array<I64>(Rows * m.C.KvHeads + 1)                         # each item's first unit
     Logits mut Array<F32>& = Array<F32>(roundUp(Outs, 16) * m.C.Vocab)
     x mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
     h mut Array<F32>& = Array<F32>(roundUp(Rows, 16) * widest(m.C))
@@ -484,6 +495,8 @@ type Attend struct(c Config&, maxCtx I64, tile Bool) {
     p mut Array<BF16>& = Array<BF16>(16 * roundUp(maxCtx, PageSize) if tile else 0)
     o mut Array<F32>& = Array<F32>(16 * c.HeadDim)
     qf mut Array<F32>& = Array<F32>(16 * c.HeadDim)
+    ml mut Array<F32>& = Array<F32>(32)                         # each query's maximum and sum
+    vb mut Array<BF16>& = Array<BF16>(c.HeadDim * PageSize)
 }
 
 # clears the step's rows
@@ -688,6 +701,16 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
     s.Times[3] += all
 }
 
+# the scale of n values from x[o] in 8 bits: their largest magnitude / 127 (1 where all are 0)
+fn quantScale(x Array<F32>&, o I64, n I64) F32 {
+    top F32 = 0.0
+    for i in range n {
+        v := x[o + i]
+        top = v if v > top else (-v if -v > top else top)
+    }
+    return top / 127.0 if top > 0.0 else F32(1.0)
+}
+
 # rows r0 .. r1: each query and key head normed (QK-norm) and rotated, and the keys and values into the cache
 fn headsOf(c Config&, l Layer&, qkv mut Array<F32>&, cos Array<F32>&, sin Array<F32>&, pos Array<I64>&, slot Array<I64>&, k mut Cache&, li I64, r0 I64, r1 I64) {
     hd := c.HeadDim
@@ -724,6 +747,18 @@ fn store(c Config&, qkv Array<F32>&, posOf Array<I64>&, slot Array<I64>&, k mut 
     n := pos % PageSize
     for h in range c.KvHeads {
         base := k.at(li, page, h)
+        if k.Kv8 {
+            # the values symmetric, the head's largest magnitude 127 (keys so lose too much: a few of their dimensions
+            # are far larger than the rest)
+            vs := quantScale(qkv, o + q + kv + h * hd, hd)
+            k.VS[base / hd + n] = vs
+            vi := 1.0 / vs
+            for i in range hd {
+                k.K[base + ((i / 2) * PageSize + n) * 2 + i % 2] = BF16(qkv[o + q + h * hd + i])
+                k.V8[base + ((n / 2) * hd + i) * 2 + n % 2] = I8((qkv[o + q + kv + h * hd + i] * vi).Round())
+            }
+            continue
+        }
         for i in range hd {
             k.K[base + ((i / 2) * PageSize + n) * 2 + i % 2] = BF16(qkv[o + q + h * hd + i])
             k.V[base + ((n / 2) * hd + i) * 2 + n % 2] = BF16(qkv[o + q + kv + h * hd + i])
@@ -737,52 +772,127 @@ fn store(c Config&, qkv Array<F32>&, posOf Array<I64>&, slot Array<I64>&, k mut 
     }
 }
 
-# every row's attention at layer li, into s.att: the rows' head groups split over the tasks
+# every row's attention at layer li, into s.att: the rows' head groups (items) split over the tasks. An item of more
+# than ChunkPages pages is split into runs of that many - so a small batch with a long context still keeps every task
+# busy - whose partial softmaxes (each query's maximum, sum and weighted values) are joined after, in order. Where an
+# item is split depends on its own length alone, so a row's attention is the same whatever else is in the step
 fn (m Model&) attention(s mut State&, k Cache&, li I64) {
     items := s.N * m.C.KvHeads
-    tasks := m.Threads.Min(items)
-    if tasks <= 1 {
-        attendItems(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Slot, k, li, 0, items, s.work[0])
-        return
+    for it in range items {
+        np := s.Pos[it / m.C.KvHeads] / PageSize + 1
+        s.uoff[it + 1] = s.uoff[it] + ((np + ChunkPages - 1) / ChunkPages if s.SplitK else 1)
     }
-    join {
-        for t in range tasks: spawn attendItems(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Slot, k, li, t * items / tasks, (t + 1) * items / tasks, s.work[t])
+    units := s.uoff[items]
+    tasks := m.Threads.Min(units)
+    if tasks <= 1 {
+        attendUnits(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Slot, k, li, 0, units, s.uoff, items, s.work[0], s.part)
+    } else {
+        join {
+            for t in range tasks: spawn attendUnits(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Slot, k, li, t * units / tasks, (t + 1) * units / tasks, s.uoff, items, s.work[t], s.part)
+        }
+    }
+    if units > items: joinParts(m.C, s.att, s.part, s.uoff, items)
+}
+
+# the pages of a run of an item's attention
+ChunkPages mut I64 = 16
+
+# a unit's partial softmax: for each of the group's queries its maximum and sum, then its weighted values
+fn partWidth(c Config&) I64 { return (c.Heads / c.KvHeads) * (c.HeadDim + 2) }
+
+# the units of a step: every item's runs of pages at most
+fn maxUnits(c Config&, rows I64, maxCtx I64) I64 {
+    return rows * c.KvHeads * ((maxCtx / PageSize + 1 + ChunkPages - 1) / ChunkPages)
+}
+
+# each split item's runs joined in order: the values and sums scaled by e^(their maximum - the larger) as they meet
+fn joinParts(c Config&, att mut Array<F32>&, part Array<F32>&, uoff Array<I64>&, items I64) {
+    hd := c.HeadDim
+    g := c.Heads / c.KvHeads
+    pw := partWidth(c)
+    for it in range items {
+        if uoff[it + 1] - uoff[it] < 2: continue
+        r := it / c.KvHeads
+        h := it % c.KvHeads
+        for j in range g {
+            o := r * c.Heads * hd + (h * g + j) * hd
+            u0 := uoff[it] * pw
+            top := part[u0 + j]
+            total := part[u0 + g + j]
+            for i in range hd: att[o + i] = part[u0 + 2 * g + j * hd + i]
+            for u in range uoff[it] + 1, uoff[it + 1] {
+                b := u * pw
+                m := part[b + j]
+                next := m if m > top else top
+                fa := elem.FastExp(top - next)
+                fb := elem.FastExp(m - next)
+                total = total * fa + part[b + g + j] * fb
+                for i in range hd: att[o + i] = att[o + i] * fa + part[b + 2 * g + j * hd + i] * fb
+                top = next
+            }
+            inv := 1.0 / total
+            for i in range hd: att[o + i] *= inv
+        }
     }
 }
 
-# items i0 .. i1 (row i / KvHeads, head group i % KvHeads)
-fn attendItems(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos Array<I64>&, slot Array<I64>&, k Cache&, li I64, i0 I64, i1 I64, a mut Attend&) {
+# the exact integers of n 8-bit values from x[o], as BF16, into dst
+fn widen(dst mut Array<BF16>&, x Array<I8>&, o I64, n I64) {
+    for i in range n: dst[i] = BF16.FromBits(U16(F32(x[o + i]).Bits() >> 16))   # the low bits are 0
+}
+
+# units u0 .. u1: item it (row it / KvHeads, head group it % KvHeads) has units uoff[it] .. uoff[it + 1] - 1, a run of
+# ChunkPages of its pages each; an item of one unit writes its attention, the runs of a longer one their partial
+# softmaxes into part
+fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos Array<I64>&, slot Array<I64>&, k Cache&, li I64, u0 I64, u1 I64, uoff Array<I64>&, items I64, a mut Attend&, part mut Array<F32>&) {
     hd := c.HeadDim
     g := c.Heads / c.KvHeads
     w3 := (c.Heads + 2 * c.KvHeads) * hd
     stride := a.s.Len() / 16
     scale := F32(1.0 / F64(hd).Sqrt())
-    for it in range i0, i1 {
+    span := hd * PageSize
+    pw := partWidth(c)
+    # the item of u0
+    lo I64 = 0
+    hi I64 = items
+    for hi - lo > 1 {
+        mid := (lo + hi) / 2
+        if uoff[mid] <= u0: lo = mid
+        else: hi = mid
+    }
+    it I64 = lo
+    for u in range u0, u1 {
+        for uoff[it + 1] <= u: it++
+        chunks := uoff[it + 1] - uoff[it]
         r := it / c.KvHeads
         h := it % c.KvHeads
         p := pos[r]
         np := p / PageSize + 1
+        pa := (u - uoff[it]) * ChunkPages if chunks > 1 else 0
+        pb := (pa + ChunkPages).Min(np) if chunks > 1 else np
         row := slot[r] * k.MaxPages
-        span := hd * PageSize
+        n := (pb - pa) * PageSize                   # the positions of the run's pages
+        valid := (p + 1).Min(pb * PageSize) - pa * PageSize
         if tile {
             for j in range g {
                 for i in range hd: a.q[j * hd + i] = BF16(qkv[r * w3 + (h * g + j) * hd + i])
-                for t in range np * PageSize: a.s[j * stride + t] = 0.0
+                for t in range n: a.s[j * stride + t] = 0.0
                 for i in range hd: a.o[j * hd + i] = 0.0
             }
-            for pi in range np {
+            for pi in range pa, pb {
                 base := k.at(li, I64(k.Table[row + pi]), h)
-                stdtile.AddDot(a.s[pi * PageSize:], stride, 16, PageSize, a.q, hd, hd, k.K[base:base + span])!
+                so := (pi - pa) * PageSize
+                stdtile.AddDot(a.s[so:], stride, 16, PageSize, a.q, hd, hd, k.K[base:base + span])!
             }
         } else {
             for j in range g {
                 for i in range hd: a.qf[j * hd + i] = qkv[r * w3 + (h * g + j) * hd + i]
-                for t in range np * PageSize: a.s[j * stride + t] = 0.0
+                for t in range n: a.s[j * stride + t] = 0.0
             }
-            for pi in range np {
+            for pi in range pa, pb {
                 base := k.at(li, I64(k.Table[row + pi]), h)
                 for j in range g {
-                    so := j * stride + pi * PageSize
+                    so := j * stride + (pi - pa) * PageSize
                     for i in range hd {
                         x := a.qf[j * hd + i]
                         ko := base + (i / 2) * PageSize * 2 + i % 2
@@ -795,32 +905,44 @@ fn attendItems(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
                 }
             }
         }
-        # the softmax of each query's scores over positions 0 .. p (each pass a loop of lanes, the sums 8 at a time)
+        # the softmax of each query's scores over the run's positions to p (each pass a loop of lanes, the sums 8 at
+        # a time)
         for j in range g {
             so := j * stride
-            top := elem.MaxIn<F32, F32>(a.s, so, p + 1) * scale
-            for t in range p + 1: a.s[so + t] = elem.FastExp(a.s[so + t] * scale - top)
-            total := elem.SumIn<F32, F32>(a.s, so, p + 1)
-            for t in range p + 1, np * PageSize: a.s[so + t] = 0.0
-            a.qf[j] = 1.0 / total
+            top := elem.MaxIn<F32, F32>(a.s, so, valid) * scale
+            for t in range valid: a.s[so + t] = elem.FastExp(a.s[so + t] * scale - top)
+            total := elem.SumIn<F32, F32>(a.s, so, valid)
+            for t in range valid, n: a.s[so + t] = 0.0
+            a.ml[j] = top
+            a.ml[16 + j] = total
         }
         if tile {
-            for j in range g {
-                for t in range np * PageSize: a.p[j * stride + t] = BF16(a.s[j * stride + t])
-            }
-            for pi in range np {
+            for pi in range pa, pb {
                 base := k.at(li, I64(k.Table[row + pi]), h)
-                stdtile.AddDot(a.o, hd, 16, hd, a.p[pi * PageSize:], stride, PageSize, k.V[base:base + span])!
+                so := (pi - pa) * PageSize
+                if k.Kv8 {
+                    sc := base / hd
+                    for j in range g {
+                        for t in range PageSize: a.p[j * stride + so + t] = BF16(a.s[j * stride + so + t] * k.VS[sc + t])
+                    }
+                    widen(a.vb, k.V8, base, span)
+                    stdtile.AddDot(a.o, hd, 16, hd, a.p[so:], stride, PageSize, a.vb)!
+                } else {
+                    for j in range g {
+                        for t in range PageSize: a.p[j * stride + so + t] = BF16(a.s[j * stride + so + t])
+                    }
+                    stdtile.AddDot(a.o, hd, 16, hd, a.p[so:], stride, PageSize, k.V[base:base + span])!
+                }
             }
         } else {
             for j in range g {
                 for i in range hd: a.o[j * hd + i] = 0.0
             }
-            for pi in range np {
+            for pi in range pa, pb {
                 base := k.at(li, I64(k.Table[row + pi]), h)
                 for j in range g {
                     for t in range PageSize {
-                        x := a.s[j * stride + pi * PageSize + t]
+                        x := a.s[j * stride + (pi - pa) * PageSize + t]
                         vo := base + (t / 2) * hd * 2 + t % 2
                         if k.VF.Len() > 0 {
                             for i in range hd: a.o[j * hd + i] += x * k.VF[vo + 2 * i]
@@ -831,9 +953,17 @@ fn attendItems(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
                 }
             }
         }
-        for j in range g {
-            inv := a.qf[j]
-            for i in range hd: att[r * c.Heads * hd + (h * g + j) * hd + i] = a.o[j * hd + i] * inv
+        if chunks == 1 {
+            for j in range g {
+                inv := 1.0 / a.ml[16 + j]
+                for i in range hd: att[r * c.Heads * hd + (h * g + j) * hd + i] = a.o[j * hd + i] * inv
+            }
+        } else {
+            for j in range g {
+                part[u * pw + j] = a.ml[j]
+                part[u * pw + g + j] = a.ml[16 + j]
+                for i in range hd: part[u * pw + 2 * g + j * hd + i] = a.o[j * hd + i]
+            }
         }
     }
 }
@@ -892,6 +1022,21 @@ fn put(w mut checkpoint.Writer&, r mut rand.Rand&, name String&, rows I64, cols 
     vals := Array<F32>[F32(base + scale * r.Normal()) for _ in range rows * cols]
     t := tensor.Tensor<F32>.Of(vals, rows, cols)! if rows > 1 else tensor.Tensor<F32>.Of(vals, cols)!
     w.AddAs(name, t, checkpoint.Dtype.BF16)!
+}
+
+# the logits of decoding toks a token a step (after the first), in a cache of its own: 8-bit keys and values or not
+fn decode(m Model&, toks Array<I32>&, kv8 Bool) Array<F32> {
+    k := Cache(m.C, 8, 1, 8, Kv8 = kv8)
+    for i in range 8: k.Table[i] = k.Take()
+    s := State(m, 1, 1, 512)
+    got := Array<F32>(toks.Len() * m.C.Vocab)
+    for i, t in toks {
+        s.Reset()
+        s.Add(t, I64(i), 0, true)
+        m.Step(s, k)
+        for v in range m.C.Vocab: got[i * m.C.Vocab + v] = s.Logits[v]
+    }
+    return got
 }
 
 # a cache with pages for "slots" sequences of up to 256 positions, its pages handed out in a scattered order
@@ -973,6 +1118,39 @@ test Model "decoding through the cache a token a step gives the logits of readin
         }
         assert worst(want, got) < (1e-4 if exact else 0.01) * biggest(want), "exact " + $exact + ": " + $worst(want, got)
     }
+    os.RemoveAll(dir)!
+}
+
+test Model "attention split into runs of pages over the tasks gives the logits of one run, to rounding, the same tokens" {
+    dir := Tiny(true, 17)
+    m := Model.Load(dir)!
+    toks := tokens(300, 4)
+    ChunkPages = 64
+    whole := decode(m, toks, false)
+    ChunkPages = 1
+    split := decode(m, toks, false)
+    ChunkPages = 16
+    assert worst(whole, split) < 0.01 * biggest(whole), $worst(whole, split)
+    v := m.C.Vocab
+    for i in range toks.Len() {
+        a, b := I64(0), I64(0)
+        for x in range v {
+            if whole[i * v + x] > whole[i * v + a]: a = x
+            if split[i * v + x] > split[i * v + b]: b = x
+        }
+        assert a == b, "position " + $i
+    }
+    os.RemoveAll(dir)!
+}
+
+test Model "8-bit values, a scale per position and head: the logits within a few percent of BF16's" {
+    dir := Tiny(false, 19)
+    m := Model.Load(dir)!
+    toks := tokens(200, 6)
+    a := decode(m, toks, false)
+    b := decode(m, toks, true)
+    assert worst(a, b) < 0.05 * biggest(a), $worst(a, b) + " of " + $biggest(a)
+    assert PageBytes(m.C, true) * 10 < PageBytes(m.C) * 8
     os.RemoveAll(dir)!
 }
 

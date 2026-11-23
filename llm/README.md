@@ -46,6 +46,7 @@ a step never reads another row, so a completion does not depend on the batch it 
 | `--ctx C` | positions a sequence may have, prompt and completion (default: the longest prompt and M) |
 | `--kv-gb G` | memory for the key-value cache (default 90% of what is free after loading, less 1 GB) |
 | `--int8` | 8-bit weights, a scale per 32 inputs (the head stays BF16): 0.56 of the memory, needs AMX (BF16 without it); the 8B models need it on 16 GB |
+| `--kv8` | values in the cache in 8 bits, a scale per position and head: 0.76 of the cache's memory, needs AMX |
 | `--exact` | F32 activations and cache: slow, for checking against a reference |
 
 ## How it works
@@ -113,6 +114,31 @@ batch 64 it is as long as the products for the 1.5B model, sooner for models wit
 saves memory, not time here: widening the weights costs what reading half the bytes saves. Qwen3-8B in BF16 (16 GB)
 does not fit in 15 GB. `oann-gen` on 64 prompts with the 1.5B model, batch 64, at most 1024 tokens: 60194 tokens in
 301 s, 200 tokens a second, peak 5.2 GB. Measurements on a shared VM vary by 10-20% from run to run.
+
+**Long contexts.** Tokens a second at 2048, 4096 and 8192 positions (BF16 weights; "-" where weights and cache do not
+fit in 15 GB):
+
+| model | batch | 2048 | 4096 | 8192 |
+|---|---|---|---|---|
+| DeepSeek-R1-Distill-Qwen-1.5B | 1 | 6.7 | 6.9 | 6.1 |
+| | 16 | 84 | 74 | 55 |
+| | 64 | 185 | 122 (134 with `--kv8`) | - (88 with `--kv8`) |
+| Qwen3-4B | 1 | 2.7 | 2.2 | 2.5 |
+| | 16 | 28 | - | - |
+
+Past a few thousand positions attention reads more than the products: each position costs 28 KB of cache a step for
+the 1.5B model (2 key-value heads of 28 layers), 147 KB for Qwen3-4B (8 of 36), and at batch 16 and more attention
+runs at about the machine's bandwidth (25 GB/s). An item of attention (a row and a head group) of more than 16 pages
+is split into runs of 16 pages over the tasks and their partial softmaxes joined, so a single long sequence keeps every
+core busy (1.5B, batch 1, 8192 positions: attention 24 -> 14 ms a step); where an item splits depends on its own length
+only, so a completion stays independent of the batch. Against the exact path over a 1500-token text the split and
+unsplit paths agree alike (mean KL 3.6e-5 and 3.3e-5, the same argmax at 99.8% of positions); greedy completions of
+1500 tokens were the same as the unsplit build's until the split engaged, and 2 of 4 then took another turn at a near
+tie, as two BF16 computations do.
+
+`--kv8` keeps the values in 8 bits with a scale per position and head (the keys stay BF16: a few of their dimensions are
+far larger than the rest, and 8 bits per position lost too much - KL 3e-2): 0.76 of the cache, mean KL 5e-5 against the
+exact path. It is mostly room - more or longer sequences - and a little speed.
 
 A prompt is read in the same steps, each of its positions a row with attention of its own; that suits prompts of
 hundreds of tokens, not of many thousands.
