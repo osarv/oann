@@ -1,0 +1,146 @@
+# llm/chat - what a model directory says about talking to it: the chat template its tokenizer has (ChatML for Qwen2.5
+# and Qwen3, DeepSeek-R1's for the models distilled from it), its stop tokens and sampling defaults
+# (generation_config.json), and fetching a model's files from Hugging Face.
+#
+# Templates. Each model ships a Jinja template (tokenizer_config.json); these are the strings they make for a system
+# prompt and one user turn with the generation prompt added, which is all generation needs:
+#     ChatML (Qwen):      [<|im_start|>system\n{system}<|im_end|>\n]<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+#                         and, with thinking off (Qwen3's enable_thinking=False), <think>\n\n</think>\n\n after it
+#     DeepSeek-R1:        <｜begin▁of▁sentence｜>{system}<｜User｜>{prompt}<｜Assistant｜><think>\n
+# The family is told by the added tokens the tokenizer has. DeepSeek-R1's template opens the thinking itself, so
+# Opening() gives "<think>\n" there: a completion written after it reads as Qwen3's does, thinking first.
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "bpe"
+
+type Family enum {
+    ChatMl
+    DeepSeek
+    Plain               # no chat template: the prompt as it is
+}
+
+type Chat struct(Kind Family, Stops Array<I32>&, Temp F64, TopP F64, TopK I64) {
+    Kind
+    Stops               # the tokens that end a completion
+    Temp                # generation_config's sampling defaults (0.6, 0.95, 0 where it has none)
+    TopP
+    TopK
+}
+
+fn ints(j json.Json&, key String&, out mut Vec<I32>&) {
+    if not j.Has(key): return
+    v := try j[key] catch { return }
+    match v {
+        case json.Json.Arr(items) {
+            for x in items {
+                n := try x.AsInt() catch { continue }
+                out.Push(I32(n))
+            }
+        }
+        case _ {
+            n := try v.AsInt() catch { return }
+            out.Push(I32(n))
+        }
+    }
+}
+
+# the chat of the model in dir, whose tokenizer is t
+fn Chat.Load(dir String&, t bpe.Bpe&) Chat {
+    family := Family.Plain
+    if t.Find("<|im_start|>") >= 0: family = Family.ChatMl
+    if t.Find("<｜User｜>") >= 0: family = Family.DeepSeek
+    stops := Vec<I32>()
+    temp F64 = 0.6
+    topP F64 = 0.95
+    topK I64 = 0
+    text := try os.ReadFile(dir + "/generation_config.json") catch default "{}"
+    j := try json.Json.Parse(text) catch { return Chat(family, endTokens(t, family, stops), temp, topP, topK) }
+    ints(j, "eos_token_id", stops)
+    temp = num(j, "temperature", temp)
+    topP = num(j, "top_p", topP)
+    topK = I64(num(j, "top_k", 0.0))
+    return Chat(family, endTokens(t, family, stops), temp, topP, topK)
+}
+
+fn num(j json.Json&, key String&, d F64) F64 {
+    if not j.Has(key): return d
+    v := try j[key] catch { return d }
+    return try v.AsNum() catch default d
+}
+
+# the stop tokens: generation_config's, and the end of a turn of the family's template
+fn endTokens(t bpe.Bpe&, f Family, given mut Vec<I32>&) Array<I32> {
+    names := match f {
+        case Family.ChatMl: ["<|im_end|>", "<|endoftext|>"]
+        case Family.DeepSeek: ["<｜end▁of▁sentence｜>", "<|EOT|>"]
+        case Family.Plain: ["<|endoftext|>", "</s>"]
+    }
+    for n in names {
+        id := t.Find(n)
+        if id < 0: continue
+        seen := false
+        for g in given.View() {
+            if g == id: seen = true
+        }
+        if not seen: given.Push(id)
+    }
+    return given.ToArray()
+}
+
+# the text a model reads for one user turn after an optional system prompt, ready for its answer
+fn (c Chat&) Prompt(user String&, system String& = "", think Bool = true) String {
+    if c.Kind == Family.ChatMl {
+        sys := "<|im_start|>system\n" + system + "<|im_end|>\n" if system.Len() > 0 else ""
+        return sys + "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" + ("" if think else "<think>\n\n</think>\n\n")
+    }
+    if c.Kind == Family.DeepSeek: return "<｜begin▁of▁sentence｜>" + system + "<｜User｜>" + user + "<｜Assistant｜><think>\n"
+    return system + user
+}
+
+# what the template wrote of the answer already: a completion is this followed by the generated text
+fn (c Chat&) Opening() String {
+    return "<think>\n" if c.Kind == Family.DeepSeek else ""
+}
+
+# ---- fetching from Hugging Face ----
+
+# the files of a model on Hugging Face (repo "owner/name") fetched into dir over HTTPS (curl), each once: the config,
+# the tokenizer, generation_config.json, the licence and the weights (one file, or the shards an index lists)
+fn Fetch(repo String&, dir String&) ? os.Error {
+    try os.MkDirAll(dir)
+    for f in ["config.json", "tokenizer.json", "tokenizer_config.json", "generation_config.json", "LICENSE"] {
+        get(repo, f, dir, false)
+    }
+    if get(repo, "model.safetensors.index.json", dir, false) {
+        text := try os.ReadFile(dir + "/model.safetensors.index.json")
+        j := try json.Json.Parse(text) catch { error os.Error.Failed("model.safetensors.index.json") }
+        m := try (try j["weight_map"] catch { error os.Error.Failed("weight_map") }).AsObj() catch { error os.Error.Failed("weight_map") }
+        seen := Map<String, Bool>()
+        for k in range m.Len() {
+            name := try m.Values[k].AsStr() catch { continue }
+            if seen.Has(name): continue
+            seen.Put(name, true)
+            if not get(repo, name, dir, true): error os.Error.Failed(repo + "/" + name)
+        }
+        return
+    }
+    if not get(repo, "model.safetensors", dir, true): error os.Error.Failed(repo + "/model.safetensors")
+}
+
+# one file, unless dir has it; whether it is there after
+fn get(repo String&, name String&, dir String&, loud Bool) Bool {
+    path := dir + "/" + name
+    if os.Exists(path): return true
+    url := "https://huggingface.co/" + repo + "/resolve/main/" + name
+    if loud: try io.PutErrLn("oann-gen: fetching " + url) catch { }
+    part := path + ".part"
+    out := try os.Output.Exec("curl", "-sfL", "--retry", "4", "-o", part, url, capture = false) catch { return false }
+    if out.Status != 0 {
+        try os.Remove(part) catch { }
+        return false
+    }
+    try os.Rename(part, path) catch { return false }
+    return true
+}

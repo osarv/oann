@@ -43,6 +43,22 @@ olang examples/charlm.olang 2000 1 2           # a character transformer on tiny
 Each example's arguments are described at the top of its file (`examples/README.md`). MNIST and the text corpora are
 fetched into `data/` on first use.
 
+## Generating text with open-weight models
+
+`llm/` loads Hugging Face checkpoints of the Qwen2 and Qwen3 architectures (Qwen3-0.6B to 8B, DeepSeek-R1-Distill-Qwen-1.5B
+and 7B, Qwen2.5) and runs them in batches on the CPU - BF16 weights on AMX tiles where the CPU has them, F32 elsewhere;
+`--int8` halves the weights. `oann-gen` writes completions of a JSON-lines file of prompts as they finish, and picks up
+where it left off when run again:
+
+```
+make oanngen
+build/oann-gen Qwen/Qwen3-1.7B prompts.jsonl out.jsonl --n 4 --temp 0.6 --max-tokens 4096
+```
+
+A model named by its repository is fetched once from Hugging Face; its licence is the model's (Apache 2.0 for Qwen3,
+MIT for the DeepSeek-R1 distillations). How it works, the flags, the checks against the reference implementation and
+the speed on a 4-core machine are in `llm/README.md`.
+
 ## Developing oann
 
 The makefile is for oann's developers; `make` alone lists its targets, one line each with its ARGS, and runs nothing.
@@ -76,6 +92,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `evo/` | evolutionary architecture search: schema and NEAT graph genomes, regularized evolution, tournament, (mu + lambda), NSGA-II, successive halving, weight inheritance, checkpoints, worker processes (`evo/README.md`) |
 | `surgery/` | changing a trained model instead of retraining it: a checkpoint of spec, named parameters, optimizer state, positions and lineage; function-preserving growth (deepen, widen, heads, vocabulary, context), removal by importance, distilled replacement, optimizer conversion (`surgery/README.md`) |
 | `archnet/` | a network for architectures, learned online: genome encoders, a performance predictor with uncertainty and curve extrapolation, a generator of genomes; the advisor evo's searches take (`archnet/README.md`) |
+| `llm/` | inference for openly licensed language models (Qwen2 and Qwen3 checkpoints from Hugging Face): byte-level BPE from tokenizer.json, BF16 or INT8 weights on AMX tiles, a paged key-value cache, continuous batching, sampling, and `oann-gen`, completions of a file of prompts as one resumable job (`llm/README.md`) |
 | `board/` | the FPGA engine simulated in integers, lowered from a `dyn` system (`board/README.md`) |
 | `tools/` | gradient checks per operation (`tools/README.md`) |
 | `examples/` | the programs the makefile runs: MNIST, transformers, settling systems, INT8, the board (`examples/README.md`) |

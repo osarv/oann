@@ -1,0 +1,517 @@
+# llm/bpe - Hugging Face's byte-level BPE tokenizers (tokenizer.json, "model": {"type": "BPE"}), as the Qwen2 and Qwen3
+# families and the models distilled into them have them: a vocabulary of byte strings in GPT-2's printable form ("Ġthe"
+# for " the"), the merges in rank order, and the added tokens (<|im_start|>, <think>, ...) matched in the text before
+# anything else, as the tokenizers library does.
+#
+# Encoding: the text is cut at every added token; each stretch between them is split by the pre-tokenizer's pattern
+#     (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+# (Qwen2's; one digit a chunk), read by a hand-written scanner over code points with the Unicode classes of
+# llm/unicode; each chunk's bytes are merged lowest rank first, leftmost first (a heap over its positions, as the
+# tokenizer module's encoder does). The normalizer's NFC is not applied: text already in NFC (nearly all text) encodes
+# as the library encodes it. Decoding writes each token's bytes.
+
+import "std/json"
+import "std/os"
+import "std/list"
+import "unicode"
+
+type BpeError error {
+    Malformed   # not a byte-level BPE tokenizer.json: no vocabulary, a merge of tokens it does not have
+    Unknown     # a token id the vocabulary does not have
+}
+
+# an added token: its text and id
+type AddedToken struct(Text String&, Id I32) {
+    Text
+    Id
+}
+
+type Bpe struct(Size I64, starts Array<I64>&, bytes Array<Char>&, byteId Array<I32>&, table Array<I64>&, mergeTo Array<I32>&
+    Added Array<AddedToken>&) {
+    Size                    # the number of ids (the largest id + 1)
+    starts                  # id t's bytes are bytes[starts[t] ... starts[t + 1] - 1]
+    bytes
+    byteId                  # the token of each single byte
+    table                   # open addressing over pairs: slot s holds a pair (a << 32 | b) at 2s (-1 empty), its rank at 2s + 1
+    mergeTo                 # the token a merge of rank r makes
+    Added                   # longest first
+    firsts Array<Bool>& = firstBytes(Added)
+}
+
+fn firstBytes(added Array<AddedToken>&) Array<Bool> {
+    f := Array<Bool>(256)
+    for a in added: f[I64(U8(a.Text[0]))] = true
+    return f
+}
+
+# ---- GPT-2's printable form of a byte ----
+
+fn printableByte(b I64) Bool { return (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or b >= 174 }
+
+# code point -> byte for the 324 code points the printable form uses (-1 elsewhere)
+fn byteOfPoint() Array<I64> {
+    out := Array<I64>(324, -1)
+    n I64 = 0
+    for b in range 256 {
+        if printableByte(b) {
+            out[b] = b
+        } else {
+            out[256 + n] = b
+            n++
+        }
+    }
+    return out
+}
+
+# the bytes a vocabulary entry in printable form stands for, appended to dst; Malformed where it is not printable form
+fn unprint(text String&, back Array<I64>&, dst mut Vec<Char>&) ? BpeError {
+    i I64 = 0
+    for i < text.Len() {
+        b0 := I64(U8(text[i]))
+        cp I64 = b0
+        if b0 >= 0xC0 and b0 < 0xE0 and i + 1 < text.Len() {
+            cp = ((b0 & 0x1F) << 6) | (I64(U8(text[i + 1])) & 0x3F)
+            i += 2
+        } else if b0 < 0x80 {
+            i++
+        } else {
+            error BpeError.Malformed
+        }
+        if cp >= 324 or back[cp] < 0: error BpeError.Malformed
+        dst.Push(Char(U8(back[cp])))
+    }
+}
+
+# ---- loading ----
+
+fn pairOf(a I64, b I64) I64 { return (a << 32) | b }
+
+fn spread(pair I64, mask I64) I64 { return I64((U64(pair) * 0x9E3779B97F4A7C15) >> 32) & mask }
+
+# the tokenizer of a tokenizer.json
+fn Bpe.Load(path String&) Bpe ? BpeError, json.Error, os.Error {
+    return try Bpe.Parse(try os.ReadFile(path))
+}
+
+fn Bpe.Parse(text String&) Bpe ? BpeError, json.Error {
+    doc := try json.Json.Parse(text)
+    model := try doc["model"]
+    vocab := try (try model["vocab"]).AsObj()
+    addedJ := try (try doc["added_tokens"]).AsArr()
+    size I64 = 0
+    for k in range vocab.Len(): size = size.Max((try vocab.Values[k].AsInt()) + 1)
+    for a in addedJ: size = size.Max((try a["id"].AsInt()) + 1)
+    # each id's bytes
+    back := byteOfPoint()
+    texts := Array<String&>(size, "")
+    for k in range vocab.Len(): texts[try vocab.Values[k].AsInt()] = vocab.Keys[k]
+    isAdded := Array<Bool>(size)
+    added := Vec<AddedToken>()
+    for a in addedJ {
+        id := try a["id"].AsInt()
+        content := try a["content"].AsStr()
+        isAdded[id] = true
+        texts[id] = content
+        if content.Len() > 0: added.Push(AddedToken(content, I32(id)))
+    }
+    starts := Array<I64>(size + 1)
+    all := Vec<Char>()
+    ids := Map<String&, I64>()
+    for id in range size {
+        starts[id] = all.Len()
+        if isAdded[id] {
+            for c in texts[id]: all.Push(c)
+        } else {
+            try unprint(texts[id], back, all)
+        }
+        ids.Put(texts[id], id)
+    }
+    starts[size] = all.Len()
+    byteId := Array<I32>(256, -1)
+    for b in range 256 {
+        cp := b if printableByte(b) else -1
+        if cp < 0 {
+            n I64 = 0
+            for x in range b {
+                if not printableByte(x): n++
+            }
+            cp = 256 + n
+        }
+        sb := StringBuilder()
+        if cp < 128 {
+            sb.PushChar(Char(U8(cp)))
+        } else {
+            sb.PushChar(Char(U8(192 | (cp >> 6))))
+            sb.PushChar(Char(U8(128 | (cp & 63))))
+        }
+        byteId[b] = I32(try ids.Get(sb.ToString()) catch { error BpeError.Malformed })
+    }
+    # the merges, in rank order: "a b" or ["a", "b"]
+    merges := try (try model["merges"]).AsArr()
+    slots I64 = 1
+    for slots < 2 * merges.Len() + 2: slots = slots * 2
+    table := Array<I64>(2 * slots, -1)
+    mergeTo := Array<I32>(merges.Len())
+    for r, m in merges {
+        left String& = ""
+        right String& = ""
+        match m {
+            case json.Json.Str(s) {
+                sp := try s.Find(" ") catch { error BpeError.Malformed }
+                left = s[:sp]
+                right = s[sp + 1:]
+            }
+            case _ {
+                pair := try m.AsArr()
+                if pair.Len() != 2: error BpeError.Malformed
+                left = try pair[0].AsStr()
+                right = try pair[1].AsStr()
+            }
+        }
+        a := try ids.Get(left) catch { error BpeError.Malformed }
+        b := try ids.Get(right) catch { error BpeError.Malformed }
+        c := try ids.Get(left + right) catch { error BpeError.Malformed }
+        mergeTo[r] = I32(c)
+        p := pairOf(a, b)
+        s := spread(p, slots - 1)
+        for table[2 * s] >= 0 and table[2 * s] != p: s = (s + 1) & (slots - 1)
+        if table[2 * s] < 0 {
+            table[2 * s] = p
+            table[2 * s + 1] = r
+        }
+    }
+    sorted := added.ToArray()
+    sorted.Sort(fn(x AddedToken, y AddedToken) Bool { return x.Text.Len() > y.Text.Len() })
+    return Bpe(size, starts, all.ToArray(), byteId, table, mergeTo, sorted)
+}
+
+# the rank of merging (a, b), -1 when no merge makes it
+fn (t Bpe&) rankOf(a I64, b I64) I64 {
+    p := pairOf(a, b)
+    mask := t.table.Len() / 2 - 1
+    s := spread(p, mask)
+    for {
+        q := t.table[2 * s]
+        if q == p: return t.table[2 * s + 1]
+        if q < 0: return -1
+        s = (s + 1) & mask
+    }
+}
+
+# the id of an added token or a vocabulary entry with exactly this text (in bytes), -1 if none
+fn (t Bpe&) Find(text String&) I32 {
+    for a in t.Added {
+        if a.Text == text: return a.Id
+    }
+    for id in range t.Size {
+        if t.starts[id + 1] - t.starts[id] == text.Len() and String(t.bytes[t.starts[id]:t.starts[id + 1]]) == text: return I32(id)
+    }
+    return -1
+}
+
+# token id's bytes
+fn (t Bpe&) Token(id I64) String& { return String(t.bytes[t.starts[id]:t.starts[id + 1]]) }
+
+# ---- pre-tokenization ----
+
+kindLetter I64 = 0
+kindNumber I64 = 1
+kindSpace I64 = 2
+kindOther I64 = 3
+
+# whether code point c is in the ranges (first, last pairs, ascending)
+fn inRanges(r Array<U32>&, c U32) Bool {
+    lo I64 = 0
+    hi I64 = r.Len() / 2
+    for lo < hi {
+        mid := (lo + hi) / 2
+        if c < r[2 * mid] {
+            hi = mid
+        } else if c > r[2 * mid + 1] {
+            lo = mid + 1
+        } else {
+            return true
+        }
+    }
+    return false
+}
+
+# White_Space
+fn isSpace(c U32) Bool {
+    return (c >= 9 and c <= 13) or c == 32 or c == 0x85 or c == 0xA0 or c == 0x1680 or (c >= 0x2000 and c <= 0x200A) or
+        c == 0x2028 or c == 0x2029 or c == 0x202F or c == 0x205F or c == 0x3000
+}
+
+# the code point at t[i] and its length in bytes (an invalid byte: itself, one byte, of no class but Other)
+fn pointAt(t String&, i I64) U32, I64 {
+    b0 := U32(U8(t[i]))
+    n := t.Len()
+    if b0 < 0x80: return b0, 1
+    if b0 >= 0xC2 and b0 < 0xE0 and i + 1 < n and (U8(t[i + 1]) & 0xC0) == 0x80 {
+        return ((b0 & 0x1F) << 6) | (U32(U8(t[i + 1])) & 0x3F), 2
+    }
+    if b0 >= 0xE0 and b0 < 0xF0 and i + 2 < n and (U8(t[i + 1]) & 0xC0) == 0x80 and (U8(t[i + 2]) & 0xC0) == 0x80 {
+        return ((b0 & 0x0F) << 12) | ((U32(U8(t[i + 1])) & 0x3F) << 6) | (U32(U8(t[i + 2])) & 0x3F), 3
+    }
+    if b0 >= 0xF0 and b0 < 0xF5 and i + 3 < n and (U8(t[i + 1]) & 0xC0) == 0x80 and (U8(t[i + 2]) & 0xC0) == 0x80 and
+            (U8(t[i + 3]) & 0xC0) == 0x80 {
+        return ((b0 & 0x07) << 18) | ((U32(U8(t[i + 1])) & 0x3F) << 12) | ((U32(U8(t[i + 2])) & 0x3F) << 6) | (U32(U8(t[i + 3])) & 0x3F), 4
+    }
+    return 0xFFFFFFFF, 1
+}
+
+fn kindOf(c U32) I64 {
+    if c < 0x80 {
+        if (c >= 0x61 and c <= 0x7A) or (c >= 0x41 and c <= 0x5A): return kindLetter
+        if c >= 0x30 and c <= 0x39: return kindNumber
+        if (c >= 9 and c <= 13) or c == 32: return kindSpace
+        return kindOther
+    }
+    if c == 0xFFFFFFFF: return kindOther
+    if isSpace(c): return kindSpace
+    if inRanges(unicode.Letters, c): return kindLetter
+    if inRanges(unicode.Numbers, c): return kindNumber
+    return kindOther
+}
+
+# the kind of the code point at t[i] and its length (i past the end: Other, 0)
+fn kindAt(t String&, i I64) I64, I64 {
+    if i >= t.Len(): return -1, 0
+    c, w := pointAt(t, i)
+    return kindOf(c), w
+}
+
+fn newline(c Char) Bool { return c == '\n' or c == '\r' }
+
+fn lower(c Char) Char { return Char(U8(c) | 0x20) if c >= 'A' and c <= 'Z' else c }
+
+# the end of the run of code points of kind k from i
+fn runEnd(t String&, i I64, k I64) I64 {
+    j I64 = i
+    for j < t.Len() {
+        kj, w := kindAt(t, j)
+        if kj != k: break
+        j += w
+    }
+    return j
+}
+
+# where the chunk starting at t[i] ends: the pattern's alternatives tried in its order
+fn ChunkEnd(t String&, i I64) I64 {
+    n := t.Len()
+    c := t[i]
+    # (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if c == '\'' and i + 1 < n {
+        d := lower(t[i + 1])
+        if d == 's' or d == 't' or d == 'm' or d == 'd': return i + 2
+        if i + 2 < n {
+            e := lower(t[i + 2])
+            if (d == 'r' and e == 'e') or (d == 'v' and e == 'e') or (d == 'l' and e == 'l'): return i + 3
+        }
+    }
+    k, w := kindAt(t, i)
+    # [^\r\n\p{L}\p{N}]?\p{L}+
+    if k == kindLetter: return runEnd(t, i, kindLetter)
+    if k != kindNumber and not newline(c) {
+        k2, _ := kindAt(t, i + w)
+        if k2 == kindLetter: return runEnd(t, i + w, kindLetter)
+    }
+    # \p{N}
+    if k == kindNumber: return i + w
+    #  ?[^\s\p{L}\p{N}]+[\r\n]*
+    j I64 = -1
+    if k == kindOther {
+        j = i
+    } else if c == ' ' {
+        k2, _ := kindAt(t, i + 1)
+        if k2 == kindOther: j = i + 1
+    }
+    if j >= 0 {
+        e := runEnd(t, j, kindOther)
+        for e < n and newline(t[e]): e++
+        return e
+    }
+    # whitespace: \s*[\r\n]+ (to the run's last line break), \s+(?!\S), \s+
+    e := runEnd(t, i, kindSpace)
+    last I64 = -1
+    for q in range i, e {
+        if newline(t[q]): last = q
+    }
+    if last >= 0: return last + 1
+    if e >= n: return e
+    # back off by the run's last code point, if that leaves one
+    q I64 = i
+    prev I64 = i
+    for q < e {
+        _, wq := kindAt(t, q)
+        prev = q
+        q += wq
+    }
+    return prev if prev > i else e
+}
+
+# the chunks of t, as pieces of it (added tokens not looked for)
+fn Chunks(t String&) list.List<String&>& {
+    out mut list.List<String&>& = list.List<String&>()
+    i I64 = 0
+    for i < t.Len() {
+        e := ChunkEnd(t, i)
+        out.Push(t[i:e])
+        i = e
+    }
+    return out
+}
+
+# ---- encoding ----
+
+# a chunk's working storage, reused
+type encoder struct() {
+    syms mut list.List<I64>& = list.List<I64>()
+    next mut list.List<I64>& = list.List<I64>()
+    prev mut list.List<I64>& = list.List<I64>()
+    heap mut list.List<I64>& = list.List<I64>()
+}
+
+fn heapPush(h mut list.List<I64>&, v I64) {
+    h.Push(v)
+    i := h.Len() - 1
+    for i > 0 {
+        p := (i - 1) / 2
+        if h[p] <= h[i]: break
+        x := h[p]
+        h[p] = h[i]
+        h[i] = x
+        i = p
+    }
+}
+
+fn heapPop(h mut list.List<I64>&) I64 {
+    top := h[0]
+    last := h.Pop()!
+    if h.Len() == 0: return top
+    h[0] = last
+    i I64 = 0
+    n := h.Len()
+    for {
+        l := 2 * i + 1
+        if l >= n: break
+        m := l
+        if l + 1 < n and h[l + 1] < h[l]: m = l + 1
+        if h[i] <= h[m]: break
+        x := h[m]
+        h[m] = h[i]
+        h[i] = x
+        i = m
+    }
+    return top
+}
+
+# piece's tokens appended to out: its bytes merged lowest rank first, leftmost first
+fn (t Bpe&) encodeChunk(piece String&, e mut encoder&, out mut Vec<I32>&) {
+    n := piece.Len()
+    syms := e.syms
+    next := e.next
+    prev := e.prev
+    heap := e.heap
+    syms.Clear()
+    next.Clear()
+    prev.Clear()
+    heap.Clear()
+    for j in range n {
+        syms.Push(I64(t.byteId[I64(U8(piece[j]))]))
+        next.Push(j + 1)
+        prev.Push(j - 1)
+    }
+    for j in range n - 1 {
+        k := t.rankOf(syms[j], syms[j + 1])
+        if k >= 0: heapPush(heap, (k << 32) | j)
+    }
+    for heap.Len() > 0 {
+        top := heapPop(heap)
+        k I64 = top >> 32
+        j I64 = top & 0xFFFFFFFF
+        if syms[j] < 0 or next[j] >= n: continue
+        right := next[j]
+        if t.rankOf(syms[j], syms[right]) != k: continue
+        syms[j] = I64(t.mergeTo[k])
+        syms[right] = -1
+        next[j] = next[right]
+        if next[j] < n: prev[next[j]] = j
+        if prev[j] >= 0 {
+            p := prev[j]
+            kp := t.rankOf(syms[p], syms[j])
+            if kp >= 0: heapPush(heap, (kp << 32) | p)
+        }
+        if next[j] < n {
+            kn := t.rankOf(syms[j], syms[next[j]])
+            if kn >= 0: heapPush(heap, (kn << 32) | j)
+        }
+    }
+    j I64 = 0
+    for j < n {
+        out.Push(I32(syms[j]))
+        j = next[j]
+    }
+}
+
+# the added token starting at text[i], -1 if none (the longest)
+fn (t Bpe&) addedAt(text String&, i I64) I64 {
+    if not t.firsts[I64(U8(text[i]))]: return -1
+    for k, a in t.Added {
+        if text.Len() - i >= a.Text.Len() and text[i:i + a.Text.Len()] == a.Text: return k
+    }
+    return -1
+}
+
+# text's tokens
+fn (t Bpe&) Encode(text String&) Array<I32> {
+    e := encoder()
+    out := Vec<I32>()
+    i I64 = 0
+    start I64 = 0
+    for i <= text.Len() {
+        k := t.addedAt(text, i) if i < text.Len() else -1
+        if k < 0 and i < text.Len() {
+            i++
+            continue
+        }
+        # the stretch before it, pre-tokenized
+        p I64 = start
+        for p < i {
+            end := ChunkEnd(text[:i], p)
+            t.encodeChunk(text[p:end], e, out)
+            p = end
+        }
+        if k < 0: break
+        out.Push(t.Added[k].Id)
+        i += t.Added[k].Text.Len()
+        start = i
+    }
+    return out.ToArray()
+}
+
+# the bytes of ids, an error for an id the vocabulary does not have
+fn (t Bpe&) Decode(ids Array<I32>&) String ? BpeError {
+    sb := StringBuilder()
+    for id in ids {
+        if id < 0 or I64(id) >= t.Size: error BpeError.Unknown
+        for q in range t.starts[I64(id)], t.starts[I64(id) + 1]: sb.PushChar(t.bytes[q])
+    }
+    return sb.ToString()
+}
+
+# ---- tests ----
+
+fn cut(t String&) String { return Chunks(t).Join("|") }
+
+test ChunkEnd "the pre-tokenizer's alternatives in their order" {
+    assert cut("Hello world") == "Hello| world"
+    assert cut("I'm 123 ok") == "I|'m| |1|2|3| ok"
+    assert cut("a  b") == "a| | b"
+    assert cut("x\n\ny") == "x|\n\n|y"
+    assert cut("(x)!!\n") == "(x|)!!\n"
+    assert cut("end   ") == "end|   "
+    assert cut("über café") == "über| café"
+    assert cut("“quoted”") == "“quoted|”"
+    assert cut("中文 text") == "中文| text"
+}

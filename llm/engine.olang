@@ -1,0 +1,375 @@
+# llm/engine - continuous batching over llm/model: requests (a prompt's tokens, how many to generate, a seed) are
+# admitted while the cache has a slot and pages for them, every step runs one row for each sequence being decoded
+# and up to Chunk rows of the prompts being read, and a sequence leaves - its slot and pages back to the pool - the step
+# it draws a stop token or reaches its length, so the next request takes its place at once rather than when the whole
+# batch is done.
+#
+# Pages are taken as a sequence grows, 32 positions at a time. Where none is left for a sequence being decoded, the
+# youngest other sequence is preempted: its pages are freed and its request goes back to the front of the queue, to be
+# run again from its prompt (its own seed, so it draws the same tokens). A request is admitted only while the free pages
+# hold its prompt and one page more for every running sequence.
+#
+# Sampling (Sampler): the logits divided by the temperature, the top-k most likely tokens kept (0: all), then the
+# smallest set of them whose probability reaches top-p; a token drawn from what is left. A temperature of 0 is greedy
+# decoding. Tokens less likely than 1e-8 times the most likely one are dropped before top-p (their mass is below 1e-3
+# even over the whole vocabulary). Each sequence draws from its own generator, seeded by its request, so a completion
+# does not depend on what else is in the batch: a row's products and attention never read another row's.
+
+import "std/rand"
+import "model"
+
+# what to generate for a prompt
+type Request struct(Id I64, Prompt Array<I32>&, MaxNew I64, Seed U64) {
+    Id                      # the caller's
+    Prompt
+    MaxNew
+    Seed
+}
+
+# a finished request: its tokens (the stop token left out) and why it ended
+type Done struct(Id I64, Tokens Array<I32>&, Stopped Bool, PromptLen I64) {
+    Id
+    Tokens
+    Stopped                 # a stop token, else its length (MaxNew, or the context)
+    PromptLen
+}
+
+# the sampling settings
+type Sampler struct(Temp F64 = 0.6, TopP F64 = 0.95, TopK I64 = 0) {
+    Temp
+    TopP
+    TopK
+}
+
+# a sequence in the batch
+type seq struct(req Request, slot I64) {
+    req
+    slot
+    toks mut Vec<I32>& = Vec<I32>()     # the prompt and what is generated
+    cached I64 = 0                      # the positions in the cache
+    pages I64 = 0                       # the pages it holds
+    order I64 = 0                       # when it was admitted
+    for t in req.Prompt: toks.Push(t)
+}
+
+type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 = 256, Exact Bool = false) {
+    m
+    Batch                   # sequences at once
+    MaxCtx                  # positions a sequence may have, prompt and completion
+    Chunk                   # prompt rows a step
+    Sampling Sampler = Sampler()
+    Stops mut Vec<I32>& = Vec<I32>()
+    Cache mut model.Cache& = model.Cache(m.C, Pages, Batch, MaxCtx / model.PageSize + 1, Exact)
+    State mut model.State& = model.State(m, Batch + Chunk, Batch, MaxCtx + model.PageSize)
+    queue mut Vec<Request>& = Vec<Request>()        # waiting, the next at the end
+    running mut Vec<seq>& = Vec<seq>()
+    slots mut Vec<I64>& = Vec<I64>()
+    for i in range Batch: slots.Push(Batch - 1 - i)
+    admitted I64 = 0
+    rowSeq mut Array<I64>& = Array<I64>(Batch + Chunk)     # each row's sequence (its index in running)
+    ran mut Array<I64>& = Array<I64>(Batch)                 # each sequence's rows this step
+    keys mut Array<I64>& = Array<I64>(m.C.Vocab)
+    rngs mut Array<rand.Rand>& = Array<rand.Rand>[rand.Rand(U64(i)) for i in range Batch]  # each slot's generator
+    Tokens I64 = 0          # tokens generated
+    Preempted I64 = 0
+    Steps I64 = 0
+}
+
+# the pages for a context of n positions with the cache's memory: weights aside, budget bytes
+fn PagesFor(c model.Config&, budget I64) I64 { return budget / model.PageBytes(c) }
+
+# r queued (to run after those queued before it)
+fn (e mut Engine&) Submit(r Request) { e.queue.Insert(0, r)! }
+
+fn (e Engine&) Idle() Bool { return e.queue.Len() == 0 and e.running.Len() == 0 }
+
+fn (e Engine&) Running() I64 { return e.running.Len() }
+
+fn (e Engine&) Waiting() I64 { return e.queue.Len() }
+
+fn pagesOf(positions I64) I64 { return (positions + model.PageSize - 1) / model.PageSize }
+
+# requests from the queue while there is a slot and room
+fn (e mut Engine&) admit() {
+    for i in range e.Batch: e.ran[i] = 0
+    for e.queue.Len() > 0 and e.slots.Len() > 0 {
+        r := e.queue.Last()!
+        need := pagesOf(r.Prompt.Len().Min(e.MaxCtx)) + e.running.Len() + 1
+        if need > e.Cache.Free() and e.running.Len() > 0: return
+        if r.Prompt.Len() == 0 or r.Prompt.Len() >= e.MaxCtx {
+            # nothing to read, or no room to generate: done as it is
+            return
+        }
+        e.queue.Pop()!
+        slot := e.slots.Pop()!
+        s := seq(r, slot)
+        e.rngs[slot] = rand.Rand(r.Seed)
+        s.order = e.admitted
+        e.admitted++
+        e.running.Push(s)
+    }
+}
+
+# sequence i's pages and slot back to the pool
+fn (e mut Engine&) release(i I64) {
+    s := e.running[i]
+    for p in range s.pages {
+        e.Cache.Give(e.Cache.Table[s.slot * e.Cache.MaxPages + p])
+        e.Cache.Table[s.slot * e.Cache.MaxPages + p] = -1
+    }
+    e.slots.Push(s.slot)
+}
+
+# pages for sequence i to hold n positions; false where the pool has none left even after preempting the others
+fn (e mut Engine&) grow(i I64, n I64) Bool {
+    for e.running[i].pages < pagesOf(n) {
+        p := e.Cache.Take()
+        if p < 0 {
+            # preempt the youngest other sequence
+            v I64 = -1
+            for j in range e.running.Len() {
+                if j != i and (v < 0 or e.running[j].order > e.running[v].order): v = j
+            }
+            if v < 0: return false
+            e.release(v)
+            e.queue.Push(e.running[v].req)
+            e.Preempted++
+            e.running.RemoveAt(v)!
+            if v < i: i--
+            continue
+        }
+        s := e.running[i]
+        e.Cache.Table[s.slot * e.Cache.MaxPages + s.pages] = p
+        e.running[i].pages = s.pages + 1
+    }
+    return true
+}
+
+# one step: admits what fits, runs a row for every sequence being decoded and prompt rows up to Chunk, samples, and
+# gives the requests that finished
+fn (e mut Engine&) Step() Array<Done> {
+    finished := Vec<Done>()
+    e.admit()
+    st := e.State
+    st.Reset()
+    budget := e.Chunk
+    # decoding sequences first (one row each), then prompts
+    for phase in range 2 {
+        i I64 = 0
+        for i < e.running.Len() {
+            s := e.running[i]
+            left := s.toks.Len() - s.cached
+            decoding := left == 1
+            if (phase == 0) != decoding or left <= 0 {
+                i++
+                continue
+            }
+            n := left if decoding else left.Min(budget)
+            if n <= 0 {
+                i++
+                continue
+            }
+            before := e.running.Len()
+            if not e.grow(i, s.cached + n) {
+                # no room even alone: ends at its length
+                t := e.running[i]
+                finished.Push(Done(t.req.Id, t.toks.View()[t.req.Prompt.Len():].Copy(), false, t.req.Prompt.Len()))
+                e.release(i)
+                e.running.RemoveAt(i)!
+                continue
+            }
+            if e.running.Len() < before {
+                # a preemption moved the sequences: start the step's rows over
+                return e.restart(finished)
+            }
+            s2 := e.running[i]
+            for q in range n {
+                pos := s2.cached + q
+                e.rowSeq[st.N] = i
+                st.Add(s2.toks[pos], pos, s2.slot, pos == s2.toks.Len() - 1)
+            }
+            e.ran[i] = n
+            if not decoding: budget -= n
+            i++
+        }
+    }
+    if st.N == 0: return finished.ToArray()
+    e.m.Step(st, e.Cache)
+    e.Steps++
+    # the rows' sequences move on: their positions are cached, and a row at a sequence's last token samples the next
+    for i in range e.running.Len() {
+        e.running[i].cached = e.running[i].cached + e.ran[i]
+        e.ran[i] = 0
+    }
+    for r in range st.N {
+        if st.Out[r] < 0: continue
+        i := e.rowSeq[r]
+        tok := Sample(e.Sampling, st.LogitsOf(st.Out[r], e.m.C.Vocab), e.keys, e.rngs[e.running[i].slot])
+        e.running[i].toks.Push(tok)
+        e.Tokens++
+    }
+    i I64 = 0
+    for i < e.running.Len() {
+        s := e.running[i]
+        gen := s.toks.Len() - s.req.Prompt.Len()
+        if gen <= 0 or s.cached < s.toks.Len() - 1 {
+            i++
+            continue
+        }
+        last := s.toks[s.toks.Len() - 1]
+        stopped := false
+        for t in e.Stops.View() {
+            if t == last: stopped = true
+        }
+        if stopped or gen >= s.req.MaxNew or s.toks.Len() >= e.MaxCtx {
+            out := s.toks.View()[s.req.Prompt.Len():s.toks.Len() - (1 if stopped else 0)].Copy()
+            finished.Push(Done(s.req.Id, out, stopped, s.req.Prompt.Len()))
+            e.release(i)
+            e.running.RemoveAt(i)!
+            continue
+        }
+        i++
+    }
+    return finished.ToArray()
+}
+
+# a step begun again after a preemption changed the batch
+fn (e mut Engine&) restart(finished mut Vec<Done>&) Array<Done> {
+    more := e.Step()
+    for d in more: finished.Push(d)
+    return finished.ToArray()
+}
+
+# a token from logits by the sampling settings sp, drawn from r; keys is scratch of the vocabulary's size
+fn Sample(sp Sampler&, logits Array<F32>&, keys mut Array<I64>&, r mut rand.Rand&) I32 {
+    v := logits.Len()
+    best I64 = 0
+    for i in range 1, v {
+        if logits[i] > logits[best]: best = i
+    }
+    if sp.Temp <= 0.0: return I32(best)
+    top := F64(logits[best])
+    inv := 1.0 / sp.Temp
+    # the candidates within 1e-8 of the best, keyed most likely first: (bits of infinity - bits of p) << 32 | id
+    n I64 = 0
+    for i in range v {
+        z := (F64(logits[i]) - top) * inv
+        if z < -18.42: continue
+        p := F32(z.Exp())
+        keys[n] = (I64(0x7F800000 - p.Bits()) << 32) | i
+        n++
+    }
+    ks := keys[:n]
+    ks.Sort(fn(a I64, b I64) Bool { return a < b })
+    if sp.TopK > 0 and n > sp.TopK: n = sp.TopK
+    total F64 = 0.0
+    for j in range n: total += F64(probOf(logits, keys[j], top, inv))
+    keep F64 = total * sp.TopP
+    cut I64 = n
+    acc F64 = 0.0
+    for j in range n {
+        acc += F64(probOf(logits, keys[j], top, inv))
+        if acc >= keep {
+            cut = j + 1
+            break
+        }
+    }
+    u := r.Float() * acc
+    for j in range cut {
+        u -= F64(probOf(logits, keys[j], top, inv))
+        if u <= 0.0: return I32(keys[j] & 0xFFFFFFFF)
+    }
+    return I32(keys[cut - 1] & 0xFFFFFFFF)
+}
+
+fn probOf(logits Array<F32>&, key I64, top F64, inv F64) F64 {
+    return ((F64(logits[key & 0xFFFFFFFF]) - top) * inv).Exp()
+}
+
+# ---- tests ----
+
+import "std/os"
+
+fn greedyRuns(m model.Model&, list Array<Array<I32>&>&, batch I64, pages I64, chunk I64, stops Array<I32>&) Array<Array<I32>&>, I64 {
+    e := Engine(m, batch, 128, pages, Chunk = chunk)
+    e.Sampling = Sampler(0.0, 1.0, 0)
+    for t in stops: e.Stops.Push(t)
+    for i, p in list: e.Submit(Request(I64(i), p, 30, U64(i)))
+    out := Array<Array<I32>&>(list.Len(), Array<I32>(0))
+    for not e.Idle() {
+        for d in e.Step(): out[d.Id] = d.Tokens
+    }
+    return out, e.Preempted
+}
+
+fn testPrompts() Array<Array<I32>&>& {
+    r := rand.Rand(4)
+    out := Array<Array<I32>&>(6, Array<I32>(0))
+    for i in range 6: out[i] = Array<I32>[I32(r.Below(96)) for _ in range 5 + 9 * i]
+    return out
+}
+
+test Engine "a batch, its prompts read in chunks, generates what each request generates alone" {
+    dir := model.Tiny(true, 21)
+    m := model.Model.Load(dir)!
+    ps := testPrompts()
+    alone := Array<Array<I32>&>(ps.Len(), Array<I32>(0))
+    for i, p in ps {
+        one, _ := greedyRuns(m, Array<Array<I32>&>[p], 1, 8, 256, Array<I32>(0))
+        alone[i] = one[0]
+        assert one[0].Len() == 30
+    }
+    together, preempted := greedyRuns(m, ps, 4, 64, 16, Array<I32>(0))
+    assert preempted == 0
+    for i in range ps.Len(): assert together[i] == alone[i], "request " + $i
+    os.RemoveAll(dir)!
+}
+
+test Engine "with too few pages for the batch, sequences are preempted and run again, to the same completions" {
+    dir := model.Tiny(false, 23)
+    m := model.Model.Load(dir)!
+    ps := testPrompts()
+    want, _ := greedyRuns(m, ps, 6, 64, 256, Array<I32>(0))
+    got, preempted := greedyRuns(m, ps, 6, 6, 256, Array<I32>(0))
+    assert preempted > 0
+    for i in range ps.Len(): assert got[i] == want[i], "request " + $i
+    os.RemoveAll(dir)!
+}
+
+test Engine "a stop token ends a completion and is left out of it" {
+    dir := model.Tiny(true, 25)
+    m := model.Model.Load(dir)!
+    ps := testPrompts()
+    full, _ := greedyRuns(m, ps, 4, 64, 256, Array<I32>(0))
+    stop := full[2][4]
+    cut, _ := greedyRuns(m, ps, 4, 64, 256, Array<I32>[stop])
+    for i in range ps.Len() {
+        k I64 = 0
+        for k < full[i].Len() and full[i][k] != stop: k++
+        assert cut[i] == full[i][:k], "request " + $i
+    }
+    os.RemoveAll(dir)!
+}
+
+test Sample "greedy at temperature 0 or top-k 1; the softmax of logits / temperature otherwise, within top-p" {
+    logits := Array<F32>[0.0, 1.0, 2.0, 0.5, -1.0, 1.5]
+    keys := Array<I64>(6)
+    r := rand.Rand(9)
+    assert Sample(Sampler(0.0, 1.0, 0), logits, keys, r) == 2
+    for _ in range 20: assert Sample(Sampler(1.0, 1.0, 1), logits, keys, r) == 2
+    for _ in range 20: assert Sample(Sampler(1.0, 0.01, 0), logits, keys, r) == 2
+    counts := Array<I64>(6)
+    n I64 = 60000
+    for _ in range n: counts[I64(Sample(Sampler(0.7, 1.0, 0), logits, keys, r))]++
+    total F64 = 0.0
+    for x in logits: total += (F64(x) / 0.7).Exp()
+    for i in range 6 {
+        p := (F64(logits[i]) / 0.7).Exp() / total
+        assert (F64(counts[i]) / F64(n) - p).Abs() < 0.01, "token " + $i + ": " + $counts[i]
+    }
+    # top-p 0.6: the two most likely (0.49 and 0.24 of the mass) and nothing else
+    for _ in range 2000 {
+        t := Sample(Sampler(0.7, 0.6, 0), logits, keys, r)
+        assert t == 2 or t == 5
+    }
+}

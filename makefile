@@ -14,7 +14,8 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang \
 	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang \
 	archnet/encode.olang archnet/offline.olang archnet/toy.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
-	surgery/model.olang surgery/ops.olang
+	surgery/model.olang surgery/ops.olang \
+	llm/bpe.olang llm/model.olang llm/engine.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers
@@ -31,7 +32,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help oanngen llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -134,6 +135,18 @@ tinystories:
 bpelm:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_bpelm examples/bpelm.olang
 	$(GPUENV) ./build/examples_bpelm $(ARGS)
+
+# oann-gen: completions of a JSON-lines file of prompts by an open-weight model (llm/gen.olang, llm/README.md), built
+# to build/oann-gen - ARGS: MODEL prompts.jsonl out.jsonl and its flags (none: only builds it)
+oanngen:
+	$(OLANG) build -output build/oann-gen llm/gen.olang
+	$(if $(ARGS),./build/oann-gen $(ARGS),)
+
+# decoding speed of an open-weight model, tokens a second at batch sizes, and peak memory (bench/llm.olang) - ARGS: the
+# model's directory, context, steps, int8 or bf16, batch sizes
+llmbench:
+	$(OLANG) build -output build/bench_llm bench/llm.olang
+	./build/bench_llm $(ARGS)
 
 # where a transformer's training step goes, operation by operation - ARGS: steps, threads, layers, width, heads,
 # context, sequences
