@@ -32,21 +32,30 @@ type Heads struct(Count I64, Ctx I64, Causal Bool = true, Window I64 = 0) {
 # the first position row i reads: i - W + 1 in a window, else 0
 fn (at Heads&) Low(i I64) I64 { return (i - at.Window + 1).Max(0) if at.Window > 0 else 0 }
 
+# the first position row r (position i of its sequence) reads, documents too: starts (empty: one document a sequence)
+# holds for each row the position its document starts at, non-decreasing along a sequence (packed documents)
+fn low(at Heads&, starts Array<I32>&, r I64, i I64) I64 {
+    lo := at.Low(i)
+    return lo.Max(I64(starts[r])) if starts.Len() > 0 else lo
+}
+
 # the softmax of matrices e0 ... e1 - 1, forward (p the scores, made weights) or backward (d the gradient of the weights, made
 # the gradient of the scores, p the weights), a run of them per task. A named job, not a lambda: a lambda's body ran three
 # times as slowly here (its loops were not vectorized)
-type rowsJob<S, A> struct(d mat.Mat<S>, p mat.Mat<S>, at Heads, scale A, backward Bool) {
+type rowsJob<S, A> struct(d mat.Mat<S>, p mat.Mat<S>, at Heads, scale A, backward Bool, starts Array<I32>&) {
     d
     p
     at
     scale
     backward
+    starts
 }
 
 fn (j rowsJob<S, A>&) one(e I64) {
     d, p := weightsOf(j.d, e, j.at), weightsOf(j.p, e, j.at)
-    if j.backward: softmaxBackward<S, A>(d, p, j.at, j.scale)
-    else: softmaxRows<S, A>(p, j.at)
+    r0 := e / j.at.Count * j.at.Ctx
+    if j.backward: softmaxBackward<S, A>(d, p, j.at, j.starts, r0, j.scale)
+    else: softmaxRows<S, A>(p, j.at, j.starts, r0)
 }
 
 fn (j rowsJob<S, A>&) run(lo I64, hi I64) {
@@ -158,7 +167,7 @@ fn ReserveAttention<S, A>(ws mut gemm.Workspace<A>&, ctx I64, dh I64, like S) {
 # out = attention(q, k, v) over the sequences and heads `at` names, the weights kept in probs (n heads rows of Ctx
 # columns). out, q, k and v are n x D, any row stride. ws is the products' workspace and fixes the thread count, its room
 # given by ReserveAttention; nothing is allocated
-fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, probs mut mat.Mat<S>&, at Heads) {
+fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, probs mut mat.Mat<S>&, at Heads, starts Array<I32>& = Array<I32>(0)) {
     dh := q.Cols / at.Count
     scale A = 1.0 / A(dh).Sqrt()
     seqs := q.Rows / at.Ctx
@@ -168,7 +177,7 @@ fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&
         # every operand a local: a call's value lent straight to a product reads as allocating (repro/tempfacts, fixed in olang and removed 2026-11-21)
         p := stackOf(probs, e0, e1, at)
         qp, kp, vp, op := partOf(q, e0, e1, at), partOf(k, e0, e1, at), partOf(v, e0, e1, at), partOf(out, e0, e1, at)
-        job := rowsJob<S, A>(probs, probs, at, scale, false)
+        job := rowsJob<S, A>(probs, probs, at, scale, false, starts)
         gemm.GemmBatch(ws, p, qp, false, kp, true, scale, 0.0, resultOf(at.Causal))
         spread(job, e0, e1, ws.Threads)
         gemm.GemmBatch(ws, op, p, false, vp, false, 1.0, 0.0, leftOf(at.Causal))
@@ -177,13 +186,13 @@ fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&
 
 # each row of the scores p (Ctx x Ctx) replaced by its softmax - over positions Low(i) ... i in row i when causal (0 ...
 # i outside a window), zeros elsewhere
-fn softmaxRows<S, A>(p mat.Mat<S>&, at Heads) {
+fn softmaxRows<S, A>(p mat.Mat<S>&, at Heads, starts Array<I32>&, r0 I64) {
     data := p.Data
     cols := p.Cols
     for i in range p.Rows {
         o := p.Off + i * p.Ld
         last := i + 1 if at.Causal else cols
-        lo := at.Low(i)
+        lo := low(at, starts, r0 + i, i)
         for j in range lo: data[o + j] = S(0.0)
         elem.SoftmaxRun<S, A>(data, o + lo, last - lo, 1.0)
         for j in range last, cols: data[o + j] = S(0.0)
@@ -192,12 +201,12 @@ fn softmaxRows<S, A>(p mat.Mat<S>&, at Heads) {
 
 # dP (in d) made dS = scale P (dP - rowsum(dP P)) row by row - softmax's backward, scaled; causal, row i only up to position
 # i, the rest of d never read
-fn softmaxBackward<S, A>(d mat.Mat<S>&, p mat.Mat<S>&, at Heads, scale A) {
+fn softmaxBackward<S, A>(d mat.Mat<S>&, p mat.Mat<S>&, at Heads, starts Array<I32>&, r0 I64, scale A) {
     dd := d.Data
     pd := p.Data
     for i in range d.Rows {
         last := i + 1 if at.Causal else d.Cols
-        lo := at.Low(i)
+        lo := low(at, starts, r0 + i, i)
         o := d.Off + i * d.Ld
         q := p.Off + i * p.Ld
         for j in range lo: dd[o + j] = S(0.0)
@@ -216,7 +225,7 @@ fn AttentionScratch(rows I64, heads I64, ctx I64) I64 {
 # probs are the weights Attention kept. A gradient wanted is a matrix with rows, one not wanted an empty one (Rows 0); each
 # is written, or added to what is there where its add flag is set - which is how a node attending to itself (q, k or v the
 # same value) collects the three contributions. scratch holds at least AttentionScratch(n, heads, Ctx) elements
-fn AttentionGrad<S, A>(ws mut gemm.Workspace<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, probs mat.Mat<S>&, scratch mut Array<S>&, at Heads, addQ Bool = false, addK Bool = false, addV Bool = false) {
+fn AttentionGrad<S, A>(ws mut gemm.Workspace<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, probs mat.Mat<S>&, scratch mut Array<S>&, at Heads, addQ Bool = false, addK Bool = false, addV Bool = false, starts Array<I32>& = Array<I32>(0)) {
     dh := q.Cols / at.Count
     scale A = 1.0 / A(dh).Sqrt()
     seqs := q.Rows / at.Ctx
@@ -227,7 +236,7 @@ fn AttentionGrad<S, A>(ws mut gemm.Workspace<A>&, dq mut mat.Mat<S>&, dk mut mat
         dS := stackOf(ds, e0, e1, at)
         dO := partOf(dout, e0, e1, at)
         qp, kp, vp, pp := partOf(q, e0, e1, at), partOf(k, e0, e1, at), partOf(v, e0, e1, at), stackOf(probs, e0, e1, at)
-        job := rowsJob<S, A>(ds, probs, at, scale, true)
+        job := rowsJob<S, A>(ds, probs, at, scale, true, starts)
         gemm.GemmBatch(ws, dS, dO, false, vp, true, 1.0, 0.0, resultOf(at.Causal))
         spread(job, e0, e1, ws.Threads)
         left := leftOf(at.Causal)
@@ -400,7 +409,7 @@ fn Flash<A>.For(threads I64, ctx I64, dh I64) Flash<A> {
 }
 
 # one task's matrices e0 .. e1 - 1 (e = s heads + h), forward or backward
-type flashJob<S, A> struct(f mut Flash<A>&, res mut mat.Mat<S>&, out mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, lse mut Array<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, at Heads, backward Bool, adds I64) {
+type flashJob<S, A> struct(f mut Flash<A>&, res mut mat.Mat<S>&, out mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, lse mut Array<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, at Heads, backward Bool, adds I64, starts Array<I32>&) {
     f
     res
     out
@@ -415,6 +424,7 @@ type flashJob<S, A> struct(f mut Flash<A>&, res mut mat.Mat<S>&, out mat.Mat<S>&
     at
     backward
     adds
+    starts
 }
 
 fn (j flashJob<S, A>&) run(e0 I64, e1 I64, t I64) {
@@ -484,12 +494,12 @@ fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
         reach := i0 + br if at.Causal else ctx
         qi := block(j.q, r0 + i0, c0, br, dh)
         om := mat.Mat<A>(sc, oo, br, dh, dh)
-        for j0 in range at.Low(i0), reach, flashCols {
+        for j0 in range low(at, j.starts, r0 + i0, i0), reach, flashCols {
             bc := flashCols.Min(reach - j0)
             kj, vj := block(j.k, r0 + j0, c0, bc, dh), block(j.v, r0 + j0, c0, bc, dh)
             sm := mat.Mat<A>(sc, so, br, bc, flashCols)
             gemm.Gemm(ws, sm, qi, false, kj, true, scale, 0.0)
-            for r in range br: flashFold(sc, so + r * flashCols, bc, (at.Low(i0 + r) - j0).Max(0), flashReach(at.Causal, i0 + r, j0, bc), mo + r, lo + r, oo + r * dh, dh)
+            for r in range br: flashFold(sc, so + r * flashCols, bc, (low(at, j.starts, r0 + i0 + r, i0 + r) - j0).Max(0), flashReach(at.Causal, i0 + r, j0, bc), mo + r, lo + r, oo + r * dh, dh)
             if halved(S(0.0)) {
                 hm := rounded(hs, 0, sc, so, br, bc)
                 gemm.Gemm(ws, om, hm, false, vj, false, 1.0, 1.0)
@@ -563,7 +573,7 @@ fn flashBack<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
         dkm, dvm := mat.Mat<A>(sc, ko, bc, dh, dh), mat.Mat<A>(sc, vo, bc, dh, dh)
         first := j0 / flashRows * flashRows if at.Causal else 0
         for i0 in range first, ctx, flashRows {
-            if at.Low(i0) >= j0 + bc: break                                # the window has left this key block
+            if low(at, j.starts, r0 + i0, i0) >= j0 + bc: break             # the window (or the document) has left this key block
             br := flashRows.Min(ctx - i0)
             qi, doi := block(j.q, r0 + i0, c0, br, dh), block(j.dout, r0 + i0, c0, br, dh)
             pm, gm := mat.Mat<A>(sc, po, br, bc, flashCols), mat.Mat<A>(sc, go, br, bc, flashCols)
@@ -571,7 +581,7 @@ fn flashBack<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
             gemm.Gemm(ws, gm, doi, false, vj, true, 1.0, 0.0)
             for r in range br {
                 lim := flashReach(at.Causal, i0 + r, j0, bc)
-                from := (at.Low(i0 + r) - j0).Max(0).Min(lim)
+                from := (low(at, j.starts, r0 + i0 + r, i0 + r) - j0).Max(0).Min(lim)
                 l := j.lse[e * ctx + i0 + r]
                 dr := sc[dd + i0 + r]
                 for c in range from {
@@ -621,16 +631,16 @@ fn flashPut<S, A>(d mut mat.Mat<S>&, sc Array<A>&, at I64, r0 I64, c0 I64, rows 
 
 # out = attention(q, k, v) as Attention computes it, with no weights kept: lse (n heads numbers) gets each row's
 # log-sum-exp of its scaled scores, for FlashAttentionGrad. f gives the tasks, the products' workspaces and the scratch
-fn FlashAttention<S, A>(f mut Flash<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, lse mut Array<A>&, at Heads) {
-    job := flashJob<S, A>(f, out, q, q, k, v, lse, out, out, out, q, at, false, 0)       # the backward's fields unread
+fn FlashAttention<S, A>(f mut Flash<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, lse mut Array<A>&, at Heads, starts Array<I32>& = Array<I32>(0)) {
+    job := flashJob<S, A>(f, out, q, q, k, v, lse, out, out, out, q, at, false, 0, starts)       # the backward's fields unread
     flashSpread(job, q.Rows / at.Ctx * at.Count)
 }
 
 # AttentionGrad's gradients from the forward's out and lse instead of its weights: each block's weights recomputed. A
 # gradient not wanted is an empty matrix (Rows 0); one wanted is written, or added to where its add flag is set
-fn FlashAttentionGrad<S, A>(f mut Flash<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, out mat.Mat<S>&, lse mut Array<A>&, at Heads, addQ Bool = false, addK Bool = false, addV Bool = false) {
+fn FlashAttentionGrad<S, A>(f mut Flash<A>&, dq mut mat.Mat<S>&, dk mut mat.Mat<S>&, dv mut mat.Mat<S>&, dout mat.Mat<S>&, q mat.Mat<S>&, k mat.Mat<S>&, v mat.Mat<S>&, out mat.Mat<S>&, lse mut Array<A>&, at Heads, addQ Bool = false, addK Bool = false, addV Bool = false, starts Array<I32>& = Array<I32>(0)) {
     adds := (1 if addQ else 0) + (2 if addK else 0) + (4 if addV else 0)
-    job := flashJob<S, A>(f, dq, out, q, k, v, lse, dq, dk, dv, dout, at, true, adds)    # res unread
+    job := flashJob<S, A>(f, dq, out, q, k, v, lse, dq, dk, dv, dout, at, true, adds, starts)    # res unread
     flashSpread(job, q.Rows / at.Ctx * at.Count)
 }
 
@@ -643,7 +653,7 @@ fn fill<T>(a mut Array<T>&, r mut rand.Rand&, sd F64) {
 }
 
 # attention as the definition gives it, in F64 on contiguous n x D arrays; probs row (s heads + h) ctx + i
-fn reference(q Array<F64>&, k Array<F64>&, v Array<F64>&, seqs I64, ctx I64, heads I64, dim I64, causal Bool, window I64 = 0) Array<F64>, Array<F64> {
+fn reference(q Array<F64>&, k Array<F64>&, v Array<F64>&, seqs I64, ctx I64, heads I64, dim I64, causal Bool, window I64 = 0, starts Array<I32>& = Array<I32>(0)) Array<F64>, Array<F64> {
     dh := dim / heads
     y := Array<F64>(seqs * ctx * dim)
     p := Array<F64>(seqs * heads * ctx * ctx)
@@ -652,6 +662,7 @@ fn reference(q Array<F64>&, k Array<F64>&, v Array<F64>&, seqs I64, ctx I64, hea
             for i in range ctx {
                 last := i + 1 if causal else ctx
                 lo := (i - window + 1).Max(0) if window > 0 else 0
+                if starts.Len() > 0: lo = lo.Max(I64(starts[s * ctx + i]))
                 row := Array<F64>(ctx)
                 for j in range lo, last {
                     for d in range dh: row[j] += q[(s * ctx + i) * dim + h * dh + d] * k[(s * ctx + j) * dim + h * dh + d]
@@ -1071,6 +1082,53 @@ test FlashAttention "a sliding window (1, 50, 128, 200 over 300 positions): the 
             AttentionStep(mat.Mat<F64>(step, 0, 1, dim, dim), row(q), row(k), row(v), mat.Mat<F64>(keys, 0, ctx, dim, dim), mat.Mat<F64>(values, 0, ctx, dim, dim), scores, p, heads, window)
             for d in range dim: assert (step[d] - want[p * dim + d]).Abs() < 1e-12, "decoding, window " + $window + " at " + $p
         }
+    }
+}
+
+test FlashAttention "packed documents (each row's document start): the reference's per-document attention, with a window too; both forms and their gradients agree" {
+    r := rand.Rand(29)
+    seqs, ctx, heads, dim := 2, 300, 2, 16
+    n := seqs * ctx
+    dh := dim / heads
+    q, k, v, dout := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+    fill(q, r, 1.0)
+    fill(k, r, 1.0)
+    fill(v, r, 1.0)
+    fill(dout, r, 1.0)
+    # documents starting at 0, 1, 140, 141, 290 in the first sequence; 0 and 200 in the second
+    starts := Array<I32>(n)
+    for i in range ctx {
+        starts[i] = I32(290 if i >= 290 else (141 if i >= 141 else (140 if i >= 140 else (1 if i >= 1 else 0))))
+        starts[ctx + i] = I32(200 if i >= 200 else 0)
+    }
+    m := fn(a mut Array<F64>&): return mat.Mat<F64>(a, 0, n, dim, dim)
+    for window in Array<I64>[0, 64] {
+        at := Heads(heads, ctx, true, window)
+        want, _ := reference(q, k, v, seqs, ctx, heads, dim, true, window, starts)
+        # a document alone gives the same rows: the second sequence's second document run as a sequence of its own
+        alone, _ := reference(q[(ctx + 200) * dim:2 * ctx * dim].Copy(), k[(ctx + 200) * dim:2 * ctx * dim].Copy(), v[(ctx + 200) * dim:2 * ctx * dim].Copy(), 1, 100, heads, dim, true, window)
+        for i in range 100 * dim: assert (alone[i] - want[(ctx + 200) * dim + i]).Abs() < 1e-12
+        plain, got := Array<F64>(n * dim), Array<F64>(n * dim)
+        prm := mat.Mat<F64>(Array<F64>(n * heads * ctx), 0, n * heads, ctx, ctx)
+        ws := gemm.Workspace<F64>(2, ctx)
+        Attention(ws, m(plain), m(q), m(k), m(v), prm, at, starts)
+        f := Flash<F64>.For(2, ctx, dh)
+        lse := Array<F64>(n * heads)
+        FlashAttention(f, m(got), m(q), m(k), m(v), lse, at, starts)
+        for i in range n * dim: assert (want[i] - got[i]).Abs() < 1e-12 and (want[i] - plain[i]).Abs() < 1e-12, "window " + $window + " at " + $i
+        dq, dk, dv := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+        fq, fk, fv := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+        AttentionGrad(ws, m(dq), m(dk), m(dv), m(dout), m(q), m(k), m(v), prm, Array<F64>(AttentionScratch(n, heads, ctx)), at, starts = starts)
+        FlashAttentionGrad(f, m(fq), m(fk), m(fv), m(dout), m(q), m(k), m(v), m(got), lse, at, starts = starts)
+        for i in range n * dim {
+            assert (dq[i] - fq[i]).Abs() < 1e-11 and (dk[i] - fk[i]).Abs() < 1e-11 and (dv[i] - fv[i]).Abs() < 1e-11, "gradients, window " + $window + " at " + $i
+        }
+        # nothing crosses a boundary: the first document's keys get no gradient from the second's queries
+        dq2, dk2, dv2 := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+        late := dout.Copy()
+        for i in range 200 * dim: late[ctx * dim + i] = 0.0
+        FlashAttentionGrad(f, m(dq2), m(dk2), m(dv2), m(late), m(q), m(k), m(v), m(got), lse, at, starts = starts)
+        for i in range 200 * dim: assert dk2[ctx * dim + i] == 0.0 and dv2[ctx * dim + i] == 0.0
     }
 }
 

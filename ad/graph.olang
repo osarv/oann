@@ -140,7 +140,7 @@ type Op enum {
     Embedding(tokens Var, table Var)                # a table row per token
     Positions(x Var, table Var)                     # x plus a learned position: the table's row Pos + t
     Rope(x Var, heads I64, base F64)                # rotary positions (Su et al.)
-    Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64)   # window 0: all earlier positions
+    Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64, docs Var)   # window 0: all earlier positions; docs: None, or each position's document start
     Dropout(x Var, p F64)                           # while Training, each element zeroed with probability p
     CrossEntropy(logits Var, classes Var)           # the mean over the entries counted: a scalar
     Mse(a Var, b Var)                               # the mean of the squared differences: a scalar
@@ -193,7 +193,7 @@ fn KindOf(k Op) I64 {
         case Op.Embedding(_, _): 16
         case Op.Positions(_, _): 17
         case Op.Rope(_, _, _): 18
-        case Op.Attention(_, _, _, _, _, _): 19
+        case Op.Attention(_, _, _, _, _, _, _): 19
         case Op.Dropout(_, _): 20
         case Op.CrossEntropy(_, _): 21
         case Op.Mse(_, _): 22
@@ -300,7 +300,11 @@ fn inputsOf(k Op) Array<I64> {
         case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sqrt(x), Op.Log(x), Op.Shift(x, _): out[0] = x
         case Op.Rope(x, _, _), Op.Dropout(x, _), Op.MaxPool2d(x, _), Op.Sum(x, _): out[0] = x
         case Op.Reshape(x), Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x), Op.Contiguous(x): out[0] = x
-        case Op.Norm(x, g, b, _, _), Op.Attention(x, g, b, _, _, _), Op.Conv2d(x, g, b, _), Op.Scan(x, g, b): set3(out, x, g, b)
+        case Op.Norm(x, g, b, _, _), Op.Conv2d(x, g, b, _), Op.Scan(x, g, b): set3(out, x, g, b)
+        case Op.Attention(x, g, b, _, _, _, d) {
+            set3(out, x, g, b)
+            out[3] = d
+        }
         case Op.SelectiveScan(x, d, a, b, c, s) {
             set3(out, x, d, a)
             out[3] = b
@@ -354,7 +358,7 @@ fn readsInputs(k Op) Bool {
 fn readsOwn(k Op) Bool {
     return match k {
         case Op.Softmax(_), Op.LogSoftmax(_), Op.Scan(_, _, _), Op.Custom(_, _, _), Op.Sqrt(_): true
-        case Op.Attention(_, _, _, _, _, _): true          # the flash form's backward reads its output
+        case Op.Attention(_, _, _, _, _, _, _): true          # the flash form's backward reads its output
         case Op.Act(_, a): ops.ActFromOutput(a)
         case _: false
     }
@@ -406,6 +410,7 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     sw64 mut scan.Work<F64>& = scan.Work<F64>(threads)
     fl32 mut attention.Flash<F32>& = attention.Flash<F32>(threads)
     fl64 mut attention.Flash<F64>& = attention.Flash<F64>(threads)
+    noStarts Array<I32>& = Array<I32>(0)
     FlashFrom I64 = 512             # attention over contexts at least this long keeps no weights (kernels/attention's flash form), on the CPU
     onCpu Bool = true               # planned for the CPU
     ParamCount I64 = 0              # the parameters' elements: the arena's first region
@@ -693,19 +698,25 @@ fn (g mut Graph<T>&) Rope(x Var, heads I64, base F64 = 10000) Var {
 }
 
 # multi-head attention of q, k, v [b, t, D] in heads of D / heads columns; causal: position i attends to 0 ... i, and
-# with a window W > 0 to i - W + 1 ... i alone (sliding-window attention; the flash form computes only the band)
-fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64 = 0) Var {
+# with a window W > 0 to i - W + 1 ... i alone (sliding-window attention; the flash form computes only the band). docs
+# (packed documents): a Tokens(t) input holding each position's document start (non-decreasing along a sequence, e.g.
+# nn/layers' DocStarts) - a position attends within its own document only
+fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64 = 0, docs Var = None) Var {
     if not g.same("Attention", q, k) or not g.same("Attention", q, v): return q
     qd := g.dims(q)
     if qd.Rank != 3 or not g.batched(q) or heads < 1 or qd[2] % heads != 0 {
         g.fail("Attention of " + $g.shape(q) + " in " + $heads + " heads: [b, t, D], heads dividing D")
         return q
     }
-    if (g.Decode or window > 0) and not causal or window < 0 {
-        g.fail("Attention while decoding, or in a window, is causal (window " + $window + ")")
+    if (g.Decode or window > 0 or docs != None) and not causal or window < 0 {
+        g.fail("Attention while decoding, in a window or over documents, is causal (window " + $window + ")")
         return q
     }
-    return g.add(Op.Attention(g.dense(q), g.dense(k), g.dense(v), heads, causal, window), qd, true)
+    if docs != None and (g.Decode or g.nodes[docs].Kind != Op.Tokens or g.nodes[docs].Dims != tensor.Shape.Of(qd[0], qd[1])) {
+        g.fail("Attention's document starts: a Tokens(" + $qd[1] + "), not while decoding")
+        return q
+    }
+    return g.add(Op.Attention(g.dense(q), g.dense(k), g.dense(v), heads, causal, window, docs), qd, true)
 }
 
 # x with each element zeroed with probability p and the rest scaled by 1 / (1 - p) while the graph is Training; x
@@ -973,7 +984,7 @@ fn (g Graph<T>&) extrasOf(i I64) extras {
         case Op.Dropout(_, _): extras(n, 0, 0, 0)
         case Op.MaxPool2d(_, _): extras(0, 0, n, 0)
         case Op.Conv2d(_, _, _, s): extras(0, nd.Dims[0] * s.Positions() * s.Patch(), 0, 0)
-        case Op.Attention(_, _, _, heads, _, _): g.attentionExtras(nd, heads)
+        case Op.Attention(_, _, _, heads, _, _, _): g.attentionExtras(nd, heads)
         case Op.Scan(_, _, _): extras(0, 3 * n, 0, 2 * nd.Dims[0] * nd.Dims[2])
         case Op.SelectiveScan(_, _, a, _, _, _): g.selectiveExtras(nd, g.nodes[a].Dims[0])
         case Op.DeltaRule(q, _, _, beta, _): g.deltaExtras(nd, g.nodes[q].Dims[2], g.nodes[beta].Dims[2])
@@ -991,6 +1002,9 @@ fn (g Graph<T>&) attentionExtras(nd Node&, heads I64) extras {
     p := nd.Dims[0] * t * heads * t
     return extras(p, p, 0, 0)
 }
+
+# an attention's document starts: the docs input's, or none
+fn (g Graph<T>&) startsOf(docs Var) Array<I32>& { return g.noStarts if docs == None else g.intsOf(I64(docs)) }
 
 # whether an attention node runs the flash form: on the CPU, not decoding, over a context of FlashFrom or more
 fn (g Graph<T>&) flashes(nd Node&) Bool { return g.onCpu and not g.Decode and nd.Dims[1] >= g.FlashFrom }
@@ -1266,7 +1280,7 @@ fn (g Graph<T>&) reserveIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.Work
             if folded: ws.ReserveLayer(d.Count() / last, last, k, like)
             else: ws.ReserveLayer(d[d.Rank - 2], last, k, like, true)
         }
-        case Op.Attention(_, _, _, heads, _, _) {
+        case Op.Attention(_, _, _, heads, _, _, _) {
             if g.flashes(g.nodes[i]) { g.flashOf<A>().Reserve(d[1], last / heads) } else { ws.ReserveLayer(d[1], d[1], last / heads, like, true) }
         }
         case Op.Conv2d(_, _, _, s): ws.ReserveLayer(d[0] * s.Positions(), s.Patch(), s.OutC, like)
@@ -2051,13 +2065,13 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         case Op.Embedding(t, w): ops.Embedding(y, g.intsOf(t), g.Value(w))
         case Op.Positions(x, w): ops.Positions<T, A>(y, g.Value(x), g.Value(w), nd.Dims[1], g.Pos)
         case Op.Rope(x, heads, base): ops.Rope(y, g.Value(x), heads, nd.Dims[1], g.Pos, base)
-        case Op.Attention(q, k, v, heads, causal, window) {
+        case Op.Attention(q, k, v, heads, causal, window, docs) {
             if g.Decode {
                 ops.AttentionStep<T, A>(y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), nd.Dims[1], g.accOf<A>(i), g.Pos, heads, window)
             } else if g.flashes(nd) {
-                ops.FlashAttention<T, A>(g.flashOf<A>(), y, g.Value(q), g.Value(k), g.Value(v), g.accOf<A>(i), heads, nd.Dims[1], causal, window)
+                ops.FlashAttention<T, A>(g.flashOf<A>(), y, g.Value(q), g.Value(k), g.Value(v), g.accOf<A>(i), heads, nd.Dims[1], causal, window, g.startsOf(docs))
             } else {
-                ops.Attention<T, A>(ws, y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), heads, nd.Dims[1], causal, window)
+                ops.Attention<T, A>(ws, y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), heads, nd.Dims[1], causal, window, g.startsOf(docs))
             }
         }
         case Op.Dropout(x, p) {
@@ -2343,7 +2357,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             tmp := g.scratchTensor(i, 0, dy.Dims)
             if ops.Wanted(dx): ops.RopeBackward<T, A>(dy, heads, nd.Dims[1], g.Pos, base, dx, ax, tmp)
         }
-        case Op.Attention(q, k, v, heads, causal, window) {
+        case Op.Attention(q, k, v, heads, causal, window, docs) {
             dq := g.gradOf(q)
             aq := g.acc(q)
             dk := g.gradOf(k)
@@ -2351,10 +2365,10 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             dv := g.gradOf(v)
             av := g.acc(v)
             if g.flashes(nd) {
-                ops.FlashAttentionBackward<T, A>(g.flashOf<A>(), dy, g.Value(q), g.Value(k), g.Value(v), g.Value(Var(i)), g.accOf<A>(i), heads, nd.Dims[1], causal, window, dq, aq, dk, ak, dv, av)
+                ops.FlashAttentionBackward<T, A>(g.flashOf<A>(), dy, g.Value(q), g.Value(k), g.Value(v), g.Value(Var(i)), g.accOf<A>(i), heads, nd.Dims[1], causal, window, g.startsOf(docs), dq, aq, dk, ak, dv, av)
             } else {
                 sc := g.scratch(i, 0, g.extrasOf(i).scratch)
-                ops.AttentionBackward<T, A>(ws, dy, g.Value(q), g.Value(k), g.Value(v), g.saved(i), sc, heads, nd.Dims[1], causal, window, dq, aq, dk, ak, dv, av)
+                ops.AttentionBackward<T, A>(ws, dy, g.Value(q), g.Value(k), g.Value(v), g.saved(i), sc, heads, nd.Dims[1], causal, window, g.startsOf(docs), dq, aq, dk, ak, dv, av)
             }
         }
         case Op.Dropout(x, p) {
@@ -2418,7 +2432,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
 fn firstInput(k Op, j I64) I64 {
     return match k {
         case Op.Linear(x, w, b): I64(x) if j == 0 else (I64(w) if j == 1 else I64(b))
-        case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
+        case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
         case Op.MatMul(a, b, _, _), Op.Add(a, b), Op.Sub(a, b), Op.Mul(a, b), Op.Mse(a, b), Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b): I64(a) if j == 0 else (I64(b) if j == 1 else -1)
         case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sum(x, _), Op.Reshape(x), Op.Contiguous(x): I64(x) if j == 0 else -1
         case Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x): I64(x) if j == 0 else -1
@@ -2476,7 +2490,7 @@ if Gpu {
                 case Op.Dropout(_, _), Op.Rope(_, _, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
                 case Op.DeltaRule(_, _, _, _, _), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
                 case Op.Sqrt(_), Op.Log(_), Op.Shift(_, _), Op.StablemaxCE(_, _) { return name + " (node " + $i + ")" }
-                case Op.Attention(_, _, _, _, _, window) { if window > 0: return "windowed Attention (node " + $i + ")" }
+                case Op.Attention(_, _, _, _, _, window, docs) { if window > 0 or docs != None: return "windowed or document Attention (node " + $i + ")" }
                 case _ { }
             }
             if isView(nd.Kind) or nd.Kind == Op.Contiguous: continue
@@ -2614,7 +2628,7 @@ if Gpu {
                 s.Cols, s.Inner, s.Ctx = last, g.nodes[table].Dims[0], d[1]
                 s.A, s.B, s.DA, s.DB = g.valAt(x), g.valAt(table), g.gradAt(x), g.gradAt(table)
             }
-            case Op.Attention(q, k, v, heads, causal, window) {
+            case Op.Attention(q, k, v, heads, causal, window, docs) {
                 s.Do = mirror.Work.Attention
                 s.Cols, s.Heads, s.Ctx, s.Flag, s.Inner = last, heads, d[1], causal, i
                 s.A, s.B, s.C = g.valAt(q), g.valAt(k), g.valAt(v)

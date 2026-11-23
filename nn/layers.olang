@@ -189,14 +189,15 @@ fn SelfAttention.New<T>(g mut graph.Graph<T>&, D I64, heads I64, layers I64 = 1,
     return SelfAttention(q, k, v, o, heads, rope, base, causal, window, gt)
 }
 
-fn (a SelfAttention&) Apply<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
+# docs (packed documents): None, or a Tokens(t) of each position's document start (DocStarts fills one)
+fn (a SelfAttention&) Apply<T>(g mut graph.Graph<T>&, x graph.Var, docs graph.Var = graph.None) graph.Var {
     q := a.Q.Apply(g, x)
     k := a.K.Apply(g, x)
     if a.Rope {
         q = g.Rope(q, a.Heads, a.Base)
         k = g.Rope(k, a.Heads, a.Base)
     }
-    y := g.Attention(q, k, a.V.Apply(g, x), a.Heads, a.Causal, a.Window)
+    y := g.Attention(q, k, a.V.Apply(g, x), a.Heads, a.Causal, a.Window, docs)
     if a.Gate.Out > 0: y = HeadGate(g, y, g.Act(a.Gate.Apply(g, x), mat.Act.Sigmoid), a.Heads)
     return a.O.Apply(g, y)
 }
@@ -357,14 +358,40 @@ fn (d DeltaBlock&) headNorm<T>(g mut graph.Graph<T>&, x graph.Var, gain graph.Va
     return g.Reshape(h, t, d.Heads * d.Dk)
 }
 
-fn (d DeltaBlock&) Apply<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
+# keep (packed documents): None, or an Input(t, 1) of ones with zeros where a document starts - the gate times it, so a
+# document's state starts from nothing (DocStarts fills one)
+fn (d DeltaBlock&) Apply<T>(g mut graph.Graph<T>&, x graph.Var, keep graph.Var = graph.None) graph.Var {
     n := d.Pre.Apply(g, x)
     q := d.headNorm(g, d.Q.Apply(g, n), d.QGain)
     k := d.headNorm(g, d.K.Apply(g, n), d.KGain)
     beta := g.Act(d.Beta.Apply(g, n), mat.Act.Sigmoid)
     gate := g.Act(d.Gate.Apply(g, n), mat.Act.Sigmoid)
+    if keep != graph.None: gate = g.Mul(gate, g.Expand(keep, g.Info(x).Dims[1], d.Heads))
     o := g.DeltaRule(q, k, d.V.Apply(g, n), beta, gate)
     return g.Add(x, d.Out.Apply(g, o))
+}
+
+# ---- packed documents ----
+
+# from a batch's tokens (a Tokens(t)), where a document begins at each sep token: docs (a Tokens(t), for Attention) gets
+# each position's document start, keep (an Input(t, 1), for DeltaBlock; or None) 0 where a document starts after the
+# first position and 1 elsewhere. A sequence's first position starts a document
+fn DocStarts<T>(g mut graph.Graph<T>&, tokens graph.Var, sep I32, docs graph.Var, keep graph.Var = graph.None) {
+    src := g.Ints(tokens).Flat()!
+    dst := g.Ints(docs).Flat()!
+    ctx := g.Info(tokens).Dims[1]
+    for s in range g.Batch {
+        start := 0
+        for j in range ctx {
+            if j > 0 and src[s * ctx + j] == sep: start = j
+            dst[s * ctx + j] = I32(start)
+        }
+    }
+    if keep == graph.None: return
+    kv := g.Value(keep).Flat()!
+    for s in range g.Batch {
+        for j in range ctx: kv[s * ctx + j] = T(0.0 if j > 0 and dst[s * ctx + j] == I32(j) else 1.0)
+    }
 }
 
 # ---- images ----
@@ -575,6 +602,35 @@ test DeltaBlock "decoding (the delta rule's state carried, a windowed attention'
             for j in range steps {
                 for c in range 11: assert (got.Get(0, j, c) - want.Get(0, pos + j, c)).Abs() < 1e-12, "position " + $(pos + j)
             }
+        }
+    }
+}
+
+test DocStarts "packed documents: two documents in one sequence give each one's outputs alone, through attention (flash and not, a window) and the delta rule" {
+    for flash in Array<Bool>[false, true] {
+        g := graph.Graph<F64>(2)
+        g.FlashFrom = 4 if flash else 1000000
+        ctx := 10
+        tok := g.Tokens(ctx)
+        docs := g.Tokens(ctx)
+        keep := g.Input(ctx, 1)
+        e := Embedding.New(g, 9, 8)
+        x := e.Apply(g, tok)
+        h := DeltaBlock.New(g, 8, 2, 2).Apply(g, x, keep)
+        a := SelfAttention.New(g, 8, 2, 2, true, true, 10000.0, 4, true)
+        y := g.Add(h, a.Apply(g, h, docs))
+        try g.Plan(rand.Rand(7))
+        # sequence 0: [8 1 2 3] [8 4 5 6 7 1] packed; sequence 1: the second document alone, then padding
+        td := g.Ints(tok).Flat()!
+        both := Array<I32>[8, 1, 2, 3, 8, 4, 5, 6, 7, 1, 8, 4, 5, 6, 7, 1, 0, 0, 0, 0]
+        for i in range 20: td[i] = both[i]
+        DocStarts(g, tok, 8, docs, keep)
+        dd := g.Ints(docs).Flat()!
+        assert dd[3] == 0 and dd[4] == 4 and dd[9] == 4 and dd[10] == 0 and dd[19] == 0
+        g.Forward(2)
+        out := g.Value(y)
+        for j in range 6 {
+            for c in range 8: assert (out.Get(0, 4 + j, c) - out.Get(1, j, c)).Abs() < 1e-12, "flash " + $flash + " position " + $j
         }
     }
 }

@@ -592,37 +592,37 @@ fn RopeBackward<S, A>(dy tensor.Tensor<S>, heads I64, ctx I64, first I64, base F
 # ---- attention ----
 
 # out = attention(q, k, v) over sequences of ctx rows, probs keeping the weights
-fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, heads I64, ctx I64, causal Bool, window I64) {
+fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, heads I64, ctx I64, causal Bool, window I64, starts Array<I32>&) {
     om := rows(out)
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
     km, vm := rows(k), rows(v)
-    attention.Attention(ws, om, qm, km, vm, pm, attention.Heads(heads, ctx, causal, window))
+    attention.Attention(ws, om, qm, km, vm, pm, attention.Heads(heads, ctx, causal, window), starts)
 }
 
-fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, window I64, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
+fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, window I64, starts Array<I32>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
     dqm := gradRows(dq)
     dkm := gradRows(dk)
     dvm := gradRows(dv)
     om, km, vm := rows(dout), rows(k), rows(v)
-    attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal, window), addQ, addK, addV)
+    attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal, window), addQ, addK, addV, starts)
 }
 
 # attention with no weights kept (kernels/attention's flash form): lse gets each row's log-sum-exp per head
-fn FlashAttention<S, A>(f mut attention.Flash<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, window I64) {
+fn FlashAttention<S, A>(f mut attention.Flash<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, window I64, starts Array<I32>&) {
     om := rows(out)
     qm, km, vm := rows(q), rows(k), rows(v)
-    attention.FlashAttention(f, om, qm, km, vm, lse, attention.Heads(heads, ctx, causal, window))
+    attention.FlashAttention(f, om, qm, km, vm, lse, attention.Heads(heads, ctx, causal, window), starts)
 }
 
-fn FlashAttentionBackward<S, A>(f mut attention.Flash<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, out tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, window I64, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
+fn FlashAttentionBackward<S, A>(f mut attention.Flash<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, out tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, window I64, starts Array<I32>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
     dqm := gradRows(dq)
     dkm := gradRows(dk)
     dvm := gradRows(dv)
     gm, qm, km, vm, om := rows(dout), rows(q), rows(k), rows(v), rows(out)
-    attention.FlashAttentionGrad(f, dqm, dkm, dvm, gm, qm, km, vm, om, lse, attention.Heads(heads, ctx, causal, window), addQ, addK, addV)
+    attention.FlashAttentionGrad(f, dqm, dkm, dvm, gm, qm, km, vm, om, lse, attention.Heads(heads, ctx, causal, window), addQ, addK, addV, starts)
 }
 
 # causal attention while decoding: rows are positions first ... of each sequence - a sequence's n rows in a run (one

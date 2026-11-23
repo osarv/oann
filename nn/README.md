@@ -8,6 +8,11 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   dropout), `Transformer` (GPT-2's decoder), and the scan-based residual blocks `SsmBlock` (Mamba's selective scan over
   the graph's `SelectiveScan`) and `DeltaBlock` (the gated delta rule: the graph's `DeltaRule`, chunked in the WY form for training, the recurrent form a position at a time while decoding, its state carried between Forward calls). Starting values are PyTorch's for `Dense` and
   `Conv`, GPT-2's for the transformer.
+- Packed documents (several documents to a sequence): `DocStarts(g, tokens, sep, docs, keep)` fills, from the batch's
+  tokens and a separator that begins each document, `docs` (a `Tokens(t)`, each position's document start) for
+  `SelfAttention.Apply(g, x, docs)` - the graph's `Attention(..., docs)`, attention within a document - and `keep` (an
+  `Input(t, 1)`, zero where a document starts) for `DeltaBlock.Apply(g, x, keep)`, whose gate it multiplies so the state
+  starts from nothing at each document.
 - `ngram.olang` - input tables added to the embedding, lookups only: `Ngram` of order 1 (the previous token's code, a
   table indexed by x_{t-1}, its last row for the first position), 2 or 3 (a table of `Buckets` rows indexed by a hash of
   x_{t-1}, x_t or x_{t-2}, x_{t-1}, x_t). `New` registers the table and a `Tokens()` input of row indices, `Fill` computes
