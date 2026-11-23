@@ -934,7 +934,9 @@ fn (s Sampler&) Best() I64 {
 # a long memory (structured) and graphs that want a short one (random). Hold: each move puts a bias Hold on the
 # (cell, value) it leaves, decaying as exp(-age / Tenure) moves (Tenure < 0: -Tenure x the violated constraints + 10,
 # Tabucol's tenure as a decay time) - a metadynamics bias on recently visited states, a soft no-undo memory (0: off)
-type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000, Slack F64 = 1e-9, Cap F64 = 0.0, Hold F64 = 0.0, Tenure F64 = -0.6) {
+# Dense p (0: off): Bump is scaled by (1 - d)^p, d the graph's edge density (its pairs and the pairs within factors
+# over n (n - 1) / 2) - dense graphs take smaller bumps, where breakout weights would otherwise swamp the energy
+type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay F64 = 1.0, Every I64 = 1000, Slack F64 = 1e-9, Cap F64 = 0.0, Hold F64 = 0.0, Tenure F64 = -0.6, Dense F64 = 0.0) {
     Moves
     T
     Bump
@@ -944,6 +946,7 @@ type FocusSchedule struct(Moves I64 = 100000, T F64 = 0.5, Bump F64 = 0.0, Decay
     Cap
     Hold
     Tenure
+    Dense
 }
 
 # the constraints a focused search picks from: the factors (ids 0 .. Fac.Count) and the undirected edges (ids after
@@ -1185,6 +1188,13 @@ fn (st mut focusState&) bump(m Potts&, e message.Edges&, x focusIndex&, X Array<
     }
 }
 
+# the share of cell pairs joined by an edge or by sharing a factor (at most 1)
+fn focusDensity(m Potts&, x focusIndex&, n I64) F64 {
+    pairs := F64(x.ne)
+    if m.Fac != null: pairs += F64(m.Fac!.Count * m.Fac!.Arity * (m.Fac!.Arity - 1) / 2)
+    return (pairs / (F64(n) * F64(n - 1) / 2.0)).Min(1.0)
+}
+
 fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched FocusSchedule, x focusIndex&, c I64) {
     n, k := s.Cells, s.K
     xo := c * n
@@ -1193,6 +1203,7 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
     eps := sched.Slack
     st := focusState.of(m, x, n, X, xo)
     st.slack = sched.Slack
+    bump := sched.Bump * (1.0 - focusDensity(m, x, n)).Pow(sched.Dense) if sched.Dense != 0.0 else sched.Bump
     if sched.Bump > 0.0 {
         st.L1, st.ones = Array<F64>(n * k), Array<F64>(nc, 1.0)
     }
@@ -1218,7 +1229,7 @@ fn (s mut Sampler&) focusChain(m Potts&, e message.Edges&, f Array<F64>&, sched 
         tenure := sched.Tenure if sched.Tenure > 0.0 else -sched.Tenure * F64(st.nv) + 10.0
         if moves > 0 and moves % every == 0: st.refresh(m, e, x, s.unary, X, xo)
         q := st.viol[nextBelow(s.seeds, c, st.nv)]
-        if sched.Bump > 0.0: st.bump(m, e, x, X, xo, q, sched.Bump)
+        if sched.Bump > 0.0: st.bump(m, e, x, X, xo, q, bump)
         nq I64 = 0
         if q < x.nf {
             fc := m.Fac!
@@ -2441,4 +2452,30 @@ test Fitter.AddBlocks "a planted model of overlapping 3-cell sums (a table by th
     s.Start(r)
     s.Anneal(m, e, feats, Schedule(3000, 2.0, 0.05))
     assert truth.Energy(e, feats, s.X, s.Best() * n) == 0.0
+}
+
+test FocusSchedule "Dense: the density counts a graph's pairs exactly, and on a dense planted 3-colouring Focus with density-scaled bumps (with Cap and Hold) reaches energy 0" {
+    r := rand.Rand(83)
+    n := 90
+    colour := Array<I32>(n)
+    for i in range n: colour[i] = I32(r.Below(3))
+    src, dst := Array<I32>(n * n), Array<I32>(n * n)
+    count, pairs I64 = 0, 0
+    for i in range n {
+        for j in range i + 1, n {
+            if colour[i] == colour[j] or r.Uniform(0.0, 1.0) >= 0.4: continue
+            src[count], dst[count], src[count + 1], dst[count + 1] = I32(i), I32(j), I32(j), I32(i)
+            count += 2
+            pairs++
+        }
+    }
+    e := message.Edges(n, n * n)
+    e.Set(src, dst, count)
+    m := Potts.Colouring(3)
+    x := focusIndex.of(m, e)
+    assert (focusDensity(m, x, n) - F64(pairs) / F64(n * (n - 1) / 2)).Abs() < 1e-12
+    s := Sampler(n, 4, 3)
+    s.Start(rand.Rand(9))
+    s.Focus(m, e, Array<F64>(n), FocusSchedule(200000, 0.15, 0.1, 0.5, 1000, 1e-9, 1.0, 1.0, -0.6, 8.0))
+    assert s.Energies[s.Best()] == 0.0, $s.Energies[s.Best()]
 }
