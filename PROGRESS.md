@@ -2145,3 +2145,18 @@ unchanged:
 The earlier cases' moves, solved chains and checksums are unchanged. Left: a move's per-neighbour bookkeeping
 (the violated set's mark, the weight-1 copy) keeps U1 at about 2.3x Tabucol a move; U1 makes fewer moves on the
 harder graphs and solves the one Tabucol does not.
+
+## CPU training throughput of a small language model (wt-lmthroughput, 2026-11-23)
+
+`bench/lmstep` (`make lmstep`): a training step of the language experiments' decoder (4 pre-norm blocks of 128, 4
+heads, rotary causal attention, gated SwiGLU, tied embedding over 4097 tokens, window 128, batch 16) on random tokens,
+per-operation times and tokens a second. Before, one thread: 365 ms a step, 5611 tokens/s - CrossEntropy's forward
+86 ms (the softmax, then a second scalar pass of exponentials for the log-sum-exp), Rope 27 ms (each row's cosines and
+sines computed again), products 186 ms; four threads 7594 (1.35x: only the products split, and at width 128 poorly).
+Changed: the loss read off the softmax's own probability at the class (the log-sum-exp, now vectorized as
+`elem.LogSumExpRun`, only where that underflows): 86 -> 10 ms; Rope's angles computed once a position and applied to
+every sequence's row there: 27 -> 6 ms (the same arithmetic, bit for bit); data parallel replicas (nn/train
+`AverageGrads`, `BroadcastParams`; tested against one graph of the whole batch): one single-thread graph a thread at
+its share of the batch. After: one thread 7936 tokens/s (1.41x), four threads 12298 inside the operations, 21504 data
+parallel (2.83x the old four threads, 3.83x the old one thread). Left at one thread: the products (~180 ms of 258, at
+~50 GMAC/s - near what the kernel does at these widths) and attention (31 ms).

@@ -15,7 +15,7 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   2-D parameter's step - `MuonMatrices(g)` lists them, the other elements go to AdamW at `adamRate`; `Orthogonalize` is
   the Newton-Schulz step on its own) and `Ema`, a weight average (`Update` after each step, `Swap` to evaluate with the
   average and `Swap` back).
-- `train.olang` - the loops: `Epoch`/`Evaluate` for a classifier over a `loader.Loader`; `LmStep`/`LmEvaluate` for a
+- `train.olang` - the loops: `Epoch`/`Evaluate` for a classifier over a `loader.Loader`; `LmStep`/`LmEvaluate` for a Data parallel: `AverageGrads` and `BroadcastParams` over replicas - one single-thread graph a thread at its share of the batch, run at once (a join), the gradients averaged into the first, the optimizer stepping it, its parameters copied back; for small models whose products split poorly across threads.
   language model over any batch source with `Random` and `At` (data/text's `Windows`, data/tokens' `Tokens`); `Fit`, a
   whole run with reports, a record through io/runlog and checkpoints; `Save`/`Resume`, safetensors files holding the
   parameters, the optimizer's state and the step, which resume a run bit for bit.
