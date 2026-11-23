@@ -2109,3 +2109,11 @@ caller's validation scores best. Tests: free energies equal brute force over the
 central differences; run counts of the rows and columns of 4 x 4 binary grids (H 5, clues 0-2): 4 restarts x 1500
 steps of 8 grids, the kept restart solves 8 / 8 validation puzzles and 32 / 32 held-out (best of 2 chains x 200
 sweeps), 10.5 s.
+
+## The energy toolkit benchmark (wt-energybench, 2026-11-23)
+
+`examples/energy_suite.olang` and `make energybench` (with examples/potts_latin): Focus with breakout, Cap and Hold
+on planted 3-SAT and 3-colouring, CutsetMove on grid distance fields, BySum cage sums, nn/lines run counts; the table
+is in examples/README.md. Found on the way: olang accepts a parameter typed by a member a module lacks
+(repro/unknowntype). A soft pair penalty (5) made the distance energy's optimum not the BFS field (raising many
+cells outweighed it); the example uses 1000.

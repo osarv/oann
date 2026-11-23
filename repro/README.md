@@ -7,6 +7,7 @@ Last re-checked against olang f73ca3c4f (2026-11-21). A repro is removed once ol
 | file | status | why |
 |---|---|---|
 | `fieldname.olang` | reproduces | D3a: a constructor field may not share a function's name in its module. A deliberate rule, kept as a record of the friction |
+| `unknowntype.olang` | reproduces (new) | a parameter typed by a module member that does not exist (`time.Instant`) passes the checker and stops the build in lowering ("does not lower an unknown type") instead of a check error naming it |
 
 
 The `Status` line in each file's header repeats the row.
