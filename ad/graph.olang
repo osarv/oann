@@ -2102,10 +2102,21 @@ fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
 
 # ---- running ----
 
+# a decoding graph's positions: its first Tokens' (else its first batched node's) second axis, wherever it was recorded
+fn (g Graph<T>&) positions() I64 {
+    for i in range g.nodes.Len() {
+        if g.nodes[i].Kind == Op.Tokens: return g.nodes[i].Dims[1]
+    }
+    for i in range g.nodes.Len() {
+        if g.nodes[i].Batched and g.nodes[i].Dims.Rank >= 2: return g.nodes[i].Dims[1]
+    }
+    return 0
+}
+
 # runs every node in the order recorded, on the first n entries of the batch (decoding: positions Pos ... Pos + n - 1)
 fn (g mut Graph<T>&) Forward(n I64) {
     if not g.planned or g.problem != "": unreachable "oann: Forward of a graph not planned, or with a shape that did not fit: " + $g.problem
-    limit := g.nodes[0].Dims[1] if g.Decode else g.Batch
+    limit := g.positions() if g.Decode else g.Batch
     if n < 1 or n > g.Batch and not g.Decode: unreachable "oann: Forward on " + $n + " entries of a graph planned for " + $g.Batch
     if g.Decode and g.Pos + n > limit: unreachable "oann: decoding positions " + $g.Pos + " ... " + $(g.Pos + n - 1) + " of " + $limit
     if g.Decode and g.Batch > 1 and n > 1: unreachable "oann: a decoding graph of " + $g.Batch + " sequences runs one position a Forward"
@@ -3745,6 +3756,20 @@ test Graph "decoding with a cache of keys and values equals the full forward, a 
             }
         }
     }
+}
+
+test Graph "a decoding graph's positions are its Tokens', wherever they were recorded: a parameter made first does not set them" {
+    d := Graph<F64>(1, 1, Mode.Captured, true)
+    extra := d.Param(Init.Normal(0.0, 1.0), true, 2, 3)      # second axis 3, fewer than the 12 positions
+    dt, dl := tinyLm(d, 12)
+    d.Keep(extra)
+    try d.Plan(rand.Rand(1))
+    for pos in range 12 {
+        d.Pos = pos
+        d.Ints(dt).Flat()![0] = I32(pos % 11)
+        d.Forward(1)
+    }
+    assert d.Value(dl).Dims[1] >= 1
 }
 
 # this process's anonymous resident memory in kB (RssAnon, Linux: heap and stacks, not the code pages that running a path
