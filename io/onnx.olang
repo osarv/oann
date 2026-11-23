@@ -1,0 +1,275 @@
+# onnx - the weights of an ONNX model: the initializers of its graph (the constant tensors a trained network was
+# exported with) and the graph's nodes as names (an operator and the names of its inputs and outputs) - enough to load
+# a network whose arithmetic oann writes itself, not to run the graph.
+#
+# The file is a protobuf message (onnx.proto): ModelProto's field 7 the GraphProto, whose field 1 is every NodeProto
+# (1 input, 2 output, 4 op_type, repeated strings) and field 5 every initializer, a TensorProto: 1 dims (int64s, packed
+# or not), 2 data_type (1 FLOAT), 4 float_data (packed fixed32s), 8 name, 9 raw_data (the elements little-endian). Every
+# other field is skipped by its wire type: 0 a varint, 1 eight bytes, 2 a length and that many bytes, 5 four bytes.
+# Tensors stored outside the file (external_data) and element types other than FLOAT are refused when read.
+
+import "std/os"
+
+type OnnxError error {
+    Malformed(what String)
+    Missing(name String)          # no initializer of the name
+    Unsupported(what String)
+}
+
+# an initializer: its name, dimensions, data_type and where its elements are in the file - raw_data's bytes, or
+# or float_data's packed fixed32s (the same bytes for FLOAT) - From .. To
+type Initializer struct(Name String, Dims Array<I64>, Type I64, From I64, To I64) {
+    Name
+    Dims
+    Type
+    From
+    To
+}
+
+# the elements of an initializer
+fn (t Initializer&) Count() I64 {
+    n I64 = 1
+    for d in t.Dims: n *= d
+    return n
+}
+
+# a node of the graph: its operator, and the names of what it reads and writes
+type Node struct(Op String, Inputs Array<String>, Outputs Array<String>) {
+    Op
+    Inputs
+    Outputs
+}
+
+# a model's file read: its bytes, initializers (by name) and nodes in the graph's order
+type File struct(bytes String&) {
+    bytes
+    Initializers mut Vec<Initializer>& = Vec<Initializer>()
+    Nodes mut Vec<Node>& = Vec<Node>()
+    index mut Map<String, I64>& = Map<String, I64>()
+}
+
+# ---- the wire format ----
+
+type wire struct(b String&, at I64, end I64) {
+    b
+    at
+    end
+}
+
+fn (w mut wire&) varint() I64 ? OnnxError {
+    v U64 = 0
+    shift U64 = 0
+    for w.at < w.end and shift < 64 {
+        c := U64(U8(w.b[w.at]))
+        w.at += 1
+        v |= (c & 0x7F) << shift
+        if c < 0x80: return I64(v)
+        shift += 7
+    }
+    error OnnxError.Malformed("a varint past its message")
+}
+
+# a field's number and wire type
+fn (w mut wire&) key() I64, I64 ? OnnxError {
+    k := try w.varint()
+    return k >> 3, k & 7
+}
+
+# a length-delimited field's bytes, from .. to
+fn (w mut wire&) span() I64, I64 ? OnnxError {
+    n := try w.varint()
+    if n < 0 or w.at + n > w.end: error OnnxError.Malformed("a field past its message")
+    from := w.at
+    w.at += n
+    return from, from + n
+}
+
+# the field of this wire type passed over
+fn (w mut wire&) skip(kind I64) ? OnnxError {
+    match kind {
+        case 0 { try w.varint() }
+        case 1 { w.at += 8 }
+        case 2 { try w.span() }
+        case 5 { w.at += 4 }
+        case _ { error OnnxError.Malformed("wire type " + $kind) }
+    }
+    if w.at > w.end: error OnnxError.Malformed("a field past its message")
+}
+
+fn (w mut wire&) text() String ? OnnxError {
+    from, to := try w.span()
+    return String(w.b[from:to])
+}
+
+# ---- reading ----
+
+# the model in the file at path
+fn File.Load(path String&) File ? OnnxError, os.Error {
+    return try File.Parse(try os.ReadFile(path))
+}
+
+# the model in bytes
+fn File.Parse(bytes String&) File ? OnnxError {
+    f := File(bytes)
+    w := wire(bytes, 0, bytes.Len())
+    found := false
+    for w.at < w.end {
+        field, kind := try w.key()
+        if field != 7 or kind != 2 {
+            try w.skip(kind)
+            continue
+        }
+        from, to := try w.span()
+        try f.graph(from, to)
+        found = true
+    }
+    if not found: error OnnxError.Malformed("no graph")
+    for i, t in f.Initializers: f.index.Put(t.Name, I64(i))
+    return f
+}
+
+fn (f mut File&) graph(from I64, to I64) ? OnnxError {
+    w := wire(f.bytes, from, to)
+    for w.at < w.end {
+        field, kind := try w.key()
+        if kind != 2 or (field != 1 and field != 5) {
+            try w.skip(kind)
+            continue
+        }
+        a, b := try w.span()
+        if field == 1: f.Nodes.Push(try Node.parse(f.bytes, a, b))
+        if field == 5: f.Initializers.Push(try Initializer.parse(f.bytes, a, b))
+    }
+}
+
+fn Node.parse(bytes String&, from I64, to I64) Node ? OnnxError {
+    w := wire(bytes, from, to)
+    ins := Vec<String>()
+    outs := Vec<String>()
+    op := ""
+    for w.at < w.end {
+        field, kind := try w.key()
+        if kind != 2 or field < 1 or field > 4 or field == 3 {
+            try w.skip(kind)
+            continue
+        }
+        s := try w.text()
+        match field {
+            case 1 { ins.Push(s) }
+            case 2 { outs.Push(s) }
+            case _ { op = s }
+        }
+    }
+    return Node(op, ins.ToArray(), outs.ToArray())
+}
+
+fn Initializer.parse(bytes String&, from I64, to I64) Initializer ? OnnxError {
+    w := wire(bytes, from, to)
+    dims := Vec<I64>()
+    name := ""
+    typ I64 = 0
+    a, b I64 = 0, 0
+    for w.at < w.end {
+        field, kind := try w.key()
+        if field == 1 and kind == 0: dims.Push(try w.varint())
+        else if field == 1 and kind == 2: try packedInts(w, dims)
+        else if field == 2 and kind == 0: typ = try w.varint()
+        else if (field == 4 or field == 9) and kind == 2: a, b = try w.span()
+        else if field == 8 and kind == 2: name = try w.text()
+        else if field == 14 and kind == 2: error OnnxError.Unsupported("external data (" + name + ")")
+        else: try w.skip(kind)
+    }
+    return Initializer(name, dims.ToArray(), typ, a, b)
+}
+
+# a packed run of varints into out
+fn packedInts(w mut wire&, out mut Vec<I64>&) ? OnnxError {
+    from, to := try w.span()
+    r := wire(w.b, from, to)
+    for r.at < r.end: out.Push(try r.varint())
+}
+
+# ---- the weights ----
+
+fn (f File&) Has(name String&) Bool { return f.index.Has(name) }
+
+fn (f File&) Find(name String&) Initializer& ? OnnxError {
+    i := try f.index.Get(name) catch { error OnnxError.Missing(name) }
+    return f.Initializers.Ref(i)
+}
+
+# an initializer's elements (FLOAT)
+fn (f File&) Floats(name String&) Array<F32> ? OnnxError {
+    t := try f.Find(name)
+    if t.Type != 1: error OnnxError.Unsupported(name + ": data_type " + $t.Type + " (FLOAT reads)")
+    n := t.Count()
+    if t.To - t.From != 4 * n: error OnnxError.Malformed(name + ": " + $(t.To - t.From) + " bytes for " + $n + " elements")
+    out := Array<F32>(n)
+    for i in range n {
+        at := t.From + 4 * i
+        bits := U32(U8(f.bytes[at])) | (U32(U8(f.bytes[at + 1])) << 8) | (U32(U8(f.bytes[at + 2])) << 16) | (U32(U8(f.bytes[at + 3])) << 24)
+        out[i] = F32.FromBits(bits)
+    }
+    return out
+}
+
+# ---- checks ----
+
+# a protobuf field's key, a varint
+fn putVarint(out mut Vec<U8>&, v I64) {
+    x := U64(v)
+    for x >= 0x80 {
+        out.Push(U8(x & 0x7F) | 0x80)
+        x >>= 7
+    }
+    out.Push(U8(x))
+}
+
+fn putBytes(out mut Vec<U8>&, field I64, b Array<U8>&) {
+    putVarint(out, field * 8 + 2)
+    putVarint(out, b.Len())
+    for x in b: out.Push(x)
+}
+
+test File "a hand-made model: two initializers (raw_data and float_data, packed and plain dims) and a node" {
+    t1 := Vec<U8>()
+    putBytes(t1, 8, "w".Bytes())
+    putVarint(t1, 1 * 8)
+    putVarint(t1, 2)
+    putVarint(t1, 1 * 8)
+    putVarint(t1, 1)
+    putVarint(t1, 2 * 8)
+    putVarint(t1, 1)
+    raw := Vec<U8>()
+    for v in [F32(1.5), F32(-2.25)] {
+        bits := v.Bits()
+        for k in range 4: raw.Push(U8((bits >> U32(8 * k)) & 0xFF))
+    }
+    putBytes(t1, 9, raw.ToArray())
+    t2 := Vec<U8>()
+    putBytes(t2, 4, raw.ToArray())
+    putBytes(t2, 1, Array<U8>[U8(2)])
+    putVarint(t2, 2 * 8)
+    putVarint(t2, 1)
+    putBytes(t2, 8, "b".Bytes())
+    n := Vec<U8>()
+    putBytes(n, 1, "x".Bytes())
+    putBytes(n, 1, "w".Bytes())
+    putBytes(n, 2, "y".Bytes())
+    putBytes(n, 4, "MatMul".Bytes())
+    g := Vec<U8>()
+    putBytes(g, 1, n.ToArray())
+    putBytes(g, 5, t1.ToArray())
+    putBytes(g, 5, t2.ToArray())
+    m := Vec<U8>()
+    putVarint(m, 1 * 8)
+    putVarint(m, 8)
+    putBytes(m, 7, g.ToArray())
+    f := File.Parse(String(m.ToArray()))!
+    w := f.Floats("w")!
+    assert f.Find("w")!.Dims.Equal(Array<I64>[2, 1])
+    assert w.Len() == 2 and w[0] == 1.5 and w[1] == -2.25
+    assert f.Floats("b")![1] == -2.25 and f.Find("b")!.Dims.Equal(Array<I64>[2])
+    assert f.Nodes.Len() == 1 and f.Nodes[0].Op == "MatMul" and f.Nodes[0].Inputs[1] == "w" and f.Nodes[0].Outputs[0] == "y"
+    assert not f.Has("z")
+}
