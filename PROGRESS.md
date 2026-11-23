@@ -2125,3 +2125,23 @@ pairs and the pairs within factors over n (n - 1) / 2). Test: the density counts
 exactly (90 cells, 40 % of cross-colour pairs), and Focus at T 0.15 with Cap, Hold and Dense 8 reaches energy 0.
 energybench gains the U1 row (T 0.15, breakout, Cap 1, Hold 1, Dense 8): 3-SAT 4/4 at 3.0 ms, 3-colouring 4/4 at
 13 ms (41261 moves) - the fewest moves of the variants on both.
+
+## Focus on dense graphs: sparse pair updates (wt-gamma, 2026-11-23)
+
+Focus already keeps every (cell, value)'s energy by differences (Tabucol's gamma matrix); on a dense graph each move
+still walked all K values of each of ~n/2 neighbours. A move now updates only the rows where W's column at the old or
+new value is nonzero (one each for a colouring), as do weight bumps; candidate weights and the Hold decay use FastExp.
+bench/focus gains G(250, 0.5) colourings against a Tabucol in olang (bench/focus.olang `tabucol`, tenure 0.6 c + a
+draw below 10; `bench_focus 4 2000000 1 K` runs only these). U1 (T 0.15, breakout, Cap 1, Hold 1, Dense 8), moves
+unchanged:
+
+| graph x colours | U1 before: ms, ns a move | U1 after | Tabucol |
+|---|---|---|---|
+| 0 x 28 | 1382, 7858 | 533, 3032 | 403, 1370 |
+| 1 x 28 | 115478, 7981 | 45942, 3175 | not solved in 20M moves (28712 ms) |
+| 2 x 28 | 11951, 8192 | 4553, 3121 | 1598, 1299 |
+| 0 / 1 / 2 x 30 | 20 / 177 / 101 ms, 7700-8500 | 11 / 58 / 36 ms, 2760-4660 | 10-21 ms, 1270-1650 |
+
+The earlier cases' moves, solved chains and checksums are unchanged. Left: a move's per-neighbour bookkeeping
+(the violated set's mark, the weight-1 copy) keeps U1 at about 2.3x Tabucol a move; U1 makes fewer moves on the
+harder graphs and solves the one Tabucol does not.

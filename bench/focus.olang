@@ -25,6 +25,10 @@ fn main() ? io.Error, ParseError {
     moves := try args[2].ParseInt() if args.Len() > 2 else 2000000
     threads := try args[3].ParseInt() if args.Len() > 3 else 1
     try io.PutLn("case | weights | ms | moves | ns a move | solved | checksum")
+    if args.Len() > 4 {
+        try dense(250, 0.5, try args[4].ParseInt(), rand.Rand(1))
+        return
+    }
     r := rand.Rand(1)
     for n in Array<I64>[1000, 4000] {
         for ratio in Array<F64>[4.0, 4.2] {
@@ -39,6 +43,88 @@ fn main() ? io.Error, ParseError {
         e := colouring(n, r)
         try run("colouring " + $n + " x 3", potts.Potts.Colouring(3), e, n, 3, chains, moves, threads)
     }
+    try dense(250, 0.5, 30, r)
+}
+
+# a dense random graph G(n, p) coloured with k colours (no planted answer): Focus as U1 (T 0.15, breakout, Cap 1,
+# Hold 1, Dense 8) against Tabucol (Galinier and Hertz's tabu search: the best non-tabu move of a conflicting vertex
+# by its gamma matrix of neighbour colour counts, tenure 0.6 conflicts + a draw below 10), each to a proper colouring
+# or 20 million moves; 3 graphs
+fn dense(n I64, p F64, k I64, r mut rand.Rand&) ? io.Error {
+    for g in range 3 {
+        src, dst := Array<I32>(n * n), Array<I32>(n * n)
+        count I64 = 0
+        for i in range n {
+            for j in range i + 1, n {
+                if r.Uniform(0.0, 1.0) >= p: continue
+                src[count], dst[count], src[count + 1], dst[count + 1] = I32(i), I32(j), I32(j), I32(i)
+                count += 2
+            }
+        }
+        e := message.Edges(n, count)
+        e.Set(src, dst, count)
+        s := potts.Sampler(n, 1, k)
+        s.Start(rand.Rand(U64(g + 1)))
+        t0 := time.Now()
+        s.Focus(potts.Potts.Colouring(k), e, Array<F64>(n), potts.FocusSchedule(20000000, 0.15, 0.1, 0.9, 1000, 1e-9, 1.0, 1.0, -0.6, 8.0))
+        ms := F64(time.Since(t0)) * 1e-6
+        try io.PutLn("G(" + $n + ", " + $p + ") graph " + $g + " x " + $k + " | U1 | " + $ms.Fixed(1) + " | " + $s.Sweeps[0] + " | " + $(ms * 1e6 / F64(s.Sweeps[0].Max(1))).Fixed(1) + " | " + ("1/1" if s.Left[0] == 0 else "0/1") + " | -")
+        t1 := time.Now()
+        mv, left := tabucol(e, n, k, 20000000, rand.Rand(U64(g + 1)))
+        ms2 := F64(time.Since(t1)) * 1e-6
+        try io.PutLn("G(" + $n + ", " + $p + ") graph " + $g + " x " + $k + " | Tabucol | " + $ms2.Fixed(1) + " | " + $mv + " | " + $(ms2 * 1e6 / F64(mv.Max(1))).Fixed(1) + " | " + ("1/1" if left == 0 else "0/1") + " | -")
+    }
+}
+
+# Tabucol: moves made and the conflicts left (0: a proper colouring)
+fn tabucol(e message.Edges&, n I64, k I64, limit I64, r mut rand.Rand&) I64, I64 {
+    col := Array<I64>(n)
+    for i in range n: col[i] = r.Below(k)
+    gamma := Array<I64>(n * k)
+    tabu := Array<I64>(n * k)
+    for i in range n {
+        for a in range e.First(i), e.First(i + 1): gamma[i * k + col[e.Source(a)]]++
+    }
+    conflicts I64 = 0
+    for i in range n: conflicts += gamma[i * k + col[i]]
+    conflicts /= 2
+    best := conflicts
+    it I64 = 0
+    for it < limit and conflicts > 0 {
+        bi, bc, bd, ties := -1, -1, I64.Max, 0
+        for i in range n {
+            here := gamma[i * k + col[i]]
+            if here == 0: continue
+            for c in range k {
+                if c == col[i]: continue
+                d := gamma[i * k + c] - here
+                if tabu[i * k + c] > it and conflicts + d >= best: continue
+                if d > bd: continue
+                if d < bd {
+                    bi, bc, bd, ties = i, c, d, 1
+                    continue
+                }
+                ties++
+                if r.Below(ties) == 0: bi, bc = i, c
+            }
+        }
+        if bi < 0 {
+            it++
+            continue
+        }
+        old := col[bi]
+        tabu[bi * k + old] = it + I64(0.6 * F64(conflicts)) + r.Below(10)
+        col[bi] = bc
+        for a in range e.First(bi), e.First(bi + 1) {
+            u := e.Source(a)
+            gamma[u * k + old]--
+            gamma[u * k + bc]++
+        }
+        conflicts += bd
+        best = best.Min(conflicts)
+        it++
+    }
+    return it, conflicts
 }
 
 fn run(name String&, m potts.Potts&, e message.Edges&, n I64, k I64, chains I64, moves I64, threads I64) ? io.Error {
