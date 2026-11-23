@@ -1,0 +1,1172 @@
+# speech/vits - VITS text to speech (Kim, Kong and Son 2021) run for inference: phoneme ids in, F32 samples out. Two
+# publications of it load: Hugging Face's VitsModel (config.json, model.safetensors; kakao-enterprise/vits-ljs) and
+# Piper's voices (<voice>.onnx, <voice>.onnx.json; rhasspy/piper-voices, the medium quality), whose initializers
+# io/onnx reads and whose names map onto transformers' - one network, written once here.
+#
+# The network, in the order it runs:
+#   - a text encoder: the ids' embeddings times sqrt(hidden), post-norm transformer layers whose attention adds
+#     relative positions (keys' and values' embeddings of the offsets -4 .. 4) and whose feed-forward is two
+#     convolutions of width 3 around a ReLU; projected to a prior's means and log-variances of every id;
+#   - the stochastic duration predictor in reverse: noise (times NoiseScaleDuration) through its flows backwards -
+#     rational-quadratic splines whose bins a dilated depth-separable convolution stack predicts from the text - to
+#     every id's log-duration; its frames the ceiling of exp of that times LengthScale;
+#   - length regulation: each id's mean and log-variance repeated over its frames, the latent sampled from them with
+#     NoiseScale;
+#   - the residual coupling flow in reverse: four affine (mean-only) couplings of WaveNet layers, the channels flipped
+#     between them;
+#   - HiFi-GAN: transposed convolutions upsampling the frames to samples (256 a frame), each followed by the mean of
+#     residual blocks of dilated convolutions, a tanh at the end.
+#
+# Layout. Every signal is time-major, a row a frame (or sample) with its channels together, so every convolution is a
+# kernels/gemm product of its patches (made a run of rows at a time on each thread) with the weights as PyTorch stores
+# them, [out x in K]; a transposed convolution of stride s is s ordinary ones, one for each phase of its outputs. The
+# leaky ReLU before each of HiFi-GAN's convolutions is applied as its patches are gathered, and a residual sum is the
+# product's own (beta 1). F32 throughout, as the references compute.
+
+import "std/json"
+import "std/os"
+import "std/rand"
+import "std/utf8"
+import "../io/checkpoint"
+import "../io/onnx"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../tensor"
+import "mel"
+
+
+type ModelError error {
+    Unsupported(what String)
+    Malformed(what String)
+}
+
+# ---- the configuration ----
+
+type Config struct() {
+    Hidden I64              # hidden_size: the text encoder's, the flows' and the duration predictor's channels
+    Heads I64
+    Layers I64              # the text encoder's
+    Ffn I64
+    FfnKernel I64
+    Window I64              # relative positions -Window .. Window
+    Vocab I64
+    Flow I64                # flow_size: the latent's channels
+    Flows I64               # couplings
+    WaveLayers I64          # WaveNet layers of a coupling
+    WaveKernel I64
+    DdsLayers I64           # the duration predictor's depth-separable convolutions
+    DdsKernel I64
+    DpFlows I64             # its spline flows
+    Bins I64
+    Tail F32                # the splines' tail bound
+    Initial I64             # HiFi-GAN's first channels
+    Rates Array<I64>& = Array<I64>(0)          # its upsampling strides
+    UpKernels Array<I64>& = Array<I64>(0)
+    ResKernels Array<I64>& = Array<I64>(0)
+    ResDilations Array<Array<I64>>& = Array<Array<I64>>(0)
+    Paired Bool             # residual blocks of conv pairs (HiFi-GAN's ResBlock1); one conv a dilation otherwise (ResBlock2)
+    Slope F32               # the leaky ReLU's
+    Rate I64                # samples a second
+    NoiseScale F32          # the defaults of Options
+    NoiseScaleDuration F32
+    LengthScale F32
+}
+
+fn intOf(j json.Json&, key String&) I64 ? ModelError {
+    v := try j[key] catch { error ModelError.Malformed("no " + key) }
+    return try v.AsInt() catch { error ModelError.Malformed(key + " is not an integer") }
+}
+
+fn numOf(j json.Json&, key String&) F64 ? ModelError {
+    v := try j[key] catch { error ModelError.Malformed("no " + key) }
+    return try v.AsNum() catch { error ModelError.Malformed(key + " is not a number") }
+}
+
+fn intsOf(j json.Json&) Array<I64> ? ModelError {
+    a := try j.AsArr() catch { error ModelError.Malformed("not an array") }
+    out := Array<I64>(a.Len())
+    for i, v in a: out[i] = try v.AsInt() catch { error ModelError.Malformed("not an integer") }
+    return out
+}
+
+fn listOf(j json.Json&, key String&) Array<I64> ? ModelError {
+    return try intsOf(try j[key] catch { error ModelError.Malformed("no " + key) })
+}
+
+# transformers' config.json of a VitsModel
+fn Config.Parse(text String&) Config ? ModelError {
+    j := try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
+    kind := try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
+    if kind != "vits": error ModelError.Unsupported("model_type " + kind + " (vits runs)")
+    if (try intOf(j, "num_speakers")) != 1: error ModelError.Unsupported("more than one speaker")
+    if (try intOf(j, "wavenet_dilation_rate")) != 1: error ModelError.Unsupported("a WaveNet dilation rate past 1")
+    if (try intOf(j, "depth_separable_channels")) != 2: error ModelError.Unsupported("depth_separable_channels other than 2")
+    sdp := try (try j["use_stochastic_duration_prediction"] catch { error ModelError.Malformed("no use_stochastic_duration_prediction") }).AsBool() catch { error ModelError.Malformed("use_stochastic_duration_prediction") }
+    if not sdp: error ModelError.Unsupported("the deterministic duration predictor")
+    c := Config()
+    c.Hidden = try intOf(j, "hidden_size")
+    c.Heads = try intOf(j, "num_attention_heads")
+    c.Layers = try intOf(j, "num_hidden_layers")
+    c.Ffn = try intOf(j, "ffn_dim")
+    c.FfnKernel = try intOf(j, "ffn_kernel_size")
+    c.Window = try intOf(j, "window_size")
+    c.Vocab = try intOf(j, "vocab_size")
+    c.Flow = try intOf(j, "flow_size")
+    c.Flows = try intOf(j, "prior_encoder_num_flows")
+    c.WaveLayers = try intOf(j, "prior_encoder_num_wavenet_layers")
+    c.WaveKernel = try intOf(j, "wavenet_kernel_size")
+    c.DdsLayers = try intOf(j, "depth_separable_num_layers")
+    c.DdsKernel = try intOf(j, "duration_predictor_kernel_size")
+    c.DpFlows = try intOf(j, "duration_predictor_num_flows")
+    c.Bins = try intOf(j, "duration_predictor_flow_bins")
+    c.Tail = F32(try numOf(j, "duration_predictor_tail_bound"))
+    c.Initial = try intOf(j, "upsample_initial_channel")
+    c.Rates = try listOf(j, "upsample_rates")
+    c.UpKernels = try listOf(j, "upsample_kernel_sizes")
+    c.ResKernels = try listOf(j, "resblock_kernel_sizes")
+    dils := try (try j["resblock_dilation_sizes"] catch { error ModelError.Malformed("no resblock_dilation_sizes") }).AsArr() catch { error ModelError.Malformed("resblock_dilation_sizes") }
+    ds := Array<Array<I64>>(dils.Len())
+    for i, d in dils: ds[i] = try intsOf(d)
+    c.ResDilations = ds
+    c.Paired = true
+    c.Slope = F32(try numOf(j, "leaky_relu_slope"))
+    c.Rate = try intOf(j, "sampling_rate")
+    c.NoiseScale = F32(try numOf(j, "noise_scale"))
+    c.NoiseScaleDuration = F32(try numOf(j, "noise_scale_duration"))
+    c.LengthScale = F32(1.0 / (try numOf(j, "speaking_rate")))
+    return try c.checked()
+}
+
+# a Piper voice's <voice>.onnx.json: the medium quality's network (piper's training config, which the file does not
+# repeat), its symbols' count, sample rate and inference defaults
+fn Config.Piper(text String&) Config ? ModelError {
+    j := try json.Json.Parse(text) catch { error ModelError.Malformed("the voice's JSON is not JSON") }
+    audio := try j["audio"] catch { error ModelError.Malformed("no audio") }
+    quality := try (try audio["quality"] catch { error ModelError.Malformed("no audio.quality") }).AsStr() catch { error ModelError.Malformed("audio.quality") }
+    if quality != "medium": error ModelError.Unsupported("Piper's " + quality + " quality (medium runs)")
+    if (try intOf(j, "num_speakers")) != 1: error ModelError.Unsupported("more than one speaker")
+    inf := try j["inference"] catch { error ModelError.Malformed("no inference") }
+    c := Config()
+    c.Hidden, c.Heads, c.Layers, c.Ffn, c.FfnKernel, c.Window = 192, 2, 6, 768, 3, 4
+    c.Vocab = try intOf(j, "num_symbols")
+    c.Flow, c.Flows, c.WaveLayers, c.WaveKernel = 192, 4, 4, 5
+    c.DdsLayers, c.DdsKernel, c.DpFlows, c.Bins, c.Tail = 3, 3, 4, 10, F32(5.0)
+    c.Initial = 256
+    c.Rates = Array<I64>[8, 8, 4]
+    c.UpKernels = Array<I64>[16, 16, 8]
+    c.ResKernels = Array<I64>[3, 5, 7]
+    c.ResDilations = Array<Array<I64>>[Array<I64>[1, 2], Array<I64>[2, 6], Array<I64>[3, 12]]
+    c.Paired = false
+    c.Slope = F32(0.1)
+    c.Rate = try intOf(audio, "sample_rate")
+    c.NoiseScale = F32(try numOf(inf, "noise_scale"))
+    c.NoiseScaleDuration = F32(try numOf(inf, "noise_w"))
+    c.LengthScale = F32(try numOf(inf, "length_scale"))
+    return try c.checked()
+}
+
+fn (c Config&) checked() Config ? ModelError {
+    if c.Hidden % c.Heads != 0: error ModelError.Malformed("heads that do not divide the hidden size")
+    if c.Flow % 2 != 0: error ModelError.Malformed("an odd flow size")
+    if c.Rates.Len() != c.UpKernels.Len(): error ModelError.Malformed("upsample rates and kernels of different counts")
+    if c.ResKernels.Len() != c.ResDilations.Len(): error ModelError.Malformed("resblock kernels and dilations of different counts")
+    for i, k in c.UpKernels {
+        if k % c.Rates[i] != 0 or (k - c.Rates[i]) % 2 != 0: error ModelError.Unsupported("an upsampling kernel " + $k + " of stride " + $c.Rates[i])
+    }
+    return c
+}
+
+# samples a frame: the strides' product
+fn (c Config&) Hop() I64 {
+    h I64 = 1
+    for r in c.Rates: h *= r
+    return h
+}
+
+# ---- the weights, by transformers' names ----
+
+type Weights struct() {
+    t mut Map<String, Array<F32>&>& = Map<String, Array<F32>&>()
+}
+
+# tensor name's n elements into dst from at
+fn (w Weights&) into(dst mut Array<F32>&, at I64, name String&, n I64) ? ModelError {
+    a := try w.t.Get(name) catch { error ModelError.Malformed("no tensor " + name) }
+    if a.Len() != n: error ModelError.Malformed(name + " has " + $a.Len() + " elements, not " + $n)
+    for i in range n: dst[at + i] = a[i]
+}
+
+# a VitsModel's model.safetensors, every weight-normed convolution's weight made (g v / |v|, the norm over each
+# output's elements), the duration predictor's affine flow's scale exp(-log_scale) made
+fn Weights.Safetensors(path String&) Weights ? ModelError, os.Error {
+    f := try checkpoint.File.Load(path) catch checkpoint.SafetensorsError { error ModelError.Malformed(path) }
+    w := Weights()
+    for name in f.Names() {
+        e := try f.Find(name) catch { error ModelError.Malformed(name) }
+        n I64 = 1
+        for d in e.Shape: n *= d
+        a := Array<F32>(n)
+        t := try tensor.Tensor<F32>.Over(a, 0, ...e.Shape) catch { error ModelError.Malformed(name) }
+        try f.Read(name, t) catch { error ModelError.Malformed(name) }
+        w.t.Put(name, a)
+    }
+    for name in f.Names() {
+        if not name.EndsWith(".weight_v"): continue
+        base := String(name[0:name.Len() - 2])
+        v := try w.t.Get(name) catch { error ModelError.Malformed(name) }
+        g := try w.t.Get(base + "_g") catch { error ModelError.Malformed("no " + base + "_g") }
+        w.t.Put(base, weightNorm(v, g))
+    }
+    ls := try w.t.Get("duration_predictor.flows.0.log_scale") catch { error ModelError.Malformed("no duration_predictor.flows.0.log_scale") }
+    w.t.Put("duration_predictor.flows.0.scale", Array<F32>[(-v).Exp() for v in ls])
+    return w
+}
+
+# PyTorch's weight norm: v (g's count of rows) times g / |row|, the norm summed in F64 and rounded
+fn weightNorm(v Array<F32>&, g Array<F32>&) Array<F32> {
+    per := v.Len() / g.Len()
+    out := Array<F32>(v.Len())
+    for o in range g.Len() {
+        s F64 = 0.0
+        for i in range per: s += F64(v[o * per + i]) * F64(v[o * per + i])
+        k := g[o] / F32(s.Sqrt())
+        for i in range per: out[o * per + i] = v[o * per + i] * k
+    }
+    return out
+}
+
+# a Piper voice's .onnx: its initializers by transformers' names. The export folded each weight-normed convolution's
+# weight into an unnamed constant, which takes its name from the bias of the Conv reading it; the affine flow's
+# exp(-log_scale) is a constant itself or the input of the Exp making it
+fn Weights.Onnx(path String&) Weights ? ModelError, os.Error {
+    f := try onnx.File.Load(path) catch onnx.OnnxError { error ModelError.Malformed(path + " is not an ONNX model") }
+    named := Map<String, String>()
+    scale := "/dp/flows.0/Exp_output_0"
+    exp := ""
+    for nd in f.Nodes {
+        if nd.Op == "Conv" and nd.Inputs.Len() == 3 and nd.Inputs[2].EndsWith(".bias") and f.Has(nd.Inputs[1]): named.Put(nd.Inputs[1], String(nd.Inputs[2][0:nd.Inputs[2].Len() - 5]) + ".weight")
+        if nd.Op == "Exp" and nd.Outputs.Len() == 1 and nd.Outputs[0] == scale and f.Has(nd.Inputs[0]): exp = nd.Inputs[0]
+    }
+    w := Weights()
+    for t in f.Initializers {
+        if t.Type != 1: continue
+        name := try named.Get(t.Name) catch default t.Name
+        hf := piperName(name)
+        if hf.Len() == 0: continue
+        w.t.Put(hf, try f.Floats(t.Name) catch { error ModelError.Malformed(t.Name) })
+    }
+    if f.Has(scale): w.t.Put("duration_predictor.flows.0.scale", try f.Floats(scale) catch { error ModelError.Malformed(scale) })
+    else if exp.Len() > 0 {
+        e := try f.Floats(exp) catch { error ModelError.Malformed(exp) }
+        w.t.Put("duration_predictor.flows.0.scale", Array<F32>[v.Exp() for v in e])
+    } else: error ModelError.Malformed("no scale of the duration predictor's affine flow")
+    return w
+}
+
+# a word of Piper's (original VITS's) names in transformers' words
+fn word(p String&) String {
+    return match p {
+        case "gamma": "weight"
+        case "beta": "bias"
+        case "pre": "conv_pre"
+        case "proj": "conv_proj"
+        case "post": "conv_post"
+        case "convs_sep": "convs_dilated"
+        case "convs_1x1": "convs_pointwise"
+        case "enc": "wavenet"
+        case "ups": "upsampler"
+        case "dec": "decoder"
+        case "m": "translate"
+        case _: p
+    }
+}
+
+# the parts from i on, each in transformers' words, joined by dots
+fn words(parts Array<String&>&, from I64) String {
+    out := ""
+    for i in range from, parts.Len(): out = out + ("." if i > from else "") + word(parts[i])
+    return out
+}
+
+# a Piper initializer's name as transformers names the weight; "" for one this does not read
+fn piperName(name String&) String {
+    if name == "sid": return "text_encoder.embed_tokens.weight"
+    p := name.Split(".")
+    if p.Len() < 2: return ""
+    if p[0] == "enc_p" and p[1] == "proj": return "text_encoder.project." + p[2]
+    if p[0] == "enc_p" and p.Len() >= 5: return "text_encoder.encoder.layers." + p[3] + "." + encoderPart(p[2], p[4], p[5] if p.Len() > 5 else "")
+    if p[0] == "dp" and p[1] == "flows" {
+        k := (try p[2].ParseInt() catch default -1)
+        if k == 0: return "duration_predictor.flows.0." + word(p[3])
+        return "duration_predictor.flows." + $((k + 1) / 2) + "." + dpWords(p, 3)
+    }
+    if p[0] == "dp": return "duration_predictor." + dpWords(p, 1)
+    if p[0] == "flow" and p[1] == "flows": return "flow.flows." + $((try p[2].ParseInt() catch default 0) / 2) + "." + words(p, 3)
+    if p[0] == "dec" and p.Len() >= 5 and p[1] == "resblocks": return "decoder.resblocks." + p[2] + ".convs1." + p[4] + "." + p[5]
+    if p[0] == "dec": return words(p, 0)
+    return ""
+}
+
+# the duration predictor's words from i: "convs" its depth-separable stack
+fn dpWords(p Array<String&>&, i I64) String {
+    if p[i] != "convs": return words(p, i)
+    return "conv_dds." + words(p, i + 1)
+}
+
+# a text encoder layer's part: kind (attn_layers, norm_layers_1, norm_layers_2, ffn_layers), its module and field
+fn encoderPart(kind String&, module String&, field String&) String {
+    if kind == "norm_layers_1": return "layer_norm." + word(module)
+    if kind == "norm_layers_2": return "final_layer_norm." + word(module)
+    if kind == "ffn_layers": return "feed_forward." + module + "." + field
+    if module.StartsWith("emb_rel"): return "attention." + module
+    proj := match module {
+        case "conv_q": "q_proj"
+        case "conv_k": "k_proj"
+        case "conv_v": "v_proj"
+        case _: "out_proj"
+    }
+    return "attention." + proj + "." + field
+}
+
+# ---- the modules ----
+
+type Norm struct(n I64) {
+    G mut Array<F32>& = Array<F32>(n)
+    B mut Array<F32>& = Array<F32>(n)
+}
+
+# a convolution over time of In channels to Out, K taps Dil apart, Pad rows of zeros before: W [Out x In K] (input
+# channel c's tap k at c K + k, PyTorch's layout), a bias (zero where none). K 1: a linear map of each row
+type Conv struct(In I64, Out I64, K I64 = 1, Dil I64 = 1) {
+    In
+    Out
+    K
+    Dil
+    Pad I64 = (K - 1) * Dil / 2
+    W mut Array<F32>& = Array<F32>(Out * In * K)
+    Bias mut Array<F32>& = Array<F32>(Out)
+}
+
+# a transposed convolution of stride S: K taps, (K - S) / 2 of padding, as S convolutions of K / S taps - phase r's
+# output q (the stretched signal's row q S + r - P) reading input rows q, q - 1, ..
+type Up struct(In I64, Out I64, K I64, S I64) {
+    In
+    Out
+    K
+    S
+    P I64 = (K - S) / 2
+    made := Vec<Conv>()
+    for _ in range S: made.Push(Conv(In, Out, K / S, -1))
+    Phases mut Array<Conv>& = made.ToArray()
+}
+
+# a depth-separable stack: depthwise convolutions of DdsKernel taps (dilation DdsKernel^i), LayerNorm, GELU, a 1x1
+# convolution, LayerNorm, GELU, added to its input
+type Dds struct(c Config&) {
+    sep := Vec<Conv>()
+    point := Vec<Conv>()
+    n1 := Vec<Norm>()
+    n2 := Vec<Norm>()
+    dil I64 = 1
+    for _ in range c.DdsLayers {
+        sep.Push(Conv(1, c.Hidden, c.DdsKernel, dil))
+        point.Push(Conv(c.Hidden, c.Hidden))
+        n1.Push(Norm(c.Hidden))
+        n2.Push(Norm(c.Hidden))
+        dil *= c.DdsKernel
+    }
+    Sep mut Array<Conv>& = sep.ToArray()            # depthwise: W [Hidden x K]
+    Point mut Array<Conv>& = point.ToArray()
+    N1 mut Array<Norm>& = n1.ToArray()
+    N2 mut Array<Norm>& = n2.ToArray()
+}
+
+# a spline flow of the duration predictor: channel 0 through Pre, the stack and Proj into the bins of channel 1's spline
+type SplineFlow struct(c Config&) {
+    Pre Conv = Conv(1, c.Hidden)
+    Stack Dds = Dds(c)
+    Proj Conv = Conv(c.Hidden, 3 * c.Bins - 1)
+}
+
+type Sdp struct(c Config&) {
+    Pre Conv = Conv(c.Hidden, c.Hidden)
+    Stack Dds = Dds(c)
+    Proj Conv = Conv(c.Hidden, c.Hidden)
+    Translate mut Array<F32>& = Array<F32>(2)
+    Scale mut Array<F32>& = Array<F32>(2)        # exp(-log_scale)
+    made := Vec<SplineFlow>()
+    for _ in range c.DpFlows: made.Push(SplineFlow(c))
+    Flows mut Array<SplineFlow>& = made.ToArray()  # transformers' flows 1 .. DpFlows; reverse never runs the first
+}
+
+type Layer struct(c Config&) {
+    Q Conv = Conv(c.Hidden, c.Hidden)
+    K Conv = Conv(c.Hidden, c.Hidden)
+    V Conv = Conv(c.Hidden, c.Hidden)
+    O Conv = Conv(c.Hidden, c.Hidden)
+    RelK mut Array<F32>& = Array<F32>((2 * c.Window + 1) * (c.Hidden / c.Heads))
+    RelV mut Array<F32>& = Array<F32>((2 * c.Window + 1) * (c.Hidden / c.Heads))
+    Ln1 Norm = Norm(c.Hidden)
+    F1 Conv = Conv(c.Hidden, c.Ffn, c.FfnKernel)
+    F2 Conv = Conv(c.Ffn, c.Hidden, c.FfnKernel)
+    Ln2 Norm = Norm(c.Hidden)
+}
+
+# a coupling: the first half of the channels through Pre, WaveNet layers and Post, subtracted from the second half
+type Coupling struct(c Config&) {
+    Pre Conv = Conv(c.Flow / 2, c.Hidden)
+    ins := Vec<Conv>()
+    skips := Vec<Conv>()
+    for i in range c.WaveLayers {
+        ins.Push(Conv(c.Hidden, 2 * c.Hidden, c.WaveKernel))
+        skips.Push(Conv(c.Hidden, 2 * c.Hidden if i + 1 < c.WaveLayers else c.Hidden))
+    }
+    In mut Array<Conv>& = ins.ToArray()
+    Skip mut Array<Conv>& = skips.ToArray()
+    Post Conv = Conv(c.Hidden, c.Flow / 2)
+}
+
+# a residual block of HiFi-GAN: a convolution of each dilation (and, paired, one of dilation 1 after it), its input added
+type Res struct(ch I64, k I64, dils Array<I64>&, paired Bool) {
+    a := Vec<Conv>()
+    b := Vec<Conv>()
+    for d in dils {
+        a.Push(Conv(ch, ch, k, d))
+        if paired: b.Push(Conv(ch, ch, k))
+    }
+    C1 mut Array<Conv>& = a.ToArray()
+    C2 mut Array<Conv>& = b.ToArray()
+}
+
+type Model struct(C Config) {
+    C
+    Embed mut Array<F32>& = Array<F32>(C.Vocab * C.Hidden)
+    layers := Vec<Layer>()
+    for _ in range C.Layers: layers.Push(Layer(C))
+    Enc mut Array<Layer>& = layers.ToArray()
+    Project Conv = Conv(C.Hidden, 2 * C.Flow)
+    Dp Sdp = Sdp(C)
+    couplings := Vec<Coupling>()
+    for _ in range C.Flows: couplings.Push(Coupling(C))
+    Couplings mut Array<Coupling>& = couplings.ToArray()
+    DecPre Conv = Conv(C.Flow, C.Initial, 7)
+    ups := Vec<Up>()
+    res := Vec<Res>()
+    ch I64 = C.Initial
+    for i, r in C.Rates {
+        ups.Push(Up(ch, ch / 2, C.UpKernels[i], r))
+        ch /= 2
+        for j, k in C.ResKernels: res.Push(Res(ch, k, C.ResDilations[j], C.Paired))
+    }
+    Ups mut Array<Up>& = ups.ToArray()
+    Blocks mut Array<Res>& = res.ToArray()                  # stage i's at i ResKernels.Len() ..
+    DecPost Conv = Conv(ch, 1, 7)
+    Threads I64 = gemm.Cores()
+}
+
+# ---- loading ----
+
+type reader struct(w Weights&) {
+    w
+}
+
+fn (r reader&) conv(c mut Conv&, name String&) ? ModelError {
+    try r.w.into(c.W, 0, name + ".weight", c.W.Len())
+    if r.w.t.Has(name + ".bias"): try r.w.into(c.Bias, 0, name + ".bias", c.Out)
+}
+
+fn (r reader&) norm(n mut Norm&, name String&) ? ModelError {
+    try r.w.into(n.G, 0, name + ".weight", n.G.Len())
+    try r.w.into(n.B, 0, name + ".bias", n.B.Len())
+}
+
+fn (r reader&) dds(d mut Dds&, p String&) ? ModelError {
+    for i in range d.Sep.Len() {
+        try r.conv(d.Sep[i], p + "convs_dilated." + $i)
+        try r.conv(d.Point[i], p + "convs_pointwise." + $i)
+        try r.norm(d.N1[i], p + "norms_1." + $i)
+        try r.norm(d.N2[i], p + "norms_2." + $i)
+    }
+}
+
+# a transposed convolution's weights ([In x Out x K]) and bias into its phases: phase r's tap m is tap r + S m
+fn (r reader&) up(u mut Up&, name String&) ? ModelError {
+    w := Array<F32>(u.In * u.Out * u.K)
+    try r.w.into(w, 0, name + ".weight", w.Len())
+    m := u.K / u.S
+    for ph in range u.S {
+        c := u.Phases[ph]
+        c.Pad = 0
+        try r.w.into(c.Bias, 0, name + ".bias", u.Out)
+        for o in range u.Out {
+            for i in range u.In {
+                for t in range m: c.W[(o * u.In + i) * m + t] = w[(i * u.Out + o) * u.K + ph + u.S * t]
+            }
+        }
+    }
+}
+
+fn (r reader&) splineFlow(f mut SplineFlow&, p String&) ? ModelError {
+    try r.conv(f.Pre, p + "conv_pre")
+    try r.dds(f.Stack, p + "conv_dds.")
+    try r.conv(f.Proj, p + "conv_proj")
+}
+
+fn (r reader&) coupling(f mut Coupling&, p String&) ? ModelError {
+    try r.conv(f.Pre, p + "conv_pre")
+    for l in range f.In.Len() {
+        try r.conv(f.In[l], p + "wavenet.in_layers." + $l)
+        try r.conv(f.Skip[l], p + "wavenet.res_skip_layers." + $l)
+    }
+    try r.conv(f.Post, p + "conv_post")
+}
+
+fn (r reader&) res(b mut Res&, p String&) ? ModelError {
+    for j in range b.C1.Len(): try r.conv(b.C1[j], p + "convs1." + $j)
+    for j in range b.C2.Len(): try r.conv(b.C2[j], p + "convs2." + $j)
+}
+
+fn (m mut Model&) read(w Weights&) ? ModelError {
+    r := reader(w)
+    c := m.C
+    try w.into(m.Embed, 0, "text_encoder.embed_tokens.weight", m.Embed.Len())
+    for i in range c.Layers {
+        l := m.Enc[i]
+        p := "text_encoder.encoder.layers." + $i + "."
+        try r.conv(l.Q, p + "attention.q_proj")
+        try r.conv(l.K, p + "attention.k_proj")
+        try r.conv(l.V, p + "attention.v_proj")
+        try r.conv(l.O, p + "attention.out_proj")
+        try w.into(l.RelK, 0, p + "attention.emb_rel_k", l.RelK.Len())
+        try w.into(l.RelV, 0, p + "attention.emb_rel_v", l.RelV.Len())
+        try r.norm(l.Ln1, p + "layer_norm")
+        try r.conv(l.F1, p + "feed_forward.conv_1")
+        try r.conv(l.F2, p + "feed_forward.conv_2")
+        try r.norm(l.Ln2, p + "final_layer_norm")
+    }
+    try r.conv(m.Project, "text_encoder.project")
+    d := "duration_predictor."
+    try r.conv(m.Dp.Pre, d + "conv_pre")
+    try r.dds(m.Dp.Stack, d + "conv_dds.")
+    try r.conv(m.Dp.Proj, d + "conv_proj")
+    try w.into(m.Dp.Translate, 0, d + "flows.0.translate", 2)
+    try w.into(m.Dp.Scale, 0, d + "flows.0.scale", 2)
+    for i in range 1, c.DpFlows: try r.splineFlow(m.Dp.Flows[i], d + "flows." + $(i + 1) + ".")
+    for i in range c.Flows: try r.coupling(m.Couplings[i], "flow.flows." + $i + ".")
+    try r.conv(m.DecPre, "decoder.conv_pre")
+    for i in range m.Ups.Len(): try r.up(m.Ups[i], "decoder.upsampler." + $i)
+    for i in range m.Blocks.Len(): try r.res(m.Blocks[i], "decoder.resblocks." + $i + ".")
+    try r.conv(m.DecPost, "decoder.conv_post")
+}
+
+# transformers' VitsModel in directory dir (config.json, model.safetensors)
+fn Model.Load(dir String&) Model ? ModelError, os.Error {
+    m := Model(try Config.Parse(try os.ReadFile(dir + "/config.json")))
+    try m.read(try Weights.Safetensors(dir + "/model.safetensors"))
+    return m
+}
+
+# a Piper voice: path its .onnx, path.json beside it
+fn Model.Piper(path String&) Model ? ModelError, os.Error {
+    m := Model(try Config.Piper(try os.ReadFile(path + ".json")))
+    try m.read(try Weights.Onnx(path))
+    return m
+}
+
+# ---- text to ids ----
+
+# the ids of a model's symbols (IPA characters and punctuation): vits-ljs's vocab.json, a blank (0) before and after
+# every character (VitsTokenizer's add_blank); or a Piper voice's phoneme_id_map, "^" and "_" first, "_" after every
+# character, "$" last
+type Symbols struct(Piper Bool) {
+    Piper
+    Ids mut Map<String, Array<I32>>& = Map<String, Array<I32>>()
+}
+
+# vits-ljs's vocab.json
+fn Symbols.Vocab(path String&) Symbols ? ModelError, os.Error {
+    text := try os.ReadFile(path)
+    j := try json.Json.Parse(text) catch { error ModelError.Malformed(path + " is not JSON") }
+    o := try j.AsObj() catch { error ModelError.Malformed(path + " is not an object") }
+    s := Symbols(false)
+    for i, k in o.Keys: s.Ids.Put(k, Array<I32>[I32(try o.Values[i].AsInt() catch { error ModelError.Malformed(path + ": " + k) })])
+    return s
+}
+
+# a Piper voice's phoneme_id_map (its .onnx.json)
+fn Symbols.PiperMap(path String&) Symbols ? ModelError, os.Error {
+    text := try os.ReadFile(path)
+    j := try json.Json.Parse(text) catch { error ModelError.Malformed(path + " is not JSON") }
+    o := try (try j["phoneme_id_map"] catch { error ModelError.Malformed(path + " has no phoneme_id_map") }).AsObj() catch { error ModelError.Malformed(path + ": phoneme_id_map") }
+    s := Symbols(true)
+    for i, k in o.Keys {
+        ids := try intsOf(o.Values[i])
+        s.Ids.Put(k, Array<I32>[I32(v) for v in ids])
+    }
+    return s
+}
+
+# a character's ids; one vits-ljs's vocabulary lacks lowercased first (VitsTokenizer's normalize)
+fn (s Symbols&) of(ch String&) Array<I32> ? ModelError {
+    key := ch if s.Piper or s.Ids.Has(ch) else ch.ToLower()
+    return try s.Ids.Get(key) catch { error ModelError.Unsupported("no symbol " + ch) }
+}
+
+# the ids of IPA text, a character (code point) at a time
+fn (s Symbols&) Encode(ipa String&) Array<I32> ? ModelError {
+    out := Vec<I32>()
+    gap := try s.of("_")
+    if s.Piper {
+        for v in try s.of("^"): out.Push(v)
+    }
+    for v in gap: out.Push(v)
+    at I64 = 0
+    for at < ipa.Len() {
+        _, n := try utf8.Decode(ipa, at) catch { error ModelError.Malformed("text that is not UTF-8") }
+        for v in try s.of(String(ipa[at:at + n])): out.Push(v)
+        for v in gap: out.Push(v)
+        at += n
+    }
+    if s.Piper {
+        for v in try s.of("$"): out.Push(v)
+    }
+    return out.ToArray()
+}
+
+# ---- the arithmetic ----
+
+Room I64 = 1 << 16          # the patch elements a task gathers at a time (256 KiB of F32)
+
+# a synthesis's products: a gemm workspace and room for patches for each task
+type Arith struct(threads I64) {
+    Threads I64 = threads.Max(1)
+    made := Vec<gemm.Workspace<F32>>()
+    for _ in range Threads: made.Push(gemm.Workspace<F32>(1, 4096))
+    ws mut Array<gemm.Workspace<F32>>& = made.ToArray()
+    col mut Array<F32>& = Array<F32>(Threads * Room)
+}
+
+# rows of c's patches gathered at a time
+fn runOf(c Conv&) I64 { return (Room / (c.In * c.K)).Max(1) }
+
+# f(task, r0, r1) over the n rows in runs of `run`, the runs dealt to the tasks in turn
+fn (a Arith&) runs(n I64, run I64, f fn&(task I64, r0 I64, r1 I64)) {
+    count := (n + run - 1) / run
+    t := a.Threads.Min(count).Max(1)
+    join {
+        for i in range t: spawn dealt(i, t, count, n, run, f)
+    }
+}
+
+fn dealt(task I64, t I64, count I64, n I64, run I64, f fn&(task I64, r0 I64, r1 I64)) {
+    for r in range task, count, t: f(task, r * run, (r * run + run).Min(n))
+}
+
+# dst = c over src: dst's row i is output q0 + i, reading src's rows q0 + i + k Dil - Pad (zeros outside src's rows),
+# each leaky-ReLU'd by slope first where act; add: the result added to what dst holds
+fn (a mut Arith&) Apply(dst mat.Mat<F32>&, src mat.Mat<F32>&, c Conv&, q0 I64 = 0, act Bool = false, slope F32 = 0.0, add Bool = false) {
+    a.runs(dst.Rows, runOf(c), fn(task I64, r0 I64, r1 I64) { convRun(a.ws[task], a.col[task * Room:(task + 1) * Room], dst, src, c, q0, r0, r1, act, slope, add) })
+}
+
+fn convRun(ws mut gemm.Workspace<F32>&, col mut Array<F32>&, dst mat.Mat<F32>&, src mat.Mat<F32>&, c Conv&, q0 I64, r0 I64, r1 I64, act Bool, slope F32, add Bool) {
+    rows := r1 - r0
+    d := c.In * c.K
+    out := mat.Mat<F32>(dst.Data, dst.Off + r0 * dst.Ld, rows, c.Out, dst.Ld)
+    w := mat.Mat<F32>(c.W, 0, c.Out, d, d)
+    beta := F32(1.0) if add else F32(0.0)
+    if c.K == 1 and not act {
+        gemm.Gemm(ws, out, mat.Mat<F32>(src.Data, src.Off + (q0 + r0) * src.Ld, rows, c.In, src.Ld), false, w, true, beta = beta, epi = gemm.Epilogue.Bias(c.Bias))
+        return
+    }
+    for i in range rows: gather(col, i * d, src, q0 + r0 + i, c, act, slope)
+    gemm.Gemm(ws, out, mat.Mat<F32>(col, 0, rows, d, d), false, w, true, beta = beta, epi = gemm.Epilogue.Bias(c.Bias))
+}
+
+# the patch of output row q into col from at: input channel ch's tap k at ch K + k
+fn gather(col mut Array<F32>&, at I64, src mat.Mat<F32>&, q I64, c Conv&, act Bool, slope F32) {
+    for k in range c.K {
+        j := q + k * c.Dil - c.Pad
+        if j < 0 or j >= src.Rows {
+            for ch in range c.In: col[at + ch * c.K + k] = 0.0
+            continue
+        }
+        o := src.Off + j * src.Ld
+        for ch in range c.In {
+            v := src.Data[o + ch]
+            col[at + ch * c.K + k] = v * slope if act and v < 0.0 else v
+        }
+    }
+}
+
+# a transposed convolution of src's n rows (leaky-ReLU'd by slope first) into dst's n S rows, phase by phase
+fn (a mut Arith&) Up(dst mut Array<F32>&, src mat.Mat<F32>&, u Up&, slope F32) {
+    n := src.Rows
+    for r in range u.S {
+        q0 I64 = 0
+        for q0 * u.S + r - u.P < 0: q0 += 1
+        q1 := (n * u.S - 1 + u.P - r) / u.S + 1
+        if q1 <= q0: continue
+        out := mat.Mat<F32>(dst, (q0 * u.S + r - u.P) * u.Out, q1 - q0, u.Out, u.S * u.Out)
+        a.Apply(out, src, u.Phases[r], q0, true, slope)
+    }
+}
+
+# a depthwise convolution (c.W [Out x K]) of rows r0 .. r1 of x (n rows, width wide) into y
+fn depthwise(y mut Array<F32>&, x Array<F32>&, n I64, width I64, c Conv&, r0 I64, r1 I64) {
+    for t in range r0, r1 {
+        for ch in range width {
+            s := c.Bias[ch]
+            for k in range c.K {
+                j := t + k * c.Dil - c.Pad
+                if j >= 0 and j < n: s += c.W[ch * c.K + k] * x[j * width + ch]
+            }
+            y[t * width + ch] = s
+        }
+    }
+}
+
+# LayerNorm of rows r0 .. r1 of x (width wide) into y, statistics in F64
+fn layerNorm(y mut Array<F32>&, x Array<F32>&, width I64, r0 I64, r1 I64, g Norm&) {
+    for r in range r0, r1 {
+        o := r * width
+        s F64 = 0.0
+        for i in range width: s += F64(x[o + i])
+        mean := s / F64(width)
+        v F64 = 0.0
+        for i in range width: v += (F64(x[o + i]) - mean) * (F64(x[o + i]) - mean)
+        inv := 1.0 / (v / F64(width) + 1e-5).Sqrt()
+        for i in range width: y[o + i] = F32((F64(x[o + i]) - mean) * inv) * g.G[i] + g.B[i]
+    }
+}
+
+# GELU (erf's), as PyTorch writes it: x / 2 (1 + erf(x / sqrt 2))
+fn gelu(x mut Array<F32>&, from I64, to I64) {
+    for i in range from, to {
+        v := x[i]
+        x[i] = v * 0.5 * (1.0 + (v * F32(0.7071067811865476)).Erf())
+    }
+}
+
+fn sigmoid(x F32) F32 { return 1.0 / (1.0 + (-x).Exp()) }
+
+# f(rows r0 .. r1) over the threads, rows split evenly
+fn (m Model&) rows(n I64, f fn&(r0 I64, r1 I64)) {
+    t := m.Threads.Min(n / 64).Max(1)
+    join {
+        for i in range t: spawn f(i * n / t, (i + 1) * n / t)
+    }
+}
+
+fn plain(a mut Array<F32>&, rows I64, cols I64) mat.Mat<F32> { return mat.Mat<F32>(a, 0, rows, cols, cols) }
+
+# ---- the text encoder ----
+
+# the n ids' hidden states ([n x Hidden]) and the prior's statistics ([n x 2 Flow]: means, then log-variances)
+fn (m Model&) encode(a mut Arith&, ids Array<I32>&) Array<F32>, Array<F32> {
+    c := m.C
+    n := ids.Len()
+    h := c.Hidden
+    x := Array<F32>(n * h)
+    scale := F32(F64(h).Sqrt())
+    for t, id in ids {
+        for i in range h: x[t * h + i] = m.Embed[I64(id) * h + i] * scale
+    }
+    q := Array<F32>(n * h)
+    k := Array<F32>(n * h)
+    v := Array<F32>(n * h)
+    att mut Array<F32>& = Array<F32>(n * h)
+    y := Array<F32>(n * h)
+    f := Array<F32>(n * c.Ffn)
+    for l in m.Enc {
+        a.Apply(plain(q, n, h), plain(x, n, h), l.Q)
+        a.Apply(plain(k, n, h), plain(x, n, h), l.K)
+        a.Apply(plain(v, n, h), plain(x, n, h), l.V)
+        hd := h / c.Heads
+        qs := F32(1.0 / F64(hd).Sqrt())
+        for i in range n * h: q[i] *= qs
+        m.rows(n, fn(r0 I64, r1 I64) { attend(att, q, k, v, l, n, h, c.Heads, c.Window, r0, r1) })
+        a.Apply(plain(y, n, h), plain(att, n, h), l.O)
+        for i in range n * h: y[i] += x[i]
+        layerNorm(x, y, h, 0, n, l.Ln1)
+        a.Apply(plain(f, n, c.Ffn), plain(x, n, h), l.F1)
+        for i in range n * c.Ffn: f[i] = f[i].Max(0.0)
+        a.Apply(plain(y, n, h), plain(f, n, c.Ffn), l.F2)
+        for i in range n * h: y[i] += x[i]
+        layerNorm(x, y, h, 0, n, l.Ln2)
+    }
+    stats := Array<F32>(n * 2 * c.Flow)
+    a.Apply(plain(stats, n, 2 * c.Flow), plain(x, n, h), m.Project)
+    return x, stats
+}
+
+# attention of queries r0 .. r1 over all n positions, each head's scores plus the relative keys' (offsets within the
+# window), its output plus the relative values weighted by the probabilities
+fn attend(att mut Array<F32>&, q Array<F32>&, k Array<F32>&, v Array<F32>&, l Layer&, n I64, h I64, heads I64, win I64, r0 I64, r1 I64) {
+    hd := h / heads
+    s := Array<F32>(n)
+    for i in range r0, r1 {
+        for hh in range heads {
+            o := hh * hd
+            for j in range n {
+                dot F32 = 0.0
+                for e in range hd: dot += q[i * h + o + e] * k[j * h + o + e]
+                rel := j - i + win
+                if rel >= 0 and rel <= 2 * win {
+                    rd F32 = 0.0
+                    for e in range hd: rd += q[i * h + o + e] * l.RelK[rel * hd + e]
+                    dot += rd
+                }
+                s[j] = dot
+            }
+            softmax(s, n)
+            for e in range hd: att[i * h + o + e] = 0.0
+            for j in range n {
+                p := s[j]
+                for e in range hd: att[i * h + o + e] += p * v[j * h + o + e]
+            }
+            for rel in range 2 * win + 1 {
+                j := i + rel - win
+                if j < 0 or j >= n: continue
+                for e in range hd: att[i * h + o + e] += s[j] * l.RelV[rel * hd + e]
+            }
+        }
+    }
+}
+
+fn softmax(s mut Array<F32>&, n I64) {
+    top := s[0]
+    for i in range 1, n: top = top.Max(s[i])
+    sum F32 = 0.0
+    for i in range n {
+        s[i] = (s[i] - top).Exp()
+        sum += s[i]
+    }
+    for i in range n: s[i] /= sum
+}
+
+# ---- the stochastic duration predictor, in reverse ----
+
+# the stack over x (n rows of Hidden), g added first where given
+fn (m Model&) dds(a mut Arith&, x mut Array<F32>&, n I64, d Dds&, g Array<F32>&) {
+    h := m.C.Hidden
+    if g.Len() > 0 {
+        for i in range n * h: x[i] += g[i]
+    }
+    y := Array<F32>(n * h)
+    z := Array<F32>(n * h)
+    for i in range d.Sep.Len() {
+        depthwise(y, x, n, h, d.Sep[i], 0, n)
+        layerNorm(y, y, h, 0, n, d.N1[i])
+        gelu(y, 0, n * h)
+        a.Apply(plain(z, n, h), plain(y, n, h), d.Point[i])
+        layerNorm(z, z, h, 0, n, d.N2[i])
+        gelu(z, 0, n * h)
+        for j in range n * h: x[j] += z[j]
+    }
+}
+
+# every id's log-duration from the text's hidden states x
+fn (m Model&) logDurations(a mut Arith&, x mut Array<F32>&, n I64, noise F32, r mut rand.Rand&) Array<F32> {
+    c := m.C
+    h := c.Hidden
+    g := Array<F32>(n * h)
+    t := Array<F32>(n * h)
+    a.Apply(plain(t, n, h), plain(x, n, h), m.Dp.Pre)
+    m.dds(a, t, n, m.Dp.Stack, Array<F32>(0))
+    a.Apply(plain(g, n, h), plain(t, n, h), m.Dp.Proj)
+    # the latent, [2 x n]: channel 0 then channel 1
+    z := Array<F32>(2 * n)
+    for i in range 2 * n: z[i] = F32(r.Normal()) * noise
+    for i in range c.DpFlows - 1 {
+        flip(z, n)
+        m.splineFlow(a, z, n, g, m.Dp.Flows[c.DpFlows - 1 - i])
+    }
+    flip(z, n)
+    for ch in range 2 {
+        for j in range n: z[ch * n + j] = (z[ch * n + j] - m.Dp.Translate[ch]) * m.Dp.Scale[ch]
+    }
+    return Array<F32>[z[j] for j in range n]
+}
+
+# a spline flow in reverse over the latent z ([2 x n]), g the text's conditioning
+fn (m Model&) splineFlow(a mut Arith&, z mut Array<F32>&, n I64, g mut Array<F32>&, f SplineFlow&) {
+    c := m.C
+    h := c.Hidden
+    bins := 3 * c.Bins - 1
+    x0 := Array<F32>(n)
+    for j in range n: x0[j] = z[j]
+    t := Array<F32>(n * h)
+    p := Array<F32>(n * bins)
+    a.Apply(plain(t, n, h), plain(x0, n, 1), f.Pre)
+    m.dds(a, t, n, f.Stack, g)
+    a.Apply(plain(p, n, bins), plain(t, n, h), f.Proj)
+    root := F32(F64(h).Sqrt())
+    for j in range n: z[n + j] = spline(z[n + j], p[j * bins:(j + 1) * bins], c.Bins, c.Tail, root)
+}
+
+# the latent's two channels exchanged
+fn flip(z mut Array<F32>&, n I64) {
+    for j in range n {
+        t := z[j]
+        z[j] = z[n + j]
+        z[n + j] = t
+    }
+}
+
+fn softplus(x F32) F32 { return x if x > 20.0 else x.Exp().Log1p() }
+
+# the inverse of the monotone rational-quadratic spline whose bins p gives (widths, heights / sqrt(hidden) first, then
+# the inner derivatives) on -tail .. tail; the identity outside
+fn spline(x F32, p Array<F32>&, bins I64, tail F32, root F32) F32 {
+    if x < -tail or x > tail: return x
+    minW := F32(1e-3)
+    widths := Array<F32>(bins)
+    heights := Array<F32>(bins)
+    for i in range bins {
+        widths[i] = p[i] / root
+        heights[i] = p[bins + i] / root
+    }
+    cw := knots(widths, bins, tail, minW)
+    ch := knots(heights, bins, tail, minW)
+    for i in range bins {
+        widths[i] = cw[i + 1] - cw[i]
+        heights[i] = ch[i + 1] - ch[i]
+    }
+    edge := F32((F64(1.0 - 1e-3).Exp() - 1.0).Log())
+    deriv := Array<F32>(bins + 1)
+    for i in range bins + 1 {
+        u := edge if i == 0 or i == bins else p[2 * bins + i - 1]
+        deriv[i] = minW + softplus(u)
+    }
+    ch[bins] += F32(1e-6)
+    b I64 = -1
+    for i in range bins + 1: b += 1 if x >= ch[i] else 0
+    delta := heights[b] / widths[b]
+    d0, d1 := deriv[b], deriv[b + 1]
+    i1 := d0 + d1 - 2.0 * delta
+    i2 := x - ch[b]
+    i3 := i2 * i1
+    qa := heights[b] * (delta - d0) + i3
+    qb := heights[b] * d0 - i3
+    qc := -delta * i2
+    disc := qb * qb - 4.0 * qa * qc
+    t := (2.0 * qc) / (-qb - disc.Sqrt())
+    return t * widths[b] + cw[b]
+}
+
+# the knots of bins of these unnormalised sizes on -tail .. tail: softmax, the least size, cumulative sums scaled
+fn knots(u Array<F32>&, bins I64, tail F32, least F32) Array<F32> {
+    s := Array<F32>(bins)
+    for i in range bins: s[i] = u[i]
+    softmax(s, bins)
+    out := Array<F32>(bins + 1)
+    keep := F32(1.0 - 1e-3 * F64(bins))
+    acc F32 = 0.0
+    for i in range bins {
+        acc += least + keep * s[i]
+        out[i + 1] = acc
+    }
+    for i in range bins + 1: out[i] = 2.0 * tail * out[i] + -tail
+    out[0] = -tail
+    out[bins] = tail
+    return out
+}
+
+# ---- synthesis ----
+
+type Options struct(c Config&) {
+    NoiseScale F32 = c.NoiseScale                   # the prior's sampling
+    NoiseScaleDuration F32 = c.NoiseScaleDuration   # the duration predictor's
+    LengthScale F32 = c.LengthScale                 # every duration times this: slower above 1
+    Seed U64 = 0
+}
+
+# the waveform of ids (samples in -1 .. 1 at C.Rate) and every id's frames (C.Hop() samples each)
+fn (m Model&) Speak(ids Array<I32>&, o Options&) Array<F32>, Array<I64> {
+    c := m.C
+    a := Arith(m.Threads)
+    r := rand.Rand(o.Seed)
+    n := ids.Len()
+    x, stats := m.encode(a, ids)
+    logw := m.logDurations(a, x, n, o.NoiseScaleDuration, r)
+    dur := Array<I64>(n)
+    frames I64 = 0
+    for i in range n {
+        dur[i] = I64((logw[i].Exp() * o.LengthScale).Ceil())
+        frames += dur[i]
+    }
+    frames = frames.Max(1)
+    # the prior over the frames, each id's statistics repeated for its frames
+    fl := c.Flow
+    z := Array<F32>(frames * fl)
+    f I64 = 0
+    for i in range n {
+        for _ in range dur[i] {
+            if f >= frames: break
+            for e in range fl: z[f * fl + e] = stats[i * 2 * fl + e] + F32(r.Normal()) * stats[i * 2 * fl + fl + e].Exp() * o.NoiseScale
+            f += 1
+        }
+    }
+    for k in range c.Flows: m.couple(a, z, frames, m.Couplings[c.Flows - 1 - k])
+    return m.decode(a, z, frames), dur
+}
+
+# a coupling in reverse over z (frames rows of Flow), its channels flipped first
+fn (m Model&) couple(a mut Arith&, z mut Array<F32>&, n I64, cp Coupling&) {
+    fl := m.C.Flow
+    h := m.C.Hidden
+    half := fl / 2
+    for t in range n {
+        for e in range half {
+            u := z[t * fl + e]
+            z[t * fl + e] = z[t * fl + fl - 1 - e]
+            z[t * fl + fl - 1 - e] = u
+        }
+    }
+    x := Array<F32>(n * h)
+    a.Apply(plain(x, n, h), mat.Mat<F32>(z, 0, n, half, fl), cp.Pre)
+    acts := Array<F32>(n * 2 * h)
+    gated mut Array<F32>& = Array<F32>(n * h)
+    skip := Array<F32>(n * 2 * h)
+    out := Array<F32>(n * h)
+    for l in range cp.In.Len() {
+        a.Apply(plain(acts, n, 2 * h), plain(x, n, h), cp.In[l])
+        m.rows(n, fn(r0 I64, r1 I64) { gate(gated, acts, h, r0, r1) })
+        last := l + 1 == cp.In.Len()
+        a.Apply(plain(skip, n, h if last else 2 * h), plain(gated, n, h), cp.Skip[l])
+        for t in range n {
+            if last {
+                for e in range h: out[t * h + e] += skip[t * h + e]
+                continue
+            }
+            for e in range h {
+                x[t * h + e] += skip[t * 2 * h + e]
+                out[t * h + e] += skip[t * 2 * h + h + e]
+            }
+        }
+    }
+    mean := Array<F32>(n * half)
+    a.Apply(plain(mean, n, half), plain(out, n, h), cp.Post)
+    for t in range n {
+        for e in range half: z[t * fl + half + e] -= mean[t * half + e]
+    }
+}
+
+# tanh of the first h of each row of acts (2h wide) times the sigmoid of the second, into g
+fn gate(g mut Array<F32>&, acts Array<F32>&, h I64, r0 I64, r1 I64) {
+    for t in range r0, r1 {
+        for e in range h: g[t * h + e] = acts[t * 2 * h + e].Tanh() * sigmoid(acts[t * 2 * h + h + e])
+    }
+}
+
+# HiFi-GAN: the latent's n frames to n Hop() samples
+fn (m Model&) decode(a mut Arith&, z mut Array<F32>&, n I64) Array<F32> {
+    c := m.C
+    most I64 = n * c.Initial
+    rows I64 = n
+    ch I64 = c.Initial
+    for r in c.Rates {
+        rows *= r
+        ch /= 2
+        most = most.Max(rows * ch)
+    }
+    y := Array<F32>(most)
+    u := Array<F32>(most)
+    s := Array<F32>(most)
+    w := Array<F32>(most)
+    t := Array<F32>(most)
+    a.Apply(plain(y, n, c.Initial), plain(z, n, c.Flow), m.DecPre)
+    rows = n
+    ch = c.Initial
+    kinds := c.ResKernels.Len()
+    for i, up in m.Ups {
+        a.Up(u, plain(y, rows, ch), up, c.Slope)
+        rows *= up.S
+        ch = up.Out
+        for j in range kinds {
+            for e in range rows * ch: w[e] = u[e]
+            m.res(a, w, t, rows, ch, m.Blocks[i * kinds + j])
+            for e in range rows * ch: s[e] = w[e] if j == 0 else s[e] + w[e]
+        }
+        for e in range rows * ch: y[e] = s[e] / F32(kinds)
+    }
+    wave := Array<F32>(rows)
+    a.Apply(plain(wave, rows, 1), plain(y, rows, ch), m.DecPost, 0, true, F32(0.01))
+    for e in range rows: wave[e] = wave[e].Tanh()
+    return wave
+}
+
+# a residual block over x (rows of ch) in place, t its scratch
+fn (m Model&) res(a mut Arith&, x mut Array<F32>&, t mut Array<F32>&, rows I64, ch I64, b Res&) {
+    slope := m.C.Slope
+    for k in range b.C1.Len() {
+        if b.C2.Len() == 0 {
+            a.Apply(plain(t, rows, ch), plain(x, rows, ch), b.C1[k], 0, true, slope)
+            for e in range rows * ch: x[e] += t[e]
+            continue
+        }
+        a.Apply(plain(t, rows, ch), plain(x, rows, ch), b.C1[k], 0, true, slope)
+        a.Apply(plain(x, rows, ch), plain(t, rows, ch), b.C2[k], 0, true, slope, true)
+    }
+}
+
+# ---- checks against the references (speech/tools/vits_reference.py) ----
+
+# every case of the reference in ref (cases.json: each case's IPA and ids) spoken with no noise: the ids s gives its
+# IPA the reference's, every duration the reference's; the greatest difference of a sample, -1 where there is no reference
+fn gapTo(m Model&, s Symbols&, ref String&) F64 {
+    text := try os.ReadFile(ref + "/cases.json") catch { return -1.0 }
+    o := json.Json.Parse(text)!.AsObj()!
+    worst F64 = 0.0
+    for i, key in o.Keys {
+        ids := s.Encode(o.Values[i]["ipa"]!.AsStr()!)!
+        want := intsOf(o.Values[i]["ids"]!)!
+        assert ids.Len() == want.Len(), key + ": " + $ids.Len() + " ids, not " + $want.Len()
+        for j, v in ids: assert I64(v) == want[j], key + ": id " + $j
+        opts := Options(m.C)
+        opts.NoiseScale = 0.0
+        opts.NoiseScaleDuration = 0.0
+        opts.LengthScale = 1.0
+        wave, dur := m.Speak(ids, opts)
+        rd := mel.F32s(ref + "/" + key + ".dur.f32")!
+        frames I64 = 0
+        for j, d in dur {
+            assert d == I64(rd[j]), key + ": id " + $j + " lasts " + $d + " frames, not " + $rd[j]
+            frames += d
+        }
+        rw := mel.F32s(ref + "/" + key + ".wav.f32")!
+        assert rw.Len() == wave.Len(), key + ": " + $wave.Len() + " samples, not " + $rw.Len()
+        gap F64 = 0.0
+        for j in range rw.Len(): gap = gap.Max((F64(wave[j]) - F64(rw[j])).Abs())
+        Println(key + ": " + $ids.Len() + " ids, " + $frames + " frames, every duration equal, samples within " + $gap)
+        worst = worst.Max(gap)
+    }
+    return worst
+}
+
+test Model "vits-ljs: durations equal to transformers', the waveform within 1e-4 (where the files are)" {
+    dir := mel.Cache() + "/models/kakao-enterprise--vits-ljs"
+    if not os.Exists(dir + "/model.safetensors") {
+        Println("skipped: no model in " + dir)
+        return
+    }
+    m := Model.Load(dir)!
+    gap := gapTo(m, Symbols.Vocab(dir + "/vocab.json")!, mel.Cache() + "/ref/vits-ljs")
+    if gap < 0.0: Println("skipped: no reference")
+    assert gap < 1e-4, $gap
+}
+
+test Model "Piper's voices: durations equal to onnxruntime's, the waveform within 1e-4 (where the files are)" {
+    for voice in ["en_US-ljspeech-medium", "sv_SE-nst-medium"] {
+        path := mel.Cache() + "/models/piper/" + voice + ".onnx"
+        if not os.Exists(path) {
+            Println("skipped: no voice " + path)
+            continue
+        }
+        m := Model.Piper(path)!
+        gap := gapTo(m, Symbols.PiperMap(path + ".json")!, mel.Cache() + "/ref/" + voice)
+        if gap < 0.0: Println("skipped: no reference for " + voice)
+        assert gap < 1e-4, voice + ": " + $gap
+    }
+}
+
