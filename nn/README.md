@@ -30,6 +30,14 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   language model over any batch source with `Random` and `At` (data/text's `Windows`, data/tokens' `Tokens`); `Fit`, a
   whole run with reports, a record through io/runlog and checkpoints; `Save`/`Resume`, safetensors files holding the
   parameters, the optimizer's state and the step, which resume a run bit for bit.
+- `dist.olang` - one model trained by workers that share no network, only a store of named blobs: DiLoCo. Each worker
+  trains its own copy for H steps with its own optimizer, `Sync` hands in its delta (global - local) and takes back the
+  outer step the coordinator (worker 0) took on the average - Nesterov momentum, DiLoCo's 0.7 and 0.9. `Store` is the
+  transport (`Put`/`Get` of named blobs): `DirStore` a directory, `HttpStore` PUT/GET under a base URL. Deltas and updates
+  go as F32, BF16, Int8 (blocks of 256) or TopK (error feedback kept in the worker's model); `Fragments` > 1 streams
+  (a fragment a round); a worker missing the coordinator's deadline is left out and folded in a round late; `Begin`
+  joins a run from its newest `state.<R>` (a safetensors checkpoint: the flat region and the outer momentum) and the
+  updates after it. README "Distributed training" has the blob names and the HTTP contract.
 - `generate.olang` - `Sample` and the generators: `CachedTokens`/`Cached` through a decoding graph's key-value cache, `CachedBatch` (a batch of sequences decoded at once on a graph planned to decode Batch sequences: a forward of one position a sequence a step, each sequence its own cache - several samples of a prompt as rows),
   `RerunTokens`/`Rerun` running the context again, on token ids and on text.
 

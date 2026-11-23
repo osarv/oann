@@ -1,0 +1,520 @@
+# dist - one model trained by workers that share no network, only a store of named blobs: DiLoCo (Douillard et al.
+# 2023, "DiLoCo: Distributed Low-Communication Training of Language Models") with the streaming and late-worker
+# variants of its follow-ups.
+#
+# Every worker holds a whole copy of the model and trains it with its own (inner) optimizer on its own data for H steps;
+# then it hands in its pseudo-gradient, delta = global - local (how far its H steps moved it from the shared model),
+# and takes back the shared model. The coordinator (worker 0, itself a worker too) averages the deltas it has, takes an
+# outer step - Nesterov momentum on the average,
+#     m <- mu m + avg,   update = lr (avg + mu m)      (lr (m) without Nesterov)
+# - and publishes the update; every worker subtracts it from its copy of the global model and sets its parameters to
+# the result, keeping its inner optimizer's state. One round moves one delta up and one update down a worker, each the
+# size of the parameters in the codec chosen, instead of a gradient every step.
+#
+# The store (`Store`: Put and Get of named byte blobs, nothing else) is all the workers share: `DirStore` a directory
+# (processes on one machine, or a shared disk), `HttpStore` a plain blob store over HTTP(S) - PUT and GET of a name under
+# a base URL, 404 for a name not there yet (README "Distributed training" has the contract). Names:
+#     r<R>.d<W>      worker W's delta of round R               r<R>.u     the update of round R (its contributors in its metadata)
+#     state.<R>      the global model and the outer momentum after round R, every SnapshotEvery rounds
+#     latest         the round of the newest state.<R>, as text
+# Every blob is a safetensors file (io/checkpoint), so any of them opens in PyTorch, and a state is a checkpoint: the
+# flat parameter region "global" (F32, Graph.Params' or a BF16 graph's Masters' order), "momentum", and the round,
+# the run's name and lineage in the metadata.
+#
+# Variants: the codec of the deltas and of the update (F32, BF16, Int8 - blocks of 256 with an F32 scale each -, or
+# TopK: the largest Keep share of the entries; the rest stays in the worker's own model - its parameters set to the
+# global model less what it did not send - so it is in the next delta: error feedback that counts nothing twice);
+# Fragments > 1 is streaming DiLoCo - round R syncs only fragment R mod Fragments of the region, so a sync every H /
+# Fragments steps moves 1 / Fragments of the bytes; a worker the coordinator has not heard from within TimeoutMs (with
+# Quorum deltas in) is left out of the round, and its delta, when it comes, is folded into that fragment's next round
+# (Stale); a worker that joins late (Begin) starts from the newest state and replays the updates after it.
+
+import "std/http"
+import "std/os"
+import "std/time"
+import "../io/checkpoint"
+import "../tensor"
+
+# why a blob could not be stored or read
+type StoreError error {
+    Missing             # no blob of that name (yet)
+    Failed(why String)  # the store refused or could not be reached
+    Malformed(why String) # a blob that is not what its name says
+    Timeout(why String) # waited longer than allowed
+}
+
+# what workers share: named blobs, each written once, read by anyone. Get of a name not written (yet) is Missing
+type Store trait {
+    Put(name String&, data Array<U8>&) ? StoreError
+    Get(name String&) Array<U8>& ? StoreError
+}
+
+# a directory: each blob a file, written beside and renamed into place so a reader never sees half of one
+type DirStore struct(root String&) {
+    Root String& = root
+}
+
+fn (s DirStore&) Put(name String&, data Array<U8>&) ? StoreError {
+    path := s.Root + "/" + name
+    part := path + ".part"
+    try os.WriteFile(part, data) catch err { error StoreError.Failed("writing " + part + ": " + $err) }
+    try os.Rename(part, path) catch err { error StoreError.Failed("renaming " + part + ": " + $err) }
+}
+
+fn (s DirStore&) Get(name String&) Array<U8>& ? StoreError {
+    path := s.Root + "/" + name
+    if not os.Exists(path) { error StoreError.Missing }
+    text := try os.ReadFile(path) catch err { error StoreError.Failed("reading " + path + ": " + $err) }
+    return text.Bytes()
+}
+
+# a blob store over HTTP(S): PUT Base/name with the blob as body, GET Base/name, 404 for a name not there; Token, when
+# set, sent as "Authorization: Bearer Token". Any status but 2xx and 404 is Failed
+type HttpStore struct(base String&, token String& = "", timeoutMs I64 = 120000) {
+    Base String& = base
+    Token String& = token
+    TimeoutMs I64 = timeoutMs
+}
+
+fn (s HttpStore&) headers() Array<http.Header> {
+    if s.Token == "": return Array<http.Header>(0, http.Header("", ""))
+    return Array<http.Header>(1, http.Header("Authorization", "Bearer " + s.Token))
+}
+
+fn (s HttpStore&) Put(name String&, data Array<U8>&) ? StoreError {
+    r := try http.Response.Send("PUT", s.Base + "/" + name, s.headers(), data, s.TimeoutMs) catch err { error StoreError.Failed("PUT " + name + ": " + $err) }
+    if r.Status < 200 or r.Status >= 300 { error StoreError.Failed("PUT " + name + ": status " + $r.Status) }
+}
+
+fn (s HttpStore&) Get(name String&) Array<U8>& ? StoreError {
+    r := try http.Response.Send("GET", s.Base + "/" + name, s.headers(), "", s.TimeoutMs) catch err { error StoreError.Failed("GET " + name + ": " + $err) }
+    if r.Status == 404 { error StoreError.Missing }
+    if r.Status < 200 or r.Status >= 300 { error StoreError.Failed("GET " + name + ": status " + $r.Status) }
+    return r.Body.Bytes()
+}
+
+# ---- codecs ----
+
+# how a delta or an update is sent
+type Codec enum {
+    F32     # 4 bytes an entry, exact
+    BF16    # 2 bytes, rounded to nearest
+    Int8    # 1 byte, blocks of 256 entries scaled by their largest magnitude (4 bytes a block)
+    TopK    # the largest Keep share of the entries by magnitude: an I32 index and a BF16 value each
+}
+
+fn Codec.Named(name String&) Codec ? StoreError {
+    if name == "f32": return Codec.F32
+    if name == "bf16": return Codec.BF16
+    if name == "int8": return Codec.Int8
+    if name == "topk": return Codec.TopK
+    error StoreError.Malformed("no codec " + name)
+}
+
+fn (c Codec) Name() String {
+    if c == Codec.F32: return "f32"
+    if c == Codec.BF16: return "bf16"
+    if c == Codec.Int8: return "int8"
+    return "topk"
+}
+
+block I64 = 256
+
+# v as a blob in codec c (keep: TopK's share), its metadata pairs given; "decoded" is set to what a reader will get back
+fn Encode(v Array<F32>&, c Codec, keep F64, meta Array<String>&, decoded mut Array<F32>&) Array<U8> ? StoreError {
+    n := v.Len()
+    w := checkpoint.Writer()
+    w.Meta("codec", c.Name())
+    w.Meta("count", $n)
+    for i in range meta.Len() / 2: w.Meta(meta[2 * i], meta[2 * i + 1])
+    if c == Codec.F32 {
+        for i in range n: decoded[i] = v[i]
+        try w.Add("d", tensor.Tensor<F32>.Of(v, n)!) catch err { error StoreError.Malformed($err) }
+    } else if c == Codec.BF16 {
+        for i in range n: decoded[i] = F32(BF16(v[i]))
+        try w.AddAs("d", tensor.Tensor<F32>.Of(v, n)!, checkpoint.Dtype.BF16) catch err { error StoreError.Malformed($err) }
+    } else if c == Codec.Int8 {
+        nb := (n + block - 1) / block
+        q := Array<I8>(n)
+        s := Array<F32>(nb)
+        for b in range nb {
+            lo, hi := b * block, (b * block + block).Min(n)
+            big F32 = 0.0
+            for i in range lo, hi: big = big.Max(v[i].Abs())
+            scale F32 = big / F32(127.0)
+            s[b] = scale
+            inv F32 = F32(1.0) / scale if scale > F32(0.0) else F32(0.0)
+            for i in range lo, hi {
+                k := I8(F64(v[i] * inv).Round().Max(-127.0).Min(127.0))
+                q[i] = k
+                decoded[i] = F32(k) * scale
+            }
+        }
+        try w.Add("q", tensor.Tensor<I8>.Of(q, n)!) catch err { error StoreError.Malformed($err) }
+        try w.Add("s", tensor.Tensor<F32>.Of(s, nb)!) catch err { error StoreError.Malformed($err) }
+    } else {
+        k := I64(F64(n) * keep).Max(1).Min(n)
+        mags := Array<F32>(n)
+        for i in range n: mags[i] = v[i].Abs()
+        mags.Sort(fn(x, y): return x < y)
+        cut := mags[n - k]
+        idx := Vec<I32>()
+        vals := Vec<F32>()
+        for i in range n {
+            decoded[i] = 0.0
+            if v[i].Abs() >= cut and idx.Len() < k {
+                idx.Push(I32(i))
+                vals.Push(v[i])
+                decoded[i] = F32(BF16(v[i]))
+            }
+        }
+        m := idx.Len()
+        ia, va := idx.ToArray(), vals.ToArray()
+        try w.Add("i", tensor.Tensor<I32>.Of(ia, m)!) catch err { error StoreError.Malformed($err) }
+        try w.AddAs("v", tensor.Tensor<F32>.Of(va, m)!, checkpoint.Dtype.BF16) catch err { error StoreError.Malformed($err) }
+    }
+    return try w.Bytes() catch err { error StoreError.Failed("encoding: " + $err) }
+}
+
+# a blob's values into out (of the count it was encoded with), and its file for the metadata
+fn Decode(bytes Array<U8>&, out mut Array<F32>&) checkpoint.File ? StoreError {
+    f := try checkpoint.File.Parse(bytes) catch err { error StoreError.Malformed($err) }
+    c := try Codec.Named(try f.Meta.Get("codec") catch { error StoreError.Malformed("no codec") })
+    n := try (try f.Meta.Get("count") catch { error StoreError.Malformed("no count") }).ParseInt() catch { error StoreError.Malformed("count") }
+    if n != out.Len() { error StoreError.Malformed("a blob of " + $n + " values for " + $out.Len()) }
+    if c == Codec.F32 or c == Codec.BF16 {
+        d := try f.Get<F32>("d") catch err { error StoreError.Malformed($err) }
+        dv := d.Flat()!
+        for i in range n: out[i] = dv[i]
+    } else if c == Codec.Int8 {
+        q := (try f.Get<I8>("q") catch err { error StoreError.Malformed($err) }).Flat()!
+        s := (try f.Get<F32>("s") catch err { error StoreError.Malformed($err) }).Flat()!
+        for i in range n: out[i] = F32(q[i]) * s[i / block]
+    } else {
+        for i in range n: out[i] = 0.0
+        ix := (try f.Get<I32>("i") catch err { error StoreError.Malformed($err) }).Flat()!
+        vs := (try f.Get<F32>("v") catch err { error StoreError.Malformed($err) }).Flat()!
+        for j in range ix.Len(): out[I64(ix[j])] = vs[j]
+    }
+    return f
+}
+
+# ---- DiLoCo ----
+
+# what one round did: its number, the fragment's first and last entry, the deltas averaged (Stale of them a round
+# late), the bytes this worker sent and received, and the seconds it waited on the others
+type Report struct(Round I64, Lo I64, Hi I64, Contributors I64, Stale I64, Up I64, Down I64, Wait F64) {
+    Round
+    Lo
+    Hi
+    Contributors
+    Stale
+    Up
+    Down
+    Wait
+}
+
+# worker "worker" of "workers" training a region of "count" parameters together through store. OuterRate and Momentum
+# are the outer Nesterov step's (DiLoCo's 0.7 and 0.9); Coded the deltas' codec, Updates the update's; Keep TopK's share;
+# Fragments the streaming split; the coordinator waits up to TimeoutMs for every delta, then goes on with Quorum (at
+# least 1: its own); PollMs between looks at the store; SnapshotEvery rounds a state is written (0: never)
+type DiLoCo<S Store> struct(store S&, worker I64, workers I64, count I64, outerRate F64 = 0.7, momentum F64 = 0.9
+        nesterov Bool = true, coded Codec = Codec.BF16, updates Codec = Codec.BF16, keep F64 = 0.01, fragments I64 = 1
+        quorum I64 = 1, timeoutMs I64 = 600000, pollMs I64 = 5, stale Bool = true, snapshotEvery I64 = 0, name String& = "run"
+        lineage String& = "") {
+    store
+    Worker I64 = worker
+    Workers I64 = workers
+    OuterRate F64 = outerRate
+    Momentum F64 = momentum
+    Nesterov Bool = nesterov
+    Coded Codec = coded
+    Updates Codec = updates
+    Keep F64 = keep
+    Fragments I64 = fragments
+    Quorum I64 = quorum
+    TimeoutMs I64 = timeoutMs
+    PollMs I64 = pollMs
+    Stale Bool = stale
+    SnapshotEvery I64 = snapshotEvery
+    Name String& = name
+    Lineage String& = lineage
+    Round I64 = 0                                   # the next round to sync
+    Global mut Array<F32>& = Array<F32>(count)      # the shared model as of the last round synced
+    Buf mut Array<F32>& = Array<F32>(count)         # the outer momentum (the coordinator's)
+    residual mut Array<F32>& = Array<F32>(count)    # what TopK left out of this worker's last delta, kept in its model
+    scratch mut Array<F32>& = Array<F32>(count)
+    acc mut Array<F32>& = Array<F32>(count)
+    late mut Array<Bool>& = Array<Bool>(workers * fragments)  # (fragment, worker): left out of the fragment's last round
+    BytesUp I64 = 0
+    BytesDown I64 = 0
+}
+
+# fragment f's entries: lo, hi
+fn (d DiLoCo<S>&) fragment(f I64) I64, I64 {
+    n := d.Global.Len()
+    return n * f / d.Fragments, n * (f + 1) / d.Fragments
+}
+
+fn (d DiLoCo<S>&) sleep() { time.Sleep(time.Duration.Millis(d.PollMs)) }
+
+# the blob "name", waiting for it up to ms milliseconds
+fn (d mut DiLoCo<S>&) await(name String&, ms I64) Array<U8>& ? StoreError {
+    t0 := time.Now()
+    for {
+        b := try d.store.Get(name) catch StoreError.Missing {
+            if time.Since(t0) > ms * 1000000 { error StoreError.Timeout("waited " + $ms + " ms for " + name) }
+            d.sleep()
+            continue
+        }
+        d.BytesDown += b.Len()
+        return b
+    }
+}
+
+# the run joined: params set to the shared model - the newest state in the store and every update after it, or params
+# themselves (every worker's the same: the same seed) when there is none yet. Call once before training
+fn (d mut DiLoCo<S>&) Begin(params mut Array<F32>&) ? StoreError {
+    for i in range params.Len(): d.Global[i] = params[i]
+    latest := try d.store.Get("latest") catch StoreError.Missing default "".Bytes()
+    if latest.Len() > 0 {
+        r := try String(latest).Trim().ParseInt() catch { error StoreError.Malformed("latest") }
+        b := try d.store.Get("state." + $r)
+        d.BytesDown += b.Len()
+        f := try checkpoint.File.Parse(b) catch err { error StoreError.Malformed($err) }
+        g := (try f.Get<F32>("global") catch err { error StoreError.Malformed($err) }).Flat()!
+        m := (try f.Get<F32>("momentum") catch err { error StoreError.Malformed($err) }).Flat()!
+        if g.Len() != d.Global.Len() { error StoreError.Malformed("a state of " + $g.Len() + " parameters for " + $d.Global.Len()) }
+        for i in range g.Len() {
+            d.Global[i] = g[i]
+            d.Buf[i] = m[i]
+        }
+        d.Round = r + 1
+    }
+    for {                                           # the updates since
+        b := try d.store.Get("r" + $d.Round + ".u") catch StoreError.Missing { break }
+        d.BytesDown += b.Len()
+        try d.apply(b)
+        d.Round++
+    }
+    for i in range params.Len(): params[i] = d.Global[i]
+}
+
+# an update blob subtracted from the global model's fragment
+fn (d mut DiLoCo<S>&) apply(b Array<U8>&) ? StoreError {
+    lo, hi := d.fragment(d.Round % d.Fragments)
+    u := d.scratch[lo:hi]
+    try Decode(b, u)
+    for i in range lo, hi: d.Global[i] -= d.scratch[i]
+}
+
+# one round: this worker's delta handed in, the round's update taken back, params' fragment set to the shared model's.
+# Call every H (H / Fragments when streaming) inner steps; a BF16 graph's region is its Masters (SyncParams after)
+fn (d mut DiLoCo<S>&) Sync(params mut Array<F32>&) Report ? StoreError {
+    f := d.Round % d.Fragments
+    lo, hi := d.fragment(f)
+    up0, down0 := d.BytesUp, d.BytesDown
+    delta := Array<F32>(hi - lo)
+    for i in range lo, hi: delta[i - lo] = d.Global[i] - params[i]
+    sent := Array<F32>(hi - lo)
+    blob := try Encode(delta, d.Coded, d.Keep, Array<String>["round", $d.Round, "worker", $d.Worker, "lo", $lo], sent)
+    for i in range lo, hi: d.residual[i] = delta[i - lo] - sent[i - lo] if d.Coded == Codec.TopK else 0.0
+    try d.store.Put("r" + $d.Round + ".d" + $d.Worker, blob)
+    d.BytesUp += blob.Len()
+    t0 := time.Now()
+    contributors, stale := 0, 0
+    if d.Worker == 0 {
+        contributors, stale = try d.coordinate(lo, hi)
+    } else {
+        b := try d.await("r" + $d.Round + ".u", 2 * d.TimeoutMs + 60000)
+        f2 := try checkpoint.File.Parse(b) catch err { error StoreError.Malformed($err) }
+        contributors = try (try f2.Meta.Get("contributors") catch default "0").ParseInt() catch default 0
+        stale = try (try f2.Meta.Get("stale") catch default "0").ParseInt() catch default 0
+        try d.apply(b)
+    }
+    wait := F64(time.Since(t0)) * 1e-9
+    for i in range lo, hi: params[i] = d.Global[i] - d.residual[i]
+    rep := Report(d.Round, lo, hi, contributors, stale, d.BytesUp - up0, d.BytesDown - down0, wait)
+    d.Round++
+    return rep
+}
+
+# the coordinator's part of a round over lo ... hi - 1: the deltas gathered, averaged, the outer step taken and
+# published (and applied here). Gives the deltas averaged and how many of them were a round late
+fn (d mut DiLoCo<S>&) coordinate(lo I64, hi I64) I64, I64 ? StoreError {
+    f := d.Round % d.Fragments
+    n := hi - lo
+    one := Array<F32>(n)
+    for i in range lo, hi: d.acc[i] = 0.0
+    have := Array<Bool>(d.Workers)
+    got I64 = 0
+    t0 := time.Now()
+    for {
+        for w in range d.Workers {
+            if have[w]: continue
+            b := try d.store.Get("r" + $d.Round + ".d" + $w) catch StoreError.Missing { continue }
+            if w != d.Worker: d.BytesDown += b.Len()
+            try Decode(b, one)
+            for i in range n: d.acc[lo + i] += one[i]
+            have[w] = true
+            got++
+        }
+        if got == d.Workers: break
+        if got >= d.Quorum.Max(1) and time.Since(t0) > d.TimeoutMs * 1000000: break
+        d.sleep()
+    }
+    stale I64 = 0
+    prev := d.Round - d.Fragments                   # this fragment's last round
+    for w in range d.Workers {
+        k := f * d.Workers + w
+        if d.Stale and d.late[k] and prev >= 0 {
+            b := try d.store.Get("r" + $prev + ".d" + $w) catch StoreError.Missing default "".Bytes()
+            if b.Len() > 0 {
+                d.BytesDown += b.Len()
+                try Decode(b, one)
+                for i in range n: d.acc[lo + i] += one[i]
+                stale++
+            }
+        }
+        d.late[k] = not have[w]
+    }
+    total := got + stale
+    mu F32 = F32(d.Momentum)
+    lr F32 = F32(d.OuterRate)
+    upd := Array<F32>(n)
+    for i in range n {
+        a F32 = d.acc[lo + i] / F32(total)
+        m F32 = mu * d.Buf[lo + i] + a
+        d.Buf[lo + i] = m
+        upd[i] = lr * (a + mu * m) if d.Nesterov else lr * m
+    }
+    names := Vec<String&>()
+    for w in range d.Workers { if have[w]: names.Push($w) }
+    sent := Array<F32>(n)
+    blob := try Encode(upd, d.Updates, d.Keep, Array<String>["round", $d.Round, "lo", $lo, "contributors", $total, "stale", $stale
+        "workers", names.ToArray().Join(",")], sent)
+    try d.store.Put("r" + $d.Round + ".u", blob)
+    d.BytesUp += blob.Len()
+    for i in range n: d.Global[lo + i] -= sent[i]
+    if d.SnapshotEvery > 0 and (d.Round + 1) % d.SnapshotEvery == 0: try d.Snapshot()
+    return total, stale
+}
+
+# the global model and the outer momentum as state.<Round>, and "latest" naming it (the coordinator's, after a round)
+fn (d mut DiLoCo<S>&) Snapshot() ? StoreError {
+    w := checkpoint.Writer()
+    w.Meta("round", $d.Round)
+    w.Meta("name", d.Name)
+    w.Meta("lineage", d.Lineage)
+    w.Meta("workers", $d.Workers)
+    w.Meta("fragments", $d.Fragments)
+    n := d.Global.Len()
+    try w.Add("global", tensor.Tensor<F32>.Over(d.Global, 0, n)!) catch err { error StoreError.Malformed($err) }
+    try w.Add("momentum", tensor.Tensor<F32>.Over(d.Buf, 0, n)!) catch err { error StoreError.Malformed($err) }
+    b := try w.Bytes() catch err { error StoreError.Failed("encoding a state: " + $err) }
+    try d.store.Put("state." + $d.Round, b)
+    try d.store.Put("latest", $d.Round)
+    d.BytesUp += b.Len()
+}
+
+# ---- tests ----
+# Workers as tasks of one process over a DirStore, each minimizing its own quadratic |x - c_w|^2 by plain gradient
+# steps: together they find the mean of the c_w.
+
+fn DirStore.temp() DirStore {
+    dir := os.MkTemp("", "dist-")!
+    return DirStore(dir)
+}
+
+# worker w's H gradient steps on |x - c_w|^2 with c_w = w + 1 in every entry
+fn local(x mut Array<F32>&, w I64, H I64) {
+    c F32 = F32(w + 1)
+    for _ in range H {
+        for i in range x.Len(): x[i] -= F32(0.1) * F32(2.0) * (x[i] - c)
+    }
+}
+
+fn runWorker(s DirStore&, w I64, N I64, rounds I64, coded Codec, fragments I64, skip I64, out mut Array<F32>&) {
+    x := Array<F32>(1000)
+    d := DiLoCo<DirStore>(s, w, N, 1000, coded = coded, keep = 0.1, fragments = fragments, timeoutMs = 300, pollMs = 1, quorum = 1
+        snapshotEvery = 2)
+    d.Begin(x)!
+    for r in range rounds {
+        local(x, w, 5)
+        if r == skip: time.Sleep(time.Duration.Millis(900))   # a straggler: misses the coordinator's deadline
+        d.Sync(x)!
+    }
+    for i in range x.Len(): out[i] = d.Global[i]     # x itself once every fragment is synced (Fragments 1)
+    if fragments == 1 and coded != Codec.TopK { for i in range x.Len(): assert x[i] == d.Global[i] }
+}
+
+fn together(N I64, rounds I64, coded Codec, fragments I64, skip I64) Vec<mut Array<F32>&> {
+    s := DirStore.temp()
+    outs := Vec<mut Array<F32>&>()
+    for _ in range N: outs.Push(Array<F32>(1000))
+    join {
+        for w in range N: spawn runWorker(s, w, N, rounds, coded, fragments, skip if w == N - 1 else -1, outs[w])
+    }
+    os.RemoveAll(s.Root)!
+    return outs
+}
+
+test DiLoCo "four workers end on one model, the mean of their optima, in every codec" {
+    for coded in Array<Codec>[Codec.F32, Codec.BF16, Codec.Int8] {
+        outs := together(4, 30, coded, 1, -1)
+        for w in range 4 {
+            for i in range 1000 {
+                assert outs[w][i] == outs[0][i]
+                assert (outs[w][i] - F32(2.5)).Abs() < F32(0.02)
+            }
+        }
+    }
+}
+
+test DiLoCo.Sync "streaming fragments and TopK with error feedback reach the mean too" {
+    outs := together(3, 60, Codec.F32, 3, -1)
+    for i in range 1000: assert (outs[2][i] - F32(2.0)).Abs() < F32(0.02) and outs[2][i] == outs[0][i]
+    tk := together(2, 150, Codec.TopK, 1, -1)
+    mean F64 = 0.0
+    for i in range 1000 {
+        assert tk[1][i] > F32(0.9) and tk[1][i] < F32(2.1)       # sparse rounds leave entries between the optima ...
+        mean += F64(tk[1][i]) / 1000.0
+    }
+    assert (mean - 1.5).Abs() < 0.05                             # ... about their mean
+}
+
+test DiLoCo.coordinate "a worker late for a round is left out of it, folded into the next, and still ends on the shared model" {
+    outs := together(3, 20, Codec.F32, 1, 4)
+    for w in range 3 {
+        for i in range 1000: assert outs[w][i] == outs[0][i] and (outs[w][i] - F32(2.0)).Abs() < F32(0.02)
+    }
+}
+
+test DiLoCo.Begin "a worker that begins late takes the newest state and the updates after it" {
+    s := DirStore.temp()
+    x := Array<F32>(1000)
+    d := DiLoCo<DirStore>(s, 0, 1, 1000, snapshotEvery = 3)
+    d.Begin(x)!
+    for _ in range 7 {
+        local(x, 0, 5)
+        d.Sync(x)!
+    }
+    y := Array<F32>(1000)
+    e := DiLoCo<DirStore>(s, 1, 1, 1000)
+    e.Begin(y)!
+    assert e.Round == 7 and y == x
+    os.RemoveAll(s.Root)!
+}
+
+test Encode "each codec's blob decodes to what the encoder says it sent" {
+    v := Array<F32>(1000)
+    for i in range 1000: v[i] = F32((F64(i) * 0.37).Sin() * F64(1 + i % 7))
+    for c in Array<Codec>[Codec.F32, Codec.BF16, Codec.Int8, Codec.TopK] {
+        sent := Array<F32>(1000)
+        b := Encode(v, c, 0.1, Array<String>["round", "3"], sent)!
+        back := Array<F32>(1000)
+        f := Decode(b, back)!
+        assert back == sent and f.Meta.Get("round")! == "3"
+        if c == Codec.Int8 { for i in range 1000: assert (back[i] - v[i]).Abs() <= F32(7.0 / 254.0 + 1e-5) }
+    }
+}

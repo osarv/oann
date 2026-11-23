@@ -59,6 +59,44 @@ A model named by its repository is fetched once from Hugging Face; its licence i
 MIT for the DeepSeek-R1 distillations). How it works, the flags, the checks against the reference implementation and
 the speed on a 4-core machine are in `llm/README.md`.
 
+## Distributed training
+
+`nn/dist` trains one model on machines that share no network but a store of blobs - cloud VMs with outbound HTTPS
+only, or processes on one machine - by DiLoCo (Douillard et al. 2023): every worker trains a whole copy with its own
+optimizer for H steps, hands in its delta (the shared model minus its own) and takes back the outer step - Nesterov
+momentum on the average of the deltas - that the coordinator, worker 0, published. A round moves one delta up and one
+update down a worker, each the size of the parameters in the codec chosen (BF16: half the F32 parameters), instead of a
+gradient every step.
+
+```
+import "github.com/osarv/oann/nn/dist"
+
+params := g.Params().Flat()!                        # a BF16 graph: g.Masters(), and g.SyncParams() after a Sync
+d := dist.DiLoCo<dist.DirStore>(dist.DirStore("/shared/run1"), worker, workers, params.Len())
+try d.Begin(params)                                 # every worker from the same seed; a late one from the newest state
+for s in range 1, steps + 1 {
+    train.LmStep(g, m, data, o, rate(s - 1), 1.0)   # the inner optimizer, whatever it is, keeps its own state
+    if s % H == 0: try d.Sync(params)               # a Report: the round, its contributors, bytes up and down, the wait
+}
+```
+
+`make diloco ARGS="diloco 4 2000 125"` runs four worker processes of `examples/diloco_lm.olang` through a directory;
+`"single 2000"` and `"dp 4 2000"` are the baselines it is measured against. Options of `DiLoCo`: `outerRate` and
+`momentum` (0.7, 0.9), the deltas' and the update's codec (`coded`, `updates`: F32, BF16, Int8, TopK with `keep`),
+`fragments` (streaming: a round syncs one fragment, so a sync every H / fragments steps moves that share of the bytes),
+`timeoutMs` and `quorum` (a worker not in by then is left out of the round and its delta folded into that fragment's
+next round), `snapshotEvery` (a state every so many rounds, for joining and resuming) and `name`/`lineage` (into the
+state's metadata).
+
+The store is a trait of two methods, `Put(name, bytes)` and `Get(name)` (Missing for a name not there yet), so a backend is
+a struct with those. `HttpStore(base, token)` is the contract for any blob service: `PUT base/NAME` with the bytes as the
+body (any 2xx is success), `GET base/NAME` giving them back (404 while there is none), `Authorization: Bearer TOKEN` when a
+token is given. Blobs are written once and never changed; names are `r<R>.d<W>` (worker W's delta of round R), `r<R>.u`
+(the update; its contributors in the metadata), `state.<R>` (the global model and outer momentum after round R) and
+`latest` (the newest state's round, as text). Each is a safetensors file - a state is a checkpoint any safetensors
+reader opens. An S3-style bucket through presigned or token-authorized URLs, or a small relay in front of any object
+store, meets it as it is; a Hugging Face repository needs an adapter (uploads there are commits).
+
 ## Developing oann
 
 The makefile is for oann's developers; `make` alone lists its targets, one line each with its ARGS, and runs nothing.
@@ -84,7 +122,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `kernels/` | GEMM (blocked, batched, from patches, GEMV, INT8), element kernels, attention, scans, sparse and event-driven products, convolution; the backend a plan runs on (`device.olang`: `SetDefault`, `GpuAvailable`) and the GPU's in `kernels/gpu` (`kernels/README.md`) |
 | `ad/` | reverse-mode autodiff on tensors: `Graph<T>`, the operations and their gradients (`ad/README.md`) |
 | `dyn/` | the dynamical-system core: systems of populations and connections, the settle, equilibrium propagation and the other learning rules, energies, the bridge into `ad` (`dyn/README.md`) |
-| `nn/` | layers, AdamW and Sgd, the training loops, generation, INT8 quantization (`nn/README.md`) |
+| `nn/` | layers, AdamW and Sgd, the training loops, DiLoCo over a blob store (`nn/dist`), generation, INT8 quantization (`nn/README.md`) |
 | `models/` | the reference models: an MLP, a CNN, a GPT, an SSM, a transformer with a settle block (`models/README.md`) |
 | `data/`, `tokenizer.olang` | IDX, MNIST, a character corpus, token files, the Loader over a Dataset trait; byte-level BPE |
 | `io/` | safetensors checkpoints, JSON-lines run records |

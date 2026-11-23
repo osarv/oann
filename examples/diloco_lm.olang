@@ -1,0 +1,202 @@
+# DiLoCo against one worker and against data parallel (nn/dist): models/gpt's character transformer (GptConfig.Char: 4
+# layers of 128, 4 heads, context 64) on tiny Shakespeare, every worker on one thread, batches of 16 windows a worker,
+# AdamW (beta2 0.99, decay 0.1) at 1e-3 warmed up over 100 steps and down a cosine to 1e-4, clipped to norm 1.
+#     single STEPS               one worker
+#     dp R STEPS                 R single-thread replicas of one process, gradients averaged every step (nn/train)
+#     diloco N STEPS H [CODEC] [FRAGMENTS] [DIR]
+#                                N worker processes of this program, each STEPS inner steps on its own data order, a
+#                                round every H steps (H / FRAGMENTS streaming) through a DirStore in DIR (a new
+#                                temporary directory by default); CODEC f32, bf16 (default), int8 or topk
+# Every EVAL (250) steps the validation loss on the same 20 batches of the held-out tenth is printed as
+#     eval STEP TOKENS SECONDS LOSS
+# TOKENS the tokens trained on by every worker together, SECONDS the training time so far (evaluation left out), and for
+# DiLoCo the rounds' bytes. From the environment: SEED (1), OUTER_LR and OUTER_MOMENTUM (DiLoCo's 0.7 and 0.9).
+#     make diloco ARGS="diloco 4 2000 125"
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../data/text"
+import "../nn/dist"
+import "../nn/optim"
+import "../nn/train"
+import "../models/gpt"
+
+batch I64 = 16
+every I64 = 250
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn seed() I64 { return try (try os.Env("SEED") catch default "1").ParseInt() catch default 1 }
+
+# a number from the environment, or fallback
+fn setting(name String&, fallback F64) F64 { return try F64.Parse(try os.Env(name) catch default $fallback) catch default fallback }
+
+fn corpus() text.Corpus ? {
+    try os.MkDirAll("data/shakespeare")
+    try text.Fetch("data/shakespeare/input.txt", text.Shakespeare)
+    return try text.Corpus.Load("data/shakespeare/input.txt")
+}
+
+type Replica struct(g graph.Graph<F32>, m train.LanguageModel) { g, m }
+
+fn Replica.make(c text.Corpus&, B I64) Replica ? {
+    g := graph.Graph<F32>(B, 1)
+    cfg := gpt.GptConfig.Char(c.Size())
+    m := gpt.Gpt.New(g, cfg).Lm(g)
+    try g.Plan(rand.Rand(U64(seed())))
+    return Replica(g, m)
+}
+
+fn adam(g graph.Graph<F32>&) optim.AdamW<F32, F32> {
+    return optim.AdamW(g.Params(), g.ParamGrads(), beta2 = 0.99, decay = 0.1, spans = optim.Spans(g))
+}
+
+fn report(step I64, tokens I64, seconds F64, loss F64) {
+    io.Put("eval " + $step + " " + $tokens + " " + $seconds.Fixed(1) + " " + $loss.Fixed(4) + "\n")!
+}
+
+fn main() ? {
+    args := os.Args()
+    mode := args[1] if args.Len() > 1 else "single"
+    c := try corpus()
+    if mode == "single": try single(c, try number(args, 2, 2000))
+    else if mode == "dp": try dataParallel(c, try number(args, 2, 4), try number(args, 3, 2000))
+    else if mode == "diloco": try launch(args)
+    else if mode == "worker": try work(c, args)
+    else: try io.Put("modes: single, dp, diloco\n")
+}
+
+fn single(c text.Corpus&, steps I64) ? {
+    r := try Replica.make(c, batch)
+    g, m := r.g, r.m
+    o := adam(g)
+    rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
+    trainSet := text.Windows(c.Train(), 64, U64(seed() * 100))
+    valSet := text.Windows(c.Val(), 64)
+    try io.Put("one worker: " + $g.ParamCount + " parameters, batch " + $batch + "\n")
+    report(0, 0, 0.0, train.LmEvaluate(g, m, valSet, 20))
+    spent I64 = 0
+    for s in range 1, steps + 1 {
+        t0 := time.Now()
+        train.LmStep(g, m, trainSet, o, rate(s - 1), 1.0)
+        spent += time.Since(t0)
+        if s % every == 0 or s == steps: report(s, s * batch * 64, F64(spent) * 1e-9, train.LmEvaluate(g, m, valSet, 20))
+    }
+}
+
+fn replicaStep(g mut graph.Graph<F32>&, m train.LanguageModel&, src mut text.Windows&) {
+    g.Training = true
+    src.Random(g.Ints(m.Tokens).Flat()!, g.Ints(m.Targets).Flat()!, g.Batch)
+    g.Forward(g.Batch)
+    g.Backward(m.Loss)
+}
+
+fn dataParallel(c text.Corpus&, R I64, steps I64) ? {
+    gs := Vec<graph.Graph<F32>>()
+    ms := Vec<train.LanguageModel>()
+    srcs := Vec<text.Windows>()
+    for w in range R {
+        r := try Replica.make(c, batch)
+        gs.Push(r.g)
+        ms.Push(r.m)
+        srcs.Push(text.Windows(c.Train(), 64, U64(seed() * 100 + w)))
+    }
+    o := adam(gs[0])
+    rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
+    valSet := text.Windows(c.Val(), 64)
+    try io.Put("data parallel: " + $R + " replicas of batch " + $batch + "\n")
+    report(0, 0, 0.0, train.LmEvaluate(gs.RefMut(0), ms[0], valSet, 20))
+    spent I64 = 0
+    for s in range 1, steps + 1 {
+        t0 := time.Now()
+        join {
+            for w in range R: spawn replicaStep(gs.RefMut(w), ms[w], srcs.RefMut(w))
+        }
+        train.AverageGrads(gs)
+        optim.ClipNorm(gs.RefMut(0).ParamGrads(), 1.0)
+        o.SetRate(rate(s - 1))
+        o.Step()
+        train.BroadcastParams(gs)
+        spent += time.Since(t0)
+        if s % every == 0 or s == steps: report(s, s * R * batch * 64, F64(spent) * 1e-9, train.LmEvaluate(gs.RefMut(0), ms[0], valSet, 20))
+    }
+}
+
+# the N workers started as processes of this program, their output passed on, worker 0's first
+fn launch(args Array<String&>&) ? {
+    N := try number(args, 2, 4)
+    dir := args[7] if args.Len() > 7 else try os.MkTemp("", "diloco-")
+    try os.MkDirAll(dir)
+    exe := try os.ReadLink("/proc/self/exe")
+    procs := Vec<os.Process>()
+    for w in range N {
+        argv := Vec<String&>[exe, "worker", $w, $N, $(try number(args, 3, 2000)), $(try number(args, 4, 125))
+            args[5] if args.Len() > 5 else "bf16", args[6] if args.Len() > 6 else "1", dir]
+        procs.Push(try os.Process.Start(...argv.ToArray()))
+    }
+    for w in range N {
+        p := procs.RefMut(w)
+        out := try p.Wait()
+        if w == 0 or out.Status != 0: try io.Put(out.Stdout + out.Stderr)
+    }
+    if args.Len() <= 7: try os.RemoveAll(dir)
+}
+
+# worker W of N: STEPS inner steps, a round every H / FRAGMENTS of them; worker 0 evaluates the shared model
+fn work(c text.Corpus&, args Array<String&>&) ? {
+    w := try number(args, 2, 0)
+    N := try number(args, 3, 4)
+    steps := try number(args, 4, 2000)
+    H := try number(args, 5, 125)
+    coded := try dist.Codec.Named(args[6])
+    F := try number(args, 7, 1)
+    dir := args[8]
+    r := try Replica.make(c, batch)
+    g, m := r.g, r.m
+    o := adam(g)
+    rate := optim.WarmupCosine(1e-3, 100, steps, 1e-4)
+    trainSet := text.Windows(c.Train(), 64, U64(seed() * 100 + w))
+    valSet := text.Windows(c.Val(), 64)
+    params := g.Params().Flat()!
+    d := dist.DiLoCo<dist.DirStore>(dist.DirStore(dir), w, N, params.Len(), coded = coded, fragments = F, keep = 0.05
+        outerRate = setting("OUTER_LR", 0.7), momentum = setting("OUTER_MOMENTUM", 0.9))
+    try d.Begin(params)
+    if w == 0 {
+        try io.Put("DiLoCo: " + $N + " workers, " + $g.ParamCount + " parameters, batch " + $batch + ", a round every " + $(H / F) +
+            " steps, " + coded.Name() + " deltas, outer rate " + $d.OuterRate + " momentum " + $d.Momentum + $((", " + $F + " fragments") if F > 1 else "") + "\n")
+        report(0, 0, 0.0, train.LmEvaluate(g, m, valSet, 20))
+    }
+    spent I64 = 0
+    up, down, rounds I64 = 0, 0, 0
+    wait F64 = 0.0
+    for s in range 1, steps + 1 {
+        t0 := time.Now()
+        train.LmStep(g, m, trainSet, o, rate(s - 1), 1.0)
+        if s % (H / F) == 0 {
+            rep := try d.Sync(params)
+            up += rep.Up
+            down += rep.Down
+            wait += rep.Wait
+            rounds++
+        }
+        spent += time.Since(t0)
+        if w == 0 and (s % every == 0 or s == steps) {
+            # the shared model, every fragment as of its last round (this worker's own progress since put back after)
+            keep := params.Copy()
+            for i in range params.Len(): params[i] = d.Global[i]
+            report(s, s * N * batch * 64, F64(spent) * 1e-9, train.LmEvaluate(g, m, valSet, 20))
+            for i in range params.Len(): params[i] = keep[i]
+        }
+    }
+    if w == 0 {
+        try io.Put("rounds " + $rounds + ": a round sent " + $(up / rounds.Max(1)) + " bytes and received " + $(down / rounds.Max(1)) +
+            " (the coordinator's: every worker's delta in), waited " + $(wait / F64(rounds.Max(1))).Fixed(3) + " s; the parameters are " +
+            $(4 * params.Len()) + " bytes in F32\n")
+    }
+}

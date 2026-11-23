@@ -11,6 +11,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `mnist_cnn.olang` | the small convolutional network (`models/cnn`); resident memory and a per-op profile | `cnn` |
 | `mnist_int8.olang` | either trained, quantized by `nn/quant`: accuracy dynamic and static, size, batch 1 / 64 / 128 speed | `int8` |
 | `charlm.olang` | the character transformer (`models/gpt`) on tiny Shakespeare through `nn/train.Fit`, its checkpoint, a sample | `charlm` |
+| `diloco_lm.olang` | the same transformer by one worker, by data parallel, or by DiLoCo worker processes sharing a directory store (`nn/dist`): validation loss against tokens and seconds, bytes a round | `diloco` |
 | `charlm_sample.olang` | text from its checkpoint, through the key-value cache and by running the context again | `sample` |
 | `charlm_int8.olang` | the same transformer with its linear layers in INT8: loss, a forward's time, cached decoding | `int8lm` |
 | `charlm_ssm.olang` | the recurrent model (`models/ssm`: Mamba or delta-rule blocks) on tiny Shakespeare with the same recipe, generating by running the context again | |
