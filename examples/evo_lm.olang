@@ -1,0 +1,146 @@
+# Architecture search over tiny character language models with evo, on tiny Shakespeare. Each model is
+# models/gpt's GPT. The space:
+#   - depth 1 to 4;
+#   - width 32, 64, 96 or 128;
+#   - 1, 2 or 4 heads;
+#   - window (the context it attends over) 16, 32 or 64 characters;
+#   - GELU or gated (SwiGLU) feed-forward layers, LayerNorm or RMSNorm;
+#   - a learning rate from 3e-4 to 1e-2.
+#
+# The search is regularized evolution, with successive halving over training steps (rungs of 60, 180 and 540 steps) and
+# 9 children a round. A trial trains with AdamW at its own rate on one thread, in batches of 16 windows. Past the first
+# rung it resumes from its own weights. It gives the validation loss and two costs:
+#   - Costs[0], the training TMACs (3 x params x tokens);
+#   - Costs[1], the parameters.
+#
+# The data is split three ways. Training data is the first 90% of the corpus's training text, and validation the rest of
+# it. The corpus's own held-out tenth is the test set, read once at the end for the best genome.
+#
+# Arguments, all optional: rounds (8), workers (1), seed (1), directory (a fresh temporary one).
+# `make evolm ARGS="8 4"` runs it.
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../data/text"
+import "../evo/schema"
+import "../evo/search"
+import "../models/gpt"
+import "../nn/optim"
+import "../nn/train"
+
+Sequences I64 = 16
+
+fn lmSpace() schema.Schema {
+    s := schema.Schema()
+    s.Int(schema.Root, "depth", 1, 4)
+    s.Choice(schema.Root, "width", Array<String>["32", "64", "96", "128"])
+    s.Choice(schema.Root, "heads", Array<String>["1", "2", "4"])
+    s.Choice(schema.Root, "window", Array<String>["16", "32", "64"])
+    s.Choice(schema.Root, "ffn", Array<String>["gelu", "gated"])
+    s.Choice(schema.Root, "norm", Array<String>["layer", "rms"])
+    s.Float(schema.Root, "lr", 3e-4, 1e-2, true)
+    return s
+}
+
+# the training and validation characters, and the vocabulary's size
+type Chars struct(ids Array<I32>, vocab I64) {
+    Ids Array<I32> = ids
+    Vocab I64 = vocab
+}
+
+type Fit struct(space schema.Schema) {
+    Space schema.Schema = space
+}
+
+fn (f Fit&) config(g schema.Genome&, vocab I64) gpt.GptConfig {
+    s := f.Space
+    num := fn(name String&) I64: return try s.Pick(g, schema.Root, name).ParseInt() catch default 0
+    c := gpt.GptConfig(vocab, num("width"), I64(s.Num(g, schema.Root, "depth")), num("heads"), num("window"))
+    c.Gated = s.Pick(g, schema.Root, "ffn") == "gated"
+    c.Rms = s.Pick(g, schema.Root, "norm") == "rms"
+    return c
+}
+
+type LmError error { Load(why String) }
+
+fn (f mut Fit&) Evaluate(g schema.Genome&, t search.Trial&, data search.Split<Chars>&) search.Result ? LmError {
+    cfg := f.config(g, data.Train.Vocab)
+    net := graph.Graph<F32>(Sequences)
+    lm := gpt.Gpt.New(net, cfg).Lm(net)
+    try net.Plan(rand.Rand(t.Seed)) catch e { error LmError.Load("the model's shapes: " + $e) }
+    done F64 = 0.0
+    if t.Resume != "" {
+        try net.Load(t.Resume) catch e { error LmError.Load($e) }
+        done = t.Spent
+    }
+    o := optim.AdamW(net.Params(), net.ParamGrads(), rate = f.Space.Num(g, schema.Root, "lr"), beta2 = 0.99, decay = 0.1, spans = optim.Spans(net))
+    src := text.Windows(data.Train.Ids, cfg.Ctx, t.Seed)
+    ids := net.Ints(lm.Tokens).Flat()!
+    targets := net.Ints(lm.Targets).Flat()!
+    steps := I64(t.Budget - done)
+    for _ in range steps {
+        src.Random(ids, targets, Sequences)
+        net.Forward(Sequences)
+        net.Backward(lm.Loss)
+        o.Step()
+    }
+    if t.Save != "": try net.Save(t.Save) catch e { error LmError.Load($e) }
+    val := text.Windows(data.Val.Ids, cfg.Ctx)
+    loss := train.LmEvaluate(net, lm, val, 8)
+    res := search.Result(loss)
+    tokens := F64(Sequences * cfg.Ctx) * t.Budget
+    res.Costs.Push(3.0 * F64(cfg.Params()) * tokens / 1e12)
+    res.Costs.Push(F64(cfg.Params()))
+    return res
+}
+
+# tiny Shakespeare's training text split into training and validation, and its held-out tenth (the test set)
+fn corpus() search.Split<Chars>, Chars ? {
+    try os.MkDirAll("data/shakespeare")
+    try text.Fetch("data/shakespeare/input.txt", text.Shakespeare)
+    c := try text.Corpus.Load("data/shakespeare/input.txt")
+    all := c.Train()
+    cut := all.Len() * 9 / 10
+    return search.Split<Chars>(Chars(all[:cut], c.Size()), Chars(all[cut:], c.Size())), Chars(c.Val(), c.Size())
+}
+
+fn main() ? {
+    args := search.Args()
+    rounds := try args[0].ParseInt() if args.Len() > 0 else 8
+    workers := try args[1].ParseInt() if args.Len() > 1 else 1
+    seed := U64(try args[2].ParseInt()) if args.Len() > 2 else U64(1)
+    dir := $args[3] if args.Len() > 3 else try os.MkTemp("", "evo-lm-")
+    sp := lmSpace()
+    fit := Fit(sp)
+    split, held := try corpus()
+    search.Worker(sp, fit, split)
+    c := search.Config(search.Algorithm.Regularized(12, 4), seed)
+    c.Rungs = Vec<F64>[60.0, 180.0, 540.0]
+    c.Batch = 9
+    c.Workers = workers
+    c.Dir = dir
+    e := search.Evolution<schema.Genome>(c)
+    if os.Exists(dir + "/state.evo") {
+        try e.Resume(sp, try os.ReadFile(dir + "/state.evo"))
+        try io.PutLn("resumed at round " + $e.Round)
+    }
+    start := time.Now()
+    for e.Round < rounds {
+        e.Step(sp, fit, split)
+        b := e.Best()
+        try io.PutLn("round " + $e.Round + ": best val " + $b.Res.Loss.Fixed(4) + " (" + sp.Key(b.Genome) + "), " + $e.Evaluations + " trials, " + $(F64(time.Since(start)) / 1e9).Fixed(0) + " s")
+    }
+    b := e.Best()
+    cfg := fit.config(b.Genome, held.Vocab)
+    try io.PutLn("best: " + $cfg.Layers + " layers of " + $cfg.Dim + ", " + $cfg.Heads + " heads, window " + $cfg.Ctx + ", " + ("gated" if cfg.Gated else "gelu") + ", " + ("rms" if cfg.Rms else "layer") + " norm, lr " + $sp.Num(b.Genome, schema.Root, "lr").Fixed(5) + "; val " + $b.Res.Loss.Fixed(4) + ", " + $b.Res.Costs[0].Fixed(4) + " TMACs, " + $b.Res.Costs[1] + " parameters")
+    net := graph.Graph<F32>(Sequences)
+    lm := gpt.Gpt.New(net, cfg).Lm(net)
+    try net.Plan(rand.Rand(1))
+    try net.Load(dir + "/w" + $b.Id + ".bin")
+    heldOut := text.Windows(held.Ids, cfg.Ctx)
+    try io.PutLn("its test loss (the held-out tenth, read once): " + $train.LmEvaluate(net, lm, heldOut, 8).Fixed(4))
+    for m in e.Front(): try io.PutLn("  front: val " + $m.Res.Loss.Fixed(4) + " at " + $m.Res.Costs[0].Fixed(4) + " TMACs: " + sp.Key(m.Genome))
+}

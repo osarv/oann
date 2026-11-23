@@ -150,6 +150,9 @@ Every result at every rung is passed to the advisor, and each member records how
 mutated, crossed or proposed). evo has no other dependency on archnet: `Run` passes a no-op advisor. After `Resume`,
 `Replay(adv)` rebuilds an advisor from the history.
 
-## Example
+## Examples
+
+`make evolm ARGS="rounds workers seed dir"` runs `examples/evo_lm.olang`. It searches tiny character language models (`models/gpt`: depth, width, heads, window, feed-forward and norm kinds, learning rate) on tiny Shakespeare. Rungs are 60, 180 and 540 steps, and trials resume across rungs. It reports the validation loss, then the training TMACs and parameter count as costs.
+
 
 `make evomlp ARGS="rounds workers seed dir"` runs `examples/evo_mlp.olang`. It searches multilayer perceptrons for a synthetic regression and uses every part of the package. It prints the best genome, its test loss (the only time the test set is read), the loss-against-MACs front, and a digest of the history that is equal for any number of workers.

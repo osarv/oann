@@ -30,7 +30,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -272,6 +272,12 @@ samplebench:
 archsearch:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_archsearch bench/archsearch.olang
 	./build/bench_archsearch $(ARGS)
+
+# architecture search over tiny character LMs (depth, width, heads, window, ffn, norm, rate) on tiny Shakespeare with
+# evo, successive halving over steps (examples/evo_lm.olang) - ARGS: rounds, workers, seed, directory
+evolm:
+	$(OLANG) build $(GPUDEFINE) -output build/examples_evo_lm examples/evo_lm.olang
+	./build/examples_evo_lm $(ARGS)
 
 # architecture search with evo: regularized evolution over MLPs for a synthetic regression, successive halving, weight
 # inheritance, checkpoints, worker processes (examples/evo_mlp.olang) - ARGS: rounds, workers, seed, directory

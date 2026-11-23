@@ -2258,3 +2258,16 @@ Measured on archnet/toy (a known optimum, deliberately misleading early curves),
   hurts. It is kept, but off by default.
 - **Proposals:** 48% beat the median mutated child, and 452 of 455 genomes evaluated were distinct. Fitted to 200
   random genomes, the generator's proposals score below 0.75 of the random mean (a test).
+
+## evo on language models (wt-evolm)
+
+examples/evo_lm.olang (`make evolm`) runs evo over tiny character GPTs on tiny Shakespeare:
+
+- **Space:** depth 1-4; width 32-128; 1, 2 or 4 heads; window 16-64; GELU or gated feed-forward; LayerNorm or RMSNorm;
+  a learning rate.
+- **Search:** regularized evolution with successive halving at 60, 180 and 540 steps, resuming across rungs.
+- **Costs reported:** training TMACs and parameters.
+- **Data:** validation carved from the training text; the held-out tenth read once for the best genome.
+
+Three rounds on 4 workers took 49 s for 37 trials. The best (2 layers of 64, 2 heads, window 32) reached val 2.242 and
+test 2.249.
