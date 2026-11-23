@@ -100,6 +100,7 @@ type Options struct() {
     Timestamps Bool = false
     Beams I64 = 1               # 1: greedy
     MaxTokens I64 = 224         # tokens a window may have after its prompt
+    NoRepeat Bool = false       # greedy: stop where the last 1-30 tokens have come three times running (a loop)
     Positions I64 = 1500        # the encoder's positions (fewer: a shorter window, faster and not the reference)
 }
 
@@ -146,10 +147,12 @@ fn (w mut Whisper&) Window(clip Array<F32>&, frames I64, seek I64 = 0, take I64 
     w.M.Cross(w.Dec, w.Enc.Out, n)
 }
 
-# the first window of samples x (at most 30 s of it)
+# the first window of samples x (at most 30 s of it); a window shortened to n positions keeps at least 3 s of silence
+# after the sound (with none, the model never ends and repeats its last phrase)
 fn (w mut Whisper&) Clip(x Array<F32>&, n I64 = 1500) {
     clip, frames := w.Mel.Clip(x[:x.Len().Min(30 * mel.Rate)])
-    w.Window(clip, frames, 0, 2 * n, n)
+    m := n.Max(x.Len() / (2 * mel.Hop) + 150).Min(w.M.C.Positions)
+    w.Window(clip, frames, 0, 2 * m, m)
 }
 
 # the likeliest language token of the window
@@ -260,11 +263,30 @@ fn (w mut Whisper&) Decode(prompt Array<I32>&, o Options&) Array<I32> {
         }
         gen.Push(I32(best))
         if I32(best) == w.T.Eot: break
+        loop := loopOf(gen) if o.NoRepeat else 0
+        if loop > 0 {
+            for _ in range 2 * loop: try gen.Pop() catch { unreachable }
+            gen.Push(w.T.Eot)
+            break
+        }
         k.Reset()
         k.Add(I32(best), I64(prompt.Len() + gen.Len() - 1), 0)
         w.M.Step(k, 1)
     }
     return gen.ToArray()
+}
+
+# the length k (1 .. 30) of a loop at gen's end - its last k tokens three times running - or 0
+fn loopOf(gen Vec<I32>&) I64 {
+    n := gen.Len()
+    for k in range 1, (n / 3).Min(30) + 1 {
+        same := true
+        for i in range 2 * k {
+            if gen[n - 1 - i] != gen[n - 1 - i - k]: same = false
+        }
+        if same: return k
+    }
+    return 0
 }
 
 # a candidate of a beam step: its score, the beam it extends, its token
@@ -621,6 +643,12 @@ test Stream "sound pushed in half seconds: nothing settled before its end, the p
     }
     assert st.Partial() == w.Text(x, Options()), st.Partial()
     assert w.LanguageCode() == "en", w.LanguageCode()
+    # a window shortened below the clip keeps a margin of silence and ends
+    o := Options()
+    o.Positions = 200
+    o.NoRepeat = true
+    short := w.Text(x[:2 * mel.Rate], o)
+    assert short.Len() > 0 and short.Len() < 80, short
     got := ""
     for g in st.Settled(true): got = got + g.Text
     assert got == whole, got + " | " + whole

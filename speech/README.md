@@ -28,7 +28,9 @@ arecord -q -f S16_LE -r 16000 -c 1 | build/oann-listen openai/whisper-base - --w
 MODEL is a directory or a Hugging Face repository, fetched once into `$OANN_MODELS` (`~/.cache/oann/models`). Flags:
 `--timestamps`, `--beams N`, `--language L` (detected otherwise), `--translate` (into English), `--bf16` (BF16 weights:
 half the memory, AMX products where the CPU has them), `--threads T`, `--positions N` (a shorter encoder window: faster
-on short commands, not the reference), `--max-tokens`; with `--wake`: `--threshold`, `--pause`, `--longest`, `--quiet`.
+on short commands, not the reference; `Text` keeps at least 3 s of silence after the sound, without which the model
+never ends and repeats itself; `Options.NoRepeat` also stops greedy decoding at a phrase come three times running),
+`--max-tokens`; with `--wake`: `--threshold`, `--pause`, `--longest`, `--quiet`.
 
 For the Pi: `olang build -target aarch64-linux-gnu -output build/oann-listen speech/listen.olang` (clang 19 or newer and
 the arm64 C library, olang's docs/install.md), then copy the binary over.
