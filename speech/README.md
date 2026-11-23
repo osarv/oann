@@ -108,43 +108,50 @@ clip (log-mel + encoder + greedy decoding of its 75-78 tokens, over 24 s):
 A window costs one encoder pass whatever the clip's length, so a 3 s command costs about what a 30 s clip does;
 `--positions 300` (a 6 s window) cuts the encoder by about five (an approximation: the model saw 30 s windows).
 
-**Raspberry Pi 5, estimated** (not measured): Cortex-A76 at 2.4 GHz, two 128-bit NEON FMA pipes - 38 GFLOPS a core at
-peak against about 190 here (two 512-bit FMA units at up to 3 GHz) - and LPDDR4X at about 10 GB/s in practice against
-about 25 here. The encoder is bound by arithmetic (about 4x slower), the decoder by reading its weights (about 2.5x at 4
-threads, 3x at 1), and there is no AMX, so F32 (or `--bf16` for the memory, widened in software):
+**Raspberry Pi 4, estimated** (not measured; the target): Cortex-A72 at 1.8 GHz, NEON (two 128-bit FMA pipes, no
+BF16 or dot-product instructions) - 29 GFLOPS a core at peak against about 190 here, and a narrower core that reaches a
+smaller share of it: the encoder, bound by arithmetic, about 8x slower; LPDDR4 at about 4-5 GB/s in practice against
+about 25 here: the decoder, bound by reading its weights, about 5x slower at 4 threads and 6x at 1. F32 (`--bf16`
+halves the memory and the decoder's reading, widened in software):
 
 | model | threads | encoder (30 s window) | decoder / token | 24 s clip, ~75 tokens: RTF |
 |---|---|---|---|---|
-| tiny | 4 | ~1.0 s | ~21 ms | ~0.11 |
-| tiny | 1 | ~2.4 s | ~42 ms | ~0.23 |
-| base | 4 | ~2.0 s | ~45 ms | ~0.23 |
-| base | 1 | ~5.3 s | ~81 ms | ~0.48 |
-| small | 4 | ~6.5 s | ~100 ms | ~0.6 |
-| small | 1 | ~18 s | ~225 ms | ~1.5 |
+| tiny | 4 | ~2 s | ~42 ms | ~0.2 |
+| tiny | 1 | ~4.7 s | ~85 ms | ~0.5 |
+| base | 4 | ~4 s | ~90 ms | ~0.45 |
+| base | 1 | ~10.5 s | ~160 ms | ~0.95 |
+| small | 4 | ~13 s | ~200 ms | ~1.2 |
 
-So tiny and base are faster than real time on a Pi 5 with room to spare; a spoken command of 3 s through base costs
-about 2.5 s (encoder 2 s, ten tokens), or under a second with `--positions 300`. small is usable for dictation on 4
-threads, not as an instant assistant.
+So on a Pi 4, tiny and base run faster than real time on 4 threads; a spoken command of 3 s through base costs about 5
+s (the encoder's whole 30 s window, ten tokens), about 1.5 s with `--positions 300`, and through tiny about 2.5 s and 1
+s. small is too slow for an assistant there. (A Pi 5 - Cortex-A76 at 2.4 GHz, about 10 GB/s - is about twice as fast
+again.) All three models are multilingual: Swedish and English are detected (`LanguageCode()`) or fixed
+(`--language sv`).
 
 ## Text to speech: the survey
 
 Models with open code and permissively licensed weights, for a Pi (sizes are the published files):
 
-| model | architecture | params / size | code | weights | input | fits a Pi 5 |
+| model | architecture | params / size | code | weights | input | fits a Pi 4 |
 |---|---|---|---|---|---|---|
 | kakao-enterprise/vits-ljs | VITS (end to end, HiFi-GAN decoder) | 36 M, 145 MB F32 (safetensors, transformers' `VitsModel`) | MIT | MIT; LJ Speech, public domain | IPA phonemes (espeak-ng's) | yes: VITS runs in real time on a Pi 4 (Piper) |
 | rhasspy/piper-voices (e.g. en_US-ljspeech-medium) | VITS, Piper's training | 15-30 M, 60-75 MB a voice (ONNX) | MIT (rhasspy/piper; the successor piper1-gpl is GPL-3) | MIT repository; each voice's dataset licence in its MODEL_CARD (LJ Speech: public domain; some voices non-commercial) | espeak-ng phonemes | yes, the reference for Pi TTS |
 | KittenML/kitten-tts-nano-0.1 | StyleTTS-like, ONNX | 15 M, 25 MB | Apache 2.0 | Apache 2.0 | espeak-ng phonemes | yes |
 | hexgrad/Kokoro-82M | StyleTTS 2 + iSTFTNet | 82 M, 330 MB | Apache 2.0 | Apache 2.0 | misaki G2P (Apache) or espeak-ng | about real time on 4 cores; best quality here |
 | myshell-ai/MeloTTS-English | VITS 2-like + BERT features | ~50 M + BERT | MIT | MIT | g2p_en (CMUdict) + BERT | heavier (the BERT) |
-| facebook/mms-tts-eng | VITS | 36 M | MIT (transformers) | **CC BY-NC 4.0**: not permissive | characters | excluded |
+| rhasspy/piper-voices sv_SE-nst-medium | VITS, Piper's (trained by KBLab) | ~20 M, 63 MB (ONNX) | MIT | MIT repository; NST Swedish data **CC0** | espeak-ng phonemes (sv) | yes - the Swedish voice |
+| rhasspy/piper-voices sv_SE-alma-medium, sv_SE-lisa-medium | VITS, Piper's | ~20 M, 63 MB | MIT | alma: CC BY 4.0; lisa: fine-tuned from a Norwegian voice, licence not stated | espeak-ng phonemes | alma yes (attribution); lisa unclear |
+| facebook/mms-tts-eng, -swe | VITS | 36 M | MIT (transformers) | **CC BY-NC 4.0**: not permissive | characters | excluded |
 | Coqui XTTS-v2 | GPT + HiFi-GAN | 470 M | MPL | **CPML, non-commercial** | text | excluded |
 
-The best fit is VITS on LJ Speech: kakao-enterprise/vits-ljs is MIT end to end on public-domain data, small (36 M), in
-safetensors and in transformers (so it can be held to a reference as Whisper is), and its architecture is Piper's, so
-Piper's MIT voices can follow. What every candidate but MMS needs is a grapheme-to-phoneme step - espeak-ng is GPL-3, so
-it would be our own: CMUdict (BSD-2) for known words and letter-to-sound rules for the rest, mapped to the model's IPA
-symbols. Not built yet: the network is clearly small enough (about 1 GFLOP a second of speech), the G2P is the work.
+The best fit for an assistant in Swedish and English is Piper's VITS: sv_SE-nst-medium (CC0 data) and
+en_US-ljspeech-medium (public-domain data), one architecture for both, real time on a Pi 4 as Piper is today, 22050 Hz.
+kakao-enterprise/vits-ljs (MIT, the same architecture in safetensors and in transformers' `VitsModel`) is the way to
+hold an implementation to a reference before reading Piper's ONNX files. Two pieces are the work, not the network (about
+1 GFLOP a second of speech): reading Piper's weights (ONNX protobuf, or converted once to safetensors) and a
+grapheme-to-phoneme step - espeak-ng, which every candidate here was trained with, is GPL-3, so it would be our own,
+matching espeak-ng's IPA for these voices: CMUdict (BSD-2) and rules for English, a lexicon and Swedish's fairly regular
+spelling rules for Swedish. Not built yet.
 
 ## Models, data and licences
 
