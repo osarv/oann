@@ -1,0 +1,241 @@
+# Architecture search with evo: regularized evolution over multilayer perceptrons fitting a synthetic target, with
+# successive halving over training steps, weight inheritance, a checkpoint per round and parallel workers. The space:
+# 1 to 4 hidden layers, each of an activation (relu, tanh, gelu) and a width (4 to 128), and a learning rate. A trial
+# trains its network with AdamW for its budget of steps on the training split, starting from its parent's weights where
+# their shapes allow (inherit.Overlap) or its own from the rung before, and gives the validation loss and the MACs a
+# sample costs. The test set is made apart and read once, at the end, for the best genome alone.
+#
+# Arguments, all optional: rounds (30), workers (1), seed (1), directory for weights and the checkpoint (a fresh
+# temporary one). The last line, "digest", sums the history's losses: equal for any number of workers.
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../evo/inherit"
+import "../io/checkpoint"
+import "../evo/schema"
+import "../evo/search"
+import "../kernels/mat"
+import "../nn/layers"
+import "../nn/optim"
+
+In I64 = 4
+Batch I64 = 128
+
+# samples of the target y = sin(3 x0) x1 + 0.5 tanh(2 x2) - 0.3 x3^2, inputs uniform in [-1, 1]: n rows of In, then n
+# targets
+type Samples struct(n I64) {
+    N I64 = n
+    X Array<F32> = Array<F32>(n * In)
+    Y Array<F32> = Array<F32>(n)
+}
+
+fn Samples.Draw(n I64, seed U64) Samples {
+    s := Samples(n)
+    r := rand.Rand(seed)
+    for i in range n {
+        for j in range In: s.X[i * In + j] = F32(r.Uniform(-1.0, 1.0))
+        x := s.X[i * In:(i + 1) * In]
+        s.Y[i] = F32((3.0 * F64(x[0])).Sin() * F64(x[1]) + 0.5 * (2.0 * F64(x[2])).Tanh() - 0.3 * F64(x[3]) * F64(x[3]))
+    }
+    return s
+}
+
+# the samples at these indices
+fn (s Samples&) Pick(idx Array<I64>&) Samples {
+    out := Samples(idx.Len())
+    for k in range idx.Len() {
+        for j in range In: out.X[k * In + j] = s.X[idx[k] * In + j]
+        out.Y[k] = s.Y[idx[k]]
+    }
+    return out
+}
+
+fn mlpSpace() schema.Schema {
+    s := schema.Schema()
+    layer := s.Block("layer")
+    s.Choice(layer, "act", Array<String>["relu", "tanh", "gelu"])
+    s.Int(layer, "width", 4, 128, true)
+    s.Float(schema.Root, "lr", 1e-3, 3e-2, true)
+    s.Repeat(schema.Root, "layers", layer, 1, 4)
+    return s
+}
+
+# a network a genome decodes to, its loss and its layers
+type Net struct(g graph.Graph<F32>, x graph.Var, y graph.Var, out graph.Var, loss graph.Var) {
+    g
+    x
+    y
+    out
+    loss
+    Dense Vec<layers.Dense> = Vec<layers.Dense>()
+    Macs F64 = 0.0
+}
+
+fn act(name String&) mat.Act {
+    if name == "tanh": return mat.Act.Tanh
+    return mat.Act.Gelu if name == "gelu" else mat.Act.Relu
+}
+
+# the fitness: train on the split's training samples, score on its validation samples
+type Fit struct(space schema.Schema) {
+    space
+}
+
+fn (f Fit&) build(gen schema.Genome&, seed U64) Net {
+    s := f.space
+    g := graph.Graph<F32>(Batch)
+    x := g.Input(In)
+    y := g.Input(1)
+    h := x
+    width := In
+    dense := Vec<layers.Dense>()
+    macs F64 = 0.0
+    for i in s.Children(gen, schema.Root, "layers") {
+        w := I64(s.Num(gen, i, "width"))
+        d := layers.Dense.New(g, width, w)
+        h = g.Act(d.Apply(g, h), act(s.Pick(gen, i, "act")))
+        dense.Push(d)
+        macs += F64(width * w)
+        width = w
+    }
+    head := layers.Dense.New(g, width, 1)
+    dense.Push(head)
+    macs += F64(width)
+    out := head.Apply(g, h)
+    loss := g.Mse(out, y)
+    try g.Plan(rand.Rand(seed)) catch e { unreachable "the network's shapes: " + $e }
+    n := Net(g, x, y, out, loss)
+    n.Dense = dense
+    n.Macs = macs
+    return n
+}
+
+# the network's weights, a safetensors file: layer k's as "wK" and "bK"
+fn (n Net&) Save(path String&) ? os.Error, checkpoint.SafetensorsError {
+    w := checkpoint.Writer()
+    for k in range n.Dense.Len() {
+        try w.Add("w" + $k, n.g.Value(n.Dense[k].W))
+        try w.Add("b" + $k, n.g.Value(n.Dense[k].B))
+    }
+    try w.Save(path)
+}
+
+# the weights at path copied into the network where shapes allow, layer by layer (inherit.Overlap)
+fn (n mut Net&) Load(path String&) {
+    f := try checkpoint.File.Load(path) catch { return }
+    for k in range n.Dense.Len() {
+        for name in Array<String>["w" + $k, "b" + $k] {
+            if not f.Has(name): return
+            src := try f.Get<F32>(name) catch { return }
+            dst := n.g.Value(n.Dense[k].W if name[0] == 'w' else n.Dense[k].B)
+            inherit.Overlap(dst, src)
+        }
+    }
+}
+
+fn (f mut Fit&) Evaluate(gen schema.Genome&, t search.Trial&, data search.Split<Samples>&) search.Result ? os.Error, checkpoint.SafetensorsError {
+    n := f.build(gen, t.Seed)
+    done F64 = 0.0
+    if t.Resume != "" {
+        n.Load(t.Resume)
+        done = t.Spent
+    } else if t.Inherit != "" {
+        n.Load(t.Inherit)
+    }
+    o := optim.AdamW(n.g.Params(), n.g.ParamGrads(), rate = f.space.Num(gen, schema.Root, "lr"))
+    r := rand.Rand(t.Seed)
+    xs := n.g.Value(n.x).Flat()!
+    ys := n.g.Value(n.y).Flat()!
+    tr := data.Train
+    for _ in range I64(t.Budget - done) {
+        for b in range Batch {
+            i := r.Below(tr.N)
+            for j in range In: xs[b * In + j] = tr.X[i * In + j]
+            ys[b] = tr.Y[i]
+        }
+        n.g.Forward(Batch)
+        n.g.Backward(n.loss)
+        o.Step()
+    }
+    if t.Save != "": try n.Save(t.Save)
+    res := search.Result(mse(n, data.Val))
+    res.Costs.Push(n.Macs)
+    return res
+}
+
+# the mean squared error of the network over all of s
+fn mse(n mut Net&, s Samples&) F64 {
+    xs := n.g.Value(n.x).Flat()!
+    total F64 = 0.0
+    at I64 = 0
+    for at < s.N {
+        m := Batch if at + Batch <= s.N else s.N - at
+        for k in range m * In: xs[k] = s.X[at * In + k]
+        n.g.Forward(m)
+        out := n.g.Value(n.out).Flat()!
+        for k in range m {
+            e := F64(out[k]) - F64(s.Y[at + k])
+            total += e * e
+        }
+        at += m
+    }
+    return total / F64(s.N)
+}
+
+fn main() ? io.Error, ParseError, os.Error, checkpoint.SafetensorsError {
+    args := search.Args()
+    rounds := try args[0].ParseInt() if args.Len() > 0 else 30
+    workers := try args[1].ParseInt() if args.Len() > 1 else 1
+    seed := U64(try args[2].ParseInt()) if args.Len() > 2 else U64(1)
+    dir := $args[3] if args.Len() > 3 else try os.MkTemp("", "evo-mlp-")
+    sp := mlpSpace()
+    fit := Fit(sp)
+    split := loadData(seed)
+    search.Worker(sp, fit, split)          # in a worker process: run its trial and end
+    c := search.Config(search.Algorithm.Regularized(16, 4), seed)
+    c.Rungs = Vec<F64>[100.0, 300.0]
+    c.Batch = 6
+    c.Workers = workers
+    c.Dir = dir
+    c.Crossover = 0.2
+    e := search.Evolution<schema.Genome>(c)
+    if os.Exists(dir + "/state.evo") {
+        try e.Resume(sp, try os.ReadFile(dir + "/state.evo")) catch search.SearchError err { unreachable "evo_mlp: " + $err }
+        try io.PutLn("resumed at round " + $e.Round)
+    }
+    start := time.Now()
+    for e.Round < rounds {
+        e.Step(sp, fit, split)
+        b := e.Best()
+        try io.PutLn("round " + $e.Round + ": best " + $b.Res.Loss.Fixed(5) + " at " + $b.Res.Costs[0] + " MACs, " + $e.Evaluations + " trials, " + $e.Hits + " cached")
+    }
+    secs := F64(time.Since(start)) / 1e9
+    b := e.Best()
+    try io.PutLn("best " + sp.Key(b.Genome) + " val " + $b.Res.Loss + " MACs " + $b.Res.Costs[0])
+    held := Samples.Draw(1024, seed + 1000)
+    final := fit.build(b.Genome, 1)
+    try io.PutLn("best's test loss (its saved weights, read once): " + $testLoss(final, dir + "/w" + $b.Id + ".bin", held))
+    front := e.Front()
+    try io.PutLn("loss against MACs, the front: " + $front.Len() + " members")
+    for m in front: try io.PutLn("  " + $m.Res.Loss.Fixed(5) + " at " + $m.Res.Costs[0] + " MACs: " + sp.Key(m.Genome))
+    digest F64 = 0.0
+    for m in e.History: digest += m.Res.Loss * F64(m.Id + 1)
+    try io.PutLn("seconds " + $secs.Fixed(1) + ", workers " + $workers + ", trials " + $e.Evaluations + ", digest " + $digest)
+}
+
+# the loss on the test set of the network with the weights at path
+fn testLoss(n mut Net&, path String&, held Samples&) F64 {
+    n.Load(path)
+    return mse(n, held)
+}
+
+# the training data (a quarter carved out for validation): drawn from seed alone, so every worker draws the same
+fn loadData(seed U64) search.Split<Samples> {
+    all := Samples.Draw(2048, seed)
+    idx := Array<I64>[i for i in range all.N]
+    cut := search.Split<Array<I64>>.Carve(idx, 0.25, seed)
+    return search.Split<Samples>(all.Pick(cut.Train), all.Pick(cut.Val))
+}

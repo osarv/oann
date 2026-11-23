@@ -73,6 +73,7 @@ Each `.olang` file is one module, imported by its path relative to the importer 
 | `data/`, `tokenizer.olang` | IDX, MNIST, a character corpus, token files, the Loader over a Dataset trait; byte-level BPE |
 | `io/` | safetensors checkpoints, JSON-lines run records |
 | `bayes/` | Bayesian inference: Gaussian beliefs, Laplace / assumed-density updates for normal, logit, probit, binomial, Poisson and ordered likelihoods, drift, Kalman filter and smoother, quadrature, ADVI and HMC on `ad`, empirical Bayes, calibration (`bayes/README.md`) |
+| `evo/` | evolutionary architecture search: schema and NEAT graph genomes, regularized evolution, tournament, (mu + lambda), NSGA-II, successive halving, weight inheritance, checkpoints, worker processes (`evo/README.md`) |
 | `board/` | the FPGA engine simulated in integers, lowered from a `dyn` system (`board/README.md`) |
 | `tools/` | gradient checks per operation (`tools/README.md`) |
 | `examples/` | the programs the makefile runs: MNIST, transformers, settling systems, INT8, the board (`examples/README.md`) |

@@ -1,0 +1,88 @@
+# evo/pareto - non-dominated sorting and crowding distance (Deb et al. 2002, NSGA-II), every objective minimized. Points
+# are rows of a flat array, m objectives a row: point i's objective k is objs[i * m + k].
+#
+#     ranks := pareto.Ranks(objs, m)              # 0: the first front, the points nothing dominates
+#     crowd := pareto.Crowding(objs, m, front)    # within one front: larger is lonelier, the ends infinite
+
+# whether point a dominates point b: no worse in every objective, better in one
+fn Dominates(objs Array<F64>&, m I64, a I64, b I64) Bool {
+    better := false
+    for k in range m {
+        x, y := objs[a * m + k], objs[b * m + k]
+        if x > y: return false
+        if x < y: better = true
+    }
+    return better
+}
+
+# each point's front: 0 for the points no point dominates, 1 for those only front 0 dominates, and so on
+fn Ranks(objs Array<F64>&, m I64) Array<I64> {
+    n := objs.Len() / m
+    count := Array<I64>(n)          # how many points dominate each
+    for i in range n {
+        for j in range n {
+            if i != j and Dominates(objs, m, j, i): count[i] += 1
+        }
+    }
+    rank := Array<I64>(n)
+    for i in range n: rank[i] = -1
+    front := Vec<I64>()
+    for i in range n {
+        if count[i] == 0: front.Push(i)
+    }
+    level I64 = 0
+    for front.Len() > 0 {
+        next := Vec<I64>()
+        for i in front: rank[i] = level
+        for i in front {
+            for j in range n {
+                if rank[j] >= 0 or not Dominates(objs, m, i, j): continue
+                count[j] -= 1
+                if count[j] == 0: next.Push(j)
+            }
+        }
+        front = next
+        level += 1
+    }
+    return rank
+}
+
+# the crowding distance of each point of `front` (indices into objs), in its order: the sum over objectives of the gap
+# between its neighbours, scaled by the front's extent; the ends of each objective infinite
+fn Crowding(objs Array<F64>&, m I64, front Array<I64>&) Array<F64> {
+    n := front.Len()
+    d := Array<F64>(n)
+    order := Vec<I64>()
+    for k in range m {
+        order.Clear()
+        for i in range n: order.Push(i)
+        order.Sort(fn(a, b): return objs[front[a] * m + k] < objs[front[b] * m + k] or (objs[front[a] * m + k] == objs[front[b] * m + k] and a < b))
+        lo, hi := objs[front[order[0]] * m + k], objs[front[order[n - 1]] * m + k]
+        d[order[0]] = F64.Inf
+        d[order[n - 1]] = F64.Inf
+        if hi <= lo: continue
+        for p in range 1, n - 1 {
+            d[order[p]] += (objs[front[order[p + 1]] * m + k] - objs[front[order[p - 1]] * m + k]) / (hi - lo)
+        }
+    }
+    return d
+}
+
+# the indices of the first front
+fn Front(objs Array<F64>&, m I64) Array<I64> {
+    ranks := Ranks(objs, m)
+    out := Vec<I64>()
+    for i in range ranks.Len() {
+        if ranks[i] == 0: out.Push(i)
+    }
+    return out.ToArray()
+}
+
+test Ranks "fronts of a known set: the staircase first, then what it dominates, then the rest" {
+    objs := Array<F64>[1.0, 4.0,  2.0, 2.0,  4.0, 1.0,  3.0, 3.0,  2.0, 5.0,  5.0, 5.0,  2.0, 2.0]
+    ranks := Ranks(objs, 2)
+    assert ranks == Array<I64>[0, 0, 0, 1, 1, 2, 0]
+    assert Front(objs, 2) == Array<I64>[0, 1, 2, 6]
+    d := Crowding(objs, 2, Array<I64>[0, 1, 2])
+    assert d[0] == F64.Inf and d[2] == F64.Inf and (d[1] - 2.0).Abs() < 1e-12
+}

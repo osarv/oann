@@ -1,0 +1,492 @@
+# evo/neat - graph genomes with historical markings, as in NEAT (Stanley and Miikkulainen 2002): a network of nodes,
+# each with an operation (an index into the space's Ops) and a width, joined by directed edges that can be switched off.
+# The program decodes a genome into its model through its own code, in topological order:
+#
+#     sp := neat.Space(2, 1, Array<String>["linear", "relu", "tanh", "attention"], 8, 256)
+#     g := sp.Random(r)                     # every input joined to every output
+#     for n in g.Order() {                  # every node, each after the nodes it reads
+#         node := g.Nodes[n]
+#         ...sp.Ops[node.Op], node.Width, g.Into(n) (the nodes it reads, by index)...
+#     }
+#
+# Nodes 0 .. inputs - 1 are the inputs and the next `outputs` the outputs; the rest are hidden. Every structural change
+# is named by the space's registry, so the same change made in two genomes gets the same name and crossover can align
+# them: an edge u -> v gets one marking for the whole search, and the node splitting the edge of marking m gets one id
+# (as NEAT's innovation numbers, kept for the whole run rather than per generation). Mutations: adding a node (an
+# enabled edge split in two, the edge switched off), adding an edge (any pair that keeps the graph acyclic), deleting a
+# hidden node with its edges, an operation swap, width scaling, and a point mutation (an edge switched on or off, or a
+# width drawn afresh). Crossover aligns edges by marking: a gene both parents have comes from either, the rest from the
+# fitter (the first) parent, so a child is a subgraph of the fitter parent's and stays acyclic. The registry is the
+# space's state: State and Restore keep it across a checkpoint.
+
+import "std/rand"
+
+# a node gene
+type Node struct(Id I64, Op I64, Width I64) {
+    Id      # its id: equal ids across genomes are the same node
+    Op      # its operation, an index into Space.Ops
+    Width   # its size
+}
+
+# an edge gene: From's output read by To
+type Edge struct(From I64, To I64, Mark I64, On Bool) {
+    From    # node ids
+    To
+    Mark    # its historical marking
+    On      # enabled
+}
+
+# a network: its nodes (inputs, outputs, then hidden in the order made) and edges
+type Net struct() {
+    Nodes Vec<Node> = Vec<Node>()
+    Edges Vec<Edge> = Vec<Edge>()
+}
+
+type NeatError error {
+    Parse(text String)      # a genome's or registry's text that is no genome or registry of this space
+}
+
+# the mutation operators, in the order of Space.Rates
+type Mutation enum { Point, AddNode, AddEdge, DeleteNode, Swap, Width }
+
+# a space of networks of `inputs` inputs and `outputs` outputs, hidden nodes of operations `ops` and widths minWidth to
+# maxWidth; it registers the markings
+type Space struct(inputs I64, outputs I64, ops Array<String>, minWidth I64, maxWidth I64) {
+    Inputs I64 = inputs
+    Outputs I64 = outputs
+    Ops Array<String> = ops
+    MinWidth I64 = minWidth
+    MaxWidth I64 = maxWidth
+    OutputOp I64 = 0                                            # the operation of output nodes (not swapped)
+    Rates Array<F64> = Array<F64>[1.0, 1.0, 1.0, 0.5, 1.0, 1.0]  # how often each Mutation is drawn, among those that apply
+    marks Map<String, I64> = Map<String, I64>()                 # "u v" -> the edge's marking
+    splits Map<I64, I64> = Map<I64, I64>()                      # an edge's marking -> the id of the node splitting it
+    nextMark I64 = 0
+    nextNode I64 = inputs + outputs
+}
+
+# ---- the registry ----
+
+# the marking of edge u -> v, the same for the whole search
+fn (s mut Space&) Mark(u I64, v I64) I64 {
+    key := $u + " " + $v
+    m := try s.marks.Get(key) catch default -1
+    if m >= 0: return m
+    s.marks.Put(key, s.nextMark)
+    s.nextMark += 1
+    return s.nextMark - 1
+}
+
+# the id of the node splitting the edge of marking m, the same for the whole search
+fn (s mut Space&) splitter(m I64) I64 {
+    id := try s.splits.Get(m) catch default -1
+    if id >= 0: return id
+    s.splits.Put(m, s.nextNode)
+    s.nextNode += 1
+    return s.nextNode - 1
+}
+
+# the registry as one line of text, for a checkpoint
+fn (s Space&) State() String {
+    t := $s.nextMark + " " + $s.nextNode
+    for e in s.marks.Iter(): t += " m" + e.Key.Split(" ")[0] + "," + e.Key.Split(" ")[1] + "," + $e.Value
+    for e in s.splits.Iter(): t += " s" + $e.Key + "," + $e.Value
+    return t
+}
+
+# the registry State wrote
+fn (s mut Space&) Restore(t String&) ? NeatError {
+    f := t.Split(" ")
+    if f.Len() < 2: error NeatError.Parse($t)
+    s.nextMark = try f[0].ParseInt() catch { error NeatError.Parse($t) }
+    s.nextNode = try f[1].ParseInt() catch { error NeatError.Parse($t) }
+    s.marks.Clear()
+    s.splits.Clear()
+    for w in f[2:] {
+        if w.Len() < 2: error NeatError.Parse($t)
+        p := w[1:].Split(",")
+        if w[0] == 'm' and p.Len() == 3 {
+            m := try p[2].ParseInt() catch { error NeatError.Parse($t) }
+            s.marks.Put($p[0] + " " + $p[1], m)
+        } else if w[0] == 's' and p.Len() == 2 {
+            k := try p[0].ParseInt() catch { error NeatError.Parse($t) }
+            v := try p[1].ParseInt() catch { error NeatError.Parse($t) }
+            s.splits.Put(k, v)
+        } else {
+            error NeatError.Parse($t)
+        }
+    }
+}
+
+# ---- reading a network ----
+
+# the index of node id, -1 where the net has none
+fn (n Net&) Find(id I64) I64 {
+    for i in range n.Nodes.Len() {
+        if n.Nodes[i].Id == id: return i
+    }
+    return -1
+}
+
+# the nodes node i reads through enabled edges, by index, in the order of their edges' markings
+fn (n Net&) Into(i I64) Array<I64> {
+    id := n.Nodes[i].Id
+    out := Vec<I64>()
+    for e in n.Edges {
+        if e.On and e.To == id: out.Push(n.Find(e.From))
+    }
+    return out.ToArray()
+}
+
+# every node, each after every node it reads through an enabled edge (Kahn's order, ties by index)
+fn (n Net&) Order() Array<I64> {
+    count := n.Nodes.Len()
+    deg := Array<I64>(count)
+    for e in n.Edges {
+        if e.On: deg[n.Find(e.To)] += 1
+    }
+    done := Array<Bool>(count)
+    out := Vec<I64>()
+    for _ in range count {
+        next := -1
+        for i in range count {
+            if not done[i] and deg[i] == 0 and next < 0: next = i
+        }
+        if next < 0: break
+        done[next] = true
+        out.Push(next)
+        id := n.Nodes[next].Id
+        for e in n.Edges {
+            if e.On and e.From == id: deg[n.Find(e.To)] -= 1
+        }
+    }
+    return out.ToArray()
+}
+
+# whether node id `to` can be reached from node id `from` through edges on or off (a new edge to -> from would close
+# a cycle)
+fn (n Net&) reaches(from I64, to I64) Bool {
+    seen := Vec<I64>[from]
+    at I64 = 0
+    for at < seen.Len() {
+        u := seen[at]
+        at += 1
+        if u == to: return true
+        for e in n.Edges {
+            if e.From == u and not (e.To in seen): seen.Push(e.To)
+        }
+    }
+    return false
+}
+
+# whether node id `to` can be reached from node id `from` through enabled edges
+fn (n Net&) Reaches(from I64, to I64) Bool {
+    seen := Vec<I64>[from]
+    at I64 = 0
+    for at < seen.Len() {
+        u := seen[at]
+        at += 1
+        if u == to: return true
+        for e in n.Edges {
+            if e.On and e.From == u and not (e.To in seen): seen.Push(e.To)
+        }
+    }
+    return false
+}
+
+# whether node id is hidden
+fn (s Space&) hidden(id I64) Bool { return id >= s.Inputs + s.Outputs }
+
+# ---- drawing ----
+
+# the starting network: every input joined to every output, nothing hidden
+fn (s mut Space&) Random(r mut rand.Rand&) Net {
+    n := Net()
+    for i in range s.Inputs + s.Outputs: n.Nodes.Push(Node(i, -1 if i < s.Inputs else s.OutputOp, 0))
+    for i in range s.Inputs {
+        for o in range s.Outputs: n.Edges.Push(Edge(i, s.Inputs + o, s.Mark(i, s.Inputs + o), true))
+    }
+    return n
+}
+
+# ---- mutation ----
+
+# n changed by one mutation, drawn by Rates among those that apply (n itself where none does)
+fn (s mut Space&) Mutate(n Net&, r mut rand.Rand&) Net {
+    kinds := Array<Mutation>[Mutation.Point, Mutation.AddNode, Mutation.AddEdge, Mutation.DeleteNode, Mutation.Swap, Mutation.Width]
+    total F64 = 0.0
+    for k in range kinds.Len() {
+        if s.Rates[k] > 0.0 and s.applies(n, kinds[k]): total += s.Rates[k]
+    }
+    if total <= 0.0: return n
+    u := r.Float() * total
+    for k in range kinds.Len() {
+        if s.Rates[k] <= 0.0 or not s.applies(n, kinds[k]): continue
+        u -= s.Rates[k]
+        if u < 0.0 or k == kinds.Len() - 1: return s.Apply(n, kinds[k], r)
+    }
+    return n
+}
+
+fn (s Space&) hiddenCount(n Net&) I64 {
+    c I64 = 0
+    for x in n.Nodes {
+        if s.hidden(x.Id): c += 1
+    }
+    return c
+}
+
+# whether Mutation m can change n
+fn (s Space&) applies(n Net&, m Mutation) Bool {
+    return match m {
+        case Mutation.Point: n.Edges.Len() > 0 or (s.hiddenCount(n) > 0 and s.MaxWidth > s.MinWidth)
+        case Mutation.AddNode: n.Edges.Len() > 0
+        case Mutation.AddEdge: s.openPairs(n).Len() > 0
+        case Mutation.DeleteNode: s.hiddenCount(n) > 0
+        case Mutation.Swap: s.hiddenCount(n) > 0 and s.Ops.Len() > 1
+        case Mutation.Width: s.hiddenCount(n) > 0 and s.MaxWidth > s.MinWidth
+    }
+}
+
+# the pairs (u, v) of node indices, packed u * count + v, that a new edge u -> v may join: v neither an input nor u, u
+# no output, no edge u -> v yet, and none from v back to u
+fn (s Space&) openPairs(n Net&) Array<I64> {
+    count := n.Nodes.Len()
+    out := Vec<I64>()
+    for u in range count {
+        a := n.Nodes[u].Id
+        if a >= s.Inputs and a < s.Inputs + s.Outputs: continue
+        for v in range count {
+            b := n.Nodes[v].Id
+            if b < s.Inputs or u == v or n.has(a, b) or n.reaches(b, a): continue
+            out.Push(u * count + v)
+        }
+    }
+    return out.ToArray()
+}
+
+fn (n Net&) has(u I64, v I64) Bool {
+    for e in n.Edges {
+        if e.From == u and e.To == v: return true
+    }
+    return false
+}
+
+# a hidden node's index drawn uniformly
+fn (s Space&) anyHidden(n Net&, r mut rand.Rand&) I64 {
+    k := r.Below(s.hiddenCount(n))
+    for i in range n.Nodes.Len() {
+        if not s.hidden(n.Nodes[i].Id): continue
+        if k == 0: return i
+        k -= 1
+    }
+    return -1
+}
+
+# a width drawn log-uniformly in range, rounded
+fn (s Space&) drawWidth(r mut rand.Rand&) I64 {
+    lo, hi := F64(s.MinWidth).Log(), F64(s.MaxWidth).Log()
+    return I64((lo + r.Float() * (hi - lo)).Exp().Round())
+}
+
+# n changed by Mutation m at a site drawn uniformly (n itself where it does not apply)
+fn (s mut Space&) Apply(n Net&, m Mutation, r mut rand.Rand&) Net {
+    if not s.applies(n, m): return n
+    out := n.Copy()
+    match m {
+        case Mutation.Point {
+            if n.Edges.Len() > 0 and (s.hiddenCount(n) == 0 or r.Float() < 0.5) {
+                k := r.Below(n.Edges.Len())
+                e := out.Edges[k]
+                e.On = not e.On
+                out.Edges[k] = e
+            } else {
+                i := s.anyHidden(n, r)
+                x := out.Nodes[i]
+                x.Width = s.drawWidth(r)
+                out.Nodes[i] = x
+            }
+        }
+        case Mutation.AddNode {
+            k := r.Below(n.Edges.Len())
+            e := out.Edges[k]
+            id := s.splitter(e.Mark)
+            if out.Find(id) >= 0: return out         # split already (the edge re-enabled since): nothing new
+            e.On = false
+            out.Edges[k] = e
+            out.Nodes.Push(Node(id, r.Below(s.Ops.Len()), s.drawWidth(r)))
+            out.Edges.Push(Edge(e.From, id, s.Mark(e.From, id), true))
+            out.Edges.Push(Edge(id, e.To, s.Mark(id, e.To), true))
+        }
+        case Mutation.AddEdge {
+            pairs := s.openPairs(n)
+            p := pairs[r.Below(pairs.Len())]
+            count := n.Nodes.Len()
+            a, b := n.Nodes[p / count].Id, n.Nodes[p % count].Id
+            out.Edges.Push(Edge(a, b, s.Mark(a, b), true))
+        }
+        case Mutation.DeleteNode {
+            i := s.anyHidden(n, r)
+            id := n.Nodes[i].Id
+            try out.Nodes.RemoveAt(i) catch { unreachable }
+            kept := Vec<Edge>()
+            for e in out.Edges {
+                if e.From != id and e.To != id: kept.Push(e)
+            }
+            out.Edges = kept
+        }
+        case Mutation.Swap {
+            i := s.anyHidden(n, r)
+            x := out.Nodes[i]
+            k := r.Below(s.Ops.Len() - 1)
+            x.Op = k + 1 if k >= x.Op else k
+            out.Nodes[i] = x
+        }
+        case Mutation.Width {
+            i := s.anyHidden(n, r)
+            x := out.Nodes[i]
+            w := x.Width * 2 if r.Float() < 0.5 else x.Width / 2
+            x.Width = s.MinWidth if w < s.MinWidth else (s.MaxWidth if w > s.MaxWidth else w)
+            out.Nodes[i] = x
+        }
+    }
+    return out
+}
+
+# ---- crossover ----
+
+# a child of a (the fitter) and b, aligned by markings: an edge both have from either, an edge only a has from a; a node
+# from either where both have it, else from a. A subgraph of a's, so acyclic
+fn (s Space&) Cross(a Net&, b Net&, r mut rand.Rand&) Net {
+    out := Net()
+    for x in a.Nodes {
+        j := b.Find(x.Id)
+        out.Nodes.Push(b.Nodes[j] if j >= 0 and r.Float() < 0.5 else x)
+    }
+    for e in a.Edges {
+        f := e
+        for g in b.Edges {
+            if g.Mark == e.Mark and r.Float() < 0.5: f = g
+        }
+        out.Edges.Push(f)
+    }
+    return out
+}
+
+# ---- text ----
+
+# the canonical text of what n computes: its nodes by id (op, width) and enabled edges by marking, both sorted
+fn (s Space&) Key(n Net&) String {
+    ids := Vec<I64>()
+    for x in n.Nodes: ids.Push(x.Id)
+    ids.Sort(fn(x, y): return x < y)
+    t := ""
+    for id in ids {
+        x := n.Nodes[n.Find(id)]
+        t += $id + ":" + $x.Op + ":" + $x.Width + ","
+    }
+    t += "|"
+    marks := Vec<I64>()
+    for e in n.Edges {
+        if e.On: marks.Push(e.Mark)
+    }
+    marks.Sort(fn(x, y): return x < y)
+    for m in marks: t += $m + ","
+    return t
+}
+
+# n's full text, one line: "N id op width ...;E from to mark on ...", what Decode reads back
+fn (s Space&) Encode(n Net&) String {
+    t := "N"
+    for x in n.Nodes: t += " " + $x.Id + " " + $x.Op + " " + $x.Width
+    t += ";E"
+    for e in n.Edges: t += " " + $e.From + " " + $e.To + " " + $e.Mark + " " + ("1" if e.On else "0")
+    return t
+}
+
+# the network Encode wrote as t
+fn (s Space&) Decode(t String&) Net ? NeatError {
+    parts := t.Split(";")
+    if parts.Len() != 2: error NeatError.Parse($t)
+    nf, ef := parts[0].Split(" "), parts[1].Split(" ")
+    if nf[0] != "N" or ef[0] != "E" or (nf.Len() - 1) % 3 != 0 or (ef.Len() - 1) % 4 != 0: error NeatError.Parse($t)
+    n := Net()
+    for k in range (nf.Len() - 1) / 3 {
+        id := try nf[1 + 3 * k].ParseInt() catch { error NeatError.Parse($t) }
+        op := try nf[2 + 3 * k].ParseInt() catch { error NeatError.Parse($t) }
+        w := try nf[3 + 3 * k].ParseInt() catch { error NeatError.Parse($t) }
+        n.Nodes.Push(Node(id, op, w))
+    }
+    for k in range (ef.Len() - 1) / 4 {
+        u := try ef[1 + 4 * k].ParseInt() catch { error NeatError.Parse($t) }
+        v := try ef[2 + 4 * k].ParseInt() catch { error NeatError.Parse($t) }
+        m := try ef[3 + 4 * k].ParseInt() catch { error NeatError.Parse($t) }
+        n.Edges.Push(Edge(u, v, m, ef[4 + 4 * k] == "1"))
+    }
+    if not s.Valid(n): error NeatError.Parse($t)
+    return n
+}
+
+# whether n is a network of this space: its inputs and outputs first, every edge between its nodes, acyclic
+fn (s Space&) Valid(n Net&) Bool {
+    if n.Nodes.Len() < s.Inputs + s.Outputs: return false
+    for i in range s.Inputs + s.Outputs {
+        if n.Nodes[i].Id != i: return false
+    }
+    for x in n.Nodes {
+        if s.hidden(x.Id) and (x.Op < 0 or x.Op >= s.Ops.Len() or x.Width < s.MinWidth or x.Width > s.MaxWidth): return false
+    }
+    for e in n.Edges {
+        if n.Find(e.From) < 0 or n.Find(e.To) < 0 or e.To < s.Inputs: return false
+    }
+    return n.Order().Len() == n.Nodes.Len()
+}
+
+# ---- tests ----
+
+fn Space.testSpace() Space { return Space(2, 1, Array<String>["linear", "relu", "tanh"], 4, 64) }
+
+test Space "mutated and crossed networks stay acyclic and valid; Encode and Decode give them back" {
+    s := Space.testSpace()
+    r := rand.Rand(1)
+    pop := Vec<Net>[s.Random(r)]
+    for _ in range 600 {
+        a := pop[r.Below(pop.Len())]
+        child := s.Mutate(a, r)
+        assert s.Valid(child)
+        if r.Float() < 0.3 {
+            child = s.Cross(child, pop[r.Below(pop.Len())], r)
+            assert s.Valid(child)
+        }
+        back := try s.Decode(s.Encode(child)) catch { unreachable }
+        assert s.Key(back) == s.Key(child)
+        pop.Push(child)
+    }
+    deepest I64 = 0
+    for n in pop {
+        h := s.hiddenCount(n)
+        deepest = h if h > deepest else deepest
+    }
+    assert deepest >= 3
+}
+
+test Space "the same split in two genomes is the same node and markings; the registry survives State and Restore" {
+    s := Space.testSpace()
+    r := rand.Rand(2)
+    base := s.Random(r)
+    kids := Vec<Net>()
+    for _ in range 20: kids.Push(s.Apply(base, Mutation.AddNode, r))
+    for a in kids {
+        for b in kids {
+            if a.Edges[0].On != b.Edges[0].On: continue       # each split one of base's two edges
+            assert a.Nodes[3].Id == b.Nodes[3].Id
+            assert a.Edges[2].Mark == b.Edges[2].Mark and a.Edges[3].Mark == b.Edges[3].Mark
+        }
+    }
+    t := s.State()
+    c := Space.testSpace()
+    try c.Restore(t) catch { unreachable }
+    assert c.Mark(0, 2) == s.Mark(0, 2) and c.Mark(1, 2) == s.Mark(1, 2)
+    assert c.Mark(5, 2) == s.Mark(5, 2)       # a pair new to both gets the same marking
+    assert c.splitter(0) == s.splitter(0) and c.splitter(1) == s.splitter(1)
+}

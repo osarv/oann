@@ -1,0 +1,134 @@
+# evo/inherit - weight inheritance: a child starts from its parent's weights where it can, rather than from scratch.
+# Tensors are copied where their shapes overlap, and a layer is widened or a layer added keeping the function the
+# network computes (Net2Net: Chen, Goodfellow and Shlens 2016), so a child of a trained parent starts where the parent
+# ended. Weights are in the Linear layers' layout, w [out, in] (y = x w^T + b).
+#
+#     inherit.Overlap(child.Value(w), parent.Value(w))           # the corner both shapes have (all of it where equal)
+#     inherit.Widen(w1, b1, w2, nw1, nb1, nw2, r)                 # hidden width h -> h', the output unchanged
+#     inherit.Identity(nw, nb)                                    # a new square layer that passes its input through
+#
+# Widen copies each new unit from a unit of the old layer (the first h from themselves, the rest drawn), and divides
+# each old unit's outgoing weights among its copies: for any activation applied unit by unit, the next layer sees the
+# same sum. Identity keeps the function where the layer goes after an activation f with f(f(x)) = f(x) - ReLU - or where
+# no activation follows it. A small `noise` breaks the symmetry between copies, at the cost of the exact function.
+
+import "std/rand"
+import "../tensor"
+
+# the elements of src at every index below both shapes copied into dst (tensors of one rank); how many were copied
+fn Overlap<T>(dst mut tensor.Tensor<T>&, src tensor.Tensor<T>&) I64 {
+    rank := dst.Rank()
+    if src.Rank() != rank: return 0
+    lim := Array<I64>(rank)
+    for a in range rank {
+        lim[a] = dst.Dim(a) if dst.Dim(a) < src.Dim(a) else src.Dim(a)
+        if lim[a] == 0: return 0
+    }
+    idx := Array<I64>(rank)
+    n I64 = 0
+    for {
+        dst.Set(src.Get(...idx), ...idx)
+        n += 1
+        a := rank - 1
+        for a >= 0 {
+            idx[a] += 1
+            if idx[a] < lim[a]: break
+            idx[a] = 0
+            a -= 1
+        }
+        if a < 0: return n
+    }
+}
+
+# a hidden layer widened from h to h' units, keeping the output of the next layer: w1 [h, in] and b1 [h] the layer,
+# w2 [out, h] the next; nw1 [h', in], nb1 [h'], nw2 [out, h'] written (h' >= h). New units copy units drawn from r; each
+# old unit's outgoing weights are divided among its copies, then moved by Normal(0, noise) times their size where noise
+fn Widen<T>(w1 tensor.Tensor<T>&, b1 tensor.Tensor<T>&, w2 tensor.Tensor<T>&, nw1 mut tensor.Tensor<T>&, nb1 mut tensor.Tensor<T>&, nw2 mut tensor.Tensor<T>&, r mut rand.Rand&, noise F64 = 0.0) {
+    h, wide := w1.Dim(0), nw1.Dim(0)
+    from := Array<I64>(wide)
+    copies := Array<I64>(h)
+    for j in range wide {
+        from[j] = j if j < h else r.Below(h)
+        copies[from[j]] += 1
+    }
+    for j in range wide {
+        for i in range w1.Dim(1): nw1.Set(w1.Get(from[j], i), j, i)
+        nb1.Set(b1.Get(from[j]), j)
+        for o in range w2.Dim(0) {
+            v := F64(w2.Get(o, from[j])) / F64(copies[from[j]])
+            if noise > 0.0: v += r.Normal(0.0, noise * v.Abs())
+            nw2.Set(T(v), o, j)
+        }
+    }
+}
+
+# w [h, h] the identity and b [h] zero: a layer that passes its input through
+fn Identity<T>(w mut tensor.Tensor<T>&, b mut tensor.Tensor<T>&) {
+    w.Fill(T(0.0))
+    b.Fill(T(0.0))
+    for j in range w.Dim(0): w.Set(T(1.0), j, j)
+}
+
+# ---- tests ----
+
+# y = w2 relu(w1 x + b1) + b2, or with a square layer (w3, b3) and a second relu between: the reference the tests check
+fn forward(x Array<F32>&, w1 tensor.Tensor<F32>&, b1 tensor.Tensor<F32>&, w2 tensor.Tensor<F32>&, b2 tensor.Tensor<F32>&) Array<F32> {
+    h := Array<F32>(w1.Dim(0))
+    for j in range h.Len() {
+        s := b1.Get(j)
+        for i in range x.Len(): s += w1.Get(j, i) * x[i]
+        h[j] = s if s > 0.0 else 0.0
+    }
+    y := Array<F32>(w2.Dim(0))
+    for o in range y.Len() {
+        s := b2.Get(o)
+        for j in range h.Len(): s += w2.Get(o, j) * h[j]
+        y[o] = s
+    }
+    return y
+}
+
+test Widen "a hidden layer widened from 3 to 7 units computes what it did; Identity adds a layer that changes nothing" {
+    r := rand.Rand(1)
+    w1, b1 := tensor.Tensor<F32>.Zeros(3, 4), tensor.Tensor<F32>.Zeros(3)
+    w2, b2 := tensor.Tensor<F32>.Zeros(2, 3), tensor.Tensor<F32>.Zeros(2)
+    w1.FillNormal(r, 0.0, 1.0)
+    b1.FillNormal(r, 0.0, 1.0)
+    w2.FillNormal(r, 0.0, 1.0)
+    b2.FillNormal(r, 0.0, 1.0)
+    nw1, nb1, nw2 := tensor.Tensor<F32>.Zeros(7, 4), tensor.Tensor<F32>.Zeros(7), tensor.Tensor<F32>.Zeros(2, 7)
+    Widen(w1, b1, w2, nw1, nb1, nw2, r)
+    w3, b3 := tensor.Tensor<F32>.Zeros(7, 7), tensor.Tensor<F32>.Zeros(7)
+    Identity(w3, b3)
+    for _ in range 20 {
+        x := Array<F32>[F32(r.Normal()) for _ in range 4]
+        a := forward(x, w1, b1, w2, b2)
+        b := forward(x, nw1, nb1, nw2, b2)
+        for o in range 2: assert (a[o] - b[o]).Abs() < 1e-5
+        h := Array<F32>(7)            # through the identity layer and a second relu: the same hidden state
+        for j in range 7 {
+            s := nb1.Get(j)
+            for i in range 4: s += nw1.Get(j, i) * x[i]
+            h[j] = s if s > 0.0 else 0.0
+        }
+        for j in range 7 {
+            s := b3.Get(j)
+            for i in range 7: s += w3.Get(j, i) * h[i]
+            assert (s if s > 0.0 else 0.0) == h[j]
+        }
+    }
+}
+
+test Overlap "the corner two shapes share is copied, all of it where they are equal; ranks that differ copy nothing" {
+    src := tensor.Tensor<F32>.Zeros(3, 5)
+    for i in range 3 {
+        for j in range 5: src.Set(F32(10 * i + j), i, j)
+    }
+    dst := tensor.Tensor<F32>.Zeros(4, 2)
+    assert Overlap(dst, src) == 6
+    assert dst.Get(2, 1) == 21.0 and dst.Get(3, 1) == 0.0
+    same := tensor.Tensor<F32>.Zeros(3, 5)
+    assert Overlap(same, src) == 15 and same.Get(2, 4) == 24.0
+    flat := tensor.Tensor<F32>.Zeros(15)
+    assert Overlap(flat, src) == 0
+}

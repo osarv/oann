@@ -2196,3 +2196,36 @@ Graph<BF16>.Forward.Allocates`, `.Backward`). Tested against the same operation 
 parameters, at the full and a short batch: the loss and gradients agree to BF16's precision (2e-2). An F64 graph still
 refuses Custom. Eager BF16 graphs fail on their parameters' masters before any Custom is reached (the masters are
 sized at Plan); that is unchanged.
+
+## evo: evolutionary architecture search (wt-evo)
+
+A new package, `evo/` (README there), for evolving neural architectures. It has:
+
+- **Genomes:** schema-defined search spaces (`schema.olang`: choices, integer and real ranges, repeated blocks of
+  variable count, conditional genes) and NEAT graph genomes with historical markings (`neat.olang`).
+- **Operators:** point mutation, swap, width scaling, insert and delete of a block or node, and crossover (aligned genes, or
+  markings for graphs).
+- **Search** (`search.olang`): regularized evolution as the default, tournament, (mu + lambda) and NSGA-II.
+- **Efficiency:** successive halving over training budgets, weight-inheritance paths and `inherit.olang` (Overlap, and
+  Net2Net's Widen and Identity), a result cache by canonical key, a checkpoint of the whole state after every round,
+  and worker processes with seeds fixed per trial.
+- **The fitness contract:** `Evaluate(g, Trial, Split<D>) Result`, where `Split` holds training and validation data only.
+
+Tests, all against known optima:
+
+- Each of the three single-objective algorithms finds a known width, op and depth.
+- Halving sends 9, 3 and 1 children through the rungs each round.
+- NSGA-II recovers ZDT1's front: at least 20 points, mean gap under 0.03, f1 from under 0.05 to over 0.9.
+- NEAT finds a known two-node network.
+- Inherit and resume paths are checked.
+- A run stopped and resumed ends byte-identical to a straight run.
+- Widen and Identity preserve the function.
+
+`make evomlp` (examples/evo_mlp.olang) searches MLPs on a synthetic regression:
+
+- 6 rounds take 4.6 s on one worker and 2.4 s on four. The history digest is the same, and the same again when resumed
+  at round 3 with a different worker count.
+- 40 rounds take 15.4 s on four workers for 297 trials. The best validation loss falls from 5.3e-4 to 6e-5, with a test
+  loss of 6.8e-5 read once.
+- The weights first went to text files, whose string building made a run 7x slower and dominated the time; safetensors
+  (io/checkpoint) fixed it.

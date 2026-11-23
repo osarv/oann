@@ -1,0 +1,637 @@
+# evo/schema - a search space written as a schema: blocks of named genes - a choice among options, an integer or a real
+# in a range, a block repeated a variable number of times - some genes active only when another holds a given value. A
+# genome is one point of the space; the program decodes it into its model through its own code, reading genes by name.
+#
+#     s := schema.Schema()
+#     layer := s.Block("layer")
+#     s.Choice(layer, "op", Array<String>["mlp", "attention", "conv"])
+#     s.Int(layer, "width", 16, 512, true)           # true: a size, scaled by width mutations
+#     s.Int(layer, "heads", 1, 8)
+#     s.When(layer, "heads", "op", "attention")      # heads counts only where op is attention
+#     s.Float(schema.Root, "lr", 1e-4, 1e-2, true)    # true: drawn and perturbed on a log scale
+#     s.Repeat(schema.Root, "layers", layer, 1, 8)    # 1 to 8 layers
+#
+#     g := s.Random(r)
+#     for i in s.Children(g, schema.Root, "layers") {
+#         ...s.Pick(g, i, "op"), s.Num(g, i, "width")...
+#     }
+#
+# A genome is its block instances in pre-order (the root first, each instance followed by its children), each with its
+# depth, the repeat gene of its parent it fills, and a value per gene of its block: a choice's index, an integer, a
+# real, a repeat's count. Mutation (Mutate) is one of: a point mutation (a gene drawn afresh or perturbed), a swap (a
+# choice set to another option), width scaling (a size doubled or halved), inserting a block (a copy of a sibling,
+# which a function-preserving deepen can start from, or a fresh one) and deleting one. Crossover (Cross) is uniform over
+# aligned genes: each gene from either parent, a repeat's children aligned by position. Key is a canonical text of the
+# active genes alone - equal for genomes that decode alike - and Encode/Decode a genome's full text for checkpoints and
+# worker processes. A schema has no state of its own to keep (State is "").
+
+import "std/rand"
+
+# the root block: every schema has it, made with the schema
+Root I64 = 0
+
+# what a gene holds
+type Kind enum {
+    Choice(options Array<String>)       # one of these, kept as its index
+    Int(lo I64, hi I64)                 # an integer in [lo, hi]
+    Float(lo F64, hi F64, log Bool)     # a real in [lo, hi], drawn and perturbed on a log scale where log
+    Repeat(block I64, min I64, max I64) # min to max instances of a block, its value their count
+}
+
+# a named gene of a block
+type Gene struct(Name String, Holds Kind) {
+    Name
+    Holds
+    Width Bool = false      # a size: width scaling doubles or halves it
+    When I64 = -1           # active only where gene When of the same block holds the value Is (-1: always)
+    Is F64 = 0.0
+}
+
+# a block: its genes, in order
+type Block struct(Name String) {
+    Name
+    Genes Vec<Gene> = Vec<Gene>()
+}
+
+# a block's instance in a genome
+type Inst struct(Of I64, Depth I64, Slot I64, Values Array<F64>) {
+    Of              # which block
+    Depth           # 0 for the root, a child's its parent's plus one
+    Slot            # the gene of its parent's block (a repeat) it is an instance of; -1 for the root
+    Values          # a value per gene of its block
+}
+
+# a point of a schema's space: its instances in pre-order
+type Genome struct() {
+    Insts Vec<Inst> = Vec<Inst>()
+}
+
+type SchemaError error {
+    Unknown(name String)        # no gene or option of this name
+    Parse(text String)          # a genome's text that is no genome of this schema
+}
+
+# the mutation operators, in the order of Schema.Rates
+type Mutation enum { Point, Swap, Width, Insert, Delete }
+
+# a search space
+type Schema struct() {
+    Blocks Vec<Block> = Vec<Block>[Block("root")]
+    Rates Array<F64> = Array<F64>[1.0, 1.0, 1.0, 1.0, 1.0]  # how often each Mutation is drawn, among those that apply
+    Spread F64 = 0.15                                       # a perturbed real moves by about this share of its range
+}
+
+# ---- writing the schema ----
+
+# a new block, by its index
+fn (s mut Schema&) Block(name String&) I64 {
+    s.Blocks.Push(Block($name))
+    return s.Blocks.Len() - 1
+}
+
+fn (s mut Schema&) add(block I64, g Gene) I64 {
+    b := s.Blocks[block]
+    b.Genes.Push(g)
+    s.Blocks[block] = b
+    return b.Genes.Len() - 1
+}
+
+# a choice among options
+fn (s mut Schema&) Choice(block I64, name String&, options Array<String>) I64 {
+    return s.add(block, Gene($name, Kind.Choice(options)))
+}
+
+# an integer in [lo, hi]; width: a size, which width scaling doubles or halves
+fn (s mut Schema&) Int(block I64, name String&, lo I64, hi I64, width Bool = false) I64 {
+    g := Gene($name, Kind.Int(lo, hi))
+    g.Width = width
+    return s.add(block, g)
+}
+
+# a real in [lo, hi], on a log scale where log (lo > 0 then)
+fn (s mut Schema&) Float(block I64, name String&, lo F64, hi F64, log Bool = false) I64 {
+    return s.add(block, Gene($name, Kind.Float(lo, hi, log)))
+}
+
+# min to max instances of block `of`
+fn (s mut Schema&) Repeat(block I64, name String&, of I64, min I64, max I64) I64 {
+    return s.add(block, Gene($name, Kind.Repeat(of, min, max)))
+}
+
+# gene `name` of the block counts only where gene `on` holds option `is` (a choice) or the number `is` reads as
+fn (s mut Schema&) When(block I64, name String&, on String&, is String&) ? SchemaError {
+    j := try s.Find(block, name)
+    k := try s.Find(block, on)
+    b := s.Blocks[block]
+    g := b.Genes[j]
+    g.When = k
+    g.Is = try s.valueOf(b.Genes[k], is)
+    b.Genes[j] = g
+    s.Blocks[block] = b
+}
+
+# the value text t gives gene g: an option's index for a choice, else the number written
+fn (s Schema&) valueOf(g Gene&, t String&) F64 ? SchemaError {
+    match g.Holds {
+        case Kind.Choice(options) {
+            for i in range options.Len() {
+                if options[i] == t: return F64(i)
+            }
+            error SchemaError.Unknown($t)
+        }
+        case _: return try t.ParseFloat() catch { error SchemaError.Unknown($t) }
+    }
+}
+
+# the index of gene `name` of a block
+fn (s Schema&) Find(block I64, name String&) I64 ? SchemaError {
+    b := s.Blocks[block]
+    for j in range b.Genes.Len() {
+        if b.Genes[j].Name == name: return j
+    }
+    error SchemaError.Unknown($name)
+}
+
+# ---- reading a genome ----
+
+# the value of gene `name` of instance i: a choice's index, an integer, a real, a repeat's count
+fn (s Schema&) Num(g Genome&, i I64, name String&) F64 {
+    j := try s.Find(g.Insts[i].Of, name) catch SchemaError e { unreachable "evo: " + $e }
+    return g.Insts[i].Values[j]
+}
+
+# the option chosen by choice gene `name` of instance i
+fn (s Schema&) Pick(g Genome&, i I64, name String&) String {
+    inst := g.Insts[i]
+    j := try s.Find(inst.Of, name) catch SchemaError e { unreachable "evo: " + $e }
+    match s.Blocks[inst.Of].Genes[j].Holds {
+        case Kind.Choice(options): return options[I64(inst.Values[j])]
+        case _: unreachable "evo: " + $name + " is no choice"
+    }
+}
+
+# whether gene j of instance i counts: its condition holds, and that of every gene its condition reads
+fn (s Schema&) Active(g Genome&, i I64, j I64) Bool {
+    inst := g.Insts[i]
+    genes := s.Blocks[inst.Of].Genes
+    at := j
+    for _ in range genes.Len() {
+        w := genes[at].When
+        if w < 0: return true
+        if inst.Values[w] != genes[at].Is: return false
+        at = w
+    }
+    return true
+}
+
+# the end of instance i's subtree: the index after its last descendant
+fn (g Genome&) End(i I64) I64 {
+    d := g.Insts[i].Depth
+    j := i + 1
+    for j < g.Insts.Len() and g.Insts[j].Depth > d: j += 1
+    return j
+}
+
+# the instances that repeat gene `slot` of instance i holds, in order
+fn (g Genome&) kids(i I64, slot I64) Array<I64> {
+    out := Vec<I64>()
+    d := g.Insts[i].Depth
+    for j in range i + 1, g.End(i) {
+        if g.Insts[j].Depth == d + 1 and g.Insts[j].Slot == slot: out.Push(j)
+    }
+    return out.ToArray()
+}
+
+# the instances that repeat gene `name` of instance i holds, in order
+fn (s Schema&) Children(g Genome&, i I64, name String&) Array<I64> {
+    j := try s.Find(g.Insts[i].Of, name) catch SchemaError e { unreachable "evo: " + $e }
+    return g.kids(i, j)
+}
+
+# ---- drawing ----
+
+# a value of gene g drawn uniformly (a log-uniform real where log)
+fn draw(g Gene&, r mut rand.Rand&) F64 {
+    return match g.Holds {
+        case Kind.Choice(options): F64(r.Below(options.Len()))
+        case Kind.Int(lo, hi): F64(lo + r.Below(hi - lo + 1))
+        case Kind.Float(lo, hi, log): (lo.Log() + r.Float() * (hi.Log() - lo.Log())).Exp() if log else lo + r.Float() * (hi - lo)
+        case Kind.Repeat(_, min, max): F64(min + r.Below(max - min + 1))
+    }
+}
+
+# a genome drawn uniformly: every gene drawn, every repeat's instances drawn in turn
+fn (s Schema&) Random(r mut rand.Rand&) Genome {
+    g := Genome()
+    s.grow(g, Root, 0, -1, r)
+    return g
+}
+
+# a fresh instance of block b (and its subtree) appended to g
+fn (s Schema&) grow(g mut Genome&, b I64, depth I64, slot I64, r mut rand.Rand&) {
+    genes := s.Blocks[b].Genes
+    vals := Array<F64>(genes.Len())
+    for j in range genes.Len(): vals[j] = draw(genes[j], r)
+    g.Insts.Push(Inst(b, depth, slot, vals))
+    for j in range genes.Len() {
+        match genes[j].Holds {
+            case Kind.Repeat(of, _, _) {
+                for _ in range I64(vals[j]): s.grow(g, of, depth + 1, j, r)
+            }
+            case _ { }
+        }
+    }
+}
+
+# ---- mutation ----
+
+# the genes Mutation m could change: (instance, gene) pairs packed as instance * stride + gene
+fn (s Schema&) sites(g Genome&, m Mutation, stride I64) Array<I64> {
+    out := Vec<I64>()
+    for i in range g.Insts.Len() {
+        genes := s.Blocks[g.Insts[i].Of].Genes
+        for j in range genes.Len() {
+            if s.Active(g, i, j) and s.fits(genes[j], g.Insts[i].Values[j], m): out.Push(i * stride + j)
+        }
+    }
+    return out.ToArray()
+}
+
+# whether Mutation m applies to gene g holding v
+fn (s Schema&) fits(g Gene&, v F64, m Mutation) Bool {
+    return match m {
+        case Mutation.Point: match g.Holds {
+            case Kind.Repeat(_, _, _): false
+            case Kind.Choice(options): options.Len() > 1
+            case Kind.Int(lo, hi): hi > lo
+            case Kind.Float(lo, hi, _): hi > lo
+        }
+        case Mutation.Swap: match g.Holds {
+            case Kind.Choice(options): options.Len() > 1
+            case _: false
+        }
+        case Mutation.Width: g.Width
+        case Mutation.Insert: match g.Holds {
+            case Kind.Repeat(_, _, max): v < F64(max)
+            case _: false
+        }
+        case Mutation.Delete: match g.Holds {
+            case Kind.Repeat(_, min, _): v > F64(min)
+            case _: false
+        }
+    }
+}
+
+# the largest number of genes a block has: the stride packing (instance, gene) pairs
+fn (s Schema&) stride() I64 {
+    n I64 = 1
+    for b in s.Blocks: n = n if n > b.Genes.Len() else b.Genes.Len()
+    return n
+}
+
+# g changed by one mutation, drawn by Rates among those that apply (g itself where none does)
+fn (s Schema&) Mutate(g Genome&, r mut rand.Rand&) Genome {
+    stride := s.stride()
+    kinds := Array<Mutation>[Mutation.Point, Mutation.Swap, Mutation.Width, Mutation.Insert, Mutation.Delete]
+    total F64 = 0.0
+    for k in range kinds.Len() {
+        if s.Rates[k] > 0.0 and s.sites(g, kinds[k], stride).Len() > 0: total += s.Rates[k]
+    }
+    if total <= 0.0: return g
+    u := r.Float() * total
+    for k in range kinds.Len() {
+        sites := s.sites(g, kinds[k], stride)
+        if s.Rates[k] <= 0.0 or sites.Len() == 0: continue
+        u -= s.Rates[k]
+        if u < 0.0 or k == kinds.Len() - 1: return s.Apply(g, kinds[k], r)
+    }
+    return g
+}
+
+# g changed by Mutation m at a site drawn uniformly among those it applies to (g itself where none)
+fn (s Schema&) Apply(g Genome&, m Mutation, r mut rand.Rand&) Genome {
+    stride := s.stride()
+    sites := s.sites(g, m, stride)
+    if sites.Len() == 0: return g
+    site := sites[r.Below(sites.Len())]
+    i, j := site / stride, site % stride
+    gene := s.Blocks[g.Insts[i].Of].Genes[j]
+    out := g.Copy()
+    inst := out.Insts[i]
+    match m {
+        case Mutation.Point: inst.Values[j] = s.perturb(gene, inst.Values[j], r)
+        case Mutation.Swap: inst.Values[j] = other(gene, inst.Values[j], r)
+        case Mutation.Width: inst.Values[j] = scaled(gene, inst.Values[j], r)
+        case Mutation.Insert {
+            s.insert(out, i, j, r)
+            return out
+        }
+        case Mutation.Delete {
+            s.delete(out, i, j, r)
+            return out
+        }
+    }
+    out.Insts[i] = inst
+    return out
+}
+
+# another option of a choice, drawn uniformly
+fn other(g Gene&, v F64, r mut rand.Rand&) F64 {
+    match g.Holds {
+        case Kind.Choice(options) {
+            k := r.Below(options.Len() - 1)
+            return F64(k + 1) if F64(k) >= v else F64(k)
+        }
+        case _: return v
+    }
+}
+
+# a point mutation: a choice set to another option, an integer stepped by one or drawn afresh, a real moved by about
+# Spread of its range (on the log scale where log), kept in range
+fn (s Schema&) perturb(g Gene&, v F64, r mut rand.Rand&) F64 {
+    match g.Holds {
+        case Kind.Choice(_): return other(g, v, r)
+        case Kind.Int(lo, hi) {
+            if r.Float() < 0.5: return draw(g, r)
+            step := 1.0 if r.Float() < 0.5 else -1.0
+            w := v + step
+            return w if w >= F64(lo) and w <= F64(hi) else v - step
+        }
+        case Kind.Float(lo, hi, log) {
+            if log {
+                w := v.Log() + r.Normal(0.0, s.Spread * (hi.Log() - lo.Log()))
+                return clamp(w.Exp(), lo, hi)
+            }
+            return clamp(v + r.Normal(0.0, s.Spread * (hi - lo)), lo, hi)
+        }
+        case Kind.Repeat(_, _, _): return v
+    }
+}
+
+fn clamp(v F64, lo F64, hi F64) F64 {
+    if v < lo: return lo
+    return hi if v > hi else v
+}
+
+# a size doubled or halved (an integer rounded), kept in range
+fn scaled(g Gene&, v F64, r mut rand.Rand&) F64 {
+    k := 2.0 if r.Float() < 0.5 else 0.5
+    return match g.Holds {
+        case Kind.Int(lo, hi): clamp((v * k).Round(), F64(lo), F64(hi))
+        case Kind.Float(lo, hi, _): clamp(v * k, lo, hi)
+        case _: v
+    }
+}
+
+# a block inserted into repeat gene j of instance i, at a position drawn uniformly: a copy of a sibling where there is
+# one, half the time, else drawn afresh
+fn (s Schema&) insert(g mut Genome&, i I64, j I64, r mut rand.Rand&) {
+    kids := g.kids(i, j)
+    at := g.End(i)
+    pos := r.Below(kids.Len() + 1)
+    if pos < kids.Len(): at = kids[pos]
+    fresh := Genome()
+    if kids.Len() > 0 and r.Float() < 0.5 {
+        c := kids[r.Below(kids.Len())]
+        for k in range c, g.End(c): fresh.Insts.Push(g.Insts[k])
+    } else {
+        match s.Blocks[g.Insts[i].Of].Genes[j].Holds {
+            case Kind.Repeat(of, _, _): s.grow(fresh, of, g.Insts[i].Depth + 1, j, r)
+            case _ { }
+        }
+    }
+    for k in range fresh.Insts.Len(): try g.Insts.Insert(at + k, fresh.Insts[k]) catch { unreachable }
+    inst := g.Insts[i]
+    inst.Values[j] += 1.0
+    g.Insts[i] = inst
+}
+
+# one of the blocks repeat gene j of instance i holds, drawn uniformly, deleted with its subtree
+fn (s Schema&) delete(g mut Genome&, i I64, j I64, r mut rand.Rand&) {
+    kids := g.kids(i, j)
+    c := kids[r.Below(kids.Len())]
+    end := g.End(c)
+    for _ in range end - c: try g.Insts.RemoveAt(c) catch { unreachable }
+    inst := g.Insts[i]
+    inst.Values[j] -= 1.0
+    g.Insts[i] = inst
+}
+
+# ---- crossover ----
+
+# a child of a and b, uniform over aligned genes: each gene of the root from either parent, each repeat's count from
+# either, its k-th child crossed from both parents' k-th where both have one, else copied from the one that has
+fn (s Schema&) Cross(a Genome&, b Genome&, r mut rand.Rand&) Genome {
+    out := Genome()
+    s.cross(out, a, 0, b, 0, r)
+    return out
+}
+
+# instance ia of a (or -1) crossed with ib of b (or -1) appended to out with its subtree
+fn (s Schema&) cross(out mut Genome&, a Genome&, ia I64, b Genome&, ib I64, r mut rand.Rand&) {
+    if ib < 0 {
+        copySubtree(out, a, ia)
+        return
+    }
+    if ia < 0 {
+        copySubtree(out, b, ib)
+        return
+    }
+    x, y := a.Insts[ia], b.Insts[ib]
+    vals := Array<F64>(x.Values.Len())
+    for j in range vals.Len(): vals[j] = x.Values[j] if r.Float() < 0.5 else y.Values[j]
+    out.Insts.Push(Inst(x.Of, x.Depth, x.Slot, vals))
+    genes := s.Blocks[x.Of].Genes
+    for j in range genes.Len() {
+        match genes[j].Holds {
+            case Kind.Repeat(_, _, _) {
+                ka, kb := a.kids(ia, j), b.kids(ib, j)
+                for k in range I64(vals[j]) {
+                    ca := ka[k] if k < ka.Len() else -1
+                    cb := kb[k] if k < kb.Len() else -1
+                    s.cross(out, a, ca, b, cb, r)
+                }
+            }
+            case _ { }
+        }
+    }
+}
+
+fn copySubtree(out mut Genome&, g Genome&, i I64) {
+    for k in range i, g.End(i): out.Insts.Push(g.Insts[k])
+}
+
+# ---- text ----
+
+# the canonical text of g's active genes: equal for two genomes exactly when they decode alike
+fn (s Schema&) Key(g Genome&) String {
+    return s.keyOf(g, 0)
+}
+
+fn (s Schema&) keyOf(g Genome&, i I64) String {
+    inst := g.Insts[i]
+    genes := s.Blocks[inst.Of].Genes
+    t := "" + $inst.Of + "("
+    for j in range genes.Len() {
+        if not s.Active(g, i, j): continue
+        match genes[j].Holds {
+            case Kind.Repeat(_, _, _) {
+                t += "["
+                for c in g.kids(i, j): t += s.keyOf(g, c)
+                t += "]"
+            }
+            case _: t += $inst.Values[j] + ","
+        }
+    }
+    return t + ")"
+}
+
+# g's full text, one line: its instances separated by ';', each "block depth slot value..." - what Decode reads back
+fn (s Schema&) Encode(g Genome&) String {
+    t := ""
+    for k in range g.Insts.Len() {
+        inst := g.Insts[k]
+        if k > 0: t += ";"
+        t += $inst.Of + " " + $inst.Depth + " " + $inst.Slot
+        for v in inst.Values: t += " " + $v
+    }
+    return t
+}
+
+# the genome Encode wrote as t, checked against the schema
+fn (s Schema&) Decode(t String&) Genome ? SchemaError {
+    g := Genome()
+    for part in t.Split(";") {
+        f := part.Split(" ")
+        if f.Len() < 3: error SchemaError.Parse($part)
+        b := try f[0].ParseInt() catch { error SchemaError.Parse($part) }
+        if b < 0 or b >= s.Blocks.Len() or f.Len() != 3 + s.Blocks[b].Genes.Len(): error SchemaError.Parse($part)
+        d := try f[1].ParseInt() catch { error SchemaError.Parse($part) }
+        slot := try f[2].ParseInt() catch { error SchemaError.Parse($part) }
+        vals := Array<F64>(f.Len() - 3)
+        for j in range vals.Len(): vals[j] = try f[3 + j].ParseFloat() catch { error SchemaError.Parse($part) }
+        g.Insts.Push(Inst(b, d, slot, vals))
+    }
+    if g.Insts.Len() == 0: error SchemaError.Parse($t)
+    if not s.Valid(g): error SchemaError.Parse($t)
+    return g
+}
+
+# whether g is a genome of this schema: every value in its gene's range, every repeat's count its children's
+fn (s Schema&) Valid(g Genome&) Bool {
+    if g.Insts.Len() == 0 or g.Insts[0].Of != Root or g.Insts[0].Depth != 0: return false
+    if g.End(0) != g.Insts.Len(): return false
+    for i in range g.Insts.Len() {
+        inst := g.Insts[i]
+        genes := s.Blocks[inst.Of].Genes
+        if inst.Values.Len() != genes.Len(): return false
+        for j in range genes.Len() {
+            if not inRange(genes[j], inst.Values[j]): return false
+            match genes[j].Holds {
+                case Kind.Repeat(of, _, _) {
+                    kids := g.kids(i, j)
+                    if F64(kids.Len()) != inst.Values[j]: return false
+                    for c in kids {
+                        if g.Insts[c].Of != of: return false
+                    }
+                }
+                case _ { }
+            }
+        }
+    }
+    return true
+}
+
+fn inRange(g Gene&, v F64) Bool {
+    return match g.Holds {
+        case Kind.Choice(options): v >= 0.0 and v < F64(options.Len()) and v == v.Floor()
+        case Kind.Int(lo, hi): v >= F64(lo) and v <= F64(hi) and v == v.Floor()
+        case Kind.Float(lo, hi, _): v >= lo and v <= hi
+        case Kind.Repeat(_, min, max): v >= F64(min) and v <= F64(max) and v == v.Floor()
+    }
+}
+
+# a schema keeps no state between generations
+fn (s Schema&) State() String { return "" }
+
+fn (s mut Schema&) Restore(t String&) ? SchemaError {
+    if t != "": error SchemaError.Parse($t)
+}
+
+# ---- tests ----
+
+fn Schema.testSpace() Schema {
+    s := Schema()
+    layer := s.Block("layer")
+    s.Choice(layer, "op", Array<String>["mlp", "attention", "conv"])
+    s.Int(layer, "width", 16, 512, true)
+    s.Int(layer, "heads", 1, 8)
+    try s.When(layer, "heads", "op", "attention") catch { unreachable }
+    s.Float(Root, "lr", 1e-4, 1e-2, true)
+    s.Repeat(Root, "layers", layer, 1, 6)
+    return s
+}
+
+test Schema "drawn, mutated and crossed genomes stay in the space; Encode and Decode give the genome back" {
+    s := Schema.testSpace()
+    r := rand.Rand(1)
+    a := s.Random(r)
+    for _ in range 400 {
+        assert s.Valid(a)
+        b := s.Mutate(a, r)
+        assert s.Valid(b)
+        c := s.Cross(a, b, r)
+        assert s.Valid(c)
+        back := try s.Decode(s.Encode(c)) catch { unreachable }
+        assert s.Encode(back) == s.Encode(c)
+        assert s.Key(back) == s.Key(c)
+        a = c if r.Float() < 0.5 else s.Random(r)
+    }
+}
+
+test Schema "insert and delete keep a repeat within its range and its count equal to its blocks" {
+    s := Schema.testSpace()
+    r := rand.Rand(2)
+    g := s.Random(r)
+    for _ in range 200 {
+        g = s.Apply(g, Mutation.Insert if r.Float() < 0.5 else Mutation.Delete, r)
+        assert s.Valid(g)
+        n := s.Children(g, Root, "layers").Len()
+        assert n >= 1 and n <= 6 and F64(n) == s.Num(g, Root, "layers")
+    }
+    for _ in range 10: g = s.Apply(g, Mutation.Insert, r)
+    assert s.Children(g, Root, "layers").Len() == 6
+    for _ in range 10: g = s.Apply(g, Mutation.Delete, r)
+    assert s.Children(g, Root, "layers").Len() == 1
+}
+
+test Schema "a gene whose condition fails is left out of the key; swap and width change what they name" {
+    s := Schema.testSpace()
+    r := rand.Rand(3)
+    g := s.Random(r)
+    i := s.Children(g, Root, "layers")[0]
+    inst := g.Insts[i]
+    inst.Values[0] = 0.0         # mlp: heads inactive
+    inst.Values[2] = 2.0
+    g.Insts[i] = inst
+    h := g
+    inst.Values[2] = 7.0
+    h.Insts[i] = inst
+    assert s.Key(g) == s.Key(h) and s.Encode(g) != s.Encode(h)
+    inst.Values[0] = 1.0         # attention: heads counts
+    h.Insts[i] = inst
+    assert s.Key(g) != s.Key(h)
+    for _ in range 50 {
+        x := s.Apply(g, Mutation.Width, r)
+        changed I64 = 0
+        for k in s.Children(x, Root, "layers") {
+            v, was := s.Num(x, k, "width"), s.Num(g, k, "width")
+            if v == was: continue
+            changed += 1
+            assert v == (was * 2.0).Min(512.0) or v == (was * 0.5).Round().Max(16.0)
+        }
+        assert changed <= 1 and s.Num(x, Root, "lr") == s.Num(g, Root, "lr")
+        y := s.Apply(g, Mutation.Swap, r)
+        assert s.Num(y, Root, "lr") == s.Num(g, Root, "lr") and s.Key(y) != s.Key(g) or s.Children(g, Root, "layers").Len() == 0
+    }
+}

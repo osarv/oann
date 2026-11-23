@@ -16,6 +16,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `charlm_ssm.olang` | the recurrent model (`models/ssm`: Mamba or delta-rule blocks) on tiny Shakespeare with the same recipe, generating by running the context again | |
 | `bpelm.olang` | the same model on byte-level BPE tokens, loss a character against the character model's | `bpelm` |
 | `tinystories.olang` | `prep`, then a GPT or an SSM of 10 million parameters on TinyStories: loss curve, tokens a second | `tinystories` |
+| `evo_mlp.olang` | architecture search with `evo`: regularized evolution over MLPs (depth, widths, activations, learning rate) for a synthetic regression, with successive halving, weight inheritance, a checkpoint a round and worker processes; the test set read once, for the best | `evomlp` |
 | `graph_count.olang` | message passing (`nn/message`) over random graphs, sum against mean aggregation, on a counting and a majority node task: trained on small graphs, tested on them and on larger, denser ones | `graphcount` |
 | `history_encode.olang` | `nn/history`'s encoder (one attention block, 14k parameters) against a flat perceptron (100k) over histories of 1-16 symbols, padded: the most frequent symbol, and whether the last symbol occurred before | `historyencode` |
 | `potts_latin.olang` | `nn/potts` end to end: Latin squares learnt from solved examples (`Pairs.Screen`, `PairFitter`, `Pruned`), held-out puzzles solved by `Sampler.Anneal` and `Sampler.Focus` - accuracy and time | `potts_latin` |

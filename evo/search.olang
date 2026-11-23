@@ -1,0 +1,863 @@
+# evo/search - evolutionary search over a space of genomes: regularized (aging) evolution (Real et al. 2019, the
+# default), tournament selection, (mu + lambda), and NSGA-II (Deb et al. 2002) for several objectives - a validation loss
+# against MACs, parameters or latency. Nothing here knows the genome or the model: the space draws, mutates, crosses and
+# writes genomes (evo/schema's Schema, evo/neat's Space, or any type with the same methods), and the fitness trains and
+# scores one.
+#
+#     e := search.Evolution<schema.Genome>(search.Config(search.Algorithm.Regularized(64, 16), 1))
+#     e.Run(space, fit, search.Split<Tokens>(train, val), 500)       # 500 rounds
+#     best := e.Best()                                              # a Member: Genome, Res.Loss, Res.Costs
+#
+# The fitness contract. The fitness is any type with
+#
+#     fn (f mut Fit&) Evaluate(g G&, t search.Trial&, data search.Split<D>&) search.Result ? E
+#
+# - it builds the model g decodes to, trains it on data.Train for t.Budget (seconds, steps, epochs: the program's unit)
+# seeded by t.Seed, and gives its loss on data.Val (lower is better) with any costs (MACs, parameters, latency) in
+# Result.Costs; an error (any) marks the genome failed, and it is dropped. A Split holds the training and validation
+# data and nothing else: the search is never given test data, so no choice it makes - selection, halving, the best -
+# can read it. Carve takes a validation share out of training data where the program has no validation split.
+#
+# Efficiency.
+# - Multi-fidelity: Config.Rungs lists ascending budgets (the last the full one). Each round's children are evaluated at
+#   the first, the best 1/Eta (by loss) go on to the next, and so on (successive halving, Jamieson and Talwalkar 2016);
+#   only those reaching the last join the population. Halving runs over a round's children, so it wants Batch (the
+#   children of a regularized round) or a generational algorithm's population to hold several. The first population is
+#   evaluated at the full budget alone.
+# - Weight inheritance: with Config.Dir set, a trial is handed where to save its weights (Trial.Save), its parent's
+#   (Trial.Inherit, where saved) and, past the first rung, its own from the rung before (Trial.Resume, trained for
+#   Trial.Spent). What to copy is the program's: evo/inherit copies tensors where their shapes match and widens or
+#   deepens a layer keeping the function it computes. Weights of members that leave the population are deleted, the
+#   best's kept.
+# - A cache of results by the space's Key and rung: a genome met again (a mutation undone, a crossover of equals) is
+#   not trained again.
+# - Checkpoints: with Config.Dir set, the whole state (the generator, the population, the history, the cache, the
+#   space's registry) is written to Dir/state.evo after every round; Resume reads it back, and the run goes on as if it
+#   had never stopped.
+# - Parallel evaluation: Config.Workers > 1 runs each trial in its own process - this program again, started with
+#   "--evo-worker JOB" and then its own arguments - up to Workers at once. The program reads its arguments with Args
+#   (the same in either process), loads its data and calls Worker(space, fit, data) before searching: in a worker
+#   process that runs the job and ends the process. Each trial's seed comes from the run's seed, the trial's id and rung alone,
+#   and results are taken in id order, so the run is the same for any number of workers.
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "pareto"
+import "schema"
+import "neat"
+
+# how a round makes and keeps members
+type Algorithm enum {
+    Regularized(population I64, sample I64)         # aging evolution: the best of a random sample is mutated, the oldest dies
+    Tournament(population I64, size I64, elite I64) # generational: parents by tournaments of size, the elite kept
+    MuPlusLambda(mu I64, lambda I64)                # lambda children of random parents, the best mu of both kept
+    Nsga2(population I64)                           # several objectives: fronts, then crowding
+}
+
+# a search's settings
+type Config struct(method Algorithm, seed U64) {
+    Method Algorithm = method
+    Seed U64 = seed
+    Crossover F64 = 0.0                     # the share of children made by crossover (then mutated)
+    Rungs Vec<F64> = Vec<F64>[1.0]      # the budgets of successive halving, ascending; the last the full budget
+    Eta I64 = 3                             # each rung keeps the best 1/Eta
+    Batch I64 = 1                           # the children of a regularized round
+    Workers I64 = 1                         # trials run at once, each in its own process (1: in this one)
+    Dir String = ""                         # weights and checkpoints ("": neither)
+    Objectives I64 = 2                      # NSGA-II's: the loss, then the first Objectives - 1 costs
+}
+
+# one evaluation of a genome
+type Trial struct(Id I64, Seed U64, Budget F64, Rung I64) {
+    Id              # the member's id
+    Seed            # seed everything the training draws from this
+    Budget          # train for this (the program's unit)
+    Rung            # which of Config.Rungs
+    Parent I64 = -1         # the parent's id (-1: drawn afresh)
+    Inherit String = ""     # the parent's saved weights ("": none)
+    Resume String = ""      # this member's own weights from the rung before ("": none)
+    Spent F64 = 0.0         # the budget Resume's weights were trained for
+    Save String = ""        # where to save this member's weights ("": not kept)
+}
+
+# what an evaluation gives: the validation loss and any costs (MACs, parameters, latency), all lower-is-better
+type Result struct(Loss F64) {
+    Loss
+    Costs Vec<F64> = Vec<F64>()
+}
+
+# training and validation data - all a fitness is given
+type Split<D> struct(Train D, Val D) {
+    Train
+    Val
+}
+
+# a member of the search: its genome and what it scored at the full budget
+type Member<G> struct(Id I64, Genome G, Res Result, Parent I64, Born I64) {
+    Id
+    Genome
+    Res
+    Parent          # -1: drawn afresh
+    Born            # the round it was made in
+}
+
+type SearchError error {
+    State(why String)       # a checkpoint that cannot be read back
+}
+
+# a search's state
+type Evolution<G> struct(config Config) {
+    Settings Config = config
+    Population Vec<Member<G>> = Vec<Member<G>>()    # oldest first
+    History Vec<Member<G>> = Vec<Member<G>>()       # every member that reached the full budget, in the order made
+    Round I64 = 0
+    Evaluations I64 = 0         # evaluations run (cache hits not counted)
+    Spent F64 = 0.0             # their budgets summed
+    Hits I64 = 0                # evaluations the cache answered
+    Failures I64 = 0            # evaluations that failed
+    nextId I64 = 0
+    rng rand.Rand = rand.Rand(config.Seed)
+    cache Map<String, Result> = Map<String, Result>()
+}
+
+# ---- data ----
+
+# a split of items: a share `val` of them (drawn by seed) for validation, the rest for training
+fn Split<Array<T>>.Carve(items Array<T>&, val F64, seed U64) Split<Array<T>> {
+    order := Array<I64>[i for i in range items.Len()]
+    r := rand.Rand(seed)
+    r.Shuffle(order)
+    nv := I64(F64(items.Len()) * val)
+    return Split<Array<T>>(Array<T>[items[order[i]] for i in range nv, items.Len()], Array<T>[items[order[i]] for i in range nv])
+}
+
+# ---- running ----
+
+# rounds more rounds: the first draws and evaluates the population, each later one makes and keeps children
+fn (e mut Evolution<G>&) Run<S, F, D>(space mut S&, fit mut F&, data Split<D>&, rounds I64) {
+    for _ in range rounds: e.Step(space, fit, data)
+}
+
+# one round
+fn (e mut Evolution<G>&) Step<S, F, D>(space mut S&, fit mut F&, data Split<D>&) {
+    if e.Population.Len() == 0 {
+        e.start(space, fit, data)
+    } else {
+        match e.Settings.Method {
+            case Algorithm.Regularized(size, sample): e.regularized(space, fit, data, size, sample)
+            case Algorithm.Tournament(size, k, elite): e.tournament(space, fit, data, size, k, elite)
+            case Algorithm.MuPlusLambda(mu, lambda): e.muPlusLambda(space, fit, data, mu, lambda)
+            case Algorithm.Nsga2(size): e.nsga2(space, fit, data, size)
+        }
+    }
+    e.Round += 1
+    e.tidy()
+    if e.Settings.Dir != "": e.checkpoint(space)
+}
+
+# the population's size
+fn (e Evolution<G>&) size() I64 {
+    return match e.Settings.Method {
+        case Algorithm.Regularized(n, _): n
+        case Algorithm.Tournament(n, _, _): n
+        case Algorithm.MuPlusLambda(mu, _): mu
+        case Algorithm.Nsga2(n): n
+    }
+}
+
+# the first population, drawn uniformly and evaluated at the full budget
+fn (e mut Evolution<G>&) start<S, F, D>(space mut S&, fit mut F&, data Split<D>&) {
+    kids := Vec<Member<G>>()
+    for _ in range e.size(): kids.Push(e.member(space.Random(e.rng), -1))
+    for m in e.evaluate(space, fit, data, kids, false): e.Population.Push(m)
+}
+
+# a new member of genome g, not yet evaluated
+fn (e mut Evolution<G>&) member(g G, parent I64) Member<G> {
+    e.nextId += 1
+    return Member<G>(e.nextId - 1, g, Result(F64.Inf), parent, e.Round)
+}
+
+# a child of a (and b, by crossover with probability Crossover where b is given), mutated
+fn (e mut Evolution<G>&) child<S>(space mut S&, a Member<G>&, b Member<G>&, cross Bool) Member<G> {
+    if cross and e.Settings.Crossover > 0.0 and e.rng.Float() < e.Settings.Crossover {
+        first, second := a, b
+        if better(b, a) {
+            first = b
+            second = a
+        }
+        return e.member(space.Mutate(space.Cross(first.Genome, second.Genome, e.rng), e.rng), first.Id)
+    }
+    return e.member(space.Mutate(a.Genome, e.rng), a.Id)
+}
+
+# whether a scored better than b (lower loss, then the older)
+fn better<G>(a Member<G>&, b Member<G>&) Bool {
+    return a.Res.Loss < b.Res.Loss or (a.Res.Loss == b.Res.Loss and a.Id < b.Id)
+}
+
+# the indices of k members of the population drawn without replacement
+fn (e mut Evolution<G>&) draw(k I64) Array<I64> {
+    n := e.Population.Len()
+    idx := Array<I64>[i for i in range n]
+    return try e.rng.Sample(idx, k if k < n else n) catch { unreachable }
+}
+
+# the best of the members at these indices
+fn (e Evolution<G>&) bestOf(idx Array<I64>&) I64 {
+    b := idx[0]
+    for i in idx {
+        if better(e.Population[i], e.Population[b]): b = i
+    }
+    return b
+}
+
+# aging evolution: Batch children, each the mutation of the best of `sample` members drawn at random (crossed with the
+# sample's second best at the Crossover rate); the oldest leave once there are more than `size`
+fn (e mut Evolution<G>&) regularized<S, F, D>(space mut S&, fit mut F&, data Split<D>&, size I64, sample I64) {
+    kids := Vec<Member<G>>()
+    for _ in range e.Settings.Batch {
+        idx := e.draw(sample)
+        b := e.bestOf(idx)
+        second := b
+        for i in idx {
+            if i != b and (second == b or better(e.Population[i], e.Population[second])): second = i
+        }
+        kids.Push(e.child(space, e.Population[b], e.Population[second], second != b))
+    }
+    for m in e.evaluate(space, fit, data, kids, true): e.Population.Push(m)
+    for e.Population.Len() > size {
+        try e.Population.RemoveAt(0) catch { unreachable }
+    }
+}
+
+# generational: size - elite children of tournament winners (crossed with a second winner at the Crossover rate); the
+# elite and the children make the next population, the best of the rest filling places children failed to take
+fn (e mut Evolution<G>&) tournament<S, F, D>(space mut S&, fit mut F&, data Split<D>&, size I64, k I64, elite I64) {
+    e.sortPopulation()
+    kids := Vec<Member<G>>()
+    for _ in range size - elite {
+        a := e.bestOf(e.draw(k))
+        b := e.bestOf(e.draw(k))
+        kids.Push(e.child(space, e.Population[a], e.Population[b], a != b))
+    }
+    next := Vec<Member<G>>()
+    for i in range elite if elite < e.Population.Len() else e.Population.Len(): next.Push(e.Population[i])
+    for m in e.evaluate(space, fit, data, kids, true): next.Push(m)
+    for i in range elite, e.Population.Len() {
+        if next.Len() < size: next.Push(e.Population[i])
+    }
+    e.Population = next
+}
+
+# (mu + lambda): lambda children of parents drawn uniformly, the best mu of parents and children kept
+fn (e mut Evolution<G>&) muPlusLambda<S, F, D>(space mut S&, fit mut F&, data Split<D>&, mu I64, lambda I64) {
+    kids := Vec<Member<G>>()
+    for _ in range lambda {
+        idx := e.draw(2)
+        kids.Push(e.child(space, e.Population[idx[0]], e.Population[idx[idx.Len() - 1]], idx.Len() > 1))
+    }
+    for m in e.evaluate(space, fit, data, kids, true): e.Population.Push(m)
+    e.sortPopulation()
+    for e.Population.Len() > mu {
+        try e.Population.Pop() catch { unreachable }
+    }
+}
+
+fn (e mut Evolution<G>&) sortPopulation() {
+    e.Population.Sort(fn(a, b): return better(a, b))
+}
+
+# a member's objectives: the loss, then its first Objectives - 1 costs (a missing one counted 0)
+fn (e Evolution<G>&) objectives(m Member<G>&, out mut Array<F64>&, at I64) {
+    k := e.Settings.Objectives
+    out[at * k] = m.Res.Loss
+    for j in range 1, k: out[at * k + j] = m.Res.Costs[j - 1] if j - 1 < m.Res.Costs.Len() else 0.0
+}
+
+# NSGA-II: size children of binary tournaments by front then crowding (crossed with a second winner at the Crossover
+# rate); parents and children sorted into fronts, the next population filled front by front, the last front cut by
+# crowding
+fn (e mut Evolution<G>&) nsga2<S, F, D>(space mut S&, fit mut F&, data Split<D>&, size I64) {
+    rank, crowd := e.fronts()
+    kids := Vec<Member<G>>()
+    for _ in range size {
+        a := e.crowdedWinner(rank, crowd)
+        b := e.crowdedWinner(rank, crowd)
+        kids.Push(e.child(space, e.Population[a], e.Population[b], a != b))
+    }
+    for m in e.evaluate(space, fit, data, kids, true): e.Population.Push(m)
+    rank2, crowd2 := e.fronts()
+    order := Vec<I64>()
+    for i in range e.Population.Len(): order.Push(i)
+    order.Sort(fn(a, b): return rank2[a] < rank2[b] or (rank2[a] == rank2[b] and (crowd2[a] > crowd2[b] or (crowd2[a] == crowd2[b] and a < b))))
+    next := Vec<Member<G>>()
+    for p in range order.Len() if order.Len() < size else size: next.Push(e.Population[order[p]])
+    next.Sort(fn(a, b): return a.Id < b.Id)
+    e.Population = next
+}
+
+# the population's fronts and each member's crowding distance within its front
+fn (e Evolution<G>&) fronts() Array<I64>, Array<F64> {
+    n := e.Population.Len()
+    objs := Array<F64>(n * e.Settings.Objectives)
+    for i in range n: e.objectives(e.Population[i], objs, i)
+    rank := pareto.Ranks(objs, e.Settings.Objectives)
+    crowd := Array<F64>(n)
+    level I64 = 0
+    done I64 = 0
+    for done < n {
+        front := Vec<I64>()
+        for i in range n {
+            if rank[i] == level: front.Push(i)
+        }
+        d := pareto.Crowding(objs, e.Settings.Objectives, front.ToArray())
+        for j in range front.Len(): crowd[front[j]] = d[j]
+        done += front.Len()
+        level += 1
+    }
+    return rank, crowd
+}
+
+# the winner of a binary tournament: the lower front, then the larger crowding distance
+fn (e mut Evolution<G>&) crowdedWinner(rank Array<I64>&, crowd Array<F64>&) I64 {
+    idx := e.draw(2)
+    a, b := idx[0], idx[idx.Len() - 1]
+    if rank[a] != rank[b]: return a if rank[a] < rank[b] else b
+    return a if crowd[a] >= crowd[b] else b
+}
+
+# ---- evaluating ----
+
+# the trial seed of member id at rung k: from the run's seed, id and k alone
+fn (e Evolution<G>&) seedOf(id I64, k I64) U64 {
+    return mix(mix(e.Settings.Seed ^ 0x9E3779B97F4A7C15) ^ mix(U64(id) * 64 + U64(k)))
+}
+
+fn mix(x U64) U64 {
+    z := x + 0x9E3779B97F4A7C15
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    return z ^ (z >> 31)
+}
+
+# where member id's weights go
+fn (e Evolution<G>&) weights(id I64) String {
+    return "" if e.Settings.Dir == "" else e.Settings.Dir + "/w" + $id + ".bin"
+}
+
+# every member's weights deleted but the population's and the best's (what the state alone decides, so a resumed run
+# keeps the same files)
+fn (e Evolution<G>&) tidy() {
+    if e.Settings.Dir == "": return
+    keep := Vec<String>()
+    for m in e.Population: keep.Push("w" + $m.Id + ".bin")
+    if e.History.Len() > 0: keep.Push("w" + $e.Best().Id + ".bin")
+    names := try os.ReadDir(e.Settings.Dir) catch default Array<String&>(0)
+    for name in names {
+        if name.StartsWith("w") and name.EndsWith(".bin") and not (name in keep): try os.Remove(e.Settings.Dir + "/" + name) catch { }
+    }
+}
+
+# kids evaluated - through every rung of successive halving where ladder, else at the full budget alone - those that
+# reach it added to the history and given back
+fn (e mut Evolution<G>&) evaluate<S, F, D>(space mut S&, fit mut F&, data Split<D>&, kids mut Vec<Member<G>>&, ladder Bool) Vec<Member<G>> {
+    rungs := e.Settings.Rungs.Len()
+    alive := kids
+    for k in range 0 if ladder else rungs - 1, rungs {
+        e.rung(space, fit, data, alive, k)
+        kept := Vec<Member<G>>()
+        for m in alive {
+            if m.Res.Loss < F64.Inf: kept.Push(m)
+        }
+        alive = kept
+        if k == rungs - 1 or alive.Len() == 0: break
+        alive.Sort(fn(a, b): return better(a, b))
+        keep := (alive.Len() + e.Settings.Eta - 1) / e.Settings.Eta
+        for alive.Len() > keep {
+            try alive.Pop() catch { unreachable }
+        }
+        alive.Sort(fn(a, b): return a.Id < b.Id)
+    }
+    for m in alive: e.History.Push(m)
+    return alive
+}
+
+# every member of alive evaluated at rung k (its Res set; F64.Inf where it failed): from the cache where it holds the
+# genome's result, else in this process or in workers
+fn (e mut Evolution<G>&) rung<S, F, D>(space mut S&, fit mut F&, data Split<D>&, alive mut Vec<Member<G>>&, k I64) {
+    todo := Vec<I64>()
+    trials := Vec<Trial>()
+    for i in range alive.Len() {
+        m := alive[i]
+        key := space.Key(m.Genome) + "@" + $k
+        hit := try e.cache.Get(key) catch default Result(-F64.Inf)
+        if hit.Loss > -F64.Inf {
+            m.Res = hit
+            alive[i] = m
+            e.Hits += 1
+            continue
+        }
+        todo.Push(i)
+        trials.Push(e.trial(m, k))
+    }
+    if e.Settings.Workers > 1 and todo.Len() > 1 {
+        e.parallel(space, alive, todo, trials)
+    } else {
+        for j in range todo.Len() {
+            m := alive[todo[j]]
+            m.Res = try fit.Evaluate(m.Genome, trials[j], data) catch default Result(F64.Inf)
+            alive[todo[j]] = m
+        }
+    }
+    for j in range todo.Len() {
+        m := alive[todo[j]]
+        e.Evaluations += 1
+        e.Spent += trials[j].Budget
+        if m.Res.Loss == F64.Inf or m.Res.Loss != m.Res.Loss {
+            m.Res = Result(F64.Inf)
+            alive[todo[j]] = m
+            e.Failures += 1
+            continue
+        }
+        e.cache.Put(space.Key(m.Genome) + "@" + $k, m.Res)
+    }
+}
+
+# member m's trial at rung k
+fn (e Evolution<G>&) trial(m Member<G>&, k I64) Trial {
+    t := Trial(m.Id, e.seedOf(m.Id, k), e.Settings.Rungs[k], k)
+    t.Parent = m.Parent
+    if e.Settings.Dir == "": return t
+    t.Save = e.weights(m.Id)
+    if m.Parent >= 0 and os.Exists(e.weights(m.Parent)): t.Inherit = e.weights(m.Parent)
+    if k > 0 and os.Exists(t.Save) {
+        t.Resume = t.Save
+        t.Spent = e.Settings.Rungs[k - 1]
+    }
+    return t
+}
+
+# ---- workers ----
+
+# the job of one trial, as Worker reads it
+fn job<S, G>(space S&, g G&, t Trial&) String {
+    head := $t.Id + " " + $t.Seed + " " + $t.Budget + " " + $t.Rung + " " + $t.Parent + " " + $t.Spent
+    return head + "\n" + t.Inherit + "\n" + t.Resume + "\n" + t.Save + "\n" + space.Encode(g) + "\n"
+}
+
+# the trials of alive's members at todo run in processes of this program, Workers at a time, their results set in id
+# order (a process that fails or prints no result marks its member failed)
+fn (e mut Evolution<G>&) parallel<S>(space S&, alive mut Vec<Member<G>>&, todo Vec<I64>&, trials Vec<Trial>&) {
+    exe := try os.ReadLink("/proc/self/exe") catch { unreachable "evo: this program's path cannot be read" }
+    dir := e.Settings.Dir
+    made := ""
+    if dir == "" {
+        made = try os.MkTemp("", "evo-") catch { unreachable "evo: no directory for worker jobs" }
+        dir = made
+    }
+    w := e.Settings.Workers
+    start I64 = 0
+    for start < todo.Len() {
+        procs := Vec<os.Process>()
+        end := start + w if start + w < todo.Len() else todo.Len()
+        for j in range start, end {
+            path := dir + "/job" + $trials[j].Id + ".txt"
+            try os.WriteFile(path, job(space, alive[todo[j]].Genome, trials[j])) catch { unreachable "evo: cannot write " + path }
+            argv := Vec<String&>[exe, "--evo-worker", path]
+            for a in Args(): argv.Push(a)
+            procs.Push(try os.Process.Start(...argv.ToArray()) catch { unreachable "evo: cannot start a worker" })
+        }
+        for j in range start, end {
+            p := procs[j - start]
+            out := try p.Wait() catch default os.Output(1, "", "")
+            m := alive[todo[j]]
+            m.Res = Result.printed(out.Stdout)
+            alive[todo[j]] = m
+            try os.Remove(dir + "/job" + $trials[j].Id + ".txt") catch { }
+        }
+        start = end
+    }
+    if made != "": try os.RemoveAll(made) catch { }
+}
+
+# the result a worker printed: its last line "evo-result LOSS COST...", F64.Inf where there is none
+fn Result.printed(text String&) Result {
+    res := Result(F64.Inf)
+    for line in text.Split("\n") {
+        f := line.Split(" ")
+        if f.Len() < 2 or f[0] != "evo-result": continue
+        res = Result(try f[1].ParseFloat() catch default F64.Inf)
+        for j in range 2, f.Len(): res.Costs.Push(try f[j].ParseFloat() catch default 0.0)
+    }
+    return res
+}
+
+# the program's own arguments, after its name: in a worker process too, which is started as "PROGRAM --evo-worker JOB
+# ARGS..." with the arguments the search was started with, so it can load the same data
+fn Args() Array<String&>& {
+    all := os.Args()
+    from := 3 if all.Len() >= 3 and all[1] == "--evo-worker" else 1
+    return all[from:]
+}
+
+# in a worker process - started with "--evo-worker JOB" - the job run, its result printed and the process ended; in
+# any other process nothing. A program searching with Workers > 1 calls it first in main, once its data is loaded
+fn Worker<S, F, D>(space mut S&, fit mut F&, data Split<D>&) {
+    args := os.Args()
+    if args.Len() < 3 or args[1] != "--evo-worker": return
+    text := try os.ReadFile(args[2]) catch default ""
+    lines := text.Split("\n")
+    if lines.Len() < 5: failed()
+    f := lines[0].Split(" ")
+    if f.Len() != 6: failed()
+    id := try f[0].ParseInt() catch default -1
+    seed := try f[1].ParseUint() catch default 0
+    budget := try f[2].ParseFloat() catch default 0.0
+    k := try f[3].ParseInt() catch default 0
+    t := Trial(id, seed, budget, k)
+    t.Parent = try f[4].ParseInt() catch default -1
+    t.Spent = try f[5].ParseFloat() catch default 0.0
+    t.Inherit = $lines[1]
+    t.Resume = $lines[2]
+    t.Save = $lines[3]
+    g := try space.Decode(lines[4]) catch { failed() }
+    res := try fit.Evaluate(g, t, data) catch { failed() }
+    line := "evo-result " + $res.Loss
+    for c in res.Costs: line += " " + $c
+    try io.PutLn(line) catch { }
+    os.Exit(0)
+}
+
+# a worker's end where its job failed
+fn failed() noreturn {
+    try io.PutLn("evo-failed") catch { }
+    os.Exit(1)
+}
+
+# ---- results ----
+
+# the best member evaluated at the full budget (the lowest loss, then the oldest)
+fn (e Evolution<G>&) Best() Member<G> {
+    b I64 = 0
+    for i in range e.History.Len() {
+        if better(e.History[i], e.History[b]): b = i
+    }
+    return e.History[b]
+}
+
+# the members of the history no other dominates in the Config.Objectives objectives, by id
+fn (e Evolution<G>&) Front() Vec<Member<G>> {
+    n := e.History.Len()
+    objs := Array<F64>(n * e.Settings.Objectives)
+    for i in range n: e.objectives(e.History[i], objs, i)
+    out := Vec<Member<G>>()
+    for i in pareto.Front(objs, e.Settings.Objectives): out.Push(e.History[i])
+    return out
+}
+
+# ---- checkpoints ----
+
+fn memberLine<S, G>(space S&, tag String&, m Member<G>&) String {
+    t := tag + " " + $m.Id + " " + $m.Parent + " " + $m.Born + " " + $m.Res.Loss + " " + $m.Res.Costs.Len()
+    for c in m.Res.Costs: t += " " + $c
+    return t + "\t" + space.Encode(m.Genome) + "\n"
+}
+
+# the state, all of it, as text: what Resume reads back
+fn (e Evolution<G>&) Save<S>(space S&) String {
+    st := e.rng.State()
+    t := "evo 1\nrng " + $st[0] + " " + $st[1] + " " + $st[2] + " " + $st[3] + "\n"
+    t += "counts " + $e.Round + " " + $e.nextId + " " + $e.Evaluations + " " + $e.Spent + " " + $e.Hits + " " + $e.Failures + "\n"
+    t += "space\t" + space.State() + "\n"
+    for m in e.Population: t += memberLine(space, "P", m)
+    for m in e.History: t += memberLine(space, "H", m)
+    for c in e.cache.Iter() {
+        t += "C " + $c.Value.Loss + " " + $c.Value.Costs.Len()
+        for x in c.Value.Costs: t += " " + $x
+        t += "\t" + c.Key + "\n"
+    }
+    return t
+}
+
+# Dir/state.evo written whole: to a file beside it, then moved over it in one step
+fn (e Evolution<G>&) checkpoint<S>(space S&) {
+    path := e.Settings.Dir + "/state.evo"
+    try os.WriteFile(path + ".tmp", e.Save(space)) catch { unreachable "evo: cannot write " + path }
+    try os.Rename(path + ".tmp", path) catch { unreachable "evo: cannot write " + path }
+}
+
+# the numbers of a result written as "LOSS N COST...", from field `at` of f
+fn Result.read(f Array<String&>&, at I64) Result ? SearchError {
+    res := Result(try f[at].ParseFloat() catch { error SearchError.State("a loss") })
+    n := try f[at + 1].ParseInt() catch { error SearchError.State("a cost count") }
+    if f.Len() != at + 2 + n: error SearchError.State("costs")
+    for j in range n: res.Costs.Push(try f[at + 2 + j].ParseFloat() catch { error SearchError.State("a cost") })
+    return res
+}
+
+# the state Save wrote (Dir/state.evo of an earlier run) put back, the space's registry with it: the search goes on
+# from there exactly as the run that wrote it would have
+fn (e mut Evolution<G>&) Resume<S>(space mut S&, text String&) ? SearchError {
+    lines := text.Split("\n")
+    if lines.Len() < 4 or lines[0] != "evo 1": error SearchError.State("not a state of evo 1")
+    r := lines[1].Split(" ")
+    if r.Len() != 5: error SearchError.State("the generator")
+    st := Array<U64>(4)
+    for j in range 4: st[j] = try r[1 + j].ParseUint() catch { error SearchError.State("the generator") }
+    try e.rng.SetState(st) catch { error SearchError.State("the generator") }
+    c := lines[2].Split(" ")
+    if c.Len() != 7: error SearchError.State("the counts")
+    e.Round = try c[1].ParseInt() catch { error SearchError.State("the counts") }
+    e.nextId = try c[2].ParseInt() catch { error SearchError.State("the counts") }
+    e.Evaluations = try c[3].ParseInt() catch { error SearchError.State("the counts") }
+    e.Spent = try c[4].ParseFloat() catch { error SearchError.State("the counts") }
+    e.Hits = try c[5].ParseInt() catch { error SearchError.State("the counts") }
+    e.Failures = try c[6].ParseInt() catch { error SearchError.State("the counts") }
+    sp := lines[3].Split("\t")
+    if sp.Len() != 2 or sp[0] != "space": error SearchError.State("the space")
+    try space.Restore(sp[1]) catch { error SearchError.State("the space's registry") }
+    e.Population.Clear()
+    e.History.Clear()
+    e.cache.Clear()
+    for line in lines[4:] {
+        if line == "": continue
+        parts := line.Split("\t")
+        if parts.Len() != 2: error SearchError.State("a line: " + $line)
+        f := parts[0].Split(" ")
+        if f[0] == "C" {
+            e.cache.Put($parts[1], try Result.read(f, 1))
+            continue
+        }
+        if f.Len() < 6 or (f[0] != "P" and f[0] != "H"): error SearchError.State("a line: " + $line)
+        id := try f[1].ParseInt() catch { error SearchError.State("an id") }
+        parent := try f[2].ParseInt() catch { error SearchError.State("a parent") }
+        born := try f[3].ParseInt() catch { error SearchError.State("a round") }
+        g := try space.Decode(parts[1]) catch { error SearchError.State("a genome") }
+        m := Member<G>(id, g, try Result.read(f, 4), parent, born)
+        if f[0] == "P" {
+            e.Population.Push(m)
+        } else {
+            e.History.Push(m)
+        }
+    }
+}
+
+# ---- tests ----
+
+type testError error { Diverged }
+
+# a known optimum: op "gelu", width 48, three layers all of kind "b"; below the full budget (9) the loss is noisy
+type widthTask struct(space schema.Schema) {
+    space
+    calls I64 = 0
+}
+
+fn widthSpace() schema.Schema {
+    s := schema.Schema()
+    layer := s.Block("layer")
+    s.Choice(layer, "kind", Array<String>["a", "b"])
+    s.Choice(schema.Root, "op", Array<String>["relu", "tanh", "gelu", "sin"])
+    s.Int(schema.Root, "width", 4, 256, true)
+    s.Repeat(schema.Root, "layers", layer, 1, 6)
+    return s
+}
+
+fn (w mut widthTask&) Evaluate(g schema.Genome&, t Trial&, data Split<I64>&) Result ? testError {
+    w.calls += 1
+    s := w.space
+    d := (s.Num(g, schema.Root, "width") / 48.0).Log2()
+    loss := d * d
+    if s.Pick(g, schema.Root, "op") != "gelu": loss += 1.0
+    layers := s.Children(g, schema.Root, "layers")
+    loss += 0.3 * (F64(layers.Len()) - 3.0).Abs()
+    for i in layers {
+        if s.Pick(g, i, "kind") != "b": loss += 0.2
+    }
+    r := rand.Rand(t.Seed)
+    return Result(loss + r.Normal(0.0, 0.3 * (1.0 - t.Budget / 9.0)) + F64(data.Train - data.Val))
+}
+
+fn widthFound(s schema.Schema&, m Member<schema.Genome>&) Bool {
+    g := m.Genome
+    layers := s.Children(g, schema.Root, "layers")
+    kinds := true
+    for i in layers: kinds = kinds and s.Pick(g, i, "kind") == "b"
+    w := s.Num(g, schema.Root, "width")
+    return s.Pick(g, schema.Root, "op") == "gelu" and layers.Len() == 3 and kinds and w >= 46.0 and w <= 50.0
+}
+
+test Evolution "regularized, tournament and (mu + lambda) evolution find a known width, operation and depth" {
+    s := widthSpace()
+    data := Split<I64>(0, 0)
+    methods := Array<Algorithm>[Algorithm.Regularized(32, 8), Algorithm.Tournament(32, 3, 2), Algorithm.MuPlusLambda(16, 16)]
+    rounds := Array<I64>[800, 40, 500]
+    for k in range methods.Len() {
+        c := Config(methods[k], 7)
+        c.Rungs = Vec<F64>[9.0]
+        c.Crossover = 0.3
+        e := Evolution<schema.Genome>(c)
+        fit := widthTask(s)
+        e.Run(s, fit, data, rounds[k])
+        assert widthFound(s, e.Best()), "method " + $k + " best " + s.Key(e.Best().Genome) + " loss " + $e.Best().Res.Loss
+        assert e.Hits > 0 and e.Evaluations == fit.calls
+    }
+}
+
+test Evolution "successive halving: each round's children go through every rung, the best third on, one reaching the full budget" {
+    s := widthSpace()
+    c := Config(Algorithm.Regularized(16, 6), 3)
+    c.Rungs = Vec<F64>[1.0, 3.0, 9.0]
+    c.Batch = 9
+    e := Evolution<schema.Genome>(c)
+    fit := widthTask(s)
+    e.Run(s, fit, Split<I64>(0, 0), 1)
+    assert e.Evaluations + e.Hits == 16 and e.History.Len() == 16
+    for _ in range 60: e.Step(s, fit, Split<I64>(0, 0))
+    assert e.Evaluations + e.Hits == 16 + 60 * (9 + 3 + 1) - e.Failures
+    assert e.History.Len() == 16 + 60
+    assert widthFound(s, e.Best()), "best " + s.Key(e.Best().Genome)
+}
+
+# ZDT1 (Zitzler, Deb and Thiele 2000) in six variables: its Pareto front is f2 = 1 - sqrt(f1), x1 .. x5 all 0
+type zdt1 struct(space schema.Schema) { space }
+
+fn zdtSpace() schema.Schema {
+    s := schema.Schema()
+    for i in range 6: s.Float(schema.Root, "x" + $i, 0.0, 1.0)
+    return s
+}
+
+fn (z mut zdt1&) Evaluate(g schema.Genome&, t Trial&, data Split<I64>&) Result ? testError {
+    x := g.Insts[0].Values
+    sum F64 = 0.0
+    for i in range 1, 6: sum += x[i]
+    h := 1.0 + 9.0 * sum / 5.0
+    res := Result(x[0])
+    res.Costs.Push(h * (1.0 - (x[0] / h).Sqrt()))
+    return res
+}
+
+test Evolution "NSGA-II recovers the known Pareto front of ZDT1" {
+    s := zdtSpace()
+    s.Rates = Array<F64>[1.0, 0.0, 0.0, 0.0, 0.0]
+    s.Spread = 0.05
+    c := Config(Algorithm.Nsga2(40), 5)
+    c.Crossover = 0.9
+    e := Evolution<schema.Genome>(c)
+    fit := zdt1(s)
+    e.Run(s, fit, Split<I64>(0, 0), 250)
+    front := e.Front()
+    gap F64 = 0.0
+    lo, hi := 1.0, 0.0
+    for m in front {
+        f1, f2 := m.Res.Loss, m.Res.Costs[0]
+        gap += (f2 - (1.0 - f1.Sqrt())).Abs()
+        lo = f1 if f1 < lo else lo
+        hi = f1 if f1 > hi else hi
+    }
+    gap /= F64(front.Len())
+    assert front.Len() >= 20 and gap < 0.03 and lo < 0.05 and hi > 0.9, "front " + $front.Len() + " gap " + $gap + " span " + $lo + " .. " + $hi
+    for m in e.Population {
+        assert m.Res.Costs.Len() == 1
+    }
+}
+
+# a known network: two hidden nodes, both tanh of width 32, on a path from every input to the output
+type netTask struct(space neat.Space) { space }
+
+fn (n mut netTask&) Evaluate(g neat.Net&, t Trial&, data Split<I64>&) Result ? testError {
+    s := n.space
+    hidden I64 = 0
+    loss F64 = 0.0
+    for x in g.Nodes {
+        if x.Id < s.Inputs + s.Outputs: continue
+        hidden += 1
+        if s.Ops[x.Op] != "tanh": loss += 1.0
+        loss += (F64(x.Width) / 32.0).Log2().Abs()
+    }
+    loss += F64((hidden - 2).Abs())
+    for i in range s.Inputs {
+        if not g.Reaches(i, s.Inputs): loss += 1.0
+    }
+    return Result(loss)
+}
+
+test Evolution "regularized evolution of NEAT genomes finds a known network" {
+    s := neat.Space(2, 1, Array<String>["linear", "relu", "tanh"], 4, 64)
+    e := Evolution<neat.Net>(Config(Algorithm.Regularized(32, 8), 11))
+    fit := netTask(s)
+    e.Run(s, fit, Split<I64>(0, 0), 1500)
+    assert e.Best().Res.Loss == 0.0, "best " + s.Key(e.Best().Genome) + " loss " + $e.Best().Res.Loss
+}
+
+# a fitness that keeps weights: it writes its id where told to save, and checks what it inherits and resumes
+type keepTask struct(space schema.Schema) {
+    space
+    inherited I64 = 0
+    resumed I64 = 0
+}
+
+fn (k mut keepTask&) Evaluate(g schema.Genome&, t Trial&, data Split<I64>&) Result ? testError {
+    if t.Inherit != "" {
+        assert (try os.ReadFile(t.Inherit) catch default "") == $t.Parent
+        k.inherited += 1
+    }
+    if t.Resume != "" {
+        assert (try os.ReadFile(t.Resume) catch default "") == $t.Id and t.Spent < t.Budget
+        k.resumed += 1
+    }
+    try os.WriteFile(t.Save, $t.Id) catch { error testError.Diverged }
+    w := widthTask(k.space)
+    return try w.Evaluate(g, t, data)
+}
+
+test Evolution "weights: a trial inherits its parent's, resumes its own on the next rung; members leaving are deleted" {
+    s := widthSpace()
+    dir := try os.MkTemp("", "evotest-") catch { unreachable }
+    c := Config(Algorithm.Regularized(8, 4), 9)
+    c.Rungs = Vec<F64>[3.0, 9.0]
+    c.Batch = 4
+    c.Dir = dir
+    e := Evolution<schema.Genome>(c)
+    fit := keepTask(s)
+    e.Run(s, fit, Split<I64>(0, 0), 30)
+    assert fit.inherited > 50 and fit.resumed > 30
+    files := try os.ReadDir(dir) catch { unreachable }
+    assert files.Len() <= 8 + 2, "files " + $files.Len()        # the population's, the best's and the checkpoint
+    try os.RemoveAll(dir) catch { }
+}
+
+test Evolution "a run stopped, checkpointed and resumed ends exactly as one run straight through" {
+    s := neat.Space(2, 1, Array<String>["linear", "relu", "tanh"], 4, 64)
+    dirs := Array<String>[try os.MkTemp("", "evotest-") catch { unreachable }, try os.MkTemp("", "evotest-") catch { unreachable }]
+    c := Config(Algorithm.Regularized(16, 4), 13)
+    c.Crossover = 0.5
+    c.Dir = dirs[0]
+    whole := Evolution<neat.Net>(c)
+    fit := netTask(s)
+    whole.Run(s, fit, Split<I64>(0, 0), 60)
+    c.Dir = dirs[1]
+    s2 := neat.Space(2, 1, Array<String>["linear", "relu", "tanh"], 4, 64)
+    first := Evolution<neat.Net>(c)
+    fit2 := netTask(s2)
+    first.Run(s2, fit2, Split<I64>(0, 0), 25)
+    s3 := neat.Space(2, 1, Array<String>["linear", "relu", "tanh"], 4, 64)
+    second := Evolution<neat.Net>(c)
+    try second.Resume(s3, try os.ReadFile(dirs[1] + "/state.evo") catch { unreachable }) catch { unreachable }
+    fit3 := netTask(s3)
+    second.Run(s3, fit3, Split<I64>(0, 0), 35)
+    assert second.Save(s3) == whole.Save(s)
+    for d in dirs: try os.RemoveAll(d) catch { }
+}
+
+test Split.Carve "a validation share drawn out of the training data, the two disjoint and together all of it" {
+    items := Array<I64>[i for i in range 100]
+    sp := Split<Array<I64>>.Carve(items, 0.2, 4)
+    assert sp.Val.Len() == 20 and sp.Train.Len() == 80
+    seen := Array<I64>(100)
+    for x in sp.Train: seen[x] += 1
+    for x in sp.Val: seen[x] += 1
+    for x in seen: assert x == 1
+}
