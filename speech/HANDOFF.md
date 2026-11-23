@@ -1,4 +1,12 @@
-# speech: hand-off (2026-11-23)
+# speech: hand-off (2026-11-23, stopped by the usage guard)
+
+Read first: this note, then speech/README.md (API, checks, speed, licences). Last commits: 5fcd249 (g2p clock
+times), fb13d23 (speak.olang), 91bc1bd (shortened windows keep 3 s silence, Options.NoRepeat). Nothing is in progress;
+the tree was clean. Users: the OAgent home session (session_01DLX3U7kkfPnv219zp4wSrU) runs Whisper, kws.Detector and
+speak.Voice from oann; e75-speech (session_01DLX3U8EBgCK5YZpKCPmx4N) reuses mel/kws.
+
+aarch64 under qemu: mel, whisper and transcribe test files pass with tiny (logits 7.6e-5); kws and speak/vits/g2p were
+not run under qemu (stopped) - the first thing to rerun.
 
 Done and pushed: Whisper (mel, whisper, transcribe, listen/oann-listen), kws (wake word), bench/speech, README (licences,
 VM speed, Pi 4 estimate, TTS survey). Exact against transformers 5.24 for tiny/base/small (see README, Checks).
