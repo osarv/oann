@@ -122,6 +122,18 @@ Here the predictor earns its keep. With screening, the seeds that came within 0.
 budget of 812, against 1101 for the three seeds of evolution that got there at all. The held-out tau on the genome
 alone is 0.66 (n = 16) and 0.45 (n = 32).
 
+At n = 32 (8 seeds, mean final gap with screening, then with proposals as well), screening more candidates helps:
+
+| setting | screening | + proposals |
+|---|---|---|
+| Screen 8, K 0.5 | 0.54 | 0.54 |
+| Screen 16 | 0.58 | 0.46 |
+| Screen 32 | 0.39 | 0.41 |
+| K 0 | 0.60 | 0.50 |
+| K 1.5 | 0.59 | 0.67 |
+
+The weight on the uncertainty changes little either way. Raise `Config.Screen` when evaluations are dear.
+
 **The generator:**
 
 - Fitted on 200 random genomes, its proposals have a true loss below 0.75 of the random mean (tested).
