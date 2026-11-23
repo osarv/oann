@@ -178,10 +178,14 @@ fn (p mut Predictor&) Observe(x Array<F64>&, rung I64, curve Array<F64>&, y F64)
             i := p.rng.Below(n)
             c := p.curves[i]
             m := p.rng.Below(c.Len() + 1)
-            net.Train(p.input(p.xs[i], c, m, p.rungs[i]), (p.ys[i] - p.mu) / p.sd, p.Rate)
+            net.Train(p.input(p.xs[i], c, m, p.rungs[i]), (p.ys[i] - p.mu) / p.sd - p.base(c, m), p.Rate)
         }
     }
 }
+
+# what the networks predict on top of: the last of the first n points of curve, standardized (0 for none) - so they
+# learn the drop still to come, and from few observations a prediction ranks as the loss reached so far does
+fn (p Predictor&) base(curve Array<F64>&, n I64) F64 { return 0.0 if n == 0 else (curve[n - 1] - p.mu) / p.sd }
 
 # the predicted final loss of features x after the points of curve given, and the members' spread
 fn (p mut Predictor&) Predict(x Array<F64>&, curve Array<F64>&) F64, F64 { return p.PredictAt(x, curve, p.Curve) }
@@ -190,16 +194,21 @@ fn (p mut Predictor&) Predict(x Array<F64>&, curve Array<F64>&) F64, F64 { retur
 fn (p mut Predictor&) PredictAt(x Array<F64>&, curve Array<F64>&, rung I64) F64, F64 {
     if p.nets.Len() == 0: return p.mu, p.sd
     row := p.input(x, curve, curve.Len(), rung)
+    n := curve.Len().Min(p.Curve)
     sum, sq := 0.0, 0.0
     for k in range p.nets.Len() {
         net := p.nets.RefMut(k)
-        v := net.Forward(row) * p.sd + p.mu
+        v := net.Forward(row)
         sum += v
         sq += v * v
     }
     m := F64(p.nets.Len())
-    mean := sum / m
-    return mean, (sq / m - mean * mean).Max(0.0).Sqrt()
+    drop := sum / m
+    spread := (sq / m - drop * drop).Max(0.0)
+    # from a curve, the drop still to come shrunk by its signal to noise across the members: where they disagree as
+    # much as the drop itself, the prediction stays near the loss reached so far
+    if n > 0 and drop * drop + spread > 0.0: drop *= drop * drop / (drop * drop + spread)
+    return (p.base(curve, n) + drop) * p.sd + p.mu, spread.Sqrt() * p.sd
 }
 
 # Kendall's rank correlation of a and b (tau-a: the share of concordant pairs less that of discordant ones)
