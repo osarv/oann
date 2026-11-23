@@ -1,0 +1,409 @@
+# nn/lines - a factor over a line of cells with a learned hidden chain: a rule about a whole line (a count, a pattern
+# along it) as an energy. Each line carries a hidden chain of H states, never labelled; the tables are shared by every
+# line, the end table read at the line's clue (what the line is told, e.g. its count):
+#   E_line(x, h) = sum_i A[h_{i-1}][h_i][x_i] + Z[clue][h_last] + sum_i B[x_i]     (h_{-1} = state 0)
+# The chain is summed out exactly by forward-backward, so a line's energy is its free energy F = -log sum_h exp(-E),
+# and the energy of an assignment the sum of its lines' (cells may lie on several lines, as a grid's rows and columns).
+# The states learn what to count; what they mean is the fit's to find.
+#
+# - `Free(q, x, xo)`, `Energy(x, xo)`: a line's free energy and the sum over the lines.
+# - `PseudoGrad(x, xo)`: exact per-cell pseudolikelihood - a cell's conditional reads only the free energies of the
+#   lines through it, so the gradient is the lines' expected counts (forward-backward) at each of the cell's values,
+#   weighted by the data less the conditional - added into GA, GZ, GB; `Step` takes an Adam step.
+# - `Anneal(x, sweeps, t0, t1, r)`: single-site Gibbs on the summed free energy (a change re-reads the lines through
+#   the cell), annealed, then greedy until nothing moves.
+# - `FitRestarts(restarts, fit, score, r)`: the latent counter is found from a minority of random starts and the
+#   training loss cannot tell which; each restart is fitted from random tables by fit and kept by score - the caller's
+#   validation (e.g. the share of held-out puzzles solved).
+
+import "std/rand"
+
+type Lines struct(k I64, h I64, clues I64, cells I64, count I64, total I64) {
+    K I64 = k
+    H I64 = h
+    Clues I64 = clues
+    Cells I64 = cells
+    Count I64 = count
+    Ptr mut Array<I64>& = Array<I64>(count + 1)    # line q's cells, in order: At[Ptr[q] .. Ptr[q + 1]]
+    At mut Array<I64>& = Array<I64>(total)
+    Clue mut Array<I64>& = Array<I64>(count)       # each line's clue (set per example)
+    A mut Array<F64>& = Array<F64>(h * h * k)      # A[h'][h][x]
+    Z mut Array<F64>& = Array<F64>(clues * h)      # Z[clue][h]
+    B mut Array<F64>& = Array<F64>(k)
+    GA mut Array<F64>& = Array<F64>(h * h * k)
+    GZ mut Array<F64>& = Array<F64>(clues * h)
+    GB mut Array<F64>& = Array<F64>(k)
+    Steps I64 = 0
+    ma mut Array<F64>& = Array<F64>(h * h * k)
+    va mut Array<F64>& = Array<F64>(h * h * k)
+    mz mut Array<F64>& = Array<F64>(clues * h)
+    vz mut Array<F64>& = Array<F64>(clues * h)
+    mb mut Array<F64>& = Array<F64>(k)
+    vb mut Array<F64>& = Array<F64>(k)
+    cptr mut Array<I64>& = Array<I64>(cells + 1)   # cell i's lines: lid[cptr[i] .. cptr[i + 1]]
+    lid mut Array<I64>& = Array<I64>(total)
+    fw mut Array<F64>& = Array<F64>(total * h)
+    bw mut Array<F64>& = Array<F64>(total * h)
+    w mut Array<F64>& = Array<F64>(h)
+    L mut Array<F64>& = Array<F64>(k)
+}
+
+# each cell's lines (after Ptr and At are set)
+fn (l mut Lines&) Index() {
+    for i in range l.Cells + 1: l.cptr[i] = 0
+    for t in range l.Ptr[l.Count]: l.cptr[l.At[t] + 1]++
+    for i in range l.Cells: l.cptr[i + 1] += l.cptr[i]
+    fill := Array<I64>(l.Cells)
+    for q in range l.Count {
+        for t in range l.Ptr[q], l.Ptr[q + 1] {
+            c := l.At[t]
+            l.lid[l.cptr[c] + fill[c]] = q
+            fill[c]++
+        }
+    }
+}
+
+fn (l mut Lines&) Init(r mut rand.Rand&, scale F64) {
+    for i in range l.A.Len(): l.A[i] = r.Normal() * scale
+    for i in range l.Z.Len(): l.Z[i] = r.Normal() * scale
+    for i in range l.K: l.B[i] = 0.0
+    for i in range l.A.Len(): l.ma[i], l.va[i] = 0.0, 0.0
+    for i in range l.Z.Len(): l.mz[i], l.vz[i] = 0.0, 0.0
+    for i in range l.K: l.mb[i], l.vb[i] = 0.0, 0.0
+    l.Steps = 0
+}
+
+fn (l Lines&) a(p I64, h I64, x I64) F64 { return l.A[(p * l.H + h) * l.K + x] }
+
+fn lse(x Array<F64>&, n I64) F64 {
+    m := x[0]
+    for i in range 1, n: m = m.Max(x[i])
+    z F64 = 0.0
+    for i in range n: z += (x[i] - m).Exp()
+    return m + z.Log()
+}
+
+# line q's forward messages into fw (its own slots, from Ptr[q]); its free energy
+fn (l mut Lines&) forward(q I64, x Array<I32>&, xo I64) F64 {
+    h := l.H
+    o, n := l.Ptr[q], l.Ptr[q + 1] - l.Ptr[q]
+    fb F64 = 0.0
+    for i in range n {
+        xi := I64(x[xo + l.At[o + i]])
+        fb += l.B[xi]
+        for s in range h {
+            if i == 0 {
+                l.fw[o * h + s] = -l.a(0, s, xi)
+                continue
+            }
+            for p in range h: l.w[p] = l.fw[(o + i - 1) * h + p] - l.a(p, s, xi)
+            l.fw[(o + i) * h + s] = lse(l.w, h)
+        }
+    }
+    for s in range h: l.w[s] = l.fw[(o + n - 1) * h + s] - l.Z[l.Clue[q] * h + s]
+    return fb - lse(l.w, h)
+}
+
+fn (l mut Lines&) Free(q I64, x Array<I32>&, xo I64) F64 { return l.forward(q, x, xo) }
+
+fn (l mut Lines&) Energy(x Array<I32>&, xo I64) F64 {
+    e F64 = 0.0
+    for q in range l.Count: e += l.forward(q, x, xo)
+    return e
+}
+
+# line q's expected counts (dF/dtheta) times wt into GA, GZ, GB, at x
+fn (l mut Lines&) counts(q I64, x Array<I32>&, xo I64, wt F64) {
+    h := l.H
+    o, n := l.Ptr[q], l.Ptr[q + 1] - l.Ptr[q]
+    f := l.forward(q, x, xo)
+    fb F64 = 0.0
+    for i in range n: fb += l.B[I64(x[xo + l.At[o + i]])]
+    lz := fb - f
+    c := l.Clue[q]
+    for s in range h: l.bw[(o + n - 1) * h + s] = -l.Z[c * h + s]
+    for t in range n - 1 {
+        i := n - 2 - t
+        xn := I64(x[xo + l.At[o + i + 1]])
+        for p in range h {
+            for s in range h: l.w[s] = -l.a(p, s, xn) + l.bw[(o + i + 1) * h + s]
+            l.bw[(o + i) * h + p] = lse(l.w, h)
+        }
+    }
+    for s in range h: l.GZ[c * h + s] += wt * (l.fw[(o + n - 1) * h + s] + l.bw[(o + n - 1) * h + s] - lz).Exp()
+    for i in range n {
+        xi := I64(x[xo + l.At[o + i]])
+        l.GB[xi] += wt
+        for s in range h {
+            if i == 0 {
+                l.GA[(0 * h + s) * l.K + xi] += wt * (-l.a(0, s, xi) + l.bw[o * h + s] - lz).Exp()
+                continue
+            }
+            for p in range h: l.GA[(p * h + s) * l.K + xi] += wt * (l.fw[(o + i - 1) * h + p] - l.a(p, s, xi) + l.bw[(o + i) * h + s] - lz).Exp()
+        }
+    }
+}
+
+# cell i's energy at each value (the lines through it), into L
+fn (l mut Lines&) local(x mut Array<I32>&, xo I64, i I64) {
+    keep := x[xo + i]
+    for v in range l.K {
+        x[xo + i] = I32(v)
+        l.L[v] = 0.0
+        for r in range l.cptr[i], l.cptr[i + 1]: l.L[v] += l.forward(l.lid[r], x, xo)
+    }
+    x[xo + i] = keep
+}
+
+# every cell's negative log-conditional at x[xo ..] summed, returned; its gradient added into GA, GZ, GB
+fn (l mut Lines&) PseudoGrad(x mut Array<I32>&, xo I64) F64 {
+    nll F64 = 0.0
+    for i in range l.Cells {
+        l.local(x, xo, i)
+        mn := l.L[0]
+        for v in range 1, l.K: mn = mn.Min(l.L[v])
+        z F64 = 0.0
+        for v in range l.K: z += (mn - l.L[v]).Exp()
+        y := x[xo + i]
+        nll += l.L[I64(y)] - mn + z.Log()
+        for v in range l.K {
+            g := (1.0 if I32(v) == y else 0.0) - (mn - l.L[v]).Exp() / z
+            if g.Abs() < 1e-12: continue
+            x[xo + i] = I32(v)
+            for r in range l.cptr[i], l.cptr[i + 1]: l.counts(l.lid[r], x, xo, g)
+        }
+        x[xo + i] = y
+    }
+    return nll
+}
+
+# one Adam step from the gradients summed over count cells (cleared)
+fn (l mut Lines&) Step(rate F64, count F64) {
+    l.Steps++
+    adamStep(l.A, l.GA, l.ma, l.va, count, rate, l.Steps)
+    adamStep(l.Z, l.GZ, l.mz, l.vz, count, rate, l.Steps)
+    adamStep(l.B, l.GB, l.mb, l.vb, count, rate, l.Steps)
+}
+
+fn adamStep(p mut Array<F64>&, g mut Array<F64>&, m mut Array<F64>&, v mut Array<F64>&, n F64, rate F64, step I64) {
+    c1 := 1.0 - 0.9.Pow(F64(step))
+    c2 := 1.0 - 0.999.Pow(F64(step))
+    for i in range p.Len() {
+        gi := g[i] / n
+        m[i] = 0.9 * m[i] + 0.1 * gi
+        v[i] = 0.999 * v[i] + 0.001 * gi * gi
+        p[i] -= rate * (m[i] / c1) / ((v[i] / c2).Sqrt() + 1e-8)
+        g[i] = 0.0
+    }
+}
+
+# annealed single-site Gibbs from x: t from t0 to t1 geometrically over sweeps, then greedy sweeps until none moves;
+# the energy at the end
+fn (l mut Lines&) Anneal(x mut Array<I32>&, sweeps I64, t0 F64, t1 F64, r mut rand.Rand&) F64 {
+    for sw in range sweeps + 20 {
+        t := t0 * (t1 / t0).Pow(F64(sw) / F64((sweeps - 1).Max(1))) if sw < sweeps else 0.0
+        moved I64 = 0
+        for i in range l.Cells {
+            l.local(x, 0, i)
+            best I64 = 0
+            for v in range 1, l.K {
+                if l.L[v] < l.L[best]: best = v
+            }
+            pick := best
+            if t > 0.0 {
+                z F64 = 0.0
+                for v in range l.K: z += ((l.L[best] - l.L[v]) / t).Exp()
+                u := r.Uniform(0.0, 1.0) * z
+                for v in range l.K {
+                    u -= ((l.L[best] - l.L[v]) / t).Exp()
+                    pick = v
+                    if u <= 0.0: break
+                }
+            }
+            if I64(x[i]) != pick: moved++
+            x[i] = I32(pick)
+        }
+        if t == 0.0 and moved == 0: break
+    }
+    return l.Energy(x, 0)
+}
+
+# restarts: each from random tables (scale 0.5), trained by fit(lines, restart) and scored by score(lines) (higher is
+# better); the best restart's tables are kept in l. Returns the best score
+fn (l mut Lines&) FitRestarts(restarts I64, fit fn&(c mut Lines&, restart I64), score fn&(c mut Lines&) F64, r mut rand.Rand&) F64 {
+    best := -1e300
+    keepA, keepZ, keepB := Array<F64>(l.A.Len()), Array<F64>(l.Z.Len()), Array<F64>(l.K)
+    for t in range restarts {
+        l.Init(r, 0.5)
+        fit(l, t)
+        s := score(l)
+        if s <= best: continue
+        best = s
+        for i in range l.A.Len(): keepA[i] = l.A[i]
+        for i in range l.Z.Len(): keepZ[i] = l.Z[i]
+        for i in range l.K: keepB[i] = l.B[i]
+    }
+    for i in range l.A.Len(): l.A[i] = keepA[i]
+    for i in range l.Z.Len(): l.Z[i] = keepZ[i]
+    for i in range l.K: l.B[i] = keepB[i]
+    return best
+}
+
+# ---- tests ----
+
+# one line, brute force over every hidden path
+fn bruteFree(l Lines&, q I64, x Array<I32>&) F64 {
+    o, n := l.Ptr[q], l.Ptr[q + 1] - l.Ptr[q]
+    total I64 = 1
+    for _ in range n: total *= l.H
+    es := Array<F64>(total)
+    for code in range total {
+        rest := code
+        prev I64 = 0
+        e F64 = 0.0
+        last I64 = 0
+        for i in range n {
+            s := rest % l.H
+            rest /= l.H
+            xi := I64(x[l.At[o + i]])
+            e += l.a(prev, s, xi) + l.B[xi]
+            prev, last = s, s
+        }
+        es[code] = -(e + l.Z[l.Clue[q] * l.H + last])
+    }
+    return -lse(es, total)
+}
+
+# a 2 x 3 grid's rows and columns as lines
+fn Lines.grid(rows I64, cols I64, k I64, h I64, clues I64) Lines {
+    l := Lines(k, h, clues, rows * cols, rows + cols, 2 * rows * cols)
+    t I64 = 0
+    for q in range rows {
+        l.Ptr[q] = t
+        for c in range cols {
+            l.At[t] = q * cols + c
+            t++
+        }
+    }
+    for c in range cols {
+        l.Ptr[rows + c] = t
+        for q in range rows {
+            l.At[t] = q * cols + c
+            t++
+        }
+    }
+    l.Ptr[rows + cols] = t
+    l.Index()
+    return l
+}
+
+fn (l mut Lines&) plTotal(x mut Array<I32>&) F64 {
+    nll := l.PseudoGrad(x, 0)
+    for i in range l.GA.Len(): l.GA[i] = 0.0
+    for i in range l.GZ.Len(): l.GZ[i] = 0.0
+    for i in range l.K: l.GB[i] = 0.0
+    return nll
+}
+
+test Lines "free energies match brute force over the hidden paths, and the pseudolikelihood gradient matches central differences" {
+    r := rand.Rand(61)
+    l := Lines.grid(2, 3, 2, 3, 4)
+    l.Init(r, 0.7)
+    for i in range 2: l.B[i] = r.Normal() * 0.3
+    for q in range l.Count: l.Clue[q] = r.Below(4)
+    x := Array<I32>[1, 0, 1, 1, 1, 0]
+    for q in range l.Count: assert (l.Free(q, x, 0) - bruteFree(l, q, x)).Abs() < 1e-10
+    l.PseudoGrad(x, 0)
+    ga, gz, gb := Array<F64>(l.GA.Len()), Array<F64>(l.GZ.Len()), Array<F64>(2)
+    for i in range ga.Len(): ga[i] = l.GA[i]
+    for i in range gz.Len(): gz[i] = l.GZ[i]
+    for i in range 2: gb[i] = l.GB[i]
+    for i in range ga.Len(): l.GA[i] = 0.0
+    for i in range gz.Len(): l.GZ[i] = 0.0
+    for i in range 2: l.GB[i] = 0.0
+    d := 1e-5
+    for i in range l.A.Len() {
+        keep := l.A[i]
+        l.A[i] = keep + d
+        up := l.plTotal(x)
+        l.A[i] = keep - d
+        down := l.plTotal(x)
+        l.A[i] = keep
+        assert (ga[i] - (up - down) / (2.0 * d)).Abs() < 1e-6, "A " + $i
+    }
+    for i in range l.Z.Len() {
+        keep := l.Z[i]
+        l.Z[i] = keep + d
+        up := l.plTotal(x)
+        l.Z[i] = keep - d
+        down := l.plTotal(x)
+        l.Z[i] = keep
+        assert (gz[i] - (up - down) / (2.0 * d)).Abs() < 1e-6, "Z " + $i
+    }
+}
+
+# runs of 1s in a line of the grid g (n x n), line q (rows then columns)
+fn runsOf(g Array<I32>&, n I64, q I64) I64 {
+    runs, prev I64 = 0, 0
+    for t in range n {
+        v := I64(g[q * n + t] if q < n else g[t * n + (q - n)])
+        runs += 1 if v == 1 and prev == 0 else 0
+        prev = v
+    }
+    return runs
+}
+
+# a random n x n binary grid and its lines' run counts as clues
+fn puzzle(l mut Lines&, n I64, r mut rand.Rand&, g mut Array<I32>&) {
+    for i in range n * n: g[i] = I32(r.Below(2))
+    for q in range 2 * n: l.Clue[q] = runsOf(g, n, q)
+}
+
+# x solves the clues in l (every line's run count right)
+fn solves(l Lines&, n I64, x Array<I32>&) Bool {
+    for q in range 2 * n {
+        if runsOf(x, n, q) != l.Clue[q]: return false
+    }
+    return true
+}
+
+# the share of count puzzles solved from random starts, best of 2 annealed chains each
+fn (l mut Lines&) solveShare(n I64, count I64, r mut rand.Rand&) F64 {
+    g, x, best := Array<I32>(n * n), Array<I32>(n * n), Array<I32>(n * n)
+    right I64 = 0
+    for _ in range count {
+        puzzle(l, n, r, g)
+        low := 1e300
+        for _ in range 2 {
+            for i in range n * n: x[i] = I32(r.Below(2))
+            e := l.Anneal(x, 200, 2.0, 0.05, r)
+            if e >= low: continue
+            low = e
+            for i in range n * n: best[i] = x[i]
+        }
+        right += 1 if solves(l, n, best) else 0
+    }
+    return F64(right) / F64(count)
+}
+
+test Lines.FitRestarts "a run-count rule over the rows and columns of 4 x 4 grids is learnt by a hidden chain (restarts kept by validation solving) and held-out puzzles are solved" {
+    n := 4
+    l := Lines.grid(n, n, 2, 5, 3)
+    data mut rand.Rand& = rand.Rand(71)
+    val mut rand.Rand& = rand.Rand(72)
+    g mut Array<I32>& = Array<I32>(n * n)
+    best := l.FitRestarts(4, fn(c, t) {
+        for it in range 1500 {
+            for _ in range 8 {
+                puzzle(c, n, data, g)
+                c.PseudoGrad(g, 0)
+            }
+            c.Step(0.05 * 0.5 * (1.0 + (3.14159265358979 * F64(it) / 1500.0).Cos()), F64(8 * n * n))
+        }
+    }, fn(c) {
+        return c.solveShare(n, 8, val)
+    }, rand.Rand(73))
+    assert best >= 0.75, $best
+    held := l.solveShare(n, 32, rand.Rand(74))
+    assert held >= 0.8, $held
+}
