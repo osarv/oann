@@ -18,7 +18,7 @@ import "../nn/train"
 
 type Block struct(n1 layers.Norm, attn layers.SelfAttention, n2 layers.Norm, ffn layers.Feed) { n1, attn, n2, ffn }
 
-fn (b Block&) Apply(g mut graph.Graph<F32>&, x graph.Var) graph.Var {
+fn (b Block&) Apply<E>(g mut graph.Graph<E>&, x graph.Var) graph.Var {
     h := g.Add(x, b.attn.Apply(g, b.n1.Apply(g, x)))
     return g.Add(h, b.ffn.Apply(g, b.n2.Apply(g, h)))
 }
@@ -29,7 +29,7 @@ fn ms(ns I64, steps I64) String { return $(F64(ns) * 1e-6 / F64(steps)).Fixed(2)
 
 type Model struct(tok graph.Var, y graph.Var, loss graph.Var) { tok, y, loss }
 
-fn Model.build(g mut graph.Graph<F32>&, nb I64, D I64, heads I64, T I64, V I64) Model {
+fn Model.build<E>(g mut graph.Graph<E>&, nb I64, D I64, heads I64, T I64, V I64) Model {
     emb := layers.Embedding.New(g, V, D)
     bs := Vec<Block>()
     for _ in range nb {
@@ -46,7 +46,7 @@ fn Model.build(g mut graph.Graph<F32>&, nb I64, D I64, heads I64, T I64, V I64) 
     return Model(tok, y, g.CrossEntropy(logits, y))
 }
 
-fn replicaStep(g mut graph.Graph<F32>&, m Model&, seed U64, T I64, V I64) {
+fn replicaStep<E>(g mut graph.Graph<E>&, m Model&, seed U64, T I64, V I64) {
     r := rand.Rand(seed)
     tk, cl := g.Ints(m.tok).Flat()!, g.Ints(m.y).Flat()!
     for j in range g.Batch * T {
@@ -99,25 +99,29 @@ fn main() ? {
         try dataParallel(steps, threads, try number(args, 3, 4), try number(args, 4, 128), try number(args, 5, 4), try number(args, 6, 128), try number(args, 7, 16), V)
         return
     }
-    g := graph.Graph<F32>(B, threads)
-    emb := layers.Embedding.New(g, V, D)
-    bs := Vec<Block>()
-    for _ in range nb {
-        out := graph.Init.Normal(0.0, 0.02 / F64(2 * nb).Sqrt())
-        bs.Push(Block(layers.Norm.New(g, D, true), layers.SelfAttention.New(g, D, heads, nb, true, true), layers.Norm.New(g, D, true)
-            layers.Feed.New(g, D, (8 * D / 3 + 7) / 8 * 8, out, true)))
+    bf16 := args.Len() > 9 and args[9] == "bf16"
+    if bf16 {
+        like BF16 = 0.0
+        try single(steps, threads, nb, D, heads, T, B, V, like)
+        return
     }
-    fin := layers.Norm.New(g, D, true)
-    tok := g.Tokens(T)
-    h := emb.Apply(g, tok)
-    for b in bs: h = b.Apply(g, h)
-    logits := emb.Logits(g, fin.Apply(g, h))
-    y := g.Classes(T)
-    loss := g.CrossEntropy(logits, y)
+    like F32 = 0.0
+    try single(steps, threads, nb, D, heads, T, B, V, like)
+}
+
+# one graph over the whole batch, threads inside each operation; BF16 storage keeps F32 masters for AdamW
+fn single<E>(steps I64, threads I64, nb I64, D I64, heads I64, T I64, B I64, V I64, like E) ? {
+    g := graph.Graph<E>(B, threads)
+    m := Model.build(g, nb, D, heads, T, V)
     try g.Plan(rand.Rand(1))
     try io.Put($nb + " blocks of " + $D + ", " + $heads + " heads, window " + $T + ", batch " + $B + ", vocabulary " + $V + ", " +
-        $g.ParamCount + " parameters, " + $threads + " threads\n")
-    o := optim.AdamW(g.Params(), g.ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(g))
+        $g.ParamCount + " parameters, " + $threads + " threads" + (", BF16 storage, F32 masters" if g.HasMasters() else "") + "\n")
+    if g.HasMasters(): try measure(g, m, optim.AdamW(g.Masters(), g.ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(g)), steps, T, B, V)
+    else: try measure(g, m, optim.AdamW(g.Params(), g.ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(g)), steps, T, B, V)
+}
+
+fn measure<E, O>(g mut graph.Graph<E>&, m Model&, o mut O&, steps I64, T I64, B I64, V I64) ? io.Error {
+    tok, y, loss := m.tok, m.y, m.loss
     r := rand.Rand(7)
     for i in range 3 + steps {
         if i == 3: g.Profiling = true
@@ -130,9 +134,9 @@ fn main() ? {
         g.Backward(loss)
         optim.ClipNorm(g.ParamGrads(), 1.0)
         o.Step()
+        g.SyncParams()
     }
     g.Profiling = false
-    # timed apart: whole steps (no profiling overhead), and clipping plus the optimizer
     tsteps, topt I64 = 0, 0
     tk, cl := g.Ints(tok).Flat()!, g.Ints(y).Flat()!
     for _ in range steps {
@@ -146,6 +150,7 @@ fn main() ? {
         b := time.Now()
         optim.ClipNorm(g.ParamGrads(), 1.0)
         o.Step()
+        g.SyncParams()
         c := time.Now()
         tsteps += c - a
         topt += c - b

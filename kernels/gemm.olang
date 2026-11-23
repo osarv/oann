@@ -37,6 +37,7 @@
 
 import "mat"
 import "std/rand"
+import stdtile "std/tile"
 import unistd "unistd.h"
 
 # ---- what a product is given ----
@@ -108,6 +109,18 @@ type Workspace<A> struct(threads I64, dim I64 = 0, wide I64 = 0) {
     qa mut Array<U8>& = Array<U8>(0)            # GemmI8's row tiles, one per task
     qb mut Array<I8>& = Array<I8>(0)            # GemmI8's weight panels
     corr mut Array<I32>& = Array<I32>(0)        # GemmI8's zero-point corrections
+    Tile Bool = TargetHasTileDot and accF32(A(0))   # BF16 x BF16 products into F32 by AMX tiles (tile.AddDot) here
+    ta mut Array<BF16>& = Array<BF16>(amxRows * roundUp(dim, 32) if Tile else 0)   # the tile path's block of op(A)
+    tb mut Array<BF16>& = Array<BF16>(amxCols * roundUp(dim, 32) if Tile else 0)   # its block of op(B), in pairs
+    tc mut Array<F32>& = Array<F32>(amxRows * amxCols if Tile else 0)             # its block of the result
+}
+
+# an accumulator of F32: the tile path's (its products sum in F32)
+fn accF32<A>(z A) Bool {
+    return match A {
+        case F32: true
+        case _: false
+    }
 }
 
 # room for every Gemm, GemmLeft and GemmBatch whose m, n and k are each at most dim, on up to ws.Threads tasks; wide is
@@ -119,6 +132,10 @@ fn (ws mut Workspace<A>&) Reserve(dim I64, wide I64 = 0) {
     if ws.a.Len() < roomA(ws.Threads, dim, z): ws.a = Array<A>(roomA(ws.Threads, dim, z))
     if ws.b.Len() < roomB(ws.Threads, dim, z): ws.b = Array<A>(roomB(ws.Threads, dim, z))
     if ws.c.Len() < wide: ws.c = Array<A>(wide)
+    if not ws.Tile: return
+    if ws.ta.Len() < amxRows * roundUp(dim, 32): ws.ta = Array<BF16>(amxRows * roundUp(dim, 32))
+    if ws.tb.Len() < amxCols * roundUp(dim, 32): ws.tb = Array<BF16>(amxCols * roundUp(dim, 32))
+    if ws.tc.Len() < amxRows * amxCols: ws.tc = Array<F32>(amxRows * amxCols)
 }
 
 # the panels' room for products of every size up to dim on threads tasks: op(A)'s, a block of tile rows by a block
@@ -206,6 +223,11 @@ fn Gemm<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&,
     oa := operand<SA>.of(a)
     ob := operand<SB>.of(b)
     cd := c.Data[c.Off:]
+    if ws.Tile and k > 0 and m * n * k >= tileFrom and ws.ta.Len() >= amxRows * roundUp(k, 32) and bf16Operands(a.Data, b.Data, alpha) {
+        tileProduct(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
+        finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
+        return
+    }
     if k > 0 and unpacked(m, n, k, ta, tb, cd, alpha) {
         unpackedProduct(m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
         finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
@@ -985,6 +1007,145 @@ fn sameType<S, A>(c Array<S>&, z A) Bool {
     return match S {
         case A: true
         case _: false
+    }
+}
+
+# ---- products by BF16 tiles ----
+
+# products from this many multiply-adds take the tile path (where the workspace's Tile holds): below it the packing
+# costs more than the tiles save
+tileFrom I64 = 1 << 18
+
+# both operands BF16 and the accumulator F32: tile.AddDot's product
+fn bf16Operands<SA, SB, A>(a Array<SA>&, b Array<SB>&, z A) Bool {
+    sa := match SA {
+        case BF16: true
+        case _: false
+    }
+    sb := match SB {
+        case BF16: true
+        case _: false
+    }
+    f := match A {
+        case F32: true
+        case _: false
+    }
+    return sa and sb and f
+}
+
+# the tile path's blocks: op(B) packed amxCols columns at a time, op(A) amxRows rows at a time within it
+amxRows I64 = 256
+amxCols I64 = 1024
+
+# c = alpha op(a) op(b) + beta c by tile.AddDot, block by block: op(b)'s columns into AddDot's pairs (padded to 16
+# columns and a depth of 32), op(a)'s rows into rows of that depth (padded to 16 rows), the block summed in F32 and
+# written back once (the epilogue after). Nothing allocated: the blocks are the workspace's
+fn tileProduct<SA, SB, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, a operand<SA>&, ta Bool, b operand<SB>&, tb Bool, alpha A, beta A, c mut Array<S>&, ldc I64) {
+    # a transposed left operand is gathered as it is packed; where the result is narrow, C^T = op(b)^T a gathers the
+    # narrow op(b) instead and stores the result transposed
+    if ta and not tb and n < m {
+        tileBlocks(ws, n, m, k, b, true, a, false, alpha, beta, c, ldc, true)
+        return
+    }
+    tileBlocks(ws, m, n, k, a, ta, b, tb, alpha, beta, c, ldc, false)
+}
+
+# the blocked tile product of op(l) (m x k) by op(r) (k x n) into c, or into c transposed (trans: c is n x m)
+fn tileBlocks<SL, SR, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, l operand<SL>&, lt Bool, r operand<SR>&, rt Bool, alpha A, beta A, c mut Array<S>&, ldc I64, trans Bool) {
+    kp := roundUp(k, 32)
+    for j0 in range 0, n, amxCols {
+        w := lesser(amxCols, n - j0)
+        wp := roundUp(w, 16)
+        packPairs(ws.tb, r, rt, k, kp, j0, w, wp)
+        for i0 in range 0, m, amxRows {
+            h := lesser(amxRows, m - i0)
+            hp := roundUp(h, 16)
+            packRows(ws.ta, l, lt, k, kp, i0, h, hp)
+            for t in range hp * wp: ws.tc[t] = 0.0
+            try stdtile.AddDot(ws.tc, wp, hp, wp, ws.ta, kp, kp, ws.tb) catch { unreachable "gemm: a tile product's shape" }
+            if trans: tileStoreT(ws.tc, wp, h, w, alpha, beta, c, j0 * ldc + i0, ldc)
+            else: tileStore(ws.tc, wp, h, w, alpha, beta, c, i0 * ldc + j0, ldc)
+        }
+    }
+}
+
+# a block of the result transposed into c from c[at]: element (i, j) of the block to c[at + j ldc + i]
+fn tileStoreT<S, A>(t Array<F32>&, wp I64, h I64, w I64, alpha A, beta A, c mut Array<S>&, at I64, ldc I64) {
+    for j in range w {
+        for i in range h {
+            v := cast(t[i * wp + j], alpha) * alpha
+            o := at + j * ldc + i
+            c[o] = cast(v + beta * cast(c[o], alpha) if beta != A(0) else v, c[o])
+        }
+    }
+}
+
+# op(a)'s rows i0 .. i0 + h into rows of kp (zeros past the depth k, and in the rows from h to hp)
+fn packRows<SA>(dst mut Array<BF16>&, a operand<SA>&, ta Bool, k I64, kp I64, i0 I64, h I64, hp I64) {
+    z := BF16(0.0)
+    if ta {
+        # 32 x 16 blocks transposed through a local block: 32 depth rows of 16 read, 16 rows of 32 written
+        blk := Array<BF16>(512)
+        for ib in range 0, h, 16 {
+            hb := lesser(16, h - ib)
+            for p0 in range 0, k, 32 {
+                pb := lesser(32, k - p0)
+                for p in range pb {
+                    src := (p0 + p) * a.ld + i0 + ib
+                    for i in range hb: blk[i * 32 + p] = cast(a.d[src + i], z)
+                }
+                for i in range hb {
+                    o := (ib + i) * kp + p0
+                    for p in range pb: dst[o + p] = blk[i * 32 + p]
+                }
+            }
+        }
+    } else {
+        for i in range h {
+            src, o := (i0 + i) * a.ld, i * kp
+            for p in range k: dst[o + p] = cast(a.d[src + p], z)
+        }
+    }
+    for i in range h {
+        for p in range k, kp: dst[i * kp + p] = z
+    }
+    for t in range h * kp, hp * kp: dst[t] = z
+}
+
+# op(b)'s columns j0 .. j0 + w in AddDot's pairs, wp columns a pair row (zeros past the depth k and from w to wp)
+fn packPairs<SB>(dst mut Array<BF16>&, b operand<SB>&, tb Bool, k I64, kp I64, j0 I64, w I64, wp I64) {
+    z := BF16(0.0)
+    for t in range kp * wp: dst[t] = z
+    if tb {
+        for j in range w {
+            src := (j0 + j) * b.ld
+            for p in range k: dst[((p / 2) * wp + j) * 2 + p % 2] = cast(b.d[src + p], z)
+        }
+        return
+    }
+    # two rows of op(b) interleaved into one pair row
+    for q in range k / 2 {
+        s0, o := 2 * q * b.ld + j0, q * wp * 2
+        s1 := s0 + b.ld
+        for j in range w {
+            dst[o + 2 * j] = cast(b.d[s0 + j], z)
+            dst[o + 2 * j + 1] = cast(b.d[s1 + j], z)
+        }
+    }
+    if k % 2 == 1 {
+        s0, o := (k - 1) * b.ld + j0, (k / 2) * wp * 2
+        for j in range w: dst[o + 2 * j] = cast(b.d[s0 + j], z)
+    }
+}
+
+# a block of the result (h x w, row stride wp) into c from c[at]: alpha times it, plus beta c where beta is not zero
+fn tileStore<S, A>(t Array<F32>&, wp I64, h I64, w I64, alpha A, beta A, c mut Array<S>&, at I64, ldc I64) {
+    for i in range h {
+        for j in range w {
+            v := cast(t[i * wp + j], alpha) * alpha
+            o := at + i * ldc + j
+            c[o] = cast(v + beta * cast(c[o], alpha) if beta != A(0) else v, c[o])
+        }
     }
 }
 
@@ -2378,4 +2539,34 @@ test GemmBatch "a storage type per operand: BF16 keys under F32 queries are the 
     GemmBatch(ws, Batch.Stacked(p, 20), Batch.Stacked(q, 20), false, Batch.Stacked(kb, 20), true, F32(1), F32(0), Triangle.Result(0))
     GemmBatch(ws, Batch.Stacked(pw, 20), Batch.Stacked(q, 20), false, Batch.Stacked(kw, 20), true, F32(1), F32(0), Triangle.Result(0))
     assert sameBits(p, pw)
+}
+
+test Gemm "BF16 operands into F32 by the tile path (where the CPU has AMX) match the packed path, every transpose, padded shapes, alpha, beta and a bias" {
+    r := rand.Rand(91)
+    for shape in range 2 {
+        m := 300 if shape == 0 else 64
+        n := 77 if shape == 0 else 48
+        k := 140 if shape == 0 else 96
+        for ta in Array<Bool>[false, true] {
+            for tb in Array<Bool>[false, true] {
+                a := Array<BF16>(m * k)
+                b := Array<BF16>(k * n)
+                for i in range a.Len(): a[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
+                for i in range b.Len(): b[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
+                am := mat.Mat<BF16>(a, 0, k, m, m) if ta else mat.Mat<BF16>(a, 0, m, k, k)
+                bm := mat.Mat<BF16>(b, 0, n, k, k) if tb else mat.Mat<BF16>(b, 0, k, n, n)
+                bias := Array<F32>(n)
+                for j in range n: bias[j] = F32(j) * 0.01
+                c1, c2 := Array<F32>(m * n, 0.5), Array<F32>(m * n, 0.5)
+                w1 := Workspace<F32>(1, 512)
+                w2 := Workspace<F32>(1, 512)
+                w1.Reserve(512)
+                w2.Tile = false
+                c1m, c2m := mat.Mat<F32>(c1, 0, m, n, n), mat.Mat<F32>(c2, 0, m, n, n)
+                Gemm(w1, c1m, am, ta, bm, tb, F32(0.5), F32(2.0), Epilogue.Bias(bias))
+                Gemm(w2, c2m, am, ta, bm, tb, F32(0.5), F32(2.0), Epilogue.Bias(bias))
+                for i in range m * n: assert (F64(c1[i]) - F64(c2[i])).Abs() < 1e-3, $shape + " " + $ta + " " + $tb + " " + $i
+            }
+        }
+    }
 }

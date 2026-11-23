@@ -1,0 +1,97 @@
+# F32 against BF16 training of the language experiments' small decoder (bench/lmstep's model) on TinyStories: SECONDS
+# of training at batch 16, window 128 (AdamW beta2 0.95, decay 0.1, rate 1e-3 warmed over 5 % of the time then a cosine
+# to 1e-4, gradient clipped to 1), then the validation loss over 64 fixed windows of the held-out tokens. BF16 keeps
+# bf16 weights and activations with F32 masters and AdamW state, its products accumulated in F32 (AMX tiles where the
+# CPU has them). After `build/examples_tinystories prep 300`:
+#     bench_lmeq f32|bf16 SECONDS SEED
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../data/tokens"
+import "../nn/layers"
+import "../nn/optim"
+
+type Block struct(n1 layers.Norm, attn layers.SelfAttention, n2 layers.Norm, ffn layers.Feed) { n1, attn, n2, ffn }
+
+fn (b Block&) Apply<E>(g mut graph.Graph<E>&, x graph.Var) graph.Var {
+    h := g.Add(x, b.attn.Apply(g, b.n1.Apply(g, x)))
+    return g.Add(h, b.ffn.Apply(g, b.n2.Apply(g, h)))
+}
+
+type Model struct(tok graph.Var, y graph.Var, loss graph.Var) { tok, y, loss }
+
+fn Model.build<E>(g mut graph.Graph<E>&, nb I64, D I64, heads I64, T I64, V I64) Model {
+    emb := layers.Embedding.New(g, V, D)
+    bs := Vec<Block>()
+    for _ in range nb {
+        out := graph.Init.Normal(0.0, 0.02 / F64(2 * nb).Sqrt())
+        bs.Push(Block(layers.Norm.New(g, D, true), layers.SelfAttention.New(g, D, heads, nb, true, true), layers.Norm.New(g, D, true)
+            layers.Feed.New(g, D, (8 * D / 3 + 7) / 8 * 8, out, true)))
+    }
+    fin := layers.Norm.New(g, D, true)
+    tok := g.Tokens(T)
+    h := emb.Apply(g, tok)
+    for b in bs: h = b.Apply(g, h)
+    logits := emb.Logits(g, fin.Apply(g, h))
+    y := g.Classes(T)
+    return Model(tok, y, g.CrossEntropy(logits, y))
+}
+
+fn main() ? {
+    args := os.Args()
+    secs := try args[2].ParseFloat() if args.Len() > 2 else 600.0
+    seed := try args[3].ParseInt() if args.Len() > 3 else 1
+    if args.Len() > 1 and args[1] == "bf16" {
+        like BF16 = 0.0
+        try run(secs, seed, like)
+        return
+    }
+    like F32 = 0.0
+    try run(secs, seed, like)
+}
+
+fn run<E>(secs F64, seed I64, like E) ? {
+    T, B, V := 128, 16, 4097
+    g := graph.Graph<E>(B, 1)
+    m := Model.build(g, 4, 128, 4, T, V)
+    try g.Plan(rand.Rand(U64(seed)))
+    train := try tokens.Tokens.Open("data/tinystories/train.bin", T, 2, U64(seed))
+    if g.HasMasters(): try fit(g, m, optim.AdamW(g.Masters(), g.ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(g)), train, secs, seed)
+    else: try fit(g, m, optim.AdamW(g.Params(), g.ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(g)), train, secs, seed)
+}
+
+fn fit<E, O>(g mut graph.Graph<E>&, m Model&, o mut O&, train mut tokens.Tokens&, secs F64, seed I64) ? {
+    B := g.Batch
+    t0 := time.Now()
+    steps I64 = 0
+    for {
+        frac := F64(time.Since(t0)) * 1e-9 / secs
+        if frac >= 1.0: break
+        rate := 1e-3 * frac / 0.05 if frac < 0.05 else 1e-4 + 0.5 * (1e-3 - 1e-4) * (1.0 + (3.14159265358979 * (frac - 0.05) / 0.95).Cos())
+        o.SetRate(rate)
+        try train.Random(g.Ints(m.tok).Flat()!, g.Ints(m.y).Flat()!, B)
+        g.Forward(B)
+        g.Backward(m.loss)
+        optim.ClipNorm(g.ParamGrads(), 1.0)
+        o.Step()
+        g.SyncParams()
+        steps++
+    }
+    try io.Put((("bf16" if g.HasMasters() else "f32") + " seed " + $seed + ": " + $steps + " steps (" + $(steps * B * 128) + " tokens) in " + $secs + " s, validation loss " + (try validation(g, m)).Fixed(4) + "\n"))
+}
+
+# the mean loss over 4 fixed batches of the held-out tokens
+fn validation<E>(g mut graph.Graph<E>&, m Model&) F64 ? {
+    B := g.Batch
+    valid := try tokens.Tokens.Open("data/tinystories/valid.bin", 128, 2, 1)
+    total := 0.0
+    for v in range 4 {
+        try valid.At(v * B * 97, g.Ints(m.tok).Flat()!, g.Ints(m.y).Flat()!, B)
+        g.Forward(B)
+        total += F64(g.Value(m.loss).Flat()![0])
+    }
+    return total / 4.0
+}

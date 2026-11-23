@@ -2160,3 +2160,19 @@ every sequence's row there: 27 -> 6 ms (the same arithmetic, bit for bit); data 
 its share of the batch. After: one thread 7936 tokens/s (1.41x), four threads 12298 inside the operations, 21504 data
 parallel (2.83x the old four threads, 3.83x the old one thread). Left at one thread: the products (~180 ms of 258, at
 ~50 GMAC/s - near what the kernel does at these widths) and attention (31 ms).
+
+## BF16 products on AMX tiles (wt-bf16tile, 2026-11-23)
+
+kernels/gemm: a product of BF16 operands accumulated in F32 goes to std/tile's `AddDot` (AMX tdpbf16ps) where
+`TargetHasTileDot` holds (`Workspace.Tile`), from 2^18 multiply-adds: op(B) packed 1024 columns at a time into
+AddDot's pairs, op(A) 256 rows at a time (a transposed op(A) by 32 x 16 block transposes; a transposed op(A) against a
+narrower result as C^T = op(B)^T A, the gather on the narrow side), the F32 block written back with alpha, beta and
+the epilogue; the blocks reserved with the workspace, nothing allocated per product. The BF16 graph (BF16 weights and
+activations, F32 masters and AdamW state, F32 accumulation) takes it unchanged. One thread, GMAC/s at the model's
+shapes (F32 kernel 43-61): forward 2048 x 128 x 384 175, logits 2048 x 128 x 4097 109-125, weight gradients
+384 x 2048 x 128 129 (46 before the block transposes). bench/lmstep, one thread: F32 7353-8088 tokens/s, BF16
+12827-15116 (1.6-1.9x; the products 69 of 135 ms a step). bench/lmeq (new, TinyStories after `examples/tinystories
+prep 300`, 4 x 128 decoder, batch 16 x 128, 600 s, one thread each, the four runs side by side): F32 2301 / 2305
+steps, validation loss 2.8064 / 2.8063 (seeds 1 / 2); BF16 3948 / 4003 steps, 2.5898 / 2.5781; BF16 for 350 s
+(2327 / 2314 steps, the F32 runs' count) 2.7930 / 2.8008 - no loss from BF16 at equal steps, 0.22 nats better at equal
+time.
