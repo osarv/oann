@@ -1,0 +1,525 @@
+# surgery/model - a language model kept so it can be reopened and changed: a description of its architecture (Spec),
+# its parameters and its optimizer's state by name, its training position and its lineage, all together in one State.
+# Built on a graph (Build), trained there, read back (Capture), changed by surgery/ops and built again.
+#
+#     st := model.State.Fresh(spec, seed)              # or model.State.Open(path)
+#     net := model.Net.Build(st, batch)                    # a graph with st's parameters
+#     ...train net.G, with an optimizer from net.Optimizer(st)...
+#     st = net.Capture(st, o)                          # the parameters and moments back, by name
+#     try st.Save(path)
+#
+# The model: a token embedding (and learned positions where Rope is off), blocks, a final norm, logits against the
+# embedding (Tied) or a head of its own. A block is pre-norm: x + O(attention(Q, K, V of norm1(x))), then
+# + Down(ffn(norm2(x))). Attention has Heads heads of HeadDim (its width need not be the model's) over a Window (0:
+# the whole context), with rotary positions where Rope is set. The feed-forward is GELU or gated (SwiGLU) of Hidden
+# units. Linear layers have no biases. Norms are RMSNorm (Rms) or LayerNorm. Every block may differ.
+#
+# Names: "embed", "pos", "head", "final.g", "final.b", and "bK." followed by "n1.g", "n1.b", "q", "k", "v", "o",
+# "n2.g", "n2.b", "up", "gate", "down" for block K. Optimizer state follows the names: "m.NAME" and "v.NAME" for
+# AdamW, "buf.NAME" for Muon's momentum, in the same layout as the parameter.
+
+import "std/os"
+import "std/rand"
+import "../ad/graph"
+import "../io/checkpoint"
+import "../kernels/device"
+import "../kernels/mat"
+import "../nn/optim"
+import "../tensor"
+
+# one block
+type Block struct() {
+    Heads I64 = 4
+    HeadDim I64 = 16
+    Hidden I64 = 256        # the feed-forward's units
+    Gated Bool = false
+    Window I64 = 0
+}
+
+# the architecture
+type Spec struct(vocab I64, dim I64, ctx I64) {
+    Vocab I64 = vocab
+    Dim I64 = dim
+    Ctx I64 = ctx
+    Rms Bool = true
+    Rope Bool = true
+    Base F64 = 10000.0
+    Tied Bool = true
+    Eps F64 = 1e-5          # the norms' (WidenDim scales it with the width, which keeps RMSNorm exact)
+    Blocks Vec<Block> = Vec<Block>()
+}
+
+type SurgeryError error {
+    Format(why String)          # a checkpoint or spec that cannot be read
+    Shape(why String)           # an operation that does not fit the model
+}
+
+# n blocks of `heads` heads of dim / heads and a feed-forward of 4 dim
+fn Spec.Uniform(vocab I64, dim I64, ctx I64, layers I64, heads I64) Spec {
+    s := Spec(vocab, dim, ctx)
+    for _ in range layers {
+        b := Block()
+        b.Heads = heads
+        b.HeadDim = dim / heads
+        b.Hidden = 4 * dim
+        s.Blocks.Push(b)
+    }
+    return s
+}
+
+# the spec as one line: "vocab dim ctx rms rope base tied eps | heads headdim hidden gated window | ..."
+fn (s Spec&) Text() String {
+    t := $s.Vocab + " " + $s.Dim + " " + $s.Ctx + " " + bit(s.Rms) + " " + bit(s.Rope) + " " + $s.Base + " " + bit(s.Tied) + " " + $s.Eps
+    for b in s.Blocks: t += " | " + $b.Heads + " " + $b.HeadDim + " " + $b.Hidden + " " + bit(b.Gated) + " " + $b.Window
+    return t
+}
+
+fn bit(b Bool) String { return "1" if b else "0" }
+
+fn Spec.Parse(t String&) Spec ? SurgeryError {
+    parts := t.Split(" | ")
+    f := parts[0].Split(" ")
+    if f.Len() != 8: error SurgeryError.Format("a spec: " + $t)
+    n := Array<I64>(4)
+    for k in Array<I64>[0, 1, 2] {
+        n[k] = try f[k].ParseInt() catch { error SurgeryError.Format("a spec: " + $t) }
+    }
+    s := Spec(n[0], n[1], n[2])
+    s.Rms = f[3] == "1"
+    s.Rope = f[4] == "1"
+    s.Base = try f[5].ParseFloat() catch { error SurgeryError.Format("a spec: " + $t) }
+    s.Tied = f[6] == "1"
+    s.Eps = try f[7].ParseFloat() catch { error SurgeryError.Format("a spec: " + $t) }
+    for part in parts[1:] {
+        g := part.Split(" ")
+        if g.Len() != 5: error SurgeryError.Format("a block: " + $part)
+        b := Block()
+        b.Heads = try g[0].ParseInt() catch { error SurgeryError.Format("a block: " + $part) }
+        b.HeadDim = try g[1].ParseInt() catch { error SurgeryError.Format("a block: " + $part) }
+        b.Hidden = try g[2].ParseInt() catch { error SurgeryError.Format("a block: " + $part) }
+        b.Gated = g[3] == "1"
+        b.Window = try g[4].ParseInt() catch { error SurgeryError.Format("a block: " + $part) }
+        s.Blocks.Push(b)
+    }
+    return s
+}
+
+# every parameter's name and shape, in the order Build registers them
+fn (s Spec&) Shapes() Vec<String>, Vec<Array<I64>> {
+    names mut Vec<String>& = Vec<String>()
+    shapes mut Vec<Array<I64>>& = Vec<Array<I64>>()
+    add := fn(n String&, d Array<I64>) {
+        names.Push($n)
+        shapes.Push(d)
+    }
+    add("embed", Array<I64>[s.Vocab, s.Dim])
+    if not s.Rope: add("pos", Array<I64>[s.Ctx, s.Dim])
+    for k in range s.Blocks.Len() {
+        b := s.Blocks[k]
+        p := "b" + $k + "."
+        inner := b.Heads * b.HeadDim
+        add(p + "n1.g", Array<I64>[s.Dim])
+        if not s.Rms: add(p + "n1.b", Array<I64>[s.Dim])
+        add(p + "q", Array<I64>[inner, s.Dim])
+        add(p + "k", Array<I64>[inner, s.Dim])
+        add(p + "v", Array<I64>[inner, s.Dim])
+        add(p + "o", Array<I64>[s.Dim, inner])
+        add(p + "n2.g", Array<I64>[s.Dim])
+        if not s.Rms: add(p + "n2.b", Array<I64>[s.Dim])
+        if b.Gated: add(p + "gate", Array<I64>[b.Hidden, s.Dim])
+        add(p + "up", Array<I64>[b.Hidden, s.Dim])
+        add(p + "down", Array<I64>[s.Dim, b.Hidden])
+    }
+    add("final.g", Array<I64>[s.Dim])
+    if not s.Rms: add("final.b", Array<I64>[s.Dim])
+    if not s.Tied: add("head", Array<I64>[s.Vocab, s.Dim])
+    return names, shapes
+}
+
+# the parameters a token's forward pass multiplies by, about: every matrix's elements but the embedding's (the head's
+# product counted where tied)
+fn (s Spec&) Macs() I64 {
+    names, shapes := s.Shapes()
+    n I64 = 0
+    for k in range names.Len() {
+        if shapes[k].Len() == 2 and names[k] != "embed" and names[k] != "pos": n += shapes[k][0] * shapes[k][1]
+    }
+    if s.Tied: n += s.Vocab * s.Dim
+    return n
+}
+
+# ---- the state ----
+
+# everything a model is: its spec, parameters and optimizer state by name, where training stands, and how it came to be
+type State struct(spec Spec) {
+    Arch Spec = spec
+    Params Map<String, tensor.Tensor<F32>> = Map<String, tensor.Tensor<F32>>()
+    Opt String = ""                 # "adamw", "muon", or "" (no optimizer state)
+    Moments Map<String, tensor.Tensor<F32>> = Map<String, tensor.Tensor<F32>>()   # "m.NAME", "v.NAME", "buf.NAME"
+    Steps I64 = 0                   # the optimizer's steps (its bias corrections)
+    Step I64 = 0                    # the training step (the schedule's)
+    Warm I64 = -1                   # the step a warmup restarted at (Rewarm), -1 none
+    Data I64 = 0                    # the data position (the program's: a window, a byte, a batch)
+    Lineage Vec<String> = Vec<String>()     # the parent checkpoint and the operations applied, oldest first
+}
+
+# a state of spec with GPT-2's starting values drawn from seed: matrices Normal(0, 0.02), the projections back into the
+# stream Normal(0, 0.02 / sqrt(2 blocks)), gains 1, biases 0
+fn State.Fresh(spec Spec, seed U64) State {
+    st := State(spec)
+    r := rand.Rand(seed)
+    names, shapes := spec.Shapes()
+    out := 0.02 / F64(2 * spec.Blocks.Len().Max(1)).Sqrt()
+    for k in range names.Len() {
+        t := zeros(shapes[k])
+        n := names[k]
+        if n.EndsWith(".g") {
+            t.Fill(1.0)
+        } else if n.EndsWith(".b") {
+        } else {
+            t.FillNormal(r, 0.0, out if n.EndsWith(".o") or n.EndsWith(".down") else 0.02)
+        }
+        st.Params.Put($n, t)
+    }
+    st.Lineage.Push("fresh " + spec.Text() + " seed " + $seed)
+    return st
+}
+
+fn zeros(dims Array<I64>&) tensor.Tensor<F32> {
+    if dims.Len() == 1: return tensor.Tensor<F32>.Zeros(dims[0])
+    return tensor.Tensor<F32>.Zeros(dims[0], dims[1])
+}
+
+# parameter name's tensor
+fn (st State&) Param(name String&) tensor.Tensor<F32>& {
+    return try st.Params.Ref(name) catch { unreachable "surgery: no parameter " + $name }
+}
+
+# whether the params match the spec's names and shapes
+fn (st State&) Valid() Bool {
+    names, shapes := st.Arch.Shapes()
+    if names.Len() != st.Params.Len(): return false
+    for k in range names.Len() {
+        t := try st.Params.Get(names[k]) catch { return false }
+        if t.Rank() != shapes[k].Len(): return false
+        for a in range t.Rank() {
+            if t.Dim(a) != shapes[k][a]: return false
+        }
+    }
+    return true
+}
+
+# ---- checkpoints ----
+
+# the whole state in one safetensors file: "p.NAME" parameters, the moments by their names, and as metadata the spec,
+# the optimizer's kind and steps, the step, the warmup's start, the data position and the lineage (one line an entry)
+fn (st State&) Save(path String&) ? os.Error, checkpoint.SafetensorsError {
+    w := checkpoint.Writer()
+    names, _ := st.Arch.Shapes()
+    for n in names: try w.Add("p." + n, st.Param(n))
+    for key in st.Moments.Keys(): try w.Add(key, try st.Moments.Ref(key) catch { unreachable })
+    w.Meta("spec", st.Arch.Text())
+    w.Meta("opt", st.Opt)
+    w.Meta("steps", $st.Steps)
+    w.Meta("step", $st.Step)
+    w.Meta("warm", $st.Warm)
+    w.Meta("data", $st.Data)
+    lineage := ""
+    for k in range st.Lineage.Len(): lineage += ("\n" if k > 0 else "") + st.Lineage[k]
+    w.Meta("lineage", lineage)
+    try w.Save(path)
+}
+
+fn meta(f checkpoint.File&, key String&) String ? SurgeryError {
+    return try f.Meta.Get(key) catch { error SurgeryError.Format("no " + $key) }
+}
+
+fn metaInt(f checkpoint.File&, key String&) I64 ? SurgeryError {
+    return try (try meta(f, key)).ParseInt() catch { error SurgeryError.Format("the " + $key) }
+}
+
+# the state a checkpoint holds, its path added to the lineage as the parent
+fn State.Open(path String&) State ? os.Error, checkpoint.SafetensorsError, SurgeryError {
+    f := try checkpoint.File.Load(path)
+    st := State(try Spec.Parse(try meta(f, "spec")))
+    names, _ := st.Arch.Shapes()
+    for n in names: st.Params.Put($n, try f.Get<F32>("p." + n))
+    for n in f.Names() {
+        if n.StartsWith("m.") or n.StartsWith("v.") or n.StartsWith("buf."): st.Moments.Put($n, try f.Get<F32>(n))
+    }
+    st.Opt = try meta(f, "opt")
+    st.Steps = try metaInt(f, "steps")
+    st.Step = try metaInt(f, "step")
+    st.Warm = try metaInt(f, "warm")
+    st.Data = try metaInt(f, "data")
+    lineage := try meta(f, "lineage")
+    for line in lineage.Split("\n") {
+        if line != "": st.Lineage.Push($line)
+    }
+    st.Lineage.Push("opened " + $path)
+    return st
+}
+
+# ---- a model on a graph ----
+
+# a state's model on a graph of `batch` sequences: its handles and its parameters by name
+type Net struct(g graph.Graph<F32>, spec Spec) {
+    G graph.Graph<F32> = g
+    Arch Spec = spec
+    Tokens graph.Var = graph.None
+    Targets graph.Var = graph.None
+    Logits graph.Var = graph.None
+    Loss graph.Var = graph.None
+    Names Vec<String> = Vec<String>()
+    Vars Vec<graph.Var> = Vec<graph.Var>()
+    Inputs Vec<graph.Var> = Vec<graph.Var>()        # each block's input (kept), then the final norm's
+}
+
+# the graph of st's model, planned on the CPU and given st's parameters
+fn Net.Build(st State&, batch I64, threads I64 = 1) Net {
+    n := Net(graph.Graph<F32>(batch, threads), st.Arch)
+    s := st.Arch
+    n.Tokens = n.G.Tokens(s.Ctx)
+    h := n.G.Embedding(n.Tokens, n.param("embed", s.Vocab, s.Dim))
+    if not s.Rope: h = n.G.Positions(h, n.param("pos", s.Ctx, s.Dim))
+    for k in range s.Blocks.Len() {
+        n.G.Keep(h)
+        n.Inputs.Push(h)
+        h = n.block(h, s.Blocks[k], "b" + $k + ".")
+    }
+    n.G.Keep(h)
+    n.Inputs.Push(h)
+    h = n.norm(h, "final.")
+    head := n.param("head", s.Vocab, s.Dim) if not s.Tied else n.Vars[0]
+    n.Logits = n.G.MatMul(h, head, false, true)
+    n.Targets = n.G.Classes(s.Ctx)
+    n.Loss = n.G.CrossEntropy(n.Logits, n.Targets)
+    try n.G.Plan(rand.Rand(1), on = device.Backend.Cpu) catch e { unreachable "surgery: the model's shapes: " + $e }
+    n.Put(st)
+    return n
+}
+
+# block i of st alone, for distilling it: Tokens an input [batch, ctx, dim] (the block's input), Targets another (the
+# output to reproduce), Loss their squared error
+fn Net.ForBlock(st State&, i I64, batch I64) Net {
+    n := Net(graph.Graph<F32>(batch), st.Arch)
+    n.Tokens = n.G.Input(st.Arch.Ctx, st.Arch.Dim)
+    n.Targets = n.G.Input(st.Arch.Ctx, st.Arch.Dim)
+    n.Loss = n.G.Mse(n.block(n.Tokens, st.Arch.Blocks[i], "b" + $i + "."), n.Targets)
+    try n.G.Plan(rand.Rand(1), on = device.Backend.Cpu) catch e { unreachable "surgery: the block's shapes: " + $e }
+    n.Put(st)
+    return n
+}
+
+fn (n mut Net&) param(name String&, dims ...I64) graph.Var {
+    v := n.G.Param(graph.Init.Zeros, not (name.EndsWith(".g") or name.EndsWith(".b")), ...dims)
+    n.Names.Push($name)
+    n.Vars.Push(v)
+    return v
+}
+
+fn (n mut Net&) norm(x graph.Var, p String&) graph.Var {
+    gain := n.param(p + "g", n.Arch.Dim)
+    bias := graph.None if n.Arch.Rms else n.param(p + "b", n.Arch.Dim)
+    return n.G.Norm(x, gain, bias, n.Arch.Rms, n.Arch.Eps)
+}
+
+# block b on x, its parameters named from p
+fn (n mut Net&) block(x graph.Var, b Block&, p String&) graph.Var {
+    d := n.Arch.Dim
+    inner := b.Heads * b.HeadDim
+    a := n.norm(x, p + "n1.")
+    q := n.G.Linear(a, n.param(p + "q", inner, d))
+    k := n.G.Linear(a, n.param(p + "k", inner, d))
+    v := n.G.Linear(a, n.param(p + "v", inner, d))
+    if n.Arch.Rope {
+        q = n.G.Rope(q, b.Heads, n.Arch.Base)
+        k = n.G.Rope(k, b.Heads, n.Arch.Base)
+    }
+    y := n.G.Attention(q, k, v, b.Heads, true, b.Window)
+    h := n.G.Add(x, n.G.Linear(y, n.param(p + "o", d, inner)))
+    c := n.norm(h, p + "n2.")
+    gate := n.param(p + "gate", b.Hidden, d) if b.Gated else graph.None
+    up := n.G.Linear(c, n.param(p + "up", b.Hidden, d))
+    mid := n.G.Mul(n.G.Act(n.G.Linear(c, gate), mat.Act.Silu), up) if b.Gated else n.G.Act(up, mat.Act.GeluTanh)
+    return n.G.Add(h, n.G.Linear(mid, n.param(p + "down", d, b.Hidden)))
+}
+
+# st's parameters copied into the graph, by name
+fn (n mut Net&) Put(st State&) {
+    for k in range n.Names.Len() {
+        dst := n.G.Value(n.Vars[k])
+        src := st.Param(n.Names[k])
+        d, s := dst.Flat()!, src.Flat()!
+        for i in range d.Len(): d[i] = s[i]
+    }
+}
+
+# the region index of parameter k (its offset in Params())
+fn (n Net&) offset(k I64) I64 { return n.G.Info(n.Vars[k]).Offset }
+
+# an AdamW over the graph, its moments and steps from st where st's optimizer is AdamW (else fresh)
+fn (n Net&) AdamW(st State&, rate F64 = 1e-3, decay F64 = 0.1) optim.AdamW<F32, F32> {
+    o := optim.AdamW(n.G.Params(), n.G.ParamGrads(), rate = rate, beta2 = 0.99, decay = decay, spans = optim.Spans(n.G))
+    if st.Opt != "adamw": return o
+    o.Steps = st.Steps
+    for k in range n.Names.Len() {
+        n.moment(st, "m." + n.Names[k], o.M, k)
+        n.moment(st, "v." + n.Names[k], o.V, k)
+    }
+    return o
+}
+
+# moment key of st copied into region array a at parameter k's place (left as it is where st has none)
+fn (n Net&) moment(st State&, key String&, a mut Array<F32>&, k I64) {
+    t := try st.Moments.Get(key) catch { return }
+    src := t.Flat()!
+    at := n.offset(k)
+    for i in range src.Len(): a[at + i] = src[i]
+}
+
+# a Muon over the graph's matrices (the embedding and head left to its AdamW part), its momentum from st where st's
+# optimizer is Muon; its AdamW part's moments too
+fn (n Net&) Muon(st State&, rate F64 = 0.02, adamRate F64 = 1e-3, decay F64 = 0.1) optim.Muon<F32, F32> {
+    mats := Vec<optim.MuonMatrix>()
+    for k in range n.Names.Len() {
+        name := n.Names[k]
+        nd := n.G.Info(n.Vars[k])
+        if nd.Dims.Rank == 2 and name != "embed" and name != "head" and name != "pos": mats.Push(optim.MuonMatrix(nd.Offset, nd.Dims[0], nd.Dims[1], true))
+    }
+    o := optim.Muon(n.G.Params(), n.G.ParamGrads(), mats.ToArray(), rate = rate, adamRate = adamRate, decay = decay, spans = optim.Spans(n.G))
+    if st.Opt != "muon": return o
+    o.Adam.Steps = st.Steps
+    for k in range n.Names.Len() {
+        n.moment(st, "buf." + n.Names[k], o.Buf, k)
+        n.moment(st, "m." + n.Names[k], o.Adam.M, k)
+        n.moment(st, "v." + n.Names[k], o.Adam.V, k)
+    }
+    return o
+}
+
+# the graph's parameters read back into a copy of st, by name
+fn (n Net&) Params(st State&) State {
+    out := st.Copy()
+    out.Params = Map<String, tensor.Tensor<F32>>()
+    for k in range n.Names.Len(): out.Params.Put(n.Names[k], n.G.Value(n.Vars[k]).Clone())
+    return out
+}
+
+# the graph's parameters and AdamW's moments and steps read back into a copy of st
+fn (n Net&) CaptureAdamW(st State&, o optim.AdamW<F32, F32>&) State {
+    out := n.Params(st)
+    out.Opt = "adamw"
+    out.Steps = o.Steps
+    out.Moments = Map<String, tensor.Tensor<F32>>()
+    for k in range n.Names.Len() {
+        out.Moments.Put("m." + n.Names[k], n.slice(o.M, k))
+        out.Moments.Put("v." + n.Names[k], n.slice(o.V, k))
+    }
+    return out
+}
+
+# the graph's parameters and Muon's momentum, its AdamW part's moments and steps read back into a copy of st
+fn (n Net&) CaptureMuon(st State&, o optim.Muon<F32, F32>&) State {
+    out := n.Params(st)
+    out.Opt = "muon"
+    out.Steps = o.Adam.Steps
+    out.Moments = Map<String, tensor.Tensor<F32>>()
+    for k in range n.Names.Len() {
+        out.Moments.Put("buf." + n.Names[k], n.slice(o.Buf, k))
+        out.Moments.Put("m." + n.Names[k], n.slice(o.Adam.M, k))
+        out.Moments.Put("v." + n.Names[k], n.slice(o.Adam.V, k))
+    }
+    return out
+}
+
+# parameter k's part of a region array, as a tensor of its shape
+fn (n Net&) slice(a Array<F32>&, k I64) tensor.Tensor<F32> {
+    nd := n.G.Info(n.Vars[k])
+    t := zeros(Array<I64>[nd.Dims[i] for i in range nd.Dims.Rank])
+    d := t.Flat()!
+    for i in range d.Len(): d[i] = a[nd.Offset + i]
+    return t
+}
+
+# the mean loss over `batches` batches of windows of ids, window b starting at (b stride) mod (ids - ctx - 1)
+fn (n mut Net&) Loss(ids Array<I32>&, batches I64, stride I64 = 997) F64 {
+    ctx := n.Arch.Ctx
+    tok := n.G.Ints(n.Tokens).Flat()!
+    tgt := n.G.Ints(n.Targets).Flat()!
+    total F64 = 0.0
+    span := ids.Len() - ctx - 1
+    for b in range batches {
+        for s in range n.G.Batch {
+            at := ((b * n.G.Batch + s) * stride) % span
+            for t in range ctx {
+                tok[s * ctx + t] = ids[at + t]
+                tgt[s * ctx + t] = ids[at + t + 1]
+            }
+        }
+        n.G.Forward(n.G.Batch)
+        total += n.G.Scalar(n.Loss)
+    }
+    return total / F64(batches)
+}
+
+# one training step on a batch of windows drawn from ids by r
+fn (n mut Net&) Batch(ids Array<I32>&, r mut rand.Rand&) {
+    ctx := n.Arch.Ctx
+    tok := n.G.Ints(n.Tokens).Flat()!
+    tgt := n.G.Ints(n.Targets).Flat()!
+    for s in range n.G.Batch {
+        at := r.Below(ids.Len() - ctx - 1)
+        for t in range ctx {
+            tok[s * ctx + t] = ids[at + t]
+            tgt[s * ctx + t] = ids[at + t + 1]
+        }
+    }
+}
+
+# a rate restarted from zero at step `from`: base's rate scaled by a linear warmup over `steps` steps (after an
+# optimizer change or a surgery that reset moments), the base schedule's own step carried on
+fn Rewarm(base fn&(step I64) F64, from I64, steps I64) fn&(step I64) F64 {
+    return fn(step) {
+        if from < 0 or step < from or step >= from + steps: return base(step)
+        return base(step) * F64(step - from + 1) / F64(steps)
+    }
+}
+
+# ---- tests ----
+
+fn Spec.tiny() Spec {
+    s := Spec.Uniform(11, 16, 8, 2, 2)
+    return s
+}
+
+test State "a checkpoint gives back the spec, parameters, optimizer state, positions and lineage" {
+    st := State.Fresh(Spec.tiny(), 3)
+    net := Net.Build(st, 2)
+    o := net.AdamW(st)
+    ids := Array<I32>[I32(i * 7 % 11) for i in range 200]
+    r := rand.Rand(5)
+    for _ in range 3 {
+        net.Batch(ids, r)
+        net.G.Forward(2)
+        net.G.Backward(net.Loss)
+        o.Step()
+    }
+    st = net.CaptureAdamW(st, o)
+    st.Step = 3
+    st.Data = 42
+    path := "build/surgery_test.safetensors"
+    try st.Save(path) catch { unreachable }
+    back := try State.Open(path) catch { unreachable }
+    assert back.Arch.Text() == st.Arch.Text() and back.Opt == "adamw" and back.Steps == 3 and back.Step == 3 and back.Data == 42
+    assert back.Lineage.Len() == st.Lineage.Len() + 1 and back.Lineage[0] == st.Lineage[0]
+    names, _ := st.Arch.Shapes()
+    for n in names {
+        assert back.Param(n).Flat()! == st.Param(n).Flat()!
+        assert (try back.Moments.Get("m." + n) catch { unreachable }).Flat()! == (try st.Moments.Get("m." + n) catch { unreachable }).Flat()!
+    }
+    again := Net.Build(back, 2)
+    o2 := again.AdamW(back)
+    assert o2.Steps == 3 and o2.M == o.M and o2.V == o.V
+    try os.Remove(path) catch { }
+}
