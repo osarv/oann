@@ -378,6 +378,17 @@ type extras struct(saved I64, scratch I64, ints I64, acc I64) {
     acc
 }
 
+# a sparse table's touched rows (Graph.Sparse): Rows[0 .. Count[0]] are the rows its gradient holds since the last
+# Backward that did not accumulate (each once); every other row's gradient is zero. Count[1] counts those backwards. A
+# copy shares the arrays, so an optimizer keeps one and reads each step's rows from it
+type RowSet struct(table I64, rows I64, cols I64) {
+    Table I64 = table
+    Cols I64 = cols
+    Rows mut Array<I32>& = Array<I32>(rows)
+    Count mut Array<I64>& = Array<I64>(2)
+    stamp mut Array<I64>& = Array<I64>(rows)
+}
+
 # ---- the graph ----
 
 # a network of T elements, planned for batches of up to `batch`; its products and scans split over `threads` tasks
@@ -388,6 +399,7 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     Decode Bool = decode
     nodes mut list.List<Node>& = list.List<Node>()
     customIn mut list.List<Var>& = list.List<Var>()
+    rowSets Vec<RowSet> = Vec<RowSet>()        # the sparse tables'
     customVals mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]    # each custom input's value, set per call
     customGrads mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]   # and the gradient its backward writes
     customVals32 mut Array<tensor.Tensor<F32>>& = Array<tensor.Tensor<F32>>[]  # their F32 copies in a BF16 or F16 graph
@@ -663,6 +675,60 @@ fn (g mut Graph<T>&) Norm(x Var, gain Var, bias Var = None, rms Bool = false, ep
 }
 
 # each token's row of table [vocabulary, D]: tokens [b, t] give [b, t, D]
+# a table whose gradient is kept sparse: read by Embedding alone (Plan refuses any other use), its gradient written only
+# at the rows the tokens reach - the rows of the last step zeroed at the start of the next Backward, not the whole table
+# - and those rows listed (Touched), for an optimizer that steps them alone (nn/optim's AdamW.Sparse). Every row's
+# gradient stays exact: zero where no token reached it. On the CPU
+fn (g mut Graph<T>&) Sparse(table Var) {
+    if not g.known("Sparse", table): return
+    nd := g.nodes[table]
+    if nd.Kind != Op.Param or nd.Dims.Rank != 2 {
+        g.fail("Sparse of " + $g.shape(table) + ": a table is a parameter [rows, width]")
+        return
+    }
+    if g.IsSparse(table): return
+    g.rowSets.Push(RowSet(I64(table), nd.Dims[0], nd.Dims[1]))
+}
+
+# whether v is a sparse table
+fn (g Graph<T>&) IsSparse(v Var) Bool {
+    for rs in g.rowSets {
+        if rs.Table == I64(v): return true
+    }
+    return false
+}
+
+# the rows of sparse table v the last Backward wrote (and those before it while accumulating)
+fn (g Graph<T>&) Touched(v Var) RowSet {
+    for rs in g.rowSets {
+        if rs.Table == I64(v): return rs
+    }
+    unreachable "oann: Touched of a table not made Sparse"
+}
+
+fn (g Graph<T>&) rowSetOf(v I64) I64 {
+    for k in range g.rowSets.Len() {
+        if g.rowSets[k].Table == v: return k
+    }
+    return -1
+}
+
+# every use of a sparse table is an Embedding's table
+fn (g Graph<T>&) checkSparse() ? tensor.ShapeError {
+    if g.rowSets.Len() == 0: return
+    for i in range g.nodes.Len() {
+        ins := g.inputsOfNode(i)
+        for j in range ins.Len() {
+            if ins[j] < 0 or g.rowSetOf(ins[j]) < 0: continue
+            emb := match g.nodes[i].Kind {
+                case Op.Embedding(_, _): j == 1
+                case _: false
+            }
+            if not emb: error tensor.ShapeError.Mismatch("a Sparse table read by node " + $i + " (not an Embedding's table): a sparse table is read by Embedding alone")
+        }
+    }
+}
+
 fn (g mut Graph<T>&) Embedding(tokens Var, table Var) Var {
     if not g.known("Embedding", tokens) or not g.known("Embedding", table): return table
     t := g.nodes[tokens]
@@ -1161,6 +1227,8 @@ fn (g mut Graph<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.D
     fpmode.Startup()
     g.onCpu = on != device.Backend.Gpu
     try g.Check()
+    try g.checkSparse()
+    if on == device.Backend.Gpu and g.rowSets.Len() > 0: error tensor.ShapeError.Mismatch("Sparse tables are the CPU's: plan this graph on device.Backend.Cpu")
     if g.planned: unreachable "oann: a graph is planned once"
     if g.Eager {
         g.begin(r)
@@ -2219,6 +2287,7 @@ fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false, params Bool = t
     }
     g.stateOnly = not params
     for i in range count: g.written[i] = accumulate and g.nodes[i].Kind == Op.Param
+    if params and not accumulate: g.clearRows()
     one := g.Grad(loss)
     one.Fill(T(1.0))
     g.written[loss] = true
@@ -2239,10 +2308,22 @@ fn (g mut Graph<T>&) Backward(loss Var, accumulate Bool = false, params Bool = t
         return
     }
     for i in range count {
-        if g.nodes[i].Kind == Op.Param and not g.written[i] {
+        if g.nodes[i].Kind == Op.Param and not g.written[i] and g.rowSetOf(i) < 0 {
             p := g.Grad(Var(i))
             p.Fill(T(0.0))
         }
+    }
+}
+
+fn (g mut Graph<T>&) embeddingRows<A>(k I64, dy tensor.Tensor<T>, tokens Array<I32>&, dw mut tensor.Tensor<T>&) {
+    ops.EmbeddingRows<T, A>(dy, tokens, dw, g.rowSets[k].Rows, g.rowSets[k].Count, g.rowSets[k].stamp)
+}
+
+# each sparse table's rows of the last step zeroed in its gradient, its list emptied, a new epoch begun
+fn (g mut Graph<T>&) clearRows() {
+    for q in range g.rowSets.Len() {
+        d := g.Grad(Var(g.rowSets[q].Table))
+        ops.ClearRows(d, g.rowSets[q].Rows, g.rowSets[q].Count)
     }
 }
 
@@ -2342,7 +2423,9 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
         case Op.Embedding(t, w) {
             dw := g.gradOf(w)
             aw := g.acc(w)
-            if ops.Wanted(dw): ops.EmbeddingBackward<T, A>(dy, g.intsOf(t), dw, aw)
+            k := g.rowSetOf(I64(w))
+            if ops.Wanted(dw) and k < 0: ops.EmbeddingBackward<T, A>(dy, g.intsOf(t), dw, aw)
+            if ops.Wanted(dw) and k >= 0: g.embeddingRows<A>(k, dy, g.intsOf(t), dw)
         }
         case Op.Positions(x, w) {
             dx := g.gradOf(x)
@@ -3533,6 +3616,63 @@ test Graph.Custom "a BF16 graph runs a custom operation in F32 at its edge, as a
         gb := b.Grad(wb).Flat()!
         for i in range 16: assert (F64(ga[i]) - F64(gb[i])).Abs() < 2e-2 * (1.0 + F64(gb[i]).Abs())
     }
+}
+
+
+# a table of 40 rows of 4 looked up by 2 sequences of 6 tokens, its rows to a target: on g, the table Sparse or not
+fn sparseNet(g mut Graph<F32>&, sparse Bool) Var, Var, Var {
+    tok := g.Tokens(6)
+    table := g.Param(Init.Normal(0.0, 1.0), true, 40, 4)
+    if sparse: g.Sparse(table)
+    y := g.Input(6, 4)
+    loss := g.Mse(g.Embedding(tok, table), y)
+    return tok, y, loss
+}
+
+fn sparseFill(g mut Graph<F32>&, tok Var, y Var, r mut rand.Rand&, lo I64) {
+    ids := g.Ints(tok).Flat()!
+    for k in range ids.Len(): ids[k] = I32(lo + r.Below(12))
+    yy := g.Value(y).Flat()!
+    for k in range yy.Len(): yy[k] = F32(r.Normal())
+}
+
+test Graph.Sparse "a sparse table's gradient equals the dense one at every row; Touched lists the rows reached, each once" {
+    a, b := Graph<F32>(2), Graph<F32>(2)
+    ta, ya, la := sparseNet(a, false)
+    tb, yb, lb := sparseNet(b, true)
+    try a.Plan(rand.Rand(1)) catch { unreachable }
+    try b.Plan(rand.Rand(1)) catch { unreachable }
+    for step in range 4 {
+        ra, rb := rand.Rand(U64(step + 5)), rand.Rand(U64(step + 5))
+        sparseFill(a, ta, ya, ra, 7 * step)
+        sparseFill(b, tb, yb, rb, 7 * step)
+        a.Forward(2)
+        a.Backward(la)
+        b.Forward(2)
+        b.Backward(lb)
+        assert a.ParamGrads().Flat()! == b.ParamGrads().Flat()!
+        rs := b.Touched(Var(1))
+        seen := Array<Bool>(40)
+        for k in range rs.Count[0] {
+            assert not seen[rs.Rows[k]]
+            seen[rs.Rows[k]] = true
+        }
+        ids := b.Ints(tb).Flat()!
+        for id in ids: assert seen[id]
+        for row in range 40: assert seen[row] or not (I32(row) in ids)
+    }
+}
+
+
+test Graph.Sparse "a sparse table read by anything but an Embedding is refused by Plan" {
+    g := Graph<F32>(2)
+    table := g.Param(Init.Normal(0.0, 1.0), true, 40, 4)
+    g.Sparse(table)
+    x := g.Input(4)
+    g.Mse(g.Linear(x, table, None), g.Input(40))
+    said := ""
+    try g.Plan(rand.Rand(1)) catch tensor.ShapeError e { said = $e }
+    assert said.Contains("Embedding alone"), said
 }
 
 # a causal language model's layers: embedding, learned and rotary positions, causal attention, a norm, tied logits

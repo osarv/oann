@@ -1,0 +1,52 @@
+# A large lookup table trained densely and sparsely (Graph.Sparse, AdamW.Sparse): a table of rows x width (262144 x
+# 160) looked up by batches of 32 sequences of 128 tokens drawn uniformly, a Linear of the width after it and a squared
+# error against a random target - forward, backward and AdamW, one thread. Prints the milliseconds a step of each and the
+# rows a step touches. Arguments, all optional: steps (20), rows (262144), width (160), batch (32), context (128).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../nn/optim"
+
+fn run(sparse Bool, steps I64, rows I64, width I64, batch I64, ctx I64) F64, I64 {
+    g := graph.Graph<F32>(batch)
+    tok := g.Tokens(ctx)
+    table := g.Param(graph.Init.Normal(0.0, 0.02), true, rows, width)
+    if sparse: g.Sparse(table)
+    w := g.Param(graph.Init.Normal(0.0, 0.05), true, width, width)
+    y := g.Input(ctx, width)
+    loss := g.Mse(g.Linear(g.Embedding(tok, table), w, graph.None), y)
+    try g.Plan(rand.Rand(1)) catch e { unreachable "shapes: " + $e }
+    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 1e-3, decay = 0.1, spans = optim.Spans(g))
+    if sparse: o.Sparse(g)
+    r := rand.Rand(2)
+    ids := g.Ints(tok).Flat()!
+    yy := g.Value(y).Flat()!
+    for k in range yy.Len(): yy[k] = F32(r.Normal())
+    total I64 = 0
+    touched I64 = 0
+    for s in range steps + 2 {
+        for k in range ids.Len(): ids[k] = I32(r.Below(rows))
+        t0 := time.Now()
+        g.Forward(batch)
+        g.Backward(loss)
+        o.Step()
+        if s >= 2: total += time.Since(t0)      # two warm-up steps
+        if sparse: touched = g.Touched(table).Count[0]
+    }
+    return F64(total) / 1e6 / F64(steps), touched
+}
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    steps := try args[1].ParseInt() if args.Len() > 1 else 20
+    rows := try args[2].ParseInt() if args.Len() > 2 else 262144
+    width := try args[3].ParseInt() if args.Len() > 3 else 160
+    batch := try args[4].ParseInt() if args.Len() > 4 else 32
+    ctx := try args[5].ParseInt() if args.Len() > 5 else 128
+    dense, _ := run(false, steps, rows, width, batch, ctx)
+    sparse, touched := run(true, steps, rows, width, batch, ctx)
+    try io.PutLn("table " + $rows + " x " + $width + ", batches of " + $batch + " x " + $ctx + ": dense " + $dense.Fixed(2) + " ms a step, sparse " + $sparse.Fixed(2) + " ms (" + $(dense / sparse).Fixed(2) + "x), " + $touched + " rows touched a step")
+}

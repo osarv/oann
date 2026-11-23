@@ -2271,3 +2271,22 @@ examples/evo_lm.olang (`make evolm`) runs evo over tiny character GPTs on tiny S
 
 Three rounds on 4 workers took 49 s for 37 trials. The best (2 layers of 64, 2 heads, window 32) reached val 2.242 and
 test 2.249.
+
+## Sparse row updates for lookup tables (wt-sparse)
+
+Embedding tables and nn/ngram's hashed tables used to get a dense gradient (the whole table zeroed every backward) and
+a dense AdamW step over every row. Now:
+
+- **`Graph.Sparse(table)`:** the table is read by Embedding alone, which Plan checks. Its gradient is written only at
+  the rows looked up, and the next Backward zeroes just those rows. `Touched(table)` lists them, each once; while
+  accumulating the list grows. The gradient is still exact at every row. CPU only.
+- **`AdamW.Sparse(g)`:** steps those tables by their touched rows alone, as lazy Adam. A row touched at step t after k
+  skipped steps has its moments decayed by beta^k and its weight by (1 - rate decay)^k, then takes the ordinary step.
+  A row touched every step is updated bit for bit as dense AdamW updates it (tested). Otherwise the moves its momentum
+  alone would have made in the skipped steps are not made; a test checks this against an F64 reference.
+- **`Muon.Sparse(g)`:** the same for Muon's AdamW part. MuonMatrices leaves sparse tables out.
+
+bench/sparsetable (`make sparsetable`), a 262144 x 160 table with a Linear after it at batch 32 x 128, one thread: dense
+81.9 ms a step against sparse 11.9 ms (6.9x), with 4075 rows touched a step.
+
+A BF16 graph's SyncParams still rounds every master each step, so sparse tables in BF16 graphs keep that dense pass.

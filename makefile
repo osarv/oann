@@ -30,7 +30,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -272,6 +272,12 @@ graphsettle:
 samplebench:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_sample bench/sample.olang
 	./build/bench_sample $(ARGS)
+
+# a 262144 x 160 lookup table trained densely and sparsely (Graph.Sparse, AdamW.Sparse) at batch 32 x 128
+# (bench/sparsetable.olang) - ARGS: steps, rows, width, batch, context
+sparsetable:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_sparsetable bench/sparsetable.olang
+	./build/bench_sparsetable $(ARGS)
 
 # archnet on its toy benchmark: the predictor's held-out rank correlation, and evolution alone against screening,
 # proposals and forecast halving (bench/archsearch.olang) - ARGS: rounds, seeds, gap

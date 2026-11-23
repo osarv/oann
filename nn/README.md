@@ -20,7 +20,8 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   first position), `Apply` gives the rows [b, t, Dim]: `h = g.Add(emb.Apply(g, tok), ng.Apply(g))`.
 - `optim.olang` - `AdamW` and `Sgd` over ONE FLAT REGION (two tensors laid out alike: a graph's
   `Params()`/`ParamGrads()`, a settling system's, a BF16 graph's `Masters()` with its BF16 gradients), the runs of the
-  region that decay (`Spans(g)`), `ClipNorm`, the schedules `WarmupCosine` and `WarmupLinear`, and `Projector`, the
+  region that decay (`Spans(g)`), sparse tables stepped by their touched rows (`o.Sparse(g)` after `g.Sparse(table)`:
+  lazy Adam, exact where a row is touched every step; `Muon.Sparse` the same for its AdamW part), `ClipNorm`, the schedules `WarmupCosine` and `WarmupLinear`, and `Projector`, the
   delta-rule input projection that stands in for weight decay; `Muon` (momentum, then Newton-Schulz orthogonalization of each
   2-D parameter's step - `MuonMatrices(g)` lists them, the other elements go to AdamW at `adamRate`; `Orthogonalize` is
   the Newton-Schulz step on its own) and `Ema`, a weight average (`Update` after each step, `Swap` to evaluate with the

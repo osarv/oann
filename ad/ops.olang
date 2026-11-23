@@ -543,6 +543,37 @@ fn EmbeddingBackward<S, A>(dy tensor.Tensor<S>, tokens Array<I32>&, dtable mut t
     }
 }
 
+# the rows touched[0 .. count[0]] of a table's gradient zeroed, the list emptied and count[1] (the epoch) moved on
+fn ClearRows<S>(dtable mut tensor.Tensor<S>&, touched Array<I32>&, count mut Array<I64>&) {
+    d := rows(dtable)
+    for k in range count[0] {
+        at := d.Off + I64(touched[k]) * d.Ld
+        for c in range d.Cols: d.Data[at + c] = S(0.0)
+    }
+    count[0] = 0
+    count[1] += 1
+}
+
+# EmbeddingBackward for a sparse table (Graph.Sparse): each token's gradient row added to its table row, nothing else
+# written, and each row reached recorded once a backward - in touched[0 .. count[0]], stamp[row] set to the backward's
+# epoch count[1]
+fn EmbeddingRows<S, A>(dy tensor.Tensor<S>, tokens Array<I32>&, dtable mut tensor.Tensor<S>&, touched mut Array<I32>&, count mut Array<I64>&, stamp mut Array<I64>&) {
+    g := rows(dy)
+    d := rows(dtable)
+    epoch := count[1]
+    for r in range g.Rows {
+        t := I64(tokens[r])
+        if stamp[t] != epoch {
+            stamp[t] = epoch
+            touched[count[0]] = I32(t)
+            count[0] += 1
+        }
+        dst := d.Off + t * d.Ld
+        src := g.Off + r * g.Ld
+        for c in range g.Cols: d.Data[dst + c] = S(A(d.Data[dst + c]) + A(g.Data[src + c]))
+    }
+}
+
 # x [b, t, ...] plus the table's row (first + t) mod T at every position t of every sequence (T the table's rows)
 fn Positions<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, table tensor.Tensor<S>, ctx I64, first I64) {
     ym := rows(y)

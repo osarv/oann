@@ -134,9 +134,48 @@ type AdamW<A, G> struct(params tensor.Tensor<A>, grads tensor.Tensor<G>, rate F6
     M mut Array<A>& = Array<A>(params.Count())
     V mut Array<A>& = Array<A>(params.Count())
     runs Array<Span>& = runsOf(spans, params.Count())
+    tables Vec<RowTable> = Vec<RowTable>()
 }
 
 fn (o mut AdamW<A, G>&) SetRate(rate F64) { o.Rate = rate }
+
+# a sparse table of the region (Graph.Sparse) that AdamW steps by its touched rows: Lo its first element, Set its
+# graph's row list, Last the step each row was last stepped at
+type RowTable struct(lo I64, rows I64, decay Bool, set graph.RowSet) {
+    Lo I64 = lo
+    Decay Bool = decay
+    Set graph.RowSet = set
+    Last mut Array<I64>& = Array<I64>(rows)
+}
+
+# g's sparse tables (Graph.Sparse) stepped from now on by the rows each Backward touched, and taken out of the dense
+# runs: a step costs those rows, not the table. Lazy Adam: a row's moments are decayed by beta^k for the k steps it was
+# not touched (as the dense update would have decayed them under zero gradients), its decoupled weight decay is applied
+# as (1 - rate decay)^k at the current rate, and the moves its moments alone would have made in those k steps are not
+# made. A row touched at every step is stepped exactly - bit for bit - as dense AdamW steps it
+fn (o mut AdamW<A, G>&) Sparse<T>(g graph.Graph<T>&) {
+    for i in range g.Size() {
+        v := graph.Var(i)
+        if not g.IsSparse(v): continue
+        nd := g.Info(v)
+        o.tables.Push(RowTable(nd.Offset, nd.Dims[0], g.Decays(v), g.Touched(v)))
+        o.runs = cut(o.runs, nd.Offset, nd.Offset + nd.Dims.Count())
+    }
+}
+
+# the runs with [lo, hi) taken out
+fn cut(runs Array<Span>&, lo I64, hi I64) Array<Span> {
+    out := Vec<Span>()
+    for r in runs {
+        if r.Hi <= lo or r.Lo >= hi {
+            out.Push(r)
+            continue
+        }
+        if r.Lo < lo: out.Push(Span(r.Lo, lo, r.Decay))
+        if r.Hi > hi: out.Push(Span(hi, r.Hi, r.Decay))
+    }
+    return out.ToArray()
+}
 
 # one step from the gradients the last Backward left
 fn (o mut AdamW<A, G>&) Step() {
@@ -153,6 +192,28 @@ fn (o mut AdamW<A, G>&) Step() {
     for r in o.runs {
         keep A = A(1.0 - o.Rate * o.Decay) if r.Decay else A(1.0)
         adamRun(o.p, o.gr, o.M, o.V, r.Lo, r.Hi, b1, b2, c1, c2, keep, step, root, eps)
+    }
+    for t in range o.tables.Len() {
+        tb := o.tables[t]
+        keep F64 = 1.0 - o.Rate * o.Decay if tb.Decay else 1.0
+        cols := tb.Set.Cols
+        for k in range tb.Set.Count[0] {
+            row := I64(tb.Set.Rows[k])
+            lo := tb.Lo + row * cols
+            gap := o.Steps - tb.Last[row] - 1
+            tb.Last[row] = o.Steps
+            if gap > 0: lazyDecay(o.M, o.V, o.p, lo, lo + cols, A(o.Beta1.Pow(F64(gap))), A(o.Beta2.Pow(F64(gap))), A(keep.Pow(F64(gap))))
+            adamRun(o.p, o.gr, o.M, o.V, lo, lo + cols, b1, b2, c1, c2, A(keep), step, root, eps)
+        }
+    }
+}
+
+# what k skipped steps did to a row's moments and weight decay: m and v decayed, p kept by (1 - rate decay)^k
+fn lazyDecay<A>(m mut Array<A>&, v mut Array<A>&, p mut Array<A>&, lo I64, hi I64, d1 A, d2 A, keep A) {
+    for k in range lo, hi {
+        m[k] = m[k] * d1
+        v[k] = v[k] * d2
+        p[k] = p[k] * keep
     }
 }
 
@@ -330,12 +391,12 @@ type MuonMatrix struct(Lo I64, Rows I64, Cols I64, Decay Bool) {
 }
 
 # the 2-D parameters of g's region, each one matrix (Muon's: hidden weights - give the list by hand to leave an embedding
-# or an output layer to AdamW)
+# or an output layer to AdamW); sparse tables (Graph.Sparse) are left to AdamW
 fn MuonMatrices<T>(g graph.Graph<T>&) Array<MuonMatrix> {
     out := Vec<MuonMatrix>()
     for i in range g.Size() {
         nd := g.Info(graph.Var(i))
-        if nd.Kind == graph.Op.Param and nd.Dims.Rank == 2: out.Push(MuonMatrix(nd.Offset, nd.Dims[0], nd.Dims[1], g.Decays(graph.Var(i))))
+        if nd.Kind == graph.Op.Param and nd.Dims.Rank == 2 and not g.IsSparse(graph.Var(i)): out.Push(MuonMatrix(nd.Offset, nd.Dims[0], nd.Dims[1], g.Decays(graph.Var(i))))
     }
     return out.ToArray()
 }
@@ -446,6 +507,9 @@ fn (o mut Muon<A, G>&) SetRate(rate F64) {
     if o.Rate > 0.0: o.Adam.Rate = o.Adam.Rate * rate / o.Rate
     o.Rate = rate
 }
+
+# g's sparse tables stepped by AdamW's part by their touched rows (AdamW.Sparse); MuonMatrices leaves them out
+fn (o mut Muon<A, G>&) Sparse<T>(g graph.Graph<T>&) { o.Adam.Sparse(g) }
 
 fn (o mut Muon<A, G>&) Step() {
     for m in o.mats: o.matrix(m)
@@ -981,4 +1045,109 @@ test Ema "averages the region's values, and Swap exchanges the average with the 
     assert (pd[0] - 1.2).Abs() < 1e-15 and e.Shadow[0] == 3.0
     e.Swap()
     assert pd[0] == 3.0 and (e.Shadow[0] - 1.2).Abs() < 1e-15
+}
+
+# a table of 40 rows of 4 looked up by 2 sequences of 6 tokens, its rows to a target: on g, the table Sparse or not
+fn tableNet<T>(g mut graph.Graph<T>&, sparse Bool) graph.Var, graph.Var, graph.Var {
+    tok := g.Tokens(6)
+    table := g.Param(graph.Init.Normal(0.0, 1.0), true, 40, 4)
+    if sparse: g.Sparse(table)
+    y := g.Input(6, 4)
+    loss := g.Mse(g.Embedding(tok, table), y)
+    return tok, y, loss
+}
+
+# each step's tokens: all from rows lo .. lo + 11 (so 12 of the 40), drawn by r; the target drawn too
+fn fillTable<T>(g mut graph.Graph<T>&, tok graph.Var, y graph.Var, r mut rand.Rand&, lo I64) {
+    ids := g.Ints(tok).Flat()!
+    for k in range ids.Len(): ids[k] = I32(lo + r.Below(12))
+    yy := g.Value(y).Flat()!
+    for k in range yy.Len(): yy[k] = T(r.Normal())
+}
+
+test AdamW "Sparse steps a table by its touched rows: bit for bit as dense AdamW where every row is touched every step" {
+    a, b := graph.Graph<F32>(2), graph.Graph<F32>(2)
+    ta, ya, la := tableNet(a, false)
+    tb, yb, lb := tableNet(b, true)
+    try a.Plan(rand.Rand(2)) catch { unreachable }
+    try b.Plan(rand.Rand(2)) catch { unreachable }
+    oa := AdamW(a.Params(), a.ParamGrads(), rate = 0.01, decay = 0.1, spans = Spans(a))
+    ob := AdamW(b.Params(), b.ParamGrads(), rate = 0.01, decay = 0.1, spans = Spans(b))
+    ob.Sparse(b)
+    for step in range 6 {
+        ra, rb := rand.Rand(U64(step + 9)), rand.Rand(U64(step + 9))
+        fillTable(a, ta, ya, ra, 0)
+        fillTable(b, tb, yb, rb, 0)
+        ia, ib := a.Ints(ta).Flat()!, b.Ints(tb).Flat()!
+        for k in range 12 {                         # every one of rows 0 .. 11, every step
+            ia[k] = I32(k)
+            ib[k] = I32(k)
+        }
+        a.Forward(2)
+        a.Backward(la)
+        oa.Step()
+        b.Forward(2)
+        b.Backward(lb)
+        ob.Step()
+    }
+    pa, pb := a.Params().Flat()!, b.Params().Flat()!
+    for k in range 12 * 4: assert pa[k] == pb[k] and oa.M[k] == ob.M[k] and oa.V[k] == ob.V[k]
+}
+
+test AdamW "Sparse on rows touched now and then: each touch decays the moments and the weight by the skipped steps, then steps" {
+    b := graph.Graph<F32>(2)
+    tb, yb, lb := tableNet(b, true)
+    try b.Plan(rand.Rand(2)) catch { unreachable }
+    rate, decay, b1, b2, eps := 0.01, 0.1, 0.9, 0.999, 1e-8
+    ob := AdamW(b.Params(), b.ParamGrads(), rate = rate, decay = decay, spans = Spans(b))
+    ob.Sparse(b)
+    n := 40 * 4
+    p := Array<F64>[F64(x) for x in b.Params().Flat()!]
+    m, v := Array<F64>(n), Array<F64>(n)
+    last := Array<I64>(40)
+    for step in range 1, 10 {
+        r := rand.Rand(U64(step + 20))
+        fillTable(b, tb, yb, r, 12 * (step % 3))
+        b.Forward(2)
+        b.Backward(lb)
+        gr := b.ParamGrads().Flat()!
+        rs := b.Touched(graph.Var(1))
+        for k in range rs.Count[0] {               # the reference: lazy Adam in F64
+            row := I64(rs.Rows[k])
+            gap := step - last[row] - 1
+            last[row] = step
+            for c in range 4 {
+                q := row * 4 + c
+                m[q] *= b1.Pow(F64(gap))
+                v[q] *= b2.Pow(F64(gap))
+                p[q] *= (1.0 - rate * decay).Pow(F64(gap + 1))
+                m[q] = b1 * m[q] + (1.0 - b1) * F64(gr[q])
+                v[q] = b2 * v[q] + (1.0 - b2) * F64(gr[q]) * F64(gr[q])
+                p[q] -= rate / (1.0 - b1.Pow(F64(step))) * m[q] / ((v[q] / (1.0 - b2.Pow(F64(step)))).Sqrt() + eps)
+            }
+        }
+        ob.Step()
+    }
+    pb := b.Params().Flat()!
+    for q in range n: assert (F64(pb[q]) - p[q]).Abs() <= 1e-5 * (1.0 + p[q].Abs()), "element " + $q + ": " + $pb[q] + " against " + $p[q]
+}
+
+test Muon "a sparse table is left out of the matrices and stepped by the AdamW part, by rows" {
+    g := graph.Graph<F32>(2)
+    tok, y, loss := tableNet(g, true)
+    try g.Plan(rand.Rand(3)) catch { unreachable }
+    assert MuonMatrices(g).Len() == 0
+    o := Muon(g.Params(), g.ParamGrads(), MuonMatrices(g), adamRate = 0.01)
+    o.Sparse(g)
+    before := g.Params().Flat()!.Copy()
+    r := rand.Rand(4)
+    fillTable(g, tok, y, r, 0)
+    g.Forward(2)
+    g.Backward(loss)
+    o.Step()
+    after := g.Params().Flat()!
+    for row in range 40 {
+        moved := after[row * 4] != before[row * 4]
+        assert moved == (row < 12 and I32(row) in g.Ints(tok).Flat()!)
+    }
 }
