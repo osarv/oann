@@ -39,6 +39,17 @@ fn low(at Heads&, starts Array<I32>&, r I64, i I64) I64 {
     return lo.Max(I64(starts[r])) if starts.Len() > 0 else lo
 }
 
+# one past the last position row r (position i of its sequence of `cols`) reads: i + 1 when causal; else the end of its
+# document - the first later position whose start differs - or of the sequence (non-causal packed documents: each
+# document attends within itself both ways, as an encoder over packed utterances needs)
+fn high(at Heads&, starts Array<I32>&, r I64, i I64, cols I64) I64 {
+    if at.Causal: return i + 1
+    if starts.Len() == 0: return cols
+    j := i + 1
+    for j < cols and starts[r + j - i] == starts[r]: j++
+    return j
+}
+
 # the softmax of matrices e0 ... e1 - 1, forward (p the scores, made weights) or backward (d the gradient of the weights, made
 # the gradient of the scores, p the weights), a run of them per task. A named job, not a lambda: a lambda's body ran three
 # times as slowly here (its loops were not vectorized)
@@ -191,7 +202,7 @@ fn softmaxRows<S, A>(p mat.Mat<S>&, at Heads, starts Array<I32>&, r0 I64) {
     cols := p.Cols
     for i in range p.Rows {
         o := p.Off + i * p.Ld
-        last := i + 1 if at.Causal else cols
+        last := high(at, starts, r0 + i, i, cols)
         lo := low(at, starts, r0 + i, i)
         for j in range lo: data[o + j] = S(0.0)
         elem.SoftmaxRun<S, A>(data, o + lo, last - lo, 1.0)
@@ -205,13 +216,16 @@ fn softmaxBackward<S, A>(d mat.Mat<S>&, p mat.Mat<S>&, at Heads, starts Array<I3
     dd := d.Data
     pd := p.Data
     for i in range d.Rows {
-        last := i + 1 if at.Causal else d.Cols
+        last := high(at, starts, r0 + i, i, d.Cols)
         lo := low(at, starts, r0 + i, i)
         o := d.Off + i * d.Ld
         q := p.Off + i * p.Ld
         for j in range lo: dd[o + j] = S(0.0)
         dot := elem.DotIn<S, A>(dd, o + lo, pd, q + lo, last - lo)
         for j in range lo, last: dd[o + j] = S(scale * A(pd[q + j]) * (A(dd[o + j]) - dot))
+        if not at.Causal {
+            for j in range last, d.Cols: dd[o + j] = S(0.0)
+        }
     }
 }
 
@@ -663,6 +677,10 @@ fn reference(q Array<F64>&, k Array<F64>&, v Array<F64>&, seqs I64, ctx I64, hea
                 last := i + 1 if causal else ctx
                 lo := (i - window + 1).Max(0) if window > 0 else 0
                 if starts.Len() > 0: lo = lo.Max(I64(starts[s * ctx + i]))
+                if starts.Len() > 0 and not causal {
+                    last = i + 1
+                    for last < ctx and starts[s * ctx + last] == starts[s * ctx + i]: last++
+                }
                 row := Array<F64>(ctx)
                 for j in range lo, last {
                     for d in range dh: row[j] += q[(s * ctx + i) * dim + h * dh + d] * k[(s * ctx + j) * dim + h * dh + d]
@@ -1130,6 +1148,61 @@ test FlashAttention "packed documents (each row's document start): the reference
         FlashAttentionGrad(f, m(dq2), m(dk2), m(dv2), m(late), m(q), m(k), m(v), m(got), lse, at, starts = starts)
         for i in range 200 * dim: assert dk2[ctx * dim + i] == 0.0 and dv2[ctx * dim + i] == 0.0
     }
+}
+
+test Attention "packed documents, not causal: each document attends within itself both ways - the reference's rows, a document alone's, and gradients equal to central differences" {
+    r := rand.Rand(31)
+    seqs, ctx, heads, dim := 2, 40, 2, 8
+    n := seqs * ctx
+    q, k, v, dout := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+    fill(q, r, 1.0)
+    fill(k, r, 1.0)
+    fill(v, r, 1.0)
+    fill(dout, r, 1.0)
+    starts := Array<I32>(n)
+    for i in range ctx {
+        starts[i] = I32(25 if i >= 25 else (10 if i >= 10 else 0))
+        starts[ctx + i] = I32(1 if i >= 1 else 0)
+    }
+    m := fn(a mut Array<F64>&): return mat.Mat<F64>(a, 0, n, dim, dim)
+    at := Heads(heads, ctx, false)
+    want, _ := reference(q, k, v, seqs, ctx, heads, dim, false, 0, starts)
+    alone, _ := reference(q[10 * dim:25 * dim].Copy(), k[10 * dim:25 * dim].Copy(), v[10 * dim:25 * dim].Copy(), 1, 15, heads, dim, false)
+    for i in range 15 * dim: assert (alone[i] - want[10 * dim + i]).Abs() < 1e-12
+    got := Array<F64>(n * dim)
+    prm := mat.Mat<F64>(Array<F64>(n * heads * ctx), 0, n * heads, ctx, ctx)
+    ws := gemm.Workspace<F64>(2, ctx)
+    Attention(ws, m(got), m(q), m(k), m(v), prm, at, starts)
+    for i in range n * dim: assert (want[i] - got[i]).Abs() < 1e-12, "at " + $i
+    dq, dk, dv := Array<F64>(n * dim), Array<F64>(n * dim), Array<F64>(n * dim)
+    AttentionGrad(ws, m(dq), m(dk), m(dv), m(dout), m(q), m(k), m(v), prm, Array<F64>(AttentionScratch(n, heads, ctx)), at, starts = starts)
+    for i in range 0, n * dim, 7 {
+        for which in range 3 {
+            g := dq[i] if which == 0 else (dk[i] if which == 1 else dv[i])
+            assert (nudged(q, k, v, dout, starts, seqs, ctx, heads, dim, which, i) - g).Abs() < 1e-6, "gradient " + $which + " at " + $i
+        }
+    }
+}
+
+# the central difference of sum(y dout) for non-causal attention over packed documents, at element i of q, k or v (which)
+fn nudged(q Array<F64>&, k Array<F64>&, v Array<F64>&, dout Array<F64>&, starts Array<I32>&, seqs I64, ctx I64, heads I64, dim I64, which I64, i I64) F64 {
+    total := fn(qq Array<F64>&, kk Array<F64>&, vv Array<F64>&) {
+        y, _ := reference(qq, kk, vv, seqs, ctx, heads, dim, false, 0, starts)
+        t F64 = 0.0
+        for j in range y.Len(): t += y[j] * dout[j]
+        return t
+    }
+    up, down := q.Copy(), q.Copy()
+    if which == 1 {
+        up, down = k.Copy(), k.Copy()
+    } else if which == 2 {
+        up, down = v.Copy(), v.Copy()
+    }
+    up[i] += 1e-6
+    down[i] -= 1e-6
+    if which == 0: return (total(up, k, v) - total(down, k, v)) / 2e-6
+    if which == 1: return (total(q, up, v) - total(q, down, v)) / 2e-6
+    return (total(q, k, up) - total(q, k, down)) / 2e-6
 }
 
 assert not FlashAttention<F32, F32>.Allocates, "flash attention allocates"

@@ -766,7 +766,8 @@ fn (g mut Graph<T>&) Rope(x Var, heads I64, base F64 = 10000) Var {
 # multi-head attention of q, k, v [b, t, D] in heads of D / heads columns; causal: position i attends to 0 ... i, and
 # with a window W > 0 to i - W + 1 ... i alone (sliding-window attention; the flash form computes only the band). docs
 # (packed documents): a Tokens(t) input holding each position's document start (non-decreasing along a sequence, e.g.
-# nn/layers' DocStarts) - a position attends within its own document only
+# nn/layers' DocStarts) - a position attends within its own document only; not causal, both ways within it (an encoder
+# over packed utterances; the weights-kept form, never the flash form, and no window)
 fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64 = 0, docs Var = None) Var {
     if not g.same("Attention", q, k) or not g.same("Attention", q, v): return q
     qd := g.dims(q)
@@ -774,8 +775,8 @@ fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, causal Bool, wind
         g.fail("Attention of " + $g.shape(q) + " in " + $heads + " heads: [b, t, D], heads dividing D")
         return q
     }
-    if (g.Decode or window > 0 or docs != None) and not causal or window < 0 {
-        g.fail("Attention while decoding, in a window or over documents, is causal (window " + $window + ")")
+    if (g.Decode or window > 0) and not causal or window < 0 or docs != None and not causal and window > 0 {
+        g.fail("Attention while decoding or in a window is causal (window " + $window + ")")
         return q
     }
     if docs != None and (g.Decode or g.nodes[docs].Kind != Op.Tokens or g.nodes[docs].Dims != tensor.Shape.Of(qd[0], qd[1])) {
@@ -1073,7 +1074,13 @@ fn (g Graph<T>&) attentionExtras(nd Node&, heads I64) extras {
 fn (g Graph<T>&) startsOf(docs Var) Array<I32>& { return g.noStarts if docs == None else g.intsOf(I64(docs)) }
 
 # whether an attention node runs the flash form: on the CPU, not decoding, over a context of FlashFrom or more
-fn (g Graph<T>&) flashes(nd Node&) Bool { return g.onCpu and not g.Decode and nd.Dims[1] >= g.FlashFrom }
+fn (g Graph<T>&) flashes(nd Node&) Bool {
+    noncausalDocs := match nd.Kind {
+        case Op.Attention(_, _, _, _, causal, _, docs): not causal and docs != None
+        case _: false
+    }
+    return g.onCpu and not g.Decode and nd.Dims[1] >= g.FlashFrom and not noncausalDocs
+}
 
 # the flash attention workspace of accumulator A
 fn (g Graph<T>&) flashOf<A>() mut attention.Flash<A>& {
