@@ -147,6 +147,7 @@ type Evolution<G> struct(config Config) {
     nextId I64 = 0
     rng rand.Rand = rand.Rand(config.Seed)
     cache Map<String, Result> = Map<String, Result>()
+    seeds Vec<G> = Vec<G>()
 }
 
 # ---- data ----
@@ -182,7 +183,7 @@ fn (e mut Evolution<G>&) Step<S, F, D>(space mut S&, fit mut F&, data Split<D>&)
 
 # one round, advised by adv
 fn (e mut Evolution<G>&) StepWith<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&) {
-    if e.Population.Len() == 0 {
+    if e.Round == 0 {
         e.start(space, fit, data, adv)
     } else {
         match e.Settings.Method {
@@ -210,8 +211,29 @@ fn (e Evolution<G>&) size() I64 {
 # the first population, drawn uniformly and evaluated at the full budget
 fn (e mut Evolution<G>&) start<S, F, D, A>(space mut S&, fit mut F&, data Split<D>&, adv mut A&) {
     kids := Vec<Member<G>>()
-    for _ in range e.size(): kids.Push(e.member(space.Random(e.rng), -1, Origin.Drawn))
+    for g in e.seeds: kids.Push(e.member(g, -1, Origin.Drawn))
+    e.seeds.Clear()
+    for kids.Len() + e.Population.Len() < e.size(): kids.Push(e.member(space.Random(e.rng), -1, Origin.Drawn))
     for m in e.evaluate(space, fit, data, adv, kids, false): e.Population.Push(m)
+}
+
+# g put in the first population (evaluated at the full budget with it, before the random genomes that fill the rest);
+# before the first round
+fn (e mut Evolution<G>&) Seed(g G) {
+    e.seeds.Push(g)
+}
+
+# g, already evaluated to res at the full budget elsewhere, added as a member: given the next id, put in the population
+# and the history, and its result cached (so it is not trained again). Before the first round it counts towards the first
+# population, which random genomes then fill
+fn (e mut Evolution<G>&) Add<S>(space S&, g G, res Result) Member<G> {
+    m := e.member(g, -1, Origin.Drawn)
+    m.Res = res
+    m.Curve.Push(res.Loss)
+    e.cache.Put(space.Key(g) + "@" + $(e.Settings.Rungs.Len() - 1), res)
+    e.Population.Push(m)
+    e.History.Push(m)
+    return m
 }
 
 # a new member of genome g, not yet evaluated
@@ -961,6 +983,23 @@ test Evolution "a run stopped, checkpointed and resumed ends exactly as one run 
     second.Run(s3, fit3, Split<I64>(0, 0), 35)
     assert second.Save(s3) == whole.Save(s)
     for d in dirs: try os.RemoveAll(d) catch { }
+}
+
+test Evolution.Seed "seeded and added genomes start the first population; random ones fill the rest; an added one is not trained" {
+    s := widthSpace()
+    r := rand.Rand(4)
+    e := Evolution<schema.Genome>(Config(Algorithm.Regularized(8, 3), 2))
+    fit := widthTask(s)
+    a, b, c := s.Random(r), s.Random(r), s.Random(r)
+    e.Seed(a)
+    e.Seed(b)
+    added := e.Add(s, c, Result(0.5))
+    e.Step(s, fit, Split<I64>(0, 0))
+    assert e.Population.Len() == 8 and fit.calls == 7 and added.Id == 0
+    assert s.Key(e.Population[1].Genome) == s.Key(a) and s.Key(e.Population[2].Genome) == s.Key(b)
+    ids := Vec<I64>()
+    for m in e.History: ids.Push(m.Id)
+    for i in range ids.Len(): assert ids[i] == I64(i)
 }
 
 test Split.Carve "a validation share drawn out of the training data, the two disjoint and together all of it" {

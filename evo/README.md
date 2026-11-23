@@ -93,6 +93,13 @@ best := e.Best()      # lowest validation loss at the full budget
 front := e.Front()    # loss against the first Objectives - 1 costs, non-dominated
 ```
 
+### Seeding
+
+Call these before the first round:
+
+- `e.Seed(g)` puts genome `g` in the first population. It is evaluated at the full budget with the rest of that population, and random genomes fill the remaining places.
+- `e.Add(space, g, Result(loss))` adds a genome already evaluated elsewhere. It gets the next id, joins the population and the history, and its result is cached, so it is never trained again.
+
 ### Algorithms
 
 | algorithm | how one round works |
