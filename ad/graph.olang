@@ -110,7 +110,7 @@ type Init enum {
 
 # an operation defined outside oann (the settle of dyn/bridge.olang): its output's shape from its inputs' (batch axis
 # included), its forward, and its backward - the gradients of its inputs (written, each of its input's shape) from its
-# output's. F32 only. Forward and Backward allocate nothing (a promise held of every implementation, T21c), so a step
+# output's. In F32; a BF16 or F16 graph converts the inputs, output and gradients at the edge. Forward and Backward allocate nothing (a promise held of every implementation, T21c), so a step
 # through one can be pinned allocation-free
 type Function trait {
     Shape(inputs Array<tensor.Shape>&) tensor.Shape
@@ -385,6 +385,8 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     customIn mut list.List<Var>& = list.List<Var>()
     customVals mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]    # each custom input's value, set per call
     customGrads mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]   # and the gradient its backward writes
+    customVals32 mut Array<tensor.Tensor<F32>>& = Array<tensor.Tensor<F32>>[]  # their F32 copies in a BF16 or F16 graph
+    customGrads32 mut Array<tensor.Tensor<F32>>& = Array<tensor.Tensor<F32>>[]
     vals mut list.List<slot<T>>& = list.List<slot<T>>()
     ints mut list.List<slot<I32>>& = list.List<slot<I32>>()
     accs32 mut list.List<slot<F32>>& = list.List<slot<F32>>()
@@ -824,14 +826,15 @@ fn (g mut Graph<T>&) Mean(x Var) Var {
     return g.add(Op.Sum(g.dense(x), true), dropLast(g.dims(x)), g.batched(x) and g.dims(x).Rank > 1)
 }
 
-# an operation defined outside oann, of these inputs (F32 graphs)
+# an operation defined outside oann, of these inputs. It runs in F32: a BF16 or F16 graph widens its inputs and the
+# output's gradient into F32 copies (in the node's accumulator room) and rounds its output and input gradients back
 fn (g mut Graph<T>&) Custom(f mut any Function&, inputs ...Var) Var {
     match T {
-        case F32 { }
-        case _ {
-            g.fail("Custom operations run in a Graph<F32>")
+        case F64 {
+            g.fail("Custom operations run in a Graph<F32>, Graph<BF16> or Graph<F16>")
             return inputs[0]
         }
+        case _ { }
     }
     shapes := Array<tensor.Shape>[g.dims(x) for x in inputs]
     first := g.customIn.Len()
@@ -849,6 +852,18 @@ fn (g mut Graph<T>&) customRoom() {
     for v in g.customIn: vals.Push(g.Value(v))
     g.customVals = vals.ToArray()
     g.customGrads = vals.ToArray()
+    if g.custom32() {
+        g.customVals32 = Array<tensor.Tensor<F32>>(g.customIn.Len(), tensor.Tensor<F32>.Zeros(1))
+        g.customGrads32 = Array<tensor.Tensor<F32>>(g.customIn.Len(), tensor.Tensor<F32>.Zeros(1))
+    }
+}
+
+# whether custom operations run on F32 copies: in a BF16 or F16 graph
+fn (g Graph<T>&) custom32() Bool {
+    return match T {
+        case BF16, F16: true
+        case _: false
+    }
 }
 
 # ---- views ----
@@ -960,7 +975,7 @@ fn (g Graph<T>&) extrasOf(i I64) extras {
         case Op.Scan(_, _, _): extras(0, 3 * n, 0, 2 * nd.Dims[0] * nd.Dims[2])
         case Op.SelectiveScan(_, _, a, _, _, _): g.selectiveExtras(nd, g.nodes[a].Dims[0])
         case Op.DeltaRule(q, _, _, beta, _): g.deltaExtras(nd, g.nodes[q].Dims[2], g.nodes[beta].Dims[2])
-        case Op.Custom(_, first, count): extras(0, g.customScratch(first, count), 0, 0)
+        case Op.Custom(_, first, count): extras(0, g.customScratch(first, count), 0, (2 * g.customScratch(first, count) + n) if g.custom32() else 0)
         case _: extras(0, 0, 0, 0)
     }
 }
@@ -2130,8 +2145,38 @@ fn (g mut Graph<T>&) customForward(i I64, f mut any Function&, first I64, count 
             ins := g.customVals[first:first + count]
             f.Forward(out, ins)
         }
+        case BF16, F16 {
+            at I64 = 0
+            for j in range count {
+                x := g.customIn[first + j]
+                v := g.Value(x)
+                g.customVals32[first + j] = g.wide(i, at, v)
+                at += v.Count()
+            }
+            out := g.Value(Var(i))
+            o32 := g.accTensor(i, 2 * g.customScratch(first, count), out.Dims)
+            f.Forward(o32, g.customVals32[first:first + count])
+            narrowInto<T>(out.Flat()!, o32.Flat()!, out.Count())
+        }
         case _ { }
     }
+}
+
+# node i's accumulator elements from start as an F32 tensor of these dims (a BF16 or F16 graph's, whose accumulator is F32)
+fn (g Graph<T>&) accTensor(i I64, start I64, d tensor.Shape) tensor.Tensor<F32> {
+    return over<F32>(g.accs32[i].mem, g.nodes[i].AccOffset + start, d, rowMajor(d))
+}
+
+# v widened into node i's accumulator elements from start
+fn (g Graph<T>&) wide(i I64, start I64, v tensor.Tensor<T>&) tensor.Tensor<F32> {
+    w := g.accTensor(i, start, v.Dims)
+    to, from := w.Flat()!, v.Flat()!
+    for k in range v.Count(): to[k] = F32(from[k])
+    return w
+}
+
+fn narrowInto<T>(to mut Array<T>&, from Array<F32>&, n I64) {
+    for k in range n: to[k] = T(from[k])
 }
 
 # the gradients of loss - a one-element node - with respect to every node it depends on, parameters included, after a
@@ -3006,6 +3051,34 @@ fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count 
                 ops.Put<T, A>(to, from, A(1.0), ax)
             }
         }
+        case BF16, F16 {
+            n := g.customScratch(first, count)
+            gy := g.Grad(Var(i))
+            dy := g.wide(i, 2 * n, gy)
+            at I64 = 0
+            for j in range count {
+                x := g.customIn[first + j]
+                v := g.Value(x)
+                g.customVals32[first + j] = g.wide(i, at, v)
+                g.customGrads32[first + j] = g.accTensor(i, n + at, v.Dims)
+                at += v.Count()
+            }
+            f.Backward(dy, g.customVals32[first:first + count], g.customGrads32[first:first + count])
+            at = 0
+            for j in range count {
+                x := g.customIn[first + j]
+                dx := g.gradOf(x)
+                ax := g.acc(x)
+                d := g.customGrads32[first + j]
+                c := d.Count()
+                if ops.Wanted(dx) {
+                    s := g.scratchTensor(i, at, d.Dims)
+                    narrowInto<T>(s.Flat()!, d.Flat()!, c)
+                    ops.Put<T, A>(dx.Flat()!, s.Flat()!, A(1.0), ax)
+                }
+                at += c
+            }
+        }
         case _ { }
     }
 }
@@ -3414,6 +3487,30 @@ test Graph.Custom "an operation defined outside runs forward and backward as the
         ga := a.Grad(wa).Flat()!
         gb := b.Grad(wb).Flat()!
         for i in range 16: assert (ga[i] - gb[i]).Abs() < 1e-6
+    }
+}
+
+test Graph.Custom "a BF16 graph runs a custom operation in F32 at its edge, as an F32 graph does to BF16's precision" {
+    f := square()
+    a := Graph<BF16>(3)
+    b := Graph<F32>(3)
+    wa := a.Param(Init.Normal(0.0, 1.0), true, 4, 4)
+    wb := b.Param(Init.Normal(0.0, 1.0), true, 4, 4)
+    la := a.Mse(a.Custom(f, a.Act(wa, mat.Act.Tanh)), a.Param(Init.Normal(0.0, 1.0), true, 4, 4))
+    lb := b.Mse(b.Custom(f, b.Act(wb, mat.Act.Tanh)), b.Param(Init.Normal(0.0, 1.0), true, 4, 4))
+    try a.Plan(rand.Rand(4))
+    try b.Plan(rand.Rand(4))
+    pb := b.Params()
+    try pb.Convert(a.Params())
+    for n in Array<I64>[3, 2] {
+        a.Forward(n)
+        a.Backward(la)
+        b.Forward(n)
+        b.Backward(lb)
+        assert (a.Scalar(la) - b.Scalar(lb)).Abs() < 2e-2 * b.Scalar(lb)
+        ga := a.Grad(wa).Flat()!
+        gb := b.Grad(wb).Flat()!
+        for i in range 16: assert (F64(ga[i]) - F64(gb[i])).Abs() < 2e-2 * (1.0 + F64(gb[i]).Abs())
     }
 }
 

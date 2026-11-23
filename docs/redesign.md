@@ -514,7 +514,7 @@ Where the build departs from the sketch above (`dyn.Settle(g, system, input, gra
    optimizer of its own steps (the system's region is not the graph's). `bridge.Apply(g, b, settled, x, guess)` records
    it. The input may have leading axes (`[batch, t, size]` is batch x t rows of the system, at most its batch; a short
    batch's rows past it are driven by zero). Generic over T so the checks run it in F64 (`Run`, `RunFrom`, `Grad`); in a
-   graph it is F32, as `Custom` is.
+   graph it runs in F32, as `Custom` does (a BF16 or F16 graph converts at its edge).
 2. **The amortizer's guess is a second input**: the starting potentials of every relaxing population (every one but
    the inputs, in the order made: `b.StateSize` a row), their activities rho of them; without it a settle starts at rest.
    Its gradient is zero (at a fixed point the output does not depend on the start). The amortizer is trained by

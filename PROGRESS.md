@@ -2184,3 +2184,15 @@ products are small next to their packing and stores (AddDot 2.2 us of ~13 us a h
 further single fix reaches 10 % of the BF16 step (148-159 ms, noisy): cross-entropy 15 ms, attention ~31 (mostly not
 products), rope 10, norm 8; the products' remaining cost is packing and the BF16 stores (about 0.25 ns an element,
 as much as the tiles' arithmetic).
+
+## Custom operations in BF16 graphs (wt-custombf16)
+
+`Graph.Custom` was F32-only: a `Function`'s Forward and Backward take `Tensor<F32>`, so an operation defined outside
+oann could not sit in a `Graph<BF16>` or `Graph<F16>`. Such a graph now runs it in F32 at its edge: the inputs are
+widened into F32 copies in the node's accumulator room (two input-sized regions and one output-sized region, laid out at
+Plan), the function runs, and the output and the input gradients are rounded back (the gradients through the node's
+existing T scratch, then added as before). Forward and Backward still allocate nothing (`assert not
+Graph<BF16>.Forward.Allocates`, `.Backward`). Tested against the same operation in an F32 graph from the same
+parameters, at the full and a short batch: the loss and gradients agree to BF16's precision (2e-2). An F64 graph still
+refuses Custom. Eager BF16 graphs fail on their parameters' masters before any Custom is reached (the masters are
+sized at Plan); that is unchanged.
