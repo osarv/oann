@@ -2097,3 +2097,15 @@ energies by changing its cells one at a time through Local) conditioned on the r
 gradient is the scope's statistics at the data less their expectation (`scopeStats`, each term once). Test: 28
 overlapping 3-cell sums over 30 cells (K = 3, 2.0 off the sum 3), 640 samples at T 1 - 300 steps of 8 examples
 recover the gaps at 1.7-2.4, and 16 chains x 3000 sweeps on the fitted model satisfy every sum.
+
+## Rules over whole lines: a hidden chain per line (wt-lines, 2026-11-23)
+
+`nn/lines`: `Lines` - each line of cells carries a hidden chain of H states (shared tables A[h'][h][x], an end table
+Z[clue][h] read at the line's clue, a bias B[x]), summed out exactly by forward-backward; the energy is the sum of the
+lines' free energies. `PseudoGrad`: exact per-cell pseudolikelihood (a cell's conditional reads the lines through it;
+the gradient is their expected counts at each of its values weighted by data less conditional); `Step` (Adam);
+`Anneal` (single-site Gibbs on the summed free energy); `FitRestarts(restarts, fit, score, r)` keeps the restart a
+caller's validation scores best. Tests: free energies equal brute force over the hidden paths, the gradient equals
+central differences; run counts of the rows and columns of 4 x 4 binary grids (H 5, clues 0-2): 4 restarts x 1500
+steps of 8 grids, the kept restart solves 8 / 8 validation puzzles and 32 / 32 held-out (best of 2 chains x 200
+sweeps), 10.5 s.

@@ -86,5 +86,16 @@ Answers are found by searching for low energy, and new rules are learnt from sol
   conditioned on each of its values, and the forest left is solved by `ForestMin`. x takes the best completion, so
   the energy never rises; repeated over windows or random regions, it is a large-neighbourhood search.
 
+- **Rules over whole lines (`lines.olang`).** A `Lines` factor gives each line of cells (a grid's rows and columns,
+  any sequences) a learned hidden chain of H states. Its tables are shared by every line: transitions A[h'][h][x] and
+  an end table Z[clue][h] read at the line's clue, such as its count. The chain is summed out exactly by
+  forward-backward, so a line's energy is its free energy.
+  - `PseudoGrad` is exact per-cell pseudolikelihood. A cell's conditional reads only the free energies of the lines
+    through it, so the gradient is those lines' expected counts at each of its values.
+  - `Anneal` searches the summed free energy.
+  - The states' meaning, such as a run counter, is found from only some random starts, and the training loss cannot
+    tell which. `FitRestarts` therefore keeps the restart with the best score on a validation function the caller
+    supplies.
+
 `examples/potts_latin.olang` runs the whole pipeline: Latin squares, then screen, fit and prune, then held-out puzzles
 solved by `Anneal` and by `Focus`.
