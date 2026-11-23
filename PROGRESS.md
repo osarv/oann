@@ -2290,3 +2290,34 @@ bench/sparsetable (`make sparsetable`), a 262144 x 160 table with a Linear after
 81.9 ms a step against sparse 11.9 ms (6.9x), with 4075 rows touched a step.
 
 A BF16 graph's SyncParams still rounds every master each step, so sparse tables in BF16 graphs keep that dense pass.
+
+## Model surgery (wt-surgery)
+
+surgery/ (README there) is for changing a trained model instead of retraining it.
+
+- **model.State:** the architecture block by block, parameters and optimizer moments by name, the optimizer's steps,
+  the training step, a warmup restart, the data position and a lineage. It is saved and opened as one safetensors
+  file, built on a graph (Net.Build), and read back with the moments (CaptureAdamW, CaptureMuon).
+- **Function-preserving growth:** Deepen (o and down at zero), WidenFfn (Net2Net, with relative noise), AddHeads,
+  WidenDim (zero new stream dimensions, gains scaled by sqrt(old/new), eps by old/new: exact with RMSNorm), GrowVocab
+  (the old tokens' logits are exact) and LengthenContext (RoPE base kept or NTK-scaled; learned positions extended).
+  Each is tested to leave the logits within 2e-4.
+- **Removal:** DropBlock and DropHeads by measured importance, and PruneFfn by |up||down|.
+- **Replacement:** Replace switches a block's kind (window, feed-forward kind, width) and distills it locally onto the
+  old block's outputs. It is tested to end closer to the old model's loss than without distilling.
+- **Optimizer:** ToMuon and ToAdamW (Muon's momentum from AdamW's first moment and back), ResetOptimizer, and Rewarm.
+
+bench/grow (`make grow`) runs on tiny Shakespeare at equal compute (3.66 TMACs, the cost of 1500 steps of the large
+model). The large model is 4 blocks of 128 with 4 heads, and the small one 2 blocks of 64 with 2 heads. The small model
+is trained, grown by 12 function-preserving operations (its validation loss is unchanged right after), and trained on.
+
+| run | from scratch | grown |
+|---|---|---|
+| 30% of the compute to the small model, seed 1 | 1.8109 | 1.7755 |
+| 30% of the compute to the small model, seed 2 | 1.8205 | 1.7669 |
+| 50% of the compute to the small model, seed 1 | 1.8109 | 1.7506 |
+
+Growing wins at equal compute in all three. Wall time was 25-50% longer for the grown run, because the small model's
+narrow products run less efficiently per MAC.
+
+olang issue found: iterating a Map whose values hold a writable reference fails in the prelude's MapIter (repro/mapiterref).
