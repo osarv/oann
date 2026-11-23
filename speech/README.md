@@ -13,7 +13,9 @@ committed, as in `llm/`.
 | `kws.olang` | the wake word: features, the network (`Spotter`), `Train`, `Detector` (a threshold over smoothed scores, a refractory second) |
 | `listen.olang` | `oann-listen`, the command |
 | `g2p.olang` | `G2p.Load`, `Phonemes(text, "en" or "sv")`: text to the IPA espeak-ng gives the VITS voices (below) |
+| `vits.olang` | text to speech: `Model.Load` (a transformers VitsModel), `Model.Piper` (a Piper voice's .onnx), `Symbols` (IPA to ids), `Speak` (ids to samples and every id's frames) |
 | `tools/reference.py` | the reference the tests are held to: transformers, F32, on CPU |
+| `tools/vits_reference.py` | VITS's references: transformers' VitsModel (vits-ljs) and onnxruntime (Piper's voices), with no noise |
 | `tools/g2p_reference.py` | espeak-ng's phonemes (through phonemizer) for word lists and sentences, what `g2p.olang` is measured against |
 
 ## Using it
@@ -152,7 +154,7 @@ The best fit for an assistant in Swedish and English is Piper's VITS: sv_SE-nst-
 en_US-ljspeech-medium (public-domain data), one architecture for both, real time on a Pi 4 as Piper is today, 22050 Hz.
 kakao-enterprise/vits-ljs (MIT, the same architecture in safetensors and in transformers' `VitsModel`) is the way to
 hold an implementation to a reference before reading Piper's ONNX files. Two pieces are the work, not the network (about
-1 GFLOP a second of speech): reading Piper's weights (ONNX protobuf, or converted once to safetensors) and a
+4 GFLOP a second of speech for Piper's medium voices): reading Piper's weights (`io/onnx.olang`; `vits.olang`, below) and a
 grapheme-to-phoneme step - espeak-ng, which every candidate here was trained with, is GPL-3, so it would be our own,
 matching espeak-ng's IPA for these voices: CMUdict (BSD-2) and rules for English, a lexicon and Swedish's fairly regular
 spelling rules for Swedish: `g2p.olang`, below.
@@ -206,6 +208,74 @@ perfect), homographs (read, lead, wind), its FORCE and NORTH vowels (oːɹ, ɔː
 apart, syncopes (every ˈɛvɹi, different dˈɪfɹənt); Swedish long vowels of inflected forms (köpte ɕˈøːptə), secondary
 stresses and loanwords with a late stress (precis prəsˈiːs).
 
+## Text to speech: VITS
+
+`vits.olang` runs VITS (Kim, Kong and Son 2021) for inference, from phoneme ids to F32 samples at 22050 Hz, in two
+publications of it: transformers' `VitsModel` (kakao-enterprise/vits-ljs: config.json, model.safetensors) and Piper's
+voices (rhasspy/piper-voices en_US-ljspeech-medium and sv_SE-nst-medium: `<voice>.onnx`, `<voice>.onnx.json`). The
+text is IPA as espeak-ng writes it (`g2p.olang` makes it); `Symbols` maps it to ids a code point at a time -
+vits-ljs's vocab.json with a blank (0) around every symbol, as VitsTokenizer's `add_blank`; Piper's phoneme_id_map with
+`^`, `_` after every phoneme and `$`, as Piper does.
+
+    m := vits.Model.Piper(dir + "/sv_SE-nst-medium.onnx")!           # or vits.Model.Load(dir) for a VitsModel
+    s := vits.Symbols.PiperMap(dir + "/sv_SE-nst-medium.onnx.json")!   # or vits.Symbols.Vocab(dir + "/vocab.json")
+    o := vits.Options(m.C)            # NoiseScale, NoiseScaleDuration, LengthScale (the model's defaults), Seed
+    wave, frames := m.Speak(s.Encode("hɛj vˈɛːɖɛn.")!, o)              # samples at m.C.Rate; each id's frames (256 samples)
+
+**How it works.** The text encoder (the ids' embeddings times sqrt(192), six post-norm layers whose attention adds
+relative-position keys and values for the offsets -4 .. 4, a feed-forward of two width-3 convolutions) gives every
+id a prior's means and log-variances. The stochastic duration predictor runs in reverse: noise (times
+NoiseScaleDuration) through its spline flows backwards - each a monotone rational-quadratic spline of 10 bins on -5 ..
+5 whose widths, heights and slopes a dilated depth-separable convolution stack predicts from the text - gives every id's
+log-duration, its frames ceil(exp(that) LengthScale). Each id's statistics are repeated over its frames and the latent
+sampled (NoiseScale), then the residual coupling flow runs in reverse (four mean-only couplings of four WaveNet layers,
+the channels flipped between them), and HiFi-GAN makes samples: transposed convolutions upsampling 256 times (8 8 2 2
+for vits-ljs, 8 8 4 for Piper's medium) each followed by the mean of three residual blocks (ResBlock1 for vits-ljs,
+ResBlock2 for Piper's), a tanh at the end. Noise comes from a seeded std/rand generator. Every signal is time-major,
+so every convolution is one gemm of its patches gathered a run of rows at a time on each thread, the leaky ReLU before
+each of HiFi-GAN's convolutions applied as the patches are gathered and a residual sum done by the product (beta 1);
+a transposed convolution of stride s is s convolutions, one for each phase of its outputs.
+
+**Piper's weights.** `io/onnx.olang` reads an ONNX file's initializers and its nodes' names (protobuf, no graph run).
+Piper's names are original VITS's (`enc_p`, `dp`, `flow`, `dec`, `gamma`/`beta`, `convs_sep`, ...), mapped onto
+transformers' one to one, with three twists: the export folded every weight-normed convolution's weight into an
+unnamed constant (`onnx::Conv_8959`), which takes its name from the bias of the Conv node that reads it; the duration
+predictor's affine flow keeps `exp(-log_scale)` as a constant or the input of an Exp; and the duration predictor's first
+spline flow, which reverse never runs, is not in the file. Piper's medium network is the training config's (hidden 192,
+HiFi-GAN from 256 channels, ResBlock2 with kernels 3 5 7 and dilations 1 2, 2 6, 3 12), which the .onnx.json does not
+repeat; the low and high qualities are refused.
+
+**Checks** (`make test`, where `~/.cache/oann` has the models and `ref/`, written by `python3 -I
+speech/tools/vits_reference.py ~/.cache/oann/models ~/.cache/oann/ref`; skipped with a message otherwise). With no
+noise (noise_scale and the duration predictor's 0), on three English sentences for vits-ljs and two for each Piper
+voice (the ids `Symbols` gives their IPA are the reference's):
+
+- every id's duration (frames) equal to transformers' and to onnxruntime's, so the waveforms have the same length;
+- Piper's voices: the waveform within 2.9e-5 of onnxruntime's (en_US-ljspeech-medium, sv_SE-nst-medium);
+- vits-ljs: within 1.4e-4 of transformers' F32 waveform and 1.7e-4 of transformers run in F64 - transformers' own F32
+  waveform is up to 2.2e-4 from its F64 one (rounding through the flows and HiFi-GAN), so that is the floor in F32;
+  the test holds both at 2.5e-4. (The latent before HiFi-GAN is within 1.5e-5.)
+
+No ceiling of a duration landed on the other side of an integer in these cases; one could (exp(log-duration) within
+F32 rounding of a whole number), and would then shift every later frame - the check would say so.
+
+**Speed** (`make vitsbench ARGS="MODEL 3 1 4"`, bench/vits.olang: a sentence of 241-243 ids, 5.9-9.6 s of audio; the
+4-core VM above, shared with another job while measured), seconds of compute a second of audio:
+
+| model | threads | this VM | Raspberry Pi 4 (estimate) |
+|---|---|---|---|
+| Piper en_US-ljspeech-medium | 1 | 0.095 | ~0.76 |
+| | 4 | 0.058 | ~0.47 |
+| Piper sv_SE-nst-medium | 1 | 0.091 | ~0.73 |
+| | 4 | 0.048 | ~0.38 |
+| kakao-enterprise/vits-ljs | 1 | 0.69 | ~5.5 |
+| | 4 | 0.30 | ~2.4 |
+
+onnxruntime runs en_US-ljspeech-medium at 0.087 (1 thread) and 0.065 (4) on the same VM. The Pi 4 column is this VM's
+times 8 - a Cortex-A72 (NEON, no BF16) is roughly 8 times slower on compute-bound work - an estimate, not a measurement:
+Piper's medium voices speak faster than real time there on one core and about twice real time on four; vits-ljs (its
+HiFi-GAN is 512 channels wide, about 13 times Piper's medium arithmetic) does not, which is why the voices are Piper's.
+
 ## Models, data and licences
 
 Weights and clips are fetched by whoever runs the code; none are in this repository.
@@ -221,6 +291,10 @@ Weights and clips are fetched by whoever runs the code; none are in this reposit
 | espeak-ng 1.51, phonemizer (g2p_reference.py only) | the g2p reference | GPL-3; run offline to measure, not vendored or linked, not needed to run |
 | Project Gutenberg books 1342, 1661, 74, 2701, 39147, 21862, 77571 (fetched by g2p_reference.py) | g2p word lists | public domain (in the US) |
 | NST Swedish pronunciation lexicon (Språkbanken, nb.no) | surveyed for g2p, not used | CC0 |
+| kakao-enterprise/vits-ljs (Hugging Face: config.json, vocab.json, model.safetensors) | text to speech, the transformers-checked VITS | MIT; trained on LJ Speech, public domain |
+| rhasspy/piper-voices en_US-ljspeech-medium (`.onnx`, `.onnx.json`) | English voice | MIT (the repository); dataset LJ Speech, public domain (its MODEL_CARD) |
+| rhasspy/piper-voices sv_SE-nst-medium (`.onnx`, `.onnx.json`) | Swedish voice (trained by KBLab) | MIT (the repository); dataset NST Swedish (Språkbanken, nb.no), CC0 (its MODEL_CARD) |
+| onnx, onnxruntime (vits_reference.py only) | Piper's reference | Apache 2.0, MIT; not vendored, not needed to run |
 | Wiktionary pronunciations | not used | CC BY-SA |
 
 The clips are made by `ffmpeg -i IN.mp3 -ss S -t T -ar 16000 -ac 1 -c:a pcm_s16le OUT.wav` from
