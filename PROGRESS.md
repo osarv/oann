@@ -2290,3 +2290,8 @@ bench/sparsetable (`make sparsetable`), a 262144 x 160 table with a Linear after
 81.9 ms a step against sparse 11.9 ms (6.9x), with 4075 rows touched a step.
 
 A BF16 graph's SyncParams still rounds every master each step, so sparse tables in BF16 graphs keep that dense pass.
+
+BF16 follow-up (wt-sparsesync): SyncParams rounds a sparse table whole the first time, and after that only at the rows
+the last Backward touched. Load and CopyParamsFrom round everything (FullSync). A test checks that every parameter
+stays its master rounded. bench/sparsetable, BF16 with F32 masters: dense 105.3 ms a step against sparse 9.65 ms
+(10.9x); F32 in the same run, 87.4 against 11.0 ms (8.0x).

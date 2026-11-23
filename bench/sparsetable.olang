@@ -10,8 +10,10 @@ import "std/time"
 import "../ad/graph"
 import "../nn/optim"
 
-fn run(sparse Bool, steps I64, rows I64, width I64, batch I64, ctx I64) F64, I64 {
-    g := graph.Graph<F32>(batch)
+fn run(sparse Bool, steps I64, rows I64, width I64, batch I64, ctx I64) F64, I64 { return run2<F32>(sparse, steps, rows, width, batch, ctx) }
+
+fn run2<E>(sparse Bool, steps I64, rows I64, width I64, batch I64, ctx I64) F64, I64 {
+    g := graph.Graph<E>(batch)
     tok := g.Tokens(ctx)
     table := g.Param(graph.Init.Normal(0.0, 0.02), true, rows, width)
     if sparse: g.Sparse(table)
@@ -19,12 +21,25 @@ fn run(sparse Bool, steps I64, rows I64, width I64, batch I64, ctx I64) F64, I64
     y := g.Input(ctx, width)
     loss := g.Mse(g.Linear(g.Embedding(tok, table), w, graph.None), y)
     try g.Plan(rand.Rand(1)) catch e { unreachable "shapes: " + $e }
-    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 1e-3, decay = 0.1, spans = optim.Spans(g))
-    if sparse: o.Sparse(g)
+    match E {
+        case F32 {
+            o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 1e-3, decay = 0.1, spans = optim.Spans(g))
+            if sparse: o.Sparse(g)
+            return steps2(g, o, sparse, steps, rows, batch, tok, table, y, loss)
+        }
+        case _ {
+            o := optim.AdamW(g.Masters(), g.ParamGrads(), rate = 1e-3, decay = 0.1, spans = optim.Spans(g))
+            if sparse: o.Sparse(g)
+            return steps2(g, o, sparse, steps, rows, batch, tok, table, y, loss)
+        }
+    }
+}
+
+fn steps2<E, O>(g mut graph.Graph<E>&, o mut O&, sparse Bool, steps I64, rows I64, batch I64, tok graph.Var, table graph.Var, y graph.Var, loss graph.Var) F64, I64 {
     r := rand.Rand(2)
     ids := g.Ints(tok).Flat()!
     yy := g.Value(y).Flat()!
-    for k in range yy.Len(): yy[k] = F32(r.Normal())
+    for k in range yy.Len(): yy[k] = E(r.Normal())
     total I64 = 0
     touched I64 = 0
     for s in range steps + 2 {
@@ -33,6 +48,7 @@ fn run(sparse Bool, steps I64, rows I64, width I64, batch I64, ctx I64) F64, I64
         g.Forward(batch)
         g.Backward(loss)
         o.Step()
+        g.SyncParams()
         if s >= 2: total += time.Since(t0)      # two warm-up steps
         if sparse: touched = g.Touched(table).Count[0]
     }
@@ -48,5 +64,8 @@ fn main() ? io.Error, ParseError {
     ctx := try args[5].ParseInt() if args.Len() > 5 else 128
     dense, _ := run(false, steps, rows, width, batch, ctx)
     sparse, touched := run(true, steps, rows, width, batch, ctx)
+    bd, _ := run2<BF16>(false, steps, rows, width, batch, ctx)
+    bs, _ := run2<BF16>(true, steps, rows, width, batch, ctx)
+    try io.PutLn("BF16 with F32 masters: dense " + $bd.Fixed(2) + " ms a step, sparse " + $bs.Fixed(2) + " ms (" + $(bd / bs).Fixed(2) + "x)")
     try io.PutLn("table " + $rows + " x " + $width + ", batches of " + $batch + " x " + $ctx + ": dense " + $dense.Fixed(2) + " ms a step, sparse " + $sparse.Fixed(2) + " ms (" + $(dense / sparse).Fixed(2) + "x), " + $touched + " rows touched a step")
 }

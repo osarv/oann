@@ -385,7 +385,7 @@ type RowSet struct(table I64, rows I64, cols I64) {
     Table I64 = table
     Cols I64 = cols
     Rows mut Array<I32>& = Array<I32>(rows)
-    Count mut Array<I64>& = Array<I64>(2)
+    Count mut Array<I64>& = Array<I64>(3)       # [2]: 1 once SyncParams has rounded the whole table
     stamp mut Array<I64>& = Array<I64>(rows)
 }
 
@@ -1684,11 +1684,42 @@ fn (g Graph<T>&) Master(v Var) tensor.Tensor<F32> {
 
 # the parameters in the arena set from their masters, each rounded to nearest even - after the masters change (an
 # optimizer's step, a checkpoint loaded); nothing for a graph without masters
+#
+# A sparse table (Sparse) is rounded whole the first time, then only at the rows the last Backward touched: the rows an
+# optimizer stepping it by rows (AdamW.Sparse) changed. A table stepped by a dense optimizer must not be Sparse in a
+# BF16 graph. FullSync rounds everything
 fn (g mut Graph<T>&) SyncParams() {
     if not g.HasMasters(): return
     mem := g.mem
     masters := g.masters
-    for i in range g.ParamCount: mem[i] = T(masters[i])
+    if g.rowSets.Len() == 0 {
+        for i in range g.ParamCount: mem[i] = T(masters[i])
+        return
+    }
+    for i in range g.nodes.Len() {
+        nd := g.nodes[i]
+        if nd.Kind != Op.Param: continue
+        k := g.rowSetOf(i)
+        if k < 0 or g.rowSets[k].Count[2] == 0 {
+            for j in range nd.Offset, nd.Offset + nd.Dims.Count(): mem[j] = T(masters[j])
+            if k >= 0: g.rowSets[k].Count[2] = 1
+            continue
+        }
+        syncRows(mem, masters, nd.Offset, g.rowSets[k].Cols, g.rowSets[k].Rows, g.rowSets[k].Count[0])
+    }
+}
+
+# every parameter rounded from its master, sparse tables whole
+fn (g mut Graph<T>&) FullSync() {
+    for q in range g.rowSets.Len(): g.rowSets[q].Count[2] = 0
+    g.SyncParams()
+}
+
+fn syncRows<T>(mem mut Array<T>&, masters Array<F32>&, at I64, cols I64, rows Array<I32>&, n I64) {
+    for k in range n {
+        lo := at + I64(rows[k]) * cols
+        for c in range lo, lo + cols: mem[c] = T(masters[c])
+    }
 }
 
 # ---- reading and writing values ----
@@ -1874,7 +1905,7 @@ fn (g mut Graph<T>&) CopyParamsFrom(src Graph<T>&) {
         to := g.Masters().Flat()!
         from := src.Masters().Flat()!
         for i in range to.Len(): to[i] = from[i]
-        g.SyncParams()
+        g.FullSync()
         return
     }
     to := g.Params().Flat()!
@@ -1938,7 +1969,7 @@ fn (g mut Graph<T>&) Load(path String&) ? os.Error, checkpoint.SafetensorsError,
         }
         k++
     }
-    g.SyncParams()
+    g.FullSync()
 }
 
 # ---- INT8 inference ----

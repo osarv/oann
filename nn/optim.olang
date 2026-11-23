@@ -1151,3 +1151,21 @@ test Muon "a sparse table is left out of the matrices and stepped by the AdamW p
         assert moved == (row < 12 and I32(row) in g.Ints(tok).Flat()!)
     }
 }
+
+test AdamW "a BF16 graph's sparse table: SyncParams rounds only the touched rows, and every parameter stays its master rounded" {
+    g := graph.Graph<BF16>(2)
+    tok, y, loss := tableNet(g, true)
+    try g.Plan(rand.Rand(6)) catch { unreachable }
+    o := AdamW(g.Masters(), g.ParamGrads(), rate = 0.01, decay = 0.1, spans = Spans(g))
+    o.Sparse(g)
+    for step in range 6 {
+        r := rand.Rand(U64(step + 30))
+        fillTable(g, tok, y, r, 12 * (step % 3))
+        g.Forward(2)
+        g.Backward(loss)
+        o.Step()
+        g.SyncParams()
+        p, m := g.Params().Flat()!, g.Masters().Flat()!
+        for k in range p.Len(): assert p[k] == BF16(m[k])
+    }
+}
