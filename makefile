@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help potts_latin test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help potts_latin energybench test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -188,6 +188,14 @@ historyencode:
 # (examples/best_of.olang) - ARGS: patterns, flipped fraction, drive, gain, batches, seed
 # nn/potts end to end on Latin squares: learnt, then solved by Anneal and Focus (examples/potts_latin.olang) - ARGS: n,
 # examples, puzzles, clue share, seed
+# the energy toolkit on generic puzzles, one thread: examples/potts_latin and examples/energy_suite (Focus on 3-SAT and
+# colouring, CutsetMove on grid distances, BySum cage sums, nn/lines run counts) - accuracy, time, moves
+energybench:
+	$(OLANG) build -output build/examples_potts_latin examples/potts_latin.olang
+	./build/examples_potts_latin
+	$(OLANG) build -output build/examples_energy_suite examples/energy_suite.olang
+	./build/examples_energy_suite
+
 potts_latin:
 	$(OLANG) build -output build/examples_potts_latin examples/potts_latin.olang
 	./build/examples_potts_latin $(ARGS)

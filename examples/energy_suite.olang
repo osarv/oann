@@ -1,0 +1,372 @@
+# The energy toolkit on generic puzzles, one thread: each section's accuracy, time and moves. From the repository's
+# root: `make energybench` (this and examples/potts_latin), or
+#     olang build -output build/energy_suite examples/energy_suite.olang && ./build/energy_suite [seed]
+#
+# 1. Planted 3-SAT and planted 3-colouring by Sampler.Focus: plain, with breakout weights (Bump, Decay), with the
+#    weights capped (Cap), and with a decaying bias on the states each move leaves (Hold, Tenure).
+# 2. Shortest-path distances on a grid with walls and loops: each open cell's distance from a source as a Pairs
+#    energy (neighbours differ by at most 1, larger is better), searched by Pairs.CutsetMove over random 3 x 3 windows;
+#    the exact answer is breadth-first search.
+# 3. Cage sums on Latin squares: an n x n Latin square (rows and columns as inequality edges) whose cells are split
+#    into cages of three, each told its sum (a Factors table indexed by the sum, Factors.BySum); Anneal and Focus.
+# 4. Run counts: the number of runs in every row and column of a binary grid, learnt by nn/lines' hidden chain from
+#    solved grids (FitRestarts kept by validation solving), then held-out grids solved by Lines.Anneal.
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../nn/message"
+import "../nn/potts"
+import "../nn/lines"
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    seed := try args[1].ParseInt() if args.Len() > 1 else 1
+    r := rand.Rand(U64(seed))
+    try io.PutLn("section | case | solved | ms a puzzle | moves a puzzle")
+    try focusSection(r)
+    try pathSection(r)
+    try cageSection(r)
+    try runSection(r)
+}
+
+fn ms(t0 I64) F64 { return F64(time.Since(t0)) * 1e-6 }
+
+# ---- 1. Focus ----
+
+fn focusSection(r mut rand.Rand&) ? io.Error {
+    names := Array<String>["plain", "breakout", "breakout + Cap", "breakout + Hold"]
+    scheds := Array<potts.FocusSchedule>[potts.FocusSchedule(400000, 0.5), potts.FocusSchedule(400000, 0.5, 0.1, 0.5, 1000), potts.FocusSchedule(400000, 0.5, 0.1, 0.9, 1000, 1e-9, 1.0), potts.FocusSchedule(400000, 0.5, 0.1, 0.5, 1000, 1e-9, 0.0, 1.0, -0.6)]
+    for kind in range 2 {
+        n := 2000 if kind == 0 else 1500
+        for v in range 4 {
+            solved, moves := 0, 0
+            t0 := time.Now()
+            for _ in range 4 {
+                m := potts.Potts(2, 1) if kind == 0 else potts.Potts.Colouring(3)
+                e := message.Edges(n, 1)
+                if kind == 0 {
+                    m.Fac = sat3(n, 42 * n / 10, r)
+                    e.Set(Array<I32>(0), Array<I32>(0), 0)
+                } else {
+                    e = colouring(n, r)
+                }
+                s := potts.Sampler(n, 1, m.K)
+                s.Start(r)
+                s.Focus(m, e, Array<F64>(n), scheds[v])
+                solved += 1 if s.Left[0] == 0 else 0
+                moves += s.Sweeps[0]
+            }
+            name := "3-SAT " + $n + " x 4.2" if kind == 0 else "3-colouring " + $n + ", degree 6"
+            try io.PutLn("Focus | " + name + ", " + names[v] + " | " + $solved + "/4 | " + $(ms(t0) / 4.0).Fixed(1) + " | " + $(moves / 4))
+        }
+    }
+}
+
+# planted 3-SAT: clause signs drawn until the planted answer satisfies the clause; table sg is 1 on its violating value
+fn sat3(n I64, count I64, r mut rand.Rand&) potts.Factors {
+    y := Array<I32>(n)
+    for i in range n: y[i] = I32(r.Below(2))
+    f := potts.Factors(2, 3, 8, count, n)
+    q I64 = 0
+    for q < count {
+        a, b, c := r.Below(n), r.Below(n), r.Below(n)
+        if a == b or b == c or a == c: continue
+        sg := r.Below(8)
+        if I64(y[a]) == (sg >> 2) & 1 and I64(y[b]) == (sg >> 1) & 1 and I64(y[c]) == sg & 1: continue
+        f.At[3 * q], f.At[3 * q + 1], f.At[3 * q + 2] = a, b, c
+        f.Table[q] = sg
+        q++
+    }
+    for sg in range 8: f.T[sg * 8 + sg] = 1.0
+    f.Index()
+    return f
+}
+
+# a planted 3-colourable graph, 3 n edges (mean degree 6)
+fn colouring(n I64, r mut rand.Rand&) message.Edges {
+    colour := Array<I32>(n)
+    for i in range n: colour[i] = I32(r.Below(3))
+    want := 3 * n
+    src, dst := Array<I32>(2 * want), Array<I32>(2 * want)
+    count I64 = 0
+    for count < 2 * want {
+        i, j := r.Below(n), r.Below(n)
+        if i == j or colour[i] == colour[j]: continue
+        src[count], dst[count] = I32(i), I32(j)
+        src[count + 1], dst[count + 1] = I32(j), I32(i)
+        count += 2
+    }
+    e := message.Edges(n, 2 * want)
+    e.Set(src, dst, count)
+    return e
+}
+
+# ---- 2. CutsetMove: distances on a looped grid ----
+
+fn pathSection(r mut rand.Rand&) ? io.Error {
+    l, k := 10, 40
+    cells := l * l
+    right, moves, rightA := 0, 0, 0
+    tA := 0.0
+    t0 := time.Now()
+    for _ in range 8 {
+        wall := Array<Bool>(cells)
+        for i in range 1, cells: wall[i] = r.Uniform(0.0, 1.0) < 0.2
+        dist := bfs(wall, l)
+        for i in range cells: wall[i] = wall[i] or dist[i] < 0
+        p := distanceModel(wall, l, k)
+        x := Array<I32>(cells)
+        region := Array<I64>(9)
+        e := p.Energy(x, 0)
+        for it in range 3000 {
+            c0, r0 := r.Below(l - 2), r.Below(l - 2)
+            for a in range 9: region[a] = (r0 + a / 3) * l + c0 + a % 3
+            after := p.CutsetMove(x, region, 9, r)
+            moves++
+            if it % 200 == 199 and after == e: break
+            if it % 200 == 199: e = after
+        }
+        right += 1 if exact(x, 0, wall, dist, k) else 0
+        # the same energy annealed, for comparison
+        m := p.Model()
+        e2 := message.Edges(cells, 1)
+        e2.Set(Array<I32>(0), Array<I32>(0), 0)
+        s := potts.Sampler(cells, 16, k)
+        s.ColourFor(e2, m)
+        s.Bias = p.Bias(Array<I32>(cells, -1), 0.0)
+        s.Start(r)
+        t1 := time.Now()
+        s.Anneal(m, e2, Array<F64>(cells), potts.Schedule(2000, 2.0, 0.05))
+        tA += ms(t1)
+        rightA += 1 if exact(s.X, s.Best() * cells, wall, dist, k) else 0
+    }
+    try io.PutLn("CutsetMove | distances on a 10 x 10 grid with 20 % walls (loops), 40 values, 3 x 3 windows | " + $right + "/8 | " + $((ms(t0) - tA) / 8.0).Fixed(1) + " | " + $(moves / 8))
+    try io.PutLn("CutsetMove | the same energy by Anneal, 16 chains x 2000 sweeps | " + $rightA + "/8 | " + $(tA / 8.0).Fixed(1) + " | 32000 chain-sweeps")
+}
+
+# x[xo ..] the BFS distances (capped at k - 1) on every open cell
+fn exact(x Array<I32>&, xo I64, wall Array<Bool>&, dist Array<I64>&, k I64) Bool {
+    for i in range wall.Len() {
+        if not wall[i] and I64(x[xo + i]) != dist[i].Min(k - 1): return false
+    }
+    return true
+}
+
+# breadth-first distances from cell 0 over the open cells (-1: unreachable)
+fn bfs(wall Array<Bool>&, l I64) Array<I64> {
+    dist := Array<I64>(l * l, -1)
+    queue := Array<I64>(l * l)
+    dist[0] = 0
+    head, tail := 0, 1
+    for head < tail {
+        i := queue[head]
+        head++
+        for d in range 4 {
+            j := step(i, d, l)
+            if j < 0 or wall[j] or dist[j] >= 0: continue
+            dist[j] = dist[i] + 1
+            queue[tail] = j
+            tail++
+        }
+    }
+    return dist
+}
+
+fn step(i I64, d I64, l I64) I64 {
+    r, c := i / l, i % l
+    if d == 0: return i - l if r > 0 else -1
+    if d == 1: return i + l if r < l - 1 else -1
+    if d == 2: return i - 1 if c > 0 else -1
+    return i + 1 if c < l - 1 else -1
+}
+
+# each open cell's value its distance: neighbours differ by at most 1 (1000 for a larger gap), each value v costs -0.1 v,
+# the source 0 (others cost 50); walls held at 0 by a cost and joined to nothing. The lowest energy is the BFS
+# distance field (each cell as far as the Lipschitz bound lets it)
+fn distanceModel(wall Array<Bool>&, l I64, k I64) potts.Pairs {
+    count I64 = 0
+    for i in range l * l {
+        for d in range 1, 4, 2 {
+            j := step(i, d, l)
+            if j >= 0 and not wall[i] and not wall[j]: count++
+        }
+    }
+    p := potts.Pairs(k, l * l, count)
+    q I64 = 0
+    for i in range l * l {
+        for d in range 1, 4, 2 {
+            j := step(i, d, l)
+            if j < 0 or wall[i] or wall[j]: continue
+            p.I[q], p.J[q] = i, j
+            for a in range k {
+                for b in range k: p.W[(q * k + a) * k + b] = 0.0 if (a - b).Abs() <= 1 else 1000.0
+            }
+            q++
+        }
+    }
+    for i in range l * l {
+        for v in range k: p.B[i * k + v] = (50.0 if v != 0 else 0.0) if i == 0 or wall[i] else -0.1 * F64(v)
+    }
+    p.Index()
+    return p
+}
+
+# ---- 3. cage sums on Latin squares ----
+
+fn cageSection(r mut rand.Rand&) ? io.Error {
+    n := 6
+    cells := n * n
+    rightA, rightF, sweeps, moves := 0, 0, 0, 0
+    tA, tF := 0.0, 0.0
+    for _ in range 12 {
+        sq := latin(n, r)
+        order := shuffled(cells, r)
+        m := potts.Potts.Colouring(n)
+        f := potts.Factors(n, 3, cells / 3, cells / 3, cells)
+        f.BySum = true
+        for q in range cells / 3 {
+            sum I64 = 0
+            for a in range 3 {
+                f.At[q * 3 + a] = order[q * 3 + a]
+                sum += I64(sq[order[q * 3 + a]])
+            }
+            f.Table[q] = q
+            for s in range f.Width(): f.T[q * f.Size + s] = 0.0 if s == sum else 1.0
+        }
+        f.Index()
+        m.Fac = f
+        e := peers(n)
+        s := potts.Sampler(cells, 16, n)
+        s.ColourFor(e, m)
+        s.Start(r)
+        t1 := time.Now()
+        s.Anneal(m, e, Array<F64>(cells), potts.Schedule(2000, 2.0, 0.05))
+        tA += ms(t1)
+        b := s.Best()
+        rightA += 1 if s.Energies[b] == 0.0 else 0
+        for c in range 16: sweeps += s.Sweeps[c]
+        s.Start(r)
+        t2 := time.Now()
+        s.Focus(m, e, Array<F64>(cells), potts.FocusSchedule(200000, 0.5, 0.1, 0.5, 1000))
+        tF += ms(t2)
+        rightF += 1 if s.Energies[s.Best()] == 0.0 else 0
+        for c in range 16: moves += s.Sweeps[c]
+    }
+    try io.PutLn("BySum | 6 x 6 Latin squares, 12 cages of 3 told their sums, Anneal 16 chains x 2000 sweeps | " + $rightA + "/12 | " + $(tA / 12.0).Fixed(1) + " | " + $(sweeps / 12) + " chain-sweeps")
+    try io.PutLn("BySum | the same, Focus 16 chains, breakout | " + $rightF + "/12 | " + $(tF / 12.0).Fixed(1) + " | " + $(moves / 12))
+}
+
+fn latin(n I64, r mut rand.Rand&) Array<I32> {
+    rows, cols, syms := shuffled(n, r), shuffled(n, r), shuffled(n, r)
+    sq := Array<I32>(n * n)
+    for i in range n {
+        for j in range n: sq[i * n + j] = I32(syms[(rows[i] + cols[j]) % n])
+    }
+    return sq
+}
+
+fn shuffled(n I64, r mut rand.Rand&) Array<I64> {
+    a := Array<I64>(n)
+    for i in range n: a[i] = i
+    for i in range n - 1 {
+        j := i + r.Below(n - i)
+        a[i], a[j] = a[j], a[i]
+    }
+    return a
+}
+
+# every pair of cells sharing a row or a column, both ways
+fn peers(n I64) message.Edges {
+    total := 2 * n * n * (n - 1)
+    src, dst := Array<I32>(total), Array<I32>(total)
+    count I64 = 0
+    for i in range n * n {
+        for j in range n * n {
+            if i == j or (i / n != j / n and i % n != j % n): continue
+            src[count], dst[count] = I32(i), I32(j)
+            count++
+        }
+    }
+    e := message.Edges(n * n, total)
+    e.Set(src, dst, count)
+    return e
+}
+
+# ---- 4. run counts with nn/lines ----
+
+fn runSection(r mut rand.Rand&) ? io.Error {
+    n := 4
+    l := grid(n, 5, 3)
+    data mut rand.Rand& = rand.Rand(r.Next())
+    val mut rand.Rand& = rand.Rand(r.Next())
+    g mut Array<I32>& = Array<I32>(n * n)
+    t0 := time.Now()
+    best := l.FitRestarts(4, fn(c, t) {
+        for it in range 1500 {
+            for _ in range 8 {
+                puzzle(c, n, data, g)
+                c.PseudoGrad(g, 0)
+            }
+            c.Step(0.05 * 0.5 * (1.0 + (3.14159265358979 * F64(it) / 1500.0).Cos()), F64(8 * n * n))
+        }
+    }, fn(c) {
+        return solveShare(c, n, 8, val)
+    }, r)
+    fit := ms(t0)
+    t1 := time.Now()
+    held := solveShare(l, n, 64, r)
+    try io.PutLn("Lines | run counts of 4 x 4 rows and columns: fit, 4 restarts x 1500 steps, kept restart's validation " + $(best * 100.0).Fixed(0) + " % | - | " + $fit.Fixed(0) + " (once) | -")
+    try io.PutLn("Lines | held-out puzzles, best of 2 chains x 200 sweeps | " + $I64(held * 64.0 + 0.5) + "/64 | " + $(ms(t1) / 64.0).Fixed(1) + " | 400 chain-sweeps")
+}
+
+fn grid(n I64, h I64, clues I64) lines.Lines {
+    l := lines.Lines(2, h, clues, n * n, 2 * n, 2 * n * n)
+    t I64 = 0
+    for q in range 2 * n {
+        l.Ptr[q] = t
+        for s in range n {
+            l.At[t] = q * n + s if q < n else s * n + (q - n)
+            t++
+        }
+    }
+    l.Ptr[2 * n] = t
+    l.Index()
+    return l
+}
+
+fn runsOf(g Array<I32>&, n I64, q I64) I64 {
+    runs, prev I64 = 0, 0
+    for t in range n {
+        v := I64(g[q * n + t] if q < n else g[t * n + (q - n)])
+        runs += 1 if v == 1 and prev == 0 else 0
+        prev = v
+    }
+    return runs
+}
+
+fn puzzle(l mut lines.Lines&, n I64, r mut rand.Rand&, g mut Array<I32>&) {
+    for i in range n * n: g[i] = I32(r.Below(2))
+    for q in range 2 * n: l.Clue[q] = runsOf(g, n, q)
+}
+
+fn solveShare(l mut lines.Lines&, n I64, count I64, r mut rand.Rand&) F64 {
+    g, x, best := Array<I32>(n * n), Array<I32>(n * n), Array<I32>(n * n)
+    right I64 = 0
+    for _ in range count {
+        puzzle(l, n, r, g)
+        low := 1e300
+        for _ in range 2 {
+            for i in range n * n: x[i] = I32(r.Below(2))
+            e := l.Anneal(x, 200, 2.0, 0.05, r)
+            if e >= low: continue
+            low = e
+            for i in range n * n: best[i] = x[i]
+        }
+        ok := true
+        for q in range 2 * n: ok = ok and runsOf(best, n, q) == l.Clue[q]
+        right += 1 if ok else 0
+    }
+    return F64(right) / F64(count)
+}

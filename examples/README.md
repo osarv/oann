@@ -19,6 +19,7 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `graph_count.olang` | message passing (`nn/message`) over random graphs, sum against mean aggregation, on a counting and a majority node task: trained on small graphs, tested on them and on larger, denser ones | `graphcount` |
 | `history_encode.olang` | `nn/history`'s encoder (one attention block, 14k parameters) against a flat perceptron (100k) over histories of 1-16 symbols, padded: the most frequent symbol, and whether the last symbol occurred before | `historyencode` |
 | `potts_latin.olang` | `nn/potts` end to end: Latin squares learnt from solved examples (`Pairs.Screen`, `PairFitter`, `Pruned`), held-out puzzles solved by `Sampler.Anneal` and `Sampler.Focus` - accuracy and time | `potts_latin` |
+| `energy_suite.olang` | the energy toolkit on generic puzzles: `Sampler.Focus` (breakout weights, `Cap`, `Hold`) on planted 3-SAT and 3-colouring, `Pairs.CutsetMove` on grid distances with walls and loops, `Factors.BySum` cage sums on Latin squares, `nn/lines` run counts with `FitRestarts` | `energybench` |
 | `best_of.olang` | best-of-N by energy (`nn/bestof`, `dyn/energy.Of`): a continuous Hopfield memory on `dyn` settled from N random states, the lowest energy kept, against one settle and against any of N | `bestof` |
 | `mnist_learn.olang` | MNIST by a settling system of `dyn`, taught by equilibrium propagation | `mnistlearn` |
 | `xor_settle.olang`, `xor_spiking.olang` | XOR by rate and by spiking `dyn` systems | `xor`, `spiking` |
@@ -27,3 +28,26 @@ MNIST is fetched into `data/mnist`, tiny Shakespeare into `data/shakespeare`, Ti
 | `mnist_board.olang` | MNIST through the simulated board (`board/engine`): lessons settled in F32 or on the board, the test set answered both ways, their agreement | `board` |
 
 `sleep_replay` is the sleep-retention mechanism on `dyn`, with no agent model.
+
+## The energy toolkit on generic puzzles (`make energybench`)
+
+One thread, seed 1 (`examples/potts_latin.olang` and `examples/energy_suite.olang`). "Moves" are a search's moves:
+Focus moves, CutsetMove calls, or chain-sweeps for Anneal (all chains together).
+
+| case | solved | ms a puzzle | moves a puzzle |
+|---|---|---|---|
+| Latin 6 x 6 learnt from 400 solved squares (Pairs, PairFitter, Pruned), Anneal 16 x 400 | 50/50 | 6-9 | 6400 chain-sweeps |
+| the same, Focus 16 chains, Slack 1 | 47/50 | 5-9 | at most 20000 a chain |
+| planted 3-SAT, 2000 cells, clauses 4.2 n: Focus plain | 4/4 | 56 | 174731 |
+| the same, breakout (Bump 0.1, Decay 0.5) / + Cap 1 / + Hold 1 | 4/4 each | 3.1 / 3.6 / 3.5 | 4291 / 5183 / 4374 |
+| planted 3-colouring, 1500 cells, mean degree 6: Focus plain (400000 moves) | 0/4 | 96 | 400000 |
+| the same, breakout / + Cap / + Hold | 4/4 each | 29 / 12 / 14 | 94664 / 53115 / 42207 |
+| distances from a source on a 10 x 10 grid, 20 % walls (loops), 40 values: CutsetMove on 3 x 3 windows | 8/8 | 227 | 825 |
+| the same energy, Anneal 16 x 2000 | 0/8 | 506 | 32000 chain-sweeps |
+| 6 x 6 Latin squares with 12 cages of 3 told their sums (BySum): Anneal 16 x 2000 | 1/12 | 30 | 26011 chain-sweeps |
+| the same, Focus 16 chains, breakout | 12/12 | 247 | 531291 |
+| run counts of 4 x 4 rows and columns, nn/lines (H 5), 4 restarts x 1500 steps (11 s once), held-out by Anneal 2 x 200 | 64/64 | 25 | 400 chain-sweeps |
+
+Reading: breakout weights are what solve the colourings; CutsetMove's exact window moves find a distance field that
+single-cell annealing cannot (each cell's value is pinned by hard neighbour constraints); the cage sums need Focus.
+
