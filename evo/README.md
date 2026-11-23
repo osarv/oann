@@ -149,8 +149,11 @@ A trial's seed depends only on the run's seed, the trial id and the rung. Result
 `Ready`, `Observe(g, rung, curve, loss)`, `Acquire(g)`, `Forecast(g, curve)` and `Propose(r)`. Three settings turn
 its parts on:
 
-- `Config.Screen`: each child is the most promising of this many candidates, outside the `Explore` share.
-- `Config.Proposals`: this share of children comes from the advisor's generator.
+- `Config.Screen`: each child is the most promising of this many candidates, outside the `Explore` share (default 32).
+- `Config.Proposals`: this share of children comes from the advisor's generator, once the advisor is `Ready` (default 0.3).
+
+The defaults are archnet's best on its toys: final gap to the optimum 0.17 against 0.20 for plain evolution, and on
+chain landscapes 0.06 against 0.17 (16 genes) and 0.41 against 0.88 (32 genes); see archnet/README.md.
 - `Config.Forecast`: halving ranks by forecast final loss.
 
 Every result at every rung is passed to the advisor, and each member records how it was made in `From` (drawn,
