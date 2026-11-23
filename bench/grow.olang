@@ -1,0 +1,96 @@
+# Growing a trained model against training the large one from scratch, at equal compute, on tiny Shakespeare
+# (surgery). The large model: 4 blocks of width 128, 4 heads of 32, feed-forward 512, context 64. The grown one starts
+# as 2 blocks of width 64, 2 heads of 32, feed-forward 256. It is trained for a share of the budget, then grown to the
+# large shape by surgery/ops: two blocks inserted, heads added, the feed-forward and the model widened (each step keeping
+# the function), its AdamW moments carried, and the rate warmed up again over 50 steps. Then it is trained on for the
+# rest. Compute is 3 x the matrix MACs per token (model.Spec.Macs) x tokens. Both runs use AdamW at 2e-3, batches of
+# 16, the same data order from the seed, and validation loss on the corpus's held-out tenth (20 fixed batches).
+# Arguments, all optional: large-model steps of budget (1500), the small model's share of the budget (0.3), seed (1),
+# threads (1).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../data/text"
+import "../nn/optim"
+import "../surgery/model"
+import "../surgery/ops"
+
+Batch I64 = 16
+
+fn train(net mut model.Net&, o mut optim.AdamW<F32, F32>&, ids Array<I32>&, r mut rand.Rand&, steps I64, rate fn&(step I64) F64, first I64) {
+    for s in range steps {
+        o.SetRate(rate(first + s))
+        net.Batch(ids, r)
+        net.G.Forward(Batch)
+        net.G.Backward(net.Loss)
+        o.Step()
+    }
+}
+
+
+fn main() ? {
+    args := os.Args()
+    budget := try args[1].ParseInt() if args.Len() > 1 else 1500
+    share := try args[2].ParseFloat() if args.Len() > 2 else 0.3
+    seed := U64(try args[3].ParseInt()) if args.Len() > 3 else U64(1)
+    threads := try args[4].ParseInt() if args.Len() > 4 else 1
+    try os.MkDirAll("data/shakespeare")
+    try text.Fetch("data/shakespeare/input.txt", text.Shakespeare)
+    c := try text.Corpus.Load("data/shakespeare/input.txt")
+    tr, val := c.Train(), c.Val()
+    v := c.Size()
+    big := model.Spec.Uniform(v, 128, 64, 4, 4)
+    small := model.Spec.Uniform(v, 64, 64, 2, 2)
+    mb, ms := F64(big.Macs()), F64(small.Macs())
+    tokens := F64(Batch * 64)
+    total := 3.0 * mb * tokens * F64(budget)
+    base := fn(step I64) F64: return 2e-3 * (F64(step + 1) / 50.0).Min(1.0)
+
+    # the large model from scratch
+    t0 := time.Now()
+    st := model.State.Fresh(big, seed)
+    net := model.Net.Build(st, Batch, threads)
+    o := net.AdamW(st, rate = 2e-3)
+    r := rand.Rand(seed)
+    train(net, o, tr, r, budget, base, 0)
+    scratch := net.Loss(val, 20)
+    s1 := F64(time.Since(t0)) / 1e9
+
+    # the small model, grown, trained on
+    t1 := time.Now()
+    smallSteps := I64(share * total / (3.0 * ms * tokens))
+    bigSteps := I64((1.0 - share) * total / (3.0 * mb * tokens))
+    sst := model.State.Fresh(small, seed)
+    snet := model.Net.Build(sst, Batch, threads)
+    so := snet.AdamW(sst, rate = 2e-3)
+    r2 := rand.Rand(seed)
+    train(snet, so, tr, r2, smallSteps, base, 0)
+    smallLoss := snet.Loss(val, 20)
+    grown := snet.CaptureAdamW(sst, so)
+    grown.Step = smallSteps
+    b := model.Block()
+    b.Heads = 2
+    b.HeadDim = 32
+    b.Hidden = 256
+    grown = ops.Deepen(grown, 1, b, seed + 1)
+    grown = ops.Deepen(grown, 3, b, seed + 2)
+    for k in range 4 {
+        grown = ops.AddHeads(grown, k, 2, seed + 10 + U64(k))
+        grown = ops.WidenFfn(grown, k, 512, seed + 20 + U64(k))
+    }
+    grown = ops.WidenDim(grown, 128, seed + 30)
+    grown.Warm = grown.Step
+    gnet := model.Net.Build(grown, Batch, threads)
+    justGrown := gnet.Loss(val, 20)
+    go := gnet.AdamW(grown, rate = 2e-3)
+    after := model.Rewarm(base, grown.Warm, 50)
+    train(gnet, go, tr, r2, bigSteps, after, grown.Step)
+    grownLoss := gnet.Loss(val, 20)
+    s2 := F64(time.Since(t1)) / 1e9
+
+    try io.PutLn("budget: " + $budget + " large-model steps (" + $(total / 1e12).Fixed(3) + " TMACs); large " + $I64(mb) + " MACs a token, small " + $I64(ms))
+    try io.PutLn("from scratch: val " + $scratch.Fixed(4) + " (" + $s1.Fixed(0) + " s)")
+    try io.PutLn("grown: small " + $smallSteps + " steps -> val " + $smallLoss.Fixed(4) + "; grown (" + $grown.Lineage.Len() + " lineage entries) val " + $justGrown.Fixed(4) + " right after; large " + $bigSteps + " steps -> val " + $grownLoss.Fixed(4) + " (" + $s2.Fixed(0) + " s)")
+}
