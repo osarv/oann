@@ -16,7 +16,8 @@
 #
 # Names: "embed", "pos", "head", "final.g", "final.b", and "bK." followed by "n1.g", "n1.b", "q", "k", "v", "o",
 # "n2.g", "n2.b", "up", "gate", "down" for block K. Optimizer state follows the names: "m.NAME" and "v.NAME" for
-# AdamW, "buf.NAME" for Muon's momentum, in the same layout as the parameter.
+# AdamW, "buf.NAME" for Muon's momentum, in the same layout as the parameter; "outer.NAME" is DiLoCo's outer momentum
+# (nn/dist), whose snapshots are States: Net.Layout and DistMeta give a DiLoCo what it needs to write one.
 
 import "std/os"
 import "std/rand"
@@ -24,6 +25,7 @@ import "../ad/graph"
 import "../io/checkpoint"
 import "../kernels/device"
 import "../kernels/mat"
+import "../nn/dist"
 import "../nn/optim"
 import "../tensor"
 
@@ -148,6 +150,9 @@ fn (s Spec&) Macs() I64 {
     return n
 }
 
+# the prefixes of the moments a parameter carries
+MomentPrefixes Array<String> = Array<String>["m.", "v.", "buf.", "outer."]
+
 # ---- the state ----
 
 # everything a model is: its spec, parameters and optimizer state by name, where training stands, and how it came to be
@@ -155,7 +160,7 @@ type State struct(spec Spec) {
     Arch Spec = spec
     Params Map<String, tensor.Tensor<F32>> = Map<String, tensor.Tensor<F32>>()
     Opt String = ""                 # "adamw", "muon", or "" (no optimizer state)
-    Moments Map<String, tensor.Tensor<F32>> = Map<String, tensor.Tensor<F32>>()   # "m.NAME", "v.NAME", "buf.NAME"
+    Moments Map<String, tensor.Tensor<F32>> = Map<String, tensor.Tensor<F32>>()   # "m.NAME", "v.NAME", "buf.NAME", "outer.NAME"
     Steps I64 = 0                   # the optimizer's steps (its bias corrections)
     Step I64 = 0                    # the training step (the schedule's)
     Warm I64 = -1                   # the step a warmup restarted at (Rewarm), -1 none
@@ -245,7 +250,9 @@ fn State.Open(path String&) State ? os.Error, checkpoint.SafetensorsError, Surge
     names, _ := st.Arch.Shapes()
     for n in names: st.Params.Put($n, try f.Get<F32>("p." + n))
     for n in f.Names() {
-        if n.StartsWith("m.") or n.StartsWith("v.") or n.StartsWith("buf."): st.Moments.Put($n, try f.Get<F32>(n))
+        for pre in MomentPrefixes {
+            if n.StartsWith(pre): st.Moments.Put($n, try f.Get<F32>(n))
+        }
     }
     st.Opt = try meta(f, "opt")
     st.Steps = try metaInt(f, "steps")
@@ -484,6 +491,40 @@ fn Rewarm(base fn&(step I64) F64, from I64, steps I64) fn&(step I64) F64 {
         if from < 0 or step < from or step >= from + steps: return base(step)
         return base(step) * F64(step - from + 1) / F64(steps)
     }
+}
+
+# ---- DiLoCo ----
+# A DiLoCo (nn/dist) over a Net's region writes its states as States when given the Net's Layout and the State's
+# DistMeta: "p.NAME" the shared model, "outer.NAME" the outer momentum, no inner optimizer's moments (every worker keeps
+# its own), the lineage with the round appended. Such a state opens with State.Open, goes through surgery/ops like any
+# other (the outer momentum moved as the first moment is), and seeds the grown model's run: DiLoCo.Publish of the new
+# Net's Params and Outer, numbered on from the round it grew out of.
+
+# the graph's parameters by name: their offsets in the region and dimensions
+fn (n Net&) Layout() dist.Layout {
+    l := dist.Layout()
+    for k in range n.Names.Len() {
+        nd := n.G.Info(n.Vars[k])
+        l.Names.Push(n.Names[k])
+        l.Offsets.Push(nd.Offset)
+        l.Dims.Push(Array<I64>[nd.Dims[i] for i in range nd.Dims.Rank])
+    }
+    return l
+}
+
+# the metadata pairs that make a DiLoCo state open as a State of st's spec, step, data position and lineage
+fn (st State&) DistMeta() Vec<String> {
+    lineage := ""
+    for k in range st.Lineage.Len(): lineage += ("\n" if k > 0 else "") + st.Lineage[k]
+    return Vec<String>["spec", st.Arch.Text(), "opt", "", "steps", "0", "step", $st.Step, "warm", $st.Warm, "data", $st.Data
+        "lineage", lineage]
+}
+
+# st's outer momentum ("outer.NAME") laid out as the graph's region, zero where st has none
+fn (n Net&) Outer(st State&) Array<F32> {
+    a := Array<F32>(n.G.ParamCount)
+    for k in range n.Names.Len(): n.moment(st, "outer." + n.Names[k], a, k)
+    return a
 }
 
 # ---- tests ----

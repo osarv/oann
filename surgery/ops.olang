@@ -33,11 +33,14 @@
 # - ResetOptimizer drops the state.
 # - Rewarm (model) restarts the rate with a warmup from the current step and carries on with the schedule.
 #
-# Where an operation adds parameters, their moments start at zero. Moments of copied parameters are copied. A divided
+# Where an operation adds parameters, their moments start at zero. DiLoCo's outer momentum ("outer.NAME", nn/dist) moves
+# with its parameter as the first moment does. Moments of copied parameters are copied. A divided
 # column's first moment is divided like the column, and its second moment by the square.
 
 import "std/rand"
+import "std/os"
 import "model"
+import "../nn/dist"
 import "../nn/optim"
 import "../tensor"
 
@@ -85,9 +88,10 @@ fn draw(t mut tensor.Tensor<F32>&, rowsFrom Array<I64>&, colsFrom Array<I64>&, s
 
 fn (st mut model.State&) set(name String&, t tensor.Tensor<F32>) { st.Params.Put($name, t) }
 
-# the moments of parameter name, each through f (key, tensor) where present
+# the moments of parameter name, each through f (key, tensor) where present - the optimizer's and DiLoCo's outer
+# momentum ("outer.", nn/dist)
 fn (st mut model.State&) moved(name String&, f fn&(key String&, t tensor.Tensor<F32>&) tensor.Tensor<F32>) {
-    for pre in Array<String>["m.", "v.", "buf."] {
+    for pre in model.MomentPrefixes {
         key := pre + name
         if not st.Moments.Has(key): continue
         t := try st.Moments.Get(key) catch { unreachable }
@@ -114,7 +118,7 @@ fn (st mut model.State&) reshape(name String&, rows Array<I64>&, cols Array<I64>
 fn renamed(key String&, from I64, by I64, drop I64) String {
     pre := ""
     rest := $key
-    for p in Array<String>["m.", "v.", "buf."] {
+    for p in model.MomentPrefixes {
         if key.StartsWith(p) {
             pre = p
             rest = $key[p.Len():]
@@ -490,7 +494,7 @@ fn Replace(st model.State&, i I64, b model.Block, ids Array<I32>&, steps I64, ra
         } else {
             out.set(name, mine.Clone())
         }
-        for pre in Array<String>["m.", "v.", "buf."]: out.Moments.Remove(pre + name)
+        for pre in model.MomentPrefixes: out.Moments.Remove(pre + name)
     }
     for key in st.Params.Keys() {
         if key.StartsWith(p) and not (key in names): out.Params.Remove(key)
@@ -564,10 +568,14 @@ fn ToAdamW(st model.State&) model.State {
     return out
 }
 
-# the optimizer's state dropped, its steps from zero, a warmup restarted at the current step (model.Rewarm)
+# the optimizer's state dropped, its steps from zero, a warmup restarted at the current step (model.Rewarm); DiLoCo's
+# outer momentum ("outer.") is not the optimizer's and stays
 fn ResetOptimizer(st model.State&) model.State {
     out := st.Copy()
     out.Moments = Map<String, tensor.Tensor<F32>>()
+    for key in st.Moments.Keys() {
+        if key.StartsWith("outer."): out.Moments.Put(key, (try st.Moments.Get(key) catch { unreachable }).Clone())
+    }
     out.Opt = ""
     out.Steps = 0
     out.Warm = st.Step
@@ -645,6 +653,51 @@ test Deepen "each growth keeps the logits: deepen, widen the feed-forward, add h
     net := model.Net.Build(big, 2)
     o := net.AdamW(big)
     assert o.Steps == 20                        # the optimizer's state carried through
+}
+
+test Deepen "a DiLoCo state is a State: opened, deepened with its outer momentum moved, it seeds the grown model's run" {
+    root := try os.MkTemp("", "surgery-dist-") catch { unreachable }
+    store := dist.DirStore(root)
+    st := model.State.Fresh(model.Spec.Uniform(11, 16, 8, 2, 2), 3)
+    net := model.Net.Build(st, 2)
+    params := net.G.Params().Flat()!
+    o := net.AdamW(st)
+    d := dist.DiLoCo<dist.DirStore>(store, 0, 1, params.Len(), snapshotEvery = 1, name = "small")
+    d.Named = net.Layout()
+    d.Meta = st.DistMeta()
+    try d.Begin(params) catch { unreachable }
+    ids := Array<I32>[I32(i * 7 % 11) for i in range 200]
+    r := rand.Rand(5)
+    for _ in range 3 {
+        for _ in range 4 {
+            net.Batch(ids, r)
+            net.G.Forward(2)
+            net.G.Backward(net.Loss)
+            o.Step()
+        }
+        try d.Sync(params) catch { unreachable }
+    }
+    path := root + "/small/state.2"
+    back := try model.State.Open(path) catch { unreachable }
+    assert back.Valid() and back.Lineage[back.Lineage.Len() - 2].StartsWith("diloco small round 2")
+    assert model.Net.Build(back, 2).G.Params().Flat()! == d.Global
+    outer := net.Outer(back)
+    assert outer == d.Buf and outer.Some(fn(x F32) Bool { return x != F32(0.0) })
+    grown := Deepen(back, 1, model.Block(), 7)
+    assert (try grown.Moments.Get("outer.b2.q") catch { unreachable }).Flat()! == (try back.Moments.Get("outer.b1.q") catch { unreachable }).Flat()!
+    assert not grown.Moments.Has("outer.b1.q")
+    big := model.Net.Build(grown, 2)
+    e := dist.DiLoCo<dist.DirStore>(store, 0, 1, big.G.ParamCount, name = "grown")
+    e.Named = big.Layout()
+    e.Meta = grown.DistMeta()
+    try e.Publish(big.G.Params().Flat()!, big.Outer(grown), 2) catch { unreachable }
+    other := model.Net.Build(model.State.Fresh(grown.Arch, 9), 2)        # a worker: another start, the run's model taken
+    f := dist.DiLoCo<dist.DirStore>(store, 1, 2, other.G.ParamCount, name = "grown")
+    f.Named = other.Layout()
+    mine := other.G.Params().Flat()!
+    try f.Begin(mine) catch { unreachable }
+    assert f.Round == 3 and mine == big.G.Params().Flat()! and f.Buf == big.Outer(grown)
+    try os.RemoveAll(root) catch { }
 }
 
 test DropBlock "removal: blocks and heads dropped by importance, the feed-forward pruned; each gives a valid model, the least important costing least" {

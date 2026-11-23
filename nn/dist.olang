@@ -11,15 +11,17 @@
 # the result, keeping its inner optimizer's state. One round moves one delta up and one update down a worker, each the
 # size of the parameters in the codec chosen, instead of a gradient every step.
 #
-# The store (`Store`: Put and Get of named byte blobs, nothing else) is all the workers share: `DirStore` a directory
-# (processes on one machine, or a shared disk), `HttpStore` a plain blob store over HTTP(S) - PUT and GET of a name under
-# a base URL, 404 for a name not there yet (README "Distributed training" has the contract). Names:
+# The store (`Store`: Put and Get of named byte blobs, and Flush to make what was put visible at once) is all the
+# workers share: `DirStore` a directory (processes on one machine, or a shared disk), `HttpStore` a plain blob store over
+# HTTP(S) - PUT and GET of a name under a base URL, 404 for a name not there yet - and `HfStore` a Hugging Face
+# repository, a commit a Flush (README "Distributed training" has the contracts). Names, under the run's (Name/):
 #     r<R>.d<W>      worker W's delta of round R               r<R>.u     the update of round R (its contributors in its metadata)
 #     state.<R>      the global model and the outer momentum after round R, every SnapshotEvery rounds
 #     latest         the round of the newest state.<R>, as text
 # Every blob is a safetensors file (io/checkpoint), so any of them opens in PyTorch, and a state is a checkpoint: the
-# flat parameter region "global" (F32, Graph.Params' or a BF16 graph's Masters' order), "momentum", and the round,
-# the run's name and lineage in the metadata.
+# flat parameter region "global" (F32, Graph.Params' or a BF16 graph's Masters' order) and "momentum", or - given the
+# parameters' Layout (Named) - surgery/model's checkpoint, "p.NAME" and "outer.NAME", which surgery/ops grows and
+# Publish seeds a run from; the round, the run and the lineage in the metadata.
 #
 # Variants: the codec of the deltas and of the update (F32, BF16, Int8 - blocks of 256 with an F32 scale each -, or
 # TopK: the largest Keep share of the entries; the rest stays in the worker's own model - its parameters set to the
@@ -29,8 +31,11 @@
 # Quorum deltas in) is left out of the round, and its delta, when it comes, is folded into that fragment's next round
 # (Stale); a worker that joins late (Begin) starts from the newest state and replays the updates after it.
 
+import "std/base64"
 import "std/http"
+import "std/json"
 import "std/os"
+import "std/sha256"
 import "std/time"
 import "../io/checkpoint"
 import "../tensor"
@@ -45,8 +50,9 @@ type StoreError error {
 
 # what workers share: named blobs, each written once, read by anyone. Get of a name not written (yet) is Missing
 type Store trait {
-    Put(name String&, data Array<U8>&) ? StoreError
+    mut Put(name String&, data Array<U8>&) ? StoreError
     Get(name String&) Array<U8>& ? StoreError
+    mut Flush() ? StoreError                # what Put staged made visible, all of it at once (a store that writes at once: nothing)
 }
 
 # a directory: each blob a file, written beside and renamed into place so a reader never sees half of one
@@ -54,8 +60,12 @@ type DirStore struct(root String&) {
     Root String& = root
 }
 
-fn (s DirStore&) Put(name String&, data Array<U8>&) ? StoreError {
+fn (s mut DirStore&) Flush() ? StoreError { }
+
+fn (s mut DirStore&) Put(name String&, data Array<U8>&) ? StoreError {
     path := s.Root + "/" + name
+    slash := try path.FindLast("/") catch default -1
+    if slash > 0: try os.MkDirAll(path[:slash]) catch err { error StoreError.Failed("making " + path[:slash] + ": " + $err) }
     part := path + ".part"
     try os.WriteFile(part, data) catch err { error StoreError.Failed("writing " + part + ": " + $err) }
     try os.Rename(part, path) catch err { error StoreError.Failed("renaming " + part + ": " + $err) }
@@ -81,7 +91,9 @@ fn (s HttpStore&) headers() Array<http.Header> {
     return Array<http.Header>(1, http.Header("Authorization", "Bearer " + s.Token))
 }
 
-fn (s HttpStore&) Put(name String&, data Array<U8>&) ? StoreError {
+fn (s mut HttpStore&) Flush() ? StoreError { }
+
+fn (s mut HttpStore&) Put(name String&, data Array<U8>&) ? StoreError {
     r := try http.Response.Send("PUT", s.Base + "/" + name, s.headers(), data, s.TimeoutMs) catch err { error StoreError.Failed("PUT " + name + ": " + $err) }
     if r.Status < 200 or r.Status >= 300 { error StoreError.Failed("PUT " + name + ": status " + $r.Status) }
 }
@@ -91,6 +103,162 @@ fn (s HttpStore&) Get(name String&) Array<U8>& ? StoreError {
     if r.Status == 404 { error StoreError.Missing }
     if r.Status < 200 or r.Status >= 300 { error StoreError.Failed("GET " + name + ": status " + $r.Status) }
     return r.Body.Bytes()
+}
+
+# ---- a Hugging Face repository ----
+#
+# A repository on the Hugging Face Hub (private, or any the token may write) as the store, where an upload is a commit:
+# Put stages a blob and Flush commits everything staged in one commit - a worker's delta, or the coordinator's update
+# with its state - so a round is one commit a worker. Get reads a blob through the repository's resolve URL, 404 (not
+# committed yet) being Missing. A blob goes in the commit itself (base64) where the Hub's preupload check says
+# "regular", or first to Git LFS where it says "lfs" (large blobs): the LFS batch API gives an upload URL - one PUT, or
+# one PUT a part and a completion for a multipart upload - and the commit then names the blob by its SHA-256. Endpoint
+# may point elsewhere (a mirror, or a mock in tests); Kind is "model" or "dataset". The Hub limits commits a repository
+# an hour, so rounds a minute or more apart suit it; a round every few seconds wants an object store (HttpStore).
+
+# a blob put and not yet committed
+type staged struct(Name String&, Data Array<U8>&) {
+    Name
+    Data
+}
+
+type HfStore struct(repo String&, token String&, kind String& = "model", revision String& = "main"
+        endpoint String& = "https://huggingface.co", timeoutMs I64 = 300000) {
+    Repo String& = repo
+    Token String& = token
+    Kind String& = kind
+    Revision String& = revision
+    Endpoint String& = endpoint
+    TimeoutMs I64 = timeoutMs
+    pending Vec<staged> = Vec<staged>()
+}
+
+fn (s HfStore&) api() String { return s.Endpoint + "/api/" + s.Kind + "s/" + s.Repo }
+fn (s HfStore&) site() String { return s.Endpoint + "/" + ("" if s.Kind == "model" else s.Kind + "s/") + s.Repo }
+fn (s HfStore&) auth() http.Header { return http.Header("Authorization", "Bearer " + s.Token) }
+
+fn (s HfStore&) send(method String&, url String&, headers Array<http.Header>&, body Array<U8>&) http.Response ? StoreError {
+    r := try http.Response.Send(method, url, headers, body, s.TimeoutMs) catch err { error StoreError.Failed(method + " " + url + ": " + $err) }
+    if r.Status < 200 or r.Status >= 300 { error StoreError.Failed(method + " " + url + ": status " + $r.Status + " " + $r.Body[:r.Body.Len().Min(300)]) }
+    return r
+}
+
+fn (s HfStore&) json(r http.Response&) json.Json& ? StoreError {
+    return try json.Json.Parse(r.Body) catch err { error StoreError.Malformed("the Hub's reply: " + $err) }
+}
+
+# names are paths of letters, digits and . _ - /, nothing else needing escaping in a URL or JSON
+fn plainName(name String&) Bool {
+    return name.Len() > 0 and name.Every(fn(c Char) Bool { return c.IsLetter() or c.IsDigit() or c == '.' or c == '_' or c == '-' or c == '/' })
+}
+
+fn (s mut HfStore&) Put(name String&, data Array<U8>&) ? StoreError {
+    if not plainName(name) { error StoreError.Failed("a blob name the store does not take: " + name) }
+    s.pending.Push(staged(name, data.Copy()))
+}
+
+fn (s HfStore&) Get(name String&) Array<U8>& ? StoreError {
+    r := try http.Response.Send("GET", s.site() + "/resolve/" + s.Revision + "/" + name, Array<http.Header>[s.auth()], "", s.TimeoutMs)
+        catch err { error StoreError.Failed("GET " + name + ": " + $err) }
+    if r.Status == 404 { error StoreError.Missing }
+    if r.Status < 200 or r.Status >= 300 { error StoreError.Failed("GET " + name + ": status " + $r.Status) }
+    return r.Body.Bytes()
+}
+
+# the preupload request: each blob's path, size and first 512 bytes (base64)
+fn preuploadBody(blobs Array<staged>&) String {
+    t := "{\"files\": ["
+    for i, b in blobs {
+        t += ("" if i == 0 else ", ") + "{\"path\": \"" + b.Name + "\", \"size\": " + $b.Data.Len() + ", \"sample\": \"" +
+            base64.Encode(b.Data[:b.Data.Len().Min(512)]) + "\"}"
+    }
+    return t + "]}"
+}
+
+# the commit, as the Hub's NDJSON: a header line, then a line a blob - its bytes inline (base64) or its LFS object
+fn commitBody(summary String&, blobs Array<staged>&, lfs Array<Bool>&) String {
+    t := "{\"key\": \"header\", \"value\": {\"summary\": \"" + summary + "\", \"description\": \"\"}}\n"
+    for i, b in blobs {
+        if lfs[i] {
+            t += "{\"key\": \"lfsFile\", \"value\": {\"path\": \"" + b.Name + "\", \"algo\": \"sha256\", \"oid\": \"" +
+                sha256.Hex(b.Data) + "\", \"size\": " + $b.Data.Len() + "}}\n"
+        } else {
+            t += "{\"key\": \"file\", \"value\": {\"path\": \"" + b.Name + "\", \"encoding\": \"base64\", \"content\": \"" +
+                base64.Encode(b.Data) + "\"}}\n"
+        }
+    }
+    return t
+}
+
+# everything staged committed at once (nothing staged: nothing done)
+fn (s mut HfStore&) Flush() ? StoreError {
+    if s.pending.Len() == 0: return
+    blobs := s.pending.ToArray()
+    s.pending = Vec<staged>()
+    pre := try s.json(try s.send("POST", s.api() + "/preupload/" + s.Revision, Array<http.Header>[s.auth(), http.Header("Content-Type", "application/json")]
+        preuploadBody(blobs)))
+    lfs := Array<Bool>(blobs.Len())
+    files := try (try pre.At("files") catch err { error StoreError.Malformed("preupload: " + $err) }).AsArr() catch err { error StoreError.Malformed("preupload: " + $err) }
+    for f in files {
+        path := try (try f.At("path") catch { error StoreError.Malformed("preupload: a file without a path") }).AsStr() catch { error StoreError.Malformed("preupload") }
+        mode := try (try f.At("uploadMode") catch { error StoreError.Malformed("preupload: no uploadMode") }).AsStr() catch { error StoreError.Malformed("preupload") }
+        for i, b in blobs {
+            if b.Name == path: lfs[i] = mode == "lfs"
+        }
+    }
+    for i, b in blobs {
+        if lfs[i]: try s.upload(b.Data)
+    }
+    try s.send("POST", s.api() + "/commit/" + s.Revision, Array<http.Header>[s.auth(), http.Header("Content-Type", "application/x-ndjson")]
+        commitBody("oann nn/dist: " + $blobs.Len() + " blobs, " + blobs[0].Name, blobs, lfs))
+}
+
+# data into the repository's Git LFS store (where the batch API says it is not there already)
+fn (s HfStore&) upload(data Array<U8>&) ? StoreError {
+    oid := sha256.Hex(data)
+    lfsHeaders := Array<http.Header>[s.auth(), http.Header("Accept", "application/vnd.git-lfs+json"), http.Header("Content-Type", "application/vnd.git-lfs+json")]
+    body := "{\"operation\": \"upload\", \"transfers\": [\"basic\", \"multipart\"], \"hash_algo\": \"sha256\", \"ref\": {\"name\": \"" + s.Revision +
+        "\"}, \"objects\": [{\"oid\": \"" + oid + "\", \"size\": " + $data.Len() + "}]}"
+    batch := try s.json(try s.send("POST", s.site() + ".git/info/lfs/objects/batch", lfsHeaders, body))
+    obj := try (try (try batch.At("objects") catch { error StoreError.Malformed("LFS batch: no objects") }).AsArr() catch { error StoreError.Malformed("LFS batch: objects") })[0].AsObj() catch { error StoreError.Malformed("LFS batch: an object") }
+    if obj.Has("error") { error StoreError.Failed("LFS: " + $(try obj.At("error") catch { unreachable })) }
+    if not obj.Has("actions"): return                          # the Hub has it already
+    actions := try obj.At("actions") catch { unreachable }
+    if not actions.Has("upload"): return
+    up := try actions.At("upload") catch { unreachable }
+    href := try (try up.At("href") catch { error StoreError.Malformed("LFS batch: no href") }).AsStr() catch { error StoreError.Malformed("LFS batch: href") }
+    head := Vec<http.Header>()
+    chunk I64 = 0
+    parts := Vec<String&>()
+    if up.Has("header") {
+        h := try (try up.At("header") catch { unreachable }).AsObj() catch { error StoreError.Malformed("LFS batch: header") }
+        for k in range h.Len() {
+            key := h.Keys[k]
+            v := try h.Values[k].AsStr() catch { error StoreError.Malformed("LFS batch: a header value") }
+            if key == "chunk_size": chunk = try v.ParseInt() catch { error StoreError.Malformed("LFS batch: chunk_size") }
+            else if key.Every(fn(c Char) Bool { return c.IsDigit() }): parts.Push(v)
+            else: head.Push(http.Header(key, v))
+        }
+    }
+    if chunk == 0 {
+        try s.send("PUT", href, head.ToArray(), data)
+    } else {                                                     # multipart: a part a URL, then the completion
+        done := "{\"oid\": \"" + oid + "\", \"parts\": ["
+        for i in range parts.Len() {
+            lo := i * chunk
+            r := try s.send("PUT", parts[i], Array<http.Header>(0, http.Header("", "")), data[lo:(lo + chunk).Min(data.Len())])
+            etag := try r.Header("ETag") catch { error StoreError.Malformed("LFS batch: a part without an ETag") }
+            tag := String(Array<Char>[c for c in etag if c != '"'])           # an ETag comes quoted
+            done += ("" if i == 0 else ", ") + "{\"partNumber\": " + $(i + 1) + ", \"etag\": \"" + tag + "\"}"
+        }
+        try s.send("POST", href, Array<http.Header>[http.Header("Content-Type", "application/json")], done + "]}")
+    }
+    if actions.Has("verify") {
+        v := try actions.At("verify") catch { unreachable }
+        vh := try (try v.At("href") catch { error StoreError.Malformed("LFS batch: verify href") }).AsStr() catch { error StoreError.Malformed("LFS batch: verify href") }
+        try s.send("POST", vh, Array<http.Header>[s.auth(), http.Header("Content-Type", "application/vnd.git-lfs+json")]
+            "{\"oid\": \"" + oid + "\", \"size\": " + $data.Len() + "}")
+    }
 }
 
 # ---- codecs ----
@@ -218,10 +386,9 @@ type Report struct(Round I64, Lo I64, Hi I64, Contributors I64, Stale I64, Up I6
 # are the outer Nesterov step's (DiLoCo's 0.7 and 0.9); Coded the deltas' codec, Updates the update's; Keep TopK's share;
 # Fragments the streaming split; the coordinator waits up to TimeoutMs for every delta, then goes on with Quorum (at
 # least 1: its own); PollMs between looks at the store; SnapshotEvery rounds a state is written (0: never)
-type DiLoCo<S Store> struct(store S&, worker I64, workers I64, count I64, outerRate F64 = 0.7, momentum F64 = 0.9
+type DiLoCo<S Store> struct(store mut S&, worker I64, workers I64, count I64, outerRate F64 = 0.7, momentum F64 = 0.9
         nesterov Bool = true, coded Codec = Codec.BF16, updates Codec = Codec.BF16, keep F64 = 0.01, fragments I64 = 1
-        quorum I64 = 1, timeoutMs I64 = 600000, pollMs I64 = 5, stale Bool = true, snapshotEvery I64 = 0, name String& = "run"
-        lineage String& = "") {
+        quorum I64 = 1, timeoutMs I64 = 600000, pollMs I64 = 5, stale Bool = true, snapshotEvery I64 = 0, name String& = "run") {
     store
     Worker I64 = worker
     Workers I64 = workers
@@ -237,8 +404,9 @@ type DiLoCo<S Store> struct(store S&, worker I64, workers I64, count I64, outerR
     PollMs I64 = pollMs
     Stale Bool = stale
     SnapshotEvery I64 = snapshotEvery
-    Name String& = name
-    Lineage String& = lineage
+    Name String& = name                             # the run: every blob's name is "NAME/..." ("" for none)
+    Named Layout = Layout()                         # the region's parameters by name, for a named state (none: flat)
+    Meta Vec<String> = Vec<String>()                # metadata pairs (key, value, ...) every state carries
     Round I64 = 0                                   # the next round to sync
     Global mut Array<F32>& = Array<F32>(count)      # the shared model as of the last round synced
     Buf mut Array<F32>& = Array<F32>(count)         # the outer momentum (the coordinator's)
@@ -249,6 +417,9 @@ type DiLoCo<S Store> struct(store S&, worker I64, workers I64, count I64, outerR
     BytesUp I64 = 0
     BytesDown I64 = 0
 }
+
+# a blob's name in the store: under the run's
+fn (d DiLoCo<S>&) key(name String&) String { return name if d.Name == "" else d.Name + "/" + name }
 
 # fragment f's entries: lo, hi
 fn (d DiLoCo<S>&) fragment(f I64) I64, I64 {
@@ -262,7 +433,7 @@ fn (d DiLoCo<S>&) sleep() { time.Sleep(time.Duration.Millis(d.PollMs)) }
 fn (d mut DiLoCo<S>&) await(name String&, ms I64) Array<U8>& ? StoreError {
     t0 := time.Now()
     for {
-        b := try d.store.Get(name) catch StoreError.Missing {
+        b := try d.store.Get(d.key(name)) catch StoreError.Missing {
             if time.Since(t0) > ms * 1000000 { error StoreError.Timeout("waited " + $ms + " ms for " + name) }
             d.sleep()
             continue
@@ -276,23 +447,16 @@ fn (d mut DiLoCo<S>&) await(name String&, ms I64) Array<U8>& ? StoreError {
 # themselves (every worker's the same: the same seed) when there is none yet. Call once before training
 fn (d mut DiLoCo<S>&) Begin(params mut Array<F32>&) ? StoreError {
     for i in range params.Len(): d.Global[i] = params[i]
-    latest := try d.store.Get("latest") catch StoreError.Missing default "".Bytes()
+    latest := try d.store.Get(d.key("latest")) catch StoreError.Missing default "".Bytes()
     if latest.Len() > 0 {
         r := try String(latest).Trim().ParseInt() catch { error StoreError.Malformed("latest") }
-        b := try d.store.Get("state." + $r)
+        b := try d.store.Get(d.key("state." + $r))
         d.BytesDown += b.Len()
-        f := try checkpoint.File.Parse(b) catch err { error StoreError.Malformed($err) }
-        g := (try f.Get<F32>("global") catch err { error StoreError.Malformed($err) }).Flat()!
-        m := (try f.Get<F32>("momentum") catch err { error StoreError.Malformed($err) }).Flat()!
-        if g.Len() != d.Global.Len() { error StoreError.Malformed("a state of " + $g.Len() + " parameters for " + $d.Global.Len()) }
-        for i in range g.Len() {
-            d.Global[i] = g[i]
-            d.Buf[i] = m[i]
-        }
+        try d.Read(b)
         d.Round = r + 1
     }
     for {                                           # the updates since
-        b := try d.store.Get("r" + $d.Round + ".u") catch StoreError.Missing { break }
+        b := try d.store.Get(d.key("r" + $d.Round + ".u")) catch StoreError.Missing { break }
         d.BytesDown += b.Len()
         try d.apply(b)
         d.Round++
@@ -319,7 +483,8 @@ fn (d mut DiLoCo<S>&) Sync(params mut Array<F32>&) Report ? StoreError {
     sent := Array<F32>(hi - lo)
     blob := try Encode(delta, d.Coded, d.Keep, Array<String>["round", $d.Round, "worker", $d.Worker, "lo", $lo], sent)
     for i in range lo, hi: d.residual[i] = delta[i - lo] - sent[i - lo] if d.Coded == Codec.TopK else 0.0
-    try d.store.Put("r" + $d.Round + ".d" + $d.Worker, blob)
+    try d.store.Put(d.key("r" + $d.Round + ".d" + $d.Worker), blob)
+    try d.store.Flush()
     d.BytesUp += blob.Len()
     t0 := time.Now()
     contributors, stale := 0, 0
@@ -352,7 +517,7 @@ fn (d mut DiLoCo<S>&) coordinate(lo I64, hi I64) I64, I64 ? StoreError {
     for {
         for w in range d.Workers {
             if have[w]: continue
-            b := try d.store.Get("r" + $d.Round + ".d" + $w) catch StoreError.Missing { continue }
+            b := try d.store.Get(d.key("r" + $d.Round + ".d" + $w)) catch StoreError.Missing { continue }
             if w != d.Worker: d.BytesDown += b.Len()
             try Decode(b, one)
             for i in range n: d.acc[lo + i] += one[i]
@@ -368,7 +533,7 @@ fn (d mut DiLoCo<S>&) coordinate(lo I64, hi I64) I64, I64 ? StoreError {
     for w in range d.Workers {
         k := f * d.Workers + w
         if d.Stale and d.late[k] and prev >= 0 {
-            b := try d.store.Get("r" + $prev + ".d" + $w) catch StoreError.Missing default "".Bytes()
+            b := try d.store.Get(d.key("r" + $prev + ".d" + $w)) catch StoreError.Missing default "".Bytes()
             if b.Len() > 0 {
                 d.BytesDown += b.Len()
                 try Decode(b, one)
@@ -393,28 +558,92 @@ fn (d mut DiLoCo<S>&) coordinate(lo I64, hi I64) I64, I64 ? StoreError {
     sent := Array<F32>(n)
     blob := try Encode(upd, d.Updates, d.Keep, Array<String>["round", $d.Round, "lo", $lo, "contributors", $total, "stale", $stale
         "workers", names.ToArray().Join(",")], sent)
-    try d.store.Put("r" + $d.Round + ".u", blob)
+    try d.store.Put(d.key("r" + $d.Round + ".u"), blob)
     d.BytesUp += blob.Len()
     for i in range n: d.Global[lo + i] -= sent[i]
     if d.SnapshotEvery > 0 and (d.Round + 1) % d.SnapshotEvery == 0: try d.Snapshot()
+    try d.store.Flush()                             # the update and the state: one commit where the store makes commits
     return total, stale
 }
 
-# the global model and the outer momentum as state.<Round>, and "latest" naming it (the coordinator's, after a round)
+# the global model and the outer momentum as state.<Round>, and "latest" naming it (the coordinator's, after a round;
+# Flush after). With a layout (Named) the state is named as surgery/model's checkpoints are - "p.NAME" each parameter in its
+# shape, "outer.NAME" its outer momentum, Meta's pairs (a model's spec and the rest State.Open reads), "lineage" with
+# this round appended - so a state opens as a model.State, is grown or pruned by surgery/ops, and seeds a run again
+# (Publish); without one, "global" and "momentum" are the flat region
 fn (d mut DiLoCo<S>&) Snapshot() ? StoreError {
     w := checkpoint.Writer()
+    lineage := ""
+    for i in range d.Meta.Len() / 2 {
+        k, v := d.Meta[2 * i], d.Meta[2 * i + 1]
+        if k == "lineage": lineage = v
+        else: w.Meta(k, v)
+    }
+    w.Meta("lineage", lineage + ("\n" if lineage != "" else "") + "diloco " + d.Name + " round " + $d.Round + " of " + $d.Workers + " workers")
     w.Meta("round", $d.Round)
-    w.Meta("name", d.Name)
-    w.Meta("lineage", d.Lineage)
+    w.Meta("run", d.Name)
     w.Meta("workers", $d.Workers)
     w.Meta("fragments", $d.Fragments)
     n := d.Global.Len()
-    try w.Add("global", tensor.Tensor<F32>.Over(d.Global, 0, n)!) catch err { error StoreError.Malformed($err) }
-    try w.Add("momentum", tensor.Tensor<F32>.Over(d.Buf, 0, n)!) catch err { error StoreError.Malformed($err) }
+    L := d.Named
+    if L.Names.Len() == 0 {
+        try w.Add("global", tensor.Tensor<F32>.Over(d.Global, 0, n)!) catch err { error StoreError.Malformed($err) }
+        try w.Add("momentum", tensor.Tensor<F32>.Over(d.Buf, 0, n)!) catch err { error StoreError.Malformed($err) }
+    } else {
+        for k in range L.Names.Len() {
+            try w.Add("p." + L.Names[k], tensor.Tensor<F32>.Over(d.Global, L.Offsets[k], ...L.Dims[k])!) catch err { error StoreError.Malformed($err) }
+            try w.Add("outer." + L.Names[k], tensor.Tensor<F32>.Over(d.Buf, L.Offsets[k], ...L.Dims[k])!) catch err { error StoreError.Malformed($err) }
+        }
+    }
     b := try w.Bytes() catch err { error StoreError.Failed("encoding a state: " + $err) }
-    try d.store.Put("state." + $d.Round, b)
-    try d.store.Put("latest", $d.Round)
+    try d.store.Put(d.key("state." + $d.Round), b)
+    try d.store.Put(d.key("latest"), $d.Round)
     d.BytesUp += b.Len()
+}
+
+# the global model and outer momentum of a state blob (by Named, or flat); a named one's missing
+# "outer.NAME" is zero
+fn (d mut DiLoCo<S>&) Read(b Array<U8>&) ? StoreError {
+    f := try checkpoint.File.Parse(b) catch err { error StoreError.Malformed($err) }
+    if f.Has("global") {
+        g := (try f.Get<F32>("global") catch err { error StoreError.Malformed($err) }).Flat()!
+        m := (try f.Get<F32>("momentum") catch err { error StoreError.Malformed($err) }).Flat()!
+        if g.Len() != d.Global.Len() { error StoreError.Malformed("a state of " + $g.Len() + " parameters for " + $d.Global.Len()) }
+        for i in range g.Len() {
+            d.Global[i] = g[i]
+            d.Buf[i] = m[i]
+        }
+        return
+    }
+    L := d.Named
+    if L.Names.Len() == 0 { error StoreError.Malformed("a named state for a DiLoCo without a layout (Named)") }
+    for k in range L.Names.Len() {
+        p := tensor.Tensor<F32>.Over(d.Global, L.Offsets[k], ...L.Dims[k])!
+        try f.Read("p." + L.Names[k], p) catch err { error StoreError.Malformed($err) }
+        m := tensor.Tensor<F32>.Over(d.Buf, L.Offsets[k], ...L.Dims[k])!
+        if f.Has("outer." + L.Names[k]) { try f.Read("outer." + L.Names[k], m) catch err { error StoreError.Malformed($err) } }
+        else { m.Fill(0.0) }
+    }
+}
+
+# a run seeded (the coordinator's, before any worker Begins): params and the outer momentum as the state after round
+# "round" - a grown model's carried on from the run it grew out of, numbering on - then params are the shared model
+fn (d mut DiLoCo<S>&) Publish(params Array<F32>&, momentum Array<F32>&, round I64) ? StoreError {
+    for i in range params.Len() {
+        d.Global[i] = params[i]
+        d.Buf[i] = momentum[i]
+    }
+    d.Round = round
+    try d.Snapshot()
+    try d.store.Flush()
+    d.Round = round + 1
+}
+
+# a region's parameters by name: each one's offset in the region and its dimensions (surgery/model's Net.Layout)
+type Layout struct() {
+    Names Vec<String> = Vec<String>()
+    Offsets Vec<I64> = Vec<I64>()
+    Dims Vec<Array<I64>> = Vec<Array<I64>>()
 }
 
 # ---- tests ----
@@ -436,7 +665,8 @@ fn local(x mut Array<F32>&, w I64, H I64) {
 
 fn runWorker(s DirStore&, w I64, N I64, rounds I64, coded Codec, fragments I64, skip I64, out mut Array<F32>&) {
     x := Array<F32>(1000)
-    d := DiLoCo<DirStore>(s, w, N, 1000, coded = coded, keep = 0.1, fragments = fragments, timeoutMs = 300, pollMs = 1, quorum = 1
+    mine := DirStore(s.Root)                        # a store of this task's own
+    d := DiLoCo<DirStore>(mine, w, N, 1000, coded = coded, keep = 0.1, fragments = fragments, timeoutMs = 300, pollMs = 1, quorum = 1
         snapshotEvery = 2)
     d.Begin(x)!
     for r in range rounds {
@@ -517,4 +747,19 @@ test Encode "each codec's blob decodes to what the encoder says it sent" {
         assert back == sent and f.Meta.Get("round")! == "3"
         if c == Codec.Int8 { for i in range 1000: assert (back[i] - v[i]).Abs() <= F32(7.0 / 254.0 + 1e-5) }
     }
+}
+
+test commitBody "a Hub commit: a header line, then each blob inline (base64) or as its LFS object (SHA-256, size)" {
+    blobs := Array<staged>[staged("run/r0.d1", "abc".Bytes().Copy()), staged("run/state.0", Array<U8>(1000, U8(7)))]
+    lines := commitBody("a round", blobs, Array<Bool>[false, true]).Split("\n")
+    assert lines.Len() == 4 and lines[3] == ""
+    head := json.Json.Parse(lines[0])!
+    assert head.At("key")!.AsStr()! == "header" and head.At("value")!.At("summary")!.AsStr()! == "a round"
+    inline := json.Json.Parse(lines[1])!.At("value")!
+    assert inline.At("path")!.AsStr()! == "run/r0.d1" and base64.Decode(inline.At("content")!.AsStr()!)! == "abc".Bytes()
+    lfs := json.Json.Parse(lines[2])!
+    assert lfs.At("key")!.AsStr()! == "lfsFile" and lfs.At("value")!.At("oid")!.AsStr()! == sha256.Hex(Array<U8>(1000, U8(7)))
+    assert lfs.At("value")!.At("size")!.AsInt()! == 1000
+    pre := json.Json.Parse(preuploadBody(blobs))!.At("files")!.AsArr()!
+    assert pre.Len() == 2 and pre[1].At("size")!.AsInt()! == 1000 and base64.Decode(pre[1].At("sample")!.AsStr()!)!.Len() == 512
 }

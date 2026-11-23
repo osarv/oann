@@ -40,7 +40,10 @@ logits computed against the embedding (tied) or a head of its own. Each block is
 - an attention `Window` (0 means the whole context).
 
 Linear layers have no biases. Norms are RMSNorm, or LayerNorm. Parameters have names such as `embed`, `b2.q`,
-`b2.down`, `final.g`, and moments use the same names with an `m.`, `v.` or `buf.` prefix.
+`b2.down`, `final.g`, and moments use the same names with an `m.`, `v.` or `buf.` prefix - and `outer.` for DiLoCo's
+outer momentum (`nn/dist`), whose states are States: `Net.Layout()` and `State.DistMeta()` make a DiLoCo write them,
+the operations move the outer momentum as they move a first moment, and `Net.Outer(st)` gives it back for
+`DiLoCo.Publish` to seed the grown model's run (README "Distributed training").
 
 ## Operations
 

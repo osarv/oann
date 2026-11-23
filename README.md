@@ -112,15 +112,30 @@ hundreds is for long runs from a warm start. The outer Nesterov step matters (1.
 Int8 deltas cost nothing measurable, streaming keeps the loss at a fifth of the bytes a sync, and TopK at 5% does not
 pay here.
 
-The store is a trait of two methods, `Put(name, bytes)` and `Get(name)` (Missing for a name not there yet), so a backend is
-a struct with those. `HttpStore(base, token)` is the contract for any blob service: `PUT base/NAME` with the bytes as the
-body (any 2xx is success), `GET base/NAME` giving them back (404 while there is none), `Authorization: Bearer TOKEN` when a
-token is given. A PUT must become visible whole (a GET sees all of a blob or a 404, never part of one), as object
-stores' PUTs do. Blobs are written once and never changed; names are `r<R>.d<W>` (worker W's delta of round R), `r<R>.u`
-(the update; its contributors in the metadata), `state.<R>` (the global model and outer momentum after round R) and
-`latest` (the newest state's round, as text). Each is a safetensors file - a state is a checkpoint any safetensors
-reader opens. An S3-style bucket through presigned or token-authorized URLs, or a small relay in front of any object
-store, meets it as it is; a Hugging Face repository needs an adapter (uploads there are commits).
+The store is a trait of three methods - `Put(name, bytes)`, `Get(name)` (Missing for a name not there yet) and `Flush()`
+(make what was put visible at once) - so a backend is a struct with those. Blobs are written once and never changed;
+names are `RUN/r<R>.d<W>` (worker W's delta of round R), `RUN/r<R>.u` (the update; its contributors in the metadata),
+`RUN/state.<R>` (the global model and outer momentum after round R) and `RUN/latest` (the newest state's round, as
+text), RUN the DiLoCo's `name`. Each is a safetensors file. The backends:
+
+- `DirStore(root)`: files in a directory (processes on one machine, or a shared disk).
+- `HttpStore(base, token)`, any blob service: `PUT base/NAME` with the bytes as the body (any 2xx is success), `GET
+  base/NAME` giving them back (404 while there is none), `Authorization: Bearer TOKEN` when a token is given; a PUT must
+  become visible whole (a GET sees all of a blob or a 404, never part of one), as object stores' PUTs do. An S3-style
+  bucket through token-authorized or presigned URLs, or a small relay in front of any object store, meets it as it is.
+- `HfStore(repo, token)`, a Hugging Face repository (`kind` "model" or "dataset"), where an upload is a commit: `Flush`
+  commits what was put in one commit - a worker's delta, or the coordinator's update with its state, so a round is one
+  commit a worker - small blobs inline, large ones first to Git LFS (single or multipart uploads, as the Hub's preupload
+  check and LFS batch API say); `Get` reads `resolve/REVISION/NAME`. The token needs write access to the repository.
+  The Hub limits commits a repository an hour, so it suits rounds a minute or more apart; faster rounds want an object
+  store. Tested against a local mock of those endpoints (inline, LFS, multipart, a late joiner, a refused token).
+
+A state can be a surgery checkpoint (`surgery/model`'s format): given the model's `Net.Layout()` as `Named` and its
+`State.DistMeta()` as `Meta`, the coordinator writes `p.NAME` for each parameter and `outer.NAME` for its outer
+momentum, with the spec, step, data position and lineage (the round appended). `model.State.Open` reads it,
+`surgery/ops` grows or prunes it - the outer momentum moved with its parameters as a first moment is, kept by
+`ResetOptimizer` - and `DiLoCo.Publish(net.G.Params(), net.Outer(st), round)` seeds the grown model's run under a new
+name, numbered on, for the workers to `Begin` from.
 
 ## Developing oann
 
