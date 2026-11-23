@@ -28,7 +28,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help potts_latin energybench test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help potts_latin energybench lmstep test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -190,6 +190,12 @@ historyencode:
 # examples, puzzles, clue share, seed
 # the energy toolkit on generic puzzles, one thread: examples/potts_latin and examples/energy_suite (Focus on 3-SAT and
 # colouring, CutsetMove on grid distances, BySum cage sums, nn/lines run counts) - accuracy, time, moves
+# a training step of a small BPE language model on the CPU: per-operation times, tokens a second, threads inside the
+# operations or the batch split over replicas (bench/lmstep.olang) - ARGS: steps threads blocks width heads window batch vocab [dp]
+lmstep:
+	$(OLANG) build -output build/bench_lmstep bench/lmstep.olang
+	./build/bench_lmstep $(ARGS)
+
 energybench:
 	$(OLANG) build -output build/examples_potts_latin examples/potts_latin.olang
 	./build/examples_potts_latin

@@ -1,0 +1,162 @@
+# where a training step of a small BPE language model goes, on the CPU: the decoder transformer the language
+# experiments train (pre-norm blocks of RMS norm, rotary causal self-attention and a gated SwiGLU feed-forward, a tied
+# embedding over a 4097-entry vocabulary), on random token windows (no data needed), the time in each kind of
+# operation forward and backward, then clipping and AdamW, and tokens a second (batch x window a step). Arguments:
+# steps (20), threads (1), blocks (4), width (128), heads (4), window (128), batch (16), vocabulary (4097), and "dp":
+# the batch split over one single-thread graph a thread (nn/train's AverageGrads and BroadcastParams) instead of the
+# threads inside each operation.
+#     make lmstep ARGS="20 4 4 128 4 128 16 4097 dp"
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../nn/layers"
+import "../nn/optim"
+import "../nn/train"
+
+type Block struct(n1 layers.Norm, attn layers.SelfAttention, n2 layers.Norm, ffn layers.Feed) { n1, attn, n2, ffn }
+
+fn (b Block&) Apply(g mut graph.Graph<F32>&, x graph.Var) graph.Var {
+    h := g.Add(x, b.attn.Apply(g, b.n1.Apply(g, x)))
+    return g.Add(h, b.ffn.Apply(g, b.n2.Apply(g, h)))
+}
+
+fn number(args Array<String&>&, i I64, d I64) I64 ? ParseError { return try args[i].ParseInt() if args.Len() > i else d }
+
+fn ms(ns I64, steps I64) String { return $(F64(ns) * 1e-6 / F64(steps)).Fixed(2) }
+
+type Model struct(tok graph.Var, y graph.Var, loss graph.Var) { tok, y, loss }
+
+fn Model.build(g mut graph.Graph<F32>&, nb I64, D I64, heads I64, T I64, V I64) Model {
+    emb := layers.Embedding.New(g, V, D)
+    bs := Vec<Block>()
+    for _ in range nb {
+        out := graph.Init.Normal(0.0, 0.02 / F64(2 * nb).Sqrt())
+        bs.Push(Block(layers.Norm.New(g, D, true), layers.SelfAttention.New(g, D, heads, nb, true, true), layers.Norm.New(g, D, true)
+            layers.Feed.New(g, D, (8 * D / 3 + 7) / 8 * 8, out, true)))
+    }
+    fin := layers.Norm.New(g, D, true)
+    tok := g.Tokens(T)
+    h := emb.Apply(g, tok)
+    for b in bs: h = b.Apply(g, h)
+    logits := emb.Logits(g, fin.Apply(g, h))
+    y := g.Classes(T)
+    return Model(tok, y, g.CrossEntropy(logits, y))
+}
+
+fn replicaStep(g mut graph.Graph<F32>&, m Model&, seed U64, T I64, V I64) {
+    r := rand.Rand(seed)
+    tk, cl := g.Ints(m.tok).Flat()!, g.Ints(m.y).Flat()!
+    for j in range g.Batch * T {
+        tk[j] = I32(r.Below(V))
+        cl[j] = I32(r.Below(V))
+    }
+    g.Forward(g.Batch)
+    g.Backward(m.loss)
+}
+
+# data parallel: one single-thread graph a thread over its share of the batch, the gradients summed into the first,
+# one AdamW step there, the parameters copied back out
+fn dataParallel(steps I64, R I64, nb I64, D I64, heads I64, T I64, B I64, V I64) ? {
+    gs := Vec<graph.Graph<F32>>()
+    models := Vec<Model>()
+    for _ in range R {
+        g := graph.Graph<F32>(B / R, 1)
+        models.Push(Model.build(g, nb, D, heads, T, V))
+        try g.Plan(rand.Rand(1))
+        gs.Push(g)
+    }
+    o := optim.AdamW(gs[0].Params(), gs[0].ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(gs[0]))
+    total I64 = 0
+    for i in range 3 + steps {
+        a := time.Now()
+        join {
+            for r in range R: spawn replicaStep(gs.RefMut(r), models[r], U64(i * R + r + 1), T, V)
+        }
+        train.AverageGrads(gs)
+        optim.ClipNorm(gs.RefMut(0).ParamGrads(), 1.0)
+        o.Step()
+        train.BroadcastParams(gs)
+        if i >= 3: total += time.Since(a)
+    }
+    try io.Put("data parallel over " + $R + " single-thread graphs of batch " + $(B / R) + ": a step " + $ms(total, steps) + " ms, " +
+        $(F64(steps * B * T) / (F64(total) * 1e-9)).Fixed(0) + " tokens a second\n")
+}
+
+fn main() ? {
+    args := os.Args()
+    steps := try number(args, 1, 20)
+    threads := try number(args, 2, 1)
+    nb := try number(args, 3, 4)
+    D := try number(args, 4, 128)
+    heads := try number(args, 5, 4)
+    T := try number(args, 6, 128)
+    B := try number(args, 7, 16)
+    V := try number(args, 8, 4097)
+    if args.Len() > 9 and args[9] == "dp" {
+        try dataParallel(steps, threads, try number(args, 3, 4), try number(args, 4, 128), try number(args, 5, 4), try number(args, 6, 128), try number(args, 7, 16), V)
+        return
+    }
+    g := graph.Graph<F32>(B, threads)
+    emb := layers.Embedding.New(g, V, D)
+    bs := Vec<Block>()
+    for _ in range nb {
+        out := graph.Init.Normal(0.0, 0.02 / F64(2 * nb).Sqrt())
+        bs.Push(Block(layers.Norm.New(g, D, true), layers.SelfAttention.New(g, D, heads, nb, true, true), layers.Norm.New(g, D, true)
+            layers.Feed.New(g, D, (8 * D / 3 + 7) / 8 * 8, out, true)))
+    }
+    fin := layers.Norm.New(g, D, true)
+    tok := g.Tokens(T)
+    h := emb.Apply(g, tok)
+    for b in bs: h = b.Apply(g, h)
+    logits := emb.Logits(g, fin.Apply(g, h))
+    y := g.Classes(T)
+    loss := g.CrossEntropy(logits, y)
+    try g.Plan(rand.Rand(1))
+    try io.Put($nb + " blocks of " + $D + ", " + $heads + " heads, window " + $T + ", batch " + $B + ", vocabulary " + $V + ", " +
+        $g.ParamCount + " parameters, " + $threads + " threads\n")
+    o := optim.AdamW(g.Params(), g.ParamGrads(), beta2 = 0.95, decay = 0.1, spans = optim.Spans(g))
+    r := rand.Rand(7)
+    for i in range 3 + steps {
+        if i == 3: g.Profiling = true
+        tk, cl := g.Ints(tok).Flat()!, g.Ints(y).Flat()!
+        for j in range B * T {
+            tk[j] = I32(r.Below(V))
+            cl[j] = I32(r.Below(V))
+        }
+        g.Forward(B)
+        g.Backward(loss)
+        optim.ClipNorm(g.ParamGrads(), 1.0)
+        o.Step()
+    }
+    g.Profiling = false
+    # timed apart: whole steps (no profiling overhead), and clipping plus the optimizer
+    tsteps, topt I64 = 0, 0
+    tk, cl := g.Ints(tok).Flat()!, g.Ints(y).Flat()!
+    for _ in range steps {
+        for j in range B * T {
+            tk[j] = I32(r.Below(V))
+            cl[j] = I32(r.Below(V))
+        }
+        a := time.Now()
+        g.Forward(B)
+        g.Backward(loss)
+        b := time.Now()
+        optim.ClipNorm(g.ParamGrads(), 1.0)
+        o.Step()
+        c := time.Now()
+        tsteps += c - a
+        topt += c - b
+    }
+    try io.Put("operation              forward ms  backward ms   (a step)\n")
+    for k in range graph.KindNames.Len() {
+        fw, bw := g.Times[2 * k], g.Times[2 * k + 1]
+        if fw + bw == 0: continue
+        name := graph.KindNames[k]
+        try io.Put($name + " ".Repeat(22 - name.Len()) + " " + $ms(fw, steps) + "        " + $ms(bw, steps) + "\n")
+    }
+    try io.Put("clipping and AdamW     " + $ms(topt, steps) + "\n")
+    try io.Put("a step " + $ms(tsteps, steps) + " ms, " + $(F64(steps * B * T) / (F64(tsteps) * 1e-9)).Fixed(0) + " tokens a second\n")
+}

@@ -391,6 +391,37 @@ fn lit(n I64, seed U64) loader.Labeled {
     return loader.Labeled(features, labels, 6, 3)
 }
 
+# ---- data parallel ----
+#
+# A batch split over replicas: one graph a thread, each built alike (the same layers, Plan from the same seed) at its
+# share of the batch and run on one thread, all stepped at once (a join of one task a replica: Forward and Backward
+# from its loss). Then `AverageGrads` makes the first replica's gradients the mean of all of theirs - the gradient of
+# the whole batch's mean loss when the shares are equal - the caller's optimizer steps the first replica, and
+# `BroadcastParams` copies its parameters to the others. On small models whose products are too small to split well
+# this outruns threading inside each operation (bench/lmstep: 1.7x at 4 threads).
+
+# the first replica's parameter gradients replaced by the mean over every replica's
+fn AverageGrads<T>(gs mut Vec<graph.Graph<T>>&) {
+    n := gs.Len()
+    if n < 2: return
+    g0 := gs.RefMut(0).ParamGrads().Flat()!
+    for r in range 1, n {
+        gr := gs.RefMut(r).ParamGrads().Flat()!
+        for j in range g0.Len(): g0[j] += gr[j]
+    }
+    k := T(1.0 / F64(n))
+    for j in range g0.Len(): g0[j] *= k
+}
+
+# every replica's parameters set to the first's (after its optimizer step)
+fn BroadcastParams<T>(gs mut Vec<graph.Graph<T>>&) {
+    p0 := gs.RefMut(0).Params().Flat()!
+    for r in range 1, gs.Len() {
+        pr := gs.RefMut(r).Params().Flat()!
+        for j in range p0.Len(): pr[j] = p0[j]
+    }
+}
+
 test Epoch "trains a classifier: the loss falls, a held-out set is classified right, and a run repeats bit for bit" {
     sets := lit(60, 1)
     held := lit(45, 2)
@@ -640,4 +671,50 @@ test LmStepAhead "a step with the next batch drawn on a task gives the same loss
     }
     # one join a step keeps ~1 kB (repro/spawnleak, fixed in olang and removed 2026-11-21): 100 steps
     assert resident() <= before + 24 + 100, "grew by " + $(resident() - before) + " kB"
+}
+
+# a linear classifier of 6 inputs and 3 classes: its input, classes and loss
+fn tinyNet(g mut graph.Graph<F32>&) graph.Var, graph.Var, graph.Var {
+    x := g.Input(6)
+    c := g.Classes()
+    return x, c, g.CrossEntropy(layers.Dense.New(g, 6, 3).Apply(g, x), c)
+}
+
+fn fillTiny(g mut graph.Graph<F32>&, x graph.Var, c graph.Var, from I64, n I64) {
+    xs, cs := g.Value(x).Flat()!, g.Ints(c).Flat()!
+    for i in range n {
+        for j in range 6: xs[i * 6 + j] = F32(((from + i) * 7 + j * 3) % 11) / 11.0
+        cs[i] = I32((from + i) % 3)
+    }
+}
+
+test AverageGrads "two replicas of batch 2 averaged give the gradients one graph of batch 4 gives" {
+    whole := graph.Graph<F32>(4)
+    xw, cw, lw := tinyNet(whole)
+    try whole.Plan(rand.Rand(5)) catch { assert false }
+    gs := Vec<graph.Graph<F32>>()
+    losses := Vec<graph.Var>()
+    xr, cr := graph.Var(0), graph.Var(0)
+    for _ in range 2 {
+        g := graph.Graph<F32>(2)
+        x, c, l := tinyNet(g)
+        xr, cr = x, c
+        losses.Push(l)
+        try g.Plan(rand.Rand(5)) catch { assert false }
+        gs.Push(g)
+    }
+    fillTiny(whole, xw, cw, 0, 4)
+    whole.Forward(4)
+    whole.Backward(lw)
+    for r in range 2 {
+        fillTiny(gs.RefMut(r), xr, cr, 2 * r, 2)
+        gs.RefMut(r).Forward(2)
+        gs.RefMut(r).Backward(losses[r])
+    }
+    AverageGrads(gs)
+    a, b := whole.ParamGrads().Flat()!, gs.RefMut(0).ParamGrads().Flat()!
+    for j in range a.Len(): assert (F64(a[j]) - F64(b[j])).Abs() < 1e-6, $j
+    gs.RefMut(0).Params().Flat()![0] = 3.0
+    BroadcastParams(gs)
+    assert gs.RefMut(1).Params().Flat()![0] == 3.0
 }

@@ -317,8 +317,9 @@ fn LogSoftmaxBackward<S, A>(dy tensor.Tensor<S>, y tensor.Tensor<S>, dx mut tens
 
 # ---- losses ----
 
-# the mean over the rows whose class is not negative of -log softmax(logits)[class] - the log-sum-exp less the class's
-# logit, so nothing overflows or takes a log of zero - in F64; probs keeps each row's softmax for the backward
+# the mean over the rows whose class is not negative of -log softmax(logits)[class] - read off the row's softmax, or
+# where that underflows the log-sum-exp less the class's logit, so nothing takes a log of zero - in F64; probs keeps
+# each row's softmax for the backward
 fn CrossEntropy<S, A>(logits tensor.Tensor<S>, classes Array<I32>&, probs mut tensor.Tensor<S>&) F64 {
     z := rows(logits)
     p := rows(probs)
@@ -328,20 +329,16 @@ fn CrossEntropy<S, A>(logits tensor.Tensor<S>, classes Array<I32>&, probs mut te
     for r in range z.Rows {
         c := I64(classes[r])
         if c < 0: continue
-        total += F64(logSumExp<S, A>(z.Data, z.Off + r * z.Ld, z.Cols) - A(z.Data[z.Off + r * z.Ld + c]))
+        # -log softmax[class] read off the probabilities just made; the log-sum-exp only where that underflows
+        pc := F64(p.Data[p.Off + r * p.Ld + c])
+        total += -pc.Log() if pc > 1e-30 else F64(logSumExp<S, A>(z.Data, z.Off + r * z.Ld, z.Cols) - A(z.Data[z.Off + r * z.Ld + c]))
         counted++
     }
     return total / F64(counted) if counted > 0 else 0.0
 }
 
 # log(sum exp x) over a run, its largest element taken out first
-fn logSumExp<S, A>(x Array<S>&, from I64, n I64) A {
-    top A = A(x[from])
-    for j in range 1, n: top = top.Max(A(x[from + j]))
-    s A = 0.0
-    for j in range n: s += elem.FastExp(A(x[from + j]) - top)
-    return top + s.Log()
-}
+fn logSumExp<S, A>(x Array<S>&, from I64, n I64) A { return elem.LogSumExpRun<S, A>(x, from, n) }
 
 # dlogits (+)= dloss (probs - onehot(class)) / counted, zero for an ignored row
 fn CrossEntropyBackward<S, A>(dloss A, classes Array<I32>&, probs tensor.Tensor<S>, dz mut tensor.Tensor<S>&, add Bool) {
