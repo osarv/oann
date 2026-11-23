@@ -80,7 +80,7 @@ for s in range 1, steps + 1 {
 }
 ```
 
-`make diloco ARGS="diloco 4 2000 125"` runs four worker processes of `examples/diloco_lm.olang` through a directory;
+`make diloco ARGS="diloco 4 2000 10"` runs four worker processes of `examples/diloco_lm.olang` through a directory;
 `"single 2000"` and `"dp 4 2000"` are the baselines it is measured against. Options of `DiLoCo`: `outerRate` and
 `momentum` (0.7, 0.9), the deltas' and the update's codec (`coded`, `updates`: F32, BF16, Int8, TopK with `keep`),
 `fragments` (streaming: a round syncs one fragment, so a sync every H / fragments steps moves that share of the bytes),
@@ -88,10 +88,35 @@ for s in range 1, steps + 1 {
 next round), `snapshotEvery` (a state every so many rounds, for joining and resuming) and `name`/`lineage` (into the
 state's metadata).
 
+Measured on one 4-core VM (`examples/diloco_lm.olang`: the 0.81M-parameter character transformer on tiny Shakespeare,
+batches of 16 a worker, every worker one thread; DiLoCo's workers four processes through a directory; BF16 deltas
+unless said; seconds of training, evaluation left out):
+
+| run | tokens | seconds | validation loss | bytes a round (coordinator up / down) |
+|---|---|---|---|---|
+| one worker, 2000 steps | 2.0M | 158 | 1.844 | |
+| one worker, 8000 steps | 8.2M | 649 | 1.500 | |
+| data parallel, 4 replicas of 16, 2000 steps | 8.2M | 221 | 1.562 | |
+| DiLoCo 4 workers, H = 250 | 8.2M | 164 | 1.806 | 3.2 MB / 4.9 MB |
+| DiLoCo, H = 125 (F32 / Int8 deltas) | 8.2M | 173 (187 / 176) | 1.757 (1.755 / 1.759) | 3.2 / 4.9 (4.9 / 9.7, 2.4 / 2.5) |
+| DiLoCo, H = 125 in 5 streamed fragments | 8.2M | 191 | 1.756 | 0.65 / 0.97 |
+| DiLoCo, H = 125, TopK 5% | 8.2M | 170 | 1.875 | 1.9 / 0.7 |
+| DiLoCo, H = 50 (outer rate 0.4 / 1.0) | 8.2M | 171 | 1.672 (1.752 / 1.648) | 3.2 / 4.9 |
+| DiLoCo, H = 50, plain averaging (rate 1, no momentum) | 8.2M | 171 | 1.773 | 3.2 / 4.9 |
+| DiLoCo, H = 25 | 8.2M | 190 | 1.610 | 3.2 / 4.9 |
+| DiLoCo, H = 10 | 8.2M | 196 | 1.563 | 3.2 / 4.9 |
+
+Four DiLoCo workers beat one worker at the same wall time at every H, and at H = 10 match data parallel at equal
+tokens. This run is short (2000 steps, from scratch), where fewer steps between rounds pay most; the paper's H of
+hundreds is for long runs from a warm start. The outer Nesterov step matters (1.65-1.67 against plain averaging's 1.77),
+Int8 deltas cost nothing measurable, streaming keeps the loss at a fifth of the bytes a sync, and TopK at 5% does not
+pay here.
+
 The store is a trait of two methods, `Put(name, bytes)` and `Get(name)` (Missing for a name not there yet), so a backend is
 a struct with those. `HttpStore(base, token)` is the contract for any blob service: `PUT base/NAME` with the bytes as the
 body (any 2xx is success), `GET base/NAME` giving them back (404 while there is none), `Authorization: Bearer TOKEN` when a
-token is given. Blobs are written once and never changed; names are `r<R>.d<W>` (worker W's delta of round R), `r<R>.u`
+token is given. A PUT must become visible whole (a GET sees all of a blob or a 404, never part of one), as object
+stores' PUTs do. Blobs are written once and never changed; names are `r<R>.d<W>` (worker W's delta of round R), `r<R>.u`
 (the update; its contributors in the metadata), `state.<R>` (the global model and outer momentum after round R) and
 `latest` (the newest state's round, as text). Each is a safetensors file - a state is a checkpoint any safetensors
 reader opens. An S3-style bucket through presigned or token-authorized URLs, or a small relay in front of any object
