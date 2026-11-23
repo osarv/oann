@@ -46,7 +46,8 @@
 #
 # Decoding (decode = true): a graph of one sequence (batch 1) run forward only, a few positions at a time - Forward(n)
 # computes positions Pos ... Pos + n - 1 (axis 1 of every batched node holding n of them) and each Attention keeps the
-# keys and values of every position so far in a cache: generation without running the context again.
+# keys and values of every position so far in a cache, and each DeltaRule its state (the recurrent form, a position at
+# a time from where the last Forward left it): generation without running the context again.
 
 import "../tensor"
 import "../kernels/mat"
@@ -139,7 +140,7 @@ type Op enum {
     Embedding(tokens Var, table Var)                # a table row per token
     Positions(x Var, table Var)                     # x plus a learned position: the table's row Pos + t
     Rope(x Var, heads I64, base F64)                # rotary positions (Su et al.)
-    Attention(q Var, k Var, v Var, heads I64, causal Bool)
+    Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64)   # window 0: all earlier positions
     Dropout(x Var, p F64)                           # while Training, each element zeroed with probability p
     CrossEntropy(logits Var, classes Var)           # the mean over the entries counted: a scalar
     Mse(a Var, b Var)                               # the mean of the squared differences: a scalar
@@ -192,7 +193,7 @@ fn KindOf(k Op) I64 {
         case Op.Embedding(_, _): 16
         case Op.Positions(_, _): 17
         case Op.Rope(_, _, _): 18
-        case Op.Attention(_, _, _, _, _): 19
+        case Op.Attention(_, _, _, _, _, _): 19
         case Op.Dropout(_, _): 20
         case Op.CrossEntropy(_, _): 21
         case Op.Mse(_, _): 22
@@ -299,7 +300,7 @@ fn inputsOf(k Op) Array<I64> {
         case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sqrt(x), Op.Log(x), Op.Shift(x, _): out[0] = x
         case Op.Rope(x, _, _), Op.Dropout(x, _), Op.MaxPool2d(x, _), Op.Sum(x, _): out[0] = x
         case Op.Reshape(x), Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x), Op.Contiguous(x): out[0] = x
-        case Op.Norm(x, g, b, _, _), Op.Attention(x, g, b, _, _), Op.Conv2d(x, g, b, _), Op.Scan(x, g, b): set3(out, x, g, b)
+        case Op.Norm(x, g, b, _, _), Op.Attention(x, g, b, _, _, _), Op.Conv2d(x, g, b, _), Op.Scan(x, g, b): set3(out, x, g, b)
         case Op.SelectiveScan(x, d, a, b, c, s) {
             set3(out, x, d, a)
             out[3] = b
@@ -353,7 +354,7 @@ fn readsInputs(k Op) Bool {
 fn readsOwn(k Op) Bool {
     return match k {
         case Op.Softmax(_), Op.LogSoftmax(_), Op.Scan(_, _, _), Op.Custom(_, _, _), Op.Sqrt(_): true
-        case Op.Attention(_, _, _, _, _): true          # the flash form's backward reads its output
+        case Op.Attention(_, _, _, _, _, _): true          # the flash form's backward reads its output
         case Op.Act(_, a): ops.ActFromOutput(a)
         case _: false
     }
@@ -691,19 +692,20 @@ fn (g mut Graph<T>&) Rope(x Var, heads I64, base F64 = 10000) Var {
     return g.add(Op.Rope(g.dense(x), heads, base), xd, true)
 }
 
-# multi-head attention of q, k, v [b, t, D] in heads of D / heads columns; causal: position i attends to 0 ... i
-fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, causal Bool) Var {
+# multi-head attention of q, k, v [b, t, D] in heads of D / heads columns; causal: position i attends to 0 ... i, and
+# with a window W > 0 to i - W + 1 ... i alone (sliding-window attention; the flash form computes only the band)
+fn (g mut Graph<T>&) Attention(q Var, k Var, v Var, heads I64, causal Bool, window I64 = 0) Var {
     if not g.same("Attention", q, k) or not g.same("Attention", q, v): return q
     qd := g.dims(q)
     if qd.Rank != 3 or not g.batched(q) or heads < 1 or qd[2] % heads != 0 {
         g.fail("Attention of " + $g.shape(q) + " in " + $heads + " heads: [b, t, D], heads dividing D")
         return q
     }
-    if g.Decode and not causal {
-        g.fail("Attention while decoding is causal")
+    if (g.Decode or window > 0) and not causal or window < 0 {
+        g.fail("Attention while decoding, or in a window, is causal (window " + $window + ")")
         return q
     }
-    return g.add(Op.Attention(g.dense(q), g.dense(k), g.dense(v), heads, causal), qd, true)
+    return g.add(Op.Attention(g.dense(q), g.dense(k), g.dense(v), heads, causal, window), qd, true)
 }
 
 # x with each element zeroed with probability p and the rest scaled by 1 / (1 - p) while the graph is Training; x
@@ -971,7 +973,7 @@ fn (g Graph<T>&) extrasOf(i I64) extras {
         case Op.Dropout(_, _): extras(n, 0, 0, 0)
         case Op.MaxPool2d(_, _): extras(0, 0, n, 0)
         case Op.Conv2d(_, _, _, s): extras(0, nd.Dims[0] * s.Positions() * s.Patch(), 0, 0)
-        case Op.Attention(_, _, _, heads, _): g.attentionExtras(nd, heads)
+        case Op.Attention(_, _, _, heads, _, _): g.attentionExtras(nd, heads)
         case Op.Scan(_, _, _): extras(0, 3 * n, 0, 2 * nd.Dims[0] * nd.Dims[2])
         case Op.SelectiveScan(_, _, a, _, _, _): g.selectiveExtras(nd, g.nodes[a].Dims[0])
         case Op.DeltaRule(q, _, _, beta, _): g.deltaExtras(nd, g.nodes[q].Dims[2], g.nodes[beta].Dims[2])
@@ -1264,7 +1266,7 @@ fn (g Graph<T>&) reserveIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.Work
             if folded: ws.ReserveLayer(d.Count() / last, last, k, like)
             else: ws.ReserveLayer(d[d.Rank - 2], last, k, like, true)
         }
-        case Op.Attention(_, _, _, heads, _) {
+        case Op.Attention(_, _, _, heads, _, _) {
             if g.flashes(g.nodes[i]) { g.flashOf<A>().Reserve(d[1], last / heads) } else { ws.ReserveLayer(d[1], d[1], last / heads, like, true) }
         }
         case Op.Conv2d(_, _, _, s): ws.ReserveLayer(d[0] * s.Positions(), s.Patch(), s.OutC, like)
@@ -2049,13 +2051,13 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         case Op.Embedding(t, w): ops.Embedding(y, g.intsOf(t), g.Value(w))
         case Op.Positions(x, w): ops.Positions<T, A>(y, g.Value(x), g.Value(w), nd.Dims[1], g.Pos)
         case Op.Rope(x, heads, base): ops.Rope(y, g.Value(x), heads, nd.Dims[1], g.Pos, base)
-        case Op.Attention(q, k, v, heads, causal) {
+        case Op.Attention(q, k, v, heads, causal, window) {
             if g.Decode {
-                ops.AttentionStep<T, A>(y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), nd.Dims[1], g.accOf<A>(i), g.Pos, heads)
+                ops.AttentionStep<T, A>(y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), nd.Dims[1], g.accOf<A>(i), g.Pos, heads, window)
             } else if g.flashes(nd) {
-                ops.FlashAttention<T, A>(g.flashOf<A>(), y, g.Value(q), g.Value(k), g.Value(v), g.accOf<A>(i), heads, nd.Dims[1], causal)
+                ops.FlashAttention<T, A>(g.flashOf<A>(), y, g.Value(q), g.Value(k), g.Value(v), g.accOf<A>(i), heads, nd.Dims[1], causal, window)
             } else {
-                ops.Attention<T, A>(ws, y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), heads, nd.Dims[1], causal)
+                ops.Attention<T, A>(ws, y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), heads, nd.Dims[1], causal, window)
             }
         }
         case Op.Dropout(x, p) {
@@ -2093,7 +2095,11 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
             dk := g.nodes[q].Dims[2] / heads
             state := g.accMat<A>(i, kk, g.inUse(nd)[0] * heads * dk, nd.Dims[2] / heads)
             keep := g.accOf<A>(i)[0:kk]
-            ops.DeltaRule<T, A>(sw, y, state, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), nd.Dims[1], heads, keep)
+            if g.Decode {
+                ops.DeltaRuleStep<T, A>(sw, y, state, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), g.inUse(nd)[1], heads, g.Pos == 0)
+            } else {
+                ops.DeltaRule<T, A>(sw, y, state, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), nd.Dims[1], heads, keep)
+            }
         }
         case Op.Contiguous(x) {
             xv := g.Value(x)
@@ -2337,7 +2343,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             tmp := g.scratchTensor(i, 0, dy.Dims)
             if ops.Wanted(dx): ops.RopeBackward<T, A>(dy, heads, nd.Dims[1], g.Pos, base, dx, ax, tmp)
         }
-        case Op.Attention(q, k, v, heads, causal) {
+        case Op.Attention(q, k, v, heads, causal, window) {
             dq := g.gradOf(q)
             aq := g.acc(q)
             dk := g.gradOf(k)
@@ -2345,10 +2351,10 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             dv := g.gradOf(v)
             av := g.acc(v)
             if g.flashes(nd) {
-                ops.FlashAttentionBackward<T, A>(g.flashOf<A>(), dy, g.Value(q), g.Value(k), g.Value(v), g.Value(Var(i)), g.accOf<A>(i), heads, nd.Dims[1], causal, dq, aq, dk, ak, dv, av)
+                ops.FlashAttentionBackward<T, A>(g.flashOf<A>(), dy, g.Value(q), g.Value(k), g.Value(v), g.Value(Var(i)), g.accOf<A>(i), heads, nd.Dims[1], causal, window, dq, aq, dk, ak, dv, av)
             } else {
                 sc := g.scratch(i, 0, g.extrasOf(i).scratch)
-                ops.AttentionBackward<T, A>(ws, dy, g.Value(q), g.Value(k), g.Value(v), g.saved(i), sc, heads, nd.Dims[1], causal, dq, aq, dk, ak, dv, av)
+                ops.AttentionBackward<T, A>(ws, dy, g.Value(q), g.Value(k), g.Value(v), g.saved(i), sc, heads, nd.Dims[1], causal, window, dq, aq, dk, ak, dv, av)
             }
         }
         case Op.Dropout(x, p) {
@@ -2412,7 +2418,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
 fn firstInput(k Op, j I64) I64 {
     return match k {
         case Op.Linear(x, w, b): I64(x) if j == 0 else (I64(w) if j == 1 else I64(b))
-        case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
+        case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
         case Op.MatMul(a, b, _, _), Op.Add(a, b), Op.Sub(a, b), Op.Mul(a, b), Op.Mse(a, b), Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b): I64(a) if j == 0 else (I64(b) if j == 1 else -1)
         case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sum(x, _), Op.Reshape(x), Op.Contiguous(x): I64(x) if j == 0 else -1
         case Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x): I64(x) if j == 0 else -1
@@ -2470,6 +2476,7 @@ if Gpu {
                 case Op.Dropout(_, _), Op.Rope(_, _, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
                 case Op.DeltaRule(_, _, _, _, _), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
                 case Op.Sqrt(_), Op.Log(_), Op.Shift(_, _), Op.StablemaxCE(_, _) { return name + " (node " + $i + ")" }
+                case Op.Attention(_, _, _, _, _, window) { if window > 0: return "windowed Attention (node " + $i + ")" }
                 case _ { }
             }
             if isView(nd.Kind) or nd.Kind == Op.Contiguous: continue
@@ -2607,7 +2614,7 @@ if Gpu {
                 s.Cols, s.Inner, s.Ctx = last, g.nodes[table].Dims[0], d[1]
                 s.A, s.B, s.DA, s.DB = g.valAt(x), g.valAt(table), g.gradAt(x), g.gradAt(table)
             }
-            case Op.Attention(q, k, v, heads, causal) {
+            case Op.Attention(q, k, v, heads, causal, window) {
                 s.Do = mirror.Work.Attention
                 s.Cols, s.Heads, s.Ctx, s.Flag, s.Inner = last, heads, d[1], causal, i
                 s.A, s.B, s.C = g.valAt(q), g.valAt(k), g.valAt(v)

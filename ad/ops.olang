@@ -592,42 +592,42 @@ fn RopeBackward<S, A>(dy tensor.Tensor<S>, heads I64, ctx I64, first I64, base F
 # ---- attention ----
 
 # out = attention(q, k, v) over sequences of ctx rows, probs keeping the weights
-fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, heads I64, ctx I64, causal Bool) {
+fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, heads I64, ctx I64, causal Bool, window I64) {
     om := rows(out)
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
     km, vm := rows(k), rows(v)
-    attention.Attention(ws, om, qm, km, vm, pm, attention.Heads(heads, ctx, causal))
+    attention.Attention(ws, om, qm, km, vm, pm, attention.Heads(heads, ctx, causal, window))
 }
 
-fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
+fn AttentionBackward<S, A>(ws mut gemm.Workspace<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, probs mut Array<S>&, scratch mut Array<S>&, heads I64, ctx I64, causal Bool, window I64, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
     qm := rows(q)
     pm := mat.Mat<S>(probs, 0, qm.Rows * heads, ctx, ctx)
     dqm := gradRows(dq)
     dkm := gradRows(dk)
     dvm := gradRows(dv)
     om, km, vm := rows(dout), rows(k), rows(v)
-    attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal), addQ, addK, addV)
+    attention.AttentionGrad(ws, dqm, dkm, dvm, om, qm, km, vm, pm, scratch, attention.Heads(heads, ctx, causal, window), addQ, addK, addV)
 }
 
 # attention with no weights kept (kernels/attention's flash form): lse gets each row's log-sum-exp per head
-fn FlashAttention<S, A>(f mut attention.Flash<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool) {
+fn FlashAttention<S, A>(f mut attention.Flash<A>&, out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, window I64) {
     om := rows(out)
     qm, km, vm := rows(q), rows(k), rows(v)
-    attention.FlashAttention(f, om, qm, km, vm, lse, attention.Heads(heads, ctx, causal))
+    attention.FlashAttention(f, om, qm, km, vm, lse, attention.Heads(heads, ctx, causal, window))
 }
 
-fn FlashAttentionBackward<S, A>(f mut attention.Flash<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, out tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
+fn FlashAttentionBackward<S, A>(f mut attention.Flash<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, out tensor.Tensor<S>, lse mut Array<A>&, heads I64, ctx I64, causal Bool, window I64, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool) {
     dqm := gradRows(dq)
     dkm := gradRows(dk)
     dvm := gradRows(dv)
     gm, qm, km, vm, om := rows(dout), rows(q), rows(k), rows(v), rows(out)
-    attention.FlashAttentionGrad(f, dqm, dkm, dvm, gm, qm, km, vm, om, lse, attention.Heads(heads, ctx, causal), addQ, addK, addV)
+    attention.FlashAttentionGrad(f, dqm, dkm, dvm, gm, qm, km, vm, om, lse, attention.Heads(heads, ctx, causal, window), addQ, addK, addV)
 }
 
 # causal attention while decoding: rows are positions first ... of each sequence - a sequence's n rows in a run (one
 # sequence), or one row a sequence (a batch, one position a step) - its keys and values kept in its own part of the cache
-fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, cache mut Array<S>&, ctx I64, scores mut Array<A>&, first I64, heads I64) {
+fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, cache mut Array<S>&, ctx I64, scores mut Array<A>&, first I64, heads I64, window I64 = 0) {
     qm := rows(q)
     d := qm.Cols
     om := rows(out)
@@ -641,7 +641,7 @@ fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.T
         kb := mat.Mat<S>(km.Data, km.Off + b * n * km.Ld, n, d, km.Ld)
         vb := mat.Mat<S>(vm.Data, vm.Off + b * n * vm.Ld, n, d, vm.Ld)
         ob := mat.Mat<S>(om.Data, om.Off + b * n * om.Ld, n, d, om.Ld)
-        attention.AttentionStep(ob, qb, kb, vb, keys, values, scores, first, heads)
+        attention.AttentionStep(ob, qb, kb, vb, keys, values, scores, first, heads, window)
     }
 }
 
@@ -790,6 +790,15 @@ fn DeltaRule<S, A>(work mut scan.Work<A>&, out mut tensor.Tensor<S>&, state mut 
     at := scan.Seq(ctx, 64, heads)
     # the chunked (WY) form where it is faster: heads of 128 or wider (measured, bench/scan; at 64 the forms tie)
     if qm.Cols / heads >= 128 and ctx >= 64 { scan.DeltaRuleChunked(work, om, state, qm, km, vm, bm, gm, at, keep) } else { scan.DeltaRule(work, om, state, qm, km, vm, bm, gm, at, keep) }
+}
+
+# the delta rule while decoding: n new positions of each sequence by the recurrent form, from the state the last call left
+# (from zeros where fresh, the first positions), which holds the state after them on return
+fn DeltaRuleStep<S, A>(work mut scan.Work<A>&, out mut tensor.Tensor<S>&, state mut mat.Mat<A>&, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, n I64, heads I64, fresh Bool) {
+    if fresh: zero(state)
+    om := rows(out)
+    qm, km, vm, bm, gm := rows(q), rows(k), rows(v), rows(beta), rows(gate)
+    scan.DeltaRule(work, om, state, qm, km, vm, bm, gm, scan.Seq(n, 64, heads), state.Data[0:0])
 }
 
 fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tensor.Tensor<S>, k tensor.Tensor<S>, v tensor.Tensor<S>, beta tensor.Tensor<S>, gate tensor.Tensor<S>, ctx I64, heads I64, keep Array<A>&, dstate mut mat.Mat<A>&, dq mut tensor.Tensor<S>&, addQ Bool, dk mut tensor.Tensor<S>&, addK Bool, dv mut tensor.Tensor<S>&, addV Bool, dbeta mut tensor.Tensor<S>&, addB Bool, dgate mut tensor.Tensor<S>&, addG Bool) {

@@ -159,8 +159,10 @@ fn (f Feed&) Apply<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
 # ---- attention and transformers ----
 
 # multi-head self-attention over [batch, t, D]: the four projections, optionally with rotary positions on queries and
-# keys. Causal: a position attends to those before it and itself
-type SelfAttention struct(Q Dense, K Dense, V Dense, O Dense, Heads I64, Rope Bool, Base F64, Causal Bool) {
+# keys. Causal: a position attends to those before it and itself - with Window W > 0, to the W positions up to itself
+# alone (sliding-window attention). Gate (Out = heads, else empty): a per-head output gate, head h's output scaled by
+# sigmoid(Gate x)_h before the projection back - W [heads, D], no bias
+type SelfAttention struct(Q Dense, K Dense, V Dense, O Dense, Heads I64, Rope Bool, Base F64, Causal Bool, Window I64, Gate Dense) {
     Q
     K
     V
@@ -169,19 +171,22 @@ type SelfAttention struct(Q Dense, K Dense, V Dense, O Dense, Heads I64, Rope Bo
     Rope
     Base
     Causal
+    Window
+    Gate
 }
 
 # attention of width D in "heads" heads; "layers", the blocks the network has, scales the starting values of the
 # projection back into the residual stream (GPT-2's 1 / sqrt(2 * layers))
 fn SelfAttention.New<T>(g mut graph.Graph<T>&, D I64, heads I64, layers I64 = 1, rope Bool = false, causal Bool = true
-        base F64 = 10000.0) SelfAttention {
+        base F64 = 10000.0, window I64 = 0, gate Bool = false) SelfAttention {
     w := gpt2()
     z := graph.Init.Zeros
     q := Dense.With(g, D, D, w, z)
     k := Dense.With(g, D, D, w, z)
     v := Dense.With(g, D, D, w, z)
     o := Dense.With(g, D, D, gpt2Out(layers), z)
-    return SelfAttention(q, k, v, o, heads, rope, base, causal)
+    gt := Dense.With(g, D, heads, w, z, false) if gate else Dense(graph.None, graph.None, 0, 0)
+    return SelfAttention(q, k, v, o, heads, rope, base, causal, window, gt)
 }
 
 fn (a SelfAttention&) Apply<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
@@ -191,7 +196,17 @@ fn (a SelfAttention&) Apply<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
         q = g.Rope(q, a.Heads, a.Base)
         k = g.Rope(k, a.Heads, a.Base)
     }
-    return a.O.Apply(g, g.Attention(q, k, a.V.Apply(g, x), a.Heads, a.Causal))
+    y := g.Attention(q, k, a.V.Apply(g, x), a.Heads, a.Causal, a.Window)
+    if a.Gate.Out > 0: y = HeadGate(g, y, g.Act(a.Gate.Apply(g, x), mat.Act.Sigmoid), a.Heads)
+    return a.O.Apply(g, y)
+}
+
+# y [batch, t, D] with head h's D / heads columns scaled by gate [batch, t, heads]'s column h (a per-head output gate)
+fn HeadGate<T>(g mut graph.Graph<T>&, y graph.Var, gate graph.Var, heads I64) graph.Var {
+    d := g.Info(y).Dims
+    t, dh := d[1], d[2] / heads
+    wide := g.Expand(g.Reshape(gate, t, heads, 1), t, heads, dh)
+    return g.Reshape(g.Mul(g.Reshape(y, t, heads, dh), wide), t, heads * dh)
 }
 
 # a transformer block, pre-normalized: h = x + Attn(Norm1(x)); then y = h + Feed(Norm2(h)). With dropout, both branches
@@ -491,6 +506,77 @@ test SsmBlock "a state that decays: the output at a position moves little with a
     near := (g.Value(y).Get(0, 0, 0) - base.Get(0, 0, 0)).Abs()
     far := (g.Value(y).Get(0, 39, 0) - base.Get(0, 39, 0)).Abs()
     assert near > 1e-3 and far < near
+}
+
+test SelfAttention "windowed and gated: gradients agree with central differences, the weights kept and the flash form" {
+    for flash in Array<Bool>[false, true] {
+        g := graph.Graph<F64>(2)
+        g.FlashFrom = 4 if flash else 1000000
+        x := g.Input(9, 8)
+        g.Watch(x)
+        a := SelfAttention.New(g, 8, 2, 2, true, true, 10000.0, 3, true)
+        assert g.Info(a.Gate.W).Dims == tensor.Shape.Of(2, 8)
+        y := a.Apply(g, a.Apply(g, x))
+        assert g.Info(y).Dims == tensor.Shape.Of(2, 9, 8)
+        assert checked(g, y, 9, 1, 0.3) < 1e-5
+    }
+}
+
+test SelfAttention "a window of W: the output at a position does not move with a position W or more before it" {
+    g := graph.Graph<F64>(1)
+    x := g.Input(8, 4)
+    a := SelfAttention.New(g, 4, 2, 1, false, true, 10000.0, 3)
+    y := a.Apply(g, x)
+    try g.Plan(rand.Rand(3)) catch e { unreachable "plan: " + $e }
+    xs := g.Value(x).Flat()!
+    r := rand.Rand(4)
+    for i in range xs.Len(): xs[i] = r.Normal()
+    g.Forward(1)
+    before := g.Value(y).Flat()!.Copy()
+    for c in range 4: xs[c] += 1.0                  # position 0
+    g.Forward(1)
+    after := g.Value(y).Flat()!
+    for i in range 3 * 4, 8 * 4: assert after[i] == before[i], "position " + $(i / 4)
+    assert after[2 * 4] != before[2 * 4]
+}
+
+# a small language model of a delta-rule block and a windowed, gated attention block: its logits
+fn mixedLm(g mut graph.Graph<F64>&, ctx I64) graph.Var, graph.Var {
+    tok := g.Tokens(ctx)
+    e := Embedding.New(g, 11, 8)
+    h := DeltaBlock.New(g, 8, 2, 2).Apply(g, e.Apply(g, tok))
+    a := SelfAttention.New(g, 8, 2, 2, true, true, 10000.0, 3, true)
+    h = g.Add(h, a.Apply(g, h))
+    return tok, e.Logits(g, h)
+}
+
+test DeltaBlock "decoding (the delta rule's state carried, a windowed attention's cache) equals the full forward, a position at a time or several" {
+    ctx I64 = 12
+    full := graph.Graph<F64>(1)
+    ft, fl := mixedLm(full, ctx)
+    try full.Plan(rand.Rand(30))
+    tokens := Array<I32>[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]
+    fd := full.Ints(ft).Flat()!
+    for i in range ctx: fd[i] = tokens[i]
+    full.Forward(1)
+    want := full.Value(fl)
+    for steps in Array<I64>[1, 3] {
+        d := graph.Graph<F64>(1, 1, graph.Mode.Captured, true)
+        dt, dl := mixedLm(d, ctx)
+        try d.Plan(rand.Rand(1))
+        dp := d.Params()
+        try dp.Convert(full.Params())
+        for pos in range 0, ctx, steps {
+            d.Pos = pos
+            td := d.Ints(dt).Flat()!
+            for j in range steps: td[j] = tokens[pos + j]
+            d.Forward(steps)
+            got := d.Value(dl)
+            for j in range steps {
+                for c in range 11: assert (got.Get(0, j, c) - want.Get(0, pos + j, c)).Abs() < 1e-12, "position " + $(pos + j)
+            }
+        }
+    }
 }
 
 test DeltaBlock "gradients agree with central differences, the input's too" {

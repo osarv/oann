@@ -6,7 +6,7 @@ OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
 TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/spike.olang \
-	ad/graph.olang ad/descent.olang ad/score.olang tools/gradcheck.olang nn/layers.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang nn/ternary.olang nn/potts.olang nn/seqsettle.olang nn/diffusion.olang nn/chain.olang nn/lines.olang \
+	ad/graph.olang ad/descent.olang ad/score.olang tools/gradcheck.olang nn/layers.olang nn/ngram.olang nn/optim.olang nn/train.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang nn/ternary.olang nn/potts.olang nn/seqsettle.olang nn/diffusion.olang nn/chain.olang nn/lines.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/holo.olang dyn/store.olang dyn/recur.olang dyn/sleep.olang dyn/halt.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
@@ -30,7 +30,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -232,6 +232,12 @@ sweepbench:
 flashbench:
 	$(OLANG) build -output build/bench_flash bench/flash.olang
 	./build/bench_flash $(ARGS)
+
+# the language-model layers on one thread, tokens/s forward and backward at width 160 and contexts of 2048: sliding-window
+# attention (a scalar loop, the flash form F32 and BF16), the delta rule, n-gram tables (bench/lmlayers.olang) - ARGS: rounds
+lmlayersbench:
+	$(OLANG) build -output build/bench_lmlayers bench/lmlayers.olang
+	./build/bench_lmlayers $(ARGS)
 
 # kernels/ternary's matrix-vector product (2-bit weights) against gemm's F32 Gemv on the same weights, one thread
 # (bench/ternary.olang) - ARGS: rounds

@@ -4,10 +4,15 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 
 - `layers.olang` - layers as plain data (handles and sizes) with a `New` on a graph that registers the parameters and an
   `Apply` that records the operations: `Dense`, `Embedding` (also a tied output head), `Norm` (layer or RMS), `Mlp`,
-  `Conv`, `SelfAttention` (rotary positions optional), `AttentionBlock` (pre-normalized, a GELU or gated SwiGLU `Feed`,
+  `Conv`, `SelfAttention` (rotary positions optional; `window` W > 0 for sliding-window attention, the graph's `Attention(..., window)`; `gate` for a per-head output gate, head h's output times sigmoid(W x)_h with W [heads, D] - `HeadGate` applies one to any [b, t, D]), `AttentionBlock` (pre-normalized, a GELU or gated SwiGLU `Feed`,
   dropout), `Transformer` (GPT-2's decoder), and the scan-based residual blocks `SsmBlock` (Mamba's selective scan over
-  the graph's `SelectiveScan`) and `DeltaBlock` (the gated delta rule). Starting values are PyTorch's for `Dense` and
+  the graph's `SelectiveScan`) and `DeltaBlock` (the gated delta rule: the graph's `DeltaRule`, chunked in the WY form for training, the recurrent form a position at a time while decoding, its state carried between Forward calls). Starting values are PyTorch's for `Dense` and
   `Conv`, GPT-2's for the transformer.
+- `ngram.olang` - input tables added to the embedding, lookups only: `Ngram` of order 1 (the previous token's code, a
+  table indexed by x_{t-1}, its last row for the first position), 2 or 3 (a table of `Buckets` rows indexed by a hash of
+  x_{t-1}, x_t or x_{t-2}, x_{t-1}, x_t). `New` registers the table and a `Tokens()` input of row indices, `Fill` computes
+  those from the batch's tokens (while decoding, the new positions; `before` carries the two tokens before a sequence's
+  first position), `Apply` gives the rows [b, t, Dim]: `h = g.Add(emb.Apply(g, tok), ng.Apply(g))`.
 - `optim.olang` - `AdamW` and `Sgd` over ONE FLAT REGION (two tensors laid out alike: a graph's
   `Params()`/`ParamGrads()`, a settling system's, a BF16 graph's `Masters()` with its BF16 gradients), the runs of the
   region that decay (`Spans(g)`), `ClipNorm`, the schedules `WarmupCosine` and `WarmupLinear`, and `Projector`, the

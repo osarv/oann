@@ -1,0 +1,212 @@
+# the language-model layers on one thread at a small model's shapes (width 160, 4 heads of 40, contexts of 2048):
+# tokens a second, forward and backward. Sliding-window attention - a scalar loop over the band (as a hand-written
+# operation does it), full causal flash attention and the banded flash form, F32 and BF16 (AMX tiles where the target
+# has them). From the repository's root:
+#     make lmlayersbench ARGS="rounds"    (3)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/mat"
+import "../kernels/elem"
+import att "../kernels/attention"
+import "../ad/graph"
+import "../nn/ngram"
+
+fn ms(t0 I64) F64 { return F64(time.Since(t0)) / 1.0e6 }
+
+# the windowed attention as a scalar loop: row by row, head by head, every key of the band (forward, keeping each row's
+# weights for the backward in p, ctx a row)
+fn scalarFore(o mut Array<F32>&, q Array<F32>&, k Array<F32>&, v Array<F32>&, p mut Array<F32>&, seqs I64, ctx I64, heads I64, dh I64, w I64) {
+    dim := heads * dh
+    scale F32 = 1.0 / F32(dh).Sqrt()
+    for s in range seqs {
+        for h in range heads {
+            for i in range ctx {
+                lo := (i - w + 1).Max(0)
+                pr := ((s * heads + h) * ctx + i) * w
+                qi := (s * ctx + i) * dim + h * dh
+                top F32 = -1e30
+                for j in range lo, i + 1 {
+                    kj := (s * ctx + j) * dim + h * dh
+                    acc F32 = 0.0
+                    for d in range dh: acc += q[qi + d] * k[kj + d]
+                    p[pr + j - lo] = acc * scale
+                    top = top.Max(acc * scale)
+                }
+                sum F32 = 0.0
+                for j in range lo, i + 1 {
+                    e := elem.FastExp(p[pr + j - lo] - top)
+                    p[pr + j - lo] = e
+                    sum += e
+                }
+                for d in range dh: o[qi + d] = 0.0
+                for j in range lo, i + 1 {
+                    x := p[pr + j - lo] / sum
+                    p[pr + j - lo] = x
+                    vj := (s * ctx + j) * dim + h * dh
+                    for d in range dh: o[qi + d] += x * v[vj + d]
+                }
+            }
+        }
+    }
+}
+
+fn scalarBack(dq mut Array<F32>&, dk mut Array<F32>&, dv mut Array<F32>&, dout Array<F32>&, q Array<F32>&, k Array<F32>&, v Array<F32>&, p Array<F32>&, seqs I64, ctx I64, heads I64, dh I64, w I64) {
+    dim := heads * dh
+    scale F32 = 1.0 / F32(dh).Sqrt()
+    for i in range dq.Len() {
+        dq[i], dk[i], dv[i] = 0.0, 0.0, 0.0
+    }
+    g := Array<F32>(w)
+    for s in range seqs {
+        for h in range heads {
+            for i in range ctx {
+                lo := (i - w + 1).Max(0)
+                pr := ((s * heads + h) * ctx + i) * w
+                qi := (s * ctx + i) * dim + h * dh
+                dot F32 = 0.0
+                for j in range lo, i + 1 {
+                    vj := (s * ctx + j) * dim + h * dh
+                    acc F32 = 0.0
+                    for d in range dh {
+                        acc += dout[qi + d] * v[vj + d]
+                        dv[vj + d] += p[pr + j - lo] * dout[qi + d]
+                    }
+                    g[j - lo] = acc
+                    dot += acc * p[pr + j - lo]
+                }
+                for j in range lo, i + 1 {
+                    ds := p[pr + j - lo] * (g[j - lo] - dot) * scale
+                    kj := (s * ctx + j) * dim + h * dh
+                    for d in range dh {
+                        dq[qi + d] += ds * k[kj + d]
+                        dk[kj + d] += ds * q[qi + d]
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn flashRun<S>(rounds I64, seqs I64, ctx I64, heads I64, dh I64, w I64, r mut rand.Rand&) F64, F64 {
+    n, dim := seqs * ctx, heads * dh
+    q, k, v, o, dout := Array<S>(n * dim), Array<S>(n * dim), Array<S>(n * dim), Array<S>(n * dim), Array<S>(n * dim)
+    for i in range n * dim {
+        q[i], k[i], v[i], dout[i] = S(r.Normal()), S(r.Normal()), S(r.Normal()), S(r.Normal())
+    }
+    dq, dk, dv := Array<S>(n * dim), Array<S>(n * dim), Array<S>(n * dim)
+    m := fn(a mut Array<S>&): return mat.Mat<S>(a, 0, n, dim, dim)
+    at := att.Heads(heads, ctx, true, w)
+    f := att.Flash<F32>.For(1, ctx, dh)
+    lse := Array<F32>(n * heads)
+    fb, bb := 1e30, 1e30
+    for _ in range rounds {
+        t0 := time.Now()
+        att.FlashAttention(f, m(o), m(q), m(k), m(v), lse, at)
+        fb = fb.Min(ms(t0))
+        t0 = time.Now()
+        att.FlashAttentionGrad(f, m(dq), m(dk), m(dv), m(dout), m(q), m(k), m(v), m(o), lse, at)
+        bb = bb.Min(ms(t0))
+    }
+    return fb, bb
+}
+
+# the graph's DeltaRule node (q, k unit per head as DeltaBlock makes them, beta and gate in (0.5, 0.95)) under an Mse
+# loss in a Graph<T> of one thread: forward and backward ms
+fn deltaRun<T>(rounds I64, seqs I64, ctx I64, heads I64, dh I64) F64, F64 {
+    g := graph.Graph<T>(seqs)
+    dim := heads * dh
+    q, k, v := g.Input(ctx, dim), g.Input(ctx, dim), g.Input(ctx, dim)
+    beta, gate := g.Input(ctx, heads), g.Input(ctx, heads)
+    g.Watch(q)
+    loss := g.Mse(g.DeltaRule(q, k, v, beta, gate), g.Input(ctx, dim))
+    try g.Plan(rand.Rand(1)) catch e { unreachable "shapes: " + $e }
+    r := rand.Rand(2)
+    for x in Array<graph.Var>[q, k, v] {
+        a := g.Value(x).Flat()!
+        for i in range a.Len(): a[i] = T(r.Normal() / F64(dh).Sqrt())
+    }
+    for x in Array<graph.Var>[beta, gate] {
+        a := g.Value(x).Flat()!
+        for i in range a.Len(): a[i] = T(0.5 + 0.45 * r.Uniform(0.0, 1.0))
+    }
+    fb, bb := 1e30, 1e30
+    for _ in range rounds {
+        t0 := time.Now()
+        g.Forward(seqs)
+        fb = fb.Min(ms(t0))
+        t0 = time.Now()
+        g.Backward(loss)
+        bb = bb.Min(ms(t0))
+    }
+    return fb, bb
+}
+
+# order-1, -2 and -3 tables (rows of dim) added to an embedding, Fill and the lookups forward and backward
+fn ngramRun<T>(rounds I64, seqs I64, ctx I64, dim I64) F64, F64 {
+    g := graph.Graph<T>(seqs)
+    tok := g.Tokens(ctx)
+    tables := Array<ngram.Ngram>[ngram.Ngram.New(g, ctx, 1, 256, dim), ngram.Ngram.New(g, ctx, 2, 65536, dim), ngram.Ngram.New(g, ctx, 3, 65536, dim)]
+    h := g.Embedding(tok, g.Param(graph.Init.Normal(0.0, 0.02), true, 256, dim))
+    for t in tables { h = g.Add(h, t.Apply(g)) }
+    loss := g.Mse(h, g.Input(ctx, dim))
+    try g.Plan(rand.Rand(1)) catch e { unreachable "shapes: " + $e }
+    r := rand.Rand(3)
+    td := g.Ints(tok).Flat()!
+    for i in range td.Len(): td[i] = I32(r.Uniform(0.0, 256.0))
+    none := Array<I32>(0)
+    fb, bb := 1e30, 1e30
+    for _ in range rounds {
+        t0 := time.Now()
+        for t in tables { t.Fill(g, tok, ctx, none) }
+        g.Forward(seqs)
+        fb = fb.Min(ms(t0))
+        t0 = time.Now()
+        g.Backward(loss)
+        bb = bb.Min(ms(t0))
+    }
+    return fb, bb
+}
+
+fn rate(tokens I64, f F64, b F64) String { return $(F64(tokens) / ((f + b) / 1000.0)).Fixed(0) }
+
+fn main() ? io.Error, ParseError {
+    args := os.Args()
+    rounds := try args[1].ParseInt() if args.Len() > 1 else 3
+    seqs, ctx, heads, dh := 2, 2048, 4, 40
+    n := seqs * ctx
+    r := rand.Rand(1)
+    try io.PutLn("sliding-window attention, " + $seqs + " x " + $ctx + " tokens, " + $heads + " heads of " + $dh + ", one thread: fwd / bwd ms, tokens/s (fwd+bwd)")
+    full32f, full32b := flashRun<F32>(rounds, seqs, ctx, heads, dh, 0, r)
+    full16f, full16b := flashRun<BF16>(rounds, seqs, ctx, heads, dh, 0, r)
+    try io.PutLn("full causal  | flash F32 " + full32f.Fixed(1) + " / " + full32b.Fixed(1) + " " + rate(n, full32f, full32b) + " | flash BF16 " + full16f.Fixed(1) + " / " + full16b.Fixed(1) + " " + rate(n, full16f, full16b))
+    d32f, d32b := deltaRun<F32>(rounds, seqs, ctx, heads, dh)
+    d16f, d16b := deltaRun<BF16>(rounds, seqs, ctx, heads, dh)
+    try io.PutLn("gated delta rule (graph) | F32 " + d32f.Fixed(1) + " / " + d32b.Fixed(1) + " " + rate(n, d32f, d32b) + " | BF16 " + d16f.Fixed(1) + " / " + d16b.Fixed(1) + " " + rate(n, d16f, d16b))
+    n32f, n32b := ngramRun<F32>(rounds, seqs, ctx, heads * dh)
+    n16f, n16b := ngramRun<BF16>(rounds, seqs, ctx, heads * dh)
+    try io.PutLn("n-gram tables 1+2+3 (graph, with the loss) | F32 " + n32f.Fixed(1) + " / " + n32b.Fixed(1) + " " + rate(n, n32f, n32b) + " | BF16 " + n16f.Fixed(1) + " / " + n16b.Fixed(1) + " " + rate(n, n16f, n16b))
+    for w in Array<I64>[128, 256, 512, 1024] {
+        dim := heads * dh
+        q, k, v, o, dout := Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim)
+        for i in range n * dim {
+            q[i], k[i], v[i], dout[i] = F32(r.Normal()), F32(r.Normal()), F32(r.Normal()), F32(r.Normal())
+        }
+        dq, dk, dv := Array<F32>(n * dim), Array<F32>(n * dim), Array<F32>(n * dim)
+        p := Array<F32>(n * heads * w)
+        sf, sb := 1e30, 1e30
+        for _ in range rounds {
+            t0 := time.Now()
+            scalarFore(o, q, k, v, p, seqs, ctx, heads, dh, w)
+            sf = sf.Min(ms(t0))
+            t0 = time.Now()
+            scalarBack(dq, dk, dv, dout, q, k, v, p, seqs, ctx, heads, dh, w)
+            sb = sb.Min(ms(t0))
+        }
+        f32f, f32b := flashRun<F32>(rounds, seqs, ctx, heads, dh, w, r)
+        f16f, f16b := flashRun<BF16>(rounds, seqs, ctx, heads, dh, w, r)
+        try io.PutLn("window " + $w + " | scalar F32 " + sf.Fixed(1) + " / " + sb.Fixed(1) + " " + rate(n, sf, sb) + " | flash F32 " + f32f.Fixed(1) + " / " + f32b.Fixed(1) + " " + rate(n, f32f, f32b) + " | flash BF16 " + f16f.Fixed(1) + " / " + f16b.Fixed(1) + " " + rate(n, f16f, f16b))
+    }
+}

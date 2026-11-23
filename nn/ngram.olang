@@ -1,0 +1,110 @@
+# nn/ngram - input tables looked up by the tokens before a position, added to its embedding: the previous token's code
+# (a table indexed by x_{t-1}) and hashed n-gram tables (indexed by a hash of x_{t-1}, x_t, or x_{t-2}, x_{t-1}, x_t, into
+# Buckets rows). Lookups only - the graph's Embedding over a Tokens() input of row indices, which Fill computes from the
+# tokens each batch; the gradient reaches only the rows looked up.
+
+import "../ad/graph"
+
+# a table of Rows x Dim and the Tokens() input holding each position's row. Order 1: the previous token's own row (Rows
+# = the vocabulary + 1, the last for a position with none before it); order 2 and 3: the row of a hash of the last
+# Order tokens up to the position, into Buckets rows (a token before the sequence hashed as -1)
+type Ngram struct(Table graph.Var, Ids graph.Var, Order I64, Buckets I64, Dim I64) {
+    Table
+    Ids
+    Order
+    Buckets
+    Dim
+}
+
+# a table of order 1 (buckets: the vocabulary), 2 or 3 over sequences of ctx positions, rows of dim, registered on g
+fn Ngram.New<T>(g mut graph.Graph<T>&, ctx I64, order I64, buckets I64, dim I64, init graph.Init = graph.Init.Normal(0.0, 0.02)) Ngram {
+    if order < 1 or order > 3 or buckets < 1: unreachable "nn/ngram: order 1, 2 or 3 and a positive bucket count, not " + $order + " and " + $buckets
+    rows := buckets + 1 if order == 1 else buckets
+    return Ngram(g.Param(init, true, rows, dim), g.Tokens(ctx), order, buckets, dim)
+}
+
+# the rows of the positions: [batch, ctx, Dim], to add to the embedding
+fn (n Ngram&) Apply<T>(g mut graph.Graph<T>&) graph.Var { return g.Embedding(n.Ids, n.Table) }
+
+# the row of a position whose tokens are a (two before), b (one before) and c (its own), -1 where there is none
+fn (n Ngram&) Row(a I32, b I32, c I32) I32 {
+    if n.Order == 1: return I32(n.Buckets) if b < 0 else b
+    x U64 = U64(I64(b) + 2) * 0x9E3779B97F4A7C15 ^ U64(I64(c) + 2) * 0xC2B2AE3D27D4EB4F
+    if n.Order == 3: x ^= U64(I64(a) + 2) * 0x165667B19E3779F9
+    x ^= x >> 31
+    x *= 0xD6E8FEB86659FD93
+    x ^= x >> 32
+    return I32(x % U64(n.Buckets))
+}
+
+# Ids from the tokens input (a Tokens() of the same graph) for the positions in use: a whole batch, or while decoding
+# the n positions from Pos. before holds each sequence's two tokens before its first position (2 a sequence, the
+# nearer last; -1 for none), or nothing: none before
+fn (n Ngram&) Fill<T>(g mut graph.Graph<T>&, tokens graph.Var, count I64, before Array<I32>&) {
+    src := g.Ints(tokens).Flat()!
+    dst := g.Ints(n.Ids).Flat()!
+    seqs := g.Batch
+    ctx := g.Info(tokens).Dims[1]
+    for s in range seqs {
+        a, b := I32(-1), I32(-1)
+        if before.Len() >= 2 * (s + 1) {
+            a, b = before[2 * s], before[2 * s + 1]
+        }
+        for j in range count {
+            at := j * seqs + s if g.Decode else s * ctx + j
+            c := src[at]
+            dst[at] = n.Row(a, b, c)
+            a, b = b, c
+        }
+    }
+}
+
+# ---- tests ----
+
+import "../tensor"
+import "std/rand"
+
+test Ngram "rows: the previous token (the last row at the start), hashes of 2 and 3 tokens in range and spread; added to an embedding, gradients reach only the rows looked up" {
+    g := graph.Graph<F64>(2)
+    tok := g.Tokens(5)
+    p := Ngram.New(g, 5, 1, 7, 3)
+    b2 := Ngram.New(g, 5, 2, 64, 3)
+    b3 := Ngram.New(g, 5, 3, 64, 3)
+    assert g.Info(p.Table).Dims == tensor.Shape.Of(8, 3)
+    e := g.Param(graph.Init.Normal(0.0, 1.0), true, 7, 3)
+    h := g.Add(g.Add(g.Embedding(tok, e), p.Apply(g)), g.Add(b2.Apply(g), b3.Apply(g)))
+    loss := g.Mse(h, g.Input(5, 3))
+    try g.Plan(rand.Rand(5))
+    td := g.Ints(tok).Flat()!
+    toks := Array<I32>[1, 2, 3, 4, 5, 6, 6, 6, 0, 1]
+    for i in range 10: td[i] = toks[i]
+    none := Array<I32>(0)
+    for n in Array<Ngram>[p, b2, b3] { n.Fill(g, tok, 5, none) }
+    ids := g.Ints(p.Ids).Flat()!
+    assert ids[0] == 7 and ids[1] == 1 and ids[4] == 4 and ids[5] == 7 and ids[6] == 6
+    i2 := g.Ints(b2.Ids).Flat()!
+    assert i2[6] == b2.Row(-1, 6, 6) and i2[7] == i2[6] and i2[1] != i2[2]
+    for i in range 10: assert i2[i] >= 0 and i2[i] < 64
+    i3 := g.Ints(b3.Ids).Flat()!
+    assert i3[7] == b3.Row(6, 6, 6) and i3[7] != i3[6]
+    # a sequence carried on: what came before replaces the start
+    b2.Fill(g, tok, 5, Array<I32>[9, 8, 9, 8])
+    assert g.Ints(b2.Ids).Flat()![0] == b2.Row(9, 8, 1)
+    g.Forward(2)
+    g.Backward(loss)
+    grad := g.Grad(p.Table).Flat()!
+    for r in range 8 {
+        used := r != 5
+        for c in range 3: assert (grad[r * 3 + c] != 0.0) == used, "row " + $r
+    }
+    # spread: 2000 distinct pairs fill most of 4096 buckets' worth of a uniform draw
+    seen := Array<Bool>(4096)
+    wide := Ngram(graph.None, graph.None, 2, 4096, 1)
+    hits := 0
+    for x in range 2000 {
+        r := wide.Row(-1, I32(x / 50), I32(x % 50))
+        if not seen[r]: hits += 1
+        seen[r] = true
+    }
+    assert hits > 1500, "distinct rows " + $hits
+}
