@@ -1,0 +1,61 @@
+# bench/vits - the speed of VITS text to speech (speech/vits): for a model - a transformers VitsModel directory or a
+# Piper voice's .onnx - the seconds of compute a second of audio of a sentence takes, on each thread count given, and
+# what that suggests on a Raspberry Pi 4 (Cortex-A72: NEON, no BF16; about 8 times slower than this machine on
+# compute-bound work, a rough factor, not a measurement). Medians of `rounds`.
+#
+#     bench_vits MODEL [rounds] [threads ...]
+
+import "std/os"
+import "std/time"
+import "../speech/vits"
+
+# a sentence in espeak's IPA, every symbol in both English models' vocabularies
+Text String = "ðə nˈɔːɹθ wˈɪnd ænd ðə sˈʌn wɜː dɪspjˈuːɾɪŋ wˈɪtʃ wʌz ðə stɹˈɔŋɡɚ, wˌɛn ɐ tɹˈævəlɚ kˈeɪm ɐlˈɔŋ ɹˈæpt ɪn ɐ wˈɔːɹm klˈoʊk."
+
+fn median(xs mut Array<F64>&) F64 {
+    for i in range xs.Len() {
+        for j in range i + 1, xs.Len() {
+            if xs[j] < xs[i] {
+                t := xs[i]
+                xs[i] = xs[j]
+                xs[j] = t
+            }
+        }
+    }
+    return xs[xs.Len() / 2]
+}
+
+fn main() {
+    args := os.Args()
+    if args.Len() < 2 {
+        Println("usage: bench_vits MODEL [rounds] [threads ...]")
+        os.Exit(2)
+    }
+    path := args[1]
+    piper := path.EndsWith(".onnx")
+    m := vits.Model.Piper(path)! if piper else vits.Model.Load(path)!
+    s := vits.Symbols.PiperMap(path + ".json")! if piper else vits.Symbols.Vocab(path + "/vocab.json")!
+    ids := s.Encode(Text)!
+    rounds := args[2].ParseInt()! if args.Len() > 2 else I64(3)
+    threads := Vec<I64>()
+    for i in range 3, args.Len(): threads.Push(args[i].ParseInt()!)
+    if threads.Len() == 0 {
+        threads.Push(1)
+        threads.Push(4)
+    }
+    o := vits.Options(m.C)
+    for t in threads {
+        m.Threads = t
+        took := Array<F64>(rounds)
+        samples I64 = 0
+        for r in range rounds {
+            t0 := time.Now()
+            wave, _ := m.Speak(ids, o)
+            took[r] = F64(time.Now() - t0) / 1e9
+            samples = wave.Len()
+        }
+        secs := F64(samples) / F64(m.C.Rate)
+        per := median(took) / secs
+        Println(path + ": " + $ids.Len() + " ids, " + $secs + " s of audio; threads " + $t + ": " + $median(took) + " s, " + $per + " s a second of audio (Raspberry Pi 4, about 8x: " + $(per * 8.0) + ")")
+    }
+}

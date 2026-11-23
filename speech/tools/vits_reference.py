@@ -4,7 +4,8 @@
 # strings, mapped to ids by hand as the tokenizers do (no phonemizer, no espeak): vits-ljs's vocab.json with a blank (0)
 # around every character, Piper's phoneme_id_map with "^", "_" after every phoneme, "$". Writes into OUT/<model>/:
 # cases.json (each case's IPA and ids), <case>.dur.f32 (every id's frames, the ceiled durations) and <case>.wav.f32
-# (the waveform). Needs torch, transformers, onnx, onnxruntime, numpy; run with python3 -I:
+# (the waveform); for vits-ljs also <case>.wav64.f32, the waveform of the model run in F64 (rounded to F32), since
+# transformers' own F32 waveform is up to 2.2e-4 from it. Needs torch, transformers, onnx, onnxruntime, numpy; run with python3 -I:
 #
 #     python3 -I speech/tools/vits_reference.py MODELS_DIR OUT
 #
@@ -49,6 +50,9 @@ def vits_ljs():
     model = VitsModel.from_pretrained(src, torch_dtype=torch.float32).eval()
     model.noise_scale = 0.0
     model.noise_scale_duration = 0.0
+    exact = VitsModel.from_pretrained(src, torch_dtype=torch.float32).double().eval()
+    exact.noise_scale = 0.0
+    exact.noise_scale_duration = 0.0
     seen = {}
     model.duration_predictor.register_forward_hook(lambda m, i, o: seen.__setitem__("logw", o))
     cases = {}
@@ -62,10 +66,12 @@ def vits_ljs():
     for key, c in cases.items():
         with torch.no_grad():
             wav = model(torch.tensor([c["ids"]])).waveform[0]
+            wav64 = exact(torch.tensor([c["ids"]])).waveform[0]
         # the forward's own durations: ceil(exp(log_duration) * mask * length_scale), the mask and the scale 1
         dur = torch.ceil(torch.exp(seen["logw"]) * 1.0 * 1.0)[0, 0]
         dur.numpy().astype(np.float32).tofile(os.path.join(d, key + ".dur.f32"))
         wav.numpy().astype(np.float32).tofile(os.path.join(d, key + ".wav.f32"))
+        wav64.numpy().astype(np.float32).tofile(os.path.join(d, key + ".wav64.f32"))
         print("vits-ljs", key, len(c["ids"]), "ids,", int(dur.sum()), "frames,", wav.shape[0], "samples")
 
 
