@@ -91,9 +91,10 @@ fn G2p.Parse(dict String&) G2p {
 marks := ";:,.!?¡¿—…\"«»“”(){}[]"
 
 # the IPA of text in lang ("en" or "sv"): words separated by a space, the punctuation phonemizer keeps where it was
-fn (g G2p&) Phonemes(text String&, lang String&) String ? G2pError {
+fn (g G2p&) Phonemes(given String&, lang String&) String ? G2pError {
     if lang != "en" and lang != "sv": error G2pError.Language(lang)
     sv := lang == "sv"
+    text := clock(given)
     out := StringBuilder()
     phrase := Vec<String>()
     i I64 = 0
@@ -120,6 +121,18 @@ fn (g G2p&) Phonemes(text String&, lang String&) String ? G2pError {
         i = j
     }
     return out.ToString().Trim().Replace("  ", " ")
+}
+
+# clock times read as their hours and minutes: "23:31" as "23 31" (tjugotre trettioett, twenty-three thirty-one) -
+# a colon between one or two digits and exactly two
+fn clock(text String&) String {
+    out := StringBuilder()
+    for i in range text.Len() {
+        c := text[i]
+        time := c == ':' and i > 0 and text[i - 1].IsDigit() and i + 2 < text.Len() and text[i + 1].IsDigit() and text[i + 2].IsDigit() and (i + 3 == text.Len() or not text[i + 3].IsDigit())
+        out.PushChar(' ' if time else c)
+    }
+    return out.ToString()
 }
 
 # the length of the punctuation mark at i (a UTF-8 sequence for the long dash, ellipsis, quotes and inverted marks), 0
@@ -1224,4 +1237,11 @@ test G2p "Swedish: words, held-out words and sentences against espeak (where the
     check(g, "sv_words", "sv", 0.88, 0.96)
     check(g, "sv_heldout", "sv", 0.81, 0.94)
     check(g, "sv_sentences", "sv", 0.58, 0.98)
+}
+
+test G2p "a clock time is read as hours and minutes, in both languages" {
+    g := G2p.Parse("")
+    assert g.Phonemes("Klockan är 23:31.", "sv")! == g.Phonemes("Klockan är 23 31.", "sv")!
+    assert g.Phonemes("It is 11:45", "en")! == g.Phonemes("It is 11 45", "en")!
+    assert clock("23:31, 1:05 och 10:3") == "23 31, 1 05 och 10:3"
 }
