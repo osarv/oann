@@ -39,6 +39,7 @@ fn target(p I64) F64 { return (32.0 * F64(1 << p)).Min(256.0) }
 
 # the final loss of g
 fn Truth(s schema.Schema&, g schema.Genome&) F64 {
+    if chained(s): return chainTruth(s, g)
     layers := s.Children(g, schema.Root, "layers")
     loss := 0.15 * (F64(layers.Len()) - 4.0).Abs()
     for p in range layers.Len() {
@@ -70,8 +71,69 @@ fn Optimum() F64 {
     return best
 }
 
-# the loss at budget b: the final loss plus a slow start, larger for wide networks and small learning rates
+# ---- a chain landscape ----
+#
+# Chain(n) is a harder space for a search, where the order of evaluation matters: n choice genes c0 .. c(n-1) of 4
+# options each, the loss a sum of a cost per gene and a cost per pair of neighbours (an NK landscape with K = 1, its
+# tables drawn once from a fixed seed). Each single change moves the loss a little, many changes interact, and
+# neutral and bad mutations far outnumber good ones, so evolution spends most evaluations on children no better than
+# their parents, while a model of the tables could tell good children apart before training them. The optimum is exact
+# by dynamic programming along the chain. Curves start slowly where many genes hold option 0. Truth, Optimum, Curve
+# and Fit serve either space.
+
+fn Chain(n I64) schema.Schema {
+    s := schema.Schema()
+    for i in range n: s.Choice(schema.Root, "c" + $i, Array<String>["a", "b", "c", "d"])
+    return s
+}
+
+fn chained(s schema.Schema&) Bool { return s.Blocks.Len() == 1 and s.Blocks[0].Genes[0].Name == "c0" }
+
+# the tables: n gene costs of 4, then n - 1 pair costs of 16
+fn tables(n I64) Array<F64> {
+    r := rand.Rand(20261123)
+    return Array<F64>[r.Uniform(0.0, 0.3) for _ in range 4 * n + 16 * (n - 1)]
+}
+
+fn chainTruth(s schema.Schema&, g schema.Genome&) F64 {
+    n := s.Blocks[0].Genes.Len()
+    t := tables(n)
+    v := g.Insts[0].Values
+    loss := 0.0
+    for i in range n {
+        loss += t[4 * i + I64(v[i])]
+        if i + 1 < n: loss += t[4 * n + 16 * i + 4 * I64(v[i]) + I64(v[i + 1])]
+    }
+    return loss
+}
+
+# the lowest loss of a space (Space's or a Chain's)
+fn OptimumOf(s schema.Schema&) F64 {
+    if not chained(s): return Optimum()
+    n := s.Blocks[0].Genes.Len()
+    t := tables(n)
+    best := Array<F64>[t[k] for k in range 4]       # the best loss of genes 0 .. i ending in each option
+    for i in range 1, n {
+        next := Array<F64>[F64.Inf for _ in range 4]
+        for b in range 4 {
+            for a in range 4: next[b] = next[b].Min(best[a] + t[4 * n + 16 * (i - 1) + 4 * a + b])
+            next[b] += t[4 * i + b]
+        }
+        best = next
+    }
+    out := F64.Inf
+    for b in range 4: out = out.Min(best[b])
+    return out
+}
+
+# the loss at budget b: the final loss plus a slow start, larger for wide networks and small learning rates (in a
+# chain, for genes holding option 0)
 fn Curve(s schema.Schema&, g schema.Genome&, b F64) F64 {
+    if chained(s) {
+        zeros := 0.0
+        for v in g.Insts[0].Values: zeros += 1.0 if v == 0.0 else 0.0
+        return chainTruth(s, g) + (0.2 + 2.0 * zeros / F64(g.Insts[0].Values.Len())) * (-b / 2.0).Exp()
+    }
     width F64 = 0.0
     for i in s.Children(g, schema.Root, "layers"): width += s.Num(g, i, "width")
     a := 0.2 + 1.0 * width / 512.0
@@ -92,4 +154,15 @@ fn (f mut Fit&) Evaluate(g schema.Genome&, t search.Trial&, data search.Split<I6
     f.Spent += t.Budget - t.Spent
     r := rand.Rand(t.Seed)
     return search.Result(Curve(f.Schema, g, t.Budget) + r.Normal(0.0, f.Noise))
+}
+
+test OptimumOf "a chain's optimum by dynamic programming is the least loss over every genome of a small chain" {
+    s := Chain(4)
+    g := s.Random(rand.Rand(1))
+    best := F64.Inf
+    for k in range 256 {
+        for i in range 4: g.Insts[0].Values[i] = F64((k >> (2 * i)) & 3)
+        best = best.Min(Truth(s, g))
+    }
+    assert (best - OptimumOf(s)).Abs() < 1e-12
 }

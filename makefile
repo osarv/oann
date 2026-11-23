@@ -13,7 +13,7 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	bayes/dense.olang bayes/gauss.olang bayes/quadrature.olang bayes/laplace.olang bayes/state.olang bayes/target.olang bayes/vi.olang \
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang \
 	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang \
-	archnet/encode.olang archnet/offline.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
+	archnet/encode.olang archnet/offline.olang archnet/toy.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
 	surgery/model.olang surgery/ops.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
