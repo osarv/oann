@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen oannlisten speechbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -144,6 +144,12 @@ bpelm:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_bpelm examples/bpelm.olang
 	$(GPUENV) ./build/examples_bpelm $(ARGS)
 
+# oann-listen: speech to text by a Whisper model (speech/listen.olang, speech/README.md), built to build/oann-listen -
+# ARGS: MODEL CLIP.wav and its flags (none: only builds it)
+oannlisten:
+	$(OLANG) build -output build/oann-listen speech/listen.olang
+	$(if $(ARGS),./build/oann-listen $(ARGS),)
+
 # oann-gen: completions of a JSON-lines file of prompts by an open-weight model (llm/gen.olang, llm/README.md), built
 # to build/oann-gen - ARGS: MODEL prompts.jsonl out.jsonl and its flags (none: only builds it)
 oanngen:
@@ -152,6 +158,11 @@ oanngen:
 
 # decoding speed of an open-weight model, tokens a second at batch sizes, and peak memory (bench/llm.olang) - ARGS: the
 # model's directory, context, steps, int8 or bf16, batch sizes
+# Whisper's real-time factor (bench/speech.olang) - ARGS: MODEL_DIR CLIP.wav [rounds] [threads ...]
+speechbench:
+	$(OLANG) build -output build/bench_speech bench/speech.olang
+	./build/bench_speech $(ARGS)
+
 llmbench:
 	$(OLANG) build -output build/bench_llm bench/llm.olang
 	./build/bench_llm $(ARGS)

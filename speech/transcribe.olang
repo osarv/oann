@@ -121,9 +121,11 @@ type Whisper struct(M whisper.Model, T Tokens, beams I64 = 5) {
     logp mut Array<F32>& = Array<F32>(M.C.Vocab)
 }
 
-# the model and tokens in dir, BF16 products where bf is set; room for beam searches of up to `beams`
-fn Whisper.Load(dir String&, bf Bool = false, beams I64 = 5) Whisper ? whisper.ModelError, os.Error {
+# the model and tokens in dir, BF16 products where bf is set; room for beam searches of up to `beams`; on `threads`
+# threads (0: every core)
+fn Whisper.Load(dir String&, bf Bool = false, beams I64 = 5, threads I64 = 0) Whisper ? whisper.ModelError, os.Error {
     m := try whisper.Model.Load(dir, bf)
+    if threads > 0: m.Threads = threads
     t := try Tokens.Load(dir)
     return Whisper(m, t, beams.Max(1))
 }
@@ -469,10 +471,14 @@ fn (s mut Stream&) Settled(final Bool = false) Array<Segment> {
     for s.seek + window <= s.buf.Len() or (final and s.seek < s.buf.Len()) {
         x := Array<F32>[s.buf[i] for i in range s.seek, (s.seek + window).Min(s.buf.Len())]
         clip, frames := s.w.Mel.Clip(x)
-        take := (x.Len() / mel.Hop).Min(frames)
-        end := s.w.segments(clip, frames.Min(take), 0, o, true, out, F64(s.base + s.seek) / F64(mel.Rate))
-        s.seek += (end.Min(take) * mel.Hop).Max(mel.Hop)
-        if not final and end < take: continue
+        take := frames.Min(2 * o.Positions)
+        s.w.Window(clip, frames, 0, take, o.Positions)
+        gen := s.w.Decode(s.w.Prompt(o), o)
+        segs, adv := s.w.Cut(gen, F64(s.base + s.seek) / F64(mel.Rate), take)
+        for g in segs {
+            if g.Text.Trim().Len() > 0: out.Push(g)
+        }
+        s.seek += adv.Max(1) * mel.Hop
     }
     s.drop()
     return out.ToArray()
@@ -573,12 +579,11 @@ test Whisper "tiny: greedy and beam transcripts the reference's token for token,
 }
 
 test Whisper "base and small: greedy and beam transcripts the reference's token for token, segments the same (where the files are)" {
-    holds("base")
-    holds("small")
+    for name in whisper.Larger(): holds(name)
 }
 
 test Whisper "BF16 products (AMX where there is): every model's greedy transcripts the F32 ones' (where the files are)" {
-    for name in ["tiny", "base", "small"] {
+    for name in whisper.Models() {
         dir := mel.Cache() + "/models/openai--whisper-" + name
         if not os.Exists(dir) or not os.Exists(mel.Cache() + "/audio/jfk.wav"): continue
         f := Whisper.Load(dir)!
@@ -589,4 +594,25 @@ test Whisper "BF16 products (AMX where there is): every model's greedy transcrip
             assert f.Text(x, o) == b.Text(x, o), name + " " + clip + ": " + b.Text(x, o)
         }
     }
+}
+
+test Stream "sound pushed in half seconds: nothing settled before its end, the partial text the clip's, then its segments' text" {
+    dir := mel.Cache() + "/models/openai--whisper-tiny"
+    if not os.Exists(dir) or not os.Exists(mel.Cache() + "/audio/jfk.wav") {
+        Println("skipped: no model or clip")
+        return
+    }
+    w := Whisper.Load(dir)!
+    x := mel.Wav(mel.Cache() + "/audio/jfk.wav")!
+    whole := ""
+    for g in w.Transcribe(x, Options()): whole = whole + g.Text
+    st := Stream(w, Options())
+    for c0 in range 0, x.Len(), 8000 {
+        st.Push(x[c0:(c0 + 8000).Min(x.Len())])
+        assert st.Settled().Len() == 0
+    }
+    assert st.Partial() == w.Text(x, Options()), st.Partial()
+    got := ""
+    for g in st.Settled(true): got = got + g.Text
+    assert got == whole, got + " | " + whole
 }

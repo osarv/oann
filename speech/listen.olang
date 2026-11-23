@@ -1,0 +1,152 @@
+# speech/listen - oann-listen, speech to text by a Whisper model:
+#
+#     oann-listen MODEL CLIP.wav [--timestamps] [--beams N] [--language L] [--translate] [--bf16] [--threads T]
+#     arecord -q -f S16_LE -r 16000 -c 1 | oann-listen MODEL - [--wake WAKE.safetensors] [...]
+#
+# MODEL is a directory holding a Hugging Face Whisper checkpoint (config.json, generation_config.json, tokenizer.json,
+# model.safetensors) or a repository's name ("openai/whisper-base"), fetched once into $OANN_MODELS (by default
+# ~/.cache/oann/models). A clip is a 16-bit PCM WAVE file of any rate and length; its text is printed, or with
+# --timestamps a line a segment, "[start - end] text". "-" reads raw 16-bit 16 kHz mono sound from standard input as it
+# comes and prints each segment once settled (dictation); with --wake, it waits for the wake word (speech/kws), then
+# takes what follows until a pause (--pause seconds below the level of silence, at most --longest seconds) and prints
+# its text, a line an utterance - the loop of a voice assistant.
+
+import "std/flags"
+import "std/io"
+import "std/os"
+import "std/time"
+import "../llm/chat"
+import "kws"
+import "mel"
+import "transcribe"
+
+fn fail(msg String&) noreturn {
+    try io.PutErrLn("oann-listen: " + msg) catch { }
+    os.Exit(1)
+}
+
+fn say(msg String&) { try io.PutErrLn("oann-listen: " + msg) catch { } }
+
+# the model's directory: MODEL itself, or the repository fetched
+fn modelDir(name String&) String {
+    if os.IsDir(name): return name
+    if not name.Contains("/"): fail("no model directory " + name)
+    root := try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: root = (try os.Env("HOME") catch default "/tmp") + "/.cache/oann/models"
+    dir := root + "/" + name.Replace("/", "--")
+    try chat.Fetch(name, dir) catch { fail("could not fetch " + name + " from Hugging Face") }
+    return dir
+}
+
+fn stamp(t F64) String { return t.Fixed(2) }
+
+fn print(segs Array<transcribe.Segment>&, timed Bool) {
+    for g in segs {
+        if timed: Println("[" + stamp(g.Start) + " - " + stamp(g.End) + "]" + g.Text)
+        else: Println(g.Text.Trim())
+    }
+}
+
+# up to n samples of raw 16-bit sound from standard input; none at its end
+fn readPcm(buf mut Array<U8>&) Array<F32> {
+    got := try io.Read(0, buf) catch { return Array<F32>(0) }
+    n := got.Len() / 2
+    out := Array<F32>(n)
+    for i in range n {
+        v := I64(got[2 * i]) | (I64(got[2 * i + 1]) << 8)
+        out[i] = F32(F64(v - 65536 if v >= 32768 else v) / 32768.0)
+    }
+    return out
+}
+
+# the root mean square of x
+fn level(x Array<F32>&) F64 {
+    if x.Len() == 0: return 0.0
+    s F64 = 0.0
+    for v in x: s += F64(v) * F64(v)
+    return (s / F64(x.Len())).Sqrt()
+}
+
+# dictation: standard input's sound, each segment printed once settled
+fn dictate(w mut transcribe.Whisper&, o transcribe.Options&) {
+    s := transcribe.Stream(w, o)
+    buf := Array<U8>(32000)
+    for {
+        x := readPcm(buf)
+        if x.Len() == 0: break
+        s.Push(x)
+        print(s.Settled(), true)
+    }
+    print(s.Settled(true), true)
+}
+
+# the assistant's loop: the wake word, then the utterance until a pause
+fn assistant(w mut transcribe.Whisper&, o transcribe.Options&, wake String&, threshold F64, pause F64, longest F64, quiet F64) {
+    sp := try kws.Spotter.Load(wake) catch { fail("cannot load the wake word " + wake) }
+    d := kws.Detector(sp, threshold)
+    buf := Array<U8>(3200)
+    for {
+        x := readPcm(buf)
+        if x.Len() == 0: return
+        if d.Push(x).Len() == 0: continue
+        say("listening")
+        said := Vec<F32>()
+        still F64 = 0.0
+        for F64(said.Len()) < longest * F64(mel.Rate) and still < pause {
+            y := readPcm(buf)
+            if y.Len() == 0: break
+            for v in y: said.Push(v)
+            still = still + F64(y.Len()) / F64(mel.Rate) if level(y) < quiet else 0.0
+        }
+        t0 := time.Now()
+        text := w.Text(said.ToArray(), o)
+        Println(text.Trim())
+        say((F64(time.Since(t0)) / 1e9).Fixed(2) + " s for " + (F64(said.Len()) / F64(mel.Rate)).Fixed(1) + " s")
+        d = kws.Detector(sp, threshold)
+    }
+}
+
+fn main() {
+    p := flags.Flags("oann-listen", "the text of CLIP.wav (or of standard input's sound, \"-\") by the Whisper model MODEL")
+    timed := p.Bool("timestamps", 't', "a line a segment, with its start and end")
+    beams := p.Int("beams", 'b', 1, "beam search over this many beams (1: greedy)")
+    lang := p.Text("language", 'l', "", "the language's code (en, de, sv, ...); detected by default")
+    translate := p.Bool("translate", 0, "into English")
+    bf16 := p.Bool("bf16", 0, "BF16 weights (AMX products where the CPU has them): half the memory")
+    threads := p.Int("threads", 'j', 0, "threads (default: every core)")
+    positions := p.Int("positions", 0, 1500, "the encoder's positions (fewer: a shorter window, faster, not the reference)")
+    maxTokens := p.Int("max-tokens", 0, 224, "tokens a 30 s window may have")
+    wake := p.Text("wake", 'w', "", "with \"-\": wait for this wake word (kws safetensors) before each utterance")
+    threshold := p.Float("threshold", 0, 0.8, "the wake word's score that fires")
+    pause := p.Float("pause", 0, 0.8, "seconds of silence that end an utterance")
+    longest := p.Float("longest", 0, 10.0, "seconds an utterance may last")
+    quiet := p.Float("quiet", 0, 0.01, "the level (RMS) below which sound is silence")
+    try p.Parse(os.Args()) catch flags.Error.Help {
+        try io.Put(p.Help()) catch { }
+        return
+    } catch flags.Error {
+        fail(p.Message())
+    }
+    args := p.Args()
+    if args.Len() != 2: fail("usage: oann-listen MODEL CLIP.wav|- [flags] (--help)")
+    dir := modelDir(args[0])
+    w := try transcribe.Whisper.Load(dir, bf16.Get(), beams.Get().Max(1), threads.Get()) catch { fail("cannot load the model in " + dir) }
+    o := transcribe.Options()
+    o.Language = lang.Get()
+    o.Translate = translate.Get()
+    o.Timestamps = timed.Get()
+    o.Beams = beams.Get()
+    o.MaxTokens = maxTokens.Get()
+    o.Positions = positions.Get().Min(w.M.C.Positions).Max(16)
+    if args[1] == "-" {
+        if wake.Get().Len() > 0: assistant(w, o, wake.Get(), threshold.Get(), pause.Get(), longest.Get(), quiet.Get())
+        else: dictate(w, o)
+        return
+    }
+    x := try mel.Wav(args[1]) catch { fail("cannot read " + args[1] + " (a 16-bit PCM WAVE file)") }
+    if timed.Get() or x.Len() > 30 * mel.Rate {
+        print(w.Transcribe(x, o), timed.Get())
+        return
+    }
+    Println(w.Text(x, o).Trim())
+}

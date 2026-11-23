@@ -15,6 +15,7 @@
 import "std/json"
 import "std/os"
 import "../io/checkpoint"
+import "../kernels/elem"
 import "../kernels/gemm"
 import "../kernels/mat"
 import "../tensor"
@@ -170,8 +171,8 @@ type Model struct(C Config, Bf Bool) {
     for _ in range C.EncLayers: encs.Push(Block(C, false, Bf))
     Enc mut Array<Block>& = encs.ToArray()
     EncLn Norm = Norm(C.Dim)
-    Embed mut Array<F32>& = Array<F32>(C.Vocab * C.Dim)   # the tokens' embeddings, also the head (tied)
-    HeadB mut Array<BF16>& = Array<BF16>(0)               # Bf: the head in BF16
+    Embed mut Array<F32>& = Array<F32>(C.Vocab * C.Dim)   # the tokens' embeddings
+    Head Lin = Lin(C.Dim, C.Vocab, Bf)                    # the head, tied to them (F32: the same array)
     DecPos mut Array<F32>& = Array<F32>(C.Text * C.Dim)
     decs := Vec<Block>()
     for _ in range C.DecLayers: decs.Push(Block(C, true, Bf))
@@ -194,7 +195,9 @@ fn Model.Load(dir String&, bf Bool = false) Model ? ModelError, os.Error {
     for i in range c.EncLayers: try r.block(m.Enc[i], "model.encoder.layers." + $i + ".", c.Dim)
     try r.norm(m.EncLn, "model.encoder.layer_norm")
     try r.into(m.Embed, 0, "model.decoder.embed_tokens.weight", c.Vocab * c.Dim)
-    if bf: m.HeadB = Array<BF16>[BF16(v) for v in m.Embed]
+    m.Head.W = m.Embed
+    if bf: m.Head.H = Array<BF16>[BF16(v) for v in m.Embed]
+    if bf: m.Head.W = Array<F32>(0)
     try r.into(m.DecPos, 0, "model.decoder.embed_positions.weight", c.Text * c.Dim)
     for i in range c.DecLayers: try r.block(m.Dec[i], "model.decoder.layers." + $i + ".", c.Dim)
     try r.norm(m.DecLn, "model.decoder.layer_norm")
@@ -211,23 +214,62 @@ fn (m Model&) Params() I64 {
 
 # ---- the arithmetic every part shares ----
 
-# the products of one caller: gemm's workspace and room for an operand rounded to BF16
+# the products of one caller: gemm's workspace, one of a thread for each task of a product of few rows, and room for
+# an operand rounded to BF16
 type Arith struct(threads I64, dim I64, room I64) {
+    Threads I64 = threads
     ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(threads, dim)
+    made := Vec<gemm.Workspace<F32>>()
+    for _ in range threads: made.Push(gemm.Workspace<F32>(1, dim))
+    each mut Array<gemm.Workspace<F32>>& = made.ToArray()
     xb mut Array<BF16>& = Array<BF16>(room)
     yb mut Array<BF16>& = Array<BF16>(room)
 }
 
-# dst[: rows, : w.Out] = src[: rows, : w.In] W^T + b, rows of src w.In apart and of dst w.Out apart
+# rows below this: a product of the decoder's few rows, F32 activations times the weights as stored (BF16 widened),
+# split over the threads by its outputs - reading the weights once is its whole cost
+Few I64 = 16
+
+# dst[: rows, : w.Out] = src[: rows, : w.In] W^T + b, rows of src w.In apart and of dst w.Out apart. Split over the
+# threads by outputs where gemm would not split it: a product of few rows, and BF16 tiles (gemm's AMX path is one task)
 fn (a mut Arith&) Lin(dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Lin&) {
     if rows == 0 or w.Out == 0: return
-    c := mat.Mat<F32>(dst, 0, rows, w.Out, w.Out)
-    if w.Bf {
-        for i in range rows * w.In: a.xb[i] = BF16(src[i])
-        gemm.Gemm(a.ws, c, mat.Mat<BF16>(a.xb, 0, rows, w.In, w.In), false, mat.Mat<BF16>(w.H, 0, w.Out, w.In, w.In), true, epi = gemm.Epilogue.Bias(w.Bias))
+    tile := w.Bf and rows >= Few
+    if tile {
+        t := a.Threads.Min(rows).Max(1)
+        join {
+            for i in range t: spawn round(a.xb, src, (i * rows / t) * w.In, ((i + 1) * rows / t) * w.In)
+        }
+    }
+    if rows >= Few and not tile {
+        gemm.Gemm(a.ws, mat.Mat<F32>(dst, 0, rows, w.Out, w.Out), mat.Mat<F32>(src, 0, rows, w.In, w.In), false, mat.Mat<F32>(w.W, 0, w.Out, w.In, w.In), true, epi = gemm.Epilogue.Bias(w.Bias))
         return
     }
-    gemm.Gemm(a.ws, c, mat.Mat<F32>(src, 0, rows, w.In, w.In), false, mat.Mat<F32>(w.W, 0, w.Out, w.In, w.In), true, epi = gemm.Epilogue.Bias(w.Bias))
+    t := a.Threads.Min(w.Out / 64).Max(1)
+    join {
+        for i in range t: spawn part(a.each[i], dst, src, a.xb, rows, w, (i * w.Out / t) / 16 * 16, ((i + 1) * w.Out / t) / 16 * 16 if i + 1 < t else w.Out, tile)
+    }
+}
+
+# dst[from .. to] = src's, rounded to BF16
+fn round(dst mut Array<BF16>&, src Array<F32>&, from I64, to I64) {
+    for i in range from, to: dst[i] = BF16(src[i])
+}
+
+# outputs o0 .. o1 of dst = src W^T + b: BF16 tiles from xb (src rounded), or F32 activations times the weights as stored
+fn part(ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, xb mut Array<BF16>&, rows I64, w Lin&, o0 I64, o1 I64, tile Bool) {
+    c := mat.Mat<F32>(dst, o0, rows, o1 - o0, w.Out)
+    epi := gemm.Epilogue.Bias(w.Bias[o0:o1])
+    if tile {
+        gemm.Gemm(ws, c, mat.Mat<BF16>(xb, 0, rows, w.In, w.In), false, mat.Mat<BF16>(w.H, o0 * w.In, o1 - o0, w.In, w.In), true, epi = epi)
+        return
+    }
+    a := mat.Mat<F32>(src, 0, rows, w.In, w.In)
+    if w.Bf {
+        gemm.Gemm(ws, c, a, false, mat.Mat<BF16>(w.H, o0 * w.In, o1 - o0, w.In, w.In), true, epi = epi)
+        return
+    }
+    gemm.Gemm(ws, c, a, false, mat.Mat<F32>(w.W, o0 * w.In, o1 - o0, w.In, w.In), true, epi = epi)
 }
 
 # LayerNorm of rows r0 .. r1 of x (n wide) into y, statistics in F64
@@ -247,8 +289,8 @@ fn layerNorm(y mut Array<F32>&, x Array<F32>&, n I64, r0 I64, r1 I64, g Norm&) {
 # GELU (erf's) of x[from .. to]
 fn gelu(x mut Array<F32>&, from I64, to I64) {
     for i in range from, to {
-        v := F64(x[i])
-        x[i] = F32(0.5 * v * (1.0 + (v * 0.7071067811865476).Erf()))
+        v := x[i]
+        x[i] = 0.5 * v * elem.FastErfc(v * F32(-0.7071067811865476))
     }
 }
 
@@ -258,13 +300,8 @@ fn softmax(s mut Array<F32>&, n I64, r0 I64, r1 I64) {
         o := r * n
         top := s[o]
         for i in range 1, n: top = top.Max(s[o + i])
-        sum F64 = 0.0
-        for i in range n {
-            e := F64(s[o + i] - top).Exp()
-            s[o + i] = F32(e)
-            sum += e
-        }
-        inv := F32(1.0 / sum)
+        for i in range n: s[o + i] = elem.FastExp(s[o + i] - top)
+        inv := F32(1.0 / elem.SumIn<F32, F64>(s, o, n))
         for i in range n: s[o + i] *= inv
     }
 }
@@ -282,14 +319,14 @@ fn (m Model&) rows(n I64, f fn&(r0 I64, r1 I64)) {
 # the encoder's buffers for up to n positions
 type Encoder struct(m Model&, n I64) {
     N I64 = n
-    a mut Arith& = Arith(m.Threads, (2 * n).Max(m.C.Ffn).Max(3 * m.C.Dim), (2 * n * 3 * m.C.Dim).Max(n * m.C.Ffn).Max(n * n))
+    a mut Arith& = Arith(m.Threads, (2 * n).Max(m.C.Ffn).Max(3 * m.C.Dim), (2 * n * 3 * m.C.Dim).Max(n * m.C.Ffn).Max(n * n * (m.Threads.Min(m.C.EncHeads) if m.Bf else 1)))
     col mut Array<F32>& = Array<F32>(2 * n * 3 * m.C.Dim.Max(m.C.Mels))
     x mut Array<F32>& = Array<F32>(2 * n * m.C.Dim)       # the states (the first convolution's 2n rows at first)
     h mut Array<F32>& = Array<F32>(n * m.C.Dim)
     qkv mut Array<F32>& = Array<F32>(n * 3 * m.C.Dim)
     att mut Array<F32>& = Array<F32>(n * m.C.Dim)
     f mut Array<F32>& = Array<F32>(n * m.C.Ffn)
-    s mut Array<F32>& = Array<F32>(n * n)
+    s mut Array<F32>& = Array<F32>(n * n * (m.Threads.Min(m.C.EncHeads) if m.Bf else 1))
     Out mut Array<F32>& = Array<F32>(n * m.C.Dim)          # the encoded positions, [n x Dim]
 }
 
@@ -339,30 +376,46 @@ fn (m Model&) encBlock(e mut Encoder&, b Block&, n I64) {
     for i in range n * d: e.x[i] += e.h[i]
 }
 
-# e.att = the heads' attention over all n positions of e.qkv (the queries scaled by head^-1/2 first)
+# e.att = the heads' attention over all n positions of e.qkv (the queries scaled by head^-1/2 first). F32: a head at a
+# time, gemm and the softmax split over the threads; BF16: the heads split over the tasks, each on its own tiles
 fn (m Model&) attend(e mut Encoder&, n I64) {
     d := m.C.Dim
     hd := d / m.C.EncHeads
     scale := F32(1.0 / F64(hd).Sqrt())
-    for r in range n {
-        for i in range d: e.qkv[r * 3 * d + i] *= scale
+    m.rows(n, fn(r0 I64, r1 I64) { scaleQueries(e.qkv, d, scale, r0, r1) })
+    if m.Bf {
+        m.rows(n, fn(r0 I64, r1 I64) { round(e.a.yb, e.qkv, r0 * 3 * d, r1 * 3 * d) })
+        t := e.a.Threads.Min(m.C.EncHeads)
+        join {
+            for i in range t: spawn tileHeads(e.a.each[i], e.att, e.a.yb, e.s[i * n * n:(i + 1) * n * n], e.a.xb[i * n * n:(i + 1) * n * n], n, d, hd, i * m.C.EncHeads / t, (i + 1) * m.C.EncHeads / t)
+        }
+        return
     }
     sm := mat.Mat<F32>(e.s, 0, n, n, n)
-    if m.Bf {
-        for i in range n * 3 * d: e.a.yb[i] = BF16(e.qkv[i])
-    }
     for h in range m.C.EncHeads {
         o := mat.Mat<F32>(e.att, h * hd, n, hd, d)
-        if m.Bf {
-            gemm.Gemm(e.a.ws, sm, mat.Mat<BF16>(e.a.yb, h * hd, n, hd, 3 * d), false, mat.Mat<BF16>(e.a.yb, d + h * hd, n, hd, 3 * d), true)
-            m.rows(n, fn(r0 I64, r1 I64) { softmax(e.s, n, r0, r1) })
-            for i in range n * n: e.a.xb[i] = BF16(e.s[i])
-            gemm.Gemm(e.a.ws, o, mat.Mat<BF16>(e.a.xb, 0, n, n, n), false, mat.Mat<BF16>(e.a.yb, 2 * d + h * hd, n, hd, 3 * d), false)
-            continue
-        }
         gemm.Gemm(e.a.ws, sm, mat.Mat<F32>(e.qkv, h * hd, n, hd, 3 * d), false, mat.Mat<F32>(e.qkv, d + h * hd, n, hd, 3 * d), true)
         m.rows(n, fn(r0 I64, r1 I64) { softmax(e.s, n, r0, r1) })
         gemm.Gemm(e.a.ws, o, mat.Mat<F32>(e.s, 0, n, n, n), false, mat.Mat<F32>(e.qkv, 2 * d + h * hd, n, hd, 3 * d), false)
+    }
+}
+
+# the queries of rows r0 .. r1 of qkv (3d wide) times scale
+fn scaleQueries(qkv mut Array<F32>&, d I64, scale F32, r0 I64, r1 I64) {
+    for r in range r0, r1 {
+        for i in range d: qkv[r * 3 * d + i] *= scale
+    }
+}
+
+# heads h0 .. h1 of the encoder's attention on BF16 tiles: yb the queries, keys and values rounded; s and pb a head's
+# scores and probabilities
+fn tileHeads(ws mut gemm.Workspace<F32>&, att mut Array<F32>&, yb mut Array<BF16>&, s mut Array<F32>&, pb mut Array<BF16>&, n I64, d I64, hd I64, h0 I64, h1 I64) {
+    sm := mat.Mat<F32>(s, 0, n, n, n)
+    for h in range h0, h1 {
+        gemm.Gemm(ws, sm, mat.Mat<BF16>(yb, h * hd, n, hd, 3 * d), false, mat.Mat<BF16>(yb, d + h * hd, n, hd, 3 * d), true)
+        softmax(s, n, 0, n)
+        round(pb, s, 0, n * n)
+        gemm.Gemm(ws, mat.Mat<F32>(att, h * hd, n, hd, d), mat.Mat<BF16>(pb, 0, n, n, n), false, mat.Mat<BF16>(yb, 2 * d + h * hd, n, hd, 3 * d), false)
     }
 }
 
@@ -384,7 +437,7 @@ type Decoder struct(m Model&, Slots I64, Rows I64, Outs I64) {
     qkv mut Array<F32>& = Array<F32>(Rows * 3 * m.C.Dim)
     att mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
     f mut Array<F32>& = Array<F32>(Rows * m.C.Ffn)
-    s mut Array<F32>& = Array<F32>(Rows * m.C.Positions.Max(m.C.Text))
+    s mut Array<F32>& = Array<F32>(Rows * m.C.Positions.Max(m.C.Text) * m.Threads.Min(m.C.DecHeads).Max(1))
     Logits mut Array<F32>& = Array<F32>(Outs * m.C.Vocab)   # the logits of a step's last Outs rows at most, in order
     tok mut Array<I32>& = Array<I32>(Rows)
     pos mut Array<I64>& = Array<I64>(Rows)
@@ -453,13 +506,7 @@ fn (m Model&) Step(k mut Decoder&, out I64) {
     if out == 0: return
     first := n - out
     layerNorm(k.h, k.x, d, first, n, m.DecLn)
-    lg := mat.Mat<F32>(k.Logits, 0, out, c.Vocab, c.Vocab)
-    if m.Bf {
-        for i in range out * d: k.a.xb[i] = BF16(k.h[first * d + i])
-        gemm.Gemm(k.a.ws, lg, mat.Mat<BF16>(k.a.xb, 0, out, d, d), false, mat.Mat<BF16>(m.HeadB, 0, c.Vocab, d, d), true)
-        return
-    }
-    gemm.Gemm(k.a.ws, lg, mat.Mat<F32>(k.h, first * d, out, d, d), false, mat.Mat<F32>(m.Embed, 0, c.Vocab, d, d), true)
+    k.a.Lin(k.Logits, k.h[first * d:], out, m.Head)
 }
 
 # each row's self-attention over its sequence's positions up to its own, its keys and values cached first
@@ -496,25 +543,46 @@ fn (m Model&) selfAttend(k mut Decoder&, l I64) {
     }
 }
 
-# each row's cross-attention over the encoded positions
+# each row's cross-attention over the encoded positions, the heads split over the tasks
 fn (m Model&) crossAttend(k mut Decoder&, l I64) {
     c := m.C
     d := c.Dim
     hd := d / c.DecHeads
-    n := k.N
     scale := F32(1.0 / F64(hd).Sqrt())
     for i in range k.n * d: k.qkv[i] *= scale
     base := l * c.Positions * 2 * d
-    sm := mat.Mat<F32>(k.s, 0, k.n, n, n)
-    for h in range c.DecHeads {
-        gemm.Gemm(k.a.ws, sm, mat.Mat<F32>(k.qkv, h * hd, k.n, hd, d), false, mat.Mat<F32>(k.ckv, base + h * hd, n, hd, 2 * d), true)
-        softmax(k.s, n, 0, k.n)
-        o := mat.Mat<F32>(k.att, h * hd, k.n, hd, d)
-        gemm.Gemm(k.a.ws, o, mat.Mat<F32>(k.s, 0, k.n, n, n), false, mat.Mat<F32>(k.ckv, base + d + h * hd, n, hd, 2 * d), false)
+    per := k.Rows * c.Positions
+    t := k.a.Threads.Min(c.DecHeads)
+    join {
+        for i in range t: spawn crossHeads(k.a.each[i], k.att, k.qkv, k.ckv, k.s[i * per:(i + 1) * per], base, k.n, k.N, d, hd, i * c.DecHeads / t, (i + 1) * c.DecHeads / t)
+    }
+}
+
+# heads h0 .. h1 of the cross-attention of rows queries q (d apart) over n positions of ckv from base
+fn crossHeads(ws mut gemm.Workspace<F32>&, att mut Array<F32>&, q mut Array<F32>&, ckv mut Array<F32>&, s mut Array<F32>&, base I64, rows I64, n I64, d I64, hd I64, h0 I64, h1 I64) {
+    sm := mat.Mat<F32>(s, 0, rows, n, n)
+    for h in range h0, h1 {
+        gemm.Gemm(ws, sm, mat.Mat<F32>(q, h * hd, rows, hd, d), false, mat.Mat<F32>(ckv, base + h * hd, n, hd, 2 * d), true)
+        softmax(s, n, 0, rows)
+        gemm.Gemm(ws, mat.Mat<F32>(att, h * hd, rows, hd, d), mat.Mat<F32>(s, 0, rows, n, n), false, mat.Mat<F32>(ckv, base + d + h * hd, n, hd, 2 * d), false)
     }
 }
 
 # ---- checks against the reference ----
+
+# tiny and the larger models
+fn Models() Array<String> {
+    out := Vec<String>()
+    out.Push("tiny")
+    for n in Larger(): out.Push(n)
+    return out.ToArray()
+}
+
+# the models past tiny the checks run: base and small, none where $OANN_SPEECH_QUICK is set (under an emulator)
+fn Larger() Array<String> {
+    quick := try os.Env("OANN_SPEECH_QUICK") catch default ""
+    return Array<String>(0) if quick.Len() > 0 else Array<String>["base", "small"]
+}
 
 # the integers of key's array in object sub of a JSON file
 fn Ints(path String&, sub String&, key String&) Array<I32> ? os.Error, json.Error {
@@ -556,13 +624,13 @@ test Model "tiny's logits over the greedy sequence of a clip within 1e-4 of tran
 }
 
 test Model "base's and small's logits within 1e-4 of transformers' (F32); BF16 products within 0.5 (where the files are)" {
-    for name in ["base", "small"] {
+    for name in Larger() {
         gap := logitsGap(name, "jfk", false)
         if gap < 0.0: continue
         Println(name + " F32: " + $gap)
         assert gap < 1e-4, name + ": " + $gap
     }
-    for name in ["tiny", "base", "small"] {
+    for name in Models() {
         gap := logitsGap(name, "jfk", true)
         if gap < 0.0: continue
         Println(name + " BF16: " + $gap)
