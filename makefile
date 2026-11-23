@@ -13,7 +13,7 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	bayes/dense.olang bayes/gauss.olang bayes/quadrature.olang bayes/laplace.olang bayes/state.olang bayes/target.olang bayes/vi.olang \
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang \
 	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang \
-	archnet/encode.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang
+	archnet/encode.olang archnet/offline.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers
@@ -284,6 +284,12 @@ sparsetable:
 archsearch:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_archsearch bench/archsearch.olang
 	./build/bench_archsearch $(ARGS)
+
+# archnet's predictor measured offline on a log of finished runs (loss, curve, features; archnet/offline.olang): Kendall
+# tau from the first m curve points, cross-validated (bench/archeval.olang) - ARGS: log, m list (0,1,2,5,10), folds, seed
+archeval:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_archeval bench/archeval.olang
+	./build/bench_archeval $(ARGS)
 
 # architecture search over tiny character LMs (depth, width, heads, window, ffn, norm, rate) on tiny Shakespeare with
 # evo, successive halving over steps (examples/evo_lm.olang) - ARGS: rounds, workers, seed, directory

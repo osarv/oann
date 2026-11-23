@@ -1,0 +1,144 @@
+# archnet/offline - the predictor measured offline, on a log of finished runs: how well it ranks unseen candidates by
+# final loss from their features and the first m points of their validation curves, by k-fold cross-validation. For
+# each m it gives Kendall's tau of the predicted against the true final loss on the held-out folds, and, as the
+# baseline, the tau of the m-th curve point itself (the loss reached so far).
+#
+#     runs := try offline.Read(text)                       # the log's text (format below)
+#     r := offline.Report.Evaluate(runs, Array<I64>[0, 2, 5, 10], 5, 1)
+#     r.Tau[k], r.Baseline[k]                              # for m = 0, 2, 5, 10 points
+#
+# The log has one finished run per line, three fields separated by tabs:
+#
+#     loss <TAB> curve <TAB> features
+#
+# - loss: the final validation loss (a RESULT line's);
+# - curve: the validation losses at the curve's points, separated by spaces, in order (e.g. 20 points, the last at the
+#   full budget); every run of a log has the same number of points;
+# - features: the genome's features separated by spaces, as archnet/encode writes them (for a schema genome,
+#   encode.SchemaCode(space).Encode(g)); every run the same number. The field may be empty: the predictor then ranks
+#   from the curve alone.
+#
+# Lines that are empty or start with '#' are skipped. Training is as in a search: every curve point is an observation
+# at its own rung (the points before it as its curve), and the final loss one at the last rung.
+
+import "std/rand"
+import "predict"
+
+type Run struct(Loss F64, Curve Array<F64>, Features Array<F64>) {
+    Loss
+    Curve
+    Features
+}
+
+type LogError error {
+    Line(n I64, why String)     # a line that is no run of the format, or differs in length from the first
+}
+
+type Report struct() {
+    Points Vec<I64> = Vec<I64>()        # m, the curve points the predictor was given
+    Tau Vec<F64> = Vec<F64>()           # the predictor's tau from m points
+    Baseline Vec<F64> = Vec<F64>()      # the tau of the m-th point itself (NaN for m = 0)
+}
+
+fn numbers(t String&) Array<F64> ? ParseError {
+    out := Vec<F64>()
+    for w in t.Split(" ") {
+        if w == "": continue
+        out.Push(try w.ParseFloat())
+    }
+    return out.ToArray()
+}
+
+# the runs of a log's text
+fn Read(text String&) Vec<Run> ? LogError {
+    runs := Vec<Run>()
+    lines := text.Split("\n")
+    for n in range lines.Len() {
+        line := lines[n]
+        if line == "" or line[0] == '#': continue
+        f := line.Split("\t")
+        if f.Len() < 2 or f.Len() > 3: error LogError.Line(n + 1, "not three tab-separated fields")
+        loss := try f[0].ParseFloat() catch { error LogError.Line(n + 1, "the loss") }
+        curve := try numbers(f[1]) catch { error LogError.Line(n + 1, "the curve") }
+        feats := Array<F64>(0)
+        if f.Len() == 3: feats = try numbers(f[2]) catch { error LogError.Line(n + 1, "the features") }
+        if curve.Len() < 2: error LogError.Line(n + 1, "a curve of fewer than two points")
+        if runs.Len() > 0 and (curve.Len() != runs[0].Curve.Len() or feats.Len() != runs[0].Features.Len()): error LogError.Line(n + 1, "a length unlike the first run's")
+        runs.Push(Run(loss, curve, feats))
+    }
+    return runs
+}
+
+# k-fold cross-validated rank correlation for each number of points m in points (each below the curve's length);
+# folds drawn by seed; hidden and members, where above zero, set the predictor's
+fn Report.Evaluate(runs Vec<Run>&, points Array<I64>&, folds I64, seed U64, hidden I64 = 0, members I64 = 0) Report {
+    n := runs.Len()
+    order := Array<I64>[i for i in range n]
+    r := rand.Rand(seed)
+    r.Shuffle(order)
+    fold := Array<I64>[0 for _ in range n]
+    for k in range n: fold[order[k]] = k % folds
+    rungs := runs[0].Curve.Len() - 1                # points before the final; the final loss is the last rung
+    guess := Vec<Vec<F64>>()
+    seen := Vec<Vec<F64>>()
+    for _ in range points.Len() {
+        guess.Push(Vec<F64>())
+        seen.Push(Vec<F64>())
+    }
+    truth := Vec<F64>()
+    for f in range folds {
+        p := predict.Predictor(runs[0].Features.Len(), rungs)
+        p.Seed = seed + U64(f)
+        if hidden > 0: p.Hidden = Vec<I64>[hidden, hidden]
+        if members > 0: p.Members = members
+        for k in range n {
+            i := order[k]
+            if fold[i] == f: continue
+            c := runs[i].Curve
+            for j in range rungs: p.Observe(runs[i].Features, j, Array<F64>[c[q] for q in range j], c[j])
+            p.Observe(runs[i].Features, rungs, Array<F64>[c[q] for q in range rungs], runs[i].Loss)
+        }
+        for i in range n {
+            if fold[i] != f: continue
+            truth.Push(runs[i].Loss)
+            c := runs[i].Curve
+            for a in range points.Len() {
+                m := points[a].Min(rungs)
+                mean, _ := p.Predict(runs[i].Features, Array<F64>[c[q] for q in range m])
+                guess[a].Push(mean)
+                seen[a].Push(0.0 if m == 0 else c[m - 1])
+            }
+        }
+    }
+    out := Report()
+    t := truth.ToArray()
+    for a in range points.Len() {
+        out.Points.Push(points[a])
+        out.Tau.Push(predict.Kendall(guess[a].ToArray(), t))
+        out.Baseline.Push(F64.NaN if points[a] == 0 else predict.Kendall(seen[a].ToArray(), t))
+    }
+    return out
+}
+
+# ---- tests ----
+
+test Report.Evaluate "on toy runs, the predictor ranks held-out finals well from the genome and better from more points" {
+    text := "# loss\tcurve\tfeatures\n"
+    r := rand.Rand(3)
+    for _ in range 120 {
+        a := r.Float()
+        b := r.Float()
+        final := (a - 0.3) * (a - 0.3) + 0.5 * b
+        # curves that start in the reverse order of b, then cross
+        text += $final + "\t"
+        for q in range 6: text += $(final + (1.0 - b) * (-F64(q + 1) / 2.0).Exp() + r.Normal(0.0, 0.01)) + " "
+        text += "\t" + $a + " " + $b + "\n"
+    }
+    runs := try Read(text) catch { unreachable "archnet: the toy log" }
+    assert runs.Len() == 120 and runs[0].Curve.Len() == 6 and runs[0].Features.Len() == 2
+    rep := Report.Evaluate(runs, Array<I64>[0, 1, 5], 4, 1)
+    assert rep.Tau[0] > 0.6 and rep.Tau[2] > 0.8
+    assert rep.Tau[1] > rep.Baseline[1]
+    bad := try Read("1.0\t0.5 0.4\t1 2\n1.0\t0.5\t1 2\n") catch default Vec<Run>()
+    assert bad.Len() == 0
+}

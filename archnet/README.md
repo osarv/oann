@@ -33,6 +33,7 @@ For graph genomes, use `encode.NetCode` and `propose.NoProposer<neat.Net>`: you 
 | `predict.olang` | `Predictor` is an ensemble of small MLPs (`Hidden`, `Members`, `Rate`, `Steps`). Its input is the features, the curve so far (each point with a presence flag) and the rung to predict. The mean over members is the prediction and their spread the uncertainty. Every rung's result is training data, and each training draw takes a random prefix of the curve, so it predicts from any number of points. `Kendall` gives rank correlation. |
 | `propose.olang` | `Proposer` is an estimation-of-distribution model (the cross-entropy method) over schema genomes. It keeps a distribution per gene and position, fitted to the best `Elite` share of final results weighted by rank, with `Smooth` of the uniform distribution mixed into every draw. It generates by walking the schema, so proposals keep the good genomes' structure position by position. |
 | `archnet.olang` | `Advisor`: the three parts behind the interface above |
+| `offline.olang` | `Read` parses a log of finished runs and `Report.Evaluate` measures the predictor on it by k-fold cross-validation (below). |
 | `toy.olang` | a synthetic architecture benchmark with a known optimum and deliberately misleading early curves, used by the tests and `bench/archsearch` |
 
 ## How a search uses it
@@ -50,6 +51,28 @@ For graph genomes, use `encode.NetCode` and `propose.NoProposer<neat.Net>`: you 
 The predictor's own settings are plain fields, set before its first observation, so a search can tune them too:
 `Hidden` (a Vec of widths), `Members`, `Rate`, `Steps` and `Least`. The same holds for the generator's `Elite` and
 `Smooth`, and for `Advisor.K`.
+
+## Measuring the predictor on your own runs
+
+`make archeval ARGS="LOG 0,2,5,10"` cross-validates the predictor on a log of finished runs. For each m, it prints
+Kendall's tau of the predicted against the true final loss when the predictor is given the first m curve points.
+Beside it, the tau of the m-th point alone, which is the loss reached so far. Other arguments: folds (5), seed, and
+the predictor's hidden width and members.
+
+The log has one run per line, with three tab-separated fields:
+
+```
+loss <TAB> curve <TAB> features
+```
+
+- `loss`: the final validation loss.
+- `curve`: the validation losses at the curve's points, space-separated, in order. The last point is at the full
+  budget, and every run has the same number of points.
+- `features`: the genome's features, space-separated, as `encode` writes them (`encode.SchemaCode(space).Encode(g)`).
+  May be empty, in which case the predictor ranks from the curve alone.
+
+Lines that are empty or start with `#` are skipped. To read the tau at a given training time, pick m as the curve
+point at that time: with 20 points over 3600 s, m = 2 is 360 s and m = 5 is 900 s.
 
 ## Measured on archnet/toy
 

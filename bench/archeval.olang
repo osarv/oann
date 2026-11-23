@@ -1,0 +1,31 @@
+# archnet's predictor measured offline on a log of finished runs (archnet/offline): k-fold cross-validated Kendall tau
+# of the predicted against the true final loss, from the genome's features and the first m curve points, beside the
+# tau of the m-th point itself. Arguments: the log's path, the values of m separated by commas (default 0,1,2,5,10),
+# folds (5), seed (1), the predictor's hidden width and members (its defaults where 0). The log's format is in
+# archnet/offline.olang and archnet/README.md.
+
+import "std/io"
+import "std/os"
+import "../archnet/offline"
+
+fn main() ? io.Error, os.Error, ParseError, offline.LogError {
+    args := os.Args()
+    if args.Len() < 2 {
+        try io.PutLn("usage: archeval LOG [m,m,...] [folds] [seed] [hidden] [members]")
+        return
+    }
+    runs := try offline.Read(try os.ReadFile(args[1]))
+    ms := Vec<I64>()
+    for w in (args[2] if args.Len() > 2 else "0,1,2,5,10").Split(","): ms.Push(try w.ParseInt())
+    folds := try args[3].ParseInt() if args.Len() > 3 else 5
+    seed := try args[4].ParseInt() if args.Len() > 4 else 1
+    hidden := try args[5].ParseInt() if args.Len() > 5 else 0
+    members := try args[6].ParseInt() if args.Len() > 6 else 0
+    rep := offline.Report.Evaluate(runs, ms.ToArray(), folds, U64(seed), hidden, members)
+    try io.PutLn($runs.Len() + " runs, " + $runs[0].Curve.Len() + " curve points, " + $runs[0].Features.Len() + " features, " + $folds + " folds")
+    for k in range rep.Points.Len() {
+        line := "m " + $rep.Points[k] + ": predictor tau " + rep.Tau[k].Fixed(3)
+        if rep.Points[k] > 0: line += ", the m-th point alone " + rep.Baseline[k].Fixed(3)
+        try io.PutLn(line)
+    }
+}
