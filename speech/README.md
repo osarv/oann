@@ -11,6 +11,7 @@ committed, as in `llm/`.
 | `whisper.olang` | `Model.Load` (config.json, model.safetensors), `Encode` (the convolutions and blocks over 1500 positions, or fewer), `Decoder` (cross-attention keys and values, a cache of the decoder's own, beams in slots), `Step` |
 | `transcribe.olang` | `Whisper`: the prompt and language detection, the logit rules (suppressed tokens, timestamp rules), greedy and beam decoding, `Cut` (segments), `Transcribe` (clips of any length), `Stream` (sound as it comes) |
 | `kws.olang` | the wake word: features, the network (`Spotter`), `Train`, `Detector` (a threshold over smoothed scores, a refractory second) |
+| `speak.olang` | `Voice.Load("en" or "sv")`, `Speak(text)`: our G2P (`g2p.olang`), then a Piper voice (`vits.olang`), samples at `Rate` (22050); `To16k` |
 | `listen.olang` | `oann-listen`, the command |
 | `g2p.olang` | `G2p.Load`, `Phonemes(text, "en" or "sv")`: text to the IPA espeak-ng gives the VITS voices (below) |
 | `vits.olang` | text to speech: `Model.Load` (a transformers VitsModel), `Model.Piper` (a Piper voice's .onnx), `Symbols` (IPA to ids), `Speak` (ids to samples and every id's frames) |

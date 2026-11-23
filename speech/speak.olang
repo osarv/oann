@@ -1,0 +1,116 @@
+# speech/speak - text to speech in English or Swedish: our own grapheme-to-phoneme step (speech/g2p) into the IPA
+# Piper's voices were trained on, then a Piper VITS voice (speech/vits) - en_US-ljspeech-medium (LJ Speech, public
+# domain) or sv_SE-nst-medium (NST, CC0), both MIT in rhasspy/piper-voices. Samples at the voice's Rate (22050 Hz).
+#
+#     v := Voice.Load("sv")!
+#     samples := v.Speak("Hej, hur mår du?")!
+#
+# Voices are fetched once (curl) into $OANN_MODELS/piper (default ~/.cache/oann/models/piper).
+
+import "std/io"
+import "std/os"
+import "g2p"
+import "mel"
+import "vits"
+
+type SpeakError error {
+    Unsupported(lang String)    # a language with no voice here
+    Failed(what String)         # a voice that could not be fetched or read, or text the G2P refused
+}
+
+# the voice of a language: its name in rhasspy/piper-voices, and the path there
+fn voiceOf(lang String&) String, String ? SpeakError {
+    if lang == "en": return "en_US-ljspeech-medium", "en/en_US/ljspeech/medium"
+    if lang == "sv": return "sv_SE-nst-medium", "sv/sv_SE/nst/medium"
+    error SpeakError.Unsupported(lang)
+}
+
+# a voice's .onnx (and .onnx.json beside it), fetched where it is not there yet
+fn Fetch(lang String&) String ? SpeakError {
+    name, at := try voiceOf(lang)
+    root := try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: root = (try os.Env("HOME") catch default "/tmp") + "/.cache/oann/models"
+    dir := root + "/piper"
+    try os.MkDirAll(dir) catch { error SpeakError.Failed(dir) }
+    for ext in [".onnx.json", ".onnx"] {
+        path := dir + "/" + name + ext
+        if os.Exists(path): continue
+        url := "https://huggingface.co/rhasspy/piper-voices/resolve/main/" + at + "/" + name + ext
+        try io.PutErrLn("speak: fetching " + url) catch { }
+        out := try os.Output.Exec("curl", "-sfL", "--retry", "4", "-o", path + ".part", url, capture = false) catch { error SpeakError.Failed(url) }
+        if out.Status != 0: error SpeakError.Failed(url)
+        try os.Rename(path + ".part", path) catch { error SpeakError.Failed(path) }
+    }
+    return dir + "/" + name + ".onnx"
+}
+
+type Voice struct(Lang String, M vits.Model, S vits.Symbols, G g2p.G2p) {
+    Lang
+    M
+    S
+    G
+    Rate I64 = M.C.Rate         # samples a second of what Speak gives
+    LengthScale F32 = 1.0       # slower above 1
+}
+
+# the voice of lang ("en" or "sv"), fetched if need be, with the G2P's data
+fn Voice.Load(lang String&) Voice ? SpeakError {
+    path := try Fetch(lang)
+    m := try vits.Model.Piper(path) catch { error SpeakError.Failed("cannot read " + path) }
+    s := try vits.Symbols.PiperMap(path + ".json") catch { error SpeakError.Failed("cannot read " + path + ".json") }
+    g := try g2p.G2p.Load() catch { error SpeakError.Failed("the G2P's data (CMUdict)") }
+    return Voice(lang, m, s, g)
+}
+
+# text spoken: samples in -1 .. 1 at v.Rate (a sentence or a few; long texts are best spoken a sentence at a time)
+fn (v Voice&) Speak(text String&, seed U64 = 0) Array<F32> ? SpeakError {
+    ipa := try v.G.Phonemes(text, v.Lang) catch { error SpeakError.Failed("phonemes of " + text) }
+    ids := try v.S.Encode(ipa) catch { error SpeakError.Failed("symbols of " + ipa) }
+    o := vits.Options(v.M.C)
+    o.LengthScale = o.LengthScale * v.LengthScale
+    o.Seed = seed
+    samples, _ := v.M.Speak(ids, o)
+    return samples
+}
+
+# x at rate, at 16 kHz (linear interpolation): what Whisper and the wake word read
+fn To16k(x Array<F32>&, rate I64) Array<F32> { return mel.Resample(x, rate) }
+
+# the share of text's words that heard has too (case and punctuation aside)
+fn overlap(text String&, heard String&) F64 {
+    words := fn(t String&) Array<String> { return Array<String>[w for w in t.ToLower().Replace(",", " ").Replace(".", " ").Replace("?", " ").Split(" ") if w.Len() > 0] }
+    got := words(heard)
+    want := words(text)
+    hit I64 = 0
+    for w in want {
+        for g in got {
+            if g == w {
+                hit += 1
+                break
+            }
+        }
+    }
+    return F64(hit) / F64(want.Len().Max(1))
+}
+
+test Voice "English and Swedish spoken by Piper's voices are heard back by Whisper base: language detected, 3/4 of the words (where the files are)" {
+    asr := mel.Cache() + "/models/openai--whisper-base"
+    if not os.Exists(asr) or not os.Exists(mel.Cache() + "/models/piper/sv_SE-nst-medium.onnx") {
+        Println("skipped: no voices or no whisper-base")
+        return
+    }
+    w := transcribe.Whisper.Load(asr)!
+    texts := ["Set a timer for five minutes.", "Vad är klockan nu?"]
+    for i, lang in ["en", "sv"] {
+        text := texts[i]
+        v := Voice.Load(lang)!
+        x := To16k(v.Speak(text)!, v.Rate)
+        o := transcribe.Options()
+        heard := w.Text(x, o)
+        Println(lang + ": " + heard)
+        assert w.LanguageCode() == lang, w.LanguageCode()
+        assert overlap(text, heard) >= 0.75, heard
+    }
+}
+
+import "transcribe"
