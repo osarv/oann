@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen oannlisten speechbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen oannlisten speechbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -401,6 +401,11 @@ int8lm:
 int8bench:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_int8 bench/int8.olang
 	$(GPUENV) ./build/bench_int8 $(ARGS)
+
+# BF16 x BF16 products into F32 widened, by the pair dot and by AMX tiles, one thread (bench/bf16gemm.olang) - ARGS: rounds
+bf16bench:
+	$(OLANG) build -output build/bench_bf16gemm bench/bf16gemm.olang
+	./build/bench_bf16gemm $(ARGS)
 
 # F32 activations times weights stored in F32, BF16 or INT8 through one Gemm (bench/storage.olang) - ARGS: rounds, threads
 storagebench:

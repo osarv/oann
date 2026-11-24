@@ -1,0 +1,62 @@
+# kernels/gemm's BF16 x BF16 products into F32 three ways - widened to F32 and the F32 kernel, the pair dot
+# (vdpbf16ps, Workspace.Pairs) and AMX tiles (Workspace.Tile, where TargetHasTileDot) - one thread, interleaved within
+# each round, the median GMAC/s of each over the rounds. What decides kernels/gemm's pairDotPays on a new CPU.
+# Arguments: rounds (7). From the repository's root: olang build -output build/bench_bf16gemm bench/bf16gemm.olang &&
+# build/bench_bf16gemm
+
+import "std/os"
+import "std/time"
+import "../kernels/gemm"
+import "../kernels/mat"
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+# the attention block's 2048 x 128 x 704, squares, an MLP's 128 x 784 x 128, a small one
+Shapes Array<I64> = Array<I64>[2048, 128, 704, 512, 512, 512, 1024, 1024, 1024, 128, 784, 128, 300, 77, 140, 64, 64, 64]
+
+type operands struct(m I64, n I64, k I64) {
+    m
+    n
+    k
+    a mut Array<BF16>& = Array<BF16>(m * k)
+    b mut Array<BF16>& = Array<BF16>(k * n)
+    c mut Array<F32>& = Array<F32>(m * n)
+}
+
+# GMAC/s of one product by the way named (0 widened, 1 pairs, 2 tiles), the best of three calls
+fn timed(x mut operands&, way I64) F64 {
+    ws := gemm.Workspace<F32>(1)
+    ws.Tile = TargetHasTileDot and way == 2
+    ws.Pairs = way == 1
+    ws.Reserve(x.m.Max(x.n).Max(x.k))
+    am := mat.Mat<BF16>(x.a, 0, x.m, x.k, x.k)
+    bm := mat.Mat<BF16>(x.b, 0, x.k, x.n, x.n)
+    cm := mat.Mat<F32>(x.c, 0, x.m, x.n, x.n)
+    best F64 = 0.0
+    for _ in range 3 {
+        t0 := time.Now()
+        gemm.Gemm(ws, cm, am, false, bm, false)
+        best = best.Max(F64(x.m * x.n * x.k) / F64(time.Since(t0)))
+    }
+    return best
+}
+
+fn main() ? ParseError {
+    args := os.Args()
+    rounds I64 = try args[1].ParseInt() if args.Len() > 1 else 7
+    Println("GMAC/s, one thread, median of " + $rounds + " rounds (" + TargetCpu + "): widened | pair dot | AMX tiles")
+    for s in range Shapes.Len() / 3 {
+        x := operands(Shapes[3 * s], Shapes[3 * s + 1], Shapes[3 * s + 2])
+        for i in range x.a.Len(): x.a[i] = BF16(F32(i % 7) * 0.125 - 0.375)
+        for i in range x.b.Len(): x.b[i] = BF16(F32(i % 5) * 0.25 - 0.5)
+        ts := [Array<F64>(rounds), Array<F64>(rounds), Array<F64>(rounds)]
+        for r in range rounds {
+            for way in range 3: ts[way][r] = timed(x, way)
+        }
+        tiles := median(ts[2]).Fixed(1) if TargetHasTileDot else "-"
+        Println($x.m + " x " + $x.n + " x " + $x.k + ": " + median(ts[0]).Fixed(1) + " | " + median(ts[1]).Fixed(1) + " | " + tiles)
+    }
+}

@@ -2185,6 +2185,21 @@ further single fix reaches 10 % of the BF16 step (148-159 ms, noisy): cross-entr
 products), rope 10, norm 8; the products' remaining cost is packing and the BF16 stores (about 0.25 ns an element,
 as much as the tiles' arithmetic).
 
+BF16 by the pair dot (wt-bf16gemm, 2026-11-24): where the target has no AMX tiles, a BF16 x BF16 product into F32
+can go to a register-blocked pair-dot kernel (olang's `x += (a * w).Sum<F32>(2)`, vdpbf16ps) over the tile path's
+blocks: 8 rows x 32 columns of F32 accumulators held across the depth, a row's pair broadcast, op(B) packed in
+32-column strips so a tile's operand is contiguous. Its inner loop is 16 vdpbf16ps and 8 broadcasts with no checks
+(slices of a row and a strip taken once per tile, the depth loop `range 0, kp - 1, 2`; slices built at `i0 kp + 2 q`
+each step kept their bounds checks in the loop: 29-31 GMAC/s). It is taken only where `pairDotPays` (TargetCpu znver4
+or znver5): on this Sapphire Rapids the instruction runs at about half its rate per MAC of two FMA ports, so widening
+wins - bench/bf16gemm (`make bf16bench`), one thread, median of 5, GMAC/s widened | pair dot | AMX:
+2048 x 128 x 704 50.3 | 38.5 | 219; 512^3 59.6 | 36.8 | 292; 1024^3 48.4 | 34.7 | 156; 128 x 784 x 128
+61.3 | 34.0 | 189; 64^3 35.3 | 25.1 | 78 (the kernel alone with its operands in L1: 43). Zen 4 runs vdpbf16ps and a
+512-bit FMA each at one a cycle, so the pair dot should do twice widening's work there: to be measured on the local
+Ryzen with `make bf16bench` before the gate is trusted. The AMX guard was checked: `Workspace.Tile` is TargetHasTileDot
+(and an F32 accumulator), so no target without tiles reaches AddDot's ~10 GMAC/s fallback. Tested with the pair dot
+forced (the tile tests now run both), and gemm, conv and attention under `-target znver4`.
+
 ## Custom operations in BF16 graphs (wt-custombf16)
 
 `Graph.Custom` was F32-only: a `Function`'s Forward and Backward take `Tensor<F32>`, so an operation defined outside

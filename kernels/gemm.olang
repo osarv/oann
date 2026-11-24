@@ -110,9 +110,10 @@ type Workspace<A> struct(threads I64, dim I64 = 0, wide I64 = 0) {
     qb mut Array<I8>& = Array<I8>(0)            # GemmI8's weight panels
     corr mut Array<I32>& = Array<I32>(0)        # GemmI8's zero-point corrections
     Tile Bool = TargetHasTileDot and accF32(A(0))   # BF16 x BF16 products into F32 by AMX tiles (tile.AddDot) here
-    ta mut Array<BF16>& = Array<BF16>(amxRows * roundUp(dim, 32) if Tile else 0)   # the tile path's block of op(A)
-    tb mut Array<BF16>& = Array<BF16>(amxCols * roundUp(dim, 32) if Tile else 0)   # its block of op(B), in pairs
-    tc mut Array<F32>& = Array<F32>(amxRows * amxCols if Tile else 0)             # its block of the result
+    Pairs Bool = pairDotPays and not Tile and accF32(A(0))   # else by the BF16 pair dot, where it beats widening
+    ta mut Array<BF16>& = Array<BF16>(amxRows * roundUp(dim, 32) if Tile or Pairs else 0)   # the BF16 block of op(A)
+    tb mut Array<BF16>& = Array<BF16>(amxCols * roundUp(dim, 32) if Tile or Pairs else 0)   # its block of op(B), in pairs
+    tc mut Array<F32>& = Array<F32>(amxRows * amxCols if Tile or Pairs else 0)             # its block of the result
 }
 
 # an accumulator of F32: the tile path's (its products sum in F32)
@@ -132,7 +133,7 @@ fn (ws mut Workspace<A>&) Reserve(dim I64, wide I64 = 0) {
     if ws.a.Len() < roomA(ws.Threads, dim, z): ws.a = Array<A>(roomA(ws.Threads, dim, z))
     if ws.b.Len() < roomB(ws.Threads, dim, z): ws.b = Array<A>(roomB(ws.Threads, dim, z))
     if ws.c.Len() < wide: ws.c = Array<A>(wide)
-    if not ws.Tile: return
+    if not ws.Tile and not ws.Pairs: return
     if ws.ta.Len() < amxRows * roundUp(dim, 32): ws.ta = Array<BF16>(amxRows * roundUp(dim, 32))
     if ws.tb.Len() < amxCols * roundUp(dim, 32): ws.tb = Array<BF16>(amxCols * roundUp(dim, 32))
     if ws.tc.Len() < amxRows * amxCols: ws.tc = Array<F32>(amxRows * amxCols)
@@ -223,7 +224,7 @@ fn Gemm<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&,
     oa := operand<SA>.of(a)
     ob := operand<SB>.of(b)
     cd := c.Data[c.Off:]
-    if ws.Tile and k > 0 and m * n * k >= tileFrom and ws.ta.Len() >= amxRows * roundUp(k, 32) and bf16Operands(a.Data, b.Data, alpha) {
+    if k > 0 and ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
         tileProduct(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
         finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
         return
@@ -265,7 +266,7 @@ fn GemmBatch<SC, SA, SB, A>(ws mut Workspace<A>&, c mut Batch<SC>&, a Batch<SA>&
         for e in range count: emptyProduct(m, n, beta, c.Data[c.Off + c.GroupStride * (e / c.Members) + c.MemberStride * (e % c.Members):], c.Ld, Epilogue.None, result, diag)
         return
     }
-    if ws.Tile and m * n * k >= tileFrom and ws.ta.Len() >= amxRows * roundUp(k, 32) and bf16Operands(a.Data, b.Data, alpha) {
+    if ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
         for e in range count {
             g, mb := e / c.Members, e % c.Members
             oa := operand<SA>(a.Data[a.Off + a.GroupStride * g + a.MemberStride * mb:], a.Ld)
@@ -1026,6 +1027,18 @@ fn sameType<S, A>(c Array<S>&, z A) Bool {
 # costs more than the tiles save
 tileFrom I64 = 1 << 18
 
+# whether an m x n x k product (both operands BF16, into F32) goes by BF16 blocks: by AMX tiles from tileFrom
+# multiply-adds, by the pair dot from as many and at least 16 rows and columns (its tiles' padding), in the room reserved
+fn (ws Workspace<A>&) blocksBF16(m I64, n I64, k I64) Bool {
+    if m * n * k < tileFrom or ws.ta.Len() < amxRows * roundUp(k, 32): return false
+    return ws.Tile or ws.Pairs and m >= 16 and n >= 16
+}
+
+# the pair dot (vdpbf16ps, 32 multiply-adds an instruction) in place of widening to F32 (16 an FMA): where it measured
+# faster. Zen 4 and 5 run both at one 512-bit instruction a cycle, so the pair dot does twice the work; Intel's cores
+# (Sapphire Rapids, measured: a register-blocked kernel 43 GMAC/s against widening's 53-61) run two FMAs a cycle
+pairDotPays Bool = TargetCpu == "znver4" or TargetCpu == "znver5"
+
 # both operands BF16 and the accumulator F32: tile.AddDot's product
 fn bf16Operands<SA, SB, A>(a Array<SA>&, b Array<SB>&, z A) Bool {
     sa := match SA {
@@ -1068,18 +1081,71 @@ fn tileBlocks<SL, SR, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, l operand
     for j0 in range 0, n, amxCols {
         w := lesser(amxCols, n - j0)
         wp := roundUp(w, 16)
-        packPairs(ws.tb, r, rt, k, kp, j0, w, wp)
+        if ws.Tile: packPairs(ws.tb, r, rt, k, kp, j0, w, wp)
+        else: packStrips(ws.tb, r, rt, k, kp, j0, w, wp)
         for i0 in range 0, m, amxRows {
             h := lesser(amxRows, m - i0)
             hp := roundUp(h, 16)
             packRows(ws.ta, l, lt, k, kp, i0, h, hp)
             if lower: maskLower(ws.ta, lt, k, kp, i0, h, diag)
-            for t in range hp * wp: ws.tc[t] = 0.0
-            try stdtile.AddDot(ws.tc, wp, hp, wp, ws.ta, kp, kp, ws.tb) catch { unreachable "gemm: a tile product's shape" }
+            if ws.Tile: addTiles(ws.tc, hp, wp, ws.ta, kp, ws.tb)
+            else: pairBlock(ws.tc, hp, wp, ws.ta, kp, ws.tb)
             if trans: tileStoreT(ws.tc, wp, h, w, alpha, beta, c, j0 * ldc + i0, ldc)
             else if result: tileStoreLower(ws.tc, wp, h, w, alpha, beta, c, i0, j0, ldc, diag)
             else: tileStore(ws.tc, wp, h, w, alpha, beta, c, i0 * ldc + j0, ldc)
         }
+    }
+}
+
+# the block t (hp x wp) = ta (hp rows of kp) . tb (kp / 2 pair rows of wp) by AMX tiles
+fn addTiles(t mut Array<F32>&, hp I64, wp I64, ta Array<BF16>&, kp I64, tb Array<BF16>&) {
+    for i in range hp * wp: t[i] = 0.0
+    try stdtile.AddDot(t, wp, hp, wp, ta, kp, kp, tb) catch { unreachable "gemm: a tile product's shape" }
+}
+
+# the same block by the pair dot, eight rows by 32 columns at a time (16 where wp ends on 16), tb packed in strips
+# (packStrips): hp and wp are multiples of 16 and kp of 32, the padding zeros. A strip's columns at a time, every row
+# tile against it, so the strip stays in the cache
+fn pairBlock(t mut Array<F32>&, hp I64, wp I64, ta Array<BF16>&, kp I64, tb Array<BF16>&) {
+    for j0 in range 0, wp - wp % 32, 32 {
+        for i0 in range 0, hp, 8: pairTile(t, wp, ta, i0, kp, tb, j0, pairWide())
+    }
+    if wp % 32 == 0: return
+    for i0 in range 0, hp, 8: pairTile(t, wp, ta, i0, kp, tb, wp - 16, pairThin())
+}
+
+# the pair dot's two tile widths: two vectors of 16 F32 lanes, and one
+type pairWide struct() { }
+type pairThin struct() { }
+
+fn pairVectors<W>() I64 {
+    return match W {
+        case pairWide: 2
+        case pairThin: 1
+    }
+}
+
+# eight rows by 16 or 32 columns of accumulators, held in registers across the depth (indexed only at constants)
+type pairAcc struct() {
+    v := Array<F32>(256)
+}
+
+# t's rows i0 .. i0 + 8 (ta's rows, kp apart), columns j0 .. j0 + 16 per vector = ta's rows . tb's pairs: per
+# pair row, each row's pair is shared by the columns' 16 pairs a vector (x += (pair * pairs).Sum<F32>(2), vdpbf16ps)
+fn pairTile<W>(t mut Array<F32>&, wp I64, ta Array<BF16>&, i0 I64, kp I64, tb Array<BF16>&, j0 I64, w W) {
+    nv I64 = pairVectors<W>()
+    acc := pairAcc()
+    rows := ta[i0 * kp:(i0 + 8) * kp]
+    strip := tb[j0 * kp:(j0 + 16 * nv) * kp]
+    for p in range 0, kp - 1, 2 {
+        bs := strip[p * 16 * nv:(p + 2) * 16 * nv]
+        comptime for i in range 8 {
+            pa := rows[i * kp + p:i * kp + p + 2]
+            comptime for v in range pairVectors<W>() { acc.v[i * 32 + v * 16:i * 32 + v * 16 + 16] += (pa * bs[v * 32:v * 32 + 32]).Sum<F32>(2) }
+        }
+    }
+    for i in range 8 {
+        for j in range 16 * nv: t[(i0 + i) * wp + j0 + j] = acc.v[i * 32 + j]
     }
 }
 
@@ -1191,6 +1257,26 @@ fn packPairs<SB>(dst mut Array<BF16>&, b operand<SB>&, tb Bool, k I64, kp I64, j
         s0, o := (k - 1) * b.ld + j0, (k / 2) * wp * 2
         for j in range w: dst[o + 2 * j] = cast(b.d[s0 + j], z)
     }
+}
+
+# op(b)'s columns j0 .. j0 + w in the pair dot's strips: 32 columns at a time (the last 16 where wp ends on 16), a
+# strip from column s kp on, its pair rows one after another - (pair row q, column s + j, t) at s kp + (q sw + j) 2 + t,
+# sw the strip's width - so a tile's operand is contiguous; zeros past the depth k and from w to wp
+fn packStrips<SB>(dst mut Array<BF16>&, b operand<SB>&, tb Bool, k I64, kp I64, j0 I64, w I64, wp I64) {
+    for s in range 0, wp, 32 {
+        sw := lesser(32, wp - s)
+        for j in range sw: stripColumn(dst, b, tb, k, kp, j0 + s + j, s * kp + 2 * j, 2 * sw, s + j < w)
+    }
+}
+
+# one column of op(b) (column c, live or padding) into a strip from dst[o], its pairs step apart
+fn stripColumn<SB>(dst mut Array<BF16>&, b operand<SB>&, tb Bool, k I64, kp I64, c I64, o I64, step I64, live Bool) {
+    z := BF16(0.0)
+    n I64 = k if live else 0
+    at I64 = c * b.ld if tb else c
+    by I64 = 1 if tb else b.ld
+    for p in range n: dst[o + (p / 2) * step + p % 2] = cast(b.d[at + p * by], z)
+    for p in range n, kp: dst[o + (p / 2) * step + p % 2] = z
 }
 
 # a block of the result (h x w, row stride wp) into c from c[at]: alpha times it, plus beta c where beta is not zero
@@ -2605,9 +2691,10 @@ test GemmBatch "a storage type per operand: BF16 keys under F32 queries are the 
     assert sameBits(p, pw)
 }
 
-test Gemm "BF16 operands into F32 by the tile path (where the CPU has AMX) match the packed path, every transpose, padded shapes, alpha, beta and a bias" {
+test Gemm "BF16 operands into F32 by the tile path (where the CPU has AMX) and by the pair dot match the packed path, every transpose, padded shapes, alpha, beta and a bias" {
     r := rand.Rand(91)
-    for shape in range 2 {
+    for run in range 4 {
+        shape, pairs := run / 2, run % 2 == 1
         m := 300 if shape == 0 else 64
         n := 77 if shape == 0 else 48
         k := 140 if shape == 0 else 96
@@ -2624,33 +2711,40 @@ test Gemm "BF16 operands into F32 by the tile path (where the CPU has AMX) match
                 c1, c2 := Array<F32>(m * n, 0.5), Array<F32>(m * n, 0.5)
                 w1 := Workspace<F32>(1, 512)
                 w2 := Workspace<F32>(1, 512)
+                w1.Tile = w1.Tile and not pairs
+                w1.Pairs = pairs
                 w1.Reserve(512)
                 w2.Tile = false
+                w2.Pairs = false
                 c1m, c2m := mat.Mat<F32>(c1, 0, m, n, n), mat.Mat<F32>(c2, 0, m, n, n)
                 Gemm(w1, c1m, am, ta, bm, tb, F32(0.5), F32(2.0), Epilogue.Bias(bias))
                 Gemm(w2, c2m, am, ta, bm, tb, F32(0.5), F32(2.0), Epilogue.Bias(bias))
-                for i in range m * n: assert (F64(c1[i]) - F64(c2[i])).Abs() < 1e-3, $shape + " " + $ta + " " + $tb + " " + $i
+                for i in range m * n: assert (F64(c1[i]) - F64(c2[i])).Abs() < 1e-3, $shape + " " + $pairs + " " + $ta + " " + $tb + " " + $i
             }
         }
     }
 }
 
-test GemmBatch "BF16 batches by the tile path match the packed path: full, causal result and lower-triangular left operands, every transpose" {
+test GemmBatch "BF16 batches by the tile path and by the pair dot match the packed path: full, causal result and lower-triangular left operands, every transpose" {
     r := rand.Rand(93)
     T, D, heads := 64, 64, 2
     q, kk := Array<BF16>(T * heads * D), Array<BF16>(T * heads * D)
     for i in range q.Len(): q[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
     for i in range kk.Len(): kk[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
-    for form in range 3 {
+    for run in range 6 {
+        form, pairs := run / 2, run % 2 == 1
         tri := Triangle.Full if form == 0 else (Triangle.Result(0) if form == 1 else Triangle.Left(0))
         for ta in Array<Bool>[false, true] {
             for tb in Array<Bool>[false, true] {
                 # p (heads x T x T) = op(q) op(k): q and k as T x D blocks per head (transposed: D x T read as T x D)
                 p1, p2 := Array<F32>(heads * T * T, 0.25), Array<F32>(heads * T * T, 0.25)
                 w1 := Workspace<F32>(1, 512)
+                w1.Tile = w1.Tile and not pairs
+                w1.Pairs = pairs
                 w1.Reserve(512)
                 w2 := Workspace<F32>(1, 512)
                 w2.Tile = false
+                w2.Pairs = false
                 aq := Batch<BF16>(q, 0, D if ta else T, T if ta else D, T if ta else D, 1, 0, heads, T * D)
                 bk := Batch<BF16>(kk, 0, T if tb else D, D if tb else T, D if tb else T, 1, 0, heads, T * D)
                 if form == 2 {
@@ -2664,7 +2758,7 @@ test GemmBatch "BF16 batches by the tile path match the packed path: full, causa
                 if form == 2 and tb: continue
                 GemmBatch(w1, c1, aq, ta, bk, tb, F32(0.5), F32(1.0), tri)
                 GemmBatch(w2, c2, aq, ta, bk, tb, F32(0.5), F32(1.0), tri)
-                for i in range p1.Len(): assert (F64(p1[i]) - F64(p2[i])).Abs() < 1e-3, $form + " " + $ta + " " + $tb + " " + $i
+                for i in range p1.Len(): assert (F64(p1[i]) - F64(p2[i])).Abs() < 1e-3, $form + " " + $pairs + " " + $ta + " " + $tb + " " + $i
             }
         }
     }
