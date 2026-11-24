@@ -5,7 +5,7 @@ times), fb13d23 (speak.olang), 91bc1bd (shortened windows keep 3 s silence, Opti
 the tree was clean. Users: the OAgent home session (session_01DLX3U7kkfPnv219zp4wSrU) runs Whisper, kws.Detector and
 speak.Voice from oann; e75-speech (session_01DLX3U8EBgCK5YZpKCPmx4N) reuses mel/kws.
 
-aarch64 under qemu: mel, whisper and transcribe test files pass with tiny (logits 7.6e-5); kws and g2p tests pass under qemu (2026-11-24; reference-file parts skipped, 12 min); speak/vits not yet run.
+aarch64 under qemu: mel, whisper and transcribe test files pass with tiny (logits 7.6e-5); kws and g2p tests pass under qemu (2026-11-24; reference-file parts skipped, 12 min); speak passes under qemu too (Piper en+sv heard back by Whisper base; en "set a time for five minutes.", sv exact); vits reference comparisons (need torch/onnxruntime reference files) still skipped under qemu.
 
 Done and pushed: Whisper (mel, whisper, transcribe, listen/oann-listen), kws (wake word), bench/speech, README (licences,
 VM speed, Pi 4 estimate, TTS survey). Exact against transformers 5.24 for tiny/base/small (see README, Checks).
