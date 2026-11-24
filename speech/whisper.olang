@@ -75,6 +75,8 @@ type Lin struct(In I64, Out I64, Bf Bool) {
     Bf
     W mut Array<F32>& = Array<F32>(0)
     H mut Array<BF16>& = Array<BF16>(0)
+    Q mut Array<I8>& = Array<I8>(0)         # INT8 weights (Quantize): row o is Q[o In ..] times Sc[o]; F32 activations
+    Sc mut Array<F32>& = Array<F32>(0)
     Bias mut Array<F32>& = Array<F32>(Out)
 }
 
@@ -134,6 +136,24 @@ fn (l mut Lin&) settle() {
     l.W = Array<F32>(0)
 }
 
+# l's weights as INT8, symmetric per output row (scale max|w| / 127), the F32 and BF16 ones dropped: a product reads a
+# quarter of the bytes of F32's, which is the whole cost of the decoder's few rows on a memory-bound CPU (a Pi 4)
+fn (l mut Lin&) Quantize() {
+    if l.Out == 0 or l.Q.Len() > 0: return
+    src := l.W if l.W.Len() > 0 else Array<F32>[F32(v) for v in l.H]
+    l.Q = Array<I8>(l.In * l.Out)
+    l.Sc = Array<F32>(l.Out)
+    for o in range l.Out {
+        top F32 = 0.0
+        for k in range l.In: top = top.Max(src[o * l.In + k].Abs())
+        sc F32 = top / 127.0 if top > 0.0 else 1.0
+        l.Sc[o] = sc
+        for k in range l.In: l.Q[o * l.In + k] = I8((src[o * l.In + k] / sc).RoundEven().Clamp(-127.0, 127.0))
+    }
+    l.W = Array<F32>(0)
+    l.H = Array<BF16>(0)
+}
+
 fn (r reader&) block(b mut Block&, p String&, d I64) ? ModelError {
     try r.norm(b.Ln1, p + "self_attn_layer_norm")
     try r.lin(b.Qkv, p + "self_attn.q_proj", 0, d)
@@ -181,8 +201,9 @@ type Model struct(C Config, Bf Bool) {
     Threads I64 = gemm.Cores()
 }
 
-# the model in directory dir (config.json, model.safetensors): BF16 operands where bf is set
-fn Model.Load(dir String&, bf Bool = false) Model ? ModelError, os.Error {
+# the model in directory dir (config.json, model.safetensors): BF16 operands where bf is set, the decoder's weights
+# (but the cross-attention's keys and values, a product of the encoder's rows) INT8 where q8 is
+fn Model.Load(dir String&, bf Bool = false, q8 Bool = false) Model ? ModelError, os.Error {
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
     f := try checkpoint.File.Load(dir + "/model.safetensors") catch checkpoint.SafetensorsError { error ModelError.Malformed(dir + "/model.safetensors") }
     r := reader(f)
@@ -201,6 +222,17 @@ fn Model.Load(dir String&, bf Bool = false) Model ? ModelError, os.Error {
     try r.into(m.DecPos, 0, "model.decoder.embed_positions.weight", c.Text * c.Dim)
     for i in range c.DecLayers: try r.block(m.Dec[i], "model.decoder.layers." + $i + ".", c.Dim)
     try r.norm(m.DecLn, "model.decoder.layer_norm")
+    if q8 {
+        for b in m.Dec {
+            b.Qkv.Quantize()
+            b.O.Quantize()
+            b.CQ.Quantize()
+            b.CO.Quantize()
+            b.Fc1.Quantize()
+            b.Fc2.Quantize()
+        }
+        m.Head.Quantize()
+    }
     return m
 }
 
@@ -234,6 +266,16 @@ Few I64 = 16
 # threads by outputs where gemm would not split it: a product of few rows, and BF16 tiles (gemm's AMX path is one task)
 fn (a mut Arith&) Lin(dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Lin&) {
     if rows == 0 or w.Out == 0: return
+    if w.Q.Len() > 0 {
+        t := a.Threads.Min(w.Out / 64).Max(1)
+        xq := Array<I8>(rows * w.In)
+        xs := Array<F32>(rows)
+        quantRows(xq, xs, src, rows, w.In)
+        join {
+            for i in range t: spawn part8(dst, xq, xs, rows, w, (i * w.Out / t), ((i + 1) * w.Out / t))
+        }
+        return
+    }
     tile := w.Bf and rows >= Few
     if tile {
         t := a.Threads.Min(rows).Max(1)
@@ -254,6 +296,33 @@ fn (a mut Arith&) Lin(dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Lin&
 # dst[from .. to] = src's, rounded to BF16
 fn round(dst mut Array<BF16>&, src Array<F32>&, from I64, to I64) {
     for i in range from, to: dst[i] = BF16(src[i])
+}
+
+# src's rows quantized to INT8, symmetric per row (scale max|x| / 127): values into xq, scales into xs
+fn quantRows(xq mut Array<I8>&, xs mut Array<F32>&, src Array<F32>&, rows I64, n I64) {
+    for r in range rows {
+        top F32 = 0.0
+        for k in range n: top = top.Max(src[r * n + k].Abs())
+        sc F32 = top / 127.0 if top > 0.0 else 1.0
+        inv := 1.0 / sc
+        xs[r] = sc
+        for k in range n: xq[r * n + k] = I8((src[r * n + k] * inv).RoundEven().Clamp(-127.0, 127.0))
+    }
+}
+
+# outputs o0 .. o1 of dst = src W^T + b, W INT8 and src (xq, scales xs) INT8 with 32-bit sums: each weight row is read
+# once, against every row of src
+fn part8(dst mut Array<F32>&, xq Array<I8>&, xs Array<F32>&, rows I64, w Lin&, o0 I64, o1 I64) {
+    n := w.In
+    for o in range o0, o1 {
+        q := w.Q[o * n:(o + 1) * n]
+        for r in range rows {
+            x := xq[r * n:(r + 1) * n]
+            acc I32 = 0
+            for k in range n: acc += I32(x[k]) * I32(q[k])
+            dst[r * w.Out + o] = F32(acc) * xs[r] * w.Sc[o] + w.Bias[o]
+        }
+    }
 }
 
 # outputs o0 .. o1 of dst = src W^T + b: BF16 tiles from xb (src rounded), or F32 activations times the weights as stored

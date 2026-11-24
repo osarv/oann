@@ -15,7 +15,7 @@ voices exact to onnxruntime, vits-ljs to transformers), speech/speak.olang (Voic
 speaks English and Swedish and hears them back through Whisper base.
 
 Next: measure on a real Pi 4; a trained wake word (data to record or synthesise - Speak can make positives in both
-languages, kws.Train); INT8 weights for the Pi 4 decoder (memory-bound there); the G2P's English words outside CMUdict
+languages, kws.Train); INT8 decoder is done (--int8, speech/README Checks) - measure it on a real Pi 4; the encoder is still F32/BF16 (INT8 there: nn/quant's GemmI8 is the tool); the embedding table stays F32; the G2P's English words outside CMUdict
 (about half differ from espeak).
 
 Environment notes: tests need `OLANG_AUTORACE=0` (clang-19's TSan makes the race build very slow); the ARM build needs

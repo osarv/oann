@@ -83,6 +83,10 @@ the implementation to transformers 5.24 (F32, CPU):
 - greedy and 5-beam transcripts token for token on three clips, and the timestamped segments (text and times) of four,
   one of 67 s read in three windows, for all three models;
 - BF16 products: logits within 0.31 (tiny), 0.19 (base), 0.14 (small) of F32, the same greedy transcripts.
+- INT8 decoder (`--int8`, `Whisper.Load(..., q8 = true)`): the decoder's weights per-row INT8, its activations per-row dynamic INT8, 32-bit sums
+  (the cross-attention's keys and values stay F32: a product of the encoder's rows); base hears Piper's English and Swedish as F32 does (speak test).
+  On the 4-core x86 VM, base, 12.6 s clip, decoder per token: F32 20.2 ms (1 thread) / 10.9 (4); INT8 19.3 / 9.7. The gain there is small
+  (compute-bound); the weights are a quarter of the bytes, which is what a Pi 4 decoder waits for - to measure there.
 
 `OANN_SPEECH_QUICK=1` checks tiny alone. The aarch64 build passes the same tiny checks under qemu-user (below).
 
