@@ -76,6 +76,11 @@ segments. For commands, the assistant loop takes what follows the wake word unti
 `audio/*.wav` and `ref/MODEL/*` (written by `python3 -I speech/tools/reference.py MODEL_DIR CLIP.wav OUT`), they hold
 the implementation to transformers 5.24 (F32, CPU):
 
+- `Options.Prompt` (Whisper's previous-text conditioning: <|startofprev|>, " " + the text cut from the left to 223 tokens, then the
+  usual prompt; never in the output; for `Text`, `Transcribe`, `Stream`, greedy and beams) gives greedy tokens equal to
+  `generate(prompt_ids=get_prompt_ids(text))`'s on tiny and base, en and sv (`reference.py MODEL_DIR CLIP.wav OUT --prompt LANG TEXT...`,
+  clips `jfk` and `sv1`; an empty prompt is the old decoding);
+
 - the log-mel within 1e-4 of the feature extractor's (its own torch and numpy paths differ by 4.4e-5);
 - the decoder's logits over the whole greedy sequence (vocabulary 51865 at every position) within 1e-4: largest gaps
   7.6e-5 (tiny), 5.7e-5 (base), 5.7e-5 (small); against transformers run in F64, 3.4e-5 for tiny (transformers' own F32

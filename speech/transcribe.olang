@@ -30,6 +30,7 @@ import "whisper"
 type Tokens struct(Bpe bpe.Bpe) {
     Bpe
     Sot I32 = 0                     # <|startoftranscript|>
+    Prev I32 = -1                   # <|startofprev|>, -1 where the vocabulary has none
     Eot I32 = 0                     # <|endoftext|>
     Transcribe I32 = 0
     Translate I32 = 0
@@ -59,6 +60,7 @@ fn Tokens.Load(dir String&) Tokens ? whisper.ModelError, os.Error {
     t := Tokens(b)
     j := try json.Json.Parse(try os.ReadFile(dir + "/generation_config.json")) catch json.Error { error whisper.ModelError.Malformed("generation_config.json") }
     t.Sot = try intAt(j, "decoder_start_token_id")
+    t.Prev = t.Bpe.Find("<|startofprev|>")
     t.Eot = try intAt(j, "eos_token_id")
     t.NoTimestamps = try intAt(j, "no_timestamps_token_id")
     t.TsBegin = t.NoTimestamps + 1
@@ -84,6 +86,28 @@ fn (t Tokens&) Text(ids Array<I32>&) String {
     return try t.Bpe.Decode(keep) catch default ""
 }
 
+# the decoder's input before its first step: with a prompt (text; left to the end, at most ctx / 2 - 1 tokens of it, as
+# OpenAI's whisper keeps it), <|startofprev|> and the tokens of " " + the text, then <|startoftranscript|>, lang (-1: none,
+# an English-only model), the task, <|notimestamps|> unless timestamps are asked for. The prompt's tokens condition the
+# decoder and are never part of what it writes
+fn (t Tokens&) Layout(o Options&, lang I32, ctx I64) Array<I32> {
+    p := Vec<I32>()
+    text := o.Prompt.Trim()
+    if text.Len() > 0 and t.Prev >= 0 {
+        ids := t.Bpe.Encode(" " + text)
+        keep := (ctx / 2 - 1).Min(ids.Len())
+        p.Push(t.Prev)
+        for i in range ids.Len() - keep, ids.Len(): p.Push(ids[i])
+    }
+    p.Push(t.Sot)
+    if lang >= 0 {
+        p.Push(lang)
+        p.Push(t.Translate if o.Translate else t.Transcribe)
+    }
+    if not o.Timestamps: p.Push(t.NoTimestamps)
+    return p.ToArray()
+}
+
 # a language's token, or -1
 fn (t Tokens&) Lang(code String&) I32 {
     for i, n in t.Names {
@@ -101,6 +125,7 @@ type Options struct() {
     Beams I64 = 1               # 1: greedy
     MaxTokens I64 = 224         # tokens a window may have after its prompt
     NoRepeat Bool = false       # greedy: stop where the last 1-30 tokens have come three times running (a loop)
+    Prompt String = ""          # text the decoder is given as the text before the clip (a name's spelling, jargon, a style); "": none
     Positions I64 = 1500        # the encoder's positions (fewer: a shorter window, faster and not the reference)
 }
 
@@ -170,17 +195,13 @@ fn (w mut Whisper&) Detect() I32 {
 
 # the prompt of a window under o
 fn (w mut Whisper&) Prompt(o Options&) Array<I32> {
-    p := Vec<I32>()
-    p.Push(w.T.Sot)
+    lang I32 = -1
     if w.T.Langs.Len() > 0 {
-        lang := w.T.Lang(o.Language) if o.Language.Len() > 0 else w.Detect()
+        lang = w.T.Lang(o.Language) if o.Language.Len() > 0 else w.Detect()
         if lang < 0: lang = w.Detect()
         w.Language = lang
-        p.Push(lang)
-        p.Push(w.T.Translate if o.Translate else w.T.Transcribe)
     }
-    if not o.Timestamps: p.Push(w.T.NoTimestamps)
-    return p.ToArray()
+    return w.T.Layout(o, lang, w.M.C.Text)
 }
 
 # the rules of a step applied to row (Vocab wide; logits or log-probabilities), gen the tokens decoded after the prompt
@@ -437,6 +458,7 @@ fn (o Options&) timed() Options {
     t.Language = o.Language
     t.Translate = o.Translate
     t.Timestamps = true
+    t.Prompt = o.Prompt
     t.Beams = o.Beams
     t.MaxTokens = o.MaxTokens
     t.Positions = o.Positions
@@ -652,4 +674,132 @@ test Stream "sound pushed in half seconds: nothing settled before its end, the p
     got := ""
     for g in st.Settled(true): got = got + g.Text
     assert got == whole, got + " | " + whole
+}
+
+# ---- decoder prompts ----
+
+fn cat(a Array<I32>&, b Array<I32>&, c Array<I32>&) Array<I32> {
+    v := Vec<I32>()
+    for x in a: v.Push(x)
+    for x in b: v.Push(x)
+    for x in c: v.Push(x)
+    return v.ToArray()
+}
+
+# the reference's prompt cases of a clip (reference.py ... --prompt): each case's prompt, prompt ids and greedy tokens
+type promptCase struct(Prompt String, Ids Array<I32>, Toks Array<I32>) {
+    Prompt
+    Ids
+    Toks
+}
+
+fn promptCases(name String&, clip String&) Array<promptCase> {
+    j := json.Json.Parse(os.ReadFile(mel.Cache() + "/ref/" + name + "/" + clip + ".prompt.json")!)!
+    out := Vec<promptCase>()
+    for c in j["cases"]!.AsArr()! {
+        ids := Array<I32>[I32(x.AsInt()!) for x in c["prompt_ids"]!.AsArr()!]
+        toks := Array<I32>[I32(x.AsInt()!) for x in c["tokens"]!.AsArr()!]
+        out.Push(promptCase(c["prompt"]!.AsStr()!, ids, toks))
+    }
+    return out.ToArray()
+}
+
+test Tokens "a prompt's layout: <|startofprev|>, the text's tokens after a space, then the old prompt; empty or blank: the old prompt; at most 223 tokens, the last ones" {
+    dir := mel.Cache() + "/models/openai--whisper-tiny"
+    if not os.Exists(dir + "/tokenizer.json") {
+        Println("skipped: no tokenizer")
+        return
+    }
+    t := Tokens.Load(dir)!
+    assert t.Prev >= 0
+    lang := t.Lang("sv")
+    o := Options()
+    old := Array<I32>[t.Sot, lang, t.Transcribe, t.NoTimestamps]
+    assert t.Layout(o, lang, 448) == old
+    o.Prompt = "  \n "
+    assert t.Layout(o, lang, 448) == old
+    o.Prompt = "Mitchell Gourley"
+    ids := t.Bpe.Encode(" Mitchell Gourley")
+    want := Vec<I32>()
+    want.Push(t.Prev)
+    for i in ids: want.Push(i)
+    for i in old: want.Push(i)
+    assert t.Layout(o, lang, 448) == want.ToArray()
+    assert t.Text(t.Layout(o, lang, 448)[1:1 + ids.Len()]) == " Mitchell Gourley"
+    o.Timestamps = true
+    o.Translate = true
+    assert t.Layout(o, lang, 448) == cat(Array<I32>[t.Prev], ids, Array<I32>[t.Sot, lang, t.Translate])
+    # an English-only model: no language, no task
+    assert t.Layout(o, -1, 448) == cat(Array<I32>[t.Prev], ids, Array<I32>[t.Sot])
+    # a long prompt keeps its last ctx / 2 - 1 tokens
+    long := ""
+    for i in range 400: long = long + " word" + $i
+    o.Prompt = long
+    all := t.Bpe.Encode(" " + long.Trim())
+    assert all.Len() > 223
+    p := t.Layout(o, lang, 448)
+    assert p.Len() == 1 + 223 + 3
+    assert p[1:224] == all[all.Len() - 223:]
+    assert p[0] == t.Prev and p[224] == t.Sot
+}
+
+# the stream with a prompt: Partial is the prompted Text, and the settled segments' text the prompted transcript's
+fn streamHolds(w mut Whisper&, x Array<F32>&, given Options&) {
+    o := given.timed()
+    o.Beams = 1
+    st := Stream(w, o)
+    st.Push(x)
+    assert st.Partial() == w.Text(x, o)
+    whole := ""
+    for g in w.Transcribe(x, o): whole = whole + g.Text
+    got := ""
+    for g in st.Settled(true): got = got + g.Text
+    assert got == whole and whole.Len() > 0, got + " | " + whole
+}
+
+test Whisper "prompt: greedy tokens the reference's (prompt_ids), the empty prompt the old decoding, beams and the stream with a prompt (where the files are)" {
+    dir := mel.Cache() + "/models/openai--whisper-tiny"
+    clips := ["jfk", "sv1"]
+    langs := ["en", "sv"]
+    for ci, clip in clips {
+        lang := langs[ci]
+        if not os.Exists(dir) or not os.Exists(mel.Cache() + "/ref/tiny/" + clip + ".prompt.json") {
+            Println("skipped: no prompt reference for " + clip)
+            continue
+        }
+        w := Whisper.Load(dir)!
+        x := mel.Wav(mel.Cache() + "/audio/" + clip + ".wav")!
+        w.Clip(x)
+        plain := Options()
+        plain.Language = lang
+        plain.MaxTokens = 200
+        base := w.Decode(w.Prompt(plain), plain)
+        changed := 0
+        for c in promptCases("tiny", clip) {
+            o := Options()
+            o.Language = lang
+            o.MaxTokens = 200
+            o.Prompt = c.Prompt
+            p := w.Prompt(o)
+            assert p.Len() == c.Ids.Len() + 4, $p
+            assert p[:c.Ids.Len()] == c.Ids, clip + ": prompt ids " + $p[:c.Ids.Len()] + " want " + $c.Ids
+            got := w.Decode(p, o)
+            if got.Len() > 0 and got[got.Len() - 1] == w.T.Eot and (c.Toks.Len() == 0 or c.Toks[c.Toks.Len() - 1] != w.T.Eot): got = got[:got.Len() - 1]
+            assert got == c.Toks, clip + " " + c.Prompt + ":\n got  " + $got + "\n want " + $c.Toks
+            if c.Prompt.Len() == 0: assert got == base[:got.Len()] and got.Len() > 0
+            else if got != base: changed += 1
+            # the prompt's tokens are never in the output
+            assert got.Len() > 0 and not got.Has(w.T.Prev) and not got.Has(w.T.Sot)
+        }
+        assert changed > 0, clip + ": no prompt changed the output"
+        # beams: a prompt gives a transcript without its tokens
+        o := Options()
+        o.Language = lang
+        o.MaxTokens = 200
+        o.Beams = 3
+        o.Prompt = promptCases("tiny", clip)[1].Prompt
+        b := w.Decode(w.Prompt(o), o)
+        assert b.Len() > 0 and not b.Has(w.T.Prev) and not b.Has(w.T.Sot)
+        if ci == 0: streamHolds(w, x, o)
+    }
 }

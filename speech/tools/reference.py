@@ -2,11 +2,17 @@
 # on a clip. Writes, for MODEL_DIR and CLIP.wav, into OUT/: CLIP.mel.f32 (the log-mel, 80 x 3000), CLIP.logits.f32
 # (the decoder's logits at every position of the greedy sequence) and CLIP.json (the greedy, timestamped and beam
 # sequences and their text, and the segments with their times); a clip longer than 30 s gets only its segments. Needs torch, transformers, numpy; run with python3 -I.
+# MODEL_DIR needs preprocessor_config.json too (openai/whisper-*'s, not in a bare weights directory).
+#
+# With a prompt - reference.py MODEL_DIR CLIP.wav OUT --prompt LANG TEXT [TEXT ...] - writes OUT/CLIP.prompt.json instead:
+# the greedy tokens generate(..., language=LANG, prompt_ids=processor.get_prompt_ids(TEXT)) writes (the decoder's prompt
+# not in them) for no prompt and for each TEXT, with the prompt ids (<|startofprev|> and the tokens of " " + TEXT).
 import json, sys, wave
 import numpy as np, torch
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
 model_dir, clip, out = sys.argv[1], sys.argv[2], sys.argv[3]
+prompts = sys.argv[6:] if len(sys.argv) > 5 and sys.argv[4] == "--prompt" else None
 torch.set_num_threads(4)
 with wave.open(clip) as w:
     audio = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
@@ -20,6 +26,19 @@ def segments(feats, **kw):
     return [{"start": round(float(s["start"]), 2), "end": round(float(s["end"]), 2), "text": proc.tokenizer.decode(s["tokens"], skip_special_tokens=True)}
             for s in out["segments"][0]]
 
+if prompts is not None:
+    lang = sys.argv[5]
+    feats = proc.feature_extractor(audio[:480000], sampling_rate=16000, return_tensors="pt").input_features
+    cases = []
+    for text in [""] + prompts:
+        kw = dict(prompt_ids=torch.tensor(proc.get_prompt_ids(text))) if text else {}
+        with torch.no_grad():
+            seq = model.generate(feats, language=lang, task="transcribe", max_new_tokens=200, **kw)[0].tolist()
+        cases.append({"prompt": text, "prompt_ids": [int(i) for i in proc.get_prompt_ids(text)] if text else [], "tokens": seq,
+                      "text": proc.tokenizer.decode(seq, skip_special_tokens=True)})
+        print(name, lang, repr(text), "->", cases[-1]["text"])
+    json.dump({"language": lang, "cases": cases}, open(f"{out}/{name}.prompt.json", "w"), indent=1, ensure_ascii=False)
+    sys.exit(0)
 if len(audio) > 480000:
     # a long clip: only its segments, read window after window
     f = proc.feature_extractor(audio, sampling_rate=16000, return_tensors="pt", truncation=False, padding="longest", return_attention_mask=True)
