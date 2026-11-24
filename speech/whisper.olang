@@ -236,6 +236,17 @@ fn Model.Load(dir String&, bf Bool = false, q8 Bool = false) Model ? ModelError,
     return m
 }
 
+# the encoder's products (not its convolutions) INT8 as the decoder's are under q8: on a CPU with a byte dot product
+# (aarch64's sdot) a quarter of the bytes and up to four times the products a cycle of F32's
+fn (m mut Model&) QuantizeEncoder() {
+    for b in m.Enc {
+        b.Qkv.Quantize()
+        b.O.Quantize()
+        b.Fc1.Quantize()
+        b.Fc2.Quantize()
+    }
+}
+
 # the parameters
 fn (m Model&) Params() I64 {
     c := m.C
@@ -310,19 +321,32 @@ fn quantRows(xq mut Array<I8>&, xs mut Array<F32>&, src Array<F32>&, rows I64, n
     }
 }
 
-# outputs o0 .. o1 of dst = src W^T + b, W INT8 and src (xq, scales xs) INT8 with 32-bit sums: each weight row is read
-# once, against every row of src
+# outputs o0 .. o1 of dst = src W^T + b, W INT8 and src (xq, scales xs) INT8 with 32-bit sums: rows in blocks of
+# RowBlock (their bytes stay in the cache) against each weight row of the block's outputs
+RowBlock I64 = 16
+
 fn part8(dst mut Array<F32>&, xq Array<I8>&, xs Array<F32>&, rows I64, w Lin&, o0 I64, o1 I64) {
     n := w.In
-    for o in range o0, o1 {
-        q := w.Q[o * n:(o + 1) * n]
-        for r in range rows {
-            x := xq[r * n:(r + 1) * n]
-            acc I32 = 0
-            for k in range n: acc += I32(x[k]) * I32(q[k])
-            dst[r * w.Out + o] = F32(acc) * xs[r] * w.Sc[o] + w.Bias[o]
+    for r0 in range 0, rows, RowBlock {
+        r1 := (r0 + RowBlock).Min(rows)
+        for o in range o0, o1 {
+            q := w.Q[o * n:(o + 1) * n]
+            sc := w.Sc[o]
+            b := w.Bias[o]
+            for r in range r0, r1: dst[r * w.Out + o] = F32(Dot8(xq[r * n:(r + 1) * n], q)) * xs[r] * sc + b
         }
     }
+}
+
+# the dot product of two byte vectors in 32 bits, 16 bytes a step each summed at once: the shape aarch64's sdot is
+# made from (a vector's total of 16 widened products), where the target has the dot product (armv8.2-a+dotprod)
+fn Dot8(x Array<I8>&, q Array<I8>&) I32 {
+    n := x.Len()
+    m := n - n % 16
+    acc I32 = 0
+    for k in range 0, m, 16: acc += (x[k:k + 16] * q[k:k + 16]).Sum<I32>()
+    for k in range m, n: acc += I32(x[k]) * I32(q[k])
+    return acc
 }
 
 # outputs o0 .. o1 of dst = src W^T + b: BF16 tiles from xb (src rounded), or F32 activations times the weights as stored
