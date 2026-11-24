@@ -432,7 +432,7 @@ fn File.Load(path String&) File ? os.Error, SafetensorsError {
     disk mut Vec<os.File>& = Vec<os.File>()
     disk.Push(try os.File.Open(path))
     f := disk[0]
-    size := unistd.lseek(f.Fd(), 0, 2)
+    size := seek(f.Fd(), 0, 2)
     if size < 10: error SafetensorsError.Malformed
     head := Array<U8>(8)
     try readAt(f, 0, head) catch io.Error { error os.Error.Failed($path) }
@@ -445,9 +445,19 @@ fn File.Load(path String&) File ? os.Error, SafetensorsError {
     return File(Array<U8>(0), entries, meta, base, disk)
 }
 
+# the file's offset moved (lseek; Windows' C library takes a 32-bit offset there, so its 64-bit one)
+if TargetOs == "windows" {
+    extern {
+        fn _lseeki64(fd I32, at I64, whence I32) I64
+    }
+    fn seek(fd I32, at I64, whence I32) I64 { return _lseeki64(fd, at, whence) }
+} else {
+    fn seek(fd I32, at I64, whence I32) I64 { return unistd.lseek(fd, at, whence) }
+}
+
 # buf filled from the file's byte at, every byte of it (a short file is a malformed one)
 fn readAt(f os.File&, at I64, buf mut Array<U8>&) ? io.Error {
-    unistd.lseek(f.Fd(), at, 0)
+    seek(f.Fd(), at, 0)
     got I64 = 0
     for got < buf.Len() {
         part := try f.Read(buf[got:])
