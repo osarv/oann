@@ -142,7 +142,7 @@ type Whisper struct(M whisper.Model, T Tokens, beams I64 = 5) {
     T
     Mel mut mel.Mel& = mel.Mel(M.C.Mels, 1000, M.Threads)
     Enc mut whisper.Encoder& = whisper.Encoder(M, M.C.Positions)
-    Dec mut whisper.Decoder& = whisper.Decoder(M, 2 * beams, beams.Max(32), beams)
+    Dec mut whisper.Decoder& = whisper.Decoder(M, 2 * beams, beams.Max(M.C.Text / 2 + 4), beams)
     Language I32 = -1                         # the last window's language token
     logp mut Array<F32>& = Array<F32>(M.C.Vocab)
 }
@@ -774,6 +774,30 @@ fn streamHolds(w mut Whisper&, x Array<F32>&, given Options&) {
     got := ""
     for g in st.Settled(true): got = got + g.Text
     assert got == whole and whole.Len() > 0, got + " | " + whole
+}
+
+test Whisper "a prompt of the longest length decodes (the decoder's first step holds all its rows), greedy and beams (where the files are)" {
+    dir := mel.Cache() + "/models/openai--whisper-tiny"
+    if not os.Exists(dir) or not os.Exists(mel.Cache() + "/audio/jfk.wav") {
+        Println("skipped: no model")
+        return
+    }
+    w := Whisper.Load(dir)!
+    x := mel.Wav(mel.Cache() + "/audio/jfk.wav")!
+    w.Clip(x)
+    long := ""
+    for i in range 400: long = long + " word" + $i
+    for beams in [1, 3] {
+        o := Options()
+        o.Language = "en"
+        o.MaxTokens = 20
+        o.Beams = beams
+        o.Prompt = long
+        p := w.Prompt(o)
+        assert p.Len() > 100, $p.Len()
+        got := w.Decode(p, o)
+        assert got.Len() > 0 and not got.Has(w.T.Prev) and not got.Has(w.T.Sot)
+    }
 }
 
 test Whisper "prompt: greedy tokens the reference's (prompt_ids), the empty prompt the old decoding, beams and the stream with a prompt (where the files are)" {
