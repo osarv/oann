@@ -1704,6 +1704,11 @@ fn i8Shape<H>(sh H) I64, I64 {
     }
 }
 
+# madds for INT8 products: they run at two to three times F32's multiply-adds a second, so a task needs four times as
+# many to pay its spawn and join (25 us and 12 a task, measured) - 64 and 128 x 784 x 128 split 4 ways were 1.6-2.5x
+# slower than one thread
+i8Madds I64 = 4 * madds
+
 # the packed product: b in column panels of nr (zeros past n) into ws, then runs of the row tiles over ws.Threads tasks
 fn (q quant&) blocked<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     mr, nr := i8Shape(sh)
@@ -1712,7 +1717,7 @@ fn (q quant&) blocked<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     qb := ws.bytesB(panels * k * nr)
     for p in range panels: packI8(q.b, k, p * nr, lesser(nr, n - p * nr), nr, qb, p * k * nr)
     tiles I64 = (m + mr - 1) / mr
-    tasks I64 = 1 if m * n * k < 2000000 else lesser(ws.Threads, tiles)
+    tasks I64 = lesser(lesser(ws.Threads, tiles), m * n * k / i8Madds).Max(1)
     share I64 = (tiles + tasks - 1) / tasks
     qa := ws.bytesA(tasks * mr * k)
     if tasks <= 1 {
@@ -1741,7 +1746,7 @@ fn (q quant&) grouped<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     qb := ws.bytesB(panels * kp * nr)
     for p in range panels: packGroupsI8(q.b, k, kp, p * nr, lesser(nr, n - p * nr), nr, qb, p * kp * nr)
     tiles I64 = (m + mr - 1) / mr
-    tasks I64 = 1 if m * n * k < 2000000 else lesser(ws.Threads, tiles)
+    tasks I64 = lesser(lesser(ws.Threads, tiles), m * n * k / i8Madds).Max(1)
     share I64 = (tiles + tasks - 1) / tasks
     room I64 = mr * kp
     qa := ws.bytesA(tasks * room)

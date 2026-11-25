@@ -77,6 +77,7 @@ type Lin struct(In I64, Out I64, Bf Bool) {
     H mut Array<BF16>& = Array<BF16>(0)
     Q mut Array<I8>& = Array<I8>(0)         # INT8 weights (Quantize): row o is Q[o In ..] times Sc[o]; F32 activations
     Sc mut Array<F32>& = Array<F32>(0)
+    Qs mut Array<I32>& = Array<I32>(0)      # each INT8 row's sum (Biased: an activation's 128 taken back out)
     Bias mut Array<F32>& = Array<F32>(Out)
 }
 
@@ -143,12 +144,14 @@ fn (l mut Lin&) Quantize() {
     src := l.W if l.W.Len() > 0 else Array<F32>[F32(v) for v in l.H]
     l.Q = Array<I8>(l.In * l.Out)
     l.Sc = Array<F32>(l.Out)
+    l.Qs = Array<I32>(l.Out)
     for o in range l.Out {
         top F32 = 0.0
         for k in range l.In: top = top.Max(src[o * l.In + k].Abs())
         sc F32 = top / 127.0 if top > 0.0 else 1.0
         l.Sc[o] = sc
         for k in range l.In: l.Q[o * l.In + k] = I8((src[o * l.In + k] / sc).RoundEven().Clamp(-127.0, 127.0))
+        for k in range l.In: l.Qs[o] += I32(l.Q[o * l.In + k])
     }
     l.W = Array<F32>(0)
     l.H = Array<BF16>(0)
@@ -273,15 +276,37 @@ type Arith struct(threads I64, dim I64, room I64) {
 # split over the threads by its outputs - reading the weights once is its whole cost
 Few I64 = 16
 
+# the multiply-adds a task of a few rows' product must have to pay its spawn and join (40-65 us on 2-4 tasks, measured
+# on a 4-core Xeon VM): F32 and BF16 weights stream from memory (1 x 512 x 2048 F32 is 150 us), INT8 run at about ten
+# times their multiply-adds a second (bench/whisperlin) - below, a product runs on the calling thread
+FewTask I64 = 1100000
+I8Task I64 = 4000000
+
 # dst[: rows, : w.Out] = src[: rows, : w.In] W^T + b, rows of src w.In apart and of dst w.Out apart. Split over the
 # threads by outputs where gemm would not split it: a product of few rows, and BF16 tiles (gemm's AMX path is one task)
 fn (a mut Arith&) Lin(dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Lin&) {
     if rows == 0 or w.Out == 0: return
     if w.Q.Len() > 0 {
-        t := a.Threads.Min(w.Out / 64).Max(1)
+        t := a.Threads.Min(w.Out / 64).Min(rows * w.In * w.Out / I8Task).Max(1)
         xq := Array<I8>(rows * w.In)
         xs := Array<F32>(rows)
         quantRows(xq, xs, src, rows, w.In)
+        if Biased {
+            xu := Array<U8>(rows * w.In)
+            for i in range rows * w.In: xu[i] = U8(I32(xq[i]) + 128)
+            if t == 1 {
+                part8u(dst, xu, xs, rows, w, 0, w.Out)
+                return
+            }
+            join {
+                for i in range t: spawn part8u(dst, xu, xs, rows, w, (i * w.Out / t), ((i + 1) * w.Out / t))
+            }
+            return
+        }
+        if t == 1 {
+            part8(dst, xq, xs, rows, w, 0, w.Out)
+            return
+        }
         join {
             for i in range t: spawn part8(dst, xq, xs, rows, w, (i * w.Out / t), ((i + 1) * w.Out / t))
         }
@@ -298,7 +323,11 @@ fn (a mut Arith&) Lin(dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Lin&
         gemm.Gemm(a.ws, mat.Mat<F32>(dst, 0, rows, w.Out, w.Out), mat.Mat<F32>(src, 0, rows, w.In, w.In), false, mat.Mat<F32>(w.W, 0, w.Out, w.In, w.In), true, epi = gemm.Epilogue.Bias(w.Bias))
         return
     }
-    t := a.Threads.Min(w.Out / 64).Max(1)
+    t := a.Threads.Min(w.Out / 64).Min(rows * w.In * w.Out / FewTask).Max(1)
+    if t == 1 {
+        part(a.each[0], dst, src, a.xb, rows, w, 0, w.Out, tile)
+        return
+    }
     join {
         for i in range t: spawn part(a.each[i], dst, src, a.xb, rows, w, (i * w.Out / t) / 16 * 16, ((i + 1) * w.Out / t) / 16 * 16 if i + 1 < t else w.Out, tile)
     }
@@ -334,6 +363,24 @@ fn part8(dst mut Array<F32>&, xq Array<I8>&, xs Array<F32>&, rows I64, w Lin&, o
             sc := w.Sc[o]
             b := w.Bias[o]
             for r in range r0, r1: dst[r * w.Out + o] = F32(Dot8(xq[r * n:(r + 1) * n], q)) * xs[r] * sc + b
+        }
+    }
+}
+
+# x86 has no signed-by-signed byte dot (VNNI's vpdpbusd is unsigned by signed): there the activations go 128 up, into
+# U8, and each output's dot takes 128 times its row's sum back out - the same integers, bit for bit
+Biased Bool = TargetArch != "aarch64"
+
+fn part8u(dst mut Array<F32>&, xu Array<U8>&, xs Array<F32>&, rows I64, w Lin&, o0 I64, o1 I64) {
+    n := w.In
+    for r0 in range 0, rows, RowBlock {
+        r1 := (r0 + RowBlock).Min(rows)
+        for o in range o0, o1 {
+            q := w.Q[o * n:(o + 1) * n]
+            sc := w.Sc[o]
+            b := w.Bias[o]
+            c := 128 * w.Qs[o]
+            for r in range r0, r1: dst[r * w.Out + o] = F32((xu[r * n:(r + 1) * n] * q).Sum<I32>() - c) * xs[r] * sc + b
         }
     }
 }
@@ -728,5 +775,31 @@ test Model "base's and small's logits within 1e-4 of transformers' (F32); BF16 p
         if gap < 0.0: continue
         Println(name + " BF16: " + $gap)
         assert gap < 0.5, name + ": " + $gap
+    }
+}
+
+test Arith "INT8 products: the biased U8 dot (x86) is the signed one's integers bit for bit, on one task and split, every row count" {
+    for shape in [[3, 300, 200], [1, 512, 1536], [17, 64, 130], [16, 1024, 600]] {
+        rows, inn, out := shape[0], shape[1], shape[2]
+        w := Lin(inn, out, false)
+        w.W = Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.0001 for i in range inn * out]
+        for o in range out: w.Bias[o] = F32(o % 5) * 0.25
+        w.Quantize()
+        src := Array<F32>[F32(((i * 104729) % 1999) - 999) * 0.001 for i in range rows * inn]
+        xq := Array<I8>(rows * inn)
+        xs := Array<F32>(rows)
+        quantRows(xq, xs, src, rows, inn)
+        want := Array<F32>(rows * out)
+        part8(want, xq, xs, rows, w, 0, out)
+        xu := Array<U8>[U8(I32(v) + 128) for v in xq]
+        got := Array<F32>(rows * out)
+        part8u(got, xu, xs, rows, w, 0, out)
+        for i in range rows * out: assert got[i] == want[i], $i
+        for threads in [1, 4] {
+            a := Arith(threads, inn.Max(out), rows * inn.Max(out))
+            y := Array<F32>(rows * out)
+            a.Lin(y, src, rows, w)
+            for i in range rows * out: assert y[i] == want[i], $threads + " " + $i
+        }
     }
 }

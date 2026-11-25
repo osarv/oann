@@ -2340,3 +2340,30 @@ Growing wins at equal compute in all three. Wall time was 25-50% longer for the 
 narrow products run less efficiently per MAC.
 
 olang issue found: iterating a Map whose values hold a writable reference fails in the prelude's MapIter (repro/mapiterref).
+
+## Few-row and INT8 threading, Whisper's INT8 one-row dot on x86 (2026-11-25)
+
+4-core Sapphire Rapids VM (Firecracker, noisy: the same binary varies up to 30% run to run), old and new builds
+alternated, medians of 5-7 rounds. Queue items checked first: gemm F32 at 4 threads is no longer slower than one at
+32/128 x 784 x 128 (fixed 2026-11-17, `madds`; 2M tried: 64 rows 150 -> 125 us but 128 rows 172 -> 205, left at 4M);
+BF16 one-row products are 0.76-0.84x F32 in L2 and 1.85-2.1x streaming (0.21x was 2026-11-16's, fixed); bench/int8's
+F32 baseline is 85-120 GFLOPS (fixed 2026-11-21). Spawn-and-join measured: 25 us for one task, +12 us a task.
+- **GemmI8** split anything over 2M multiply-adds four ways; INT8 runs at 2-3x F32's madds a second, so the join
+  dominated: 4 threads 1.6-2.5x slower than one at 64/128 x 784 x 128. Now at most one task per `i8Madds` (4 x
+  `madds`). bench/int8, 4 threads, static GOPS, 3 alternations: 64 x 784 x 128 85-99 -> 146-229, 128 x 784 x 128
+  156-168 -> 249-282; 512^3, 1024^3, 1024 x 512 x 128 unchanged within noise.
+- **Whisper's `Arith.Lin`** (the decoder's few rows) split every product over all threads, and spawned even for one task:
+  1 x 512 x 512 F32 46 us on one thread (13.8 run inline). Now tasks by work (`FewTask` 1.1M madds for F32/BF16, which
+  stream, `I8Task` 4M for INT8) and one task runs on the calling thread. A 4-row 512 x 512 F32 split two ways lost
+  (54 -> 84 us) at the madds where a streaming 1 x 512 x 2048 gained (147 -> 102), so the F32 rule is the safe one.
+- **INT8 `Dot8` on x86**: I8 x I8 lane sums have no x86 instruction and built to an out-of-line `olang_lanedot` call
+  per 16 bytes (INT8 2x slower than F32). On x86 (`Biased`) the activations go +128 into U8 and each output takes 128
+  times its row's sum (`Lin.Qs`) back out - the same integers bit for bit (test `Arith`), inline vpdpbusd. aarch64
+  keeps `Dot8` (inline sdot, checked in the cortex-a76 build; the whisper tests pass under qemu).
+bench/whisperlin (`make whisperlinbench`), us, old -> new, 1 row: INT8 1 x 512 x 512 1t 100 -> 5.5, 4t 107 -> 5.4;
+1 x 512 x 1536 1t 270 -> 15, 4t 157 -> 15; 1 x 2048 x 512 1t 367 -> 16, 4t 207 -> 17; head 1 x 512 x 51865 1t 8157 ->
+987, 4t 2630 -> 507. F32 1 x 512 x 512 4t 71 -> 14, 1 x 512 x 1536 4t 87 -> 103 (one task now; 2t was 82), head 4t
+1817 -> 2124 (noise; same split). 4 rows INT8: 4 x 512 x 512 4t 93 -> 16, head 4t 746 -> 789.
+Left: F32 few-row products take 4x for 4 rows (each row read the weights apart); the decoder's cross-attention still
+splits over heads unconditionally (unmeasured without a model here); the phone's thresholds are this VM's, untested
+on aarch64 hardware.

@@ -1,0 +1,72 @@
+# bench/whisperlin - speech/whisper's Arith.Lin at Whisper base's decoder shapes (qkv 512 -> 1536, the square 512 ones,
+# fc1 512 -> 2048, fc2 2048 -> 512, the head 512 -> 51865), a decoding step's few rows, F32 and INT8 weights, on each
+# thread count: us a product, the median of `rounds` interleaved rounds of about 20 ms each. Synthetic weights.
+#
+#     bench_whisperlin [rounds] [rows] [threads ...]
+
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../speech/whisper"
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn timed(a mut whisper.Arith&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w whisper.Lin&) F64 {
+    reps I64 = 1
+    for {
+        t0 := time.Now()
+        for _ in range reps: a.Lin(dst, src, rows, w)
+        dt := time.Since(t0)
+        if dt >= 20000000: return F64(dt) / 1000.0 / F64(reps)
+        reps *= 2
+    }
+}
+
+fn main() {
+    args := os.Args()
+    rounds := args[1].ParseInt()! if args.Len() > 1 else I64(7)
+    rows := args[2].ParseInt()! if args.Len() > 2 else I64(1)
+    threads := Vec<I64>()
+    for i in range 3, args.Len(): threads.Push(args[i].ParseInt()!)
+    if threads.Len() == 0 {
+        threads.Push(1)
+        threads.Push(2)
+        threads.Push(4)
+    }
+    r := rand.Rand(7)
+    shapes := Array<I64>[512, 1536, 512, 512, 512, 2048, 2048, 512, 512, 51865]
+    for s in range shapes.Len() / 2 {
+        inn := shapes[2 * s]
+        out := shapes[2 * s + 1]
+        f := whisper.Lin(inn, out, false)
+        f.W = Array<F32>(inn * out)
+        for i in range inn * out: f.W[i] = F32(r.Uniform(-0.05, 0.05))
+        q := whisper.Lin(inn, out, false)
+        q.W = Array<F32>[v for v in f.W]
+        q.Quantize()
+        src := Array<F32>(rows * inn)
+        for i in range rows * inn: src[i] = F32(r.Uniform(-1.0, 1.0))
+        dst := Array<F32>(rows * out)
+        ar := Vec<whisper.Arith>()
+        for t in threads: ar.Push(whisper.Arith(t, inn.Max(out), rows * inn.Max(out)))
+        nt := threads.Len()
+        tf := Array<F64>(nt * rounds)
+        tq := Array<F64>(nt * rounds)
+        for j in range rounds {
+            for i in range nt {
+                tf[i * rounds + j] = timed(ar[i], dst, src, rows, f)
+                tq[i * rounds + j] = timed(ar[i], dst, src, rows, q)
+            }
+        }
+        line := $rows + " x " + $inn + " x " + $out + ":"
+        for i in range threads.Len() {
+            a := tf[i * rounds:(i + 1) * rounds]
+            b := tq[i * rounds:(i + 1) * rounds]
+            line = line + " | " + $threads[i] + "t F32 " + $median(a).Fixed(1) + " INT8 " + $median(b).Fixed(1)
+        }
+        Println(line + " us")
+    }
+}

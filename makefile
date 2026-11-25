@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen oannlisten speechbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -160,6 +160,12 @@ oanngen:
 speechbench:
 	$(OLANG) build -output build/bench_speech bench/speech.olang
 	./build/bench_speech $(ARGS)
+
+# speech/whisper's few-row products (Arith.Lin) at Whisper base's decoder shapes, F32 and INT8, on each thread count
+# (bench/whisperlin.olang) - ARGS: [rounds] [rows] [threads ...]
+whisperlinbench:
+	$(OLANG) build -output build/bench_whisperlin bench/whisperlin.olang
+	./build/bench_whisperlin $(ARGS)
 
 # VITS text to speech (bench/vits.olang): seconds of compute a second of audio - ARGS: a VitsModel directory or a
 # Piper voice's .onnx, [rounds] [threads ...]
