@@ -398,6 +398,9 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     Eager Bool = mode == Mode.Eager
     Decode Bool = decode
     nodes mut list.List<Node>& = list.List<Node>()
+    tilePacks mut Array<gemm.TilePacked>& = Array<gemm.TilePacked>[gemm.TilePacked(0, 0)]   # constant weights packed ahead (PackConstants); [0] empty
+    packFwd mut Array<I64>& = Array<I64>(0)     # per node: its Linear's w^T in tilePacks, or 0
+    packBwd mut Array<I64>& = Array<I64>(0)     # and its w, for dx
     customIn mut list.List<Var>& = list.List<Var>()
     rowSets Vec<RowSet> = Vec<RowSet>()        # the sparse tables'
     customVals mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]    # each custom input's value, set per call
@@ -554,6 +557,38 @@ fn (g mut Graph<T>&) vector(name String&, v Var, n I64, optional Bool) Bool {
     if d.Rank == 1 and d[0] == n and not g.batched(v): return true
     g.fail($name + ": " + $g.shape(v) + " where " + $n + " numbers are wanted")
     return false
+}
+
+# every Linear whose weights are a Constant: its w^T (and w, for the input's gradient, where backward) packed once
+# for the BF16 tile path (AMX tiles or the pair dot), so no product packs them again. A BF16 graph only, after the
+# constants are set and before the steps; call again whenever a constant changes. Costs the weights' size per form
+fn (g mut Graph<T>&) PackConstants(backward Bool = true) {
+    bf := match T {
+        case BF16: true
+        case _: false
+    }
+    if not bf or not (g.ws32.Tile or g.ws32.Pairs): return
+    packs := Vec<gemm.TilePacked>()
+    packs.Push(gemm.TilePacked(0, 0))
+    g.packFwd = Array<I64>(g.nodes.Len())
+    g.packBwd = Array<I64>(g.nodes.Len())
+    for i in range g.nodes.Len() {
+        match g.nodes[i].Kind {
+            case Op.Linear(_, w, _) {
+                if g.nodes[w].Kind == Op.Constant {
+                    m := g.Value(w).Mat()!
+                    g.packFwd[i] = packs.Len()
+                    packs.Push(g.ws32.PackTiles(m, true))
+                    if backward {
+                        g.packBwd[i] = packs.Len()
+                        packs.Push(g.ws32.PackTiles(m, false))
+                    }
+                }
+            }
+            case _ { }
+        }
+    }
+    g.tilePacks = packs.ToArray()
 }
 
 # x w^T + b over the last axis: x [..., in], w [out, in], b [out] or None
@@ -2160,7 +2195,7 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
     y := g.Value(Var(i))
     match nd.Kind {
         case Op.Linear(x, w, b) {
-            if g.Int8 { g.linearInt8(i, x, b) } else { ops.Linear<T, A>(ws, y, g.Value(x), g.Value(w), g.opt(b)) }
+            if g.Int8 { g.linearInt8(i, x, b) } else { ops.Linear<T, A>(ws, y, g.Value(x), g.Value(w), g.opt(b), g.tilePacks[g.packFwd[i] if g.packFwd.Len() > i else 0]) }
         }
         case Op.MatMul(a, b, ta, tb): ops.MatMul<T, A>(ws, y, g.Value(a), ta, g.Value(b), tb)
         case Op.Add(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(1.0))
@@ -2395,7 +2430,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             aw := g.acc(w)
             db := g.gradOf(b)
             ab := g.acc(b)
-            ops.LinearBackward<T, A>(ws, dy, g.Value(x), g.Value(w), dx, ax, dw, aw, db, ab)
+            ops.LinearBackward<T, A>(ws, dy, g.Value(x), g.Value(w), dx, ax, dw, aw, db, ab, g.tilePacks[g.packBwd[i] if g.packBwd.Len() > i else 0])
         }
         case Op.MatMul(a, b, ta, tb) {
             da := g.gradOf(a)

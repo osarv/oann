@@ -1,0 +1,29 @@
+# GMAC/s of a training-shaped BF16 Linear (1024 x 1024 by 1024 x 3072), Gemm against GemmTilePacked (B packed
+# ahead), one and two threads, both transposes of B. olang build -output build/tilepacked bench/tilepacked.olang
+import "../kernels/gemm"
+import "../kernels/mat"
+import "std/time"
+fn main() {
+    m, k, n := 1024, 1024, 3072
+    a := Array<BF16>(m * k, BF16(0.5))
+    b := Array<BF16>(n * k, BF16(0.25))
+    c := Array<BF16>(m * n, BF16(0.0))
+    for th in Array<I64>[1, 2] {
+        ws := gemm.Workspace<F32>(th, 3072)
+        am := mat.Mat<BF16>(a, 0, m, k, k)
+        cm := mat.Mat<BF16>(c, 0, m, n, n)
+        for tb in Array<Bool>[true, false] {
+            bm := mat.Mat<BF16>(b, 0, n, k, k) if tb else mat.Mat<BF16>(b, 0, k, n, n)
+            p := ws.PackTiles(bm, tb)
+            gemm.Gemm(ws, cm, am, false, bm, tb)
+            t0 := time.Now()
+            for _ in range 5: gemm.Gemm(ws, cm, am, false, bm, tb)
+            d1 := time.Since(t0)
+            t1 := time.Now()
+            for _ in range 5: gemm.GemmTilePacked(ws, cm, am, bm, tb, p)
+            d2 := time.Since(t1)
+            f := 5.0 * F64(m * n * k)
+            Println("threads " + $th + " tb " + $tb + ": Gemm " + $(f / F64(d1)) + " GMAC/s, packed ahead " + $(f / F64(d2)) + " GMAC/s")
+        }
+    }
+}

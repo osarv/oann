@@ -101,20 +101,21 @@ fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A) {
 # ---- products ----
 
 # y = x w^T + b over the last axis: x [..., in], w [out, in], b [out] or empty. An F32 bias is added in the product's
-# epilogue, as each block is summed; another type's after it
-fn Linear<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>, w tensor.Tensor<S>, b tensor.Tensor<S>) {
+# epilogue, as each block is summed; another type's after it. p: w^T packed ahead for the tile path (Graph's
+# PackConstants), or an empty TilePacked
+fn Linear<S, A>(ws mut gemm.Workspace<A>&, y mut tensor.Tensor<S>&, x tensor.Tensor<S>, w tensor.Tensor<S>, b tensor.Tensor<S>, p gemm.TilePacked&) {
     ym, xm, wm := rows(y), rows(x), rows(w)
     if b.Count() == 0 {
-        gemm.Gemm(ws, ym, xm, false, wm, true)
+        gemm.GemmTilePacked(ws, ym, xm, wm, true, p)
         return
     }
     match S {
         case F32 {
             bias := gemm.Epilogue.Bias(flat(b))
-            gemm.Gemm(ws, ym, xm, false, wm, true, 1.0, 0.0, bias)
+            gemm.GemmTilePacked(ws, ym, xm, wm, true, p, 1.0, 0.0, bias)
         }
         case _ {
-            gemm.Gemm(ws, ym, xm, false, wm, true)
+            gemm.GemmTilePacked(ws, ym, xm, wm, true, p)
             addBias<S, A>(ym, flat(b))
         }
     }
@@ -128,12 +129,12 @@ fn addBias<S, A>(y mut mat.Mat<S>&, b Array<S>&) {
     }
 }
 
-# dx (+)= dy w, dw (+)= dy^T x, db (+)= the column sums of dy
-fn LinearBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor.Tensor<S>, w tensor.Tensor<S>, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool) {
+# dx (+)= dy w, dw (+)= dy^T x, db (+)= the column sums of dy. p: w packed ahead for the tile path, or empty
+fn LinearBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor.Tensor<S>, w tensor.Tensor<S>, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, db mut tensor.Tensor<S>&, addB Bool, p gemm.TilePacked&) {
     g, xm, wm := rows(dy), rows(x), rows(w)
     if Wanted(dx) {
         d := rows(dx)
-        gemm.Gemm(ws, d, g, false, wm, false, A(1.0), betaOf<A>(addX))
+        gemm.GemmTilePacked(ws, d, g, wm, false, p, A(1.0), betaOf<A>(addX))
     }
     if Wanted(dw) {
         d := rows(dw)

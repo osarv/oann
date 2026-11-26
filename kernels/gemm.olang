@@ -111,9 +111,9 @@ type Workspace<A> struct(threads I64, dim I64 = 0, wide I64 = 0) {
     corr mut Array<I32>& = Array<I32>(0)        # GemmI8's zero-point corrections
     Tile Bool = TargetHasTileDot and accF32(A(0))   # BF16 x BF16 products into F32 by AMX tiles (tile.AddDot) here
     Pairs Bool = pairDotPays and not Tile and accF32(A(0))   # else by the BF16 pair dot, where it beats widening
-    ta mut Array<BF16>& = Array<BF16>(amxRows * roundUp(dim, 32) if Tile or Pairs else 0)   # the BF16 block of op(A)
-    tb mut Array<BF16>& = Array<BF16>(amxCols * roundUp(dim, 32) if Tile or Pairs else 0)   # its block of op(B), in pairs
-    tc mut Array<F32>& = Array<F32>(amxRows * amxCols if Tile or Pairs else 0)             # its block of the result
+    ta mut Array<BF16>& = Array<BF16>(Threads * amxRows * roundUp(dim, 32) if Tile or Pairs else 0)   # the BF16 block of op(A), one per task
+    tb mut Array<BF16>& = Array<BF16>(Threads * amxCols * roundUp(dim, 32) if Tile or Pairs else 0)   # its block of op(B), in pairs
+    tc mut Array<F32>& = Array<F32>(Threads * amxRows * amxCols if Tile or Pairs else 0)             # its block of the result
 }
 
 # an accumulator of F32: the tile path's (its products sum in F32)
@@ -134,9 +134,9 @@ fn (ws mut Workspace<A>&) Reserve(dim I64, wide I64 = 0) {
     if ws.b.Len() < roomB(ws.Threads, dim, z): ws.b = Array<A>(roomB(ws.Threads, dim, z))
     if ws.c.Len() < wide: ws.c = Array<A>(wide)
     if not ws.Tile and not ws.Pairs: return
-    if ws.ta.Len() < amxRows * roundUp(dim, 32): ws.ta = Array<BF16>(amxRows * roundUp(dim, 32))
-    if ws.tb.Len() < amxCols * roundUp(dim, 32): ws.tb = Array<BF16>(amxCols * roundUp(dim, 32))
-    if ws.tc.Len() < amxRows * amxCols: ws.tc = Array<F32>(amxRows * amxCols)
+    if ws.ta.Len() < ws.Threads * amxRows * roundUp(dim, 32): ws.ta = Array<BF16>(ws.Threads * amxRows * roundUp(dim, 32))
+    if ws.tb.Len() < ws.Threads * amxCols * roundUp(dim, 32): ws.tb = Array<BF16>(ws.Threads * amxCols * roundUp(dim, 32))
+    if ws.tc.Len() < ws.Threads * amxRows * amxCols: ws.tc = Array<F32>(ws.Threads * amxRows * amxCols)
 }
 
 # the panels' room for products of every size up to dim on threads tasks: op(A)'s, a block of tile rows by a block
@@ -235,7 +235,8 @@ fn Gemm<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&,
     ob := operand<SB>.of(b)
     cd := c.Data[c.Off:]
     if k > 0 and ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
-        tileProduct(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
+        if ta: tileProduct(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
+        else: tileTasks(ws, m, n, k, oa, ob, tb, ws.tb, 0, false, alpha, beta, cd, c.Ld)
         finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
         return
     }
@@ -343,6 +344,7 @@ assert not GemmBatch<F32, F32, F32, F32>.Allocates, "a batch of products allocat
 assert not Gemv<F32, F32>.Allocates, "a matrix-vector product allocates"
 assert not GemmPacked<F32, F32, F32>.Allocates, "a product of B packed ahead allocates"
 assert not GemmI8.Allocates, "an INT8 product allocates"
+assert not GemmTilePacked<BF16, BF16, BF16, F32>.Allocates, "a product of B packed ahead for the tile path allocates"
 
 # ---- the operands as packing reads them ----
 
@@ -1104,6 +1106,113 @@ fn tileBlocks<SL, SR, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, l operand
             else if result: tileStoreLower(ws.tc, wp, h, w, alpha, beta, c, i0, j0, ldc, diag)
             else: tileStore(ws.tc, wp, h, w, alpha, beta, c, i0 * ldc + j0, ldc)
         }
+    }
+}
+
+# op(B) packed ahead for the tile path: every block of amxCols columns in the pairs (AMX) or strips (the pair dot)
+# tileBlocks packs per product, here once - a layer's constant weights over a training run. Block j0 starts at Kp j0.
+# Pack again whenever B changes; GemmTilePacked falls back to Gemm where the tile path is not taken
+type TilePacked struct(k I64, n I64) {
+    K I64 = k
+    N I64 = n
+    Kp I64 = roundUp(k, 32)
+    Strips Bool = false
+    Data mut Array<BF16>& = Array<BF16>(roundUp(k, 32) * roundUp(n, 16))
+}
+
+# op(b) (k x n: b, or b's transpose where tb) packed for ws's tile path
+fn (ws Workspace<A>&) PackTiles<SB>(b mat.Mat<SB>&, tb Bool) TilePacked {
+    k I64 = b.Rows if not tb else b.Cols
+    n I64 = b.Cols if not tb else b.Rows
+    p := TilePacked(k, n)
+    p.Strips = not ws.Tile
+    ob := operand<SB>.of(b)
+    for j0 in range 0, n, amxCols {
+        w := lesser(amxCols, n - j0)
+        dst := p.Data[p.Kp * j0:]
+        if p.Strips: packStrips(dst, ob, tb, k, p.Kp, j0, w, roundUp(w, 16))
+        else: packPairs(dst, ob, tb, k, p.Kp, j0, w, roundUp(w, 16))
+    }
+    return p
+}
+
+# c = alpha a op(b) + beta c, then the epilogue, with op(b) packed ahead in p where the tile path takes the product
+# (p made by this workspace's PackTiles, of the same k and n); else Gemm. The same sums as Gemm's tile path
+fn GemmTilePacked<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&, b mat.Mat<SB>&, tb Bool, p TilePacked&, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
+    m, n, k := c.Rows, c.Cols, a.Cols
+    if m > 0 and n > 0 and k > 0 and p.N == n and p.K == k and p.Strips == not ws.Tile and ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
+        cd := c.Data[c.Off:]
+        tileTasks(ws, m, n, k, operand<SA>.of(a), operand<SB>.of(b), tb, p.Data, p.Kp, true, alpha, beta, cd, c.Ld)
+        finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
+        return
+    }
+    Gemm(ws, c, a, false, b, tb, alpha, beta, epi)
+}
+
+# a op(b) by the tile path, its blocks (amxCols columns by amxRows rows, column-major) over up to ws.Threads tasks,
+# each with its own blocks of the workspace; op(b) read from pd (a TilePacked's Data, depth pkp) where pre, else
+# packed per block
+fn tileTasks<SA, SB, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, a operand<SA>&, b operand<SB>&, tb Bool, pd Array<BF16>&, pkp I64, pre Bool, alpha A, beta A, c mut Array<S>&, ldc I64) {
+    kp := roundUp(k, 32)
+    nb, mb := (n + amxCols - 1) / amxCols, (m + amxRows - 1) / amxRows
+    units := nb * mb
+    tasks I64 = lesser(lesser(ws.Threads, units), m * n * k / madds).Max(1)
+    tasks = lesser(tasks, ws.ta.Len() / (amxRows * kp))
+    tasks = lesser(tasks, ws.tb.Len() / (amxCols * kp))
+    tasks = lesser(tasks, ws.tc.Len() / (amxRows * amxCols)).Max(1)
+    run := tileRun<SA, SB, S, A>(a, b, tb, pd, pkp, pre, m, n, k, alpha, beta, c, ldc, ws.Tile, mb)
+    if tasks == 1 {
+        run.go(0, units, ws.ta, ws.tb, ws.tc)
+        return
+    }
+    sa, sb, sc := amxRows * kp, amxCols * kp, amxRows * amxCols
+    share := (units + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo I64 = t * share
+            hi I64 = lesser(units, lo + share)
+            if lo < hi: spawn run.go(lo, hi, ws.ta[t * sa:(t + 1) * sa], ws.tb[t * sb:(t + 1) * sb], ws.tc[t * sc:(t + 1) * sc])
+        }
+    }
+}
+
+type tileRun<SA, SB, S, A> struct(a operand<SA>, b operand<SB>, tb Bool, pd Array<BF16>&, pkp I64, pre Bool, m I64, n I64, k I64, al A, be A, c mut Array<S>&, ldc I64, amx Bool, mb I64) {
+    a
+    b
+    tb
+    pd
+    pkp
+    pre
+    m
+    n
+    k
+    al
+    be
+    c
+    ldc
+    amx
+    mb
+}
+
+# blocks lo .. hi (column block u / mb, row block u % mb) into c, with these blocks of the workspace
+fn (r tileRun<SA, SB, S, A>&) go(lo I64, hi I64, ta mut Array<BF16>&, tb mut Array<BF16>&, tc mut Array<F32>&) {
+    kp := roundUp(r.k, 32)
+    have I64 = -1
+    for u in range lo, hi {
+        jb, ib := u / r.mb, u % r.mb
+        j0, i0 := jb * amxCols, ib * amxRows
+        w, h := lesser(amxCols, r.n - j0), lesser(amxRows, r.m - i0)
+        wp, hp := roundUp(w, 16), roundUp(h, 16)
+        if not r.pre and have != jb {
+            if r.amx: packPairs(tb, r.b, r.tb, r.k, kp, j0, w, wp)
+            else: packStrips(tb, r.b, r.tb, r.k, kp, j0, w, wp)
+            have = jb
+        }
+        bb := r.pd[r.pkp * j0:] if r.pre else tb
+        packRows(ta, r.a, false, r.k, kp, i0, h, hp)
+        if r.amx: addTiles(tc, hp, wp, ta, kp, bb)
+        else: pairBlock(tc, hp, wp, ta, kp, bb)
+        tileStore(tc, wp, h, w, r.al, r.be, r.c, i0 * r.ldc + j0, r.ldc)
     }
 }
 
@@ -2775,6 +2884,39 @@ test GemmBatch "BF16 batches by the tile path and by the pair dot match the pack
                 GemmBatch(w2, c2, aq, ta, bk, tb, F32(0.5), F32(1.0), tri)
                 for i in range p1.Len(): assert (F64(p1[i]) - F64(p2[i])).Abs() < 1e-3, $form + " " + $pairs + " " + $ta + " " + $tb + " " + $i
             }
+        }
+    }
+}
+
+test GemmTilePacked "B packed ahead for the tile path, over four tasks, matches the packed path: both transposes of b, AMX and the pair dot, blocks past amxRows and amxCols, a bias" {
+    r := rand.Rand(95)
+    m, n, k := 600, 1100, 200
+    for run in range 4 {
+        pairs, tb := run / 2 == 1, run % 2 == 1
+        a := Array<BF16>(m * k)
+        b := Array<BF16>(k * n)
+        for i in range a.Len(): a[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
+        for i in range b.Len(): b[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
+        am := mat.Mat<BF16>(a, 0, m, k, k)
+        bm := mat.Mat<BF16>(b, 0, n, k, k) if tb else mat.Mat<BF16>(b, 0, k, n, n)
+        bias := Array<F32>(n)
+        for j in range n: bias[j] = F32(j) * 0.01
+        c1, c2, c3 := Array<F32>(m * n, 0.5), Array<F32>(m * n, 0.5), Array<F32>(m * n, 0.5)
+        w1 := Workspace<F32>(4, 0)
+        w1.Tile = w1.Tile and not pairs
+        w1.Pairs = pairs
+        w1.Reserve(1100)
+        w2 := Workspace<F32>(1, 1100)
+        w2.Tile = false
+        w2.Pairs = false
+        p := w1.PackTiles(bm, tb)
+        c1m, c2m, c3m := mat.Mat<F32>(c1, 0, m, n, n), mat.Mat<F32>(c2, 0, m, n, n), mat.Mat<F32>(c3, 0, m, n, n)
+        GemmTilePacked(w1, c1m, am, bm, tb, p, F32(0.5), F32(2.0), Epilogue.Bias(bias))
+        Gemm(w1, c3m, am, false, bm, tb, F32(0.5), F32(2.0), Epilogue.Bias(bias))
+        Gemm(w2, c2m, am, false, bm, tb, F32(0.5), F32(2.0), Epilogue.Bias(bias))
+        for i in range m * n {
+            assert (F64(c1[i]) - F64(c2[i])).Abs() < 1e-3, "packed ahead " + $pairs + " " + $tb + " " + $i
+            assert c1[i] == c3[i], "packed per product " + $pairs + " " + $tb + " " + $i
         }
     }
 }
