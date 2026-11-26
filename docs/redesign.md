@@ -10,7 +10,7 @@ N-d tensors, kernels in olang, no BLAS. General first: autodiff, transformers, s
 training, sharding or serving. Rounds: 1 = everything compiles on olang v1 (done, a084560, 173 tests); 2 = measure
 (branch wt-oannmeasure); 3 = this plan.
 
-Sketches are written in olang as it is about to be: the null test is `x == null` / `x != null`, text joins with `+`
+Sketches are written in olang as it is about to be: the null test is `x is null` / `x is not null`, text joins with `+`
 (`"n = " + $n`). Signatures only; names are binding unless a work package finds a better one and records why.
 
 ## 1. The architecture

@@ -17,17 +17,17 @@ st := model.State.Fresh(model.Spec.Uniform(vocab, 64, 64, 2, 2), seed)
 net := model.Net.Build(st, batch)
 o := net.AdamW(st)
 ...train...
-st = net.CaptureAdamW(st, o)
+st ~ net.CaptureAdamW(st, o)
 try st.Save("run/small.safetensors")
 
-st = try model.State.Open("run/small.safetensors")
-st = ops.Deepen(st, 1, block, seed)           # each keeps the function
-st = ops.WidenFfn(st, 0, 512, seed)
-st = ops.AddHeads(st, 0, 2, seed)
-st = ops.WidenDim(st, 128, seed)
+st ~ try model.State.Open("run/small.safetensors")
+st ~ ops.Deepen(st, 1, block, seed)           # each keeps the function
+st ~ ops.WidenFfn(st, 0, 512, seed)
+st ~ ops.AddHeads(st, 0, 2, seed)
+st ~ ops.WidenDim(st, 128, seed)
 st.Warm = st.Step                             # rate := model.Rewarm(schedule, st.Warm, 50)
-net = model.Net.Build(st, batch)
-o = net.AdamW(st)                             # moments carried; new parts start at zero
+net ~ model.Net.Build(st, batch)
+o ~ net.AdamW(st)                             # moments carried; new parts start at zero
 ```
 
 ## The model

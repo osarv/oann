@@ -7,7 +7,7 @@ Branch `pre-c3` is the last commit with them (`git show pre-c3:linalg.olang`).
 
 - Layers: `tensor`, `kernels/`, `ad/`, `dyn/`, `nn/`, `models/`, `data/`, `io/`, `board/`, `tools/` (README.md).
 - `make test OLANG=path/to/olang` runs every module's tests; the programs are the makefile's other targets.
-- olang: a current master compiler (text joins `+`, the null test `== null`, a catch's `default` taking the whole
+- olang: a current master compiler (text joins `+`, the null test `is null`, a catch's `default` taking the whole
   expression). No migration step is outstanding; `olang fix .` has nothing left to do here.
 
 ## Removed at C3
