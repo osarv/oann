@@ -227,16 +227,63 @@ fn MatMulBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, a tensor
 
 # ---- activations ----
 
-fn Act<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, a mat.Act) { elem.Act(flat(y), flat(x), a) }
+# an elementwise pass over n elements split into this many tasks: one where it is too small to pay a spawn
+fn parts(threads I64, n I64) I64 { return 1 if n < actSplitFrom else (threads if threads > 1 else 1) }
+actSplitFrom I64 = 1 << 16
+
+fn Act<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, a mat.Act, threads I64 = 1) {
+    dst, src := flat(y), flat(x)
+    n := src.Len()
+    k := parts(threads, n)
+    if k == 1 {
+        elem.Act(dst, src, a)
+        return
+    }
+    share := (n + k - 1) / k
+    join {
+        for t in range k {
+            lo, hi := t * share, lesserOf(n, (t + 1) * share)
+            if lo < hi: spawn elem.Act(dst[lo:hi], src[lo:hi], a)
+        }
+    }
+}
+
+fn lesserOf(a I64, b I64) I64 { return a if a < b else b }
 
 # dx (+)= dy act'(x)
-fn ActBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, a mat.Act, dx mut tensor.Tensor<S>&, add Bool) {
-    elem.ActGrad(flat(dx), flat(dy), flat(x), a, add)
+fn ActBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, a mat.Act, dx mut tensor.Tensor<S>&, add Bool, threads I64 = 1) {
+    d, g, v := flat(dx), flat(dy), flat(x)
+    n := v.Len()
+    k := parts(threads, n)
+    if k == 1 {
+        elem.ActGrad(d, g, v, a, add)
+        return
+    }
+    share := (n + k - 1) / k
+    join {
+        for t in range k {
+            lo, hi := t * share, lesserOf(n, (t + 1) * share)
+            if lo < hi: spawn elem.ActGrad(d[lo:hi], g[lo:hi], v[lo:hi], a, add)
+        }
+    }
 }
 
 # dx (+)= dy act'(x), read from y = act(x) - for an activation whose slope is (elem.FromOutput)
-fn ActBackwardOut<S>(dy tensor.Tensor<S>, y tensor.Tensor<S>, a mat.Act, dx mut tensor.Tensor<S>&, add Bool) {
-    elem.ActGradOut(flat(dx), flat(dy), flat(y), a, add)
+fn ActBackwardOut<S>(dy tensor.Tensor<S>, y tensor.Tensor<S>, a mat.Act, dx mut tensor.Tensor<S>&, add Bool, threads I64 = 1) {
+    d, g, v := flat(dx), flat(dy), flat(y)
+    n := v.Len()
+    k := parts(threads, n)
+    if k == 1 {
+        elem.ActGradOut(d, g, v, a, add)
+        return
+    }
+    share := (n + k - 1) / k
+    join {
+        for t in range k {
+            lo, hi := t * share, lesserOf(n, (t + 1) * share)
+            if lo < hi: spawn elem.ActGradOut(d[lo:hi], g[lo:hi], v[lo:hi], a, add)
+        }
+    }
 }
 
 # whether an activation's backward reads its output rather than its input
@@ -321,10 +368,21 @@ fn LogSoftmaxBackward<S, A>(dy tensor.Tensor<S>, y tensor.Tensor<S>, dx mut tens
 # the mean over the rows whose class is not negative of -log softmax(logits)[class] - read off the row's softmax, or
 # where that underflows the log-sum-exp less the class's logit, so nothing takes a log of zero - in F64; probs keeps
 # each row's softmax for the backward
-fn CrossEntropy<S, A>(logits tensor.Tensor<S>, classes Array<I32>&, probs mut tensor.Tensor<S>&) F64 {
+fn CrossEntropy<S, A>(logits tensor.Tensor<S>, classes Array<I32>&, probs mut tensor.Tensor<S>&, threads I64 = 1) F64 {
     z := rows(logits)
     p := rows(probs)
-    elem.RowSoftmax(p, z, S(1.0))
+    k := parts(threads, z.Rows * z.Cols).Min(z.Rows).Max(1)
+    if k == 1 {
+        elem.RowSoftmax(p, z, S(1.0))
+    } else {
+        share := (z.Rows + k - 1) / k
+        join {
+            for t in range k {
+                lo, hi := t * share, lesserOf(z.Rows, (t + 1) * share)
+                if lo < hi: spawn softmaxRows<S, A>(p.Data, p.Off + lo * p.Ld, p.Ld, z.Data, z.Off + lo * z.Ld, z.Ld, hi - lo, z.Cols)
+            }
+        }
+    }
     total F64 = 0.0
     counted I64 = 0
     for r in range z.Rows {
@@ -336,6 +394,11 @@ fn CrossEntropy<S, A>(logits tensor.Tensor<S>, classes Array<I32>&, probs mut te
         counted++
     }
     return total / F64(counted) if counted > 0 else 0.0
+}
+
+# rows of src's softmax into dst (a task's share of CrossEntropy's)
+fn softmaxRows<S, A>(dst mut Array<S>&, d0 I64, dld I64, src Array<S>&, s0 I64, sld I64, nrows I64, cols I64) {
+    for r in range nrows: elem.SoftmaxRunTo<S, A>(dst, d0 + r * dld, src, s0 + r * sld, cols, A(1.0))
 }
 
 # log(sum exp x) over a run, its largest element taken out first
