@@ -2,7 +2,9 @@
 // softmax and log-sum-exp, the norms, the losses, lookups, sums and AdamW, each the CPU's (kernels/elem, ad/ops) over
 // the graph's arena. CUDA C text compiled by NVRTC when a graph is planned on the GPU (ad/mirror.olang), after elem.cu's
 // text (kern.olang's prelude: oann_exp, oann_tanh, oann_relu) and these #defines:
-//   real      float or double, the graph's element type (typedef)
+//   real      float or double, what a kernel computes in (typedef)
+//   store     the arena's element: real itself, or oann_bf16 for a BF16 graph (read widened to real, written rounded
+//             to nearest even, as the CPU's BF16 graph does)
 //
 // Every operand is a dense row-major run (the graph's invariant for what a kernel reads: rows of `cols` elements one
 // after another), so a kernel takes an address and counts, never a stride. Counts and flags are 64-bit; reals are
@@ -115,26 +117,26 @@ __device__ __forceinline__ real oann_slope_out(real y, int a) {
     }
 }
 
-extern "C" __global__ void oann_ad_act(real *y, const real *x, long long n, long long a) {
+extern "C" __global__ void oann_ad_act(store *y, const store *x, long long n, long long a) {
     OANN_LOOP(i, n) y[i] = oann_act(x[i], (int)a);
 }
 
 // dx (+)= dy act'(x), the slope read from x (fromOut 0) or from y = act(x) (fromOut 1, Relu Sigmoid Tanh)
-extern "C" __global__ void oann_ad_act_grad(real *dx, const real *dy, const real *src, long long n, long long a, long long fromOut, long long add) {
+extern "C" __global__ void oann_ad_act_grad(store *dx, const store *dy, const store *src, long long n, long long a, long long fromOut, long long add) {
     OANN_LOOP(i, n) {
         real s = fromOut ? oann_slope_out(src[i], (int)a) : oann_slope(src[i], (int)a);
         real v;
-        if (fromOut && a == 0) v = src[i] > (real)0 ? dy[i] : (real)0;
+        if (fromOut && a == 0) v = src[i] > (real)0 ? (real)dy[i] : (real)0;
         else v = dy[i] * s;
         dx[i] = add ? dx[i] + v : v;
     }
 }
 
-extern "C" __global__ void oann_ad_leaky(real *y, const real *x, long long n, real slope) {
+extern "C" __global__ void oann_ad_leaky(store *y, const store *x, long long n, real slope) {
     OANN_LOOP(i, n) { real v = x[i]; y[i] = v > (real)0 ? v : slope * v; }
 }
 
-extern "C" __global__ void oann_ad_leaky_grad(real *dx, const real *dy, const real *x, long long n, real slope, long long add) {
+extern "C" __global__ void oann_ad_leaky_grad(store *dx, const store *dy, const store *x, long long n, real slope, long long add) {
     OANN_LOOP(i, n) {
         real v = dy[i] * (x[i] > (real)0 ? (real)1.0 : slope);
         dx[i] = add ? dx[i] + v : v;
@@ -143,38 +145,38 @@ extern "C" __global__ void oann_ad_leaky_grad(real *dx, const real *dy, const re
 
 // ---- element-wise arithmetic ----
 
-extern "C" __global__ void oann_ad_fill(real *p, real v, long long n) { OANN_LOOP(i, n) p[i] = v; }
+extern "C" __global__ void oann_ad_fill(store *p, real v, long long n) { OANN_LOOP(i, n) p[i] = v; }
 
-extern "C" __global__ void oann_ad_copy(real *y, const real *x, long long n) { OANN_LOOP(i, n) y[i] = x[i]; }
+extern "C" __global__ void oann_ad_copy(store *y, const store *x, long long n) { OANN_LOOP(i, n) y[i] = x[i]; }
 
 // dx (+)= k dy
-extern "C" __global__ void oann_ad_put(real *dx, const real *dy, real k, long long n, long long add) {
+extern "C" __global__ void oann_ad_put(store *dx, const store *dy, real k, long long n, long long add) {
     OANN_LOOP(i, n) { real v = k * dy[i]; dx[i] = add ? dx[i] + v : v; }
 }
 
 // y = a + k b
-extern "C" __global__ void oann_ad_combine(real *y, const real *a, const real *b, real k, long long n) {
+extern "C" __global__ void oann_ad_combine(store *y, const store *a, const store *b, real k, long long n) {
     OANN_LOOP(i, n) y[i] = a[i] + k * b[i];
 }
 
-extern "C" __global__ void oann_ad_mul(real *y, const real *a, const real *b, long long n) { OANN_LOOP(i, n) y[i] = a[i] * b[i]; }
+extern "C" __global__ void oann_ad_mul(store *y, const store *a, const store *b, long long n) { OANN_LOOP(i, n) y[i] = a[i] * b[i]; }
 
 // dx (+)= dy b
-extern "C" __global__ void oann_ad_mul_grad(real *dx, const real *dy, const real *b, long long n, long long add) {
+extern "C" __global__ void oann_ad_mul_grad(store *dx, const store *dy, const store *b, long long n, long long add) {
     OANN_LOOP(i, n) { real v = (real)1.0 * dy[i] * b[i]; dx[i] = add ? dx[i] + v : v; }
 }
 
-extern "C" __global__ void oann_ad_scale(real *y, const real *x, real k, long long n) { OANN_LOOP(i, n) y[i] = k * x[i]; }
+extern "C" __global__ void oann_ad_scale(store *y, const store *x, real k, long long n) { OANN_LOOP(i, n) y[i] = k * x[i]; }
 
 // y[r, c] += b[c]: the bias after a product
-extern "C" __global__ void oann_ad_bias(real *y, const real *b, long long n, long long cols) {
+extern "C" __global__ void oann_ad_bias(store *y, const store *b, long long n, long long cols) {
     OANN_LOOP(i, n) y[i] = y[i] + b[i % cols];
 }
 
 // out[c] = the sum of column c over the rows (+ out[c] where add): a bias's gradient. GP7: a block of 1024 threads is 32
 // columns by 32 row lanes; lane l sums rows l, l + 32, ... in order, and the 32 partials are added in lane order - a fixed
 // order and no atomics (the one thread a column of GP6 took 35 us for 1024 rows of 128)
-extern "C" __global__ void oann_ad_colsum(real *out, const real *x, long long rows, long long cols, long long add) {
+extern "C" __global__ void oann_ad_colsum(store *out, const store *x, long long rows, long long cols, long long add) {
     __shared__ real part[32][33];
     int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
     long long c = (long long)blockIdx.x * 32 + tx;
@@ -214,14 +216,14 @@ __device__ __forceinline__ void oann_band(long long r, long long cols, long long
 
 // y's row r = the softmax of x's row r over its band (oann_band) and 0 outside it - attention's weights, causal, in a
 // sliding window or within packed documents, or a plain softmax's row (ctx 1, no flags)
-extern "C" __global__ void oann_ad_softmax(real *y, const real *x, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads) {
+extern "C" __global__ void oann_ad_softmax(store *y, const store *x, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads) {
     long long r = blockIdx.x;
-    const real *xr = x + r * cols;
-    real *yr = y + r * cols;
+    const store *xr = x + r * cols;
+    store *yr = y + r * cols;
     long long lo, last;
     oann_band(r, cols, ctx, causal, window, starts, heads, &lo, &last);
     real top = xr[lo];
-    for (long long j = lo + threadIdx.x; j < last; j += blockDim.x) top = xr[j] > top ? xr[j] : top;
+    for (long long j = lo + threadIdx.x; j < last; j += blockDim.x) top = xr[j] > top ? (real)xr[j] : top;
     top = oann_bmax(top);
     real s = (real)0;
     for (long long j = lo + threadIdx.x; j < last; j += blockDim.x) {
@@ -235,11 +237,11 @@ extern "C" __global__ void oann_ad_softmax(real *y, const real *x, long long col
 }
 
 // dx (+)= scale p (dy - <dy, p>) row by row over the band (zero outside it, where written); dx may be dy
-extern "C" __global__ void oann_ad_softmax_grad(real *dx, const real *dy, const real *p, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads, real scale, long long add) {
+extern "C" __global__ void oann_ad_softmax_grad(store *dx, const store *dy, const store *p, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads, real scale, long long add) {
     long long r = blockIdx.x;
-    const real *gr = dy + r * cols;
-    const real *pr = p + r * cols;
-    real *dr = dx + r * cols;
+    const store *gr = dy + r * cols;
+    const store *pr = p + r * cols;
+    store *dr = dx + r * cols;
     long long lo, last;
     oann_band(r, cols, ctx, causal, window, starts, heads, &lo, &last);
     real dot = (real)0;
@@ -253,9 +255,9 @@ extern "C" __global__ void oann_ad_softmax_grad(real *dx, const real *dy, const 
 }
 
 // the log-sum-exp of each row, its largest element taken out first
-__device__ __forceinline__ real oann_lse(const real *xr, long long cols) {
+__device__ __forceinline__ real oann_lse(const store *xr, long long cols) {
     real top = xr[0];
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) top = xr[j] > top ? xr[j] : top;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) top = xr[j] > top ? (real)xr[j] : top;
     top = oann_bmax(top);
     real s = (real)0;
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) s += oann_exp(xr[j] - top);
@@ -263,23 +265,23 @@ __device__ __forceinline__ real oann_lse(const real *xr, long long cols) {
     return top + log(s);
 }
 
-extern "C" __global__ void oann_ad_lse(real *out, const real *x, long long cols) {
+extern "C" __global__ void oann_ad_lse(store *out, const store *x, long long cols) {
     real v = oann_lse(x + (long long)blockIdx.x * cols, cols);
     if (threadIdx.x == 0) out[blockIdx.x] = v;
 }
 
-extern "C" __global__ void oann_ad_logsoftmax(real *y, const real *x, long long cols) {
-    const real *xr = x + (long long)blockIdx.x * cols;
-    real *yr = y + (long long)blockIdx.x * cols;
+extern "C" __global__ void oann_ad_logsoftmax(store *y, const store *x, long long cols) {
+    const store *xr = x + (long long)blockIdx.x * cols;
+    store *yr = y + (long long)blockIdx.x * cols;
     real l = oann_lse(xr, cols);
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) yr[j] = xr[j] - l;
 }
 
 // dx (+)= dy - exp(y) sum(dy)
-extern "C" __global__ void oann_ad_logsoftmax_grad(real *dx, const real *dy, const real *y, long long cols, long long add) {
-    const real *gr = dy + (long long)blockIdx.x * cols;
-    const real *yr = y + (long long)blockIdx.x * cols;
-    real *dr = dx + (long long)blockIdx.x * cols;
+extern "C" __global__ void oann_ad_logsoftmax_grad(store *dx, const store *dy, const store *y, long long cols, long long add) {
+    const store *gr = dy + (long long)blockIdx.x * cols;
+    const store *yr = y + (long long)blockIdx.x * cols;
+    store *dr = dx + (long long)blockIdx.x * cols;
     real total = (real)0;
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) total += gr[j];
     total = oann_bsum(total);
@@ -291,8 +293,8 @@ extern "C" __global__ void oann_ad_logsoftmax_grad(real *dx, const real *dy, con
 
 // ---- normalization over rows: stats = mean[rows], inv[rows] one after the other ----
 
-extern "C" __global__ void oann_ad_norm_stats(real *mean, real *inv, const real *x, long long cols, real eps, long long rms) {
-    const real *xr = x + (long long)blockIdx.x * cols;
+extern "C" __global__ void oann_ad_norm_stats(store *mean, store *inv, const store *x, long long cols, real eps, long long rms) {
+    const store *xr = x + (long long)blockIdx.x * cols;
     real n = (real)cols;
     real m = (real)0;
     if (!rms) {
@@ -310,7 +312,7 @@ extern "C" __global__ void oann_ad_norm_stats(real *mean, real *inv, const real 
 }
 
 // y = (x - mean) inv gain + bias (bias 0: none)
-extern "C" __global__ void oann_ad_norm_apply(real *y, const real *x, const real *mean, const real *inv, const real *gain, const real *bias, long long n, long long cols) {
+extern "C" __global__ void oann_ad_norm_apply(store *y, const store *x, const store *mean, const store *inv, const store *gain, const store *bias, long long n, long long cols) {
     OANN_LOOP(i, n) {
         long long r = i / cols, c = i % cols;
         real v = (x[i] - mean[r]) * inv[r] * gain[c];
@@ -319,11 +321,11 @@ extern "C" __global__ void oann_ad_norm_apply(real *y, const real *x, const real
 }
 
 // dx (+)= inv (g - mean(g) - xhat mean(g xhat)), g = dy gain (mean(g) left out where rms)
-extern "C" __global__ void oann_ad_norm_grad(real *dx, const real *dy, const real *x, const real *mean, const real *inv, const real *gain, long long cols, long long rms, long long add) {
+extern "C" __global__ void oann_ad_norm_grad(store *dx, const store *dy, const store *x, const store *mean, const store *inv, const store *gain, long long cols, long long rms, long long add) {
     long long r = blockIdx.x;
-    const real *gr = dy + r * cols;
-    const real *xr = x + r * cols;
-    real *dr = dx + r * cols;
+    const store *gr = dy + r * cols;
+    const store *xr = x + r * cols;
+    store *dr = dx + r * cols;
     real m = mean[r], k = inv[r], n = (real)cols;
     real sg = (real)0, sgx = (real)0;
     for (long long c = threadIdx.x; c < cols; c += blockDim.x) {
@@ -343,7 +345,7 @@ extern "C" __global__ void oann_ad_norm_grad(real *dx, const real *dy, const rea
 
 // dgain[c] (+)= sum over rows of dy xhat, dbias[c] (+)= sum of dy; either address 0 where not wanted. Tiled as colsum: 32
 // columns by 32 row lanes, the partials added in lane order
-extern "C" __global__ void oann_ad_norm_param_grad(real *dgain, real *dbias, const real *dy, const real *x, const real *mean, const real *inv, long long rows, long long cols, long long addG, long long addB) {
+extern "C" __global__ void oann_ad_norm_param_grad(store *dgain, store *dbias, const store *dy, const store *x, const store *mean, const store *inv, long long rows, long long cols, long long addG, long long addB) {
     __shared__ real pg[32][33];
     __shared__ real pb[32][33];
     int tx = threadIdx.x & 31, ty = threadIdx.x >> 5;
@@ -372,16 +374,16 @@ extern "C" __global__ void oann_ad_norm_param_grad(real *dgain, real *dbias, con
 
 // ---- lookups ----
 
-extern "C" __global__ void oann_ad_embed(real *y, const int *tokens, const real *table, long long n, long long cols) {
+extern "C" __global__ void oann_ad_embed(store *y, const int *tokens, const store *table, long long n, long long cols) {
     OANN_LOOP(i, n) y[i] = table[(long long)tokens[i / cols] * cols + i % cols];
 }
 
 // dtable (+)= the rows of dy added at their tokens' rows: one block a table row, the tokens in order, so every sum is
 // in the CPU's order (and the same every run)
-extern "C" __global__ void oann_ad_embed_grad(real *dtable, const real *dy, const int *tokens, long long rows, long long cols, long long add) {
+extern "C" __global__ void oann_ad_embed_grad(store *dtable, const store *dy, const int *tokens, long long rows, long long cols, long long add) {
     long long v = blockIdx.x;
     for (long long c = threadIdx.x; c < cols; c += blockDim.x) {
-        real s = add ? dtable[v * cols + c] : (real)0;
+        real s = add ? (real)dtable[v * cols + c] : (real)0;
         for (long long r = 0; r < rows; r++) {
             if (tokens[r] == v) s += dy[r * cols + c];
         }
@@ -390,7 +392,7 @@ extern "C" __global__ void oann_ad_embed_grad(real *dtable, const real *dy, cons
 }
 
 // y = x + the table's row (first + r % ctx) % trows
-extern "C" __global__ void oann_ad_positions(real *y, const real *x, const real *table, long long n, long long cols, long long ctx, long long first, long long trows) {
+extern "C" __global__ void oann_ad_positions(store *y, const store *x, const store *table, long long n, long long cols, long long ctx, long long first, long long trows) {
     OANN_LOOP(i, n) {
         long long r = i / cols, c = i % cols;
         y[i] = x[i] + table[((first + r % ctx) % trows) * cols + c];
@@ -398,10 +400,10 @@ extern "C" __global__ void oann_ad_positions(real *y, const real *x, const real 
 }
 
 // dtable (+)= dy summed over the sequences at each position's row: one thread a table element, in the CPU's order
-extern "C" __global__ void oann_ad_positions_grad(real *dtable, const real *dy, long long rows, long long cols, long long ctx, long long first, long long trows, long long add) {
+extern "C" __global__ void oann_ad_positions_grad(store *dtable, const store *dy, long long rows, long long cols, long long ctx, long long first, long long trows, long long add) {
     OANN_LOOP(i, trows * cols) {
         long long p = i / cols, c = i % cols;
-        real s = add ? dtable[i] : (real)0;
+        real s = add ? (real)dtable[i] : (real)0;
         long long t0 = ((p - first) % trows + trows) % trows;
         for (long long q = 0; q < rows / ctx; q++) {
             for (long long t = t0; t < ctx; t += trows) s += dy[(q * ctx + t) * cols + c];
@@ -413,8 +415,8 @@ extern "C" __global__ void oann_ad_positions_grad(real *dtable, const real *dy, 
 // ---- sums and losses ----
 
 // y[r] = k sum of row r (k = 1 / cols for the mean)
-extern "C" __global__ void oann_ad_sumlast(real *y, const real *x, long long cols, real k) {
-    const real *xr = x + (long long)blockIdx.x * cols;
+extern "C" __global__ void oann_ad_sumlast(store *y, const store *x, long long cols, real k) {
+    const store *xr = x + (long long)blockIdx.x * cols;
     real s = (real)0;
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) s += xr[j];
     s = oann_bsum(s);
@@ -422,18 +424,18 @@ extern "C" __global__ void oann_ad_sumlast(real *y, const real *x, long long col
 }
 
 // dx (+)= k dy[r] spread over row r
-extern "C" __global__ void oann_ad_sumlast_grad(real *dx, const real *dy, long long n, long long cols, real k, long long add) {
+extern "C" __global__ void oann_ad_sumlast_grad(store *dx, const store *dy, long long n, long long cols, real k, long long add) {
     OANN_LOOP(i, n) { real v = k * dy[i / cols]; dx[i] = add ? dx[i] + v : v; }
 }
 
 // cross entropy, the rows: probs' row r = softmax of the logits' row r; rowloss[r] = log-sum-exp - the class's logit
 // (0 for an ignored row)
-extern "C" __global__ void oann_ad_ce_rows(real *probs, double *rowloss, const real *z, const int *classes, long long cols) {
+extern "C" __global__ void oann_ad_ce_rows(store *probs, double *rowloss, const store *z, const int *classes, long long cols) {
     long long r = blockIdx.x;
-    const real *zr = z + r * cols;
-    real *pr = probs + r * cols;
+    const store *zr = z + r * cols;
+    store *pr = probs + r * cols;
     real top = zr[0];
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) top = zr[j] > top ? zr[j] : top;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) top = zr[j] > top ? (real)zr[j] : top;
     top = oann_bmax(top);
     real s = (real)0;
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
@@ -452,7 +454,7 @@ extern "C" __global__ void oann_ad_ce_rows(real *probs, double *rowloss, const r
 
 // the loss: the mean of rowloss over the rows counted, in double, by one block in a fixed order; stats[0] = the loss,
 // stats[1] = the rows counted; value = the loss in real
-extern "C" __global__ void oann_ad_ce_total(double *stats, real *value, const double *rowloss, const int *classes, long long rows) {
+extern "C" __global__ void oann_ad_ce_total(double *stats, store *value, const double *rowloss, const int *classes, long long rows) {
     double s = 0.0;
     long long counted = 0;
     for (long long r = threadIdx.x; r < rows; r += blockDim.x) {
@@ -469,7 +471,7 @@ extern "C" __global__ void oann_ad_ce_total(double *stats, real *value, const do
 }
 
 // dz (+)= dloss (probs - onehot(class)) / counted, zero for an ignored row; dloss = dy[0] (a device word)
-extern "C" __global__ void oann_ad_ce_grad(real *dz, const real *probs, const int *classes, const real *dloss, const double *stats, long long n, long long cols, long long add) {
+extern "C" __global__ void oann_ad_ce_grad(store *dz, const store *probs, const int *classes, const store *dloss, const double *stats, long long n, long long cols, long long add) {
     real counted = (real)stats[1];
     real k = dloss[0] / (counted > (real)0 ? counted : (real)1);
     OANN_LOOP(i, n) {
@@ -481,7 +483,7 @@ extern "C" __global__ void oann_ad_ce_grad(real *dz, const real *probs, const in
 }
 
 // the mean of (a - b)^2 in double by one block; stats[0] = it; value = it in real
-extern "C" __global__ void oann_ad_mse(double *stats, real *value, const real *a, const real *b, long long n) {
+extern "C" __global__ void oann_ad_mse(double *stats, store *value, const store *a, const store *b, long long n) {
     double s = 0.0;
     for (long long i = threadIdx.x; i < n; i += blockDim.x) {
         double d = (double)(a[i] - b[i]);
@@ -496,7 +498,7 @@ extern "C" __global__ void oann_ad_mse(double *stats, real *value, const real *a
 }
 
 // da (+)= 2 dloss (a - b) / n, db (+)= the negative; an address of 0 is a gradient not wanted
-extern "C" __global__ void oann_ad_mse_grad(real *da, real *db, const real *a, const real *b, const real *dloss, long long n, long long addA, long long addB) {
+extern "C" __global__ void oann_ad_mse_grad(store *da, store *db, const store *a, const store *b, const store *dloss, long long n, long long addA, long long addB) {
     real k = (real)2.0 * dloss[0] / (real)n;
     OANN_LOOP(i, n) {
         if (da) { real v = k * (a[i] - b[i]); da[i] = addA ? da[i] + v : v; }
@@ -507,7 +509,7 @@ extern "C" __global__ void oann_ad_mse_grad(real *da, real *db, const real *a, c
 // ---- the optimizer ----
 
 // the sum of the squares of n elements, in double, by one block in a fixed order, into *out
-extern "C" __global__ void oann_ad_sumsq(double *out, const real *x, long long n) {
+extern "C" __global__ void oann_ad_sumsq(double *out, const store *x, long long n) {
     double s = 0.0;
     for (long long i = threadIdx.x; i < n; i += blockDim.x) s += (double)x[i] * (double)x[i];
     s = oann_bsum(s);
@@ -515,7 +517,7 @@ extern "C" __global__ void oann_ad_sumsq(double *out, const real *x, long long n
 }
 
 // x *= max / (norm + 1e-6) where norm = sqrt(*sumsq) is above max: optim.ClipNorm's rule on the device
-extern "C" __global__ void oann_ad_clip(real *x, const double *sumsq, long long n, double max) {
+extern "C" __global__ void oann_ad_clip(store *x, const double *sumsq, long long n, double max) {
     double norm = sqrt(*sumsq);
     if (!(norm > max)) return;
     real k = (real)(max / (norm + 1e-6));
@@ -523,9 +525,11 @@ extern "C" __global__ void oann_ad_clip(real *x, const double *sumsq, long long 
 }
 
 // nn/optim's AdamW step over n parameters, adamRun operation for operation, the decay only where decays[k] is not 0
-// (decays 0: every parameter decays) - bit for bit with the CPU's
-extern "C" __global__ void oann_ad_adamw(real *p, const real *g, real *m, real *v, const unsigned char *decays, long long n, real b1, real b2, real c1, real c2, const real *hp, real eps) {
-    real keep = hp[0], step = hp[1], root = hp[2];   // the step's scalars, which change each step: read from the device so a CUDA graph replays them
+// (decays 0: every parameter decays) - bit for bit with the CPU's. w the weights stepped in real: the parameters
+// themselves, or a BF16 graph's F32 masters, each then rounded into p (p == w: nothing to round)
+extern "C" __global__ void oann_ad_adamw(real *w, store *p, const store *g, real *m, real *v, const unsigned char *decays, long long n, real b1, real b2, real c1, real c2, const double *hp, real eps) {
+    real keep = (real)hp[0], step = (real)hp[1], root = (real)hp[2];   // the step's scalars, which change each step: read from the device so a CUDA graph replays them
+    bool copy = (void *)p != (void *)w;
     OANN_LOOP(k, n) {
         real gk = g[k];
         real mk = b1 * m[k] + c1 * gk;
@@ -533,7 +537,9 @@ extern "C" __global__ void oann_ad_adamw(real *p, const real *g, real *m, real *
         m[k] = mk;
         v[k] = vk;
         real kp = (decays == 0 || decays[k]) ? keep : (real)1.0;
-        p[k] = kp * p[k] - step * mk / (sqrt(vk) * root + eps);
+        real wk = kp * w[k] - step * mk / (sqrt(vk) * root + eps);
+        w[k] = wk;
+        if (copy) p[k] = wk;
     }
 }
 
@@ -544,7 +550,7 @@ extern "C" __global__ void oann_ad_adamw(real *p, const real *g, real *m, real *
 // [wlo, whi): a coordinate there is read at c - wlo, and outside it nothing is read (y written 0, or left) - a slice's
 // gradient into its base's. A contiguous copy of a view (wa -1, add 0) and a permutation's gradient (the strides
 // inverted) are the same kernel
-extern "C" __global__ void oann_ad_gather(real *y, const real *x, long long n, long long add, long long rank, long long wa, long long wlo, long long whi,
+extern "C" __global__ void oann_ad_gather(store *y, const store *x, long long n, long long add, long long rank, long long wa, long long wlo, long long whi,
     long long d1, long long d2, long long d3, long long d4, long long d5,
     long long s0, long long s1, long long s2, long long s3, long long s4, long long s5) {
     const long long d[6] = {1, d1, d2, d3, d4, d5};
@@ -561,7 +567,7 @@ extern "C" __global__ void oann_ad_gather(real *y, const real *x, long long n, l
             }
             off += c * s[k];
         }
-        if (in) y[i] = add ? y[i] + x[off] : x[off];
+        if (in) y[i] = add ? (real)y[i] + (real)x[off] : (real)x[off];
         else if (!add) y[i] = (real)0;
     }
 }
@@ -569,7 +575,7 @@ extern "C" __global__ void oann_ad_gather(real *y, const real *x, long long n, l
 // an Expand's gradient: dx (+)= dy summed over what was broadcast. dx dense over n elements; the view's axes (rank of
 // them, dims v) each kept - at dx's stride xs_k, its coordinate (j / xs_k) % v_k - or broadcast (xs_k 0), summed over;
 // dy dense, at strides t. The sum runs over dy in its own order, as the CPU's walk adds, so the two agree bit for bit
-extern "C" __global__ void oann_ad_unexpand(real *dx, const real *dy, long long n, long long add, long long rank,
+extern "C" __global__ void oann_ad_unexpand(store *dx, const store *dy, long long n, long long add, long long rank,
     long long v0, long long v1, long long v2, long long v3, long long v4, long long v5,
     long long x0, long long x1, long long x2, long long x3, long long x4, long long x5,
     long long t0, long long t1, long long t2, long long t3, long long t4, long long t5) {
@@ -582,7 +588,7 @@ extern "C" __global__ void oann_ad_unexpand(real *dx, const real *dy, long long 
             if (xs[k] != 0) base += ((j / xs[k]) % v[k]) * t[k];
             else reps *= v[k];
         }
-        real acc = add ? dx[j] : (real)0;
+        real acc = add ? (real)dx[j] : (real)0;
         for (long long b = 0; b < reps; b++) {
             long long r = b, off = base;
             for (int k = (int)rank - 1; k >= 0; k--) {
@@ -599,21 +605,21 @@ extern "C" __global__ void oann_ad_unexpand(real *dx, const real *dy, long long 
 // ---- element functions: Shift, Sqrt, Log (ad/ops) ----
 
 // y = x + k
-extern "C" __global__ void oann_ad_shift(real *y, const real *x, real k, long long n) { OANN_LOOP(i, n) y[i] = x[i] + k; }
+extern "C" __global__ void oann_ad_shift(store *y, const store *x, real k, long long n) { OANN_LOOP(i, n) y[i] = x[i] + k; }
 
 // y = sqrt x (NaN below 0)
-extern "C" __global__ void oann_ad_sqrt(real *y, const real *x, long long n) { OANN_LOOP(i, n) y[i] = sqrt(x[i]); }
+extern "C" __global__ void oann_ad_sqrt(store *y, const store *x, long long n) { OANN_LOOP(i, n) y[i] = sqrt(x[i]); }
 
 // dx (+)= dy / (2 y), read from y = sqrt x
-extern "C" __global__ void oann_ad_sqrt_grad(real *dx, const real *dy, const real *y, long long n, long long add) {
+extern "C" __global__ void oann_ad_sqrt_grad(store *dx, const store *dy, const store *y, long long n, long long add) {
     OANN_LOOP(i, n) { real v = dy[i] / ((real)2.0 * y[i]); dx[i] = add ? dx[i] + v : v; }
 }
 
 // y = log x (-infinity at 0, NaN below)
-extern "C" __global__ void oann_ad_log(real *y, const real *x, long long n) { OANN_LOOP(i, n) y[i] = log(x[i]); }
+extern "C" __global__ void oann_ad_log(store *y, const store *x, long long n) { OANN_LOOP(i, n) y[i] = log(x[i]); }
 
 // dx (+)= dy / x
-extern "C" __global__ void oann_ad_log_grad(real *dx, const real *dy, const real *x, long long n, long long add) {
+extern "C" __global__ void oann_ad_log_grad(store *dx, const store *dy, const store *x, long long n, long long add) {
     OANN_LOOP(i, n) { real v = dy[i] / x[i]; dx[i] = add ? dx[i] + v : v; }
 }
 
@@ -622,9 +628,9 @@ extern "C" __global__ void oann_ad_log_grad(real *dx, const real *dy, const real
 __device__ __forceinline__ real oann_stable(real x) { return x >= (real)0 ? x + (real)1.0 : (real)1.0 / ((real)1.0 - x); }
 
 // the rows: rowloss[r] = log(sum s(z) / s(z[class])) (0 for an ignored row); the total is oann_ad_ce_total's
-extern "C" __global__ void oann_ad_sm_rows(double *rowloss, const real *z, const int *classes, long long cols) {
+extern "C" __global__ void oann_ad_sm_rows(double *rowloss, const store *z, const int *classes, long long cols) {
     long long r = blockIdx.x;
-    const real *zr = z + r * cols;
+    const store *zr = z + r * cols;
     real s = (real)0;
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) s += oann_stable(zr[j]);
     s = oann_bsum(s);
@@ -636,10 +642,10 @@ extern "C" __global__ void oann_ad_sm_rows(double *rowloss, const real *z, const
 
 // dz (+)= dloss s'(z_j) (1 / sum s - [j = class] / s(z_class)) / counted, zero for an ignored row - a block a row;
 // dloss = dy[0] (a device word), counted = stats[1] (oann_ad_ce_total's)
-extern "C" __global__ void oann_ad_sm_grad(real *dz, const real *z, const int *classes, const real *dloss, const double *stats, long long cols, long long add) {
+extern "C" __global__ void oann_ad_sm_grad(store *dz, const store *z, const int *classes, const store *dloss, const double *stats, long long cols, long long add) {
     long long r = blockIdx.x;
-    const real *zr = z + r * cols;
-    real *dr = dz + r * cols;
+    const store *zr = z + r * cols;
+    store *dr = dz + r * cols;
     long long c = classes[r];
     real counted = (real)stats[1];
     real k = dloss[0] / (counted > (real)0 ? counted : (real)1);
@@ -660,7 +666,7 @@ extern "C" __global__ void oann_ad_sm_grad(real *dz, const real *z, const int *c
 // y (+)= x rotated, dir 1 (or back, -1: the gradient): row r at position pos + r % ctx, in each head of dh columns the
 // pair (c, c + dh / 2) by the angle dir position base^(-2c / dh), the angle and its cosine and sine in double as the
 // CPU's, the rotation in real; n = rows x cols / 2 pairs. y may be x where not added
-extern "C" __global__ void oann_ad_rope(real *y, const real *x, long long n, long long cols, long long dh, long long ctx, long long pos, double logbase, double dir, long long add) {
+extern "C" __global__ void oann_ad_rope(store *y, const store *x, long long n, long long cols, long long dh, long long ctx, long long pos, double logbase, double dir, long long add) {
     long long half = dh / 2, pairs = cols / 2;
     OANN_LOOP(i, n) {
         long long r = i / pairs, q = i % pairs;

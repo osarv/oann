@@ -166,7 +166,46 @@ Names := Array<String>["oann_ad_act", "oann_ad_act_grad", "oann_ad_leaky", "oann
 
 # the text of the kernels for real type T: the prelude, elem.cu, the typedef, ad.cu
 fn Source<T>(like T) String {
-    return kern.ElemSource() + "\n// ad/mirror.olang: the specialization\ntypedef " + kern.RealName(like) + " real;\n" + kern.AdText
+    return kern.ElemSource() + "\n// ad/mirror.olang: the specialization\n" + storeText(like) + kern.AdText
+}
+
+# what ad.cu computes in (real) and the arena holds (store): the graph's type for F32 and F64; F32 over 16-bit words for
+# BF16, rounded to nearest even as the CPU rounds a BF16 graph's values
+fn storeText<T>(like T) String {
+    match T {
+        case BF16 {
+            return "struct oann_bf16 {\n    unsigned short bits;\n    __device__ __forceinline__ oann_bf16() {}\n" +
+                "    __device__ __forceinline__ oann_bf16(float f) {\n        unsigned int u = __float_as_uint(f);\n" +
+                "        bits = (u & 0x7fffffffu) > 0x7f800000u ? (unsigned short)((u >> 16) | 0x40u) : (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);\n    }\n" +
+                "    __device__ __forceinline__ operator float() const { return __uint_as_float((unsigned int)bits << 16); }\n};\n" +
+                "typedef float real;\ntypedef oann_bf16 store;\n"
+        }
+        case _ { return "typedef " + kern.RealName(like) + " real;\ntypedef real store;\n" }
+    }
+}
+
+# a real argument of the kernels: F64 for an F64 graph, else F32 (what a BF16 graph computes in)
+fn rl<T>(x F64) U64 {
+    return match T {
+        case F64: kern.Arg(x)
+        case _: kern.Arg(F32(x))
+    }
+}
+
+# whether the graph's parameters have F32 masters (a BF16 graph), stepped on the device beside the arena
+fn hasMasters<T>() Bool {
+    return match T {
+        case BF16: true
+        case _: false
+    }
+}
+
+# the bytes of a real
+fn realSize<T>() I64 {
+    return match T {
+        case F64: 8
+        case _: 4
+    }
 }
 
 # attention's six products at one batch size, planned (an empty Product where a gradient is not wanted)
@@ -192,12 +231,12 @@ type MatPlan<T> unique struct(dev gdev.Device&, node I64) {
 }
 
 # AdamW's state on the device: the moments and the per-parameter decay mask, the steps taken
-type AdamW<T> unique struct(m gdev.Buf<T>, v gdev.Buf<T>, mask gdev.Buf<U8>, hp gdev.Buf<T>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
-    M gdev.Buf<T> = m
-    V gdev.Buf<T> = v
+type AdamW<T> unique struct(m gdev.Buf<U8>, v gdev.Buf<U8>, mask gdev.Buf<U8>, hp gdev.Buf<F64>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
+    M gdev.Buf<U8> = m                # the moments in real (F32 for a BF16 graph), as bytes
+    V gdev.Buf<U8> = v
     mask
-    Hp gdev.Buf<T> = hp               # keep, step and root of the step in hand: the kernel reads them, so a CUDA graph's replay has each step's
-    hostHp mut Array<T>& = Array<T>(3)
+    Hp gdev.Buf<F64> = hp             # keep, step and root of the step in hand: the kernel reads them, so a CUDA graph's replay has each step's
+    hostHp mut Array<F64>& = Array<F64>(3)
     Rate F64 = rate
     Beta1 F64 = beta1
     Beta2 F64 = beta2
@@ -209,7 +248,7 @@ type AdamW<T> unique struct(m gdev.Buf<T>, v gdev.Buf<T>, mask gdev.Buf<U8>, hp 
 # a planned graph's mirror on dev: Mem the arena (size elements, the first params of them the parameters, the gradients
 # the next params), Ints the tokens and classes, Stats two F64 a node (a loss's value and the entries it counted; two
 # more at the end for the gradients' norm), RowLoss a cross entropy's rows' losses
-type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, geo Array<I64>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>) {
+type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, geo Array<I64>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>, masters gdev.Buf<F32>) {
     dev
     geo
     Size I64 = size
@@ -221,6 +260,8 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
     Ints gdev.Buf<I32> = intMem
     Stats gdev.Buf<F64> = stats
     RowLoss gdev.Buf<F64> = losses
+    Masters gdev.Buf<F32> = masters     # a BF16 graph's parameters in F32 (what AdamW steps), else one unused word
+    HasMasters Bool = hasMasters<T>()
     plans mut Vec<AttnPlan<T>>& = Vec<AttnPlan<T>>()
     mplans mut Vec<MatPlan<T>>& = Vec<MatPlan<T>>()
     nodes
@@ -236,7 +277,7 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
 # the views' geometries (Step.Geo)
 fn Mirror<T>.Make(dev mut gdev.Device&, steps Array<Step>&, geo Array<I64>&, size I64, params I64, ints I64, batch I64, rowloss I64) Mirror<T> ? gdev.GpuError {
     z T
-    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, geo, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss))
+    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, geo, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss), try gdev.Buf<F32>.Make(dev, params if hasMasters<T>() else 1))
     try m.planAll()
     kern.Zero(dev, m.Mem.Addr(0), size * T.Size)
     kern.Zero(dev, m.Stats.Addr(0), (2 * steps.Len() + 4) * 8)
@@ -341,6 +382,18 @@ fn (m mut Mirror<T>&) Upload(host Array<T>&, from I64, n I64) {
     upload(d, m.Mem, host, from, from, n)
 }
 
+# a BF16 graph's masters up from the host's
+fn (m mut Mirror<T>&) UploadMasters(host Array<F32>&) {
+    d := m.dev
+    upload(d, m.Masters, host, 0, 0, m.params)
+}
+
+# ... and down into the host's, and waits
+fn (m mut Mirror<T>&) DownloadMasters(host mut Array<F32>&) {
+    m.Masters.Download(host, 0, 0, m.params)
+    m.sync()
+}
+
 fn (m mut Mirror<T>&) UploadInts(host Array<I32>&, from I64, n I64) {
     d := m.dev
     upload(d, m.Ints, host, from, from, n)
@@ -368,7 +421,7 @@ fn (m mut Mirror<T>&) Loss(i I64) F64 {
 }
 
 # n elements from `at` set to v
-fn (m mut Mirror<T>&) Fill(at I64, n I64, v F64) { m.elems(KFill, n, m.at(at), kern.Arg(T(v)), n64(n)) }
+fn (m mut Mirror<T>&) Fill(at I64, n I64, v F64) { m.elems(KFill, n, m.at(at), rl<T>(v), n64(n)) }
 
 # ---- forward ----
 
@@ -393,17 +446,17 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
             bc := s.Inner if s.TB else cols
             m.product(s.Y, rows, cols, s.A, ar, ac, s.TA, s.B, br, bc, s.TB, false)
         }
-        case Work.Add: m.elems(KCombine, count, m.at(s.Y), m.at(s.A), m.at(s.B), kern.Arg(T(1.0)), n64(count))
-        case Work.Sub: m.elems(KCombine, count, m.at(s.Y), m.at(s.A), m.at(s.B), kern.Arg(T(-1.0)), n64(count))
+        case Work.Add: m.elems(KCombine, count, m.at(s.Y), m.at(s.A), m.at(s.B), rl<T>(1.0), n64(count))
+        case Work.Sub: m.elems(KCombine, count, m.at(s.Y), m.at(s.A), m.at(s.B), rl<T>(-1.0), n64(count))
         case Work.Mul: m.elems(KMul, count, m.at(s.Y), m.at(s.A), m.at(s.B), n64(count))
-        case Work.Scale: m.elems(KScale, count, m.at(s.Y), m.at(s.A), kern.Arg(T(s.K)), n64(count))
+        case Work.Scale: m.elems(KScale, count, m.at(s.Y), m.at(s.A), rl<T>(s.K), n64(count))
         case Work.Act: m.elems(KAct, count, m.at(s.Y), m.at(s.A), n64(count), n64(s.Code))
-        case Work.Leaky: m.elems(KLeaky, count, m.at(s.Y), m.at(s.A), n64(count), kern.Arg(T(s.K)))
+        case Work.Leaky: m.elems(KLeaky, count, m.at(s.Y), m.at(s.A), n64(count), rl<T>(s.K))
         case Work.Copy: m.elems(KCopy, count, m.at(s.Y), m.at(s.A), n64(count))
         case Work.Softmax: m.rowk(KSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), n64(1), n64(0), n64(0), 0, n64(1))
         case Work.LogSoftmax: m.rowk(KLogSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols))
         case Work.Norm {
-            m.rowk(KNormStats, rows, cols, m.at(s.Saved), m.at(s.Saved + rows), m.at(s.A), n64(cols), kern.Arg(T(s.K)), flag(s.Flag))
+            m.rowk(KNormStats, rows, cols, m.at(s.Saved), m.at(s.Saved + rows), m.at(s.A), n64(cols), rl<T>(s.K), flag(s.Flag))
             bias U64 = 0 if s.C < 0 else m.at(s.C)
             m.elems(KNormApply, count, m.at(s.Y), m.at(s.A), m.at(s.Saved), m.at(s.Saved + rows), m.at(s.B), bias, n64(count), n64(cols))
         }
@@ -422,7 +475,7 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
             m.rowk(KSumLast, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), kern.Arg(k))
         }
         case Work.Gather: m.view(s.Geo, s.Y, s.A, count, false)
-        case Work.Shift: m.elems(KShift, count, m.at(s.Y), m.at(s.A), kern.Arg(T(s.K)), n64(count))
+        case Work.Shift: m.elems(KShift, count, m.at(s.Y), m.at(s.A), rl<T>(s.K), n64(count))
         case Work.Sqrt: m.elems(KSqrt, count, m.at(s.Y), m.at(s.A), n64(count))
         case Work.Log: m.elems(KLog, count, m.at(s.Y), m.at(s.A), n64(count))
         case Work.Stablemax {
@@ -632,22 +685,22 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             }
         }
         case Work.Add {
-            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
-            if s.DB >= 0: m.elems(KPut, count, m.at(s.DB), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add1))
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), rl<T>(1.0), n64(count), flag(add0))
+            if s.DB >= 0: m.elems(KPut, count, m.at(s.DB), m.at(s.DY), rl<T>(1.0), n64(count), flag(add1))
         }
         case Work.Sub {
-            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
-            if s.DB >= 0: m.elems(KPut, count, m.at(s.DB), m.at(s.DY), kern.Arg(T(-1.0)), n64(count), flag(add1))
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), rl<T>(1.0), n64(count), flag(add0))
+            if s.DB >= 0: m.elems(KPut, count, m.at(s.DB), m.at(s.DY), rl<T>(-1.0), n64(count), flag(add1))
         }
         case Work.Mul {
             if s.DA >= 0: m.elems(KMulGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.B), n64(count), flag(add0))
             if s.DB >= 0: m.elems(KMulGrad, count, m.at(s.DB), m.at(s.DY), m.at(s.A), n64(count), flag(add1))
         }
         case Work.Scale {
-            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(s.K)), n64(count), flag(add0))
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), rl<T>(s.K), n64(count), flag(add0))
         }
         case Work.Copy, Work.Reshape, Work.Gather {
-            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), rl<T>(1.0), n64(count), flag(add0))
         }
         case Work.ViewBack {
             if s.DA >= 0: m.view(s.Geo, s.DA, s.DY, count, add0)
@@ -660,10 +713,10 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             }
         }
         case Work.Leaky {
-            if s.DA >= 0: m.elems(KLeakyGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.A), n64(count), kern.Arg(T(s.K)), flag(add0))
+            if s.DA >= 0: m.elems(KLeakyGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.A), n64(count), rl<T>(s.K), flag(add0))
         }
         case Work.Softmax {
-            if s.DA >= 0: m.rowk(KSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), n64(1), n64(0), n64(0), 0, n64(1), kern.Arg(T(1.0)), flag(add0))
+            if s.DA >= 0: m.rowk(KSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), n64(1), n64(0), n64(0), 0, n64(1), rl<T>(1.0), flag(add0))
         }
         case Work.LogSoftmax {
             if s.DA >= 0: m.rowk(KLogSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), flag(add0))
@@ -678,12 +731,12 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             if s.DB >= 0: m.rowk(KEmbedGrad, s.Inner, cols, m.at(s.DB), m.at(s.DY), m.Ints.Addr(s.IntA), n64(rows), n64(cols), flag(add1))
         }
         case Work.Positions {
-            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), rl<T>(1.0), n64(count), flag(add0))
             if s.DB >= 0: m.elems(KPositionsGrad, s.Inner * cols, m.at(s.DB), m.at(s.DY), n64(rows), n64(cols), n64(s.Ctx), n64(pos), n64(s.Inner), flag(add1))
         }
         case Work.Attention: m.attentionBackward(s, n, add0, add1, add2)
         case Work.Shift {
-            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), rl<T>(1.0), n64(count), flag(add0))
         }
         case Work.Sqrt {
             if s.DA >= 0: m.elems(KSqrtGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(count), flag(add0))
@@ -726,7 +779,7 @@ fn (m mut Mirror<T>&) attentionBackward(s Step&, n I64, add0 Bool, add1 Bool, ad
     ds := stackedOf(m, s.Scratch, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
     scale := 1.0 / F64(dm / s.Heads).Sqrt()
     m.plans[i].dp.RunBatch(d, ds, dout, v)
-    m.rowk(KSoftmaxGrad, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Scratch), m.at(s.Scratch), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag), n64(s.Window), m.startsOf(s), n64(s.Heads), kern.Arg(T(scale)), n64(0))
+    m.rowk(KSoftmaxGrad, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Scratch), m.at(s.Scratch), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag), n64(s.Window), m.startsOf(s), n64(s.Heads), rl<T>(scale), n64(0))
     if s.DA >= 0 {
         dq := headsOf(m, s.DA, qrows, dm, s.Ctx, s.Heads)
         m.plans[i].dq.RunBatch(d, dq, ds, k, 1.0, 1.0 if add0 else 0.0)
@@ -748,9 +801,10 @@ fn (m mut Mirror<T>&) attentionBackward(s Step&, n I64, add0 Bool, add1 Bool, ad
 fn (m mut Mirror<T>&) AdamW(decays Array<U8>&, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) AdamW<T> ? gdev.GpuError {
     n := m.params
     d := m.dev
-    o := AdamW<T>(try gdev.Buf<T>.Make(d, n), try gdev.Buf<T>.Make(d, n), try gdev.Buf<U8>.Make(d, n), try gdev.Buf<T>.Make(d, 3), rate, beta1, beta2, eps, decay)
-    kern.Zero(d, o.M.Addr(0), n * T.Size)
-    kern.Zero(d, o.V.Addr(0), n * T.Size)
+    bytes := n * realSize<T>()
+    o := AdamW<T>(try gdev.Buf<U8>.Make(d, bytes), try gdev.Buf<U8>.Make(d, bytes), try gdev.Buf<U8>.Make(d, n), try gdev.Buf<F64>.Make(d, 3), rate, beta1, beta2, eps, decay)
+    kern.Zero(d, o.M.Addr(0), bytes)
+    kern.Zero(d, o.V.Addr(0), bytes)
     o.mask.UploadAll(decays)
     try d.Sync()
     return o
@@ -761,7 +815,7 @@ fn (m mut Mirror<T>&) AdamScalars(o mut AdamW<T>&) {
     o.Steps++
     corr1 F64 = 1.0 - o.Beta1.Pow(F64(o.Steps))
     corr2 F64 = 1.0 - o.Beta2.Pow(F64(o.Steps))
-    o.hostHp[0], o.hostHp[1], o.hostHp[2] = T(1.0 - o.Rate * o.Decay), T(o.Rate / corr1), T(1.0 / corr2.Sqrt())
+    o.hostHp[0], o.hostHp[1], o.hostHp[2] = 1.0 - o.Rate * o.Decay, o.Rate / corr1, 1.0 / corr2.Sqrt()
     d := m.dev
     upload(d, o.Hp, o.hostHp, 0, 0, 3)
 }
@@ -769,8 +823,9 @@ fn (m mut Mirror<T>&) AdamScalars(o mut AdamW<T>&) {
 # the step's launch (the scalars already on the device)
 fn (m mut Mirror<T>&) AdamLaunch(o mut AdamW<T>&) {
     n := m.params
-    m.elems(KAdamW, n, m.at(0), m.at(n), o.M.Addr(0), o.V.Addr(0), o.mask.Addr(0), n64(n), kern.Arg(T(o.Beta1)), kern.Arg(T(o.Beta2)), kern.Arg(T(1.0 - o.Beta1)), kern.Arg(T(1.0 - o.Beta2))
-        o.Hp.Addr(0), kern.Arg(T(o.Eps)))
+    w := m.Masters.Addr(0) if m.HasMasters else m.at(0)
+    m.elems(KAdamW, n, w, m.at(0), m.at(n), o.M.Addr(0), o.V.Addr(0), o.mask.Addr(0), n64(n), rl<T>(o.Beta1), rl<T>(o.Beta2), rl<T>(1.0 - o.Beta1), rl<T>(1.0 - o.Beta2)
+        o.Hp.Addr(0), rl<T>(o.Eps))
 }
 
 fn (m mut Mirror<T>&) AdamStep(o mut AdamW<T>&) {

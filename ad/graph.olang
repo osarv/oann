@@ -1716,10 +1716,18 @@ fn (g Graph<T>&) HasMasters() Bool {
 }
 
 # a BF16 graph's parameters in F32, laid out as Params() is - what an optimizer steps and a checkpoint keeps
-fn (g Graph<T>&) Masters() tensor.Tensor<F32> { return tensor.Tensor<F32>.Over(g.masters, 0, g.ParamCount)! }
+fn (g Graph<T>&) Masters() tensor.Tensor<F32> {
+    if Gpu {
+        if g.OnGpu: g.pullParams()
+    }
+    return tensor.Tensor<F32>.Over(g.masters, 0, g.ParamCount)!
+}
 
 # parameter v's master, a view of Masters()
 fn (g Graph<T>&) Master(v Var) tensor.Tensor<F32> {
+    if Gpu {
+        if g.OnGpu: g.pullParams()
+    }
     nd := g.nodes[v]
     return over<F32>(g.masters, nd.Offset, nd.Dims, rowMajor(nd.Dims))
 }
@@ -2639,8 +2647,8 @@ if Gpu {
     # (MatMul's first operand may be one on the CPU) is refused
     fn (g Graph<T>&) refusal() String {
         match T {
-            case F32, F64 { }
-            case _ { return "a graph of BF16 or F16 (mixed precision)" }
+            case F32, F64, BF16 { }
+            case _ { return "a graph of F16" }
         }
         if g.Eager: return "an eager graph"
         if g.Decode: return "a decoding graph"
@@ -2918,10 +2926,17 @@ if Gpu {
     # before the optimizer steps the parameters on the device: any the host wrote are up, and the device's now newer
     fn (g Graph<T>&) DeviceReady() {
         if g.gpu.HostParams {
-            g.gpu.M!.Upload(g.mem, 0, g.ParamCount)
+            g.pushParams()
             g.gpu.HostParams = false
         }
         g.gpu.FreshParams = true
+    }
+
+    # the parameters up from the host's, a BF16 graph's masters with them
+    fn (g Graph<T>&) pushParams() {
+        m :~ g.gpu.M!
+        m.Upload(g.mem, 0, g.ParamCount)
+        if g.HasMasters(): m.UploadMasters(g.masters)
     }
 
     # GP7: Times (microseconds, by kind: forward, backward) filled with what each node's kernels take on the device, each
@@ -2953,7 +2968,7 @@ if Gpu {
     fn (g mut Graph<T>&) gpuUpload() {
         m :~ g.gpu.M!
         if g.gpu.HostParams {
-            m.Upload(g.mem, 0, g.ParamCount)
+            g.pushParams()
             g.gpu.HostParams = false
         }
         for i in range g.nodes.Len() {
@@ -3002,7 +3017,7 @@ if Gpu {
         m :~ g.gpu.M!
         if accumulate: g.pullParams()
         if g.gpu.HostParams and not g.gpu.Capturing {
-            m.Upload(g.mem, 0, g.ParamCount)
+            g.pushParams()
             g.gpu.HostParams = false
         }
         if not g.gpu.Capturing: g.uploadTouched()
@@ -3081,6 +3096,7 @@ if Gpu {
     fn (g Graph<T>&) pullParams() {
         if g.gpu.FreshParams {
             g.gpu.M!.DownloadRange(g.mem, 0, 2 * g.ParamCount)
+            if g.HasMasters(): g.gpu.M!.DownloadMasters(g.masters)
             g.gpu.FreshParams = false
         }
         g.gpu.HostParams = true
@@ -3090,7 +3106,7 @@ if Gpu {
     # not the activation region (GP8: a step reading a few outputs moves those)
     fn (g Graph<T>&) pullNode(v Var, grad Bool) {
         m :~ g.gpu.M!
-        gen :~ g.gpu.Gen
+        gen := g.gpu.Gen
         if grad {
             nd := g.nodes[v]
             if g.gpu.GradGen[v] == gen or nd.GradOffset < 0: return

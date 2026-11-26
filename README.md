@@ -22,8 +22,9 @@ fn main() ? tensor.ShapeError {
 
 Where a plan runs is chosen once, as PyTorch's `torch.set_default_device` does: on a build with the GPU
 (`-define Gpu=true`, which the makefile passes wherever the CUDA toolkit is) and a machine with one, every plan made
-after this line runs there, and on the CPU otherwise - a plan's `on` still decides for that plan (docs/redesign.md 1.10;
-settling systems run on the GPU, `ad`'s graphs not yet):
+after this line runs there, and on the CPU otherwise - a plan's `on` still decides for that plan (docs/redesign.md 1.10).
+`ad`'s graphs train there in F32, F64 or BF16 (mixed precision: F32 masters and moments on the device); what has no GPU
+form yet (dropout, convolutions, scans, a custom operation, decoding) is refused at `Plan` by name:
 
 ```
 import "github.com/osarv/oann/kernels/device"

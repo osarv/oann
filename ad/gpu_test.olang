@@ -16,6 +16,7 @@ import gdev "../kernels/gpu/device"
 import "../kernels/gpu/kern"
 import "../models/gpt"
 import "../nn/optim"
+import "../nn/train"
 import "../tensor"
 import "std/rand"
 
@@ -266,7 +267,7 @@ fn adamKernel() ? {
     bv := try gdev.Buf<F32>.Make(d, n)
     bmask := try gdev.Buf<U8>.Make(d, n)
     bmask.UploadAll(mask)
-    bhp := try gdev.Buf<F32>.Make(d, 3)
+    bhp := try gdev.Buf<F64>.Make(d, 3)
     kern.Zero(d, bm.Addr(0), n * 4)
     kern.Zero(d, bv.Addr(0), n * 4)
     for step in range 1, 8 {
@@ -276,8 +277,8 @@ fn adamKernel() ? {
         bg.UploadAll(g)
         corr1 F64 = 1.0 - F64(0.9).Pow(F64(step))
         corr2 F64 = 1.0 - F64(0.999).Pow(F64(step))
-        bhp.UploadAll(Array<F32>[F32(1.0 - 0.01 * 0.1), F32(0.01 / corr1), F32(1.0 / corr2.Sqrt())])
-        kern.LaunchKit(d, k, mirror.KAdamW, kern.Blocks(n), kern.Block, bp.Addr(0), bg.Addr(0), bm.Addr(0), bv.Addr(0), bmask.Addr(0), kern.Arg(n), kern.Arg(F32(0.9)), kern.Arg(F32(0.999)), kern.Arg(F32(1.0 - 0.9)), kern.Arg(F32(1.0 - 0.999))
+        bhp.UploadAll(Array<F64>[1.0 - 0.01 * 0.1, 0.01 / corr1, 1.0 / corr2.Sqrt()])
+        kern.LaunchKit(d, k, mirror.KAdamW, kern.Blocks(n), kern.Block, bp.Addr(0), bp.Addr(0), bg.Addr(0), bm.Addr(0), bv.Addr(0), bmask.Addr(0), kern.Arg(n), kern.Arg(F32(0.9)), kern.Arg(F32(0.999)), kern.Arg(F32(1.0 - 0.9)), kern.Arg(F32(1.0 - 0.999))
             bhp.Addr(0), kern.Arg(F32(1e-8)))
         got := try down(d, bp)
         want := cp.Flat()!
@@ -524,6 +525,96 @@ fn elemsCase() {
 
 test elemsCase "rotary positions, AddScalar, Sqrt, Log and stablemax cross entropy (classes ignored too) on the GPU: within rounding of the CPU's, a short batch" { elemsCase() }
 
+# ---- BF16 graphs (mixed precision): the arena in BF16, every kernel computing in F32, F32 masters stepped on the device ----
+
+# the batch's tokens and targets from the seed, the same on any graph
+fn feedLm<T>(g mut graph.Graph<T>&, lm train.LanguageModel&, seed U64, vocab I64) {
+    r := rand.Rand(seed)
+    t :~ g.Ints(lm.Tokens).Flat()!
+    c :~ g.Ints(lm.Targets).Flat()!
+    for i in range t.Len(): t[i] = I32(r.Below(vocab))
+    for i in range c.Len(): c[i] = I32(r.Below(vocab))
+}
+
+# the largest |a - b| and |b| over two BF16 tensors' elements, in F64
+fn worstB(a tensor.Tensor<BF16>, b tensor.Tensor<BF16>) F64, F64 {
+    x :~ a.Flat()!
+    y :~ b.Flat()!
+    w F64 = 0.0
+    big F64 = 0.0
+    for i in range y.Len() {
+        w = w.Max((F64(x[i]) - F64(y[i])).Abs())
+        big = big.Max(F64(y[i]).Abs())
+    }
+    return w, big
+}
+
+fn bf16Case() {
+    if not device.GpuAvailable() {
+        gdev.Skip("BF16 graphs")
+        return
+    }
+    c := gpt.GptConfig.Variant(0)
+    cpu := graph.Graph<BF16>(4)
+    lm := gpt.Gpt.New(cpu, c).Lm(cpu)
+    gpu := graph.Graph<BF16>(4)
+    gpt.Gpt.New(gpu, c).Lm(gpu)
+    try cpu.Plan(rand.Rand(5), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    assert gpu.OnGpu and cpu.Masters() == gpu.Masters()
+    # one forward and backward: BF16's rounding (8 bits) differs where the sums' order does
+    feedLm(cpu, lm, 3, c.Vocab)
+    feedLm(gpu, lm, 3, c.Vocab)
+    cpu.Forward(4)
+    cpu.Backward(lm.Loss)
+    gpu.Forward(4)
+    gpu.Backward(lm.Loss)
+    lc := cpu.Scalar(lm.Loss)
+    lg := gpu.Scalar(lm.Loss)
+    assert (lc - lg).Abs() <= 2.0e-2 * (1.0 + lc.Abs()), "BF16: the loss " + $lg + " against the CPU's " + $lc
+    wg, bg := worstB(gpu.ParamGrads(), cpu.ParamGrads())
+    assert wg <= 5.0e-2 * (1.0 + bg), "BF16: the gradients differ by " + $wg + " of " + $bg
+    # training: the CPU's mixed AdamW on its masters against GpuAdamW on the device's, clipped, 15 steps
+    oc := optim.AdamW(cpu.Masters(), cpu.ParamGrads(), rate = 0.01, decay = 0.1, spans = optim.Spans(cpu))
+    og := try optim.GpuAdamW<BF16>.For(gpu, rate = 0.01, decay = 0.1) catch { unreachable }
+    first F64 = 0.0
+    last F64 = 0.0
+    for step in range 15 {
+        cpu.Forward(4)
+        cpu.Backward(lm.Loss)
+        optim.ClipNorm(cpu.ParamGrads(), 1.0)
+        oc.Step()
+        cpu.SyncParams()
+        gpu.Forward(4)
+        gpu.Backward(lm.Loss)
+        og.Clip(1.0)
+        og.Step()
+        lc2 := cpu.Scalar(lm.Loss)
+        lg2 := gpu.Scalar(lm.Loss)
+        assert (lc2 - lg2).Abs() <= 5.0e-2 * (1.0 + lc2), "BF16 step " + $step + ": the loss " + $lg2 + " against the CPU's " + $lc2
+        if step == 0: first = lg2
+        last = lg2
+    }
+    assert last < first, "BF16: no learning, " + $first + " to " + $last
+    # the masters read back, and the arena their rounding
+    mg :~ gpu.Masters().Flat()!
+    pg :~ gpu.Params().Flat()!
+    for i in range mg.Len(): assert pg[i] == BF16(mg[i]), "BF16: parameter " + $i + " is not its master rounded"
+    mc :~ cpu.Masters().Flat()!
+    w F64 = 0.0
+    big F64 = 0.0
+    for i in range mc.Len() {
+        w = w.Max((F64(mg[i]) - F64(mc[i])).Abs())
+        big = big.Max(F64(mc[i]).Abs())
+    }
+    assert w <= 2.0e-2 * (1.0 + big), "BF16: the masters differ by " + $w + " of " + $big
+    # Train (a whole step as a CUDA graph) runs a BF16 graph too, and learns on
+    for _ in range 5: og.Train(lm.Loss, 4, 1.0)
+    assert gpu.Scalar(lm.Loss) < first, "BF16: Train did not keep learning"
+}
+
+test bf16Case "a BF16 graph on the GPU: forward and backward within BF16's rounding of the CPU's BF16 graph, and trained by GpuAdamW on F32 masters as the CPU's mixed AdamW, then by Train" { bf16Case() }
+
 fn trained() {
     if not device.GpuAvailable() {
         gdev.Skip("training")
@@ -704,11 +795,11 @@ fn refused() ? {
     said := ""
     try g.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
     assert said.Contains("no GPU form of Dropout"), said
-    b := graph.Graph<BF16>(4)
+    b := graph.Graph<F16>(4)
     b.Linear(b.Input(3), b.Param(graph.Init.Zeros, true, 2, 3))
     said = ""
     try b.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
-    assert said.Contains("BF16"), said
+    assert said.Contains("F16"), said
     # a product reading a view's rows through leading strides of its own (no Contiguous copy is recorded for it), by a
     # matrix (a product of stacks reads them so)
     v := graph.Graph<F32>(4)

@@ -2367,3 +2367,29 @@ bench/whisperlin (`make whisperlinbench`), us, old -> new, 1 row: INT8 1 x 512 x
 Left: F32 few-row products take 4x for 4 rows (each row read the weights apart); the decoder's cross-attention still
 splits over heads unconditionally (unmeasured without a model here); the phone's thresholds are this VM's, untested
 on aarch64 hardware.
+
+## The GPU route, GP9: what language models need on the GPU (gpu-lm, 2026-11-26)
+
+docs/redesign.md 1.10's GP9 note. For a bigger language model trained on the RTX 4060 (8 GB), the parts the yardstick
+GPT and the looped-depth and reasoning experiments use, which GP6 refused on the GPU, now plan there:
+- **Attention in a band**: a sliding window and packed documents (causal, and both ways) - the softmax and its gradient
+  read each row's band as kernels/attention's `low`/`high` (the window, the document's start and, not causal, its end).
+- **Rope**, **AddScalar**, **Sqrt**, **Log**, **stablemax cross entropy** (ignored rows too).
+- **BF16 graphs** (mixed precision): the arena in BF16, kernels in F32, F32 masters and moments stepped on the device,
+  each parameter rounded from its master in AdamW's kernel. Halves the activations and the arena; the products run on
+  the tensor cores in BF16. A model's device bytes: the arena (BF16 values, gradients, saved activations) plus 4 bytes a
+  parameter of masters and 8 of moments - so about 300M parameters fit beside a short context's activations in 8 GB,
+  1B does not (16 GB of masters and moments alone).
+- **Fixed on the way**: the GPU-only code (built only with `-define Gpu=true`) had not been compiled since olang's
+  links-and-contents change (E10, 2026-11-26), so every GPU build failed: `=` into a null reference field (a mirror, an
+  optimizer, the device) is now `~`, and locals meant as references to a mirror, its steps, a key, a population are
+  `:~` (as copies they allocated, failing the `Allocates` asserts, and the CUDA graphs' keys were written into copies).
+  ad/gpu_test's `feed` wrote the graphs' inputs into copies the same way.
+
+**Tests** (`make gputest`): compiled in the cloud against CUDA 12.0's headers with no device, so every GPU test there
+reports itself skipped; `ad/gpu_test.olang` adds `bandsCase` (a window of 3; documents causal; documents both ways),
+`elemsCase` (Rope at bases 10000 and 500, AddScalar, Sqrt, Log, stablemax with ignored classes) and `bf16Case` (a BF16
+GPT's forward and backward against the CPU's BF16 graph, then 15 steps of GpuAdamW on masters against the CPU's mixed
+AdamW, the arena the masters rounded, then `Train`); the kernels compile under nvcc for F32, F64 and BF16. **Not yet
+run on a GPU** - the first run is on the RTX 4060: `make gputest`, then `make gpulm` (G-M6) at 124M and 300M sizes.
+
