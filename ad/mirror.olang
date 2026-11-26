@@ -54,6 +54,11 @@ type Work enum {
     Sum
     Gather          # GP8: a view read through its strides into a dense run (a Contiguous copy)
     ViewBack        # GP8: a Permute's, Slice's or Expand's gradient into its base's (nothing forward)
+    Shift
+    Sqrt
+    Log
+    Stablemax       # stablemax cross entropy
+    Rope
 }
 
 # one node, lowered: offsets are elements of the arena (-1: none), ints those of the I32 region
@@ -81,6 +86,7 @@ type Step struct(Do Work) {
     Code I64 = 0            # Act: mat.Act's number
     Heads I64 = 0
     Ctx I64 = 0
+    Window I64 = 0          # Attention: the sliding window (0: none); its IntA the document starts (-1: none)
     K F64 = 0.0             # Scale's factor, LeakyRelu's slope, Norm's eps
     Geo I64 = -1            # Gather, ViewBack, a MatMul of stacks: its geometry's first element in the mirror's table
     Node I64 = -1           # the graph's node it is
@@ -141,13 +147,22 @@ KClip := 34
 KAdamW := 35
 KGather := 36
 KUnexpand := 37
+KShift := 38
+KSqrt := 39
+KSqrtGrad := 40
+KLog := 41
+KLogGrad := 42
+KSmRows := 43
+KSmGrad := 44
+KRope := 45
 
 Names := Array<String>["oann_ad_act", "oann_ad_act_grad", "oann_ad_leaky", "oann_ad_leaky_grad", "oann_ad_fill", "oann_ad_copy", "oann_ad_put"
     "oann_ad_combine", "oann_ad_mul", "oann_ad_mul_grad", "oann_ad_scale", "oann_ad_bias", "oann_ad_colsum", "oann_ad_softmax"
     "oann_ad_softmax_grad", "oann_ad_lse", "oann_ad_logsoftmax", "oann_ad_logsoftmax_grad", "oann_ad_norm_stats", "oann_ad_norm_apply"
     "oann_ad_norm_grad", "oann_ad_norm_param_grad", "oann_ad_embed", "oann_ad_embed_grad", "oann_ad_positions", "oann_ad_positions_grad"
     "oann_ad_sumlast", "oann_ad_sumlast_grad", "oann_ad_ce_rows", "oann_ad_ce_total", "oann_ad_ce_grad", "oann_ad_mse", "oann_ad_mse_grad"
-    "oann_ad_sumsq", "oann_ad_clip", "oann_ad_adamw", "oann_ad_gather", "oann_ad_unexpand"]
+    "oann_ad_sumsq", "oann_ad_clip", "oann_ad_adamw", "oann_ad_gather", "oann_ad_unexpand", "oann_ad_shift", "oann_ad_sqrt"
+    "oann_ad_sqrt_grad", "oann_ad_log", "oann_ad_log_grad", "oann_ad_sm_rows", "oann_ad_sm_grad", "oann_ad_rope"]
 
 # the text of the kernels for real type T: the prelude, elem.cu, the typedef, ad.cu
 fn Source<T>(like T) String {
@@ -283,6 +298,9 @@ fn (m mut Mirror<T>&) once(k I64, args ...U64) {
 
 fn n64(x I64) U64 { return kern.Arg(x) }
 
+# an attention's document starts on the device (packed documents), or 0 for none
+fn (m Mirror<T>&) startsOf(s Step&) U64 { return 0 if s.IntA < 0 else m.Ints.Addr(s.IntA) }
+
 fn flag(b Bool) U64 { return 1 if b else 0 }
 
 # attention's operands as batches: the rows of x in sequences of ctx, its columns in heads; the weights stacked. A local
@@ -382,7 +400,7 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
         case Work.Act: m.elems(KAct, count, m.at(s.Y), m.at(s.A), n64(count), n64(s.Code))
         case Work.Leaky: m.elems(KLeaky, count, m.at(s.Y), m.at(s.A), n64(count), kern.Arg(T(s.K)))
         case Work.Copy: m.elems(KCopy, count, m.at(s.Y), m.at(s.A), n64(count))
-        case Work.Softmax: m.rowk(KSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), n64(1), n64(0))
+        case Work.Softmax: m.rowk(KSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), n64(1), n64(0), n64(0), 0, n64(1))
         case Work.LogSoftmax: m.rowk(KLogSoftmax, rows, cols, m.at(s.Y), m.at(s.A), n64(cols))
         case Work.Norm {
             m.rowk(KNormStats, rows, cols, m.at(s.Saved), m.at(s.Saved + rows), m.at(s.A), n64(cols), kern.Arg(T(s.K)), flag(s.Flag))
@@ -404,6 +422,14 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
             m.rowk(KSumLast, rows, cols, m.at(s.Y), m.at(s.A), n64(cols), kern.Arg(k))
         }
         case Work.Gather: m.view(s.Geo, s.Y, s.A, count, false)
+        case Work.Shift: m.elems(KShift, count, m.at(s.Y), m.at(s.A), kern.Arg(T(s.K)), n64(count))
+        case Work.Sqrt: m.elems(KSqrt, count, m.at(s.Y), m.at(s.A), n64(count))
+        case Work.Log: m.elems(KLog, count, m.at(s.Y), m.at(s.A), n64(count))
+        case Work.Stablemax {
+            m.rowk(KSmRows, rows, cols, m.RowLoss.Addr(0), m.at(s.A), m.Ints.Addr(s.IntA), n64(cols))
+            m.once(KCeTotal, m.Stats.Addr(2 * s.Inner), m.at(s.Y), m.RowLoss.Addr(0), m.Ints.Addr(s.IntA), n64(rows))
+        }
+        case Work.Rope: m.rope(s, s.Y, s.A, rows, cols, pos, 1.0, false)
         case _ { }
     }
 }
@@ -561,8 +587,14 @@ fn (m mut Mirror<T>&) attentionForward(s Step&, n I64, pos I64) {
     scale := 1.0 / F64(dm / s.Heads).Sqrt()
     d := m.dev
     m.plans[i].scores.RunBatch(d, p, q, k, scale)
-    m.rowk(KSoftmax, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Saved), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag))
+    m.rowk(KSoftmax, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Saved), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag), n64(s.Window), m.startsOf(s), n64(s.Heads))
     m.plans[i].pv.RunBatch(d, o, p, v)
+}
+
+# y (+)= x rotated (dir 1) or rotated back (-1, the gradient) at positions pos + t: Rope's heads, its base in K
+fn (m mut Mirror<T>&) rope(s Step&, y I64, x I64, rows I64, cols I64, pos I64, dir F64, add Bool) {
+    pairs := rows * cols / 2
+    m.elems(KRope, pairs, m.at(y), m.at(x), n64(pairs), n64(cols), n64(cols / s.Heads), n64(s.Ctx), n64(pos), kern.Arg(s.K.Log()), kern.Arg(dir), flag(add))
 }
 
 # ---- backward ----
@@ -631,7 +663,7 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             if s.DA >= 0: m.elems(KLeakyGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.A), n64(count), kern.Arg(T(s.K)), flag(add0))
         }
         case Work.Softmax {
-            if s.DA >= 0: m.rowk(KSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), n64(1), n64(0), kern.Arg(T(1.0)), flag(add0))
+            if s.DA >= 0: m.rowk(KSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), n64(1), n64(0), n64(0), 0, n64(1), kern.Arg(T(1.0)), flag(add0))
         }
         case Work.LogSoftmax {
             if s.DA >= 0: m.rowk(KLogSoftmaxGrad, rows, cols, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(cols), flag(add0))
@@ -650,6 +682,21 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
             if s.DB >= 0: m.elems(KPositionsGrad, s.Inner * cols, m.at(s.DB), m.at(s.DY), n64(rows), n64(cols), n64(s.Ctx), n64(pos), n64(s.Inner), flag(add1))
         }
         case Work.Attention: m.attentionBackward(s, n, add0, add1, add2)
+        case Work.Shift {
+            if s.DA >= 0: m.elems(KPut, count, m.at(s.DA), m.at(s.DY), kern.Arg(T(1.0)), n64(count), flag(add0))
+        }
+        case Work.Sqrt {
+            if s.DA >= 0: m.elems(KSqrtGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.Y), n64(count), flag(add0))
+        }
+        case Work.Log {
+            if s.DA >= 0: m.elems(KLogGrad, count, m.at(s.DA), m.at(s.DY), m.at(s.A), n64(count), flag(add0))
+        }
+        case Work.Stablemax {
+            if s.DA >= 0: m.rowk(KSmGrad, rows, cols, m.at(s.DA), m.at(s.A), m.Ints.Addr(s.IntA), m.at(s.DY), m.Stats.Addr(2 * s.Inner), n64(cols), flag(add0))
+        }
+        case Work.Rope {
+            if s.DA >= 0: m.rope(s, s.DA, s.DY, rows, cols, pos, -1.0, add0)
+        }
         case Work.CrossEntropy {
             if s.DA >= 0: m.elems(KCeGrad, count, m.at(s.DA), m.at(s.Saved), m.Ints.Addr(s.IntA), m.at(s.DY), m.Stats.Addr(2 * s.Inner), n64(count), n64(cols), flag(add0))
         }
@@ -679,7 +726,7 @@ fn (m mut Mirror<T>&) attentionBackward(s Step&, n I64, add0 Bool, add1 Bool, ad
     ds := stackedOf(m, s.Scratch, qrows * s.Heads, s.Ctx, s.Ctx, s.Heads)
     scale := 1.0 / F64(dm / s.Heads).Sqrt()
     m.plans[i].dp.RunBatch(d, ds, dout, v)
-    m.rowk(KSoftmaxGrad, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Scratch), m.at(s.Scratch), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag), kern.Arg(T(scale)), n64(0))
+    m.rowk(KSoftmaxGrad, n * s.Ctx * s.Heads, s.Ctx, m.at(s.Scratch), m.at(s.Scratch), m.at(s.Saved), n64(s.Ctx), n64(s.Ctx), flag(s.Flag), n64(s.Window), m.startsOf(s), n64(s.Heads), kern.Arg(T(scale)), n64(0))
     if s.DA >= 0 {
         dq := headsOf(m, s.DA, qrows, dm, s.Ctx, s.Heads)
         m.plans[i].dq.RunBatch(d, dq, ds, k, 1.0, 1.0 if add0 else 0.0)

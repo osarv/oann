@@ -2601,7 +2601,9 @@ fn firstInput(k Op, j I64) I64 {
         case Op.Linear(x, w, b): I64(x) if j == 0 else (I64(w) if j == 1 else I64(b))
         case Op.Norm(x, a, b, _, _), Op.Attention(x, a, b, _, _, _, _): I64(x) if j == 0 else (I64(a) if j == 1 else I64(b))
         case Op.MatMul(a, b, _, _), Op.Add(a, b), Op.Sub(a, b), Op.Mul(a, b), Op.Mse(a, b), Op.Embedding(a, b), Op.Positions(a, b), Op.CrossEntropy(a, b): I64(a) if j == 0 else (I64(b) if j == 1 else -1)
+        case Op.StablemaxCE(a, b): I64(a) if j == 0 else (I64(b) if j == 1 else -1)
         case Op.Scale(x, _), Op.Act(x, _), Op.LeakyRelu(x, _), Op.Softmax(x), Op.LogSoftmax(x), Op.Sum(x, _), Op.Reshape(x), Op.Contiguous(x): I64(x) if j == 0 else -1
+        case Op.Shift(x, _), Op.Sqrt(x), Op.Log(x), Op.Rope(x, _, _): I64(x) if j == 0 else -1
         case Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x): I64(x) if j == 0 else -1
         case _: -1
     }
@@ -2610,7 +2612,7 @@ fn firstInput(k Op, j I64) I64 {
 # whether an operation is a loss, its value kept in F64
 fn isLoss(k Op) Bool {
     return match k {
-        case Op.CrossEntropy(_, _), Op.Mse(_, _): true
+        case Op.CrossEntropy(_, _), Op.Mse(_, _), Op.StablemaxCE(_, _): true
         case _: false
     }
 }
@@ -2654,10 +2656,8 @@ if Gpu {
                     # a product of two stacks reads each operand through its strides, the last 1 (no copy recorded)
                     if bn.Dims.Rank > 2 and an.Strides[an.Dims.Rank - 1] == 1 and bn.Strides[bn.Dims.Rank - 1] == 1: continue
                 }
-                case Op.Dropout(_, _), Op.Rope(_, _, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
+                case Op.Dropout(_, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
                 case Op.DeltaRule(_, _, _, _, _), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
-                case Op.Sqrt(_), Op.Log(_), Op.Shift(_, _), Op.StablemaxCE(_, _) { return name + " (node " + $i + ")" }
-                case Op.Attention(_, _, _, _, _, window, docs) { if window > 0 or docs != None: return "windowed or document Attention (node " + $i + ")" }
                 case _ { }
             }
             if isView(nd.Kind) or nd.Kind == Op.Contiguous: continue
@@ -2798,6 +2798,7 @@ if Gpu {
             case Op.Attention(q, k, v, heads, causal, window, docs) {
                 s.Do = mirror.Work.Attention
                 s.Cols, s.Heads, s.Ctx, s.Flag, s.Inner = last, heads, d[1], causal, i
+                s.Window, s.IntA = window, g.intsAt(I64(docs))
                 s.A, s.B, s.C = g.valAt(q), g.valAt(k), g.valAt(v)
                 s.DA, s.DB, s.DC = g.gradAt(q), g.gradAt(k), g.gradAt(v)
                 s.Saved, s.Scratch = nd.SavedOffset, nd.ScratchOffset
@@ -2808,6 +2809,30 @@ if Gpu {
                 s.Cols, s.Rows, s.Inner = zd[zd.Rank - 1], zd.Count() / zd[zd.Rank - 1], i
                 s.Batched = g.nodes[z].Batched
                 s.A, s.DA, s.IntA, s.Saved = g.valAt(z), g.gradAt(z), g.intsAt(c), nd.SavedOffset
+            }
+            case Op.StablemaxCE(z, c) {
+                s.Do = mirror.Work.Stablemax
+                zd := g.nodes[z].Dims
+                s.Cols, s.Rows, s.Inner = zd[zd.Rank - 1], zd.Count() / zd[zd.Rank - 1], i
+                s.Batched = g.nodes[z].Batched
+                s.A, s.DA, s.IntA = g.valAt(z), g.gradAt(z), g.intsAt(c)
+            }
+            case Op.Shift(x, k) {
+                s.Do = mirror.Work.Shift
+                s.Cols, s.K, s.A, s.DA = last, k, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Sqrt(x) {
+                s.Do = mirror.Work.Sqrt
+                s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Log(x) {
+                s.Do = mirror.Work.Log
+                s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
+            }
+            case Op.Rope(x, heads, base) {
+                s.Do = mirror.Work.Rope
+                s.Cols, s.Heads, s.Ctx, s.K = last, heads, d[1], base
+                s.A, s.DA = g.valAt(x), g.gradAt(x)
             }
             case Op.Mse(a, b) {
                 s.Do = mirror.Work.Mse
@@ -2880,12 +2905,12 @@ if Gpu {
         geo := Vec<I64>()
         for i in range g.nodes.Len() {
             s := g.lower(i, geo)
-            if s.Do == mirror.Work.CrossEntropy: rowloss = rowloss.Max(s.Rows)
+            if s.Do == mirror.Work.CrossEntropy or s.Do == mirror.Work.Stablemax: rowloss = rowloss.Max(s.Rows)
             steps.Push(s)
         }
         all := steps.ToArray()
         g.gpu.Steps = all
-        g.gpu.M = try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
+        g.gpu.M ~ try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
         g.OnGpu = true
         g.gpu.HostParams = true
     }
@@ -2902,7 +2927,7 @@ if Gpu {
     # GP7: Times (microseconds, by kind: forward, backward) filled with what each node's kernels take on the device, each
     # run reps times back to back after a Forward and a Backward from loss on n entries (the profile of a GPU step)
     fn (g mut Graph<T>&) GpuProfile(loss Var, reps I64) {
-        m := g.gpu.M!
+        m :~ g.gpu.M!
         n := g.N
         for i in range g.nodes.Len() {
             if isLeaf(g.nodes[i].Kind): continue
@@ -2926,7 +2951,7 @@ if Gpu {
 
     # the parameters up if the host wrote them, and every input and token up (what a Forward starts with)
     fn (g mut Graph<T>&) gpuUpload() {
-        m := g.gpu.M!
+        m :~ g.gpu.M!
         if g.gpu.HostParams {
             m.Upload(g.mem, 0, g.ParamCount)
             g.gpu.HostParams = false
@@ -2961,9 +2986,9 @@ if Gpu {
 
     # a Forward on the device: the parameters up if the host wrote them, every input up, each node's kernels
     fn (g mut Graph<T>&) gpuForward(n I64) {
-        m := g.gpu.M!
+        m :~ g.gpu.M!
         if not g.gpu.Capturing: g.gpuUpload()
-        steps := g.gpu.Steps
+        steps :~ g.gpu.Steps
         for i in range g.nodes.Len() {
             if isLeaf(g.nodes[i].Kind): continue
             m.Forward(steps[i], n, g.Pos)
@@ -2974,7 +2999,7 @@ if Gpu {
 
     # a Backward on the device, the order and the adds of the CPU's
     fn (g mut Graph<T>&) gpuBackward(loss Var, accumulate Bool) {
-        m := g.gpu.M!
+        m :~ g.gpu.M!
         if accumulate: g.pullParams()
         if g.gpu.HostParams and not g.gpu.Capturing {
             m.Upload(g.mem, 0, g.ParamCount)
@@ -2985,7 +3010,7 @@ if Gpu {
         for i in range count: g.written[i] = accumulate and g.nodes[i].Kind == Op.Param
         m.Fill(g.nodes[loss].GradOffset, 1, 1.0)
         g.written[loss] = true
-        steps := g.gpu.Steps
+        steps :~ g.gpu.Steps
         for k in range I64(loss) + 1 {
             i := I64(loss) - k
             nd := g.nodes[i]
@@ -3038,7 +3063,7 @@ if Gpu {
 
     # the inputs handed out since the last Forward, up (before a Backward)
     fn (g mut Graph<T>&) uploadTouched() {
-        m := g.gpu.M!
+        m :~ g.gpu.M!
         for i in range g.nodes.Len() {
             if not g.gpu.Touched[i]: continue
             g.gpu.Touched[i] = false
@@ -3064,8 +3089,8 @@ if Gpu {
     # node v's value (its storage's: a view's base's) or gradient down where the device's is newer - that node's alone,
     # not the activation region (GP8: a step reading a few outputs moves those)
     fn (g Graph<T>&) pullNode(v Var, grad Bool) {
-        m := g.gpu.M!
-        gen := g.gpu.Gen
+        m :~ g.gpu.M!
+        gen :~ g.gpu.Gen
         if grad {
             nd := g.nodes[v]
             if g.gpu.GradGen[v] == gen or nd.GradOffset < 0: return

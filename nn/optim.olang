@@ -271,7 +271,7 @@ if Gpu {
         for r in Spans(g) {
             for k in range r.Lo, r.Hi: mask[k] = 1 if r.Decay else 0
         }
-        o.S = try g.Mirror().AdamW(mask, rate, beta1, beta2, eps, decay) catch gdev.GpuError err { error device.DeviceError.Failed("AdamW's moments: " + $err) }
+        o.S ~ try g.Mirror().AdamW(mask, rate, beta1, beta2, eps, decay) catch gdev.GpuError err { error device.DeviceError.Failed("AdamW's moments: " + $err) }
         return o
     }
 
@@ -295,12 +295,12 @@ if Gpu {
     # second call of a (loss, n, clip) and replayed after it (GP7): the step's hundreds of launches become one. The
     # inputs go up first, outside the graph. The loss is read afterwards with g.Scalar as always
     fn (o mut GpuAdamW<T>&) Train(loss graph.Var, n I64, clip F64 = 0.0) {
-        g := o.g
+        g :~ o.g
         g.GpuFeed(n)
         o.S!.Rate = o.Rate
-        m := g.Mirror()
+        m :~ g.Mirror()
         m.AdamScalars(o.S!)
-        key := m.Key
+        key :~ m.Key
         key[0], key[1], key[2], key[3] = U64(loss), U64(n), clip.Bits(), U64(g.Pos)
         key[4], key[5], key[6], key[7] = 0, 0, 0, 0
         d := device.Opened!

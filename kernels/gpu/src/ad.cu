@@ -193,40 +193,62 @@ extern "C" __global__ void oann_ad_colsum(real *out, const real *x, long long ro
 
 // ---- softmax, log-softmax and log-sum-exp over rows ----
 
-// y's row r = the softmax of x's row r over its first `last` entries and 0 after: last = cols, or with causal the
-// position's own (r % ctx) + 1 - attention's weights, a row of a T x T matrix
-extern "C" __global__ void oann_ad_softmax(real *y, const real *x, long long cols, long long ctx, long long causal) {
+// the band row r of a softmax reads, [*lo, *hi): the whole row (ctx 1, not causal, no window, no starts), or attention's
+// weights, row r a row of a ctx x ctx matrix of sequence r / (ctx heads) at position i = r % ctx (kernels/attention's
+// low and high): causal, i + 1 at most; a window W > 0, from i - W + 1; packed documents (starts: each position's document
+// start, ctx a sequence), from the document's start and, not causal, to its end
+__device__ __forceinline__ void oann_band(long long r, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads, long long *lo, long long *hi) {
+    long long i = r % ctx;
+    long long sr = (r / (ctx * heads)) * ctx + i;
+    long long l = window > 0 && i - window + 1 > 0 ? i - window + 1 : 0;
+    if (starts && (long long)starts[sr] > l) l = starts[sr];
+    long long h = cols;
+    if (causal) h = i + 1;
+    else if (starts) {
+        h = i + 1;
+        while (h < cols && starts[sr + h - i] == starts[sr]) h++;
+    }
+    *lo = l;
+    *hi = h;
+}
+
+// y's row r = the softmax of x's row r over its band (oann_band) and 0 outside it - attention's weights, causal, in a
+// sliding window or within packed documents, or a plain softmax's row (ctx 1, no flags)
+extern "C" __global__ void oann_ad_softmax(real *y, const real *x, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads) {
     long long r = blockIdx.x;
     const real *xr = x + r * cols;
     real *yr = y + r * cols;
-    long long last = causal ? (r % ctx) + 1 : cols;
-    real top = xr[0];
-    for (long long j = threadIdx.x; j < last; j += blockDim.x) top = xr[j] > top ? xr[j] : top;
+    long long lo, last;
+    oann_band(r, cols, ctx, causal, window, starts, heads, &lo, &last);
+    real top = xr[lo];
+    for (long long j = lo + threadIdx.x; j < last; j += blockDim.x) top = xr[j] > top ? xr[j] : top;
     top = oann_bmax(top);
     real s = (real)0;
-    for (long long j = threadIdx.x; j < last; j += blockDim.x) {
+    for (long long j = lo + threadIdx.x; j < last; j += blockDim.x) {
         real e = oann_exp(xr[j] - top);
         yr[j] = e;
         s += e;
     }
     s = oann_bsum(s);
     real scale = (real)1.0 / s;
-    for (long long j = threadIdx.x; j < cols; j += blockDim.x) yr[j] = j < last ? yr[j] * scale : (real)0;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) yr[j] = j >= lo && j < last ? yr[j] * scale : (real)0;
 }
 
-// dx (+)= scale p (dy - <dy, p>) row by row over the first `last` entries (zero after, where written); dx may be dy
-extern "C" __global__ void oann_ad_softmax_grad(real *dx, const real *dy, const real *p, long long cols, long long ctx, long long causal, real scale, long long add) {
+// dx (+)= scale p (dy - <dy, p>) row by row over the band (zero outside it, where written); dx may be dy
+extern "C" __global__ void oann_ad_softmax_grad(real *dx, const real *dy, const real *p, long long cols, long long ctx, long long causal, long long window, const int *starts, long long heads, real scale, long long add) {
     long long r = blockIdx.x;
     const real *gr = dy + r * cols;
     const real *pr = p + r * cols;
     real *dr = dx + r * cols;
-    long long last = causal ? (r % ctx) + 1 : cols;
+    long long lo, last;
+    oann_band(r, cols, ctx, causal, window, starts, heads, &lo, &last);
     real dot = (real)0;
-    for (long long j = threadIdx.x; j < last; j += blockDim.x) dot += gr[j] * pr[j];
+    for (long long j = lo + threadIdx.x; j < last; j += blockDim.x) dot += gr[j] * pr[j];
     dot = oann_bsum(dot);
     for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
-        real v = j < last ? scale * pr[j] * (gr[j] - dot) : (real)0;
-        if (j < last || !add) dr[j] = add ? dr[j] + v : v;
+        bool in = j >= lo && j < last;
+        real v = in ? scale * pr[j] * (gr[j] - dot) : (real)0;
+        if (in || !add) dr[j] = add ? dr[j] + v : v;
     }
 }
 
@@ -571,5 +593,84 @@ extern "C" __global__ void oann_ad_unexpand(real *dx, const real *dy, long long 
             acc = acc + dy[off];
         }
         dx[j] = acc;
+    }
+}
+
+// ---- element functions: Shift, Sqrt, Log (ad/ops) ----
+
+// y = x + k
+extern "C" __global__ void oann_ad_shift(real *y, const real *x, real k, long long n) { OANN_LOOP(i, n) y[i] = x[i] + k; }
+
+// y = sqrt x (NaN below 0)
+extern "C" __global__ void oann_ad_sqrt(real *y, const real *x, long long n) { OANN_LOOP(i, n) y[i] = sqrt(x[i]); }
+
+// dx (+)= dy / (2 y), read from y = sqrt x
+extern "C" __global__ void oann_ad_sqrt_grad(real *dx, const real *dy, const real *y, long long n, long long add) {
+    OANN_LOOP(i, n) { real v = dy[i] / ((real)2.0 * y[i]); dx[i] = add ? dx[i] + v : v; }
+}
+
+// y = log x (-infinity at 0, NaN below)
+extern "C" __global__ void oann_ad_log(real *y, const real *x, long long n) { OANN_LOOP(i, n) y[i] = log(x[i]); }
+
+// dx (+)= dy / x
+extern "C" __global__ void oann_ad_log_grad(real *dx, const real *dy, const real *x, long long n, long long add) {
+    OANN_LOOP(i, n) { real v = dy[i] / x[i]; dx[i] = add ? dx[i] + v : v; }
+}
+
+// ---- stablemax cross entropy (ad/ops' StablemaxCE): s(x) = x + 1 from 0 up, 1 / (1 - x) below ----
+
+__device__ __forceinline__ real oann_stable(real x) { return x >= (real)0 ? x + (real)1.0 : (real)1.0 / ((real)1.0 - x); }
+
+// the rows: rowloss[r] = log(sum s(z) / s(z[class])) (0 for an ignored row); the total is oann_ad_ce_total's
+extern "C" __global__ void oann_ad_sm_rows(double *rowloss, const real *z, const int *classes, long long cols) {
+    long long r = blockIdx.x;
+    const real *zr = z + r * cols;
+    real s = (real)0;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) s += oann_stable(zr[j]);
+    s = oann_bsum(s);
+    if (threadIdx.x == 0) {
+        long long c = classes[r];
+        rowloss[r] = c < 0 ? 0.0 : (double)log(s / oann_stable(zr[c]));
+    }
+}
+
+// dz (+)= dloss s'(z_j) (1 / sum s - [j = class] / s(z_class)) / counted, zero for an ignored row - a block a row;
+// dloss = dy[0] (a device word), counted = stats[1] (oann_ad_ce_total's)
+extern "C" __global__ void oann_ad_sm_grad(real *dz, const real *z, const int *classes, const real *dloss, const double *stats, long long cols, long long add) {
+    long long r = blockIdx.x;
+    const real *zr = z + r * cols;
+    real *dr = dz + r * cols;
+    long long c = classes[r];
+    real counted = (real)stats[1];
+    real k = dloss[0] / (counted > (real)0 ? counted : (real)1);
+    real total = (real)0;
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) total += oann_stable(zr[j]);
+    total = oann_bsum(total);
+    for (long long j = threadIdx.x; j < cols; j += blockDim.x) {
+        real s = oann_stable(zr[j]);
+        real slope = s >= (real)1.0 ? (real)1.0 : s * s;
+        real hit = j == c ? (real)1.0 / s : (real)0.0;
+        real v = c < 0 ? (real)0 : k * slope * ((real)1.0 / total - hit);
+        dr[j] = add ? dr[j] + v : v;
+    }
+}
+
+// ---- rotary positions (kernels/attention's Rope, Su et al.) ----
+
+// y (+)= x rotated, dir 1 (or back, -1: the gradient): row r at position pos + r % ctx, in each head of dh columns the
+// pair (c, c + dh / 2) by the angle dir position base^(-2c / dh), the angle and its cosine and sine in double as the
+// CPU's, the rotation in real; n = rows x cols / 2 pairs. y may be x where not added
+extern "C" __global__ void oann_ad_rope(real *y, const real *x, long long n, long long cols, long long dh, long long ctx, long long pos, double logbase, double dir, long long add) {
+    long long half = dh / 2, pairs = cols / 2;
+    OANN_LOOP(i, n) {
+        long long r = i / pairs, q = i % pairs;
+        long long c = q % half;
+        long long o = r * cols + (q / half) * dh + c;
+        double angle = dir * (double)(pos + r % ctx) * exp(-2.0 * (double)c / (double)dh * logbase);
+        real cs = (real)cos(angle), sn = (real)sin(angle);
+        real a = x[o], b = x[o + half];
+        real u = a * cs - b * sn, v = a * sn + b * cs;
+        y[o] = add ? y[o] + u : u;
+        y[o + half] = add ? y[o + half] + v : v;
     }
 }

@@ -128,7 +128,7 @@ fn softmaxCase(d mut gdev.Device&, k kern.Kit&, rows I64, cols I64, ctx I64, cau
     }
     bx := try up(d, x)
     by := try gdev.Buf<F32>.Make(d, rows * cols)
-    kern.LaunchKit(d, k, mirror.KSoftmax, rows, mirror.RowBlock(cols), by.Addr(0), bx.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)))
+    kern.LaunchKit(d, k, mirror.KSoftmax, rows, mirror.RowBlock(cols), by.Addr(0), bx.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(I64(0)), U64(0), kern.Arg(I64(1)))
     got := try down(d, by)
     w, big := worst(got, want)
     what := "softmax " + $rows + " x " + $cols + (" causal ctx " + $ctx if causal else "")
@@ -143,7 +143,7 @@ fn softmaxCase(d mut gdev.Device&, k kern.Kit&, rows I64, cols I64, ctx I64, cau
     }
     bdy := try up(d, dy)
     bdx := try gdev.Buf<F32>.Make(d, rows * cols)
-    kern.LaunchKit(d, k, mirror.KSoftmaxGrad, rows, mirror.RowBlock(cols), bdx.Addr(0), bdy.Addr(0), by.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(F32(1.0)), kern.Arg(I64(0)))
+    kern.LaunchKit(d, k, mirror.KSoftmaxGrad, rows, mirror.RowBlock(cols), bdx.Addr(0), bdy.Addr(0), by.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(I64(0)), U64(0), kern.Arg(I64(1)), kern.Arg(F32(1.0)), kern.Arg(I64(0)))
     gotG := try down(d, bdx)
     wg, bigG := worst(gotG, wantG)
     assert wg <= 1.0e-6 * (1.0 + bigG), what + " backward: " + $wg
@@ -290,12 +290,13 @@ test adamKernel "AdamW's kernel is nn/optim's step bit for bit, decay only where
 # ---- whole graphs ----
 
 # a network recorded on a graph: its handles
-type Net struct(x graph.Var, y graph.Var, logits graph.Var, loss graph.Var, tokens Bool) {
+type Net struct(x graph.Var, y graph.Var, logits graph.Var, loss graph.Var, tokens Bool, docs graph.Var = graph.None) {
     x
     y
     logits
     loss
     tokens
+    docs    # packed documents' starts (a Tokens input), or None
 }
 
 fn Net.mlp(g mut graph.Graph<F32>&) Net {
@@ -323,16 +324,28 @@ fn charlmOf(c gpt.GptConfig) fn&(g mut graph.Graph<F32>&) Net {
 # fills the batch of n entries the same on both graphs: tokens or inputs and classes from the seed
 fn feed(g mut graph.Graph<F32>&, net Net&, n I64, seed U64, classes I64) {
     r := rand.Rand(seed)
+    if net.docs != graph.None {
+        # each sequence cut into documents at positions drawn from the seed: each position's document start
+        ds :~ g.Ints(net.docs).Flat()!
+        ctx := g.Info(net.docs).Dims[1]
+        for b in range ds.Len() / ctx {
+            start I32 = 0
+            for i in range ctx {
+                if i > 0 and r.Below(4) == 0: start = I32(i)
+                ds[b * ctx + i] = start
+            }
+        }
+    }
     if net.tokens {
-        t := g.Ints(net.x).Flat()!
-        c := g.Ints(net.y).Flat()!
+        t :~ g.Ints(net.x).Flat()!
+        c :~ g.Ints(net.y).Flat()!
         for i in range t.Len() { t[i] = I32(r.Below(classes)) }
         for i in range c.Len() { c[i] = I32(r.Below(classes)) }
         return
     }
-    xs := g.Data(net.x).Flat()!
+    xs :~ g.Data(net.x).Flat()!
     for i in range xs.Len(): xs[i] = F32(r.Uniform(-1.0, 1.0))
-    ys := g.Ints(net.y).Flat()!
+    ys :~ g.Ints(net.y).Flat()!
     for i in range ys.Len(): ys[i] = I32(r.Below(classes))
 }
 
@@ -420,6 +433,96 @@ fn charlmCase() {
 }
 
 test charlmCase "the character transformer on the GPU, its variants too: forward and backward within rounding of the CPU's, twice alike" { charlmCase() }
+
+# attention in a band: a sliding window of 3, packed documents causal, and packed documents both ways (an encoder's) -
+# token embeddings, one attention of 2 heads, the logits; ctx 12
+fn bandsOf(variant I64) fn&(g mut graph.Graph<F32>&) Net {
+    return fn(g mut graph.Graph<F32>&) Net {
+        t := g.Tokens(12)
+        y := g.Classes(12)
+        docs := graph.None if variant == 0 else g.Tokens(12)
+        e := g.Embedding(t, g.Param(graph.Init.Normal(0.0, 0.5), true, 9, 16))
+        q := g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16))
+        k := g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16))
+        v := g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16))
+        a := g.Attention(q, k, v, 2, variant != 2, 3 if variant == 0 else 0, docs)
+        logits := g.Linear(g.Add(a, e), g.Param(graph.Init.Normal(0.0, 0.3), true, 9, 16))
+        g.Keep(logits)
+        return Net(t, y, logits, g.CrossEntropy(logits, y), true, docs)
+    }
+}
+
+fn bandsCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("windowed and document attention")
+        return
+    }
+    for variant in range 3 {
+        cpu, gpu, net := pair(bandsOf(variant), 4, U64(variant) + 21)
+        for n in Array<I64>[4, 3] {
+            feed(cpu, net, n, U64(n) + 5, 9)
+            feed(gpu, net, n, U64(n) + 5, 9)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 5.0e-4, "attention band " + $variant + " at " + $n)
+            first := Array<F32>[x for x in gpu.ParamGrads().Flat()!]
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            assert first == Array<F32>[x for x in gpu.ParamGrads().Flat()!], "attention band " + $variant + ": a second run differs"
+        }
+    }
+}
+
+test bandsCase "windowed attention and packed documents (causal, and both ways) on the GPU: within rounding of the CPU's, a short batch, twice alike" { bandsCase() }
+
+# rotary positions on q and k (base 10000, and 500), x + k, sqrt and log on the way, and stablemax cross entropy as the
+# loss - each against the CPU's, ctx 12, one in four classes ignored
+fn elemsOf(base F64) fn&(g mut graph.Graph<F32>&) Net {
+    return fn(g mut graph.Graph<F32>&) Net {
+        t := g.Tokens(12)
+        y := g.Classes(12)
+        e := g.Embedding(t, g.Param(graph.Init.Normal(0.0, 0.5), true, 9, 16))
+        q := g.Rope(g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16)), 2, base)
+        k := g.Rope(g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16)), 2, base)
+        a := g.Attention(q, k, e, 2, true)
+        sq := g.Sqrt(g.AddScalar(g.Mul(a, a), 0.5))
+        lg := g.Log(g.AddScalar(g.Mul(e, e), 1.0))
+        logits := g.Linear(g.Add(sq, lg), g.Param(graph.Init.Normal(0.0, 0.5), true, 9, 16))
+        g.Keep(logits)
+        return Net(t, y, logits, g.StablemaxCE(logits, y), true)
+    }
+}
+
+# every fourth class -1: ignored by the loss
+fn ignoreSome(g mut graph.Graph<F32>&, net Net&) {
+    ys :~ g.Ints(net.y).Flat()!
+    for i in range 0, ys.Len(), 4: ys[i] = -1
+}
+
+fn elemsCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("rope, sqrt, log, shift and stablemax")
+        return
+    }
+    for base in Array<F64>[10000.0, 500.0] {
+        cpu, gpu, net := pair(elemsOf(base), 4, 31)
+        for n in Array<I64>[4, 3] {
+            feed(cpu, net, n, U64(n) + 2, 9)
+            feed(gpu, net, n, U64(n) + 2, 9)
+            ignoreSome(cpu, net)
+            ignoreSome(gpu, net)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 5.0e-4, "rope and the element functions (base " + $base + ") at " + $n)
+        }
+    }
+}
+
+test elemsCase "rotary positions, AddScalar, Sqrt, Log and stablemax cross entropy (classes ignored too) on the GPU: within rounding of the CPU's, a short batch" { elemsCase() }
 
 fn trained() {
     if not device.GpuAvailable() {
