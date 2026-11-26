@@ -42,13 +42,13 @@ type Config struct() {
 }
 
 fn intOf(j json.Json&, key String&) I64 ? ModelError {
-    v := try j[key] catch { error ModelError.Malformed("config.json has no " + key) }
+    v :~ try j[key] catch { error ModelError.Malformed("config.json has no " + key) }
     return try v.AsInt() catch { error ModelError.Malformed("config.json's " + key) }
 }
 
 fn Config.Parse(text String&) Config ? ModelError {
-    j := try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
-    kind := try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
+    j :~ try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
+    kind :~ try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
     if kind != "whisper": error ModelError.Unsupported("model_type " + kind + " (whisper runs)")
     c := Config()
     c.Dim = try intOf(j, "d_model")
@@ -120,7 +120,7 @@ fn (r reader&) into(dst mut Array<F32>&, at I64, name String&, n I64) ? ModelErr
 # its bias from "name.bias" where there is one (zero otherwise)
 fn (r reader&) lin(l mut Lin&, name String&, from I64 = 0, rows I64 = -1) ? ModelError {
     n := l.Out if rows < 0 else rows
-    if l.W.Len() == 0: l.W = Array<F32>(l.In * l.Out)
+    if l.W.Len() == 0: l.W ~ Array<F32>(l.In * l.Out)
     try r.into(l.W, from * l.In, name + ".weight", n * l.In)
     if r.f.Has(name + ".bias"): try r.into(l.Bias, from, name + ".bias", n)
 }
@@ -133,18 +133,18 @@ fn (r reader&) norm(n mut Norm&, name String&) ? ModelError {
 # l's weights rounded to BF16 where it runs so, the F32 ones dropped
 fn (l mut Lin&) settle() {
     if not l.Bf: return
-    l.H = Array<BF16>[BF16(v) for v in l.W]
-    l.W = Array<F32>(0)
+    l.H ~ Array<BF16>[BF16(v) for v in l.W]
+    l.W ~ Array<F32>(0)
 }
 
 # l's weights as INT8, symmetric per output row (scale max|w| / 127), the F32 and BF16 ones dropped: a product reads a
 # quarter of the bytes of F32's, which is the whole cost of the decoder's few rows on a memory-bound CPU (a Pi 4)
 fn (l mut Lin&) Quantize() {
     if l.Out == 0 or l.Q.Len() > 0: return
-    src := l.W if l.W.Len() > 0 else Array<F32>[F32(v) for v in l.H]
-    l.Q = Array<I8>(l.In * l.Out)
-    l.Sc = Array<F32>(l.Out)
-    l.Qs = Array<I32>(l.Out)
+    src :~ l.W if l.W.Len() > 0 else Array<F32>[F32(v) for v in l.H]
+    l.Q ~ Array<I8>(l.In * l.Out)
+    l.Sc ~ Array<F32>(l.Out)
+    l.Qs ~ Array<I32>(l.Out)
     for o in range l.Out {
         top F32 = 0.0
         for k in range l.In: top = top.Max(src[o * l.In + k].Abs())
@@ -153,8 +153,8 @@ fn (l mut Lin&) Quantize() {
         for k in range l.In: l.Q[o * l.In + k] = I8((src[o * l.In + k] / sc).RoundEven().Clamp(-127.0, 127.0))
         for k in range l.In: l.Qs[o] += I32(l.Q[o * l.In + k])
     }
-    l.W = Array<F32>(0)
-    l.H = Array<BF16>(0)
+    l.W ~ Array<F32>(0)
+    l.H ~ Array<BF16>(0)
 }
 
 fn (r reader&) block(b mut Block&, p String&, d I64) ? ModelError {
@@ -219,9 +219,9 @@ fn Model.Load(dir String&, bf Bool = false, q8 Bool = false) Model ? ModelError,
     for i in range c.EncLayers: try r.block(m.Enc[i], "model.encoder.layers." + $i + ".", c.Dim)
     try r.norm(m.EncLn, "model.encoder.layer_norm")
     try r.into(m.Embed, 0, "model.decoder.embed_tokens.weight", c.Vocab * c.Dim)
-    m.Head.W = m.Embed
-    if bf: m.Head.H = Array<BF16>[BF16(v) for v in m.Embed]
-    if bf: m.Head.W = Array<F32>(0)
+    m.Head.W ~ m.Embed
+    if bf: m.Head.H ~ Array<BF16>[BF16(v) for v in m.Embed]
+    if bf: m.Head.W ~ Array<F32>(0)
     try r.into(m.DecPos, 0, "model.decoder.embed_positions.weight", c.Text * c.Dim)
     for i in range c.DecLayers: try r.block(m.Dec[i], "model.decoder.layers." + $i + ".", c.Dim)
     try r.norm(m.DecLn, "model.decoder.layer_norm")
@@ -359,7 +359,7 @@ fn part8(dst mut Array<F32>&, xq Array<I8>&, xs Array<F32>&, rows I64, w Lin&, o
     for r0 in range 0, rows, RowBlock {
         r1 := (r0 + RowBlock).Min(rows)
         for o in range o0, o1 {
-            q := w.Q[o * n:(o + 1) * n]
+            q :~ w.Q[o * n:(o + 1) * n]
             sc := w.Sc[o]
             b := w.Bias[o]
             for r in range r0, r1: dst[r * w.Out + o] = F32(Dot8(xq[r * n:(r + 1) * n], q)) * xs[r] * sc + b
@@ -376,7 +376,7 @@ fn part8u(dst mut Array<F32>&, xu Array<U8>&, xs Array<F32>&, rows I64, w Lin&, 
     for r0 in range 0, rows, RowBlock {
         r1 := (r0 + RowBlock).Min(rows)
         for o in range o0, o1 {
-            q := w.Q[o * n:(o + 1) * n]
+            q :~ w.Q[o * n:(o + 1) * n]
             sc := w.Sc[o]
             b := w.Bias[o]
             c := 128 * w.Qs[o]
@@ -667,7 +667,7 @@ fn (m Model&) selfAttend(k mut Decoder&, l I64) {
         p := k.pos[r] + 1
         for h in range c.DecHeads {
             q := r * 3 * d + h * hd
-            s := k.s[r * c.Positions.Max(c.Text):]
+            s :~ k.s[r * c.Positions.Max(c.Text):]
             for j in range p {
                 dot F32 = 0.0
                 for i in range hd: dot += k.qkv[q + i] * k.K[base + j * d + h * hd + i]
@@ -720,14 +720,14 @@ fn Models() Array<String> {
 
 # the models past tiny the checks run: base and small, none where $OANN_SPEECH_QUICK is set (under an emulator)
 fn Larger() Array<String> {
-    quick := try os.Env("OANN_SPEECH_QUICK") catch default ""
+    quick :~ try os.Env("OANN_SPEECH_QUICK") catch default ""
     return Array<String>(0) if quick.Len() > 0 else Array<String>["base", "small"]
 }
 
 # the integers of key's array in object sub of a JSON file
 fn Ints(path String&, sub String&, key String&) Array<I32> ? os.Error, json.Error {
-    j := try json.Json.Parse(try os.ReadFile(path))
-    a := try (try (try j[sub])[key]).AsArr()
+    j :~ try json.Json.Parse(try os.ReadFile(path))
+    a :~ try (try (try j[sub])[key]).AsArr()
     return Array<I32>[I32(try v.AsInt() catch default 0) for v in a]
 }
 
@@ -782,7 +782,7 @@ test Arith "INT8 products: the biased U8 dot (x86) is the signed one's integers 
     for shape in [[3, 300, 200], [1, 512, 1536], [17, 64, 130], [16, 1024, 600]] {
         rows, inn, out := shape[0], shape[1], shape[2]
         w := Lin(inn, out, false)
-        w.W = Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.0001 for i in range inn * out]
+        w.W ~ Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.0001 for i in range inn * out]
         for o in range out: w.Bias[o] = F32(o % 5) * 0.25
         w.Quantize()
         src := Array<F32>[F32(((i * 104729) % 1999) - 999) * 0.001 for i in range rows * inn]

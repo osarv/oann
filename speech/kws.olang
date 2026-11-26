@@ -113,7 +113,7 @@ fn Spotter.Load(path String&, batch I64 = 1) Spotter ? os.Error {
     c := Config()
     c.Mels = try (try f.Meta.Get("mels") catch { error os.Error.Failed("mels") }).ParseInt() catch { error os.Error.Failed("mels") }
     c.Frames = try (try f.Meta.Get("frames") catch { error os.Error.Failed("frames") }).ParseInt() catch { error os.Error.Failed("frames") }
-    ch := (try f.Meta.Get("channels") catch { error os.Error.Failed("channels") }).Split(",")
+    ch :~ (try f.Meta.Get("channels") catch { error os.Error.Failed("channels") }).Split(",")
     if ch.Len() != 3: error os.Error.Failed("channels")
     c.C1 = try ch[0].ParseInt() catch { error os.Error.Failed("channels") }
     c.C2 = try ch[1].ParseInt() catch { error os.Error.Failed("channels") }
@@ -187,7 +187,7 @@ fn example(c Config&, s mut mel.Mel&, d sounds&, wake Bool, o TrainOptions&, r m
     span := (c.Frames + 4) * mel.Hop
     x := Array<F32>(span)
     k := r.Below(d.Neg.Len())
-    n := d.Neg[k]
+    n :~ d.Neg[k]
     level := F32(1.0 if not wake else o.Mix * r.Float())
     if not wake and r.Below(2) == 0 {
         place(x, n, d.NegAt[k], o.Shift, level, r)
@@ -210,8 +210,8 @@ fn Train(c Config, pos Array<Array<F32>&>&, neg Array<Array<F32>&>&, o TrainOpti
     r := rand.Rand(o.Seed + 1)
     m := mel.Mel(c.Mels, 256)
     d := sounds(pos, neg, centres(m, pos), centres(m, neg))
-    xs := s.G.Data(s.Task.X).Flat()!
-    ys := s.G.Ints(s.Task.Y).Flat()!
+    xs :~ s.G.Data(s.Task.X).Flat()!
+    ys :~ s.G.Ints(s.Task.Y).Flat()!
     per := c.Frames * c.Mels
     batches := ((pos.Len() + neg.Len()) * o.PerClip / o.Batch).Max(1)
     loss F64 = 0.0
@@ -269,7 +269,7 @@ fn (d mut Detector&) Push(x Array<F32>&) Array<Detection> {
     upto := ((d.base + d.buf.Len() - mel.Window / 2) / mel.Hop + 1).Max(0)
     if upto > have {
         out := Array<F32>((upto - have) * c.Mels)
-        all := d.buf.ToArray()
+        all :~ d.buf.ToArray()
         d.m.Log(out, all, all.Len(), have - d.base / mel.Hop, upto - have)
         for v in out: d.frames.Push(v)
     }
@@ -277,7 +277,7 @@ fn (d mut Detector&) Push(x Array<F32>&) Array<Detection> {
     if d.next == 0: d.next = c.Frames
     for d.next <= d.f0 + d.frames.Len() / c.Mels {
         Window(c, d.frames.ToArray(), d.next - c.Frames - d.f0, d.win)
-        xs := d.S.G.Data(d.S.Task.X).Flat()!
+        xs :~ d.S.G.Data(d.S.Task.X).Flat()!
         for i in range d.win.Len(): xs[i] = d.win[i]
         d.S.Scores(1, d.one)
         d.recent[d.scored % 64] = d.one[0]
@@ -304,7 +304,7 @@ fn (d mut Detector&) trim() {
     if drop > 256 {
         rest := Vec<F32>()
         for i in range drop * c.Mels, d.frames.Len(): rest.Push(d.frames[i])
-        d.frames = rest
+        d.frames ~ rest
         d.f0 += drop
     }
     # samples: those before the first frame still to be computed, less a window
@@ -313,7 +313,7 @@ fn (d mut Detector&) trim() {
     if sdrop > 16000 {
         rest := Vec<F32>()
         for i in range sdrop, d.buf.Len(): rest.Push(d.buf[i])
-        d.buf = rest
+        d.buf ~ rest
         d.base += sdrop
     }
 }
@@ -371,8 +371,8 @@ test Detector "a network trained on a synthetic word finds it in a stream of noi
         for j in range w.Len(): bg[4000 + j] += w[j]
         ns.Push(bg)
     }
-    pos := ps.ToArray()
-    neg := ns.ToArray()
+    pos :~ ps.ToArray()
+    neg :~ ns.ToArray()
     o := TrainOptions()
     if RaceBuild {
         # the training runs tasks, which is what a race build checks; the whole test is a minute of arithmetic that
@@ -380,7 +380,7 @@ test Detector "a network trained on a synthetic word finds it in a stream of noi
         o.Epochs = 2
         s, _ := Train(Config(), pos[:4], neg[:4], o)!
         Println("race build: trained 2 epochs on 8 examples; the detection is checked without the race detector")
-        dir := os.MkTemp()!
+        dir :~ os.MkTemp()!
         s.Save(dir + "/wake.safetensors")!
         os.RemoveAll(dir)!
         return
@@ -388,7 +388,7 @@ test Detector "a network trained on a synthetic word finds it in a stream of noi
     o.Epochs = 15
     s, loss := Train(Config(), pos, neg, o)!
     assert loss < 0.1, $loss
-    dir := os.MkTemp()!
+    dir :~ os.MkTemp()!
     s.Save(dir + "/wake.safetensors")!
     loaded := Spotter.Load(dir + "/wake.safetensors")!
     os.RemoveAll(dir)!

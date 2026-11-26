@@ -80,7 +80,7 @@ type Potential struct(rho neuron.Rho, at I64, n I64) {
 
 # population p's potential, where the system's state is laid out by StateOf
 fn Potential.Of<T>(s system.System<T>&, p system.Pop) Potential ? EnergyError {
-    pop := s.Pop(p)
+    pop :~ s.Pop(p)
     model := pop.Model
     if model != neuron.Neuron.Rate: error EnergyError.NoTerm("population " + $I64(p) + " is not of rate neurons")
     if model.rho == neuron.Rho.LifRate: error EnergyError.NoTerm("LifRate neurons have no potential here")
@@ -127,7 +127,7 @@ type Bilinear<T> struct(w mut Array<T>&, off I64, rows I64, cols I64, post I64, 
 # connection c's coupling, a dense or symmetric one (a symmetric one read both ways is this one term: its effective
 # matrix is W + W^T)
 fn Bilinear<T>.Of(s system.System<T>&, c system.Conn) Bilinear<T> ? EnergyError {
-    l := s.Link(c)
+    l :~ s.Link(c)
     kind := l.Kind
     if kind != conn.Wiring.Dense and kind != conn.Wiring.Symmetric: error EnergyError.NoTerm("connection " + $I64(c) + " is not dense")
     post, pre := s.E.Pops[l.Post], s.E.Pops[l.Pre]
@@ -186,7 +186,7 @@ fn Linear<T>.Bias(s system.System<T>&, p system.Pop) Linear<T> {
 # population p's constant in batch row row - its drive, its biases and the carries of the inputs folded into it, as the
 # last settle made them; no parameter of its own
 fn Linear<T>.Constant(s system.System<T>&, p system.Pop, row I64) Linear<T> {
-    pop := s.Pop(p)
+    pop :~ s.Pop(p)
     return Linear<T>(pop.Const, row * pop.Size, pop.Unit, pop.Size, Array<T>(0))
 }
 
@@ -288,7 +288,7 @@ fn (h mut LogSumExp<T>&) AddParamGrad(z Array<T>&, scale F64) {
 # the activities of batch row row of phase, every unit at its place (Unit), into z (the system's units long)
 fn StateOf<T>(s system.System<T>&, phase settle.Phase, row I64, z mut Array<T>&) {
     for pop in s.E.Pops {
-        a := pop.Activity(0)
+        a :~ pop.Activity(0)
         at := (phase.Index() * s.Batch + row) * pop.Size
         for j in range pop.Size: z[pop.Unit + j] = a[at + j]
     }
@@ -299,7 +299,7 @@ fn StateOf<T>(s system.System<T>&, phase settle.Phase, row I64, z mut Array<T>&)
 # population's constant. Refuses spiking, custom and LifRate populations and one-way recurrent connections. A
 # diagnostic: it makes its own room
 fn Of<T>(s mut system.System<T>&, phase settle.Phase, row I64) F64 ? EnergyError {
-    e := s.E
+    e :~ s.E
     r := phase.Index() * s.Batch + row
     total F64 = 0.0
     for p in e.Pops {
@@ -313,10 +313,10 @@ fn Of<T>(s mut system.System<T>&, phase settle.Phase, row I64) F64 ? EnergyError
     for l in e.Links {
         if l.Folded: continue
         if not l.Both: error EnergyError.NoTerm("a one-way recurrent connection has no energy")
-        post := e.Pops[l.Post]
+        post :~ e.Pops[l.Post]
         carry := Array<T>((r + 1) * l.PostSize)
         l.Forward(ws, sc, carry, e.Pops[l.Pre].Activity(0), r, r + 1)
-        a := post.Activity(0)
+        a :~ post.Activity(0)
         for i in range l.PostSize: total -= F64(a[r * l.PostSize + i]) * F64(carry[r * l.PostSize + i])
     }
     return total

@@ -15,7 +15,7 @@ import "quant"
 fn vector<T>(g graph.Graph<T>&, v graph.Var, n I64) Array<F32> {
     out := Array<F32>(n)
     if v == graph.None: return out
-    d := g.Value(v).Flat()!
+    d :~ g.Value(v).Flat()!
     for i in range n: out[i] = F32(d[i])
     return out
 }
@@ -92,7 +92,7 @@ fn convNet(seed U64) graph.Graph<F32>, graph.Var, graph.Var, quant.Model {
     g.Keep(y)
     r := rand.Rand(seed)
     g.Plan(r)!
-    w := g.Params().Flat()!
+    w :~ g.Params().Flat()!
     for i in range w.Len(): w[i] = w[i] * 4.0
     m := quant.Model(9, 72)
     Conv(m, g, c, true)
@@ -106,10 +106,10 @@ test Conv "a quantized convolution network runs what the F32 graph runs, dynamic
     assert m.Outputs() == 4 and m.Layers.Len() == 3
     r := rand.Rand(5)
     xs := samples(9, 72, r, 0.0, 1.0)
-    copy := g.Data(x).Flat()!
+    copy :~ g.Data(x).Flat()!
     for i in range 648: copy[i] = xs[i]
     g.Forward(9)
-    want := g.Value(y).Flat()!
+    want :~ g.Value(y).Flat()!
     big F32 = 0.0
     for v in want: big = big.Max(v.Abs())
     for calibrated in Array<Bool>[false, true] {
@@ -135,11 +135,11 @@ test Mlp "a perceptron of a graph, threads or not, gives the same logits and the
     y := net.Apply(g, x)
     g.Keep(y)
     try g.Plan(rand.Rand(6))
-    w := g.Params().Flat()!
+    w :~ g.Params().Flat()!
     for i in range w.Len(): w[i] = w[i] * 3.0
     r := rand.Rand(7)
     xs := samples(16, 20, r, 0.0, 1.0)
-    copy := g.Data(x).Flat()!
+    copy :~ g.Data(x).Flat()!
     for i in range 320: copy[i] = xs[i]
     g.Forward(16)
     one := Mlp(16, g, net)
@@ -170,7 +170,7 @@ test Quantize "a graph's Linear layers in INT8 and back: close to F32, F32 again
     g.Keep(y)
     try g.Plan(rand.Rand(8))
     r := rand.Rand(9)
-    xs := g.Data(x).Flat()!
+    xs :~ g.Data(x).Flat()!
     for i in range 48: xs[i] = F32(r.Float())
     g.Forward(4)
     want := g.Value(y).Clone()
@@ -190,7 +190,7 @@ test Quantize "a graph's Linear layers in INT8 and back: close to F32, F32 again
 
 # this process's resident memory in kB (VmRSS, Linux)
 fn resident() I64 {
-    status := try os.ReadFile("/proc/self/status") catch { return 0 }
+    status :~ try os.ReadFile("/proc/self/status") catch { return 0 }
     for line in status.Lines() {
         if not line.StartsWith("VmRSS:"): continue
         return try line[6:].Trim().Split(" ")[0].ParseInt() catch { return 0 }

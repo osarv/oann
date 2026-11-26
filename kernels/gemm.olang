@@ -130,13 +130,13 @@ fn accF32<A>(z A) Bool {
 # size replaces the panels
 fn (ws mut Workspace<A>&) Reserve(dim I64, wide I64 = 0) {
     z A
-    if ws.a.Len() < roomA(ws.Threads, dim, z): ws.a = Array<A>(roomA(ws.Threads, dim, z))
-    if ws.b.Len() < roomB(ws.Threads, dim, z): ws.b = Array<A>(roomB(ws.Threads, dim, z))
-    if ws.c.Len() < wide: ws.c = Array<A>(wide)
+    if ws.a.Len() < roomA(ws.Threads, dim, z): ws.a ~ Array<A>(roomA(ws.Threads, dim, z))
+    if ws.b.Len() < roomB(ws.Threads, dim, z): ws.b ~ Array<A>(roomB(ws.Threads, dim, z))
+    if ws.c.Len() < wide: ws.c ~ Array<A>(wide)
     if not ws.Tile and not ws.Pairs: return
-    if ws.ta.Len() < ws.Threads * amxRows * roundUp(dim, 32): ws.ta = Array<BF16>(ws.Threads * amxRows * roundUp(dim, 32))
-    if ws.tb.Len() < ws.Threads * amxCols * roundUp(dim, 32): ws.tb = Array<BF16>(ws.Threads * amxCols * roundUp(dim, 32))
-    if ws.tc.Len() < ws.Threads * amxRows * amxCols: ws.tc = Array<F32>(ws.Threads * amxRows * amxCols)
+    if ws.ta.Len() < ws.Threads * amxRows * roundUp(dim, 32): ws.ta ~ Array<BF16>(ws.Threads * amxRows * roundUp(dim, 32))
+    if ws.tb.Len() < ws.Threads * amxCols * roundUp(dim, 32): ws.tb ~ Array<BF16>(ws.Threads * amxCols * roundUp(dim, 32))
+    if ws.tc.Len() < ws.Threads * amxRows * amxCols: ws.tc ~ Array<F32>(ws.Threads * amxRows * amxCols)
 }
 
 # the panels' room for products of every size up to dim on threads tasks: op(A)'s, a block of tile rows by a block
@@ -160,12 +160,12 @@ fn (ws mut Workspace<A>&) ReserveLayer<S>(x I64, y I64, z I64, like S, perTask B
 
 # room for every GemmI8 of at most n outputs (b's rows) and depth k, on up to ws.Threads tasks
 fn (ws mut Workspace<A>&) ReserveI8(n I64, k I64) {
-    if ws.corr.Len() < n: ws.corr = Array<I32>(n)
+    if ws.corr.Len() < n: ws.corr ~ Array<I32>(n)
     k4 I64 = roundUp(k, 4)
     nb I64 = roundUp(n, i8WideCols) * k4
     na I64 = i8ThinRows * k4 * ws.Threads
-    if ws.qb.Len() < nb: ws.qb = Array<I8>(nb)
-    if ws.qa.Len() < na: ws.qa = Array<U8>(na)
+    if ws.qb.Len() < nb: ws.qb ~ Array<I8>(nb)
+    if ws.qa.Len() < na: ws.qa ~ Array<U8>(na)
 }
 
 fn (ws mut Workspace<A>&) panelsA(n I64) mut Array<A>& {
@@ -233,7 +233,7 @@ fn Gemm<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&,
     if m == 0 or n == 0: return
     oa := operand<SA>.of(a)
     ob := operand<SB>.of(b)
-    cd := c.Data[c.Off:]
+    cd :~ c.Data[c.Off:]
     if k > 0 and ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
         if ta: tileProduct(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld)
         else: tileTasks(ws, m, n, k, oa, ob, tb, ws.tb, 0, false, alpha, beta, cd, c.Ld)
@@ -256,7 +256,7 @@ fn GemmLeft<L, SC, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a L, k I64, 
     if c.Rows == 0 or c.Cols == 0: return
     fa := foreign<L>(a)
     ob := operand<SB>.of(b)
-    cd := c.Data[c.Off:]
+    cd :~ c.Data[c.Off:]
     product(c.Rows, c.Cols, k, fa, false, ob, tb, alpha, beta, cd, c.Ld, ws, epi, false)
 }
 
@@ -282,7 +282,7 @@ fn GemmBatch<SC, SA, SB, A>(ws mut Workspace<A>&, c mut Batch<SC>&, a Batch<SA>&
             g, mb := e / c.Members, e % c.Members
             oa := operand<SA>(a.Data[a.Off + a.GroupStride * g + a.MemberStride * mb:], a.Ld)
             ob := operand<SB>(b.Data[b.Off + b.GroupStride * g + b.MemberStride * mb:], b.Ld)
-            cd := c.Data[c.Off + c.GroupStride * g + c.MemberStride * mb:]
+            cd :~ c.Data[c.Off + c.GroupStride * g + c.MemberStride * mb:]
             tileBlocks(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld, false, lower, result, diag)
         }
         return
@@ -294,10 +294,10 @@ fn GemmBatch<SC, SA, SB, A>(ws mut Workspace<A>&, c mut Batch<SC>&, a Batch<SA>&
     bsize I64 = depthMax * lesser((n + nr - 1) / nr * nr, blockCols(z))
     asize I64 = depthMax * lesser((m + microRows - 1) / microRows * microRows, blockRows(z))
     tasks I64 = 1 if count * m * n * k < 2000000 else lesser(ws.Threads, count)
-    bp := ws.panelsB(tasks * bsize)
-    ap := ws.panelsA(tasks * asize)
+    bp :~ ws.panelsB(tasks * bsize)
+    ap :~ ws.panelsA(tasks * asize)
     wsize I64 = 0 if k <= kc or sameType(c.Data, z) else m * n
-    wd := ws.wideC(tasks * wsize)
+    wd :~ ws.wideC(tasks * wsize)
     share I64 = (count + tasks - 1) / tasks
     run := batchRun<SC, SA, SB, A>(c.Data[c.Off:], strides.of(c), a.Data[a.Off:], strides.of(a), ta, b.Data[b.Off:], strides.of(b), tb, m, n, k, alpha, beta, thin, lower, result, diag)
     if tasks <= 1 {
@@ -791,7 +791,7 @@ fn product<SA, SB, S, A>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bool, al
     if k > kc and not sameType(c, al) {
         # a depth of several blocks into storage narrower than the accumulator: the partial sums are kept in the
         # accumulator, in ws, and C rounded once at the end
-        wide := ws.wideC(m * n)
+        wide :~ ws.wideC(m * n)
         if be != 0: copyInto(wide, n, c, ldc, m, n, al, n)
         product(m, n, k, sa, ta, sb, tb, al, be, wide, n, ws, ep, mayExchange)
         copyInto(c, ldc, wide, n, m, n, c[0], n)
@@ -819,8 +819,8 @@ fn packedProduct<SA, SB, A, S>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bo
     colsEach I64 = n if byRows else share
     asize I64 = lesser(blockRows(al), roundUp(rowsEach, microRows)) * depthMax
     bsize I64 = lesser(blockCols(al), roundUp(colsEach, nr)) * depthMax
-    ap := ws.panelsA(tasks * asize)
-    bp := ws.panelsB(tasks * bsize)
+    ap :~ ws.panelsA(tasks * asize)
+    bp :~ ws.panelsB(tasks * bsize)
     if tasks <= 1 {
         if thin: gemmBlocks(0, m, 0, n, k, sa, ta, sb, tb, al, be, c, ldc, ap, bp, thinTile(), exchanged, false, false, 0, ep)
         else: gemmBlocks(0, m, 0, n, k, sa, ta, sb, tb, al, be, c, ldc, ap, bp, wideTile(), exchanged, false, false, 0, ep)
@@ -835,8 +835,8 @@ fn packedProduct<SA, SB, A, S>(m I64, n I64, k I64, sa SA, ta Bool, sb SB, tb Bo
             i1 I64 = hi if byRows else m
             j0 I64 = 0 if byRows else lo
             j1 I64 = n if byRows else hi
-            pa := ap[t * asize:(t + 1) * asize]
-            pb := bp[t * bsize:(t + 1) * bsize]
+            pa :~ ap[t * asize:(t + 1) * asize]
+            pb :~ bp[t * bsize:(t + 1) * bsize]
             if thin: spawn gemmBlocks(i0, i1, j0, j1, k, sa, ta, sb, tb, al, be, c, ldc, pa, pb, thinTile(), exchanged, false, false, 0, ep)
             else: spawn gemmBlocks(i0, i1, j0, j1, k, sa, ta, sb, tb, al, be, c, ldc, pa, pb, wideTile(), exchanged, false, false, 0, ep)
         }
@@ -881,14 +881,14 @@ fn (p mut Packed<A>&) fill<SB, H>(ob operand<SB>&, tb Bool, sh H) {
 fn GemmPacked<SC, SA, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&, ta Bool, b Packed<A>&, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
     m, n, k := c.Rows, c.Cols, b.K
     if m == 0 or n == 0: return
-    cd := c.Data[c.Off:]
+    cd :~ c.Data[c.Off:]
     if k == 0 {
         emptyProduct(m, n, beta, cd, c.Ld, epi, false, 0)
         return
     }
     oa := operand<SA>.of(a)
     if k > kc and not sameType(cd, alpha) {
-        wide := ws.wideC(m * n)
+        wide :~ ws.wideC(m * n)
         if beta != 0: copyInto(wide, n, cd, c.Ld, m, n, alpha, n)
         prepacked(m, oa, ta, b, alpha, beta, wide, n, ws, epi)
         copyInto(cd, c.Ld, wide, n, m, n, cd[0], n)
@@ -908,7 +908,7 @@ fn prepacked<SA, A, S>(m I64, sa SA, ta Bool, b Packed<A>&, al A, be A, c mut Ar
     share = (share + step - 1) / step * step
     rowsEach I64 = share if byRows else m
     asize I64 = lesser(blockRows(al), roundUp(rowsEach, microRows)) * lesser(k, kc)
-    ap := ws.panelsA(tasks * asize)
+    ap :~ ws.panelsA(tasks * asize)
     if tasks <= 1 {
         if b.Thin: packedBlocks(0, m, 0, n, sa, ta, b, al, be, c, ldc, ap, thinTile(), ep)
         else: packedBlocks(0, m, 0, n, sa, ta, b, al, be, c, ldc, ap, wideTile(), ep)
@@ -923,7 +923,7 @@ fn prepacked<SA, A, S>(m I64, sa SA, ta Bool, b Packed<A>&, al A, be A, c mut Ar
             i1 I64 = hi if byRows else m
             j0 I64 = 0 if byRows else lo
             j1 I64 = n if byRows else hi
-            pa := ap[t * asize:(t + 1) * asize]
+            pa :~ ap[t * asize:(t + 1) * asize]
             if b.Thin: spawn packedBlocks(i0, i1, j0, j1, sa, ta, b, al, be, c, ldc, pa, thinTile(), ep)
             else: spawn packedBlocks(i0, i1, j0, j1, sa, ta, b, al, be, c, ldc, pa, wideTile(), ep)
         }
@@ -1001,7 +1001,7 @@ fn (r batchRun<S, SA, SB, A>&) go(lo I64, hi I64, ap mut Array<A>&, bp mut Array
     for e in range lo, hi {
         sa := operand<SA>(r.ad[r.ast.at(e):], r.ast.ld)
         sb := operand<SB>(r.bd[r.bst.at(e):], r.bst.ld)
-        cd := r.cd[r.cst.at(e):]
+        cd :~ r.cd[r.cst.at(e):]
         if r.k <= kc or sameType(cd, r.al) {
             r.blocks(sa, sb, cd, r.cst.ld, ap, bp)
             continue
@@ -1129,7 +1129,7 @@ fn (ws Workspace<A>&) PackTiles<SB>(b mat.Mat<SB>&, tb Bool) TilePacked {
     ob := operand<SB>.of(b)
     for j0 in range 0, n, amxCols {
         w := lesser(amxCols, n - j0)
-        dst := p.Data[p.Kp * j0:]
+        dst :~ p.Data[p.Kp * j0:]
         if p.Strips: packStrips(dst, ob, tb, k, p.Kp, j0, w, roundUp(w, 16))
         else: packPairs(dst, ob, tb, k, p.Kp, j0, w, roundUp(w, 16))
     }
@@ -1141,7 +1141,7 @@ fn (ws Workspace<A>&) PackTiles<SB>(b mat.Mat<SB>&, tb Bool) TilePacked {
 fn GemmTilePacked<SC, SA, SB, A>(ws mut Workspace<A>&, c mut mat.Mat<SC>&, a mat.Mat<SA>&, b mat.Mat<SB>&, tb Bool, p TilePacked&, alpha A = 1, beta A = 0, epi Epilogue = Epilogue.None) {
     m, n, k := c.Rows, c.Cols, a.Cols
     if m > 0 and n > 0 and k > 0 and p.N == n and p.K == k and p.Strips == not ws.Tile and ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
-        cd := c.Data[c.Off:]
+        cd :~ c.Data[c.Off:]
         tileTasks(ws, m, n, k, operand<SA>.of(a), operand<SB>.of(b), tb, p.Data, p.Kp, true, alpha, beta, cd, c.Ld)
         finish(cd, c.Ld, 0, m, 0, n, epi, alpha)
         return
@@ -1208,7 +1208,7 @@ fn (r tileRun<SA, SB, S, A>&) go(lo I64, hi I64, ta mut Array<BF16>&, tb mut Arr
             else: packStrips(tb, r.b, r.tb, r.k, kp, j0, w, wp)
             have = jb
         }
-        bb := r.pd[r.pkp * j0:] if r.pre else tb
+        bb :~ r.pd[r.pkp * j0:] if r.pre else tb
         packRows(ta, r.a, false, r.k, kp, i0, h, hp)
         if r.amx: addTiles(tc, hp, wp, ta, kp, bb)
         else: pairBlock(tc, hp, wp, ta, kp, bb)
@@ -1254,12 +1254,12 @@ type pairAcc struct() {
 fn pairTile<W>(t mut Array<F32>&, wp I64, ta Array<BF16>&, i0 I64, kp I64, tb Array<BF16>&, j0 I64, w W) {
     nv I64 = pairVectors<W>()
     acc := pairAcc()
-    rows := ta[i0 * kp:(i0 + 8) * kp]
-    strip := tb[j0 * kp:(j0 + 16 * nv) * kp]
+    rows :~ ta[i0 * kp:(i0 + 8) * kp]
+    strip :~ tb[j0 * kp:(j0 + 16 * nv) * kp]
     for p in range 0, kp - 1, 2 {
-        bs := strip[p * 16 * nv:(p + 2) * 16 * nv]
+        bs :~ strip[p * 16 * nv:(p + 2) * 16 * nv]
         comptime for i in range 8 {
-            pa := rows[i * kp + p:i * kp + p + 2]
+            pa :~ rows[i * kp + p:i * kp + p + 2]
             comptime for v in range pairVectors<W>() { acc.v[i * 32 + v * 16:i * 32 + v * 16 + 16] += (pa * bs[v * 32:v * 32 + 32]).Sum<F32>(2) }
         }
     }
@@ -1740,7 +1740,7 @@ fn GemmI8(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a mat.Mat<U8>&, b mat.Mat
         sums Array<I32>& = noSums) {
     m, n, k := a.Rows, b.Rows, a.Cols
     if m == 0 or n == 0: return
-    corr := ws.corrections(n)
+    corr :~ ws.corrections(n)
     corrections(corr, b, zero, sums)
     oa, ob := operand<U8>.of(a), operand<I8>.of(b)
     cd, od := c.Data[c.Off:], out.Data[out.Off:]
@@ -1760,7 +1760,7 @@ fn GemmI8Left<L>(ws mut Workspace<I32>&, c mut mat.Mat<I32>&, a L, m I64, k I64,
         sums Array<I32>& = noSums) {
     n := b.Rows
     if m == 0 or n == 0: return
-    corr := ws.corrections(n)
+    corr :~ ws.corrections(n)
     corrections(corr, b, zero, sums)
     fa, ob, none := foreign<L>(a), operand<I8>.of(b), operand<U8>(noBytes, 0)
     cd, od := c.Data[c.Off:], out.Data[out.Off:]
@@ -1823,12 +1823,12 @@ fn (q quant&) blocked<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     mr, nr := i8Shape(sh)
     m, n, k := q.m, q.n, q.k
     panels I64 = (n + nr - 1) / nr
-    qb := ws.bytesB(panels * k * nr)
+    qb :~ ws.bytesB(panels * k * nr)
     for p in range panels: packI8(q.b, k, p * nr, lesser(nr, n - p * nr), nr, qb, p * k * nr)
     tiles I64 = (m + mr - 1) / mr
     tasks I64 = lesser(lesser(ws.Threads, tiles), m * n * k / i8Madds).Max(1)
     share I64 = (tiles + tasks - 1) / tasks
-    qa := ws.bytesA(tasks * mr * k)
+    qa :~ ws.bytesA(tasks * mr * k)
     if tasks <= 1 {
         q.tilesI8(0, tiles, qa, qb, sh, src)
         return
@@ -1852,13 +1852,13 @@ fn (q quant&) grouped<H, P>(ws mut Workspace<I32>&, sh H, src P) {
     m, n, k := q.m, q.n, q.k
     kp I64 = roundUp(k, 4)
     panels I64 = (n + nr - 1) / nr
-    qb := ws.bytesB(panels * kp * nr)
+    qb :~ ws.bytesB(panels * kp * nr)
     for p in range panels: packGroupsI8(q.b, k, kp, p * nr, lesser(nr, n - p * nr), nr, qb, p * kp * nr)
     tiles I64 = (m + mr - 1) / mr
     tasks I64 = lesser(lesser(ws.Threads, tiles), m * n * k / i8Madds).Max(1)
     share I64 = (tiles + tasks - 1) / tasks
     room I64 = mr * kp
-    qa := ws.bytesA(tasks * room)
+    qa :~ ws.bytesA(tasks * room)
     if tasks <= 1 {
         q.groupTiles(0, tiles, qa, qb, kp, sh, src)
         return
@@ -1911,10 +1911,10 @@ fn groupWide(kp I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
     acc := tile<I32>()
     for p in range kp / 4 {
         o I64 = bo + p * 4 * i8WideCols
-        b0 := qb[o:o + 64]
-        b1 := qb[o + 64:o + 128]
+        b0 :~ qb[o:o + 64]
+        b1 :~ qb[o + 64:o + 128]
         comptime for i in range i8WideRows {
-            x := pa[i * kp + 4 * p:i * kp + 4 * p + 4]
+            x :~ pa[i * kp + 4 * p:i * kp + 4 * p + 4]
             acc.v[i * 32:i * 32 + 16] += (x * b0).Sum<I32>(4)
             acc.v[i * 32 + 16:i * 32 + 32] += (x * b1).Sum<I32>(4)
         }
@@ -1925,9 +1925,9 @@ fn groupWide(kp I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
 fn groupThin(kp I64, pa Array<U8>&, qb Array<I8>&, bo I64, t mut tile<I32>&) {
     acc := tile<I32>()
     for p in range kp / 4 {
-        b := qb[bo + p * 64:bo + p * 64 + 64]
+        b :~ qb[bo + p * 64:bo + p * 64 + 64]
         comptime for i in range i8ThinRows {
-            x := pa[i * kp + 4 * p:i * kp + 4 * p + 4]
+            x :~ pa[i * kp + 4 * p:i * kp + 4 * p + 4]
             acc.v[i * 16:i * 16 + 16] += (x * b).Sum<I32>(4)
         }
     }
@@ -2076,7 +2076,7 @@ fn (q quant&) rowI8(i I64) {
 fn (q quant&) dot4I8(i I64, j I64) {
     if q.k < i8SumDepth { dot4Plain(q, i, j) }
     else {
-        x := q.a.d[i * q.a.ld:i * q.a.ld + q.k]
+        x :~ q.a.d[i * q.a.ld:i * q.a.ld + q.k]
         for r in range 4 {
             o := (j + r) * q.b.ld
             q.store1(i, j + r, (x * q.b.d[o:o + q.k]).Sum<I32>())
@@ -2389,7 +2389,7 @@ test Workspace "room reserved once serves every product up to its size, and no p
     assert ws.b == big and ws.a == bigA
     # attention over a growing context, reserved for its longest: no product touches the workspace's storage
     grow := Workspace<F32>(1, 1600)
-    before := grow.b
+    before :~ grow.b
     q := gappy(64, 64, F32(0))
     fill(q, 1.0)
     for t in range 64, 1600, 16 {

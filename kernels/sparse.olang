@@ -261,7 +261,7 @@ type Csr<S> struct(Rows I64, Cols I64, ptr mut Array<I64>&, idx mut Array<I32>&,
     Ptr mut Array<I64>& = ptr
     Idx mut Array<I32>& = idx
     try checkPattern(Rows, Cols, Ptr, Idx)
-    Values mut Array<S>& = values if values != null else Array<S>(idx.Len())
+    Values mut Array<S>& = values if values is not null else Array<S>(idx.Len())
     if Values.Len() < Ptr[Rows]: error PatternError.Length("values for " + $Ptr[Rows] + " entries")
 }
 
@@ -349,8 +349,8 @@ fn (w Csr<S>&) rowDot<A>(i I64, x Array<A>&, xo I64, xs I64) A {
 # chunk, not once an entry - and the columns left over one entry at a time
 fn (w Csr<S>&) rowsInto<A>(y mut Array<A>&, yo I64, ys I64, x Array<A>&, xo I64, xs I64, width I64, alpha A, lo I64, hi I64) {
     z A
-    idx := w.Idx
-    vals := w.Values
+    idx :~ w.Idx
+    vals :~ w.Values
     whole I64 = width - width % 16
     for i in range lo, hi {
         yi I64 = yo + i * ys
@@ -397,7 +397,7 @@ fn (w Csr<S>&) scatterInto<A>(y mut Array<A>&, yo I64, ys I64, x Array<A>&, xo I
 # width = x.Cols. Adds Dense Rows Cols width and Effective Nnz width to macs
 fn (w Csr<S>&) MulAdd<A>(y mut mat.Mat<A>&, x mat.Mat<A>&, trans Bool = false, alpha A = 1, threads I64 = 1, macs mut Macs?& = null) {
     width := x.Cols
-    if macs != null: macs.Add(w.Rows * w.Cols * width, w.Nnz() * width)
+    if macs is not null: macs.Add(w.Rows * w.Cols * width, w.Nnz() * width)
     if trans {
         w.mulAddT(y, x, alpha, threads)
         return
@@ -452,7 +452,7 @@ fn (w Csr<S>&) sampledRows<A>(g mut Array<A>&, a Array<A>&, ao I64, sa I64, b Ar
 # computed only where a synapse exists. g holds Nnz entries (or more), in entry order
 fn (w Csr<S>&) Sampled<A>(g mut Array<A>&, a mat.Mat<A>&, b mat.Mat<A>&, alpha A = 1, accumulate Bool = false, threads I64 = 1, macs mut Macs?& = null) {
     width := a.Cols
-    if macs != null: macs.Add(w.Rows * w.Cols * width, w.Nnz() * width)
+    if macs is not null: macs.Add(w.Rows * w.Cols * width, w.Nnz() * width)
     tasks := tasksFor(w.Nnz() * width, threads)
     if tasks == 1 {
         w.sampledRows(g, a.Data, a.Off, a.Ld, b.Data, b.Off, b.Ld, width, alpha, accumulate, 0, w.Rows)
@@ -543,7 +543,7 @@ type Tiles<S> struct(Rows I64, Cols I64, Tile I64, ptr mut Array<I64>&, col mut 
     Ptr mut Array<I64>& = ptr
     Col mut Array<I32>& = col
     try checkPattern(TileRows, TileCols, Ptr, Col)
-    Data mut Array<S>& = data if data != null else Array<S>(col.Len() * Tile * Tile)
+    Data mut Array<S>& = data if data is not null else Array<S>(col.Len() * Tile * Tile)
     if Data.Len() < Ptr[TileRows] * Tile * Tile: error PatternError.Length("values for " + $Ptr[TileRows] + " tiles")
     Live mut Array<Bool>& = Array<Bool>(col.Len())
     for e in range Ptr[TileRows]: Live[e] = true
@@ -746,7 +746,7 @@ allActive Array<Bool> = Array<Bool>(0)
 # skipped - Active makes one; empty: no block is. Adds Dense Rows Cols width and Effective the live tiles' area times width
 fn (w Tiles<S>&) MulAdd<A>(y mut mat.Mat<A>&, x mat.Mat<A>&, trans Bool = false, alpha A = 1, active Array<Bool>& = allActive, threads I64 = 1, macs mut Macs?& = null) {
     width := x.Cols
-    if macs != null: macs.Add(w.Rows * w.Cols * width, w.liveArea(active, trans) * width)
+    if macs is not null: macs.Add(w.Rows * w.Cols * width, w.liveArea(active, trans) * width)
     tasks := tasksFor(w.Stored() * w.Tile * w.Tile * width, threads)
     if trans {
         tasks = lesser(tasks, width / 8)
@@ -785,7 +785,7 @@ fn (w Tiles<S>&) MulAdd<A>(y mut mat.Mat<A>&, x mat.Mat<A>&, trans Bool = false,
 fn (w Tiles<S>&) Sampled<A>(g mut Array<A>&, a mat.Mat<A>&, b mat.Mat<A>&, alpha A = 1, accumulate Bool = false, macs mut Macs?& = null) {
     z A
     width := a.Cols
-    if macs != null: macs.Add(w.Rows * w.Cols * width, w.liveArea(allActive) * width)
+    if macs is not null: macs.Add(w.Rows * w.Cols * width, w.liveArea(allActive) * width)
     tt := w.Tile * w.Tile
     for r in range w.TileRows {
         for e in range w.Ptr[r], w.Ptr[r + 1] {
@@ -920,7 +920,7 @@ fn (e mut Events&) Collect<A>(x Array<A>&, last mut Array<A>&, delta mut Array<A
 # y += delta[j] W[j, .] for each event j: w is stored [from, to] - a row for each unit that can change, as many columns as
 # y has - so an event reads one contiguous row. Adds Dense Rows Cols and Effective Count Cols to macs. threads split y
 fn Transport<S, A>(w mat.Mat<S>&, y mut Array<A>&, e Events&, delta Array<A>&, threads I64 = 1, macs mut Macs?& = null) {
-    if macs != null: macs.Add(w.Rows * w.Cols, e.Count * w.Cols)
+    if macs is not null: macs.Add(w.Rows * w.Cols, e.Count * w.Cols)
     tasks := lesser(tasksFor(e.Count * w.Cols, threads), w.Cols / 64)
     if tasks <= 1 {
         transportInto(w, y, e, delta, 0, w.Cols)
@@ -955,7 +955,7 @@ fn (w Csr<S>&) Transport<A>(y mut Array<A>&, e Events&, delta Array<A>&, macs mu
         work += w.Ptr[j + 1] - w.Ptr[j]
         for p in range w.Ptr[j], w.Ptr[j + 1]: y[I64(w.Idx[p])] += d * cast(w.Values[p], z)
     }
-    if macs != null: macs.Add(w.Rows * w.Cols, work)
+    if macs is not null: macs.Add(w.Rows * w.Cols, work)
 }
 
 # y += delta[j] W[j, .] over the events j, W a Tiles whose rows are the units that can change: each event's row of every
@@ -974,7 +974,7 @@ fn (w Tiles<S>&) Transport<A>(y mut Array<A>&, e Events&, delta Array<A>&, macs 
             work += wd
         }
     }
-    if macs != null: macs.Add(w.Rows * w.Cols, work)
+    if macs is not null: macs.Add(w.Rows * w.Cols, work)
 }
 
 # ---- selection and the sparse-code products ----

@@ -65,36 +65,36 @@ fn putTimes<S, A>(dx mut Array<S>&, dy Array<S>&, b Array<S>&, k A, add Bool) {
 
 # y = a + k b: Add (k 1) and Sub (k -1)
 fn Combine<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>, k A) {
-    yd := flat(y)
-    ad := flat(a)
-    bd := flat(b)
+    yd :~ flat(y)
+    ad :~ flat(a)
+    bd :~ flat(b)
     for i in range yd.Len(): yd[i] = S(A(ad[i]) + k * A(bd[i]))
 }
 
 fn CombineBackward<S, A>(dy tensor.Tensor<S>, k A, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
-    g := flat(dy)
+    g :~ flat(dy)
     if Wanted(da): Put<S, A>(flat(da), g, A(1.0), addA)
     if Wanted(db): Put<S, A>(flat(db), g, k, addB)
 }
 
 # y = a b, element by element
 fn Mul<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>) {
-    yd := flat(y)
-    ad := flat(a)
-    bd := flat(b)
+    yd :~ flat(y)
+    ad :~ flat(a)
+    bd :~ flat(b)
     for i in range yd.Len(): yd[i] = S(A(ad[i]) * A(bd[i]))
 }
 
 fn MulBackward<S, A>(dy tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
-    g := flat(dy)
+    g :~ flat(dy)
     if Wanted(da): putTimes<S, A>(flat(da), g, flat(b), A(1.0), addA)
     if Wanted(db): putTimes<S, A>(flat(db), g, flat(a), A(1.0), addB)
 }
 
 # y = k x
 fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A) {
-    yd := flat(y)
-    xd := flat(x)
+    yd :~ flat(y)
+    xd :~ flat(x)
     for i in range yd.Len(): yd[i] = S(k * A(xd[i]))
 }
 
@@ -148,7 +148,7 @@ fn LinearBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor
 fn batchOf<S>(t tensor.Tensor<S>&, groups I64, members I64) gemm.Batch<S> {
     r := t.Rank()
     m := r - 2
-    data := storageOf(t)
+    data :~ storageOf(t)
     off := t.Offset
     if r == 2: return gemm.Batch<S>(data, off, t.Dim(0), t.Dim(1), t.Strides[0], groups, 0, members, 0)
     if r == 3: return gemm.Batch<S>(data, off, t.Dim(1), t.Dim(2), t.Strides[1], t.Dim(0), t.Strides[0], 1, 0)
@@ -291,8 +291,8 @@ fn ActFromOutput(a mat.Act) Bool { return elem.FromOutput(a) }
 
 # y = x where x > 0, slope x elsewhere
 fn LeakyRelu<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, slope A) {
-    yd := flat(y)
-    xd := flat(x)
+    yd :~ flat(y)
+    xd :~ flat(x)
     for i in range yd.Len() {
         v := A(xd[i])
         yd[i] = S(v if v > 0.0 else slope * v)
@@ -300,9 +300,9 @@ fn LeakyRelu<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, slope A) {
 }
 
 fn LeakyReluBackward<S, A>(dy tensor.Tensor<S>, x tensor.Tensor<S>, slope A, dx mut tensor.Tensor<S>&, add Bool) {
-    g := flat(dy)
-    xd := flat(x)
-    d := flat(dx)
+    g :~ flat(dy)
+    xd :~ flat(x)
+    d :~ flat(dx)
     for i in range d.Len() {
         v := A(g[i]) * (A(1.0) if A(xd[i]) > 0.0 else slope)
         d[i] = S(A(d[i]) + v if add else v)
@@ -426,8 +426,8 @@ fn CrossEntropyBackward<S, A>(dloss A, classes Array<I32>&, probs tensor.Tensor<
 
 # the mean of (a - b)^2, in F64
 fn Mse<S, A>(a tensor.Tensor<S>, b tensor.Tensor<S>) F64 {
-    ad := flat(a)
-    bd := flat(b)
+    ad :~ flat(a)
+    bd :~ flat(b)
     total F64 = 0.0
     for i in range ad.Len() {
         d := F64(A(ad[i]) - A(bd[i]))
@@ -438,18 +438,18 @@ fn Mse<S, A>(a tensor.Tensor<S>, b tensor.Tensor<S>) F64 {
 
 # da (+)= 2 dloss (a - b) / n, db (+)= -that
 fn MseBackward<S, A>(dloss A, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
-    ad := flat(a)
-    bd := flat(b)
+    ad :~ flat(a)
+    bd :~ flat(b)
     k := A(2.0) * dloss / A(ad.Len())
     if Wanted(da) {
-        d := flat(da)
+        d :~ flat(da)
         for i in range d.Len() {
             v := k * (A(ad[i]) - A(bd[i]))
             d[i] = S(A(d[i]) + v if addA else v)
         }
     }
     if Wanted(db) {
-        d := flat(db)
+        d :~ flat(db)
         for i in range d.Len() {
             v := k * (A(bd[i]) - A(ad[i]))
             d[i] = S(A(d[i]) + v if addB else v)
@@ -461,23 +461,23 @@ fn MseBackward<S, A>(dloss A, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut ten
 
 # y = x + k
 fn Shift<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A) {
-    yd := flat(y)
-    xd := flat(x)
+    yd :~ flat(y)
+    xd :~ flat(x)
     for i in range yd.Len(): yd[i] = S(A(xd[i]) + k)
 }
 
 # y = sqrt x (NaN below 0)
 fn Sqrt<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>) {
-    yd := flat(y)
-    xd := flat(x)
+    yd :~ flat(y)
+    xd :~ flat(x)
     for i in range yd.Len(): yd[i] = S(A(xd[i]).Sqrt())
 }
 
 # dx (+)= dy / (2 y), read from y = sqrt x (infinite at 0)
 fn SqrtBackward<S, A>(dy tensor.Tensor<S>, y tensor.Tensor<S>, dx mut tensor.Tensor<S>&, add Bool) {
-    g := flat(dy)
-    yd := flat(y)
-    d := flat(dx)
+    g :~ flat(dy)
+    yd :~ flat(y)
+    d :~ flat(dx)
     for i in range d.Len() {
         v := A(g[i]) / (A(2.0) * A(yd[i]))
         d[i] = S(A(d[i]) + v if add else v)
@@ -486,16 +486,16 @@ fn SqrtBackward<S, A>(dy tensor.Tensor<S>, y tensor.Tensor<S>, dx mut tensor.Ten
 
 # y = log x (-infinity at 0, NaN below)
 fn Log<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>) {
-    yd := flat(y)
-    xd := flat(x)
+    yd :~ flat(y)
+    xd :~ flat(x)
     for i in range yd.Len(): yd[i] = S(A(xd[i]).Log())
 }
 
 # dx (+)= dy / x
 fn LogBackward<S, A>(dy tensor.Tensor<S>, x tensor.Tensor<S>, dx mut tensor.Tensor<S>&, add Bool) {
-    g := flat(dy)
-    xd := flat(x)
-    d := flat(dx)
+    g :~ flat(dy)
+    xd :~ flat(x)
+    d :~ flat(dx)
     for i in range d.Len() {
         v := A(g[i]) / A(xd[i])
         d[i] = S(A(d[i]) + v if add else v)
@@ -560,8 +560,8 @@ fn StablemaxCEBackward<S, A>(dloss A, classes Array<I32>&, logits tensor.Tensor<
 fn Norm<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, gain tensor.Tensor<S>, bias tensor.Tensor<S>, rms Bool, eps F64, stats mut Array<S>&) {
     xm := rows(x)
     n := xm.Rows
-    mean := stats[0:n]
-    inv := stats[n:2 * n]
+    mean :~ stats[0:n]
+    inv :~ stats[n:2 * n]
     elem.RowNormStats(mean, inv, xm, S(eps), rms)
     ym := rows(y)
     elem.RowNormApply(ym, xm, mean, inv, flat(gain), flat(bias) if bias.Count() > 0 else stats[0:0])
@@ -572,8 +572,8 @@ fn NormBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, gain tensor.Tensor<S
     g := rows(dy)
     xm := rows(x)
     n := xm.Rows
-    mean := stats[0:n]
-    inv := stats[n:2 * n]
+    mean :~ stats[0:n]
+    inv :~ stats[n:2 * n]
     if Wanted(dx) {
         d := rows(dx)
         elem.RowNormGrad(d, g, xm, mean, inv, flat(gain), rms, addX)
@@ -744,8 +744,8 @@ fn AttentionStep<S, A>(out mut tensor.Tensor<S>&, q tensor.Tensor<S>, k tensor.T
 
 # y = x mask / (1 - p), the mask drawn from r (each element kept with probability 1 - p) and kept
 fn Dropout<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, mask mut Array<S>&, p F64, r mut rand.Rand&) {
-    yd := flat(y)
-    xd := flat(x)
+    yd :~ flat(y)
+    xd :~ flat(x)
     k := A(1.0 / (1.0 - p))
     for i in range yd.Len() {
         keep := r.Float() >= p
@@ -791,7 +791,7 @@ fn Conv2dBackward<S, A>(ws mut gemm.Workspace<A>&, dy tensor.Tensor<S>, x tensor
     patches := mat.Mat<S>(cols, 0, n * s.Positions(), s.Patch(), s.Patch())
     dxm := images(dx) if Wanted(dx) else none(dx)
     dwm := gradRows(dw)
-    dbd := flat(db) if Wanted(db) else cols[0:0]
+    dbd :~ flat(db) if Wanted(db) else cols[0:0]
     dym, xm, wm := images(dy), images(x), rows(w)
     conv.Conv2dBackward<S, A>(ws, dym, xm, wm, s, dxm, addX, dwm, addW, dbd, addB, patches, threads)
 }
@@ -851,7 +851,7 @@ fn freshZero<S>(t mut tensor.Tensor<S>&, add Bool) {
 fn SelectiveScan<S, A>(work mut scan.Work<A>&, y mut tensor.Tensor<S>&, state mut mat.Mat<A>&, x tensor.Tensor<S>, delta tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, c tensor.Tensor<S>, skip tensor.Tensor<S>, ctx I64, keep mut Array<A>&) {
     zero(state)
     ym := rows(y)
-    sk := flat(skip) if skip.Count() > 0 else flat(y)[0:0]
+    sk :~ flat(skip) if skip.Count() > 0 else flat(y)[0:0]
     xm, dm, am, bm, cm := rows(x), rows(delta), rows(a), rows(b), rows(c)
     scan.SelectiveScan(work, ym, state, xm, dm, am, bm, cm, sk, scan.Seq(ctx), keep)
 }
@@ -869,10 +869,10 @@ fn SelectiveScanBackward<S, A>(work mut scan.Work<A>&, dy tensor.Tensor<S>, x te
     dam := rows(da)
     dbm := rows(db)
     dcm := rows(dc)
-    empty := flat(dy)[0:0]
+    empty :~ flat(dy)[0:0]
     if skip.Count() > 0: freshZero(dskip, addS)
-    dsk := flat(dskip) if skip.Count() > 0 else empty
-    sk := flat(skip) if skip.Count() > 0 else empty
+    dsk :~ flat(dskip) if skip.Count() > 0 else empty
+    sk :~ flat(skip) if skip.Count() > 0 else empty
     dym, xm, dm, am, bm, cm := rows(dy), rows(x), rows(delta), rows(a), rows(b), rows(c)
     scan.SelectiveScanGrad(work, dxm, ddm, dam, dbm, dcm, dsk, dstate, dym, xm, dm, am, bm, cm, sk, keep, scan.Seq(ctx), true)
 }
@@ -919,7 +919,7 @@ fn DeltaRuleBackward<S, A>(work mut scan.Work<A>&, dout tensor.Tensor<S>, q tens
 # y = the sum over x's last axis (mean: divided by its length)
 fn SumLast<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, mean Bool) {
     xm := rows(x)
-    yd := flat(y)
+    yd :~ flat(y)
     k := A(1.0) / A(xm.Cols) if mean else A(1.0)
     for r in range xm.Rows: yd[r] = S(k * elem.SumIn<S, A>(xm.Data, xm.Off + r * xm.Ld, xm.Cols))
 }
@@ -927,7 +927,7 @@ fn SumLast<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, mean Bool) {
 # dx (+)= dy spread over each row (divided by its length for the mean)
 fn SumLastBackward<S, A>(dy tensor.Tensor<S>, mean Bool, dx mut tensor.Tensor<S>&, add Bool) {
     d := rows(dx)
-    g := flat(dy)
+    g :~ flat(dy)
     k := A(1.0) / A(d.Cols) if mean else A(1.0)
     for r in range d.Rows {
         v := k * A(g[r])
@@ -951,7 +951,7 @@ fn AddInto<S, A>(dd mut Array<S>&, dst mut tensor.Tensor<S>&, src tensor.Tensor<
 # dst's elements from axis `axis` on, plus src's - a recursion over the axes, for strides of any kind, an Expand's 0
 # included (an element read through a stride of 0 is added to as many times as it is read)
 fn walkAdd<S, A>(dd mut Array<S>&, dst tensor.Tensor<S>&, src tensor.Tensor<S>&, axis I64, d I64, s I64) {
-    sd := storageOf(src)
+    sd :~ storageOf(src)
     if axis == dst.Rank() - 1 {
         for i in range dst.Dim(axis) {
             o := d + i * dst.Strides[axis]

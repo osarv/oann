@@ -67,7 +67,7 @@ fn Spans<T>(g graph.Graph<T>&) Array<Span> {
 
 # the runs a region is stepped in: the ones given, or the whole of it decaying
 fn runsOf(spans Array<Span>?&, count I64) Array<Span>& {
-    if spans == null: return Array<Span>[Span(0, count, true)]
+    if spans is null: return Array<Span>[Span(0, count, true)]
     return spans
 }
 
@@ -97,7 +97,7 @@ fn WarmupLinear(peak F64, warmup I64, total I64, floor F64 = 0.0) fn&(step I64) 
 # scales every gradient down, all by one factor, so that their Euclidean norm together is at most "max" - PyTorch's
 # clip_grad_norm_ (max / (norm + 1e-6) when the norm is above max). Gives the norm before clipping, summed in F64
 fn ClipNorm<G>(grads tensor.Tensor<G>&, max F64) F64 {
-    d := grads.Flat()!
+    d :~ grads.Flat()!
     norm F64 = elem.SquaresF64(d).Sqrt()
     if norm > max: scaleBy(d, max / (norm + 1e-6))
     return norm
@@ -159,7 +159,7 @@ fn (o mut AdamW<A, G>&) Sparse<T>(g graph.Graph<T>&) {
         if not g.IsSparse(v): continue
         nd := g.Info(v)
         o.tables.Push(RowTable(nd.Offset, nd.Dims[0], g.Decays(v), g.Touched(v)))
-        o.runs = cut(o.runs, nd.Offset, nd.Offset + nd.Dims.Count())
+        o.runs ~ cut(o.runs, nd.Offset, nd.Offset + nd.Dims.Count())
     }
 }
 
@@ -441,7 +441,7 @@ fn Orthogonalize<A>(w mut Array<A>&, rows I64, cols I64, work mut NsWork<A>&) {
     r := cols if tall else rows
     c := rows if tall else cols
     n := rows * cols
-    x := work.x
+    x :~ work.x
     norm A = 0.0
     for k in range n: norm += w[k] * w[k]
     inv := A(1.0) / (norm.Sqrt() + A(1e-7))
@@ -732,8 +732,8 @@ test AdamW "a run that does not decay is stepped without decay, one that does wi
     for variant in range 3 {
         g, w, loss := quadratic(2.0, 2.0)
         runs Array<Span>?& = null
-        if variant == 1: runs = Array<Span>[Span(0, 1, true), Span(1, 2, false)]
-        if variant == 2: runs = Array<Span>[Span(0, 2, false)]
+        if variant == 1: runs ~ Array<Span>[Span(0, 1, true), Span(1, 2, false)]
+        if variant == 2: runs ~ Array<Span>[Span(0, 2, false)]
         o := AdamW(g.Params(), g.ParamGrads(), rate = 0.1, decay = 0.5, spans = runs)
         g.Forward(1)
         g.Backward(loss)
@@ -787,7 +787,7 @@ test Projector "takes W <- W - (alpha / n) (W X^T) X, in place of weight decay, 
     loss := g.Mse(y, t)
     proj := Projector(g, 0.05, false)
     try g.Plan(rand.Rand(1))
-    xd := g.Data(x).Flat()!
+    xd :~ g.Data(x).Flat()!
     for i in range 6: xd[i] = F64(i + 1) * 0.5
     wm := g.Value(w)
     wm.Set(1.0, 0, 0)
@@ -926,7 +926,7 @@ test ClipNorm "of BF16 gradients is computed in F32 and rounded once" {
 # this process's anonymous resident memory in kB (RssAnon, Linux: heap and stacks, not the code pages that running a path
 # for the first time maps in), read once
 fn rss() I64 {
-    text := try os.ReadFile("/proc/self/status") catch { return 0 }
+    text :~ try os.ReadFile("/proc/self/status") catch { return 0 }
     for line in text.Lines() {
         if not line.StartsWith("RssAnon:"): continue
         kb := try line[8:].Trim().Split(" ")[0].ParseInt() catch { return 0 }
@@ -953,9 +953,9 @@ fn perceptron<T>(g mut graph.Graph<T>&, r mut rand.Rand&) graph.Var {
     h := g.Act(g.Linear(x, w1, b1), mat.Act.Relu)
     loss := g.CrossEntropy(g.Linear(h, w2), y)
     g.Plan(r)!
-    xs := g.Data(x).Flat()!
+    xs :~ g.Data(x).Flat()!
     for i in range xs.Len(): xs[i] = T(r.Normal())
-    ys := g.Ints(y).Flat()!
+    ys :~ g.Ints(y).Flat()!
     for i in range ys.Len(): ys[i] = I32(r.Below(10))
     return loss
 }
@@ -1015,8 +1015,8 @@ test Muon "Newton-Schulz on a diagonal matrix follows the scalar quintic five ti
 test Muon "a step: the matrix by momentum and Newton-Schulz, the bias by AdamW, decay on the matrix only" {
     p := tensor.Tensor<F64>.Zeros(6)
     g := tensor.Tensor<F64>.Zeros(6)
-    pd := p.Flat()!
-    gd := g.Flat()!
+    pd :~ p.Flat()!
+    gd :~ g.Flat()!
     pd[0], pd[3], pd[4], pd[5] = 1.0, 1.0, 1.0, 1.0
     gd[0], gd[3], gd[4], gd[5] = 2.0, 1.0, 0.5, -3.0
     mats := Array<MuonMatrix>[MuonMatrix(0, 2, 2, true)]
@@ -1035,7 +1035,7 @@ test Muon "a step: the matrix by momentum and Newton-Schulz, the bias by AdamW, 
 
 test Ema "averages the region's values, and Swap exchanges the average with the weights" {
     p := tensor.Tensor<F64>.Zeros(2)
-    pd := p.Flat()!
+    pd :~ p.Flat()!
     pd[0], pd[1] = 1.0, -1.0
     e := Ema(p, decay = 0.9)
     pd[0], pd[1] = 3.0, 0.0
@@ -1059,9 +1059,9 @@ fn tableNet<T>(g mut graph.Graph<T>&, sparse Bool) graph.Var, graph.Var, graph.V
 
 # each step's tokens: all from rows lo .. lo + 11 (so 12 of the 40), drawn by r; the target drawn too
 fn fillTable<T>(g mut graph.Graph<T>&, tok graph.Var, y graph.Var, r mut rand.Rand&, lo I64) {
-    ids := g.Ints(tok).Flat()!
+    ids :~ g.Ints(tok).Flat()!
     for k in range ids.Len(): ids[k] = I32(lo + r.Below(12))
-    yy := g.Value(y).Flat()!
+    yy :~ g.Value(y).Flat()!
     for k in range yy.Len(): yy[k] = T(r.Normal())
 }
 
@@ -1110,7 +1110,7 @@ test AdamW "Sparse on rows touched now and then: each touch decays the moments a
         fillTable(b, tb, yb, r, 12 * (step % 3))
         b.Forward(2)
         b.Backward(lb)
-        gr := b.ParamGrads().Flat()!
+        gr :~ b.ParamGrads().Flat()!
         rs := b.Touched(graph.Var(1))
         for k in range rs.Count[0] {               # the reference: lazy Adam in F64
             row := I64(rs.Rows[k])
@@ -1128,7 +1128,7 @@ test AdamW "Sparse on rows touched now and then: each touch decays the moments a
         }
         ob.Step()
     }
-    pb := b.Params().Flat()!
+    pb :~ b.Params().Flat()!
     for q in range n: assert (F64(pb[q]) - p[q]).Abs() <= 1e-5 * (1.0 + p[q].Abs()), "element " + $q + ": " + $pb[q] + " against " + $p[q]
 }
 
@@ -1145,7 +1145,7 @@ test Muon "a sparse table is left out of the matrices and stepped by the AdamW p
     g.Forward(2)
     g.Backward(loss)
     o.Step()
-    after := g.Params().Flat()!
+    after :~ g.Params().Flat()!
     for row in range 40 {
         moved := after[row * 4] != before[row * 4]
         assert moved == (row < 12 and I32(row) in g.Ints(tok).Flat()!)

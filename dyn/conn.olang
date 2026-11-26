@@ -118,8 +118,8 @@ fn (l Link<T>&) Quantize(params mut Array<T>&) {
 fn (l mut Link<T>&) Prepack() {
     if l.Folded or not (l.Kind == Wiring.Dense or l.Kind == Wiring.Symmetric): return
     if l.PreSize < PackedWidth or l.PostSize < PackedWidth: return    # narrow: Gemm's own tiling (exchanged) wins
-    l.Fwd = gemm.Packed<T>(l.PreSize, l.PostSize)
-    if l.Both: l.Bwd = gemm.Packed<T>(l.PostSize, l.PreSize)
+    l.Fwd ~ gemm.Packed<T>(l.PreSize, l.PostSize)
+    if l.Both: l.Bwd ~ gemm.Packed<T>(l.PostSize, l.PreSize)
 }
 
 # the weights packed ahead as they are now, for the sweeps of a settle - Gemm's packing of them done once instead of
@@ -163,17 +163,17 @@ fn (l mut Link<T>&) Draw(r mut rand.Rand&) {
     l.Count = l.Params()
     match l.Kind {
         case Wiring.Csr(density) {
-            l.ptr = Array<I64>(l.PostSize + 1)
+            l.ptr ~ Array<I64>(l.PostSize + 1)
             idx := list.List<I32>()
             sparse.DrawPattern(l.PostSize, l.PreSize, density, r, l.ptr, idx)
-            l.idx = idx.ToArray()
+            l.idx ~ idx.ToArray()
             l.Count = l.idx.Len()
         }
         case Wiring.Tiles(tile, density) {
-            l.ptr = Array<I64>((l.PostSize + tile - 1) / tile + 1)
+            l.ptr ~ Array<I64>((l.PostSize + tile - 1) / tile + 1)
             col := list.List<I32>()
             sparse.DrawPattern((l.PostSize + tile - 1) / tile, (l.PreSize + tile - 1) / tile, density, r, l.ptr, col)
-            l.idx = col.ToArray()
+            l.idx ~ col.ToArray()
             l.Count = l.idx.Len() * tile * tile
         }
         case _ { }
@@ -187,11 +187,11 @@ fn (l mut Link<T>&) Lay(params mut Array<T>&, off I64, rows I64, r mut rand.Rand
     post, pre := l.PostSize, l.PreSize
     match l.Kind {
         case Wiring.Csr(density) {
-            l.Csr = sparse.Csr<T>(post, pre, l.ptr, l.idx, params[off:off + l.Count])!
+            l.Csr ~ sparse.Csr<T>(post, pre, l.ptr, l.idx, params[off:off + l.Count])!
             uniform(params, off, l.Count, (6.0 / (density * F64(post + pre))).Sqrt(), r)
         }
         case Wiring.Tiles(tile, density) {
-            l.Tiles = sparse.Tiles<T>(post, pre, tile, l.ptr, l.idx, params[off:off + l.Count])!
+            l.Tiles ~ sparse.Tiles<T>(post, pre, tile, l.ptr, l.idx, params[off:off + l.Count])!
             uniform(params, off, l.Count, (6.0 / (density * F64(post + pre))).Sqrt(), r)
             zeroEdges(l.Tiles!, params, off)
         }
@@ -204,16 +204,16 @@ fn (l mut Link<T>&) Lay(params mut Array<T>&, off I64, rows I64, r mut rand.Rand
         case Wiring.Events {
             l.W = mat.Mat<T>(params, off, pre, post, post)
             uniform(params, off, l.Count, (6.0 / F64(post + pre)).Sqrt(), r)
-            l.last = Array<T>(rows * pre)
-            l.acc = Array<T>(rows * post)
-            l.delta = Array<T>(rows * pre)
+            l.last ~ Array<T>(rows * pre)
+            l.acc ~ Array<T>(rows * post)
+            l.delta ~ Array<T>(rows * pre)
         }
         case _ {
             l.W = mat.Mat<T>(params, off, post, pre, pre)
             uniform(params, off, l.Count, (6.0 / F64(post + pre)).Sqrt(), r)
         }
     }
-    l.Keep = Array<Bool>(l.Tiles!.Stored() if l.Tiles != null else l.Count, true)
+    l.Keep ~ Array<Bool>(l.Tiles!.Stored() if l.Tiles is not null else l.Count, true)
 }
 
 # the elements of a stored edge tile past the matrix: zero, so that sums of absolute weights see only real ones
@@ -304,7 +304,7 @@ fn (l mut Link<T>&) sparseProduct(sc mut Scratch<T>&, total mut Array<T>&, out I
     for e in range out * n: sc.Y[e] = T(0)
     x := mat.Mat<T>(sc.X, 0, width, n, n)
     y := mat.Mat<T>(sc.Y, 0, out, n, n)
-    if l.Csr != null { l.Csr!.MulAdd(y, x, trans) } else { l.Tiles!.MulAdd(y, x, trans) }
+    if l.Csr is not null { l.Csr!.MulAdd(y, x, trans) } else { l.Tiles!.MulAdd(y, x, trans) }
     for r in range n {
         for j in range out: total[(r0 + r) * out + j] += sc.Y[j * n + r]
     }
@@ -315,7 +315,7 @@ fn (l mut Link<T>&) sparseProduct(sc mut Scratch<T>&, total mut Array<T>&, out I
 # the row's totals
 fn (l mut Link<T>&) events(sc mut Scratch<T>&, total mut Array<T>&, s Array<T>&, r0 I64, r1 I64, threshold T) {
     post, pre := l.PostSize, l.PreSize
-    ev := sc.Ev[l.Index]
+    ev :~ sc.Ev[l.Index]
     for r in range r0, r1 {
         ev.Collect(s[r * pre:(r + 1) * pre], l.last[r * pre:(r + 1) * pre], l.delta[r * pre:(r + 1) * pre], threshold)
         sparse.Transport(l.W, l.acc[r * post:(r + 1) * post], ev, l.delta[r * pre:(r + 1) * pre])
@@ -345,7 +345,7 @@ fn (l Link<T>&) AddMass(params Array<T>&, mass mut Array<F64>&, postAt I64, preA
             }
         }
         case Wiring.Csr {
-            w := l.Csr!
+            w :~ l.Csr!
             for i in range post {
                 for e in range w.Ptr[i], w.Ptr[i + 1] {
                     a := F64(w.Values[e]).Abs()
@@ -380,7 +380,7 @@ fn (l Link<T>&) lowRankMass(params Array<T>&, mass mut Array<F64>&, postAt I64, 
 }
 
 fn (l Link<T>&) tileMass(mass mut Array<F64>&, postAt I64, preAt I64) {
-    w := l.Tiles!
+    w :~ l.Tiles!
     tt := w.Tile * w.Tile
     for r in range w.TileRows {
         for e in range w.Ptr[r], w.Ptr[r + 1] {
@@ -409,7 +409,7 @@ fn (l Link<T>&) Scale(params mut Array<T>&, f F64) {
 # the parameters (a Tiles' stored tiles) whose keep is false masked in place: zeroed in params and grads, their mask
 # cleared - a product costs what it did until Compact
 fn (l mut Link<T>&) Prune(keep Array<Bool>&, params mut Array<T>&, grads mut Array<T>&) {
-    if l.Tiles != null {
+    if l.Tiles is not null {
         l.Tiles!.Drop(keep)
         for e in range l.Keep.Len() {
             if not keep[e] and l.Keep[e]: l.Pruned++
@@ -428,7 +428,7 @@ fn (l mut Link<T>&) Prune(keep Array<Bool>&, params mut Array<T>&, grads mut Arr
 
 # a gradient where the mask holds, zero where it does not: what learning writes after its contrast
 fn (l Link<T>&) MaskGrads(grads mut Array<T>&) {
-    if l.Pruned == 0 or l.Tiles != null: return
+    if l.Pruned == 0 or l.Tiles is not null: return
     for e in range l.Count {
         if not l.Keep[e]: grads[l.Off + e] = T(0)
     }
@@ -442,11 +442,11 @@ fn (l mut Link<T>&) Compact(params mut Array<T>&, grads mut Array<T>&) I64 {
     if l.Pruned == 0: return 0
     removed := l.Pruned
     if l.Kind == Wiring.LowRank: return l.fewerRanks(params, grads)
-    if l.Csr != null {
+    if l.Csr is not null {
         sparse.Squeeze(grads[l.Off:l.Off + l.Count], l.Keep)
         l.Csr!.Drop(l.Keep)
         clearPast(params, grads, l.Off + l.Csr!.Nnz(), l.Off + l.Count)
-    } else if l.Tiles != null {
+    } else if l.Tiles is not null {
         tt := l.Tiles!.Tile * l.Tiles!.Tile
         sparse.Squeeze(grads[l.Off:l.Off + l.Count], l.Tiles!.Live, tt)
         l.Tiles!.Compact()
@@ -454,7 +454,7 @@ fn (l mut Link<T>&) Compact(params mut Array<T>&, grads mut Array<T>&) I64 {
     } else {
         return 0
     }
-    l.Count = l.Csr!.Nnz() if l.Csr != null else l.Tiles!.Stored() * l.Tiles!.Tile * l.Tiles!.Tile
+    l.Count = l.Csr!.Nnz() if l.Csr is not null else l.Tiles!.Stored() * l.Tiles!.Tile * l.Tiles!.Tile
     for e in range l.Keep.Len(): l.Keep[e] = true
     l.Pruned = 0
     return removed
@@ -524,14 +524,14 @@ fn (l Link<T>&) Prunable() Bool {
 # the weights not masked: a tiled connection's live tiles' elements, a low-rank one's live ranks' factors, else its live
 # parameters
 fn (l Link<T>&) Live() I64 {
-    if l.Tiles != null: return l.Tiles!.Alive() * l.Tiles!.Tile * l.Tiles!.Tile
+    if l.Tiles is not null: return l.Tiles!.Alive() * l.Tiles!.Tile * l.Tiles!.Tile
     return l.Count - l.Pruned
 }
 
 # what a pruning rule counts as the connection's whole: a product's multiply-adds with nothing masked - a dense
 # block's post x pre (a sparse-row one's dense shape too), a tiled one's stored tiles, a low-rank one's factors
 fn (l Link<T>&) Full() I64 {
-    if l.Tiles != null or l.Kind == Wiring.LowRank: return l.Count
+    if l.Tiles is not null or l.Kind == Wiring.LowRank: return l.Count
     return l.PostSize * l.PreSize
 }
 
@@ -569,7 +569,7 @@ fn (l Link<T>&) Unkeep(g I64, keep mut Array<Bool>&) {
 
 # the tile row and tile column of stored tile g (a tiled connection's)
 fn (l Link<T>&) TileAt(g I64) I64, I64 {
-    w := l.Tiles!
+    w :~ l.Tiles!
     lo, hi := 0, w.TileRows
     for hi - lo > 1 {
         mid := (lo + hi) / 2
@@ -581,8 +581,8 @@ fn (l Link<T>&) TileAt(g I64) I64, I64 {
 # the post and pre units weight e joins (a prunable connection's)
 fn (l Link<T>&) Ends(e I64) I64, I64 {
     if l.Kind == Wiring.Events: return e % l.PostSize, e / l.PostSize
-    if l.Csr == null: return e / l.PreSize, e % l.PreSize
-    w := l.Csr!
+    if l.Csr is null: return e / l.PreSize, e % l.PreSize
+    w :~ l.Csr!
     lo, hi := 0, w.Rows
     for hi - lo > 1 {
         mid := (lo + hi) / 2
@@ -601,7 +601,7 @@ fn (l mut Link<T>&) Revive(e I64, params mut Array<T>&) {
 
 # every masked weight zero again: what an optimizer's momentum moved since the mask was set (a prunable connection's)
 fn (l Link<T>&) Hold(params mut Array<T>&) {
-    if l.Pruned == 0 or l.Tiles != null: return
+    if l.Pruned == 0 or l.Tiles is not null: return
     for e in range l.Count {
         if not l.Keep[e]: params[l.Off + e] = T(0)
     }
@@ -644,7 +644,7 @@ fn (l mut Link<T>&) Sparsify(params mut Array<T>&, grads mut Array<T>&) ? Wiring
     clearPast(params, grads, l.Off + kept, l.Off + l.Count)
     l.Kind = Wiring.Csr(F64(kept) / F64(post * pre))
     l.Count = kept
-    l.Csr = sparse.Csr<T>(post, pre, ptr, idx, params[l.Off:l.Off + kept])!
+    l.Csr ~ sparse.Csr<T>(post, pre, ptr, idx, params[l.Off:l.Off + kept])!
     for e in range l.Keep.Len(): l.Keep[e] = true
     l.Pruned = 0
 }
@@ -702,7 +702,7 @@ fn dense(l Link<F64>&, params Array<F64>&) Array<F64> {
     w := Array<F64>(post * pre)
     match l.Kind {
         case Wiring.Csr {
-            c := l.Csr!
+            c :~ l.Csr!
             for i in range post {
                 for e in range c.Ptr[i], c.Ptr[i + 1]: w[i * pre + I64(c.Idx[e])] = c.Values[e]
             }
@@ -736,7 +736,7 @@ fn carried(wiring Wiring, both Bool, seed U64) F64 {
     r := rand.Rand(seed)
     post, pre, rows := 13, 9, 5
     l := Link<F64>.lone(wiring, post, pre, both, rows, r)
-    params := l.W.Data if l.Csr == null and l.Tiles == null else (l.Csr!.Values if l.Csr != null else l.Tiles!.Data)
+    params :~ l.W.Data if l.Csr is null and l.Tiles is null else (l.Csr!.Values if l.Csr is not null else l.Tiles!.Data)
     w := dense(l, params)
     ws := gemm.Workspace<F64>(1, post)
     sc := Scratch<F64>(post, rows, 8)
@@ -796,7 +796,7 @@ test Link.Sparsify "a masked dense block stored as sparse rows carries what it d
     r := rand.Rand(7)
     post, pre, rows := 13, 9, 3
     l := Link<F64>.lone(Wiring.Symmetric, post, pre, false, rows, r)
-    params := l.W.Data
+    params :~ l.W.Data
     grads := Array<F64>(params.Len())
     for e in range grads.Len(): grads[e] = F64(e)
     keep := Array<Bool>(l.Count, true)
@@ -824,7 +824,7 @@ test Link.Sparsify "a masked dense block stored as sparse rows carries what it d
 test Link.Revive "a revived weight is live again from zero, and Hold puts masked weights an optimizer moved back to zero" {
     r := rand.Rand(8)
     l := Link<F64>.lone(Wiring.Dense, 4, 4, false, 1, r)
-    params := l.W.Data
+    params :~ l.W.Data
     grads := Array<F64>(16)
     keep := Array<Bool>(16, true)
     keep[3] = false
@@ -863,7 +863,7 @@ test Link.AddMass "a unit's incoming mass is its row's absolute sum, and a recip
     r := rand.Rand(8)
     for wiring in Array<Wiring>[Wiring.Symmetric, Wiring.Csr(0.4), Wiring.Tiles(3, 0.6), Wiring.LowRank(2)] {
         l := Link<F64>.lone(wiring, 7, 5, true, 1, r)
-        params := l.W.Data if l.Csr == null and l.Tiles == null else (l.Csr!.Values if l.Csr != null else l.Tiles!.Data)
+        params :~ l.W.Data if l.Csr is null and l.Tiles is null else (l.Csr!.Values if l.Csr is not null else l.Tiles!.Data)
         w := dense(l, params)
         mass := Array<F64>(12)
         l.AddMass(params, mass, 0, 7)
@@ -883,7 +883,7 @@ test Link.AddMass "a unit's incoming mass is its row's absolute sum, and a recip
 test Link.Prune "pruning masks in place, and compacting a sparse form drops the entries without changing its product" {
     r := rand.Rand(9)
     l := Link<F64>.lone(Wiring.Csr(0.5), 8, 8, false, 2, r)
-    params := l.Csr!.Values
+    params :~ l.Csr!.Values
     grads := Array<F64>(params.Len())
     for e in range grads.Len(): grads[e] = F64(e)
     nnz := l.Csr!.Nnz()
@@ -897,7 +897,7 @@ test Link.Prune "pruning masks in place, and compacting a sparse form drops the 
     assert dense(l, params) == before
     assert grads[0] == 1.0                           # entry 1 moved to the front with its gradient
     d := Link<F64>.lone(Wiring.Dense, 3, 3, false, 1, r)
-    dp := d.W.Data
+    dp :~ d.W.Data
     dg := Array<F64>(9, 1.0)
     dk := Array<Bool>(9, true)
     dk[4] = false

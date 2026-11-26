@@ -377,8 +377,8 @@ fn (d DeltaBlock&) Apply<T>(g mut graph.Graph<T>&, x graph.Var, keep graph.Var =
 # each position's document start, keep (an Input(t, 1), for DeltaBlock; or None) 0 where a document starts after the
 # first position and 1 elsewhere. A sequence's first position starts a document
 fn DocStarts<T>(g mut graph.Graph<T>&, tokens graph.Var, sep I32, docs graph.Var, keep graph.Var = graph.None) {
-    src := g.Ints(tokens).Flat()!
-    dst := g.Ints(docs).Flat()!
+    src :~ g.Ints(tokens).Flat()!
+    dst :~ g.Ints(docs).Flat()!
     ctx := g.Info(tokens).Dims[1]
     for s in range g.Batch {
         start := 0
@@ -388,7 +388,7 @@ fn DocStarts<T>(g mut graph.Graph<T>&, tokens graph.Var, sep I32, docs graph.Var
         }
     }
     if keep == graph.None: return
-    kv := g.Value(keep).Flat()!
+    kv :~ g.Value(keep).Flat()!
     for s in range g.Batch {
         for j in range ctx: kv[s * ctx + j] = T(0.0 if j > 0 and dst[s * ctx + j] == I32(j) else 1.0)
     }
@@ -430,7 +430,7 @@ import "std/rand"
 # every parameter moved off its starting value by N(0, sd^2): the starting values are small enough that a block's gradients
 # are all near zero, and a check wants a network that does something
 fn perturb(g mut graph.Graph<F64>&, r mut rand.Rand&, sd F64) {
-    p := g.Params().Flat()!
+    p :~ g.Params().Flat()!
     for i in range p.Len(): p[i] = p[i] + sd * r.Normal()
 }
 
@@ -492,8 +492,8 @@ test Transformer "gradients agree with central differences: tied and untied, lay
         # norms and a gated 8 -> 24 -> 8 perceptron without biases
         assert g.ParamCount == Array<I64>[1848, 1864, 1848, 1824][variant]
         perturb(g, r, 0.3)
-        td := g.Ints(tok).Flat()!
-        yd := g.Ints(y).Flat()!
+        td :~ g.Ints(tok).Flat()!
+        yd :~ g.Ints(y).Flat()!
         for i in range 8 {
             td[i] = I32(r.Below(7))
             yd[i] = I32(r.Below(7))
@@ -555,14 +555,14 @@ test SelfAttention "a window of W: the output at a position does not move with a
     a := SelfAttention.New(g, 4, 2, 1, false, true, 10000.0, 3)
     y := a.Apply(g, x)
     try g.Plan(rand.Rand(3)) catch e { unreachable "plan: " + $e }
-    xs := g.Value(x).Flat()!
+    xs :~ g.Value(x).Flat()!
     r := rand.Rand(4)
     for i in range xs.Len(): xs[i] = r.Normal()
     g.Forward(1)
     before := g.Value(y).Flat()!.Copy()
     for c in range 4: xs[c] += 1.0                  # position 0
     g.Forward(1)
-    after := g.Value(y).Flat()!
+    after :~ g.Value(y).Flat()!
     for i in range 3 * 4, 8 * 4: assert after[i] == before[i], "position " + $(i / 4)
     assert after[2 * 4] != before[2 * 4]
 }
@@ -583,7 +583,7 @@ test DeltaBlock "decoding (the delta rule's state carried, a windowed attention'
     ft, fl := mixedLm(full, ctx)
     try full.Plan(rand.Rand(30))
     tokens := Array<I32>[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]
-    fd := full.Ints(ft).Flat()!
+    fd :~ full.Ints(ft).Flat()!
     for i in range ctx: fd[i] = tokens[i]
     full.Forward(1)
     want := full.Value(fl)
@@ -595,7 +595,7 @@ test DeltaBlock "decoding (the delta rule's state carried, a windowed attention'
         try dp.Convert(full.Params())
         for pos in range 0, ctx, steps {
             d.Pos = pos
-            td := d.Ints(dt).Flat()!
+            td :~ d.Ints(dt).Flat()!
             for j in range steps: td[j] = tokens[pos + j]
             d.Forward(steps)
             got := d.Value(dl)
@@ -621,11 +621,11 @@ test DocStarts "packed documents: two documents in one sequence give each one's 
         y := g.Add(h, a.Apply(g, h, docs))
         try g.Plan(rand.Rand(7))
         # sequence 0: [8 1 2 3] [8 4 5 6 7 1] packed; sequence 1: the second document alone, then padding
-        td := g.Ints(tok).Flat()!
+        td :~ g.Ints(tok).Flat()!
         both := Array<I32>[8, 1, 2, 3, 8, 4, 5, 6, 7, 1, 8, 4, 5, 6, 7, 1, 0, 0, 0, 0]
         for i in range 20: td[i] = both[i]
         DocStarts(g, tok, 8, docs, keep)
-        dd := g.Ints(docs).Flat()!
+        dd :~ g.Ints(docs).Flat()!
         assert dd[3] == 0 and dd[4] == 4 and dd[9] == 4 and dd[10] == 0 and dd[19] == 0
         g.Forward(2)
         out := g.Value(y)

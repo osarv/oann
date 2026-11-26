@@ -965,11 +965,11 @@ fn (g mut Graph<T>&) customRoom() {
     if g.customVals.Len() == g.customIn.Len(): return
     vals := Vec<tensor.Tensor<T>>()
     for v in g.customIn: vals.Push(g.Value(v))
-    g.customVals = vals.ToArray()
-    g.customGrads = vals.ToArray()
+    g.customVals ~ vals.ToArray()
+    g.customGrads ~ vals.ToArray()
     if g.custom32() {
-        g.customVals32 = Array<tensor.Tensor<F32>>(g.customIn.Len(), tensor.Tensor<F32>.Zeros(1))
-        g.customGrads32 = Array<tensor.Tensor<F32>>(g.customIn.Len(), tensor.Tensor<F32>.Zeros(1))
+        g.customVals32 ~ Array<tensor.Tensor<F32>>(g.customIn.Len(), tensor.Tensor<F32>.Zeros(1))
+        g.customGrads32 ~ Array<tensor.Tensor<F32>>(g.customIn.Len(), tensor.Tensor<F32>.Zeros(1))
     }
 }
 
@@ -1226,7 +1226,7 @@ type Layout struct(nodes Array<Placed>, needs Array<Bool>, ParamCount I64, Activ
 fn (g mut Graph<T>&) Lay() Layout ? tensor.ShapeError {
     try g.Check()
     if g.Eager: unreachable "oann: an eager graph has no layout"
-    g.needs = g.wants()
+    g.needs ~ g.wants()
     params := g.placeParams()
     fixed := g.placeFixed(2 * params)
     acts := g.lifetimes()
@@ -1311,7 +1311,7 @@ fn (g mut Graph<T>&) PlanBaked(r mut rand.Rand&, l Layout&, on device.Backend = 
     if g.planned: unreachable "oann: a graph is planned once"
     if g.Eager: unreachable "oann: an eager graph has no layout"
     if l.nodes.Len() != g.nodes.Len(): unreachable "oann: the baked layout is of another graph"
-    g.needs = l.needs.Copy()
+    g.needs ~ l.needs.Copy()
     for i in range l.nodes.Len() {
         p := l.nodes[i]
         nd := g.nodes[i]
@@ -1340,18 +1340,18 @@ fn (g mut Graph<T>&) begin(r mut rand.Rand&) {
 
 # the storage a layout asks for, and the parameters' starting values
 fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
-    g.mem = Array<T>(l.Size)
-    g.intMem = Array<I32>(l.Ints)
+    g.mem ~ Array<T>(l.Size)
+    g.intMem ~ Array<I32>(l.Ints)
     match T {
-        case F64: g.acc64 = Array<F64>(l.Accs)
-        case _: g.acc32 = Array<F32>(l.Accs)
+        case F64: g.acc64 ~ Array<F64>(l.Accs)
+        case _: g.acc32 ~ Array<F32>(l.Accs)
     }
     g.ActivationSize = l.ActivationSize
     g.ParamCount = l.ParamCount
     count := g.nodes.Len()
-    g.losses = Array<F64>(count)
-    g.written = Array<Bool>(count)
-    if g.HasMasters(): g.masters = Array<F32>(l.ParamCount)
+    g.losses ~ Array<F64>(count)
+    g.written ~ Array<Bool>(count)
+    if g.HasMasters(): g.masters ~ Array<F32>(l.ParamCount)
     for _ in range count {
         g.vals.Push(slot<T>(g.mem))
         g.ints.Push(slot<I32>(g.intMem))
@@ -1360,9 +1360,9 @@ fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
     }
     for i in range count: g.initParam(i, r)
     for i in range count: g.reserve(i)
-    g.views = Array<tensor.Tensor<T>>(count, g.empty())
-    g.gradViews = Array<tensor.Tensor<T>>(count, g.empty())
-    g.unplaced = Array<Bool>(count)
+    g.views ~ Array<tensor.Tensor<T>>(count, g.empty())
+    g.gradViews ~ Array<tensor.Tensor<T>>(count, g.empty())
+    g.unplaced ~ Array<Bool>(count)
     g.customRoom()
     g.SyncParams()
 }
@@ -1678,8 +1678,8 @@ fn (g mut Graph<T>&) grow(i I64) {
         w[k] = g.written[k]
         l[k] = g.losses[k]
     }
-    g.written = w
-    g.losses = l
+    g.written ~ w
+    g.losses ~ l
 }
 
 # whether node i's gradient is wanted, from what is recorded so far
@@ -1732,8 +1732,8 @@ fn (g Graph<T>&) Master(v Var) tensor.Tensor<F32> {
 # BF16 graph. FullSync rounds everything
 fn (g mut Graph<T>&) SyncParams() {
     if not g.HasMasters(): return
-    mem := g.mem
-    masters := g.masters
+    mem :~ g.mem
+    masters :~ g.masters
     if g.rowSets.Len() == 0 {
         for i in range g.ParamCount: mem[i] = T(masters[i])
         return
@@ -1944,14 +1944,14 @@ fn (g mut Graph<T>&) CopyParamsFrom(src Graph<T>&) {
         if g.OnGpu or src.OnGpu: unreachable "oann: CopyParamsFrom of a graph planned on the GPU"
     }
     if g.HasMasters() {
-        to := g.Masters().Flat()!
-        from := src.Masters().Flat()!
+        to :~ g.Masters().Flat()!
+        from :~ src.Masters().Flat()!
         for i in range to.Len(): to[i] = from[i]
         g.FullSync()
         return
     }
-    to := g.Params().Flat()!
-    from := src.Params().Flat()!
+    to :~ g.Params().Flat()!
+    from :~ src.Params().Flat()!
     for i in range to.Len(): to[i] = from[i]
 }
 
@@ -1963,8 +1963,8 @@ fn (g mut Graph<T>&) AddGradsFrom(src Graph<T>&) {
     if Gpu {
         if g.OnGpu or src.OnGpu: unreachable "oann: AddGradsFrom of a graph planned on the GPU"
     }
-    to := g.ParamGrads().Flat()!
-    from := src.ParamGrads().Flat()!
+    to :~ g.ParamGrads().Flat()!
+    from :~ src.ParamGrads().Flat()!
     for i in range to.Len(): to[i] = T(F64(to[i]) + F64(from[i]))
 }
 
@@ -2035,8 +2035,8 @@ fn (g mut Graph<T>&) QuantizeLinear() {
         case F32 { }
         case _: unreachable "oann: INT8 inference is for a Graph<F32>"
     }
-    g.q8 = list.List<q8Weights>()
-    g.q8At = list.List<I64>()
+    g.q8 ~ list.List<q8Weights>()
+    g.q8At ~ list.List<I64>()
     rows I64 = 0
     wide I64 = 0
     outs I64 = 0
@@ -2054,9 +2054,9 @@ fn (g mut Graph<T>&) QuantizeLinear() {
             case _: g.q8At.Push(-1)
         }
     }
-    g.q8Acts = Array<U8>(rows * wide)
-    g.q8Sums = Array<I32>(rows * outs)
-    g.q8Scale = Array<F32>(outs)
+    g.q8Acts ~ Array<U8>(rows * wide)
+    g.q8Sums ~ Array<I32>(rows * outs)
+    g.q8Scale ~ Array<F32>(outs)
 }
 
 # w [out, in] quantized row by row: scale = the row's largest magnitude / 127
@@ -2118,11 +2118,11 @@ fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
             lo, hi := rangeOf(xm)
             sa := (hi - lo) / 255.0 if hi > lo else F32(1.0)
             zero := I32((-lo / sa).Round())
-            acts := g.q8Acts
+            acts :~ g.q8Acts
             for r in range n {
                 for c in range xm.Cols: acts[r * xm.Cols + c] = U8((F32(xm[r, c]) / sa).Round() + F32(zero))
             }
-            scale := g.q8Scale
+            scale :~ g.q8Scale
             for o in range w.out: scale[o] = sa * w.scale[o]
             am := mat.Mat<U8>(acts, 0, n, xm.Cols, xm.Cols)
             bm := mat.Mat<I8>(w.q, 0, w.out, w.width, w.width)
@@ -2133,7 +2133,7 @@ fn (g mut Graph<T>&) linearInt8(i I64, x Var, b Var) {
             gemm.GemmI8(g.wsI8, cm, am, bm, scale[0:w.out], om, zero, w.sum)
             if b < 0: return
             bv := g.Value(b)
-            bd := bv.Flat()!
+            bd :~ bv.Flat()!
             for r in range n {
                 for o in range w.out: om.Data[om.Off + r * om.Ld + o] = om.Data[om.Off + r * om.Ld + o] + F32(bd[o])
             }
@@ -2252,7 +2252,7 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         case Op.SelectiveScan(x, d, a, b, c, skip) {
             k := g.selectiveKeep(i)
             state := g.accMat<A>(i, k, g.inUse(nd)[0] * g.nodes[a].Dims[0], nd.Dims[2])
-            keep := g.accOf<A>(i)[0:k]
+            keep :~ g.accOf<A>(i)[0:k]
             ops.SelectiveScan<T, A>(sw, y, state, g.Value(x), g.Value(d), g.Value(a), g.Value(b), g.Value(c), g.opt(skip), nd.Dims[1], keep)
         }
         case Op.DeltaRule(q, k, v, beta, gate) {
@@ -2260,7 +2260,7 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
             kk := g.deltaKeep(i)
             dk := g.nodes[q].Dims[2] / heads
             state := g.accMat<A>(i, kk, g.inUse(nd)[0] * heads * dk, nd.Dims[2] / heads)
-            keep := g.accOf<A>(i)[0:kk]
+            keep :~ g.accOf<A>(i)[0:kk]
             if g.Decode {
                 ops.DeltaRuleStep<T, A>(sw, y, state, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), g.inUse(nd)[1], heads, g.Pos == 0)
             } else {
@@ -2314,7 +2314,7 @@ fn (g mut Graph<T>&) customForward(i I64, f mut any Function&, first I64, count 
         case F32 {
             for j in range count: g.customVals[first + j] = g.Value(g.customIn[first + j])
             out := g.Value(Var(i))
-            ins := g.customVals[first:first + count]
+            ins :~ g.customVals[first:first + count]
             f.Forward(out, ins)
         }
         case BF16, F16 {
@@ -2534,7 +2534,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             if g.flashes(nd) {
                 ops.FlashAttentionBackward<T, A>(g.flashOf<A>(), dy, g.Value(q), g.Value(k), g.Value(v), g.Value(Var(i)), g.accOf<A>(i), heads, nd.Dims[1], causal, window, g.startsOf(docs), dq, aq, dk, ak, dv, av)
             } else {
-                sc := g.scratch(i, 0, g.extrasOf(i).scratch)
+                sc :~ g.scratch(i, 0, g.extrasOf(i).scratch)
                 ops.AttentionBackward<T, A>(ws, dy, g.Value(q), g.Value(k), g.Value(v), g.saved(i), sc, heads, nd.Dims[1], causal, window, g.startsOf(docs), dq, aq, dk, ak, dv, av)
             }
         }
@@ -2566,7 +2566,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             aw := g.acc(w)
             db := g.gradOf(b)
             ab := g.acc(b)
-            cols := g.scratch(i, 0, g.extrasOf(i).scratch)
+            cols :~ g.scratch(i, 0, g.extrasOf(i).scratch)
             ops.Conv2dBackward<T, A>(ws, dy, g.Value(x), g.Value(w), s, cols, g.Threads, dx, ax, dw, aw, db, ab)
         }
         case Op.MaxPool2d(x, p) {
@@ -3184,7 +3184,7 @@ fn (g mut Graph<T>&) selectiveBack<A>(i I64, sw mut scan.Work<A>&, dy tensor.Ten
     n := g.nodes[a].Dims[0]
     seqs := g.inUse(nd)[0]
     dstate := g.accMat<A>(i, k + seqs * n * nd.Dims[2], seqs * n, nd.Dims[2])
-    keep := g.accOf<A>(i)[0:k]
+    keep :~ g.accOf<A>(i)[0:k]
     ops.SelectiveScanBackward<T, A>(sw, dy, g.Value(x), g.Value(d), g.Value(a), g.Value(b), g.Value(c), g.opt(skip), nd.Dims[1], keep, dstate, dx, ax, dd, ad, da, aa, db, ab, dc, ac, ds, sa)
 }
 
@@ -3207,7 +3207,7 @@ fn (g mut Graph<T>&) deltaBack<A>(i I64, sw mut scan.Work<A>&, dy tensor.Tensor<
     seqs := g.inUse(nd)[0]
     rows := seqs * heads * dkw
     dstate := g.accMat<A>(i, kk + rows * (nd.Dims[2] / heads), rows, nd.Dims[2] / heads)
-    keep := g.accOf<A>(i)[0:kk]
+    keep :~ g.accOf<A>(i)[0:kk]
     ops.DeltaRuleBackward<T, A>(sw, dy, g.Value(q), g.Value(k), g.Value(v), g.Value(beta), g.Value(gate), nd.Dims[1], heads, keep, dstate, dq, aq, dk, ak, dv, av, db, ab, dg, ag)
 }
 
@@ -3227,8 +3227,8 @@ fn (g mut Graph<T>&) customBack<A>(i I64, f mut any Function&, first I64, count 
                 g.customGrads[first + j] = g.scratchTensor(i, at, d)
                 at += d.Count()
             }
-            ins := g.customVals[first:first + count]
-            dins := g.customGrads[first:first + count]
+            ins :~ g.customVals[first:first + count]
+            dins :~ g.customGrads[first:first + count]
             f.Backward(dy, ins, dins)
             for j in range count {
                 x := g.customIn[first + j]
@@ -3295,15 +3295,15 @@ test Graph.QuantizeLinear "a graph's linear layers in INT8: within 2% of the F32
     out := g.Linear(g.Act(g.Linear(x, w1, b1), mat.Act.Relu), w2, b2)
     r := rand.Rand(5)
     try g.Plan(r)
-    xd := g.Value(x).Flat()!
+    xd :~ g.Value(x).Flat()!
     for i in range xd.Len(): xd[i] = F32(r.Normal())
     g.Forward(16)
     exact := g.Value(out).Clone()
     g.QuantizeLinear()
     g.Int8 = true
     g.Forward(16)
-    got := g.Value(out).Flat()!
-    want := exact.Flat()!
+    got :~ g.Value(out).Flat()!
+    want :~ exact.Flat()!
     scale F32 = 0.0
     worst F32 = 0.0
     for i in range 16 * 8 {
@@ -3327,9 +3327,9 @@ test Graph "records, plans and runs a small network" {
     r := rand.Rand(1)
     try g.Plan(r)
     assert g.ParamCount == 8
-    xd := g.Value(x).Flat()!
+    xd :~ g.Value(x).Flat()!
     for i in range 12: xd[i] = F64(i)
-    yd := g.Ints(y).Flat()!
+    yd :~ g.Ints(y).Flat()!
     for i in range 4: yd[i] = I32(i % 2)
     g.Forward(4)
     assert g.Value(h).Get(1, 0) == 6.0
@@ -3354,7 +3354,7 @@ test Graph "the kernels compute what they say: ReLU, a product, a linear layer, 
     set(g, b, Array<F64>[0.5, 1, 1.5, 2, 2.5, 3])
     set(g, w, Array<F64>[1, 0, 0, 0, 1, 0, 0, 0, 1, 1, 1, 1])
     set(g, bias, Array<F64>[10, 20, 30, 40])
-    c := g.Ints(y).Flat()!
+    c :~ g.Ints(y).Flat()!
     c[0] = 3
     c[1] = 1
     g.Forward(2)
@@ -3367,7 +3367,7 @@ test Graph "the kernels compute what they say: ReLU, a product, a linear layer, 
 }
 
 fn set<T>(g mut Graph<T>&, v Var, values Array<F64>&) {
-    d := g.Value(v).Flat()!
+    d :~ g.Value(v).Flat()!
     for i in range values.Len(): d[i] = T(values[i])
 }
 
@@ -3391,9 +3391,9 @@ fn mixedNet<T>(g mut Graph<T>&, seed U64, dropout F64 = 0.0) Var, Var, Var {
 
 fn fillMixed<T>(g mut Graph<T>&, x Var, y Var, seed U64) {
     r := rand.Rand(seed)
-    xd := g.Value(x).Flat()!
+    xd :~ g.Value(x).Flat()!
     for i in range xd.Len(): xd[i] = T(F32(r.Normal()))
-    yd := g.Ints(y).Flat()!
+    yd :~ g.Ints(y).Flat()!
     for i in range yd.Len(): yd[i] = I32(r.Below(5))
 }
 
@@ -3470,7 +3470,7 @@ test Graph "causal attention: a position's output depends on no later position" 
     g.Mse(a, g.Input(32, 8))
     r := rand.Rand(13)
     try g.Plan(r)
-    xd := g.Value(x).Flat()!
+    xd :~ g.Value(x).Flat()!
     for i in range xd.Len(): xd[i] = r.Normal()
     g.Forward(1)
     early := g.Value(a).Slice(1, 0, 20)!.Clone()
@@ -3524,11 +3524,11 @@ test Graph "a step split over tasks gives exactly what one task gives, forward a
         a := g.Attention(q, x, x, 2, true)
         loss := g.Mse(g.Linear(a, g.Param(Init.Normal(0.0, 0.1), true, 64, 64)), g.Input(64, 64))
         try g.Plan(rand.Rand(17))
-        xd := g.Value(x).Flat()!
+        xd :~ g.Value(x).Flat()!
         for i in range xd.Len(): xd[i] = F64(i % 7) * 0.25 - 0.5
         g.Forward(8)
         g.Backward(loss)
-        got := g.ParamGrads().Flat()!
+        got :~ g.ParamGrads().Flat()!
         if threads == 1 {
             for v in got: want.Push(v)
             wantLoss = g.Scalar(loss)
@@ -3550,8 +3550,8 @@ test Graph "a BF16 graph keeps F32 masters drawn as an F32 graph's, and computes
     try b.Plan(rand.Rand(21))
     try c.Plan(rand.Rand(21))
     assert b.Masters() == c.Params()
-    p := b.Params().Flat()!
-    m := b.Masters().Flat()!
+    p :~ b.Params().Flat()!
+    m :~ b.Masters().Flat()!
     for i in range b.ParamCount: assert p[i] == BF16(m[i])
     pa := a.Params()
     try pa.Convert(b.Params())
@@ -3563,8 +3563,8 @@ test Graph "a BF16 graph keeps F32 masters drawn as an F32 graph's, and computes
         b.Forward(n)
         b.Backward(bloss)
         assert (b.Scalar(bloss) - a.Scalar(aloss)).Abs() < 1e-3 * a.Scalar(aloss)
-        ga := a.ParamGrads().Flat()!
-        gb := b.ParamGrads().Flat()!
+        ga :~ a.ParamGrads().Flat()!
+        gb :~ b.ParamGrads().Flat()!
         diff F64 = 0.0
         norm F64 = 0.0
         for i in range a.ParamCount {
@@ -3580,7 +3580,7 @@ test Graph "a BF16 graph's checkpoint is its F32 masters, and loads into an F32 
     b := Graph<BF16>(2)
     mixedNet(b, 1)
     try b.Plan(rand.Rand(22))
-    m := b.Masters().Flat()!
+    m :~ b.Masters().Flat()!
     for i in range b.ParamCount: m[i] = m[i] + 1e-4
     b.SyncParams()
     try b.Save("build/ad_mixed.safetensors")
@@ -3672,8 +3672,8 @@ test Graph.Custom "an operation defined outside runs forward and backward as the
         b.Forward(3)
         b.Backward(lb)
         assert a.Scalar(la) == b.Scalar(lb)
-        ga := a.Grad(wa).Flat()!
-        gb := b.Grad(wb).Flat()!
+        ga :~ a.Grad(wa).Flat()!
+        gb :~ b.Grad(wb).Flat()!
         for i in range 16: assert (ga[i] - gb[i]).Abs() < 1e-6
     }
 }
@@ -3696,8 +3696,8 @@ test Graph.Custom "a BF16 graph runs a custom operation in F32 at its edge, as a
         b.Forward(n)
         b.Backward(lb)
         assert (a.Scalar(la) - b.Scalar(lb)).Abs() < 2e-2 * b.Scalar(lb)
-        ga := a.Grad(wa).Flat()!
-        gb := b.Grad(wb).Flat()!
+        ga :~ a.Grad(wa).Flat()!
+        gb :~ b.Grad(wb).Flat()!
         for i in range 16: assert (F64(ga[i]) - F64(gb[i])).Abs() < 2e-2 * (1.0 + F64(gb[i]).Abs())
     }
 }
@@ -3714,9 +3714,9 @@ fn sparseNet(g mut Graph<F32>&, sparse Bool) Var, Var, Var {
 }
 
 fn sparseFill(g mut Graph<F32>&, tok Var, y Var, r mut rand.Rand&, lo I64) {
-    ids := g.Ints(tok).Flat()!
+    ids :~ g.Ints(tok).Flat()!
     for k in range ids.Len(): ids[k] = I32(lo + r.Below(12))
-    yy := g.Value(y).Flat()!
+    yy :~ g.Value(y).Flat()!
     for k in range yy.Len(): yy[k] = F32(r.Normal())
 }
 
@@ -3741,7 +3741,7 @@ test Graph.Sparse "a sparse table's gradient equals the dense one at every row; 
             assert not seen[rs.Rows[k]]
             seen[rs.Rows[k]] = true
         }
-        ids := b.Ints(tb).Flat()!
+        ids :~ b.Ints(tb).Flat()!
         for id in ids: assert seen[id]
         for row in range 40: assert seen[row] or not (I32(row) in ids)
     }
@@ -3777,7 +3777,7 @@ test Graph "decoding with a cache of keys and values equals the full forward, a 
     ft, fl := tinyLm(full, ctx)
     try full.Plan(rand.Rand(30))
     tokens := Array<I32>[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]
-    fd := full.Ints(ft).Flat()!
+    fd :~ full.Ints(ft).Flat()!
     for i in range ctx: fd[i] = tokens[i]
     full.Forward(1)
     want := full.Value(fl)
@@ -3789,7 +3789,7 @@ test Graph "decoding with a cache of keys and values equals the full forward, a 
         try dp.Convert(full.Params())
         for pos in range 0, ctx, steps {
             d.Pos = pos
-            td := d.Ints(dt).Flat()!
+            td :~ d.Ints(dt).Flat()!
             for j in range steps: td[j] = tokens[pos + j]
             d.Forward(steps)
             got := d.Value(dl)
@@ -3817,7 +3817,7 @@ test Graph "a decoding graph's positions are its Tokens', wherever they were rec
 # this process's anonymous resident memory in kB (RssAnon, Linux: heap and stacks, not the code pages that running a path
 # for the first time maps in), read once
 fn rss() I64 {
-    text := try os.ReadFile("/proc/self/status") catch { return 0 }
+    text :~ try os.ReadFile("/proc/self/status") catch { return 0 }
     for line in text.Lines() {
         if not line.StartsWith("RssAnon:"): continue
         kb := try line[8:].Trim().Split(" ")[0].ParseInt() catch { return 0 }
@@ -3891,9 +3891,9 @@ fn Layout.Mlp() Layout {
 
 # a batch for the perceptron: inputs from a pattern, the classes in turn
 fn feedMlp(g mut Graph<F32>&) {
-    xs := g.Data(Var(0)).Flat()!
+    xs :~ g.Data(Var(0)).Flat()!
     for i in range xs.Len(): xs[i] = F32(i % 17) / 17.0
-    ys := g.Ints(Var(1)).Flat()!
+    ys :~ g.Ints(Var(1)).Flat()!
     for i in range ys.Len(): ys[i] = I32(i % 10)
     g.Forward(64)
 }
@@ -3929,8 +3929,8 @@ test Graph.PlanBaked "a graph planned from the baked layout runs as the one that
 fn gradGap(g mut Graph<F64>&, loss Var) F64 {
     g.Forward(g.Batch)
     g.Backward(loss)
-    ps := g.Params().Flat()!
-    gr := g.ParamGrads().Flat()!
+    ps :~ g.Params().Flat()!
+    gr :~ g.ParamGrads().Flat()!
     exact := Array<F64>(ps.Len())
     for i in range ps.Len(): exact[i] = gr[i]
     worst F64 = 0.0
@@ -3980,12 +3980,12 @@ test Graph "stablemax cross-entropy: the loss as written, an ignored row, and gr
     loss := g.StablemaxCE(out, y)
     try g.Plan(rand.Rand(6))
     set(g, x, Array<F64>[1, 0.5, -1, 2, -0.5, 1, 0.3, 0.2, 1, 1, -2, 0.1])
-    c := g.Ints(y).Flat()!
+    c :~ g.Ints(y).Flat()!
     c[0] = 2
     c[1] = 4
     c[2] = -1
     g.Forward(3)
-    o := g.Value(out).Flat()!
+    o :~ g.Value(out).Flat()!
     total F64 = 0.0
     for r in range 2 {
         sum F64 = 0.0
@@ -4044,8 +4044,8 @@ test Graph "one parameter set used by two graphs: copied in, the gradients added
     a.Backward(la)
     b.Backward(lb)
     a.AddGradsFrom(b)
-    ps := a.Params().Flat()!
-    gr := a.ParamGrads().Flat()!
+    ps :~ a.Params().Flat()!
+    gr :~ a.ParamGrads().Flat()!
     h := 1e-6
     for i in range ps.Len() {
         old := ps[i]
@@ -4072,14 +4072,14 @@ test Graph.Backward "params false: the watched state's gradient bit for bit as a
     e := g.Sum(g.Sum(g.Sum(g.Linear(g.Norm(h, g.Param(Init.Uniform(1.0, 1.0), false, 8)), w3))))
     try g.Plan(r)
     for v in Array<Var>[z, x] {
-        d := g.Value(v).Flat()!
+        d :~ g.Value(v).Flat()!
         for i in range d.Len(): d[i] = F32(r.Uniform(-1.0, 1.0))
     }
     g.Forward(6)
     g.Backward(e)
     full := g.Grad(z).Clone()
     params := g.ParamGrads().Clone()
-    pg := g.ParamGrads().Flat()!
+    pg :~ g.ParamGrads().Flat()!
     for i in range pg.Len(): pg[i] = 7.0
     g.Forward(6)
     g.Backward(e, false, false)

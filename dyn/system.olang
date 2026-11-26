@@ -162,8 +162,8 @@ fn (s mut System<T>&) Quantized() {
 # a connection from pre into post, wired so; reciprocal also carries post's activities back into pre (Symmetric always
 # does); frozen: learning leaves its weights
 fn (s mut System<T>&) Connect(pre Pop, post Pop, w conn.Wiring, frozen Bool = false, reciprocal Bool = false) Conn {
-    a := s.E.Pops[I64(pre)]
-    b := s.E.Pops[I64(post)]
+    a :~ s.E.Pops[I64(pre)]
+    b :~ s.E.Pops[I64(post)]
     s.E.Links.Push(conn.Link<T>(I64(pre), I64(post), a.Size, b.Size, w, reciprocal, frozen))
     return Conn(s.E.Links.Len() - 1)
 }
@@ -173,7 +173,7 @@ fn (s mut System<T>&) Signal(m Mod, name String&, width I64 = 1) Sig {
     at I64 = 0
     for g in s.sigs: at += g.Width
     s.sigs.Push(sigRec(I64(m), name, width, at))
-    if s.Planned: s.signals = Array<T>[s.signals[i] if i < at else T(0) for i in range at + width]
+    if s.Planned: s.signals ~ Array<T>[s.signals[i] if i < at else T(0) for i in range at + width]
     return Sig(s.sigs.Len() - 1)
 }
 
@@ -213,7 +213,7 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.
             try device.NotBuilt()
         }
     }
-    e := s.E
+    e :~ s.E
     count I64 = 0
     for l in e.Links {
         try l.Check()
@@ -221,11 +221,11 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.
         count += l.Count
     }
     for p in e.Pops: count += p.Size
-    e.Params = Array<T>(count)
-    e.Grads = Array<T>(count)
+    e.Params ~ Array<T>(count)
+    e.Grads ~ Array<T>(count)
     at I64 = 0
     for i in range e.Links.Len() {
-        l := e.Links[i]
+        l :~ e.Links[i]
         l.Folded = e.Pops[l.Pre].Role == neuron.Role.Input
         l.Lay(e.Params, at, s.Batch * s.Phases, r)
         at += l.Count
@@ -233,7 +233,7 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.
         if not l.Ternary: continue
         if not (l.Kind == conn.Wiring.Dense or l.Kind == conn.Wiring.Symmetric): error tensor.ShapeError.Mismatch("a ternary connection is dense or symmetric")
         if on == device.Backend.Gpu: error tensor.ShapeError.Mismatch("ternary connections run on the CPU")
-        l.Latent = Array<T>(l.Count)
+        l.Latent ~ Array<T>(l.Count)
         for k in range l.Count: l.Latent[k] = e.Params[l.Off + k]
         l.Quantize(e.Params)
     }
@@ -246,7 +246,7 @@ fn (s mut System<T>&) Plan(r mut rand.Rand&, on device.Backend = device.Backend.
     }
     width I64 = 0
     for g in s.sigs: width += g.Width
-    s.signals = Array<T>(width)
+    s.signals ~ Array<T>(width)
     e.Ready()
     e.Reserve(s.Scheme.Anderson)
     if Gpu {
@@ -267,7 +267,7 @@ fn SettleOn(batch I64, width I64) device.Backend { return device.Backend.Gpu if 
 # whether it was planned on the GPU
 fn (s System<T>&) OnGpu() Bool {
     if Gpu {
-        return s.gpu.M != null
+        return s.gpu.M is not null
     } else {
         return false
     }
@@ -283,37 +283,37 @@ if Gpu {
 # Nothing on the CPU
 fn (s System<T>&) hostState(i I64) {
     if Gpu {
-        if s.gpu.M != null: s.gpu.M!.HostState(s.E, i)
+        if s.gpu.M is not null: s.gpu.M!.HostState(s.E, i)
     }
 }
 
 fn (s System<T>&) hostCoupling() {
     if Gpu {
-        if s.gpu.M != null: s.gpu.M!.HostCoupling(s.E)
+        if s.gpu.M is not null: s.gpu.M!.HostCoupling(s.E)
     }
 }
 
 fn (s System<T>&) wroteCoupling() {
     if Gpu {
-        if s.gpu.M != null: s.gpu.M!.WroteCoupling(s.E)
+        if s.gpu.M is not null: s.gpu.M!.WroteCoupling(s.E)
     }
 }
 
 fn (s System<T>&) wroteParams() {
     if Gpu {
-        if s.gpu.M != null: s.gpu.M!.WroteParams(s.E)
+        if s.gpu.M is not null: s.gpu.M!.WroteParams(s.E)
     }
 }
 
 fn (s System<T>&) wroteGrads() {
     if Gpu {
-        if s.gpu.M != null: s.gpu.M!.WroteGrads(s.E)
+        if s.gpu.M is not null: s.gpu.M!.WroteGrads(s.E)
     }
 }
 
 fn (s System<T>&) wroteState(i I64) {
     if Gpu {
-        if s.gpu.M != null: s.gpu.M!.WroteState(s.E, i)
+        if s.gpu.M is not null: s.gpu.M!.WroteState(s.E, i)
     }
 }
 
@@ -328,7 +328,7 @@ fn (s mut System<T>&) Use(scheme settle.Sweeping) {
 # connection i into the lists of the populations it feeds: folded into its post's constant (its pre an input), else
 # carried forward into post and, reciprocal, back into pre
 fn (s mut System<T>&) route(l conn.Link<T>&, i I64) {
-    post := s.E.Pops[l.Post]
+    post :~ s.E.Pops[l.Post]
     if l.Folded {
         post.Folds.Push(i)
         return
@@ -412,7 +412,7 @@ fn (s mut System<T>&) TargetValues(p Pop, y tensor.Tensor<T>&) ? tensor.ShapeErr
 fn (s mut System<T>&) Set(sig Sig, v tensor.Tensor<T>&) ? tensor.ShapeError {
     g := s.sigs[I64(sig)]
     if v.Count() != g.Width: error tensor.ShapeError.Mismatch("signal " + $g.Name + " holds " + $g.Width + " values, not " + $v.Count())
-    from := try v.Flat()
+    from :~ try v.Flat()
     for i in range g.Width: s.signals[g.At + i] = from[i]
 }
 
@@ -453,7 +453,7 @@ fn (s mut System<T>&) Settle(phase settle.Phase, b settle.Budget) settle.Settlem
     if ph >= s.Phases: unreachable "a system of " + $s.Phases + " phases has no " + $phase
     s.E.Beta[ph] = 0.0 if phase == settle.Phase.Free else s.E.Beta[ph]
     if Gpu {
-        if s.gpu.M != null: return s.gpu.M!.Settle(s.E, ph, ph + 1, b, true)
+        if s.gpu.M is not null: return s.gpu.M!.Settle(s.E, ph, ph + 1, b, true)
     }
     return s.E.Settle(ph, ph + 1, b, true)
 }
@@ -466,7 +466,7 @@ fn (s mut System<T>&) Nudged(b settle.Budget, beta F64 = 0.5, centered Bool = tr
     s.E.Beta[1] = beta
     if centered: s.E.Beta[2] = -beta
     if Gpu {
-        if s.gpu.M != null {
+        if s.gpu.M is not null {
             for ph in range 1, hi: s.gpu.M!.Warm(s.E, ph, 0)
             return s.gpu.M!.Settle(s.E, 1, hi, b, false)
         }
@@ -478,7 +478,7 @@ fn (s mut System<T>&) Nudged(b settle.Budget, beta F64 = 0.5, centered Bool = tr
 # phase's state at rest: every field but the kept ones (LifCell.Kept) zero
 fn (s mut System<T>&) Reset(phase settle.Phase) {
     if Gpu {
-        if s.gpu.M != null {
+        if s.gpu.M is not null {
             s.gpu.M!.Reset(s.E, phase.Index())
             return
         }
@@ -489,7 +489,7 @@ fn (s mut System<T>&) Reset(phase settle.Phase) {
 # phase's state set to from's
 fn (s mut System<T>&) Warm(phase settle.Phase, from settle.Phase) {
     if Gpu {
-        if s.gpu.M != null {
+        if s.gpu.M is not null {
             s.gpu.M!.Warm(s.E, phase.Index(), from.Index())
             return
         }
@@ -509,7 +509,7 @@ fn (s mut System<T>&) Step(dt F64) { s.E.Dt = dt }
 # - RateCell<T> for rate and custom populations, LifCell<T> for spiking ones. Writing it writes the state
 fn (s System<T>&) State<C>(p Pop) mut Columns<C>& {
     s.wroteState(I64(p))
-    pop := s.E.Pops[I64(p)]
+    pop :~ s.E.Pops[I64(p)]
     match C {
         case neuron.RateCell<T> { return pop.R0 }
         case neuron.LifCell<T> { return pop.L0 }
@@ -519,7 +519,7 @@ fn (s System<T>&) State<C>(p Pop) mut Columns<C>& {
 # p's activities in phase, [batch, size], a view
 fn (s System<T>&) Activity(phase settle.Phase, p Pop) tensor.Tensor<T> {
     s.hostState(I64(p))
-    pop := s.E.Pops[I64(p)]
+    pop :~ s.E.Pops[I64(p)]
     n := s.Batch * pop.Size
     return tensor.Tensor<T>.Over(pop.Activity(0), phase.Index() * n, s.Batch, pop.Size)!
 }
@@ -528,9 +528,9 @@ fn (s System<T>&) Activity(phase settle.Phase, p Pop) tensor.Tensor<T> {
 # groups] into out
 fn (s System<T>&) Predict(phase settle.Phase, p Pop, out mut Array<I32>&) {
     s.hostState(I64(p))
-    pop := s.E.Pops[I64(p)]
+    pop :~ s.E.Pops[I64(p)]
     groups := settle.GroupsOf(pop.Role).Max(1)
-    a := pop.Activity(0)
+    a :~ pop.Activity(0)
     w := pop.Size / groups
     base := phase.Index() * s.Batch * pop.Size
     for b in range s.Batch {
@@ -547,11 +547,11 @@ fn (s System<T>&) Predict(phase settle.Phase, p Pop, out mut Array<I32>&) {
 fn (s System<T>&) Loss(phase settle.Phase) F64 {
     total F64 = 0.0
     for i in range s.E.Pops.Len() {
-        pop := s.E.Pops[i]
+        pop :~ s.E.Pops[i]
         role := pop.Role
         if role != neuron.Role.Readout: continue
         s.hostState(i)
-        a := pop.Activity(0)
+        a :~ pop.Activity(0)
         for b in range s.Batch {
             at := (phase.Index() * s.Batch + b) * pop.Size
             total += neuron.CostOf(role.cost, a, at, pop.Size, pop.Labels, b * settle.GroupsOf(role), pop.Target, b * pop.Size)
@@ -564,7 +564,7 @@ fn (s System<T>&) Loss(phase settle.Phase) F64 {
 # event-driven one, A ([post, rank]) for a low-rank one (B follows it), the stored values for a sparse one ([Count])
 fn (s System<T>&) Weights(c Conn) tensor.Tensor<T> {
     s.wroteParams()
-    l := s.E.Links[I64(c)]
+    l :~ s.E.Links[I64(c)]
     return match l.Kind {
         case conn.Wiring.Dense, conn.Wiring.Symmetric: tensor.Tensor<T>.Over(s.E.Params, l.Off, l.PostSize, l.PreSize)!
         case conn.Wiring.Events: tensor.Tensor<T>.Over(s.E.Params, l.Off, l.PreSize, l.PostSize)!
@@ -582,7 +582,7 @@ fn (s System<T>&) Pop(p Pop) mut settle.Population<T>& { return s.E.Pops[I64(p)]
 # p's biases, a view of the parameter region
 fn (s System<T>&) Bias(p Pop) tensor.Tensor<T> {
     s.wroteParams()
-    pop := s.E.Pops[I64(p)]
+    pop :~ s.E.Pops[I64(p)]
     return tensor.Tensor<T>.Over(s.E.Params, pop.Bias, pop.Size)!
 }
 
@@ -616,7 +616,7 @@ fn (s mut System<T>&) Prune(c Conn, keep Array<Bool>&) {
 
 # unit j of p retired: held at rest from the next sweep on (its rows zero), so nothing it is connected to hears it
 fn (s mut System<T>&) Retire(p Pop, j I64) {
-    pop := s.E.Pops[I64(p)]
+    pop :~ s.E.Pops[I64(p)]
     if not pop.Alive[j]: return
     pop.Alive[j] = false
     pop.Retired++
@@ -635,7 +635,7 @@ fn (s mut System<T>&) Compact() I64 {
 # Nothing masked, nothing to do - on the GPU the parameters then stay where they are (no round trip a lesson)
 fn (s mut System<T>&) Hold() {
     masked := false
-    for l in s.E.Links: masked = masked or (l.Pruned > 0 and l.Tiles == null)
+    for l in s.E.Links: masked = masked or (l.Pruned > 0 and l.Tiles is null)
     if not masked: return
     s.wroteParams()
     for l in s.E.Links: l.Hold(s.E.Params)
@@ -680,7 +680,7 @@ fn (s System<T>&) Macs() Macs {
 # every unit's incoming mass over the recurrent connections (a folded one's source is constant and does not count)
 fn (s mut System<T>&) masses() {
     s.hostCoupling()
-    e := s.E
+    e :~ s.E
     for i in range e.Mass.Len(): e.Mass[i] = 0.0
     for l in e.Links {
         if not l.Folded: l.AddMass(e.Params, e.Mass, e.Pops[l.Post].Unit, e.Pops[l.Pre].Unit)
@@ -749,10 +749,10 @@ fn (s mut System<T>&) Restrain(target F64 = 0.9) {
     s.masses()
     l := s.slope()
     if not (l <= F64.Max): return
-    e := s.E
+    e :~ s.E
     factors := Array<F64>(e.Links.Len(), 1.0)
     for i in range e.Links.Len() {
-        c := e.Links[i]
+        c :~ e.Links[i]
         if c.Folded: continue
         factors[i] = s.worstFactor(e.Pops[c.Post], l, target)
         if c.Both: factors[i] = factors[i].Min(s.worstFactor(e.Pops[c.Pre], l, target))
@@ -817,7 +817,7 @@ fn (s mut System<T>&) NudgedRate(beta F64, free settle.Settlement) F64, I64 {
     for i in range s.E.Pops.Len() {
         if s.E.Pops[i].Role == neuron.Role.Readout: s.hostState(i)
     }
-    blocks := s.blocks(k)
+    blocks :~ s.blocks(k)
     worst F64 = 0.0
     rows := 0
     for row in range s.E.Batch {
@@ -866,12 +866,12 @@ fn (s System<T>&) plainRate(row I64, k F64, b F64, rest F64) F64 {
 # within the readouts, each sigma = kappa / the largest slope (a block's norm is at most the whole's) or 0 where no
 # connection joins those units, and the hidden units' largest slope
 fn (s System<T>&) blocks(k F64) Array<F64>& {
-    out := s.rateBlocks
+    out :~ s.rateBlocks
     for i in range 4: out[i] = 0.0
     slope := s.slope()
     if not (slope > 0.0 and slope <= F64.Max): return out
     sigma := k / slope
-    e := s.E
+    e :~ s.E
     for l in e.Links {
         if l.Folded: continue
         pre, post := e.Pops[l.Pre].Role == neuron.Role.Readout, e.Pops[l.Post].Role == neuron.Role.Readout
@@ -897,12 +897,12 @@ fn (s System<T>&) blockRate(row I64, blocks Array<F64>&, b F64, rest F64) F64, F
     if blocks[1] == 0.0: return 1.0, 0.0
     euclid := s.Bound == Norm.Spectral
     size := b * s.forceSize(row, euclid)
-    m := s.blockMatrix(row, blocks, b, 0.0)
+    m :~ s.blockMatrix(row, blocks, b, 0.0)
     t := perron(m)
     if t == 0.0: return 1.0, 0.0
     r := rest.Max((rest + size) / t) / (1.0 - kappaAt(m, t))
     for _ in range 100 {
-        m = s.blockMatrix(row, blocks, b, r * t)
+        m ~ s.blockMatrix(row, blocks, b, r * t)
         start := rest.Max((rest + size) / t)
         minus := kappaAt(m, t)
         if minus < 1.0 and (1.0 - minus) * r >= start {
@@ -922,7 +922,7 @@ fn (s System<T>&) blockMatrix(row I64, blocks Array<F64>&, b F64, ry F64) Array<
     sy := s.readoutSlope(row, ry)
     c, w := s.forceOver(row, ry, euclid)
     sh := blocks[3]
-    m := s.rateM
+    m :~ s.rateM
     m[0], m[1], m[2] = blocks[0] * sh, blocks[1] * sy, blocks[1] * sh
     m[3], m[4] = blocks[2] * sy + b * w, blocks[2] * sy + b * c
     return m
@@ -1274,8 +1274,8 @@ test System.Settle "a stable answer stops a settle (Budget.Stable): fewer sweeps
 # a and b's state, every phase, against another's: the same bit for bit
 fn sameState<T>(p System<T>&, q System<T>&) Bool {
     for i in range 1, 4 {
-        u := p.State<neuron.RateCell<T>>(Pop(i))
-        v := q.State<neuron.RateCell<T>>(Pop(i))
+        u :~ p.State<neuron.RateCell<T>>(Pop(i))
+        v :~ q.State<neuron.RateCell<T>>(Pop(i))
         if u.U != v.U or u.S != v.S: return false
     }
     return true
@@ -1512,7 +1512,7 @@ test System.Certify "certified in the spectral norm (the gain above 1, outside t
     assert cold.Converged, $cold.Sweeps + " sweeps, residual " + $cold.Residual
     first := Array<F64>[s.Activity(settle.Phase.Free, Pop(1)).Get(k / 24, k % 24) for k in range 48]
     # another drive settled, then the first again from there
-    x := s.Pop(Pop(0))
+    x :~ s.Pop(Pop(0))
     for i in range 6: x.Drive[i] = -x.Drive[i]
     assert s.Settle(settle.Phase.Free, s.BudgetFor(tol)).Converged
     for i in range 6: x.Drive[i] = -x.Drive[i]
@@ -1607,7 +1607,7 @@ test System.NudgedRate "the block norm: on a layered system (no lateral blocks) 
         assert free.Converged
         for i in range 2: s.Pop(Pop(2)).Labels[i] = I32((trial * 7 + i * 3) % 10)
         k := s.Kappa()
-        blocks := s.blocks(k)
+        blocks :~ s.blocks(k)
         for row in range s.E.Batch {
             plain := s.plainRate(row, k, beta, free.Residual)
             q, t := s.blockRate(row, blocks, beta, free.Residual)
@@ -1686,7 +1686,7 @@ fn gap(a Array<F64>&, b Array<F64>&) F64 {
 fn assertContracts(s mut System<F64>&, beta F64, free settle.Settlement, sweeps I64, tol F64) F64 {
     n := s.E.Batch
     k := s.Kappa()
-    blocks := s.blocks(k)
+    blocks :~ s.blocks(k)
     qs, ts := Array<F64>(n, 1.0), Array<F64>(n, 0.0)
     for row in range n {
         q, t := s.rowRate(row, k, blocks, beta, free.Residual)
@@ -1854,7 +1854,7 @@ test System.Reset "a cold start clears the state but the fields kept across sett
     s := System<F64>(2, 1, 1)
     h := s.Population(s.Root(), "h", 3, neuron.Neuron.Spiking(window = 8))
     s.Plan(r)!
-    cells := s.State<neuron.LifCell<F64>>(h)
+    cells :~ s.State<neuron.LifCell<F64>>(h)
     cells.Theta[4] = 0.5
     cells.V[4] = 0.25
     cells.Trace[4] = 0.125
@@ -1870,7 +1870,7 @@ type leaky struct(rows I64, size I64) {
 }
 
 fn (l mut leaky&) Relax(drive tensor.Tensor<F32>&, dt F64, lo I64, hi I64) F64 {
-    d := drive.Flat()!
+    d :~ drive.Flat()!
     worst F32 = 0.0
     for i in range lo * l.size, hi * l.size {
         r := d[i] - l.u[i]
@@ -1919,7 +1919,7 @@ test System.Prune "a pruned weight is a zero weight, a retired unit rests, and c
     b.Settle(settle.Phase.Free, settle.Budget(256, 1e-10))
     assert sameState(a, b)
     # a sparse block's entries masked, then dropped: the same equilibrium, fewer entries
-    csr := b.Link(Conn(1)).Csr!
+    csr :~ b.Link(Conn(1)).Csr!
     nnz := csr.Nnz()
     drop := Array<Bool>(b.Link(Conn(1)).Count, true)
     for e in range 0, nnz, 3: drop[e] = false
@@ -1986,11 +1986,11 @@ test System.Restrain "the gain caps what the recurrent connections carry into a 
     s.Plan(rand.Rand(3))!
     s.Bound = Norm.Sup                  # the gain's per-unit caps
     for i in range s.E.Params.Len(): s.E.Params[i] = 4.0 * s.E.Params[i]
-    k := s.Link(skip)
+    k :~ s.Link(skip)
     before := Array<F64>[s.E.Params[i] for i in range k.Off, k.Off + k.Count]
     s.Restrain(0.9)
     assert s.Gain() <= 0.9 + 1e-9
-    v := s.Link(vote)
+    v :~ s.Link(vote)
     for j in range 2 {
         # |sum_i W_ji h_i| <= sum_i |W_ji| for any hidden state (|h_i| <= 1, tanh's slope 1)
         mass := 0.0
@@ -2028,7 +2028,7 @@ test System.Read "a module reads its own signal first, then its parent's" {
 # olang's own growth checks moved to VmPeak for this (the failure seen here: 70 pages while other builds shared RAM).
 # olang's allocator maps 128 KB and up a chunk at a time, so 400 lessons allocating anything at all show here
 fn peak() I64 {
-    st := try os.ReadFile("/proc/self/status") catch default ""
+    st :~ try os.ReadFile("/proc/self/status") catch default ""
     for line in st.Lines() {
         if line.StartsWith("VmPeak:"): return try line[7:line.Len() - 3].Trim().ParseInt(10) catch default 0
     }
@@ -2075,12 +2075,12 @@ fn System<T>.lifty(model neuron.Neuron) System<T> {
     s.Connect(x, h, conn.Wiring.Dense)
     s.Connect(h, o, conn.Wiring.Symmetric)
     s.Plan(r)!
-    w := s.Weights(Conn(1)).Flat()!
+    w :~ s.Weights(Conn(1)).Flat()!
     for i in range w.Len(): w[i] = w[i] * T(2)
     for j in range 5: s.E.Params[s.Pop(h).Bias + j] = T(1.3 + 0.1 * F64(j))
     for j in range 2: s.E.Params[s.Pop(o).Bias + j] = T(1.5)
     for j in range 4: s.Pop(x).Drive[j] = T(r.Uniform(0.0, 1.0))
-    t := s.Pop(o).Target
+    t :~ s.Pop(o).Target
     t[0], t[1], t[2], t[3] = T(0.15), T(0.02), T(0.02), T(0.15)
     return s
 }

@@ -197,7 +197,7 @@ fn (l mut Learner<T>&) apply(a system.Attached, c system.Clock) ? LearnError {
 
 # a rule of one's own, given the flat parameters and their gradients (an Update runs on a System<F32>)
 fn (l mut Learner<T>&) custom(r mut any system.Update&) {
-    e := l.S.E
+    e :~ l.S.E
     match T {
         case F32 { r.Apply(e.Params, e.Grads) }
         case _ { unreachable "a custom rule runs on a System<F32>" }
@@ -211,7 +211,7 @@ fn (l mut Learner<T>&) custom(r mut any system.Update&) {
 # (NotSettled, the gradients left as they were) where a phase does not settle within the budget - the nudged pair's
 # that of the rate System.NudgedRate certifies from the free state, where it certifies one
 fn (l mut Learner<T>&) Lesson(m system.Mod, beta F64, centered Bool = true) Taught ? LearnError {
-    s := l.S
+    s :~ l.S
     if s.OnGpu() {
         for lk in s.E.Links {
             if lk.Pruned > 0: error LearnError.Unsupported("a lesson of a pruned system planned on the GPU")
@@ -259,8 +259,8 @@ fn (l mut Learner<T>&) Contrast(m system.Mod, beta F64, centered Bool = true) {
 # out (laid out as the parameters) = k sum over the rows of (s_post s_pre at phase plus - at phase minus) for module
 # m's connections, k sum(dS) for its biases
 fn (l mut Learner<T>&) contrast(out mut Array<T>&, m system.Mod, plus I64, minus I64, k T) {
-    s := l.S
-    e := s.E
+    s :~ l.S
+    e :~ s.E
     n := l.n
     for p in e.Pops: differ(p.Activity(0), plus * n * p.Size, minus * n * p.Size, l.diff, p.Unit * n, n * p.Size)
     for lk in e.Links {
@@ -273,7 +273,7 @@ fn (l mut Learner<T>&) contrast(out mut Array<T>&, m system.Mod, plus I64, minus
         lk.MaskGrads(out)
     }
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if s.Within(system.Pop(i), m): biasSums(out, p.Bias, l.diff, p.Unit * n, n, p.Size, k if p.Role != neuron.Role.Input else T(0))
     }
 }
@@ -337,8 +337,8 @@ fn (l mut Learner<T>&) sampledPair(lk conn.Link<T>&, out mut Array<T>&, a Array<
     features(b, bo, l.fb, n, pre)
     am := mat.Mat<T>(l.fa, 0, post, n, n)
     bm := mat.Mat<T>(l.fb, 0, pre, n, n)
-    g := out[lk.Off:lk.Off + lk.Count]
-    if lk.Csr != null {
+    g :~ out[lk.Off:lk.Off + lk.Count]
+    if lk.Csr is not null {
         lk.Csr!.Sampled(g, am, bm, k, true)
         return
     }
@@ -384,7 +384,7 @@ fn AdamW<T>.For(s mut system.System<T>&, rate F64 = 0.001, beta1 F64 = 0.9, beta
 fn (o mut AdamW<T>&) Step() {
     o.Steps++
     if Gpu {
-        if o.dev.K != null {
+        if o.dev.K is not null {
             k := o.dev.K!
             k.Lr = o.Rate
             o.S.Mirror().Adam(o.S.E, k)
@@ -422,7 +422,7 @@ fn adamRun<T>(p mut Array<T>&, gr Array<T>&, m mut Array<T>&, v mut Array<T>&, b
 # the free phase's coincidences), then the module's signal m times it - stepped into the parameters at rate, or written
 # as G = -m e for an optimizer when rate is 0
 fn (l mut Learner<T>&) threeFactor(m system.Mod, signal system.Sig, decay F64, rate F64, c system.Clock) {
-    s := l.S
+    s :~ l.S
     at := l.slotOf(m, signal, c)
     clear(l.work, 0, l.count)
     beta := s.NudgeOf(settle.Phase.Plus)
@@ -451,8 +451,8 @@ fn (l Learner<T>&) slotOf(m system.Mod, signal system.Sig, c system.Clock) I64 {
 
 # work = mean over the free phase's rows of s_post s_pre for module m's connections, of s for its biases
 fn (l mut Learner<T>&) hebbian(m system.Mod) {
-    s := l.S
-    e := s.E
+    s :~ l.S
+    e :~ s.E
     k := T(1.0 / F64(l.n))
     for lk in e.Links {
         if lk.Frozen or not s.Within(system.Pop(lk.Post), m): continue
@@ -461,7 +461,7 @@ fn (l mut Learner<T>&) hebbian(m system.Mod) {
         lk.MaskGrads(l.work)
     }
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role != neuron.Role.Input and s.Within(system.Pop(i), m): biasSums(l.work, p.Bias, p.Activity(0), 0, l.n, p.Size, k)
     }
 }
@@ -496,10 +496,10 @@ fn (l Learner<T>&) Trace(m system.Mod, signal system.Sig, c system.Clock) mut Ar
 # population's thresholds (Theta, every row of every phase) up by rate times the excess, a rate population's biases
 # down by it
 fn (l mut Learner<T>&) Homeostasis(m system.Mod, target F64, rate F64) {
-    s := l.S
-    e := s.E
+    s :~ l.S
+    e :~ s.E
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role == neuron.Role.Input or not s.Within(system.Pop(i), m): continue
         if p.Spiking: thresholds(p.L0, p.L1, p.Activity(0), l.n, p.Size, e.Rows, T(target), T(rate))
         else: biases(e.Params, p.Bias, p.Activity(0), l.n, p.Size, T(target), T(rate))
@@ -533,8 +533,8 @@ fn biases<T>(params mut Array<T>&, bias I64, a Array<T>&, n I64, size I64, targe
 # connection c's weights written by the delta rule from the free phase's rows: W += g / N sum (s_post - W s_pre)
 # s_pre^T, g the gate's value (nothing at 0); a dense connection's (Dense or Symmetric). A pruned weight stays zero
 fn (l mut Learner<T>&) DeltaWrite(c system.Conn, gate system.Sig) ? LearnError {
-    s := l.S
-    lk := s.Link(c)
+    s :~ l.S
+    lk :~ s.Link(c)
     if lk.Kind != conn.Wiring.Dense and lk.Kind != conn.Wiring.Symmetric: error LearnError.Unsupported("a delta write into a connection that is not dense")
     g := F64(s.Value(gate).Get(0))
     if g == 0.0: return
@@ -578,8 +578,8 @@ fn masked<T>(lk conn.Link<T>&, params mut Array<T>&) {
 # did until System.Sparsify. An optimizer's momentum moves masked weights: System.Hold after its step. Refused by a
 # learner made without room for it (pruning = true, or a Prune rule attached before it was made)
 fn (l mut Learner<T>&) Prune(m system.Mod, by conn.Score, target F64, pace F64, regrow F64 = 0, schedule conn.Schedule = conn.Schedule.Cubic) ? LearnError {
-    s := l.S
-    e := s.E
+    s :~ l.S
+    e :~ s.E
     if s.OnGpu(): error LearnError.Unsupported("pruning a system planned on the GPU")
     if l.keep.Len() == 0: error LearnError.Unsupported("pruning by a learner made without room for it (pruning = true)")
     for p in e.Pops: absMeans(p.Activity(0), l.n, p.Size, l.mean, p.Unit)
@@ -633,7 +633,7 @@ fn absMeans<T>(a Array<T>&, n I64, size I64, mean mut Array<F64>&, at I64) {
 
 # the mean over the free rows of s_post s_pre at each of lk's weights, into work (laid out as the parameters)
 fn (l mut Learner<T>&) coincide(lk conn.Link<T>&) {
-    e := l.S.E
+    e :~ l.S.E
     clear(l.work, lk.Off, lk.Count)
     l.pair(lk, l.work, e.Pops[lk.Post].Activity(0), 0, e.Pops[lk.Pre].Activity(0), 0, T(1.0 / F64(l.n)))
 }
@@ -642,7 +642,7 @@ fn (l mut Learner<T>&) coincide(lk conn.Link<T>&) {
 # gives the new n
 fn (l mut Learner<T>&) scores(lk conn.Link<T>&, by conn.Score, n I64) I64 {
     if lk.Group() > 1: return l.groupScores(lk, by, n)
-    p := l.S.E.Params
+    p :~ l.S.E.Params
     at := l.S.E.Pops[lk.Pre].Unit
     sum F64 = 0.0
     for i in range lk.Count {
@@ -669,7 +669,7 @@ fn (l mut Learner<T>&) groupScores(lk conn.Link<T>&, by conn.Score, n I64) I64 {
     alive I64 = 0
     for g in range lk.Groups() {
         if not lk.Kept(g): continue
-        v := l.tileScore(lk, by, g) if lk.Tiles != null else l.rankScore(lk, by, g)
+        v := l.tileScore(lk, by, g) if lk.Tiles is not null else l.rankScore(lk, by, g)
         l.score[lk.Off + g] = v
         sum += v
         alive++
@@ -687,7 +687,7 @@ fn (l mut Learner<T>&) groupScores(lk conn.Link<T>&, by conn.Score, n I64) I64 {
 
 # stored tile g's score: the sum of its weights' (its elements past the matrix are zero)
 fn (l Learner<T>&) tileScore(lk conn.Link<T>&, by conn.Score, g I64) F64 {
-    p := l.S.E.Params
+    p :~ l.S.E.Params
     at := l.S.E.Pops[lk.Pre].Unit
     tile := lk.Tiles!.Tile
     _, c := lk.TileAt(g)
@@ -705,7 +705,7 @@ fn (l Learner<T>&) tileScore(lk conn.Link<T>&, by conn.Score, g I64) F64 {
 # |a| sum_j |b_j| mean|s_pre j| (Activity), |a^T mean(s_post s_pre^T) b| (Energy: the coincidence's gradient of the
 # first factor, which work holds, dotted with a)
 fn (l Learner<T>&) rankScore(lk conn.Link<T>&, by conn.Score, g I64) F64 {
-    p := l.S.E.Params
+    p :~ l.S.E.Params
     at := l.S.E.Pops[lk.Pre].Unit
     rank, post, pre := lk.Groups(), lk.PostSize, lk.PreSize
     a, b, carried, energy := 0.0, 0.0, 0.0, 0.0
@@ -831,12 +831,12 @@ fn split(a mut Array<F64>&, lo I64, hi I64, p F64) I64, I64 {
 
 # module m's hidden units with no live weight, in or out, retired: they carry nothing
 fn (l mut Learner<T>&) retireLoose(m system.Mod) {
-    s := l.S
-    e := s.E
+    s :~ l.S
+    e :~ s.E
     for u in range e.Units: l.live[u] = 0
     for lk in e.Links: l.countLive(lk)
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role != neuron.Role.Hidden or not s.Within(system.Pop(i), m): continue
         for j in range p.Size {
             if l.live[p.Unit + j] == 0: s.Retire(system.Pop(i), j)
@@ -847,9 +847,9 @@ fn (l mut Learner<T>&) retireLoose(m system.Mod) {
 # each unit's live weights in lk added to live (a low-rank connection's every unit counted once while a rank is live; a
 # tiled one's units of each live tile)
 fn (l mut Learner<T>&) countLive(lk conn.Link<T>&) {
-    e := l.S.E
+    e :~ l.S.E
     post, pre := e.Pops[lk.Post], e.Pops[lk.Pre]
-    if lk.Tiles != null {
+    if lk.Tiles is not null {
         l.tileLive(lk, post.Unit, pre.Unit)
         return
     }
@@ -886,7 +886,7 @@ fn (l mut Learner<T>&) tileLive(lk conn.Link<T>&, postAt I64, preAt I64) {
 # (exact) or the nudged phases (EP) went; refuses a spiking or custom system, and an iteration or phase that does not
 # settle (NotSettled)
 fn (l mut Learner<T>&) ImplicitGrad(out system.Pop, dz tensor.Tensor<T>&, how system.Implicit, inp system.Pop, dx mut tensor.Tensor<T>&) settle.Settlement ? LearnError, tensor.ShapeError {
-    s := l.S
+    s :~ l.S
     try l.shaped(out, dz)
     try l.shaped(inp, dx)
     if s.OnGpu(): error LearnError.Unsupported("implicit gradients of a system planned on the GPU")
@@ -897,8 +897,8 @@ fn (l mut Learner<T>&) ImplicitGrad(out system.Pop, dz tensor.Tensor<T>&, how sy
         if model == neuron.Neuron.Rate and model.rho == neuron.Rho.SwiGlu: error LearnError.Unsupported("implicit gradients through gated (SwiGlu) units")
     }
     if s.Pop(out).Role == neuron.Role.Input: error LearnError.Unsupported("a loss on an input population's activities")
-    d := try dz.Flat()
-    into := try dx.Flat()
+    d :~ try dz.Flat()
+    into :~ try dx.Flat()
     l.slopes()
     out0 := match how {
         case system.Implicit.Ep(beta): try l.byEp(out, d, beta)
@@ -961,7 +961,7 @@ fn geluSlope<T Float>(x T) T {
 # the source of the adjoint, rho'(u) dz on out's units, zero elsewhere
 fn (l mut Learner<T>&) source(out system.Pop, dz Array<T>&) {
     clear(l.src, 0, l.src.Len())
-    p := l.S.Pop(out)
+    p :~ l.S.Pop(out)
     at := p.Unit * l.n
     for i in range l.n * p.Size: l.src[at + i] = l.slope[at + i] * dz[i]
 }
@@ -979,7 +979,7 @@ fn (l mut Learner<T>&) jfb(out system.Pop, dz Array<T>&) settle.Settlement {
 # Written like ImplicitGrad (ParamGrads, and dL/d(drive) of inp into dx); gives the last step's largest change. The same
 # refusals as ImplicitGrad.
 fn (l mut Learner<T>&) TruncatedGrad(out system.Pop, dz tensor.Tensor<T>&, k I64, inp system.Pop, dx mut tensor.Tensor<T>&) settle.Settlement ? LearnError, tensor.ShapeError {
-    s := l.S
+    s :~ l.S
     try l.shaped(out, dz)
     try l.shaped(inp, dx)
     if s.OnGpu(): error LearnError.Unsupported("implicit gradients of a system planned on the GPU")
@@ -990,8 +990,8 @@ fn (l mut Learner<T>&) TruncatedGrad(out system.Pop, dz tensor.Tensor<T>&, k I64
         if model == neuron.Neuron.Rate and model.rho == neuron.Rho.SwiGlu: error LearnError.Unsupported("implicit gradients through gated (SwiGlu) units")
     }
     if s.Pop(out).Role == neuron.Role.Input: error LearnError.Unsupported("a loss on an input population's activities")
-    d := try dz.Flat()
-    into := try dx.Flat()
+    d :~ try dz.Flat()
+    into :~ try dx.Flat()
     l.slopes()
     l.source(out, d)
     for i in range l.lam.Len(): l.lam[i] = l.src[i]
@@ -1000,7 +1000,7 @@ fn (l mut Learner<T>&) TruncatedGrad(out system.Pop, dz tensor.Tensor<T>&, k I64
     for _ in range k {
         l.carryBack(l.lam, l.adj)
         worst = F64(adjointStep(l.lam, l.next, l.src, l.slope, l.adj, dt))
-        l.lam, l.next = l.next, l.lam
+        l.lam, l.next ~ l.next, l.lam
     }
     l.fromAdjoint()
     l.driveGrad(inp, into)
@@ -1013,7 +1013,7 @@ fn (l mut Learner<T>&) TruncatedGrad(out system.Pop, dz tensor.Tensor<T>&, k I64
 fn (l mut Learner<T>&) exact(out system.Pop, dz Array<T>&, tol F64, sweeps I64) settle.Settlement ? LearnError {
     l.source(out, dz)
     clear(l.lam, 0, l.lam.Len())
-    e := l.S.E
+    e :~ l.S.E
     dt := T(e.Dt)
     m := e.Depth(l.S.Scheme)
     e.Restart()
@@ -1024,7 +1024,7 @@ fn (l mut Learner<T>&) exact(out system.Pop, dz Array<T>&, tol F64, sweeps I64) 
         if l.Adjoint.Converged: break
         if k == sweeps or l.Adjoint.Diverged(): error LearnError.NotSettled("adjoint", k, worst)
         if m > 0: e.Accelerate(l.lam, l.next, worst, m)
-        l.lam, l.next = l.next, l.lam
+        l.lam, l.next ~ l.next, l.lam
     }
     l.fromAdjoint()
     return l.Adjoint
@@ -1045,7 +1045,7 @@ fn adjointStep<T>(lam Array<T>&, next mut Array<T>&, src Array<T>&, slope Array<
 # read back, into its post side from its pre side's
 fn (l mut Learner<T>&) carryBack(lam mut Array<T>&, into mut Array<T>&) {
     clear(into, 0, into.Len())
-    e := l.S.E
+    e :~ l.S.E
     for lk in e.Links {
         if lk.Folded: continue
         l.backInto(lk, lam, into)
@@ -1057,7 +1057,7 @@ fn (l mut Learner<T>&) carryBack(lam mut Array<T>&, into mut Array<T>&) {
 
 # into's pre region += lam's post region W (the transpose of carrying the pre side forward)
 fn (l mut Learner<T>&) backInto(lk mut conn.Link<T>&, lam mut Array<T>&, into mut Array<T>&) {
-    e := l.S.E
+    e :~ l.S.E
     post, pre := e.Pops[lk.Post], e.Pops[lk.Pre]
     if lk.Kind != conn.Wiring.Events {
         lk.Backward(l.ws, l.sc, l.region(into, pre), l.region(lam, post), 0, l.n)
@@ -1077,7 +1077,7 @@ fn (l Learner<T>&) region(a mut Array<T>&, p settle.Population<T>&) mut Array<T>
 # ParamGrads from the adjoint: lambda_post s_pre^T for every connection (and s_post lambda_pre^T read back), lambda for
 # the biases, summed over the rows
 fn (l mut Learner<T>&) fromAdjoint() {
-    e := l.S.E
+    e :~ l.S.E
     n := l.n
     clear(e.Grads, 0, l.count)
     for lk in e.Links {
@@ -1096,10 +1096,10 @@ fn (l mut Learner<T>&) fromAdjoint() {
 # point, the drive restored and the free phase settled again (its constant folded back); ParamGrads = -contrast / (2
 # beta) and lambda = -dS / (2 beta)
 fn (l mut Learner<T>&) byEp(out system.Pop, dz Array<T>&, beta F64) settle.Settlement ? LearnError {
-    s := l.S
-    e := s.E
+    s :~ l.S
+    e :~ s.E
     if s.Phases < 3: error LearnError.Unsupported("EP's implicit gradient needs the plus and minus phases")
-    p := s.Pop(out)
+    p :~ s.Pop(out)
     count := l.n * p.Size
     tol := l.Tol if l.Tol > 0.0 else s.LessonTolerance(beta)
     b := l.budget(tol, 0.0)
@@ -1133,8 +1133,8 @@ fn nudge<T>(d mut Array<T>&, saved Array<T>&, dz Array<T>&, k T, count I64) {
 # dx = dL/d(drive) of population inp from the adjoint: lambda for a relaxing population, rho'(d) (W^T lambda over the
 # connections out of it) for an input
 fn (l mut Learner<T>&) driveGrad(inp system.Pop, dx mut Array<T>&) {
-    e := l.S.E
-    p := e.Pops[I64(inp)]
+    e :~ l.S.E
+    p :~ e.Pops[I64(inp)]
     at := p.Unit * l.n
     count := l.n * p.Size
     if p.Role != neuron.Role.Input {
@@ -1255,7 +1255,7 @@ test Learner.Contrast "the contrast written is its definition for every wiring -
     s := everyWiring(3, r)
     n := 3
     for p in s.E.Pops {
-        a := p.Activity(0)
+        a :~ p.Activity(0)
         for i in range a.Len(): a[i] = r.Uniform(-1.0, 1.0)
         if p.Role != neuron.Role.Input: continue
         for i in range n * p.Size {
@@ -1274,7 +1274,7 @@ test Learner.Contrast "the contrast written is its definition for every wiring -
         k := -1.0 / ((2.0 * beta if centered else beta) * F64(n))
         worst F64 = 0.0
         for c in range s.E.Links.Len() {
-            lk := s.E.Links[c]
+            lk :~ s.E.Links[c]
             for e in range lk.Off, lk.Off + lk.Count {
                 old := s.E.Params[e]
                 want F64 = 0.0
@@ -1291,7 +1291,7 @@ test Learner.Contrast "the contrast written is its definition for every wiring -
             }
         }
         for p in s.E.Pops {
-            a := p.Activity(0)
+            a :~ p.Activity(0)
             for j in range p.Size {
                 want F64 = 0.0
                 for row in range n: want += a[(n + row) * p.Size + j] - a[(minus * n + row) * p.Size + j]
@@ -1318,7 +1318,7 @@ fn gradientSystem(r mut rand.Rand&, reward Bool = false, skip Bool = false, rho 
     if skip: s.Connect(x, y, conn.Wiring.Dense)
     s.Plan(r)!
     for c in range 1, 3 {
-        w := s.Weights(system.Conn(c)).Flat()!
+        w :~ s.Weights(system.Conn(c)).Flat()!
         for i in range w.Len(): w[i] = 3.0 * w[i]
     }
     s.Certify(0.9)
@@ -1336,7 +1336,7 @@ fn freeLoss(s mut system.System<F64>&) F64 {
 
 # the central differences, step 1e-5, of the free equilibrium's cost in every parameter
 fn lossGradient(s mut system.System<F64>&) Array<F64> {
-    p := s.E.Params
+    p :~ s.E.Params
     out := Array<F64>(p.Len())
     for i in range p.Len() {
         old := p[i]
@@ -1391,7 +1391,7 @@ test Learner.Lesson "other activations: the centered contrast is the cost's grad
         if rho == neuron.Rho.SwiGlu {
             # no slope bound to certify by: the recurrent weights back to a sixth of the tripled draw
             for c in range 1, 3 {
-                w := s.Weights(system.Conn(c)).Flat()!
+                w :~ s.Weights(system.Conn(c)).Flat()!
                 for i in range w.Len(): w[i] = w[i] / 6.0
             }
         }
@@ -1474,7 +1474,7 @@ fn wired(symmetric Bool, r mut rand.Rand&) system.System<F64> {
 # L = sum dz s_y at the free equilibrium, settled to 1e-14
 fn readLoss(s mut system.System<F64>&, dz Array<F64>&) F64 {
     s.Settle(settle.Phase.Free, settle.Budget(20000, 1e-14))
-    y := s.Pop(system.Pop(3)).Activity(0)
+    y :~ s.Pop(system.Pop(3)).Activity(0)
     total F64 = 0.0
     for i in range dz.Len(): total += dz[i] * y[i]
     return total
@@ -1516,7 +1516,7 @@ test Learner.ImplicitGrad "exact, JFB and EP gradients at a fixed point against 
     s := wired(true, r)
     dz := tensor.Tensor<F64>.Zeros(2, 3)
     dz.FillUniform(r, -1.0, 1.0)
-    d := dz.Flat()!
+    d :~ dz.Flat()!
     readLoss(s, d)
     params := differences(s, s.E.Params, d)
     inputs := differences(s, s.Pop(system.Pop(0)).Drive, d)
@@ -1543,7 +1543,7 @@ test Learner.TruncatedGrad "the truncated adjoint is JFB at k = 0 and tends to t
     s := wired(true, r)
     dz := tensor.Tensor<F64>.Zeros(2, 3)
     dz.FillUniform(r, -1.0, 1.0)
-    d := dz.Flat()!
+    d :~ dz.Flat()!
     readLoss(s, d)
     l := Learner<F64>(s)!
     g, _, _ := implicitOf(l, dz, system.Implicit.Exact(1e-14, 20000))
@@ -1582,7 +1582,7 @@ test Learner.ImplicitGrad "the exact gradient through one-way connections (dense
     s := wired(false, r)
     dz := tensor.Tensor<F64>.Zeros(2, 3)
     dz.FillUniform(r, -1.0, 1.0)
-    d := dz.Flat()!
+    d :~ dz.Flat()!
     readLoss(s, d)
     params := differences(s, s.E.Params, d)
     inputs := differences(s, s.Pop(system.Pop(0)).Drive, d)
@@ -1632,7 +1632,7 @@ test AdamW.Step "ternary weights: after every step each weight of a ternary conn
     xorData(s, x, y, 0.0)
     l := Learner<F32>(s)!
     o := AdamW<F32>.For(s, 0.03)!
-    lk := s.E.Links[I64(c)]
+    lk :~ s.E.Links[I64(c)]
     s.Settle(settle.Phase.Free, settle.Budget())
     first := s.Loss(settle.Phase.Free)
     for _ in range 300 {
@@ -1740,7 +1740,7 @@ test Learner.Prune "a rule prunes a trained XOR system to a quarter of its weigh
     }
     s.Settle(settle.Phase.Free, settle.Budget())
     assert liveOf(s) == 8 and xorRight(s, y) == 4, $liveOf(s) + " live, " + $xorRight(s, y) + "/4 right"
-    lk := s.Link(system.Conn(1))
+    lk :~ s.Link(system.Conn(1))
     for i in range lk.Count: assert lk.Keep[i] or s.E.Params[lk.Off + i] == 0.0
     for j in range 8: assert s.Pop(h).Alive[j] != loose(s, j), "unit " + $j + ": retired exactly when it has no live weight"
     before := Array<Bool>[lk.Keep[i] for i in range lk.Count]
@@ -1790,7 +1790,7 @@ test Learner.Prune "a tiled connection loses whole tiles and a low-rank one whol
     assert k.Macs() == 12 and s.Compact() == 2 + 6 and t.Count == 8 and k.Macs() == 6 and k.Kind == conn.Wiring.LowRank and k.Count == 6
     s.Reset(settle.Phase.Free)
     s.Settle(settle.Phase.Free, settle.Budget(512, 1e-12))
-    got := s.Activity(settle.Phase.Free, system.Pop(2)).Flat()!
+    got :~ s.Activity(settle.Phase.Free, system.Pop(2)).Flat()!
     for i in range want.Len(): assert (want[i] - got[i]).Abs() < 1e-10
     # a lesson leaves the compacted factors' tail at zero
     l.Lesson(s.Root(), 0.1)!
@@ -1870,7 +1870,7 @@ test Learner.Tick "three factors: the trace is decay e + the contrast of the las
     g := s.E.Grads.Copy()
     before := s.E.Params.Copy()
     l.Tick(system.Clock.Step)!
-    e := l.Trace(s.Root(), reward, system.Clock.Step)
+    e :~ l.Trace(s.Root(), reward, system.Clock.Step)
     worst F64 = 0.0
     for i in range g.Len() {
         worst = worst.Max((e[i] + g[i]).Abs())
@@ -1891,8 +1891,8 @@ test Learner.Tick "three factors: the trace is decay e + the contrast of the las
     t.Settle(settle.Phase.Free, settle.Budget(20000, 1e-12))
     held := t.E.Params.Copy()
     lt.Tick(system.Clock.Episode)!
-    h := t.Pop(system.Pop(1)).Activity(0)
-    y := t.Pop(system.Pop(2)).Activity(0)
+    h :~ t.Pop(system.Pop(1)).Activity(0)
+    y :~ t.Pop(system.Pop(2)).Activity(0)
     # without a nudge: the coincidence of y_0 and h_1 over the two rows, its bias the mean activity
     want := (y[0] * h[1] + y[3] * h[5]) / 2.0
     assert t.E.Params == held and (t.E.Grads[t.Link(system.Conn(2)).Off + 1] - want).Abs() < 1e-15
@@ -1989,7 +1989,7 @@ test Learner.DeltaWrite "a delta write stores a value at a unit key at once, ort
 # the peak address space in 4 KB pages (VmPeak, /proc): not the resident set, which transparent huge pages ("always"
 # on some machines) grow by whole 2 MB pages a fault whatever was allocated - dyn/system's peak() and olang's checks
 fn resident() I64 {
-    st := try os.ReadFile("/proc/self/status") catch { unreachable }
+    st :~ try os.ReadFile("/proc/self/status") catch { unreachable }
     for line in st.Lines() {
         if line.StartsWith("VmPeak:"): return (try line[7:line.Len() - 3].Trim().ParseInt(10) catch { unreachable }) / 4
     }
@@ -1998,7 +1998,7 @@ fn resident() I64 {
 
 # a lesson, the optimizer's step, the Step clock's rules and an exact implicit gradient from y into x's drive
 fn moment(l mut Learner<F32>&, opt mut adam<F32>&, dz tensor.Tensor<F32>&, dx mut tensor.Tensor<F32>&) {
-    s := l.S
+    s :~ l.S
     l.Lesson(s.Root(), 0.5)!
     opt.Step(s.E.Params, s.E.Grads)
     s.Hold()

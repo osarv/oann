@@ -172,7 +172,7 @@ fn (e mut Engine&) Step() Array<Done> {
     e.admit()
     for d in e.refused.View(): finished.Push(d)
     e.refused.Clear()
-    st := e.State
+    st :~ e.State
     st.Reset()
     budget := e.Chunk
     # decoding sequences first (one row each), then prompts
@@ -281,7 +281,7 @@ fn Sample(sp Sampler&, logits Array<F32>&, keys mut Array<I64>&, r mut rand.Rand
         keys[n] = (I64(0x7F800000 - p.Bits()) << 32) | i
         n++
     }
-    ks := keys[:n]
+    ks :~ keys[:n]
     ks.Sort(fn(a I64, b I64) Bool { return a < b })
     if sp.TopK > 0 and n > sp.TopK: n = sp.TopK
     total F64 = 0.0
@@ -319,7 +319,7 @@ fn greedyRuns(m model.Model&, list Array<Array<I32>&>&, batch I64, pages I64, ch
     for i, p in list: e.Submit(Request(I64(i), p, 30, U64(i)))
     out := Array<Array<I32>&>(list.Len(), Array<I32>(0))
     for not e.Idle() {
-        for d in e.Step(): out[d.Id] = d.Tokens
+        for d in e.Step(): out[d.Id] ~ d.Tokens
     }
     return out, e.Preempted
 }
@@ -327,18 +327,18 @@ fn greedyRuns(m model.Model&, list Array<Array<I32>&>&, batch I64, pages I64, ch
 fn testPrompts() Array<Array<I32>&>& {
     r := rand.Rand(4)
     out := Array<Array<I32>&>(6, Array<I32>(0))
-    for i in range 6: out[i] = Array<I32>[I32(r.Below(96)) for _ in range 5 + 9 * i]
+    for i in range 6: out[i] ~ Array<I32>[I32(r.Below(96)) for _ in range 5 + 9 * i]
     return out
 }
 
 test Engine "a batch, its prompts read in chunks, generates what each request generates alone" {
     dir := model.Tiny(true, 21)
     m := model.Model.Load(dir)!
-    ps := testPrompts()
+    ps :~ testPrompts()
     alone := Array<Array<I32>&>(ps.Len(), Array<I32>(0))
     for i, p in ps {
         one, _ := greedyRuns(m, Array<Array<I32>&>[p], 1, 8, 256, Array<I32>(0))
-        alone[i] = one[0]
+        alone[i] ~ one[0]
         assert one[0].Len() == 30
     }
     together, preempted := greedyRuns(m, ps, 4, 64, 16, Array<I32>(0))
@@ -350,7 +350,7 @@ test Engine "a batch, its prompts read in chunks, generates what each request ge
 test Engine "with too few pages for the batch, sequences are preempted and run again, to the same completions" {
     dir := model.Tiny(false, 23)
     m := model.Model.Load(dir)!
-    ps := testPrompts()
+    ps :~ testPrompts()
     want, _ := greedyRuns(m, ps, 6, 64, 256, Array<I32>(0))
     got, preempted := greedyRuns(m, ps, 6, 3, 256, Array<I32>(0))
     assert preempted > 0
@@ -376,7 +376,7 @@ test Engine "a prompt with no room to generate in is given back at once, empty, 
 test Engine "a stop token ends a completion and is left out of it" {
     dir := model.Tiny(true, 25)
     m := model.Model.Load(dir)!
-    ps := testPrompts()
+    ps :~ testPrompts()
     full, _ := greedyRuns(m, ps, 4, 64, 256, Array<I32>(0))
     stop := full[2][4]
     cut, _ := greedyRuns(m, ps, 4, 64, 256, Array<I32>[stop])

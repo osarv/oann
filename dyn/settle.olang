@@ -262,7 +262,7 @@ fn (e mut Engine<T>&) Ready() {
         }
         e.sc.Push(sc)
     }
-    e.wideSc = conn.Scratch<T>(widest, e.Batch.Max(Chunk), rank)
+    e.wideSc ~ conn.Scratch<T>(widest, e.Batch.Max(Chunk), rank)
     for l in e.Links: l.Prepack()
     for l in e.Links {
         if l.Kind != conn.Wiring.Events: continue
@@ -271,9 +271,9 @@ fn (e mut Engine<T>&) Ready() {
     }
     e.share = (((e.Batch + e.Threads - 1) / e.Threads + 7) / 8 * 8).Max(LeastChunk).Min(Chunk)
     most := e.Pops.Len() * e.Phases * ((e.Batch + e.share - 1) / e.share + (e.Batch + 1) / 2)
-    e.units = Array<I64>(3 * most)
-    e.worst = Array<T>(most)
-    e.Mass = Array<F64>(units)
+    e.units ~ Array<I64>(3 * most)
+    e.worst ~ Array<T>(most)
+    e.Mass ~ Array<F64>(units)
     e.Spiking = false
     for p in e.Pops {
         model := p.Model
@@ -286,9 +286,9 @@ fn (e mut Engine<T>&) Ready() {
     for p in e.Pops {
         if p.Role == neuron.Role.Readout: width += GroupsOf(p.Role).Max(1)
     }
-    e.answers = halt.Stable(e.Rows, 1, width)
-    e.groups = Array<I64>(e.Pops.Len() + 1)
-    e.fresh = Array<Bool>(e.Pops.Len())
+    e.answers ~ halt.Stable(e.Rows, 1, width)
+    e.groups ~ Array<I64>(e.Pops.Len() + 1)
+    e.fresh ~ Array<Bool>(e.Pops.Len())
     for p in e.Pops {
         e.spec.Push(Array<T>(p.Size))
         e.specW.Push(Array<T>(p.Size))
@@ -305,7 +305,7 @@ fn (e mut Engine<T>&) sweepOrder() {
         if not l.Folded and l.Pre != l.Post: need[l.Post]++
     }
     done := Array<Bool>(n)
-    e.order = Array<I64>(n)
+    e.order ~ Array<I64>(n)
     for at in range n {
         pick := firstReady(need, done)
         done[pick] = true
@@ -336,7 +336,7 @@ fn (e mut Engine<T>&) Reserve(depth I64) {
     for p in e.Pops {
         if p.Role != neuron.Role.Input and not p.Spiking: size += e.Rows * p.Size
     }
-    e.acc = History<T>(size, depth)
+    e.acc ~ History<T>(size, depth)
 }
 
 # ---- state between settles ----
@@ -454,7 +454,7 @@ fn (e mut Engine<T>&) planAt(lo I64, hi I64) {
     e.idle = 0
     for at in range e.Pops.Len() {
         i := e.order[at]
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         e.groups[at] = e.count
         if p.Role == neuron.Role.Input: continue
         carried := p.Size
@@ -521,10 +521,10 @@ fn (e mut Engine<T>&) run(u0 I64, u1 I64) T {
 }
 
 fn (e mut Engine<T>&) task(u0 I64, u1 I64, t I64, every I64) {
-    ws := e.ws[t]
-    sc := e.sc[t]
+    ws :~ e.ws[t]
+    sc :~ e.sc[t]
     for u in range u0 + t, u1, every {
-        p := e.Pops[e.units[3 * u]]
+        p :~ e.Pops[e.units[3 * u]]
         r0, r1 := e.units[3 * u + 1], e.units[3 * u + 2]
         e.totals(ws, sc, p, r0, r1)
         e.worst[u] = e.lifStep(p, r0, r1) if p.Spiking else e.rateStep(p, r0, r1)
@@ -538,8 +538,8 @@ fn (e mut Engine<T>&) constant(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>
         for j in range n: p.Const[r * n + j] = p.Drive[r * n + j] + e.Params[p.Bias + j]
     }
     for i in p.Folds {
-        l := e.Links[i]
-        pre := e.Pops[l.Pre].rateS()
+        l :~ e.Links[i]
+        pre :~ e.Pops[l.Pre].rateS()
         l.Forward(ws, sc, p.Const, pre, r0, r1)
     }
 }
@@ -554,20 +554,20 @@ fn (e mut Engine<T>&) totals(ws mut gemm.Workspace<T>&, sc mut conn.Scratch<T>&,
         for j in range n: p.Total[r * n + j] = T(0) if p.Spiking else p.Const[b * n + j]
     }
     for i in p.In {
-        l := e.Links[i]
-        pre := e.Pops[l.Pre].carried(e.bufferOf(l.Pre))
+        l :~ e.Links[i]
+        pre :~ e.Pops[l.Pre].carried(e.bufferOf(l.Pre))
         l.Forward(ws, sc, p.Total, pre, r0, r1)
     }
     for i in p.Back {
-        l := e.Links[i]
-        post := e.Pops[l.Post].carried(e.bufferOf(l.Post))
+        l :~ e.Links[i]
+        post :~ e.Pops[l.Post].carried(e.bufferOf(l.Post))
         l.Backward(ws, sc, p.Total, post, r0, r1)
     }
     beta := e.Beta[r0 / e.Batch]
     role := p.Role
     if beta == 0.0 or role != neuron.Role.Readout: return
-    into := p.Force if p.Spiking else p.Total
-    from := p.readout(k)
+    into :~ p.Force if p.Spiking else p.Total
+    from :~ p.readout(k)
     for r in range r0, r1 {
         b := r % e.Batch
         if p.Spiking { for j in range n: into[r * n + j] = T(0) }
@@ -614,7 +614,7 @@ fn (e Engine<T>&) ForceCoupling() F64 {
 fn (e mut Engine<T>&) rateStep(p mut Population<T>&, r0 I64, r1 I64) T {
     model := p.Model
     if model != neuron.Neuron.Custom: return e.builtStep(p, r0, r1)
-    b := p.rate(1 - e.cur)
+    b :~ p.rate(1 - e.cur)
     if p.Retired > 0: rest(p, p.Total, r0, r1, false)
     worst := custom(model.d, p, b, r0, r1, e.step(r0 / e.Batch, e.damping))
     if p.Retired > 0: retire(p, b, r0, r1)
@@ -625,8 +625,8 @@ fn (e mut Engine<T>&) rateStep(p mut Population<T>&, r0 I64, r1 I64) T {
 fn (e mut Engine<T>&) builtStep(p mut Population<T>&, r0 I64, r1 I64) T {
     model := p.Model
     if model != neuron.Neuron.Rate: unreachable "a spiking population steps by lifStep"
-    a := p.rate(e.cur)
-    b := p.rate(1 - e.cur)
+    a :~ p.rate(e.cur)
+    b :~ p.rate(1 - e.cur)
     n := p.Size
     if p.Retired > 0: rest(p, a.U, r0, r1, true)
     worst := neuron.RateStep(model.rho, a.U, p.Total, b.U, b.S, r0 * n, r1 * n, T(e.step(r0 / e.Batch, e.damping)))
@@ -641,7 +641,7 @@ fn custom<T>(d mut any neuron.Dynamics&, p mut Population<T>&, b mut Columns<neu
             drive := tensor.Tensor<F32>.Over(p.Total, 0, p.Total.Len() / p.Size, p.Size)!
             worst := d.Relax(drive, dt, r0, r1)
             activity := d.Activity()
-            act := activity.Flat()!
+            act :~ activity.Flat()!
             for i in range r0 * p.Size, r1 * p.Size: b.S[i] = act[i]
             return T(worst)
         }
@@ -675,8 +675,8 @@ fn retire<T>(p mut Population<T>&, b mut Columns<neuron.RateCell<T>>&, r0 I64, r
 # rows r0 .. r1 of a spiking population: a time step from buffer cur into the other, and at a window's end the rates
 # and their change (the residual; nothing, zero, before then)
 fn (e mut Engine<T>&) lifStep(p mut Population<T>&, r0 I64, r1 I64) T {
-    a := p.lif(e.cur)
-    b := p.lif(1 - e.cur)
+    a :~ p.lif(e.cur)
+    b :~ p.lif(1 - e.cur)
     lif := p.Model
     if lif != neuron.Neuron.Lif: unreachable "a rate population steps by rateStep"
     n := p.Size
@@ -843,8 +843,8 @@ fn (e mut Engine<T>&) stopRows(r0 I64, r1 I64, tol F64, k I64) Bool {
 
 # the sum over p's live units in row r of ((u' - u) inv)^2, u read from buffer cur and u' from the other
 fn rowSquares<T>(p mut Population<T>&, cur I64, r I64, inv F64) F64 {
-    a := p.rate(cur)
-    b := p.rate(1 - cur)
+    a :~ p.rate(cur)
+    b :~ p.rate(1 - cur)
     n := p.Size
     sum F64 = 0.0
     for j in range n {
@@ -890,7 +890,7 @@ fn (e mut Engine<T>&) Restart() { e.acc.Kept, e.acc.Slot, e.acc.Started = 0, 0, 
 # where the residual grew tenfold (a linear iteration's residual under Anderson's method is not monotone in the sup
 # norm, and dropping it at every rise cost more sweeps than plain ones)
 fn (e mut Engine<T>&) Accelerate(x Array<T>&, next mut Array<T>&, worst F64, m I64) {
-    a := e.acc
+    a :~ e.acc
     at I64 = 0
     for p in e.Pops {
         if p.Role == neuron.Role.Input: continue
@@ -941,12 +941,12 @@ fn (a mut History<T>&) step(n I64, m I64, worst F64, guard F64) Bool {
 # rows r0 .. r1 of every relaxing population gathered: the potentials read (X) and the step to those written (F);
 # gives how many
 fn (e mut Engine<T>&) gather(r0 I64, r1 I64) I64 {
-    a := e.acc
+    a :~ e.acc
     at I64 = 0
     for p in e.Pops {
         if p.Role == neuron.Role.Input: continue
-        x := p.rate(e.cur)
-        y := p.rate(1 - e.cur)
+        x :~ p.rate(e.cur)
+        y :~ p.rate(1 - e.cur)
         for i in range r0 * p.Size, r1 * p.Size {
             a.X[at] = x.U[i]
             a.F[at] = y.U[i] - x.U[i]
@@ -958,13 +958,13 @@ fn (e mut Engine<T>&) gather(r0 I64, r1 I64) I64 {
 
 # the extrapolated potentials (X) put into the buffer the sweep wrote, its activities from them
 fn (e mut Engine<T>&) scatter(r0 I64, r1 I64) {
-    a := e.acc
+    a :~ e.acc
     at I64 = 0
     for p in e.Pops {
         if p.Role == neuron.Role.Input: continue
         model := p.Model
         rho := model.rho if model == neuron.Neuron.Rate else neuron.Rho.Linear
-        b := p.rate(1 - e.cur)
+        b :~ p.rate(1 - e.cur)
         lo, hi := r0 * p.Size, r1 * p.Size
         for i in range lo, hi {
             b.U[i] = a.X[at]
@@ -1099,7 +1099,7 @@ fn (e mut Engine<T>&) Spectral(iterations I64, tol F64) F64 {
 fn (e mut Engine<T>&) specDraw() {
     r := rand.Rand(1)
     for i in range e.spec.Len() {
-        a := e.spec[i]
+        a :~ e.spec[i]
         if e.Pops[i].Role == neuron.Role.Input: continue
         for j in range a.Len(): a[j] = T(r.Uniform(-1.0, 1.0))
     }

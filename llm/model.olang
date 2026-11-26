@@ -78,7 +78,7 @@ fn boolOr(j json.Json&, key String&, d Bool) Bool {
 
 # a config.json's architecture
 fn Config.Parse(text String&) Config ? ModelError {
-    j := try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
+    j :~ try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
     c := Config()
     c.Arch = try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
     if c.Arch != "qwen2" and c.Arch != "qwen3": error ModelError.Unsupported("model_type " + c.Arch + " (qwen2 and qwen3 run)")
@@ -96,11 +96,11 @@ fn Config.Parse(text String&) Config ? ModelError {
     c.Tied = boolOr(j, "tie_word_embeddings", false)
     c.MaxPos = intOr(j, "max_position_embeddings", 32768)
     if j.Has("rope_scaling") {
-        rs := try j["rope_scaling"] catch { error ModelError.Malformed("rope_scaling") }
+        rs :~ try j["rope_scaling"] catch { error ModelError.Malformed("rope_scaling") }
         if not rs.IsNull() {
             kind String& = ""
-            if rs.Has("rope_type"): kind = try (try rs["rope_type"] catch { error ModelError.Malformed("rope_type") }).AsStr() catch { error ModelError.Malformed("rope_type") }
-            else if rs.Has("type"): kind = try (try rs["type"] catch { error ModelError.Malformed("type") }).AsStr() catch { error ModelError.Malformed("type") }
+            if rs.Has("rope_type"): kind ~ try (try rs["rope_type"] catch { error ModelError.Malformed("rope_type") }).AsStr() catch { error ModelError.Malformed("rope_type") }
+            else if rs.Has("type"): kind ~ try (try rs["type"] catch { error ModelError.Malformed("type") }).AsStr() catch { error ModelError.Malformed("type") }
             if kind == "linear": c.PosScale = numOr(rs, "factor", 1.0)
             else if kind != "default": error ModelError.Unsupported("rope_scaling " + kind)
         }
@@ -189,7 +189,7 @@ type Weights struct(files Array<checkpoint.File>&, where Map<String, I64>, paths
 fn opened(path String&, paths mut Vec<String>&, base mut Vec<I64>&) ? ModelError, os.Error {
     f := try os.File.Open(path)
     head := Array<U8>(8)
-    got := try f.Read(head) catch io.Error { error ModelError.Malformed(path) }
+    got :~ try f.Read(head) catch io.Error { error ModelError.Malformed(path) }
     if got.Len() != 8: error ModelError.Malformed(path)
     n I64 = 0
     for i in range 8: n = n | (I64(head[i]) << (8 * i))
@@ -211,11 +211,11 @@ fn Weights.Open(dir String&) Weights ? ModelError, os.Error {
         return Weights(files.ToArray(), where, paths.ToArray(), base.ToArray())
     }
     index := dir + "/model.safetensors.index.json"
-    j := try json.Json.Parse(try os.ReadFile(index)) catch json.Error { error ModelError.Malformed(index) }
-    m := try (try j["weight_map"] catch { error ModelError.Malformed(index) }).AsObj() catch { error ModelError.Malformed(index) }
+    j :~ try json.Json.Parse(try os.ReadFile(index)) catch json.Error { error ModelError.Malformed(index) }
+    m :~ try (try j["weight_map"] catch { error ModelError.Malformed(index) }).AsObj() catch { error ModelError.Malformed(index) }
     shard := Map<String, I64>()
     for k in range m.Len() {
-        name := try m.Values[k].AsStr() catch { error ModelError.Malformed(index) }
+        name :~ try m.Values[k].AsStr() catch { error ModelError.Malformed(index) }
         if not shard.Has(name) {
             path := dir + "/" + name
             f := try checkpoint.File.Load(path) catch checkpoint.SafetensorsError { error ModelError.Malformed(path) }
@@ -242,7 +242,7 @@ fn (w Weights&) read(k I64, at I64, buf mut Array<U8>&) ? ModelError {
     checkpoint.Seek(f.Fd(), w.base[k] + at, 0)
     got I64 = 0
     for got < buf.Len() {
-        part := try f.Read(buf[got:]) catch io.Error { error ModelError.Malformed("a read of " + $buf.Len() + " bytes") }
+        part :~ try f.Read(buf[got:]) catch io.Error { error ModelError.Malformed("a read of " + $buf.Len() + " bytes") }
         if part.Len() == 0: error ModelError.Malformed("a short tensor")
         got += part.Len()
     }
@@ -275,10 +275,10 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64) ? Mode
     try w.check(e, rows, l.In)
     width := e.Type.Width()
     per := (16 * 1048576 / (l.In * width)).Max(1)
-    if w.buf.Len() < per * l.In * width: w.buf = Array<U8>(per * l.In * width)
+    if w.buf.Len() < per * l.In * width: w.buf ~ Array<U8>(per * l.In * width)
     for r0 in range 0, rows, per {
         n := per.Min(rows - r0)
-        b := w.buf[:n * l.In * width]
+        b :~ w.buf[:n * l.In * width]
         try w.read(k, e.Begin + r0 * l.In * width, b)
         for r in range n {
             o := from + r0 + r
@@ -979,7 +979,7 @@ assert not stepOf.Allocates, "a step allocates"
 # a small model of random weights (Tiny) written as a Hugging Face checkpoint to a new directory: Qwen3's (QK-norm, tied) or
 # Qwen2's (biases, a head of its own)
 fn Tiny(qwen3 Bool, seed U64) String {
-    dir := os.MkTemp("", "llm")!
+    dir :~ os.MkTemp("", "llm")!
     vocab, dim, heads, kvHeads, hd, ffn, layers := 96, 64, 4, 2, 32, 96, 2
     cfg := "{\"model_type\": \"" + ("qwen3" if qwen3 else "qwen2") + "\", \"vocab_size\": " + $vocab + ", \"hidden_size\": " + $dim +
         ", \"num_hidden_layers\": " + $layers + ", \"num_attention_heads\": " + $heads + ", \"num_key_value_heads\": " + $kvHeads +
@@ -1174,7 +1174,7 @@ test Model "a row's logits do not depend on the other rows of its step: two sequ
 
 # the directory of a Hugging Face model under $OANN_MODELS, "" where it is not there
 fn reference(name String&) String {
-    root := try os.Env("OANN_MODELS") catch default ""
+    root :~ try os.Env("OANN_MODELS") catch default ""
     dir := root + "/" + name
     return dir if root.Len() > 0 and os.Exists(dir + "/config.json") else ""
 }
@@ -1187,12 +1187,12 @@ fn greedy(m Model&, prompt Array<I32>&, n I64) Array<I32>, Array<F32> {
     for i, t in prompt: s.Add(t, I64(i), 0, true)
     m.Step(s, k)
     v := m.C.Vocab
-    lg := s.LogitsOf(prompt.Len() - 1, v)
+    lg :~ s.LogitsOf(prompt.Len() - 1, v)
     seen := Array<F32>[lg[12095], lg[0], lg[1], lg[100]]
     out := Array<I32>(n)
     for j in range n {
         best I64 = 0
-        lg2 := s.LogitsOf(s.NOut - 1, v)
+        lg2 :~ s.LogitsOf(s.NOut - 1, v)
         for x in range v {
             if lg2[x] > lg2[best]: best = x
         }

@@ -127,7 +127,7 @@ fn (s mut Store<T>&) Fold() {
 }
 
 # whether output t is left out of a write: known marks the outputs it writes, and no mask writes them all
-fn unknown(known Array<Bool>?&, t I64) Bool { return known != null and not known[t] }
+fn unknown(known Array<Bool>?&, t I64) Bool { return known is not null and not known[t] }
 
 # one write of target for reading x: the running mean moves toward x, then the table's active rows by the delta rule
 # toward target, at Rate times scale. With known, only the outputs it marks are written - the others' errors are taken
@@ -218,14 +218,14 @@ type Memory<T> struct(s mut system.System<T>&, key system.Pop, value system.Pop,
 
 # row r of the key population's readings
 fn (m Memory<T>&) KeyRow(r I64) Array<T>& {
-    p := m.S.Pop(m.Key)
+    p :~ m.S.Pop(m.Key)
     if p.Role == neuron.Role.Input: return p.Drive[r * p.Size:(r + 1) * p.Size]
     return p.Activity(0)[r * p.Size:(r + 1) * p.Size]
 }
 
 # row r of what the value population is to hold
 fn (m Memory<T>&) ValueRow(r I64) Array<T>& {
-    p := m.S.Pop(m.Value)
+    p :~ m.S.Pop(m.Value)
     if p.Target.Len() > 0: return p.Target[r * p.Size:(r + 1) * p.Size]
     if p.Role == neuron.Role.Input: return p.Drive[r * p.Size:(r + 1) * p.Size]
     return p.Activity(0)[r * p.Size:(r + 1) * p.Size]
@@ -233,7 +233,7 @@ fn (m Memory<T>&) ValueRow(r I64) Array<T>& {
 
 # the store's read of every key row into the value population's drive
 fn (m mut Memory<T>&) Recall() {
-    p := m.S.Pop(m.Value)
+    p :~ m.S.Pop(m.Value)
     for r in range m.S.Batch {
         m.Core.Read(m.KeyRow(r), m.read)
         for j in range p.Size: p.Drive[r * p.Size + j] = m.read[j]
@@ -292,7 +292,7 @@ test Store.code "a code has norm 1 and exactly K active cells, the K largest of 
     assert s.N == 320 and s.K == 16
     r := rand.Rand(1)
     for _ in range 50 {
-        x := reading(r, 16)
+        x :~ reading(r, 16)
         assert s.code(x) == 16
         norm F64 = 0.0
         for j in range s.K: norm += s.Code[j] * s.Code[j]
@@ -315,9 +315,9 @@ test Store.Write "a write at rate 1 is read back exactly; another reading is dis
     s := Store<F64>(16, 3, 8, 0, 0, 1, 0) # the mean held at 0, so both readings' codes stay as they are
     r := rand.Rand(2)
     for _ in range 20 {
-        x := reading(r, 16)
-        q := reading(r, 16)
-        target := reading(r, 3)
+        x :~ reading(r, 16)
+        q :~ reading(r, 16)
+        target :~ reading(r, 3)
         before := Array<F64>(3)
         s.Read(q, before)
         s.code(q)
@@ -360,12 +360,12 @@ test Store.WriteCode "a code kept: ReadCode and WriteCode are Read and Write at 
     out := Array<F64>(2)
     want := Array<F64>(2)
     for _ in range 30 {
-        x := reading(r, 8)
-        target := reading(r, 2)
+        x :~ reading(r, 8)
+        target :~ reading(r, 2)
         a.Encode(x, idx, code)
         a.WriteCode(idx, code, target)
         b.Write(x, target)
-        q := reading(r, 8)
+        q :~ reading(r, 8)
         a.Encode(q, idx, code)
         a.ReadCode(idx, code, out)
         b.Read(q, want)
@@ -381,10 +381,10 @@ test Store.Write "a write that knows only some outputs leaves the others' reads 
     before := Array<F64>(3)
     after := Array<F64>(3)
     for _ in range 40 {
-        x := reading(r, 8)
-        target := reading(r, 3)
+        x :~ reading(r, 8)
+        target :~ reading(r, 3)
         s.Write(x, target)
-        q := reading(r, 8)
+        q :~ reading(r, 8)
         s.Read(q, before)
         s.Read(x, after)
         moved := after[1] + 0.5 * (target[1] - after[1])
@@ -479,7 +479,7 @@ test Store.Fade "a fading store: every value it holds shrinks by the factor, a w
 test Store.ReadFamiliar "familiarity: writes teach it toward 1 at their cells for the outputs they know, and nothing fades or clears it" {
     s := Store<F64>(8, 3, 11, 0, 0, 0.5, 0.0, true)
     r := rand.Rand(4)
-    x := reading(r, 8)
+    x :~ reading(r, 8)
     out := Array<F64>(3)
     f := Array<F64>(3)
     s.Read(x, out)
@@ -505,7 +505,7 @@ test Store.ReadFamiliar "familiarity: writes teach it toward 1 at their cells fo
     sx.code(x)
     apart I64 = 0
     for _ in range 100 {
-        y := reading(r, 8)
+        y :~ reading(r, 8)
         s.code(y)
         shared I64 = 0
         for i in range s.K {
@@ -554,7 +554,7 @@ test Memory.Write "a memory writes its batch rows from the key's drive and the v
     m.Write(gate)
     assert m.Core.Writes == 3
     m.Recall()
-    drive := s.Pop(system.Pop(1)).Drive
+    drive :~ s.Pop(system.Pop(1)).Drive
     # unit codes at rate 1 with the mean held: three keys' reads are the targets, up to the keys' shared cells
     shared I64 = 0
     for a in range 3 {
@@ -587,11 +587,11 @@ test Memory.Recall "the memory as a connection is a dense one masked to the top 
     }
     for i in range 24: s.Pop(system.Pop(0)).Drive[i] = r.Uniform(-1.0, 1.0)
     m.Recall()
-    drive := s.Pop(system.Pop(1)).Drive
+    drive :~ s.Pop(system.Pop(1)).Drive
     z := Array<F64>(64)
     sorted := Array<F64>(64)
     for b in range 3 {
-        x := m.KeyRow(b)
+        x :~ m.KeyRow(b)
         for c in range 64 {
             z[c] = 0.0
             for i in range 8: z[c] += m.Core.R[c * 8 + i] * x[i]
@@ -636,7 +636,7 @@ test Remember.Apply "a Remember rule on a clock writes the memory when its Tick 
 # the peak address space in 4 KB pages (VmPeak, /proc): not the resident set, which transparent huge pages ("always"
 # on some machines) grow by whole 2 MB pages a fault whatever was allocated - dyn/system's peak() and olang's checks
 fn resident() I64 {
-    st := try os.ReadFile("/proc/self/status") catch { unreachable }
+    st :~ try os.ReadFile("/proc/self/status") catch { unreachable }
     for line in st.Lines() {
         if line.StartsWith("VmPeak:"): return (try line[7:line.Len() - 3].Trim().ParseInt(10) catch { unreachable }) / 4
     }

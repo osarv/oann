@@ -198,7 +198,7 @@ fn Attention<S, A>(ws mut gemm.Workspace<A>&, out mut mat.Mat<S>&, q mat.Mat<S>&
 # each row of the scores p (Ctx x Ctx) replaced by its softmax - over positions Low(i) ... i in row i when causal (0 ...
 # i outside a window), zeros elsewhere
 fn softmaxRows<S, A>(p mat.Mat<S>&, at Heads, starts Array<I32>&, r0 I64) {
-    data := p.Data
+    data :~ p.Data
     cols := p.Cols
     for i in range p.Rows {
         o := p.Off + i * p.Ld
@@ -213,8 +213,8 @@ fn softmaxRows<S, A>(p mat.Mat<S>&, at Heads, starts Array<I32>&, r0 I64) {
 # dP (in d) made dS = scale P (dP - rowsum(dP P)) row by row - softmax's backward, scaled; causal, row i only up to position
 # i, the rest of d never read
 fn softmaxBackward<S, A>(d mat.Mat<S>&, p mat.Mat<S>&, at Heads, starts Array<I32>&, r0 I64, scale A) {
-    dd := d.Data
-    pd := p.Data
+    dd :~ d.Data
+    pd :~ p.Data
     for i in range d.Rows {
         last := high(at, starts, r0 + i, i, d.Cols)
         lo := low(at, starts, r0 + i, i)
@@ -410,8 +410,8 @@ fn (f mut Flash<A>&) Reserve(ctx I64, dh I64) {
     if ctx <= f.Ctx and dh <= f.Dh: return
     f.Ctx, f.Dh = f.Ctx.Max(ctx), f.Dh.Max(dh)
     f.per = flashScratch(f.Ctx, f.Dh)
-    f.buf = Array<A>(f.Threads * f.per)
-    f.half = Array<BF16>(f.Threads * 2 * flashRows * flashCols)
+    f.buf ~ Array<A>(f.Threads * f.per)
+    f.half ~ Array<BF16>(f.Threads * 2 * flashRows * flashCols)
     for f.ws.Len() < f.Threads: f.ws.Push(gemm.Workspace<A>(1))
     for w in f.ws: w.Reserve(flashRows.Max(flashCols).Max(f.Dh))
 }
@@ -442,9 +442,9 @@ type flashJob<S, A> struct(f mut Flash<A>&, res mut mat.Mat<S>&, out mat.Mat<S>&
 }
 
 fn (j flashJob<S, A>&) run(e0 I64, e1 I64, t I64) {
-    sc := j.f.buf[t * j.f.per:(t + 1) * j.f.per]
-    hs := j.f.half[t * 2 * flashRows * flashCols:(t + 1) * 2 * flashRows * flashCols]
-    ws := j.f.ws[t]
+    sc :~ j.f.buf[t * j.f.per:(t + 1) * j.f.per]
+    hs :~ j.f.half[t * 2 * flashRows * flashCols:(t + 1) * 2 * flashRows * flashCols]
+    ws :~ j.f.ws[t]
     for e in range e0, e1 {
         if j.backward { flashBack<S, A>(j, ws, sc, hs, e) } else { flashFore<S, A>(j, ws, sc, hs, e) }
     }
@@ -1194,9 +1194,9 @@ fn nudged(q Array<F64>&, k Array<F64>&, v Array<F64>&, dout Array<F64>&, starts 
     }
     up, down := q.Copy(), q.Copy()
     if which == 1 {
-        up, down = k.Copy(), k.Copy()
+        up, down ~ k.Copy(), k.Copy()
     } else if which == 2 {
-        up, down = v.Copy(), v.Copy()
+        up, down ~ v.Copy(), v.Copy()
     }
     up[i] += 1e-6
     down[i] -= 1e-6

@@ -31,7 +31,7 @@ cmuUrl := "https://raw.githubusercontent.com/cmusphinx/cmudict/master/cmudict.di
 
 # $OANN_SPEECH (default ~/.cache/oann)
 fn Cache() String {
-    root := try os.Env("OANN_SPEECH") catch default ""
+    root :~ try os.Env("OANN_SPEECH") catch default ""
     return root if root.Len() > 0 else (try os.Env("HOME") catch default "/tmp") + "/.cache/oann"
 }
 
@@ -69,17 +69,17 @@ fn G2p.Parse(dict String&) G2p {
     g := G2p()
     for line in dict.Lines() {
         sp := try line.FindByte(' ') catch { continue }
-        word := line[:sp]
+        word :~ line[:sp]
         if '(' in word: continue
         end := try line.Find(" #") catch default line.Len()
         g.cmu.Put(word, line[sp + 1:end])
     }
     for line in svWords.Lines() {
-        f := line.Split(" ")
+        f :~ line.Split(" ")
         g.svTable.Put(f[0], f[1])
     }
     for line in enFunction.Lines() {
-        f := line.Split(" ")
+        f :~ line.Split(" ")
         g.alone.Put(f[0], f[1])
         g.inPhrase.Put(f[0], f[2])
     }
@@ -201,20 +201,20 @@ fn enNumber(t String&) String {
 }
 
 fn enDigits(t String&) String {
-    ones := enOnes.Split(" ")
+    ones :~ enOnes.Split(" ")
     return Vec<String>[$ones[I64(c - '0')] for c in t].Join(" ")
 }
 
 fn enInt(n I64) String {
-    ones := enOnes.Split(" ")
-    tens := enTens.Split(" ")
+    ones :~ enOnes.Split(" ")
+    tens :~ enTens.Split(" ")
     if n < 20: return ones[n]
     if n < 100: return tens[n / 10] + ("" if n % 10 == 0 else " " + ones[n % 10])
     if n < 1000: return ones[n / 100] + "+hundred" + ("" if n % 100 == 0 else " " + enInt(n % 100))
     if n >= 1900 and n < 2000: return "nineteen+hundred" + ("" if n % 100 == 0 else " " + enInt(n % 100))
     for scale in [I64(1000000000), 1000000, 1000] {
         if n < scale: continue
-        name := "billion" if scale == 1000000000 else "million" if scale == 1000000 else "thousand"
+        name :~ "billion" if scale == 1000000000 else "million" if scale == 1000000 else "thousand"
         return enInt(n / scale) + " " + name + ("" if n % scale == 0 else " " + enInt(n % scale))
     }
     unreachable
@@ -229,10 +229,10 @@ fn (g G2p&) enPhrase(ws Vec<String>&) String {
     k I64 = 0
     for k < ws.Len() {
         w := ws.At(k)
-        next := ws.At(k + 1) if k + 1 < ws.Len() else ""
-        nextIpa := g.enWord(next) if next.Len() > 0 else ""
+        next :~ ws.At(k + 1) if k + 1 < ws.Len() else ""
+        nextIpa :~ g.enWord(next) if next.Len() > 0 else ""
         pair := enPairs.Has(w + " " + next)
-        if pair: nextIpa = g.enWord(ws.At(k + 2)) if k + 2 < ws.Len() else ""
+        if pair: nextIpa ~ g.enWord(ws.At(k + 2)) if k + 2 < ws.Len() else ""
         x := enPairs.Get(w + " " + next)! if pair else g.enWord(w)
         if ws.Len() > 1 and not pair and g.inPhrase.Has(w): x = g.inPhrase.Get(w)!
         if startsVowel(nextIpa) {
@@ -347,7 +347,7 @@ fn british(w String&) Iterator<String> {
 fn suffixed(p Vec<String>&, s String&) Vec<String> {
     last := " " + p.At(p.Len() - 1) + " "
     out := Vec<String>[x for x in p]
-    add := match s {
+    add :~ match s {
         case "s", "es", "'s": "IH0 Z" if sibilant.Contains(last) else "S" if voiceless.Contains(last) else "Z"
         case "ed": "IH0 D" if last == " T " or last == " D " else "T" if voiceless.Contains(last) or last == " SH " or last == " CH " or last == " S " else "D"
         case "ing": "IH0 NG"
@@ -490,7 +490,7 @@ fn letterUnits(w String&) Vec<Unit> {
             continue
         }
         # a last "-n", "-le", "-re" after a consonant is a syllable of its own
-        end := w[i:]
+        end :~ w[i:]
         if i > 0 and not ltsLetter(w, i - 1) and end in ["n", "le", "re"] {
             out.Push(Unit(true, "", "ER" if end == "re" else "AH", false, ""))
             if end == "re": break
@@ -507,7 +507,7 @@ fn letterUnits(w String&) Vec<Unit> {
 fn vowelUnit(w String&, i I64, after Bool) Unit, I64 {
     n := w.Len()
     for d in ltsDigraphs {
-        g := d[:d.FindByte(' ')!]
+        g :~ d[:d.FindByte(' ')!]
         final := i + g.Len() == n and (g == "ie" or g == "ue")
         if w[i:].StartsWith(g) and not final: return Unit(true, g, d[g.Len() + 1:], true, ""), g.Len()
     }
@@ -516,10 +516,10 @@ fn vowelUnit(w String&, i I64, after Bool) Unit, I64 {
     if silentEnd: return Unit(false, "", "", false, ""), 1
     j := i + 1
     for j < n and not ltsLetter(w, j): j++
-    cons := w[i + 1:j]
+    cons :~ w[i + 1:j]
     if c == 'y' and i == n - 1: return Unit(true, "y", "IY", true, ""), 1
     if cons.StartsWith("r") and (cons.Len() > 1 or j == n) {
-        sound := "AA" if c == 'a' else "AO" if c == 'o' else "ER"
+        sound :~ "AA" if c == 'a' else "AO" if c == 'o' else "ER"
         return Unit(true, w[i:i + 2], sound, true, ""), 2
     }
     open := (cons.Len() == 1 and j < n) or cons in ["th", "ch", "sh", "ph"] or (j == n and cons.Len() == 0) or (cons.Len() == 1 and j == n - 1 and w[n - 1] == 'e')
@@ -530,7 +530,7 @@ fn vowelUnit(w String&, i I64, after Bool) Unit, I64 {
 fn consonantUnit(w String&, i I64) Unit, I64 {
     n := w.Len()
     for d in ltsConsonants {
-        g := d[:d.FindByte(' ')!]
+        g :~ d[:d.FindByte(' ')!]
         if not w[i:].StartsWith(g): continue
         k := i + g.Len()
         double := g.Len() == 1 and k < n and w[k] == w[i]
@@ -711,7 +711,7 @@ fn espeak(w String&, arpa Vec<String>&) String {
 
 fn (x Word&) consonant(k I64) String {
     p := x.ph[k]
-    next := x.at(k + 1)
+    next :~ x.at(k + 1)
     if p == "N" and (next == "K" or next == "G"): return "N"
     if p == "Y" and x.vowel(k + 1) and x.st[k + 1] == '0' and x.letters(k + 1).Len() == 2 and x.letters(k + 1)[0] == 'i' {
         return "I" if next == "ER0" else "i"
@@ -730,10 +730,10 @@ fn (x Word&) consonant(k I64) String {
 # the vowel phone k (and an r after it, where they go together) written into out; the next phone's index
 fn (x Word&) writeVowel(k I64, out mut StringBuilder&) I64 {
     p := x.ph[k]
-    b := p[:p.Len() - 1]
+    b :~ p[:p.Len() - 1]
     s := x.st[k]
-    next := x.at(k + 1)
-    mark := "'" if s == '1' else "," if s == '2' else ""
+    next :~ x.at(k + 1)
+    mark :~ "'" if s == '1' else "," if s == '2' else ""
     if b == "AY" and next == "R" and not x.vowel(k + 2) {
         out.Push(mark + "aIR")
         return k + 2
@@ -748,11 +748,11 @@ fn (x Word&) writeVowel(k I64, out mut StringBuilder&) I64 {
 
 # an unstressed vowel: mostly the spelling's
 fn (x Word&) reduced(k I64) String {
-    b := x.ph[k][:x.ph[k].Len() - 1]
-    g := x.letters(k)
+    b :~ x.ph[k][:x.ph[k].Len() - 1]
+    g :~ x.letters(k)
     at := x.start(k)
-    after := x.after(k)
-    prev := x.at(k - 1)
+    after :~ x.after(k)
+    prev :~ x.at(k - 1)
     if b == "ER": return "R"
     if b == "AE" and g == "a" and at == 0: return "6"
     if b == "IY" {
@@ -784,10 +784,10 @@ fn prefixE(w String&, at I64) String {
 
 # the vowels espeak gives by the letters around them: wa- ɔ, au ɔː, r-coloured ones
 fn (x Word&) coloured(k I64, b String&, v String&) String {
-    g := x.letters(k)
+    g :~ x.letters(k)
     at := x.start(k)
-    after := x.after(k)
-    next := x.at(k + 1)
+    after :~ x.after(k)
+    next :~ x.at(k + 1)
     if b == "AO" and next != "R" and g == "o": return "O"
     if b == "AA" and g == "a" and at > 0 and x.w[at - 1] == 'w' and after.StartsWith("n"): return "O"
     if b == "AA" and (g == "au" or g == "aw" or (g == "a" and next == "L")): return "O:"
@@ -859,7 +859,7 @@ fn svLetters(w String&) String {
             i++
             continue
         }
-        two := w[i:i + 2] if i + 1 < w.Len() else ""
+        two :~ w[i:i + 2] if i + 1 < w.Len() else ""
         out.PushChar(svLetter(two))
         i += 2 if c >= 0xC0 and c < 0xE0 else 1
     }
@@ -971,11 +971,11 @@ fn (x SvWord&) following(i I64) String& {
 
 # whether the vowel at i is long when stressed
 fn (x SvWord&) open(i I64) Bool {
-    w := x.w
+    w :~ x.w
     c := w[i]
-    cs := x.following(i)
+    cs :~ x.following(i)
     last := i + 1 + cs.Len() == w.Len()
-    two := cs[:2] if cs.Len() >= 2 else cs
+    two :~ cs[:2] if cs.Len() >= 2 else cs
     if c == 'e' and cs.StartsWith("j"): return false
     if i == 0 and (w.StartsWith("av") or w.StartsWith("ut")) and w.Len() > 3 and not svVowel(w[2]): return true
     if cs.Len() == 2 and cs[0] in "ptkbdg" and cs[1] in "lnrj": return true
@@ -991,9 +991,9 @@ fn (x SvWord&) open(i I64) Bool {
 }
 
 fn (x SvWord&) vowel(i I64, v I64) String {
-    w := x.w
+    w :~ x.w
     c := w[i]
-    cs := x.following(i)
+    cs :~ x.following(i)
     last := i + 1 + cs.Len() == w.Len()
     final := i + 1 == w.Len()
     if i >= 2 and (w[i - 2:].StartsWith("tion") or w[i - 2:].StartsWith("sion")): return ("'" if v == x.stress else "") + "u:"
@@ -1008,7 +1008,7 @@ fn (x SvWord&) vowel(i I64, v I64) String {
 }
 
 fn (x SvWord&) unstressed(i I64, c Char, cs String&, last Bool, final Bool, het Bool) String {
-    w := x.w
+    w :~ x.w
     single := cs.Len() == 1 and not last
     if c == 'e': return "e:" if het else "@"
     if c == 'o' and last and cs == "m": return "O"
@@ -1024,11 +1024,11 @@ fn (x SvWord&) unstressed(i I64, c Char, cs String&, last Bool, final Bool, het 
 
 # the sound of the consonant letters at i, and how many letters it takes
 fn (x SvWord&) consonant(i I64) String, I64 {
-    w := x.w
+    w :~ x.w
     c := w[i]
     next := x.at(i + 1)
     prev := x.at(i - 1)
-    rest := w[i:]
+    rest :~ w[i:]
     start := i == 0
     if rest.StartsWith("sch") or rest.StartsWith("stj"): return "sx", 3
     if rest.StartsWith("skj"): return "C", 3
@@ -1082,22 +1082,22 @@ fn svNumber(t String&) String {
             break
         }
     }
-    ones := svOnes.Split(" ")
-    whole := t[:dot]
+    ones :~ svOnes.Split(" ")
+    whole :~ t[:dot]
     out := Vec<String>[$ones[I64(c - '0')] for c in whole].Join(" ") if whole.Len() > 1 and whole[0] == '0' else svInt(try whole.ParseInt() catch default 0)
     if dot < t.Len(): out = out + " punkt " + Vec<String>[$ones[I64(c - '0')] for c in t[dot + 1:]].Join(" ")
     return Vec<String>["#" + x for x in out.Split(" ")].Join(" ").Replace("~", "~#").Replace("+", "+#")
 }
 
 fn svInt(n I64) String {
-    ones := svOnes.Split(" ")
-    tens := svTens.Split(" ")
+    ones :~ svOnes.Split(" ")
+    tens :~ svTens.Split(" ")
     if n < 20: return ones[n]
     if n < 100: return tens[n / 10] + ("" if n % 10 == 0 else "~" + ones[n % 10])
     if n < 1000: return ones[n / 100] + "+hundra" + ("" if n % 100 == 0 else " " + svInt(n % 100))
     if n >= 1900 and n < 2000: return "nitton+hundra" + ("" if n % 100 == 0 else " " + svInt(n % 100))
     if n < 1000000: return svInt(n / 1000) + " tusen" + ("" if n % 1000 == 0 else " " + svInt(n % 1000))
-    millions := "miljon" if n / 1000000 == 1 else svInt(n / 1000000) + " miljoner"
+    millions :~ "miljon" if n / 1000000 == 1 else svInt(n / 1000000) + " miljoner"
     return millions + ("" if n % 1000000 == 0 else " " + svInt(n % 1000000))
 }
 
@@ -1182,7 +1182,7 @@ fn agreement(g G2p&, path String&, lang String&, show Bool) F64, F64 ? os.Error,
     for line in (try os.ReadFile(path)).Lines() {
         tab := try line.FindByte('\t') catch { continue }
         got := try g.Phonemes(line[:tab], lang)
-        want := line[tab + 1:]
+        want :~ line[tab + 1:]
         lines++
         total += points(want).Len()
         if got == want {

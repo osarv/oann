@@ -36,7 +36,7 @@ fn Sample<T>(logits Array<T>&, temperature F64, r mut rand.Rand&) I32 {
 
 # the logits of position j of the last Forward
 fn logitsAt<E>(g graph.Graph<E>&, m train.LanguageModel&, j I64) Array<E>& {
-    z := g.Value(m.Logits).Flat()!
+    z :~ g.Value(m.Logits).Flat()!
     width := z.Len() / g.Value(m.Logits).Dim(1)
     return z[j * width:(j + 1) * width]
 }
@@ -50,7 +50,7 @@ fn RerunTokens<E>(g mut graph.Graph<E>&, m train.LanguageModel&, prompt Array<I3
     all := Vec<I32>()
     for id in prompt: all.Push(id)
     g.Training = false
-    ids := g.Ints(m.Tokens).Flat()!
+    ids :~ g.Ints(m.Tokens).Flat()!
     for _ in range count {
         n := all.Len()
         L I64 = n if n < ctx else ctx
@@ -70,7 +70,7 @@ fn CachedTokens<E>(g mut graph.Graph<E>&, m train.LanguageModel&, prompt Array<I
     all := Vec<I32>()
     for id in prompt: all.Push(id)
     g.Training = false
-    ids := g.Ints(m.Tokens).Flat()!
+    ids :~ g.Ints(m.Tokens).Flat()!
     cached := prefill(g, ids, all, ctx if all.Len() > ctx else all.Len())
     last := cached - 1
     for _ in range count {
@@ -107,13 +107,13 @@ fn CachedBatch<E>(g mut graph.Graph<E>&, m train.LanguageModel&, prompts Array<I
         for t in range p: out[b * width + t] = prompts[b * p + t]
     }
     g.Training = false
-    ids := g.Ints(m.Tokens).Flat()!
+    ids :~ g.Ints(m.Tokens).Flat()!
     for t in range width - 1 {
         g.Pos = t
         for b in range rows: ids[b] = out[b * width + t]
         g.Forward(1)
         if t + 1 < p: continue
-        z := g.Value(m.Logits).Flat()!
+        z :~ g.Value(m.Logits).Flat()!
         vocab := z.Len() / rows
         for b in range rows: out[b * width + t + 1] = Sample(z[b * vocab:(b + 1) * vocab], temperature, r)
     }
@@ -163,7 +163,7 @@ fn trained() graph.Graph<F64>, graph.Graph<F64>, graph.Graph<F64>, train.Languag
     full.Plan(r)!
     dec.Plan(r)!
     once.Plan(r)!
-    p := full.Params().Flat()!
+    p :~ full.Params().Flat()!
     for i in range p.Len(): p[i] = p[i] * 20.0
     dec.Params().Convert(full.Params())!
     once.Params().Convert(full.Params())!
@@ -184,13 +184,13 @@ test Sample "is greedy at temperature 0 and draws from the softmax otherwise" {
 
 test CachedTokens "decoding with the cache gives the logits of running the whole sequence, a prefill and then token by token" {
     full, dec, _, m := trained()
-    seq := full.Ints(m.Tokens).Flat()!
+    seq :~ full.Ints(m.Tokens).Flat()!
     r := rand.Rand(5)
     for i in range 16: seq[i] = I32(r.Below(11))
     full.Training = false
     full.Forward(2)
     want := full.Value(m.Logits)
-    ids := dec.Ints(m.Tokens).Flat()!
+    ids :~ dec.Ints(m.Tokens).Flat()!
     for i in range 3: ids[i] = seq[8 + i]                    # the second sequence: its own positions from 0
     dec.Pos = 0
     dec.Forward(3)
@@ -243,7 +243,7 @@ test CachedBatch "a batch decoded at once: each row the tokens its prompt alone 
         assert got[b * 7:b * 7 + 7] == want, "row " + $b + ": " + $got[b * 7:b * 7 + 7] + " against " + $want
     }
     # the logits of each row against the whole sequences run at once (batch 2 of the full graph holds rows 0 and 1)
-    seq := full.Ints(m.Tokens).Flat()!
+    seq :~ full.Ints(m.Tokens).Flat()!
     for i in range 16: seq[i] = 0
     for b in range 2 {
         for t in range 7: seq[b * 8 + t] = got[b * 7 + t]
@@ -251,13 +251,13 @@ test CachedBatch "a batch decoded at once: each row the tokens its prompt alone 
     full.Training = false
     full.Forward(2)
     want := full.Value(m.Logits)
-    ids := batch.Ints(bm.Tokens).Flat()!
+    ids :~ batch.Ints(bm.Tokens).Flat()!
     worst F64 = 0.0
     for t in range 7 {
         batch.Pos = t
         for b in range 3: ids[b] = got[b * 7 + t]
         batch.Forward(1)
-        z := batch.Value(bm.Logits).Flat()!
+        z :~ batch.Value(bm.Logits).Flat()!
         for b in range 2 {
             for c in range 11: worst = worst.Max((z[b * 11 + c] - want.Get(b, t, c)).Abs())
         }

@@ -77,7 +77,7 @@ fn every(n I64) Array<I64> { return Array<I64>[i for i in range n] }
 
 # rows (or elements) i of t where `at` is -1 drawn from Normal(0, sd)
 fn draw(t mut tensor.Tensor<F32>&, rowsFrom Array<I64>&, colsFrom Array<I64>&, sd F64, r mut rand.Rand&) {
-    d := t.Flat()!
+    d :~ t.Flat()!
     w := colsFrom.Len()
     for i in range rowsFrom.Len() {
         for j in range w {
@@ -101,7 +101,7 @@ fn (st mut model.State&) moved(name String&, f fn&(key String&, t tensor.Tensor<
 
 # parameter name and its moments remapped (rows, cols; a vector by rows alone); new parameter places drawn from sd
 fn (st mut model.State&) reshape(name String&, rows Array<I64>&, cols Array<I64>&, sd F64, r mut rand.Rand&) {
-    p := st.Param(name)
+    p :~ st.Param(name)
     if p.Rank() == 1 {
         st.set(name, remap1(p, rows))
         st.moved(name, fn(key, t): return remap1(t, rows))
@@ -206,7 +206,7 @@ fn WidenFfn(st model.State&, i I64, hidden I64, seed U64, noise F64 = 0.01) mode
     for name in ins {
         t := remap(out.Param(name), from, every(d))
         if noise > 0.0 {
-            q := t.Flat()!
+            q :~ t.Flat()!
             for j in range old, hidden {
                 for c in range d: q[j * d + c] *= F32(1.0 + noise * r.Normal())
             }
@@ -230,7 +230,7 @@ fn WidenFfn(st model.State&, i I64, hidden I64, seed U64, noise F64 = 0.01) mode
 
 # each column j of t divided by copies[from[j]] to the power pow
 fn divide(t mut tensor.Tensor<F32>&, from Array<I64>&, copies Array<I64>&, pow I64) {
-    q := t.Flat()!
+    q :~ t.Flat()!
     w := from.Len()
     for row in range t.Dim(0) {
         for j in range w {
@@ -284,7 +284,7 @@ fn WidenDim(st model.State&, dim I64, seed U64) model.State {
     if not out.Arch.Rms: out.reshape("final.b", keep, keep, 0.0, r)
     for name in gains {
         g := remap1(out.Param(name), keep)
-        q := g.Flat()!
+        q :~ g.Flat()!
         for j in range dim: q[j] = (q[j] if j < d else F32(1.0)) * scale
         out.set(name, g)
         out.moved(name, fn(key, m): return remap1(m, keep))
@@ -307,7 +307,7 @@ fn GrowVocab(st model.State&, vocab I64, seed U64) model.State {
     names := Vec<String>["embed"]
     if not out.Arch.Tied: names.Push("head")
     for name in names {
-        old := out.Param(name)
+        old :~ out.Param(name)
         t := remap(old, keepThenNew(v, vocab), every(d))
         q, s := t.Flat()!, old.Flat()!
         for c in range d {
@@ -365,7 +365,7 @@ fn DropHeads(st model.State&, i I64, heads Array<I64>&) model.State {
         if h in heads: continue
         for c in range b.HeadDim: keep.Push(h * b.HeadDim + c)
     }
-    rows := keep.ToArray()
+    rows :~ keep.ToArray()
     p := "b" + $i + "."
     d := out.Arch.Dim
     r := rand.Rand(0)
@@ -395,7 +395,7 @@ fn PruneFfn(st model.State&, i I64, hidden I64) model.State {
         score[j] = (u * w).Sqrt()
     }
     if b.Gated {
-        gate := out.Param(p + "gate").Flat()!
+        gate :~ out.Param(p + "gate").Flat()!
         for j in range b.Hidden {
             q F64 = 0.0
             for c in range d: q += F64(gate[j * d + c]) * F64(gate[j * d + c])
@@ -408,7 +408,7 @@ fn PruneFfn(st model.State&, i I64, hidden I64) model.State {
     kept := Vec<I64>()
     for j in range hidden: kept.Push(order[j])
     kept.Sort(fn(x, y): return x < y)
-    rows := kept.ToArray()
+    rows :~ kept.ToArray()
     r := rand.Rand(0)
     out.reshape(p + "up", rows, every(d), 0.0, r)
     if b.Gated: out.reshape(p + "gate", rows, every(d), 0.0, r)
@@ -441,7 +441,7 @@ fn HeadImportance(st model.State&, i I64, ids Array<I32>&, batches I64, batch I6
     for h in range b.Heads {
         cut := st.Copy()
         o := remap(cut.Param("b" + $i + ".o"), every(st.Arch.Dim), every(b.Heads * b.HeadDim))
-        q := o.Flat()!
+        q :~ o.Flat()!
         w := b.Heads * b.HeadDim
         for row in range st.Arch.Dim {
             for c in range b.HeadDim: q[row * w + h * b.HeadDim + c] = 0.0
@@ -488,7 +488,7 @@ fn Replace(st model.State&, i I64, b model.Block, ids Array<I32>&, steps I64, ra
     names, _ := out.Arch.Shapes()
     for name in names {
         if not name.StartsWith(p): continue
-        mine := fresh.Param(name)
+        mine :~ fresh.Param(name)
         if st.Params.Has(name) and sameShape(st.Param(name), mine) {
             out.set(name, st.Param(name).Clone())
         } else {
@@ -502,8 +502,8 @@ fn Replace(st model.State&, i I64, b model.Block, ids Array<I32>&, steps I64, ra
     one := model.Net.ForBlock(out, i, 8)
     o := optim.AdamW(one.G.Params(), one.G.ParamGrads(), rate = rate)
     r := rand.Rand(seed)
-    x := one.G.Value(one.Tokens).Flat()!
-    y := one.G.Value(one.Targets).Flat()!
+    x :~ one.G.Value(one.Tokens).Flat()!
+    y :~ one.G.Value(one.Targets).Flat()!
     for _ in range steps {
         old.Batch(ids, r)
         old.G.Forward(8)
@@ -538,7 +538,7 @@ fn ToMuon(st model.State&) model.State {
     out := st.Copy()
     if st.Opt != "adamw": return out
     for key in st.Params.Keys() {
-        t := st.Param(key)
+        t :~ st.Param(key)
         if t.Rank() != 2 or key == "embed" or key == "head" or key == "pos": continue
         m := try st.Moments.Get("m." + key) catch { continue }
         out.Moments.Put("buf." + key, m.Clone())
@@ -557,7 +557,7 @@ fn ToAdamW(st model.State&) model.State {
     for key in st.Params.Keys() {
         b := try st.Moments.Get("buf." + key) catch { continue }
         sq := b.Clone()
-        q := sq.Flat()!
+        q :~ sq.Flat()!
         for k in range q.Len(): q[k] = q[k] * q[k]
         out.Moments.Put("m." + key, b.Clone())
         out.Moments.Put("v." + key, sq)
@@ -589,7 +589,7 @@ fn ResetOptimizer(st model.State&) model.State {
 # the logits of st's model on 2 fixed sequences (tokens below `vocab`)
 fn logitsOf(st model.State&, vocab I64) Array<F32> {
     n := model.Net.Build(st, 2)
-    tok := n.G.Ints(n.Tokens).Flat()!
+    tok :~ n.G.Ints(n.Tokens).Flat()!
     ctx := st.Arch.Ctx
     for k in range tok.Len(): tok[k] = I32(((k / ctx) * 31 + (k % ctx) * 7 + 3) % vocab)
     n.G.Forward(2)
@@ -656,11 +656,11 @@ test Deepen "each growth keeps the logits: deepen, widen the feed-forward, add h
 }
 
 test Deepen "a DiLoCo state is a State: opened, deepened with its outer momentum moved, it seeds the grown model's run" {
-    root := try os.MkTemp("", "surgery-dist-") catch { unreachable }
+    root :~ try os.MkTemp("", "surgery-dist-") catch { unreachable }
     store := dist.DirStore(root)
     st := model.State.Fresh(model.Spec.Uniform(11, 16, 8, 2, 2), 3)
     net := model.Net.Build(st, 2)
-    params := net.G.Params().Flat()!
+    params :~ net.G.Params().Flat()!
     o := net.AdamW(st)
     d := dist.DiLoCo<dist.DirStore>(store, 0, 1, params.Len(), snapshotEvery = 1, name = "small")
     d.Named = net.Layout()
@@ -694,7 +694,7 @@ test Deepen "a DiLoCo state is a State: opened, deepened with its outer momentum
     other := model.Net.Build(model.State.Fresh(grown.Arch, 9), 2)        # a worker: another start, the run's model taken
     f := dist.DiLoCo<dist.DirStore>(store, 1, 2, other.G.ParamCount, name = "grown")
     f.Named = other.Layout()
-    mine := other.G.Params().Flat()!
+    mine :~ other.G.Params().Flat()!
     try f.Begin(mine) catch { unreachable }
     assert f.Round == 3 and mine == big.G.Params().Flat()! and f.Buf == big.Outer(grown)
     try os.RemoveAll(root) catch { }

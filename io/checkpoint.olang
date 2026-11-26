@@ -207,7 +207,7 @@ type Writer struct() {
 scratchCount mut I64 = 0
 
 fn scratchPath() String {
-    dir := try os.Env("TMPDIR") catch { } default "/tmp"
+    dir :~ try os.Env("TMPDIR") catch { } default "/tmp"
     k := scratchCount.AtomicAdd(1) + 1
     return $dir + "/oann-checkpoint-" + $unistd.getpid() + "-" + $k + ".data"
 }
@@ -228,12 +228,12 @@ fn (w mut Writer&) AddAs<T>(name String&, t tensor.Tensor<T>&, d Dtype) ? Safete
     for e in w.entries.View() {
         if e.Key == name: error SafetensorsError.Duplicate($name)
     }
-    c := t if t.Contiguous() else t.Clone()        # a strided view is copied, once
+    c :~ t if t.Contiguous() else t.Clone()        # a strided view is copied, once
     if w.data.Len() == 0 {
         w.scratch = scratchPath()
         w.data.Push(try os.File.Create(w.scratch) catch { error SafetensorsError.Io($w.scratch) })
     }
-    xs := try c.Flat() catch { unreachable }
+    xs :~ try c.Flat() catch { unreachable }
     width := d.Width()
     per := w.buf.Len() / width
     for i0 in range 0, xs.Len(), per {
@@ -351,7 +351,7 @@ fn (w mut Writer&) Save(path String&) ? os.Error {
     w.data.Clear()                          # closed: every byte written is there to read
     src := try os.File.Open(w.scratch)
     for at in range 0, w.size, w.buf.Len() {
-        part := w.buf[:(w.size - at).Min(w.buf.Len())]
+        part :~ w.buf[:(w.size - at).Min(w.buf.Len())]
         try readAt(src, at, part) catch io.Error { error os.Error.Failed($w.scratch) }
         try f.Write(part) catch io.Error { error os.Error.Failed($path) }
     }
@@ -385,8 +385,8 @@ fn File.Parse(bytes Array<U8>&) File ? SafetensorsError {
 
 # the header's entries and metadata, the data size bytes long
 fn parseHeader(text Array<U8>&, size I64) Array<Entry>, Map<String, String> ? SafetensorsError {
-    doc := try json.Json.Parse(String(text)) catch { error SafetensorsError.Malformed }
-    obj := try doc.AsObj() catch { error SafetensorsError.Malformed }
+    doc :~ try json.Json.Parse(String(text)) catch { error SafetensorsError.Malformed }
+    obj :~ try doc.AsObj() catch { error SafetensorsError.Malformed }
     entries Vec<Entry> = Vec<Entry>()
     meta Map<String, String> = Map<String, String>()
     for i, key in obj.Keys {
@@ -397,7 +397,7 @@ fn parseHeader(text Array<U8>&, size I64) Array<Entry>, Map<String, String> ? Sa
 }
 
 fn readMeta(j json.Json&, meta mut Map<String, String>&) ? SafetensorsError {
-    o := try j.AsObj() catch { error SafetensorsError.Malformed }
+    o :~ try j.AsObj() catch { error SafetensorsError.Malformed }
     for i, key in o.Keys: meta.Put(key, try o.Values[i].AsStr() catch { error SafetensorsError.Malformed })
 }
 
@@ -410,8 +410,8 @@ fn member(j json.Json&, name String&) json.Json& ? SafetensorsError {
 # elements exactly
 fn Entry.Parse(name String&, j json.Json&, size I64) Entry ? SafetensorsError {
     d := try Dtype.Named(try (try member(j, "dtype")).AsStr() catch { error SafetensorsError.Malformed })
-    shape := try (try member(j, "shape")).AsArr() catch { error SafetensorsError.Malformed }
-    offsets := try (try member(j, "data_offsets")).AsArr() catch { error SafetensorsError.Malformed }
+    shape :~ try (try member(j, "shape")).AsArr() catch { error SafetensorsError.Malformed }
+    offsets :~ try (try member(j, "data_offsets")).AsArr() catch { error SafetensorsError.Malformed }
     if offsets.Len() != 2: error SafetensorsError.Malformed
     dims Array<I64> = Array<I64>(shape.Len())
     count I64 = 1
@@ -463,7 +463,7 @@ fn readAt(f os.File&, at I64, buf mut Array<U8>&) ? io.Error {
     seek(f.Fd(), at, 0)
     got I64 = 0
     for got < buf.Len() {
-        part := try f.Read(buf[got:])
+        part :~ try f.Read(buf[got:])
         if part.Len() == 0: error io.Error.Partial(got)
         got += part.Len()
     }
@@ -489,7 +489,7 @@ fn (f File&) Read<T>(name String&, dst mut tensor.Tensor<T>&) ? SafetensorsError
         error tensor.ShapeError.Mismatch($name + " is stored with shape " + $e.Shape + ", not " + $dst.Dims)
     }
     like T
-    out := try dst.Flat()
+    out :~ try dst.Flat()
     width := e.Type.Width()
     if f.disk.Len() == 0 {
         for i in range out.Len(): out[i] = elementAt(f.bytes, f.base + e.Begin + i * width, e.Type, like)
@@ -498,7 +498,7 @@ fn (f File&) Read<T>(name String&, dst mut tensor.Tensor<T>&) ? SafetensorsError
     per := f.chunk.Len() / width
     for i0 in range 0, out.Len(), per {
         n := per.Min(out.Len() - i0)
-        buf := f.chunk[:n * width]
+        buf :~ f.chunk[:n * width]
         try readAt(f.disk[0], f.base + e.Begin + i0 * width, buf) catch io.Error { error SafetensorsError.Malformed }
         for i in range n: out[i0 + i] = elementAt(buf, i * width, e.Type, like)
     }
@@ -721,7 +721,7 @@ test File.Load "a saved file loads from disk" {
 fn valuesJson(name String&, t tensor.Tensor<F64>&) String {
     sb := StringBuilder()
     sb.Push("\"" + $name + "\": [")
-    flat := try t.Flat() catch { unreachable }
+    flat :~ try t.Flat() catch { unreachable }
     for i, x in flat {
         if i > 0: sb.Push(", ")
         sb.Push($x)
@@ -759,11 +759,11 @@ test File "numpy reads what is written here bit for bit, and what numpy writes r
     try os.WriteFile($dir + "/oann_values.json", text)
     assert os.Run("python3 -I bench/ref/safetensors_check.py " + $os.Quote(dir) + " > " + $os.Quote($dir + "/check.log") + " 2>&1") == 0
     f := try File.Load($dir + "/py.safetensors")
-    doc := try json.Json.Parse(try os.ReadFile($dir + "/py_values.json"))
+    doc :~ try json.Json.Parse(try os.ReadFile($dir + "/py_values.json"))
     assert f.Names().Len() == 4
     for name in f.Names() {
-        want := try (try doc[name]).AsArr()
-        got := try (try f.Get<F64>(name)).Flat() catch { unreachable }
+        want :~ try (try doc[name]).AsArr()
+        got :~ try (try f.Get<F64>(name)).Flat() catch { unreachable }
         assert got.Len() == want.Len()
         for i, x in got: assert x.Bits() == (try want[i].AsNum()).Bits(), $name + " " + $i
     }
@@ -821,7 +821,7 @@ fn peakPages() I64 {
 test Writer.Save "saving and loading stream: 64 MB of tensors saved and read back raise the peak address space by a few buffers, not by the data" {
     n I64 = 1 << 24
     big := tensor.Tensor<F32>.Zeros(n / 1024, 1024)
-    data := big.Flat()!
+    data :~ big.Flat()!
     for i in range n: data[i] = F32(i % 1000) * 0.5
     back := tensor.Tensor<F32>.Zeros(n / 1024, 1024)
     path := (try os.Env("TMPDIR") catch { } default "/tmp") + "/oann-checkpoint-test-" + $unistd.getpid() + ".safetensors"

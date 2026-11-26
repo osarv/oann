@@ -74,7 +74,7 @@ fn (s mut DirStore&) Put(name String&, data Array<U8>&) ? StoreError {
 fn (s DirStore&) Get(name String&) Array<U8>& ? StoreError {
     path := s.Root + "/" + name
     if not os.Exists(path) { error StoreError.Missing }
-    text := try os.ReadFile(path) catch err { error StoreError.Failed("reading " + path + ": " + $err) }
+    text :~ try os.ReadFile(path) catch err { error StoreError.Failed("reading " + path + ": " + $err) }
     return text.Bytes()
 }
 
@@ -193,15 +193,15 @@ fn commitBody(summary String&, blobs Array<staged>&, lfs Array<Bool>&) String {
 # everything staged committed at once (nothing staged: nothing done)
 fn (s mut HfStore&) Flush() ? StoreError {
     if s.pending.Len() == 0: return
-    blobs := s.pending.ToArray()
+    blobs :~ s.pending.ToArray()
     s.pending = Vec<staged>()
-    pre := try s.json(try s.send("POST", s.api() + "/preupload/" + s.Revision, Array<http.Header>[s.auth(), http.Header("Content-Type", "application/json")]
+    pre :~ try s.json(try s.send("POST", s.api() + "/preupload/" + s.Revision, Array<http.Header>[s.auth(), http.Header("Content-Type", "application/json")]
         preuploadBody(blobs)))
     lfs := Array<Bool>(blobs.Len())
-    files := try (try pre.At("files") catch err { error StoreError.Malformed("preupload: " + $err) }).AsArr() catch err { error StoreError.Malformed("preupload: " + $err) }
+    files :~ try (try pre.At("files") catch err { error StoreError.Malformed("preupload: " + $err) }).AsArr() catch err { error StoreError.Malformed("preupload: " + $err) }
     for f in files {
-        path := try (try f.At("path") catch { error StoreError.Malformed("preupload: a file without a path") }).AsStr() catch { error StoreError.Malformed("preupload") }
-        mode := try (try f.At("uploadMode") catch { error StoreError.Malformed("preupload: no uploadMode") }).AsStr() catch { error StoreError.Malformed("preupload") }
+        path :~ try (try f.At("path") catch { error StoreError.Malformed("preupload: a file without a path") }).AsStr() catch { error StoreError.Malformed("preupload") }
+        mode :~ try (try f.At("uploadMode") catch { error StoreError.Malformed("preupload: no uploadMode") }).AsStr() catch { error StoreError.Malformed("preupload") }
         for i, b in blobs {
             if b.Name == path: lfs[i] = mode == "lfs"
         }
@@ -219,22 +219,22 @@ fn (s HfStore&) upload(data Array<U8>&) ? StoreError {
     lfsHeaders := Array<http.Header>[s.auth(), http.Header("Accept", "application/vnd.git-lfs+json"), http.Header("Content-Type", "application/vnd.git-lfs+json")]
     body := "{\"operation\": \"upload\", \"transfers\": [\"basic\", \"multipart\"], \"hash_algo\": \"sha256\", \"ref\": {\"name\": \"" + s.Revision +
         "\"}, \"objects\": [{\"oid\": \"" + oid + "\", \"size\": " + $data.Len() + "}]}"
-    batch := try s.json(try s.send("POST", s.site() + ".git/info/lfs/objects/batch", lfsHeaders, body))
-    obj := try (try (try batch.At("objects") catch { error StoreError.Malformed("LFS batch: no objects") }).AsArr() catch { error StoreError.Malformed("LFS batch: objects") })[0].AsObj() catch { error StoreError.Malformed("LFS batch: an object") }
+    batch :~ try s.json(try s.send("POST", s.site() + ".git/info/lfs/objects/batch", lfsHeaders, body))
+    obj :~ try (try (try batch.At("objects") catch { error StoreError.Malformed("LFS batch: no objects") }).AsArr() catch { error StoreError.Malformed("LFS batch: objects") })[0].AsObj() catch { error StoreError.Malformed("LFS batch: an object") }
     if obj.Has("error") { error StoreError.Failed("LFS: " + $(try obj.At("error") catch { unreachable })) }
     if not obj.Has("actions"): return                          # the Hub has it already
-    actions := try obj.At("actions") catch { unreachable }
+    actions :~ try obj.At("actions") catch { unreachable }
     if not actions.Has("upload"): return
-    up := try actions.At("upload") catch { unreachable }
-    href := try (try up.At("href") catch { error StoreError.Malformed("LFS batch: no href") }).AsStr() catch { error StoreError.Malformed("LFS batch: href") }
+    up :~ try actions.At("upload") catch { unreachable }
+    href :~ try (try up.At("href") catch { error StoreError.Malformed("LFS batch: no href") }).AsStr() catch { error StoreError.Malformed("LFS batch: href") }
     head := Vec<http.Header>()
     chunk I64 = 0
     parts := Vec<String&>()
     if up.Has("header") {
-        h := try (try up.At("header") catch { unreachable }).AsObj() catch { error StoreError.Malformed("LFS batch: header") }
+        h :~ try (try up.At("header") catch { unreachable }).AsObj() catch { error StoreError.Malformed("LFS batch: header") }
         for k in range h.Len() {
-            key := h.Keys[k]
-            v := try h.Values[k].AsStr() catch { error StoreError.Malformed("LFS batch: a header value") }
+            key :~ h.Keys[k]
+            v :~ try h.Values[k].AsStr() catch { error StoreError.Malformed("LFS batch: a header value") }
             if key == "chunk_size": chunk = try v.ParseInt() catch { error StoreError.Malformed("LFS batch: chunk_size") }
             else if key.Every(fn(c Char) Bool { return c.IsDigit() }): parts.Push(v)
             else: head.Push(http.Header(key, v))
@@ -247,15 +247,15 @@ fn (s HfStore&) upload(data Array<U8>&) ? StoreError {
         for i in range parts.Len() {
             lo := i * chunk
             r := try s.send("PUT", parts[i], Array<http.Header>(0, http.Header("", "")), data[lo:(lo + chunk).Min(data.Len())])
-            etag := try r.Header("ETag") catch { error StoreError.Malformed("LFS batch: a part without an ETag") }
+            etag :~ try r.Header("ETag") catch { error StoreError.Malformed("LFS batch: a part without an ETag") }
             tag := String(Array<Char>[c for c in etag if c != '"'])           # an ETag comes quoted
             done += ("" if i == 0 else ", ") + "{\"partNumber\": " + $(i + 1) + ", \"etag\": \"" + tag + "\"}"
         }
         try s.send("POST", href, Array<http.Header>[http.Header("Content-Type", "application/json")], done + "]}")
     }
     if actions.Has("verify") {
-        v := try actions.At("verify") catch { unreachable }
-        vh := try (try v.At("href") catch { error StoreError.Malformed("LFS batch: verify href") }).AsStr() catch { error StoreError.Malformed("LFS batch: verify href") }
+        v :~ try actions.At("verify") catch { unreachable }
+        vh :~ try (try v.At("href") catch { error StoreError.Malformed("LFS batch: verify href") }).AsStr() catch { error StoreError.Malformed("LFS batch: verify href") }
         try s.send("POST", vh, Array<http.Header>[s.auth(), http.Header("Content-Type", "application/vnd.git-lfs+json")]
             "{\"oid\": \"" + oid + "\", \"size\": " + $data.Len() + "}")
     }
@@ -352,16 +352,16 @@ fn Decode(bytes Array<U8>&, out mut Array<F32>&) checkpoint.File ? StoreError {
     if n != out.Len() { error StoreError.Malformed("a blob of " + $n + " values for " + $out.Len()) }
     if c == Codec.F32 or c == Codec.BF16 {
         d := try f.Get<F32>("d") catch err { error StoreError.Malformed($err) }
-        dv := d.Flat()!
+        dv :~ d.Flat()!
         for i in range n: out[i] = dv[i]
     } else if c == Codec.Int8 {
-        q := (try f.Get<I8>("q") catch err { error StoreError.Malformed($err) }).Flat()!
-        s := (try f.Get<F32>("s") catch err { error StoreError.Malformed($err) }).Flat()!
+        q :~ (try f.Get<I8>("q") catch err { error StoreError.Malformed($err) }).Flat()!
+        s :~ (try f.Get<F32>("s") catch err { error StoreError.Malformed($err) }).Flat()!
         for i in range n: out[i] = F32(q[i]) * s[i / block]
     } else {
         for i in range n: out[i] = 0.0
-        ix := (try f.Get<I32>("i") catch err { error StoreError.Malformed($err) }).Flat()!
-        vs := (try f.Get<F32>("v") catch err { error StoreError.Malformed($err) }).Flat()!
+        ix :~ (try f.Get<I32>("i") catch err { error StoreError.Malformed($err) }).Flat()!
+        vs :~ (try f.Get<F32>("v") catch err { error StoreError.Malformed($err) }).Flat()!
         for j in range ix.Len(): out[I64(ix[j])] = vs[j]
     }
     return f
@@ -433,7 +433,7 @@ fn (d DiLoCo<S>&) sleep() { time.Sleep(time.Duration.Millis(d.PollMs)) }
 fn (d mut DiLoCo<S>&) await(name String&, ms I64) Array<U8>& ? StoreError {
     t0 := time.Now()
     for {
-        b := try d.store.Get(d.key(name)) catch StoreError.Missing {
+        b :~ try d.store.Get(d.key(name)) catch StoreError.Missing {
             if time.Since(t0) > ms * 1000000 { error StoreError.Timeout("waited " + $ms + " ms for " + name) }
             d.sleep()
             continue
@@ -447,16 +447,16 @@ fn (d mut DiLoCo<S>&) await(name String&, ms I64) Array<U8>& ? StoreError {
 # themselves (every worker's the same: the same seed) when there is none yet. Call once before training
 fn (d mut DiLoCo<S>&) Begin(params mut Array<F32>&) ? StoreError {
     for i in range params.Len(): d.Global[i] = params[i]
-    latest := try d.store.Get(d.key("latest")) catch StoreError.Missing default "".Bytes()
+    latest :~ try d.store.Get(d.key("latest")) catch StoreError.Missing default "".Bytes()
     if latest.Len() > 0 {
         r := try String(latest).Trim().ParseInt() catch { error StoreError.Malformed("latest") }
-        b := try d.store.Get(d.key("state." + $r))
+        b :~ try d.store.Get(d.key("state." + $r))
         d.BytesDown += b.Len()
         try d.Read(b)
         d.Round = r + 1
     }
     for {                                           # the updates since
-        b := try d.store.Get(d.key("r" + $d.Round + ".u")) catch StoreError.Missing { break }
+        b :~ try d.store.Get(d.key("r" + $d.Round + ".u")) catch StoreError.Missing { break }
         d.BytesDown += b.Len()
         try d.apply(b)
         d.Round++
@@ -467,7 +467,7 @@ fn (d mut DiLoCo<S>&) Begin(params mut Array<F32>&) ? StoreError {
 # an update blob subtracted from the global model's fragment
 fn (d mut DiLoCo<S>&) apply(b Array<U8>&) ? StoreError {
     lo, hi := d.fragment(d.Round % d.Fragments)
-    u := d.scratch[lo:hi]
+    u :~ d.scratch[lo:hi]
     try Decode(b, u)
     for i in range lo, hi: d.Global[i] -= d.scratch[i]
 }
@@ -491,7 +491,7 @@ fn (d mut DiLoCo<S>&) Sync(params mut Array<F32>&) Report ? StoreError {
     if d.Worker == 0 {
         contributors, stale = try d.coordinate(lo, hi)
     } else {
-        b := try d.await("r" + $d.Round + ".u", 2 * d.TimeoutMs + 60000)
+        b :~ try d.await("r" + $d.Round + ".u", 2 * d.TimeoutMs + 60000)
         f2 := try checkpoint.File.Parse(b) catch err { error StoreError.Malformed($err) }
         contributors = try (try f2.Meta.Get("contributors") catch default "0").ParseInt() catch default 0
         stale = try (try f2.Meta.Get("stale") catch default "0").ParseInt() catch default 0
@@ -517,7 +517,7 @@ fn (d mut DiLoCo<S>&) coordinate(lo I64, hi I64) I64, I64 ? StoreError {
     for {
         for w in range d.Workers {
             if have[w]: continue
-            b := try d.store.Get(d.key("r" + $d.Round + ".d" + $w)) catch StoreError.Missing { continue }
+            b :~ try d.store.Get(d.key("r" + $d.Round + ".d" + $w)) catch StoreError.Missing { continue }
             if w != d.Worker: d.BytesDown += b.Len()
             try Decode(b, one)
             for i in range n: d.acc[lo + i] += one[i]
@@ -533,7 +533,7 @@ fn (d mut DiLoCo<S>&) coordinate(lo I64, hi I64) I64, I64 ? StoreError {
     for w in range d.Workers {
         k := f * d.Workers + w
         if d.Stale and d.late[k] and prev >= 0 {
-            b := try d.store.Get(d.key("r" + $prev + ".d" + $w)) catch StoreError.Missing default "".Bytes()
+            b :~ try d.store.Get(d.key("r" + $prev + ".d" + $w)) catch StoreError.Missing default "".Bytes()
             if b.Len() > 0 {
                 d.BytesDown += b.Len()
                 try Decode(b, one)
@@ -606,8 +606,8 @@ fn (d mut DiLoCo<S>&) Snapshot() ? StoreError {
 fn (d mut DiLoCo<S>&) Read(b Array<U8>&) ? StoreError {
     f := try checkpoint.File.Parse(b) catch err { error StoreError.Malformed($err) }
     if f.Has("global") {
-        g := (try f.Get<F32>("global") catch err { error StoreError.Malformed($err) }).Flat()!
-        m := (try f.Get<F32>("momentum") catch err { error StoreError.Malformed($err) }).Flat()!
+        g :~ (try f.Get<F32>("global") catch err { error StoreError.Malformed($err) }).Flat()!
+        m :~ (try f.Get<F32>("momentum") catch err { error StoreError.Malformed($err) }).Flat()!
         if g.Len() != d.Global.Len() { error StoreError.Malformed("a state of " + $g.Len() + " parameters for " + $d.Global.Len()) }
         for i in range g.Len() {
             d.Global[i] = g[i]
@@ -651,7 +651,7 @@ type Layout struct() {
 # steps: together they find the mean of the c_w.
 
 fn DirStore.temp() DirStore {
-    dir := os.MkTemp("", "dist-")!
+    dir :~ os.MkTemp("", "dist-")!
     return DirStore(dir)
 }
 
@@ -751,15 +751,15 @@ test Encode "each codec's blob decodes to what the encoder says it sent" {
 
 test commitBody "a Hub commit: a header line, then each blob inline (base64) or as its LFS object (SHA-256, size)" {
     blobs := Array<staged>[staged("run/r0.d1", "abc".Bytes().Copy()), staged("run/state.0", Array<U8>(1000, U8(7)))]
-    lines := commitBody("a round", blobs, Array<Bool>[false, true]).Split("\n")
+    lines :~ commitBody("a round", blobs, Array<Bool>[false, true]).Split("\n")
     assert lines.Len() == 4 and lines[3] == ""
-    head := json.Json.Parse(lines[0])!
+    head :~ json.Json.Parse(lines[0])!
     assert head.At("key")!.AsStr()! == "header" and head.At("value")!.At("summary")!.AsStr()! == "a round"
-    inline := json.Json.Parse(lines[1])!.At("value")!
+    inline :~ json.Json.Parse(lines[1])!.At("value")!
     assert inline.At("path")!.AsStr()! == "run/r0.d1" and base64.Decode(inline.At("content")!.AsStr()!)! == "abc".Bytes()
-    lfs := json.Json.Parse(lines[2])!
+    lfs :~ json.Json.Parse(lines[2])!
     assert lfs.At("key")!.AsStr()! == "lfsFile" and lfs.At("value")!.At("oid")!.AsStr()! == sha256.Hex(Array<U8>(1000, U8(7)))
     assert lfs.At("value")!.At("size")!.AsInt()! == 1000
-    pre := json.Json.Parse(preuploadBody(blobs))!.At("files")!.AsArr()!
+    pre :~ json.Json.Parse(preuploadBody(blobs))!.At("files")!.AsArr()!
     assert pre.Len() == 2 and pre[1].At("size")!.AsInt()! == 1000 and base64.Decode(pre[1].At("sample")!.AsStr()!)!.Len() == 512
 }

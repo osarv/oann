@@ -43,8 +43,8 @@ fn Classifier.On<T>(g mut graph.Graph<T>&, x graph.Var, y graph.Var, logits grap
 # one epoch: every batch of l once, in a new order, forward, backward and a step of o after each. Gives the mean loss
 fn Epoch<T, D, O>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader<D>&, o mut O&) F64 {
     l.Epoch()
-    xs := g.Data(c.X).Flat()!
-    ys := g.Ints(c.Y).Flat()!
+    xs :~ g.Data(c.X).Flat()!
+    ys :~ g.Ints(c.Y).Flat()!
     total F64 = 0.0
     seen I64 = 0
     for b in range l.Batches() {
@@ -75,8 +75,8 @@ fn Ahead<T>.For(g graph.Graph<T>&, c Classifier&) Ahead<T> {
 # order, so the same losses, parameters and accuracy bit for bit. It gains only where a core is free
 fn EpochAhead<T, D, O>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader<D>&, o mut O&, a mut Ahead<T>&) F64 {
     l.Epoch()
-    xs := g.Data(c.X).Flat()!
-    ys := g.Ints(c.Y).Flat()!
+    xs :~ g.Data(c.X).Flat()!
+    ys :~ g.Ints(c.Y).Flat()!
     total F64 = 0.0
     seen I64 = 0
     last := l.Batches() - 1
@@ -103,8 +103,8 @@ fn EpochAhead<T, D, O>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader
 # the mean loss and the fraction classified right over every sample of l, forward only
 fn Evaluate<T, D>(g mut graph.Graph<T>&, c Classifier&, l mut loader.Loader<D>&) F64, F64 {
     l.Epoch()
-    xs := g.Data(c.X).Flat()!
-    ys := g.Ints(c.Y).Flat()!
+    xs :~ g.Data(c.X).Flat()!
+    ys :~ g.Ints(c.Y).Flat()!
     total F64 = 0.0
     right I64 = 0
     seen I64 = 0
@@ -200,8 +200,8 @@ fn LmStepAhead<E, S, O>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, o m
         try src.Random(a.tokens, a.targets, g.Batch)
         a.primed = true
     }
-    ids := g.Ints(m.Tokens).Flat()!
-    targets := g.Ints(m.Targets).Flat()!
+    ids :~ g.Ints(m.Tokens).Flat()!
+    targets :~ g.Ints(m.Targets).Flat()!
     for i in range ids.Len(): ids[i] = a.tokens[i]
     for i in range targets.Len(): targets[i] = a.targets[i]
     norm F64 = 0.0
@@ -223,8 +223,8 @@ fn LmStepAhead<E, S, O>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, o m
 fn LmEvaluate<E, S>(g mut graph.Graph<E>&, m LanguageModel&, src mut S&, batches I64) F64 ? {
     g.Training = false
     defer: g.Training = true
-    ids := g.Ints(m.Tokens).Flat()!
-    targets := g.Ints(m.Targets).Flat()!
+    ids :~ g.Ints(m.Tokens).Flat()!
+    targets :~ g.Ints(m.Targets).Flat()!
     total F64 = 0.0
     seen I64 = 0
     for b in range batches {
@@ -404,9 +404,9 @@ fn lit(n I64, seed U64) loader.Labeled {
 fn AverageGrads<T>(gs mut Vec<graph.Graph<T>>&) {
     n := gs.Len()
     if n < 2: return
-    g0 := gs.RefMut(0).ParamGrads().Flat()!
+    g0 :~ gs.RefMut(0).ParamGrads().Flat()!
     for r in range 1, n {
-        gr := gs.RefMut(r).ParamGrads().Flat()!
+        gr :~ gs.RefMut(r).ParamGrads().Flat()!
         for j in range g0.Len(): g0[j] += gr[j]
     }
     k := T(1.0 / F64(n))
@@ -415,9 +415,9 @@ fn AverageGrads<T>(gs mut Vec<graph.Graph<T>>&) {
 
 # every replica's parameters set to the first's (after its optimizer step)
 fn BroadcastParams<T>(gs mut Vec<graph.Graph<T>>&) {
-    p0 := gs.RefMut(0).Params().Flat()!
+    p0 :~ gs.RefMut(0).Params().Flat()!
     for r in range 1, gs.Len() {
-        pr := gs.RefMut(r).Params().Flat()!
+        pr :~ gs.RefMut(r).Params().Flat()!
         for j in range p0.Len(): pr[j] = p0[j]
     }
 }
@@ -521,8 +521,8 @@ fn resumes<T, O>(m LanguageModel&, g1 mut graph.Graph<T>&, o1 mut O&, g2 mut gra
     try Save(path, g2, o2, 3)
     assert (try Resume(path, g3, o3)) == 3
     for step in range 3, 6: try LmStep(g3, m, stopped, o3, rate(step), 1.0)
-    p := g1.Params().Flat()!
-    q := g3.Params().Flat()!
+    p :~ g1.Params().Flat()!
+    q :~ g3.Params().Flat()!
     assert p == q
     assert not g1.HasMasters() or g1.Masters().Flat()! == g3.Masters().Flat()!
 }
@@ -599,7 +599,7 @@ test Fit "reports and measures as the config asks, writes the run's record and a
 # this process's anonymous resident memory in kB (RssAnon, Linux: heap and stacks, not the code pages that running a path
 # for the first time maps in), read once
 fn rss() I64 {
-    status := try os.ReadFile("/proc/self/status") catch { return 0 }
+    status :~ try os.ReadFile("/proc/self/status") catch { return 0 }
     for line in status.Lines() {
         if not line.StartsWith("RssAnon:"): continue
         kb := try line[8:].Trim().Split(" ")[0].ParseInt() catch { return 0 }
@@ -647,8 +647,8 @@ test EpochAhead "an epoch with the next batch filled on a task gives the same lo
         if e == 70: before = resident()
         assert Epoch(g1, c1, l1, o1) == EpochAhead(g2, c2, l2, o2, a)
     }
-    p1 := g1.Params().Flat()!
-    p2 := g2.Params().Flat()!
+    p1 :~ g1.Params().Flat()!
+    p2 :~ g2.Params().Flat()!
     for i in range p1.Len(): assert p1[i] == p2[i]
     # the tasks' memory settles after ~60 epochs, then flat apart from what a join keeps (olang, repro/spawnleak, fixed in olang and removed 2026-11-21)
     assert resident() <= before + 24 + 30 * 8 / 4, "grew by " + $(resident() - before) + " kB"

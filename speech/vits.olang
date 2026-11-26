@@ -74,17 +74,17 @@ type Config struct() {
 }
 
 fn intOf(j json.Json&, key String&) I64 ? ModelError {
-    v := try j[key] catch { error ModelError.Malformed("no " + key) }
+    v :~ try j[key] catch { error ModelError.Malformed("no " + key) }
     return try v.AsInt() catch { error ModelError.Malformed(key + " is not an integer") }
 }
 
 fn numOf(j json.Json&, key String&) F64 ? ModelError {
-    v := try j[key] catch { error ModelError.Malformed("no " + key) }
+    v :~ try j[key] catch { error ModelError.Malformed("no " + key) }
     return try v.AsNum() catch { error ModelError.Malformed(key + " is not a number") }
 }
 
 fn intsOf(j json.Json&) Array<I64> ? ModelError {
-    a := try j.AsArr() catch { error ModelError.Malformed("not an array") }
+    a :~ try j.AsArr() catch { error ModelError.Malformed("not an array") }
     out := Array<I64>(a.Len())
     for i, v in a: out[i] = try v.AsInt() catch { error ModelError.Malformed("not an integer") }
     return out
@@ -96,8 +96,8 @@ fn listOf(j json.Json&, key String&) Array<I64> ? ModelError {
 
 # transformers' config.json of a VitsModel
 fn Config.Parse(text String&) Config ? ModelError {
-    j := try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
-    kind := try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
+    j :~ try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
+    kind :~ try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
     if kind != "vits": error ModelError.Unsupported("model_type " + kind + " (vits runs)")
     if (try intOf(j, "num_speakers")) != 1: error ModelError.Unsupported("more than one speaker")
     if (try intOf(j, "wavenet_dilation_rate")) != 1: error ModelError.Unsupported("a WaveNet dilation rate past 1")
@@ -122,13 +122,13 @@ fn Config.Parse(text String&) Config ? ModelError {
     c.Bins = try intOf(j, "duration_predictor_flow_bins")
     c.Tail = F32(try numOf(j, "duration_predictor_tail_bound"))
     c.Initial = try intOf(j, "upsample_initial_channel")
-    c.Rates = try listOf(j, "upsample_rates")
-    c.UpKernels = try listOf(j, "upsample_kernel_sizes")
-    c.ResKernels = try listOf(j, "resblock_kernel_sizes")
-    dils := try (try j["resblock_dilation_sizes"] catch { error ModelError.Malformed("no resblock_dilation_sizes") }).AsArr() catch { error ModelError.Malformed("resblock_dilation_sizes") }
+    c.Rates ~ try listOf(j, "upsample_rates")
+    c.UpKernels ~ try listOf(j, "upsample_kernel_sizes")
+    c.ResKernels ~ try listOf(j, "resblock_kernel_sizes")
+    dils :~ try (try j["resblock_dilation_sizes"] catch { error ModelError.Malformed("no resblock_dilation_sizes") }).AsArr() catch { error ModelError.Malformed("resblock_dilation_sizes") }
     ds := Array<Array<I64>>(dils.Len())
     for i, d in dils: ds[i] = try intsOf(d)
-    c.ResDilations = ds
+    c.ResDilations ~ ds
     c.Paired = true
     c.Slope = F32(try numOf(j, "leaky_relu_slope"))
     c.Rate = try intOf(j, "sampling_rate")
@@ -141,22 +141,22 @@ fn Config.Parse(text String&) Config ? ModelError {
 # a Piper voice's <voice>.onnx.json: the medium quality's network (piper's training config, which the file does not
 # repeat), its symbols' count, sample rate and inference defaults
 fn Config.Piper(text String&) Config ? ModelError {
-    j := try json.Json.Parse(text) catch { error ModelError.Malformed("the voice's JSON is not JSON") }
-    audio := try j["audio"] catch { error ModelError.Malformed("no audio") }
-    quality := try (try audio["quality"] catch { error ModelError.Malformed("no audio.quality") }).AsStr() catch { error ModelError.Malformed("audio.quality") }
+    j :~ try json.Json.Parse(text) catch { error ModelError.Malformed("the voice's JSON is not JSON") }
+    audio :~ try j["audio"] catch { error ModelError.Malformed("no audio") }
+    quality :~ try (try audio["quality"] catch { error ModelError.Malformed("no audio.quality") }).AsStr() catch { error ModelError.Malformed("audio.quality") }
     if quality != "medium": error ModelError.Unsupported("Piper's " + quality + " quality (medium runs)")
     if (try intOf(j, "num_speakers")) != 1: error ModelError.Unsupported("more than one speaker")
-    inf := try j["inference"] catch { error ModelError.Malformed("no inference") }
+    inf :~ try j["inference"] catch { error ModelError.Malformed("no inference") }
     c := Config()
     c.Hidden, c.Heads, c.Layers, c.Ffn, c.FfnKernel, c.Window = 192, 2, 6, 768, 3, 4
     c.Vocab = try intOf(j, "num_symbols")
     c.Flow, c.Flows, c.WaveLayers, c.WaveKernel = 192, 4, 4, 5
     c.DdsLayers, c.DdsKernel, c.DpFlows, c.Bins, c.Tail = 3, 3, 4, 10, F32(5.0)
     c.Initial = 256
-    c.Rates = Array<I64>[8, 8, 4]
-    c.UpKernels = Array<I64>[16, 16, 8]
-    c.ResKernels = Array<I64>[3, 5, 7]
-    c.ResDilations = Array<Array<I64>>[Array<I64>[1, 2], Array<I64>[2, 6], Array<I64>[3, 12]]
+    c.Rates ~ Array<I64>[8, 8, 4]
+    c.UpKernels ~ Array<I64>[16, 16, 8]
+    c.ResKernels ~ Array<I64>[3, 5, 7]
+    c.ResDilations ~ Array<Array<I64>>[Array<I64>[1, 2], Array<I64>[2, 6], Array<I64>[3, 12]]
     c.Paired = false
     c.Slope = F32(0.1)
     c.Rate = try intOf(audio, "sample_rate")
@@ -192,7 +192,7 @@ type Weights struct() {
 
 # tensor name's n elements into dst from at
 fn (w Weights&) into(dst mut Array<F32>&, at I64, name String&, n I64) ? ModelError {
-    a := try w.t.Get(name) catch { error ModelError.Malformed("no tensor " + name) }
+    a :~ try w.t.Get(name) catch { error ModelError.Malformed("no tensor " + name) }
     if a.Len() != n: error ModelError.Malformed(name + " has " + $a.Len() + " elements, not " + $n)
     for i in range n: dst[at + i] = a[i]
 }
@@ -214,11 +214,11 @@ fn Weights.Safetensors(path String&) Weights ? ModelError, os.Error {
     for name in f.Names() {
         if not name.EndsWith(".weight_v"): continue
         base := String(name[0:name.Len() - 2])
-        v := try w.t.Get(name) catch { error ModelError.Malformed(name) }
-        g := try w.t.Get(base + "_g") catch { error ModelError.Malformed("no " + base + "_g") }
+        v :~ try w.t.Get(name) catch { error ModelError.Malformed(name) }
+        g :~ try w.t.Get(base + "_g") catch { error ModelError.Malformed("no " + base + "_g") }
         w.t.Put(base, weightNorm(v, g))
     }
-    ls := try w.t.Get("duration_predictor.flows.0.log_scale") catch { error ModelError.Malformed("no duration_predictor.flows.0.log_scale") }
+    ls :~ try w.t.Get("duration_predictor.flows.0.log_scale") catch { error ModelError.Malformed("no duration_predictor.flows.0.log_scale") }
     w.t.Put("duration_predictor.flows.0.scale", Array<F32>[(-v).Exp() for v in ls])
     return w
 }
@@ -292,7 +292,7 @@ fn words(parts Array<String&>&, from I64) String {
 # a Piper initializer's name as transformers names the weight; "" for one this does not read
 fn piperName(name String&) String {
     if name == "sid": return "text_encoder.embed_tokens.weight"
-    p := name.Split(".")
+    p :~ name.Split(".")
     if p.Len() < 2: return ""
     if p[0] == "enc_p" and p[1] == "proj": return "text_encoder.project." + p[2]
     if p[0] == "enc_p" and p.Len() >= 5: return "text_encoder.encoder.layers." + p[3] + "." + encoderPart(p[2], p[4], p[5] if p.Len() > 5 else "")
@@ -320,7 +320,7 @@ fn encoderPart(kind String&, module String&, field String&) String {
     if kind == "norm_layers_2": return "final_layer_norm." + word(module)
     if kind == "ffn_layers": return "feed_forward." + module + "." + field
     if module.StartsWith("emb_rel"): return "attention." + module
-    proj := match module {
+    proj :~ match module {
         case "conv_q": "q_proj"
         case "conv_k": "k_proj"
         case "conv_v": "v_proj"
@@ -586,9 +586,9 @@ type Symbols struct(Piper Bool) {
 
 # vits-ljs's vocab.json
 fn Symbols.Vocab(path String&) Symbols ? ModelError, os.Error {
-    text := try os.ReadFile(path)
-    j := try json.Json.Parse(text) catch { error ModelError.Malformed(path + " is not JSON") }
-    o := try j.AsObj() catch { error ModelError.Malformed(path + " is not an object") }
+    text :~ try os.ReadFile(path)
+    j :~ try json.Json.Parse(text) catch { error ModelError.Malformed(path + " is not JSON") }
+    o :~ try j.AsObj() catch { error ModelError.Malformed(path + " is not an object") }
     s := Symbols(false)
     for i, k in o.Keys: s.Ids.Put(k, Array<I32>[I32(try o.Values[i].AsInt() catch { error ModelError.Malformed(path + ": " + k) })])
     return s
@@ -596,9 +596,9 @@ fn Symbols.Vocab(path String&) Symbols ? ModelError, os.Error {
 
 # a Piper voice's phoneme_id_map (its .onnx.json)
 fn Symbols.PiperMap(path String&) Symbols ? ModelError, os.Error {
-    text := try os.ReadFile(path)
-    j := try json.Json.Parse(text) catch { error ModelError.Malformed(path + " is not JSON") }
-    o := try (try j["phoneme_id_map"] catch { error ModelError.Malformed(path + " has no phoneme_id_map") }).AsObj() catch { error ModelError.Malformed(path + ": phoneme_id_map") }
+    text :~ try os.ReadFile(path)
+    j :~ try json.Json.Parse(text) catch { error ModelError.Malformed(path + " is not JSON") }
+    o :~ try (try j["phoneme_id_map"] catch { error ModelError.Malformed(path + " has no phoneme_id_map") }).AsObj() catch { error ModelError.Malformed(path + ": phoneme_id_map") }
     s := Symbols(true)
     for i, k in o.Keys {
         ids := try intsOf(o.Values[i])
@@ -609,7 +609,7 @@ fn Symbols.PiperMap(path String&) Symbols ? ModelError, os.Error {
 
 # a character's ids; one vits-ljs's vocabulary lacks lowercased first (VitsTokenizer's normalize)
 fn (s Symbols&) of(ch String&) Array<I32> ? ModelError {
-    key := ch if s.Piper or s.Ids.Has(ch) else ch.ToLower()
+    key :~ ch if s.Piper or s.Ids.Has(ch) else ch.ToLower()
     return try s.Ids.Get(key) catch { error ModelError.Unsupported("no symbol " + ch) }
 }
 
@@ -1148,8 +1148,8 @@ fn (m Model&) res(a mut Arith&, x mut Array<F32>&, t mut Array<F32>&, rows I64, 
 # IPA the reference's, every duration the reference's; the greatest difference of a sample from the reference's
 # waveform and from the one of the model run in F64 (where there is one; -1 where not), -1 where there is no reference
 fn gapTo(m Model&, s Symbols&, ref String&) F64, F64 {
-    text := try os.ReadFile(ref + "/cases.json") catch { return -1.0, -1.0 }
-    o := json.Json.Parse(text)!.AsObj()!
+    text :~ try os.ReadFile(ref + "/cases.json") catch { return -1.0, -1.0 }
+    o :~ json.Json.Parse(text)!.AsObj()!
     worst F64 = 0.0
     worst64 F64 = -1.0
     for i, key in o.Keys {

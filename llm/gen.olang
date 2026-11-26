@@ -48,7 +48,7 @@ fn mix(x U64) U64 {
 
 # MemAvailable in bytes (0 if unknown)
 fn available() I64 {
-    text := try os.ReadFile("/proc/meminfo") catch default ""
+    text :~ try os.ReadFile("/proc/meminfo") catch default ""
     for line in text.Lines() {
         if not line.StartsWith("MemAvailable:"): continue
         kb := try line[13:].Trim().Split(" ")[0].ParseInt() catch default 0
@@ -59,7 +59,7 @@ fn available() I64 {
 
 # the peak resident memory in MB (VmHWM)
 fn peak() I64 {
-    status := try os.ReadFile("/proc/self/status") catch default ""
+    status :~ try os.ReadFile("/proc/self/status") catch default ""
     for line in status.Lines() {
         if not line.StartsWith("VmHWM:"): continue
         return (try line[6:].Trim().Split(" ")[0].ParseInt() catch default 0) / 1024
@@ -78,8 +78,8 @@ fn say(msg String&) { try io.PutErrLn("oann-gen: " + msg) catch { } }
 fn modelDir(name String&) String {
     if os.IsDir(name): return name
     if not name.Contains("/"): fail("no model directory " + name)
-    root := try os.Env("OANN_MODELS") catch default ""
-    if root.Len() == 0: root = (try os.Env("HOME") catch default "/tmp") + "/.cache/oann/models"
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: root ~ (try os.Env("HOME") catch default "/tmp") + "/.cache/oann/models"
     dir := root + "/" + name.Replace("/", "--")
     try chat.Fetch(name, dir) catch { fail("could not fetch " + name + " from Hugging Face") }
     return dir
@@ -110,7 +110,7 @@ fn main() {
     args := p.Args()
     if args.Len() != 3: fail("usage: oann-gen MODEL prompts.jsonl out.jsonl [flags] (--help)")
     dir := modelDir(args[0])
-    outPath := args[2]
+    outPath :~ args[2]
     t0 := time.Now()
     tok := try bpe.Bpe.Load(dir + "/tokenizer.json") catch { fail("cannot read " + dir + "/tokenizer.json") }
     ch := chat.Chat.Load(dir, tok)
@@ -120,32 +120,32 @@ fn main() {
     # what is done already
     finished := Map<String, Bool>()
     if os.Exists(outPath) {
-        text := try os.ReadFile(outPath) catch { fail("cannot read " + outPath) }
+        text :~ try os.ReadFile(outPath) catch { fail("cannot read " + outPath) }
         for line in text.Lines() {
             if line.Trim().Len() == 0: continue
-            j := try json.Json.Parse(line) catch { continue }
-            id := try j["id"] catch { continue }
+            j :~ try json.Json.Parse(line) catch { continue }
+            id :~ try j["id"] catch { continue }
             k := try (try j["sample"] catch { continue }).AsInt() catch { continue }
             finished.Put(json.Encode(id) + "#" + $k, true)
         }
     }
     # the jobs
-    text := try os.ReadFile(args[1]) catch { fail("cannot read " + args[1]) }
+    text :~ try os.ReadFile(args[1]) catch { fail("cannot read " + args[1]) }
     jobs := Vec<job>()
     longest I64 = 0
     skipped I64 = 0
     for li, line in text.Lines() {
         if line.Trim().Len() == 0: continue
-        j := try json.Json.Parse(line) catch { fail(args[1] + ":" + $(li + 1) + ": not JSON") }
-        id := json.Encode(try j["id"] catch default json.Json.Num(F64(li)))
+        j :~ try json.Json.Parse(line) catch { fail(args[1] + ":" + $(li + 1) + ": not JSON") }
+        id :~ json.Encode(try j["id"] catch default json.Json.Num(F64(li)))
         prompt String& = ""
         if j.Has("text") {
-            prompt = try (try j["text"] catch { fail("text") }).AsStr() catch { fail(args[1] + ":" + $(li + 1) + ": text is not a string") }
+            prompt ~ try (try j["text"] catch { fail("text") }).AsStr() catch { fail(args[1] + ":" + $(li + 1) + ": text is not a string") }
         } else {
-            user := try (try j["prompt"] catch { fail(args[1] + ":" + $(li + 1) + ": no prompt or text") }).AsStr() catch { fail(args[1] + ":" + $(li + 1) + ": prompt is not a string") }
-            sys := system.Get()
-            if j.Has("system"): sys = try (try j["system"] catch { fail("system") }).AsStr() catch { fail("system is not a string") }
-            prompt = ch.Prompt(user, sys, not noThink.Get())
+            user :~ try (try j["prompt"] catch { fail(args[1] + ":" + $(li + 1) + ": no prompt or text") }).AsStr() catch { fail(args[1] + ":" + $(li + 1) + ": prompt is not a string") }
+            sys :~ system.Get()
+            if j.Has("system"): sys ~ try (try j["system"] catch { fail("system") }).AsStr() catch { fail("system is not a string") }
+            prompt ~ ch.Prompt(user, sys, not noThink.Get())
         }
         ids := tok.Encode(prompt)
         for k in range n.Get() {

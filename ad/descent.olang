@@ -131,8 +131,8 @@ fn (d mut Descent<T>&) SetTarget(t Array<F64>&) {
 # first: the plan places buffers by a backward from the last node, so that one's gradients never overwrite a value the
 # other's backward reads
 fn (d mut Descent<T>&) at(x Array<F64>&, beta F64, params Bool = true) F64 {
-    g := d.G
-    s := g.Value(d.X).Flat()!
+    g :~ d.G
+    s :~ g.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
     g.Forward(g.Batch)
     d.Forwards++
@@ -140,10 +140,10 @@ fn (d mut Descent<T>&) at(x Array<F64>&, beta F64, params Bool = true) F64 {
     if nudged and d.C > d.E: d.fromCost()
     g.Backward(d.E, false, params)
     d.Backwards++
-    dx := g.Grad(d.X).Flat()!
+    dx :~ g.Grad(d.X).Flat()!
     for i in range d.n: d.gx[i] = F64(dx[i])
     if params {
-        pg := g.ParamGrads().Flat()!
+        pg :~ g.ParamGrads().Flat()!
         for i in range d.p: d.gp[i] = F64(pg[i])
     }
     if nudged and d.C < d.E: d.fromCost()
@@ -158,20 +158,20 @@ fn (d mut Descent<T>&) at(x Array<F64>&, beta F64, params Bool = true) F64 {
 fn (d mut Descent<T>&) fromCost() {
     d.G.Backward(d.C)
     d.Backwards++
-    cx := d.G.Grad(d.X).Flat()!
+    cx :~ d.G.Grad(d.X).Flat()!
     for i in range d.n: d.cx[i] = F64(cx[i])
 }
 
 # dC/dx at x into out
 fn (d mut Descent<T>&) costGrad(x Array<F64>&, out mut Array<F64>&) {
-    g := d.G
-    s := g.Value(d.X).Flat()!
+    g :~ d.G
+    s :~ g.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
     g.Forward(g.Batch)
     g.Backward(d.C)
     d.Forwards++
     d.Backwards++
-    cx := g.Grad(d.X).Flat()!
+    cx :~ g.Grad(d.X).Flat()!
     for i in range d.n: out[i] = F64(cx[i])
 }
 
@@ -199,7 +199,7 @@ fn (d mut Descent<T>&) along(x Array<F64>&, v Array<F64>&) {
 # the state settled from its current value, nudged by beta toward the cost (0: the free phase); the state and C's value
 # are the settled ones after it. Its steps compute the state's gradient alone: the graph's ParamGrads is left as it was
 fn (d mut Descent<T>&) Settle(beta F64 = 0.0) Settled {
-    s := d.G.Value(d.X).Flat()!
+    s :~ d.G.Value(d.X).Flat()!
     for i in range d.n: d.x[i] = F64(s[i])
     return d.settle(beta, 0)
 }
@@ -360,7 +360,7 @@ fn (d mut Descent<T>&) record(slot I64) {
 
 # the state at x, a Forward: C's and E's values are x's
 fn (d mut Descent<T>&) put(x Array<F64>&) {
-    s := d.G.Value(d.X).Flat()!
+    s :~ d.G.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
     d.G.Forward(d.G.Batch)
     d.Forwards++
@@ -371,7 +371,7 @@ fn (d mut Descent<T>&) put(x Array<F64>&) {
 # dL/dtheta into the graph's ParamGrads() by how, from a free settle starting at the state's current value; the state is
 # left at the free fixed point. The free settle's outcome
 fn (d mut Descent<T>&) Train(how Trainer) Settled {
-    s := d.G.Value(d.X).Flat()!
+    s :~ d.G.Value(d.X).Flat()!
     for i in range d.n: d.x[i] = F64(s[i])
     keep := match how {
         case Trainer.Unrolled(h): h.Max(1)
@@ -384,7 +384,7 @@ fn (d mut Descent<T>&) Train(how Trainer) Settled {
     }
     if d.Sphere > 0 and not ep: unreachable "oann: Descent.Train Unrolled or Implicit with a Sphere state - they differentiate the steps"
     if keep > 0 and d.Adaptive: unreachable "oann: Descent.Train Unrolled with Adaptive steps - it differentiates the steps"
-    if d.trail.Len() < keep * d.n: d.trail = Array<F64>(keep * d.n)
+    if d.trail.Len() < keep * d.n: d.trail ~ Array<F64>(keep * d.n)
     d.Last = d.settle(0.0, keep)
     for i in range d.n: d.free[i] = d.x[i]
     match how {
@@ -394,7 +394,7 @@ fn (d mut Descent<T>&) Train(how Trainer) Settled {
         case Trainer.Margin(m): d.margin(m)
     }
     d.put(d.free)
-    pg := d.G.ParamGrads().Flat()!
+    pg :~ d.G.ParamGrads().Flat()!
     for i in range d.p: pg[i] = T(d.acc[i])
     return d.Last
 }
@@ -493,10 +493,10 @@ fn (d mut Descent<T>&) margin(m F64) {
 # rows that do not are given the same state in both passes and cancel. The state is left as it was. The rows that added
 fn (d mut Descent<T>&) AddMargin(m F64, weight F64, start Array<F64>&, right fn&(z Array<F64>&, row I64) Bool) I64 {
     if d.RowEnergy == graph.None: unreachable "oann: Descent.AddMargin needs RowEnergy, the energy row by row"
-    g := d.G
-    s := g.Value(d.X).Flat()!
+    g :~ d.G
+    s :~ g.Value(d.X).Flat()!
     for i in range d.n: d.free[i] = F64(s[i])
-    pg := g.ParamGrads().Flat()!
+    pg :~ g.ParamGrads().Flat()!
     for i in range d.p: d.acc[i] = F64(pg[i])
     d.rowsAt(d.free, d.eF)
     for i in range d.n: d.x[i] = start[i]
@@ -529,12 +529,12 @@ fn (d mut Descent<T>&) AddMargin(m F64, weight F64, start Array<F64>&, right fn&
 
 # each row's energy at the state x (a Forward) into out
 fn (d mut Descent<T>&) rowsAt(x Array<F64>&, out mut Array<F64>&) {
-    g := d.G
-    s := g.Value(d.X).Flat()!
+    g :~ d.G
+    s :~ g.Value(d.X).Flat()!
     for i in range d.n: s[i] = T(x[i])
     g.Forward(g.Batch)
     d.Forwards++
-    e := g.Value(d.RowEnergy).Flat()!
+    e :~ g.Value(d.RowEnergy).Flat()!
     for r in range g.Batch: out[r] = F64(e[r])
 }
 
@@ -582,7 +582,7 @@ fn fill(g mut graph.Graph<F64>&, v graph.Var, r rand.Rand, k F64) {
 
 # the cost at the free fixed point, settled from 0
 fn costAt(d mut Descent<F64>&) F64 {
-    s := d.G.Value(d.X).Flat()!
+    s :~ d.G.Value(d.X).Flat()!
     for i in range s.Len(): s[i] = 0.0
     d.Settle()
     return d.G.Scalar(d.C)
@@ -590,7 +590,7 @@ fn costAt(d mut Descent<F64>&) F64 {
 
 # dL/dtheta by central differences of the settled cost
 fn differences(d mut Descent<F64>&) Array<F64> {
-    ps := d.G.Params().Flat()!
+    ps :~ d.G.Params().Flat()!
     out := Array<F64>(ps.Len())
     h := 1e-5
     for i in range ps.Len() {
@@ -606,10 +606,10 @@ fn differences(d mut Descent<F64>&) Array<F64> {
 }
 
 fn gradOf(d mut Descent<F64>&, how Trainer) Array<F64> {
-    s := d.G.Value(d.X).Flat()!
+    s :~ d.G.Value(d.X).Flat()!
     for i in range s.Len(): s[i] = 0.0
     d.Train(how)
-    pg := d.G.ParamGrads().Flat()!
+    pg :~ d.G.ParamGrads().Flat()!
     out := Array<F64>(pg.Len())
     for i in range pg.Len(): out[i] = pg[i]
     return out
@@ -663,7 +663,7 @@ test Descent.Settle "adaptive steps settle where a fixed step diverges, to the s
     want := gradOf(d, Trainer.Implicit(1e-12, 100))
     d.Rate = 3.0
     d.Steps = 200
-    s := g.Value(x).Flat()!
+    s :~ g.Value(x).Flat()!
     for i in range s.Len(): s[i] = 0.0
     assert not d.Settle().Converged, "a fixed step of 3 should not settle"
     d.Adaptive = true
@@ -681,7 +681,7 @@ test Descent.Settle "adaptive steps settle where a fixed step diverges, to the s
 
 # the settled cost from a state of ones, and its central differences in the parameters (Sphere states)
 fn onesCost(d mut Descent<F64>&) F64 {
-    s := d.G.Value(d.X).Flat()!
+    s :~ d.G.Value(d.X).Flat()!
     for i in range s.Len(): s[i] = 1.0
     d.Settle()
     return d.G.Scalar(d.C)
@@ -693,7 +693,7 @@ test Descent.Train "EP on a sphere state against central differences of the sett
     d.Rate = 0.05
     d.Tol = 1e-12
     d.Sphere = 4
-    ps := g.Params().Flat()!
+    ps :~ g.Params().Flat()!
     want := Array<F64>(ps.Len())
     for i in range ps.Len() {
         old := ps[i]
@@ -704,10 +704,10 @@ test Descent.Train "EP on a sphere state against central differences of the sett
         ps[i] = old
         want[i] = (up - down) / 2e-5
     }
-    s := g.Value(x).Flat()!
+    s :~ g.Value(x).Flat()!
     for i in range s.Len(): s[i] = 1.0
     d.Train(Trainer.Ep(1e-4, true))
-    pg := g.ParamGrads().Flat()!
+    pg :~ g.ParamGrads().Flat()!
     got := Array<F64>(pg.Len())
     for i in range pg.Len(): got[i] = pg[i]
     assert d.Last.Converged and relative(got, want) < 1e-4, "sphere EP " + $relative(got, want)
@@ -722,10 +722,10 @@ test Descent.Train "a few steps of gradient descent on the parameters by EP lowe
     d := Descent<F64>(g, x, e, c)
     d.Rate = 0.2
     before := costAt(d)
-    ps := g.Params().Flat()!
+    ps :~ g.Params().Flat()!
     for _ in range 30 {
         gradOf(d, Trainer.Ep(1e-2, true))
-        pg := g.ParamGrads().Flat()!
+        pg :~ g.ParamGrads().Flat()!
         for i in range ps.Len(): ps[i] -= 0.1 * pg[i]
     }
     after := costAt(d)
@@ -748,8 +748,8 @@ fn wells(rows I64, w0 F64) graph.Graph<F64>, graph.Var, graph.Var, graph.Var, gr
     g.Keep(e)
     g.Keep(c)
     g.Plan(rand.Rand(1))!
-    us := g.Value(u).Flat()!
-    xs := g.Value(x).Flat()!
+    us :~ g.Value(u).Flat()!
+    xs :~ g.Value(x).Flat()!
     for r in range rows {
         us[r] = 1.0 if r % 2 == 0 else -1.0
         xs[r] = -us[r]
@@ -783,7 +783,7 @@ test Descent.Train "Margin: the hinge between the target's well and the other st
     for r in range rows: yt[r] = d.x[r]
     yf := Array<F64>(rows)
     for r in range rows: yf[r] = d.free[r]
-    ws := g.Params().Flat()!
+    ws :~ g.Params().Flat()!
     w := ws[0]
     ws[0] = w + 1e-6
     up := hingeAt(d, yt, yf, m)
@@ -816,13 +816,13 @@ test Descent.AddMargin "the settled-pair margin: two settles, the right one judg
     d.Settle(0.0)                                   # the first settled state: every row in the wrong well
     first := Array<F64>(rows)
     for r in range rows: first[r] = d.x[r]
-    pg := g.ParamGrads().Flat()!
+    pg :~ g.ParamGrads().Flat()!
     pg[0] = 0.25                                    # what a trainer left there
     active := d.AddMargin(m, weight, t, right)
     assert active == rows and g.Value(x).Flat()![0] == first[0], "the state is left as it was"
     yr := Array<F64>(rows)
     for r in range rows: yr[r] = d.x[r]
-    ws := g.Params().Flat()!
+    ws :~ g.Params().Flat()!
     w := ws[0]
     ws[0] = w + 1e-6
     up := hingeAt(d, yr, first, m)
@@ -855,7 +855,7 @@ test Descent.Settle "Langevin steps sample exp(-E / T): on E = |x|^2 / 2 each el
     d.Steps = 2000
     d.Temperature = 0.1
     d.Settle()
-    s := g.Value(x).Flat()!
+    s :~ g.Value(x).Flat()!
     sq F64 = 0.0
     for i in range 400: sq += s[i] * s[i]
     variance := sq / 400.0
@@ -877,7 +877,7 @@ test Descent.Train "deep supervision: Unrolled with Ds is the gradient of the la
     d.Steps = n
     d.Ds = 0.5
     got := gradOf(d, Trainer.Unrolled(n))
-    ps := g.Params().Flat()!
+    ps :~ g.Params().Flat()!
     h := 1e-5
     for i in range ps.Len() {
         old := ps[i]
@@ -904,7 +904,7 @@ test Descent.Settle "a low-bit state: after a settle every block's values lie on
     d.Rate = 0.2
     d.Tol = 0.0
     d.Steps = 30
-    s := g.Value(x).Flat()!
+    s :~ g.Value(x).Flat()!
     for bits in Array<I64>[4, 1] {
         d.StateBits = bits
         for i in range s.Len(): s[i] = 0.3 * F64(i % 5) - 0.6

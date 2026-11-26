@@ -44,13 +44,13 @@ type Tokens struct(Bpe bpe.Bpe) {
 }
 
 fn intAt(j json.Json&, key String&) I32 ? whisper.ModelError {
-    v := try j[key] catch { error whisper.ModelError.Malformed("generation_config.json has no " + key) }
+    v :~ try j[key] catch { error whisper.ModelError.Malformed("generation_config.json has no " + key) }
     return I32(try v.AsInt() catch { error whisper.ModelError.Malformed(key) })
 }
 
 fn intsAt(j json.Json&, key String&) Array<I32> {
-    v := try j[key] catch { return Array<I32>(0) }
-    a := try v.AsArr() catch { return Array<I32>(0) }
+    v :~ try j[key] catch { return Array<I32>(0) }
+    a :~ try v.AsArr() catch { return Array<I32>(0) }
     return Array<I32>[I32(try x.AsInt() catch default 0) for x in a]
 }
 
@@ -58,24 +58,24 @@ fn intsAt(j json.Json&, key String&) Array<I32> {
 fn Tokens.Load(dir String&) Tokens ? whisper.ModelError, os.Error {
     b := try bpe.Bpe.Load(dir + "/tokenizer.json") catch { error whisper.ModelError.Malformed(dir + "/tokenizer.json") }
     t := Tokens(b)
-    j := try json.Json.Parse(try os.ReadFile(dir + "/generation_config.json")) catch json.Error { error whisper.ModelError.Malformed("generation_config.json") }
+    j :~ try json.Json.Parse(try os.ReadFile(dir + "/generation_config.json")) catch json.Error { error whisper.ModelError.Malformed("generation_config.json") }
     t.Sot = try intAt(j, "decoder_start_token_id")
     t.Prev = t.Bpe.Find("<|startofprev|>")
     t.Eot = try intAt(j, "eos_token_id")
     t.NoTimestamps = try intAt(j, "no_timestamps_token_id")
     t.TsBegin = t.NoTimestamps + 1
-    t.Suppress = intsAt(j, "suppress_tokens")
-    t.Begin = intsAt(j, "begin_suppress_tokens")
+    t.Suppress ~ intsAt(j, "suppress_tokens")
+    t.Begin ~ intsAt(j, "begin_suppress_tokens")
     if j.Has("max_initial_timestamp_index"): t.MaxInitial = I64(try intAt(j, "max_initial_timestamp_index"))
     if j.Has("task_to_id") {
-        tasks := try j["task_to_id"] catch { unreachable }
+        tasks :~ try j["task_to_id"] catch { unreachable }
         t.Transcribe = try intAt(tasks, "transcribe")
         t.Translate = try intAt(tasks, "translate")
     }
     if j.Has("lang_to_id") {
-        m := try (try j["lang_to_id"] catch { unreachable }).AsObj() catch { error whisper.ModelError.Malformed("lang_to_id") }
-        t.Langs = Array<I32>[I32(try v.AsInt() catch default 0) for v in m.Values]
-        t.Names = Array<String>[k[2:k.Len() - 2] for k in m.Keys]
+        m :~ try (try j["lang_to_id"] catch { unreachable }).AsObj() catch { error whisper.ModelError.Malformed("lang_to_id") }
+        t.Langs ~ Array<I32>[I32(try v.AsInt() catch default 0) for v in m.Values]
+        t.Names ~ Array<String>[k[2:k.Len() - 2] for k in m.Keys]
     }
     return t
 }
@@ -92,7 +92,7 @@ fn (t Tokens&) Text(ids Array<I32>&) String {
 # decoder and are never part of what it writes
 fn (t Tokens&) Layout(o Options&, lang I32, ctx I64) Array<I32> {
     p := Vec<I32>()
-    text := o.Prompt.Trim()
+    text :~ o.Prompt.Trim()
     if text.Len() > 0 and t.Prev >= 0 {
         ids := t.Bpe.Encode(" " + text)
         keep := (ctx / 2 - 1).Min(ids.Len())
@@ -269,14 +269,14 @@ fn logSoftmax(row mut Array<F32>&) {
 # the tokens of the window after prompt: greedy or by beam search
 fn (w mut Whisper&) Decode(prompt Array<I32>&, o Options&) Array<I32> {
     if o.Beams > 1: return w.beam(prompt, o)
-    k := w.Dec
+    k :~ w.Dec
     k.Reset()
     for i, t in prompt: k.Add(t, I64(i), 0)
     w.M.Step(k, 1)
     gen := Vec<I32>()
     limit := o.MaxTokens.Min(w.M.C.Text - prompt.Len())
     for gen.Len() < limit {
-        row := k.Logits[:w.M.C.Vocab]
+        row :~ k.Logits[:w.M.C.Vocab]
         w.rules(row, gen.ToArray(), o)
         best I64 = 0
         for i in range row.Len() {
@@ -323,7 +323,7 @@ fn (w mut Whisper&) beam(prompt Array<I32>&, o Options&) Array<I32> {
     v := w.M.C.Vocab
     pl := prompt.Len()
     limit := o.MaxTokens.Min(w.M.C.Text - pl)
-    k := w.Dec
+    k :~ w.Dec
     k.Reset()
     for i, t in prompt: k.Add(t, I64(i), 0)
     w.M.Step(k, 1)
@@ -343,7 +343,7 @@ fn (w mut Whisper&) beam(prompt Array<I32>&, o Options&) Array<I32> {
     for step in range limit {
         cands.Clear()
         for b in range nb {
-            row := w.logp
+            row :~ w.logp
             for i in range v: row[i] = k.Logits[rows[b] * v + i]
             logSoftmax(row)
             w.rules(row, run[b * limit:b * limit + step], o)
@@ -384,7 +384,7 @@ fn (w mut Whisper&) beam(prompt Array<I32>&, o Options&) Array<I32> {
             rows[b] = b
         }
         half = other
-        run, next = next, run
+        run, next ~ next, run
         w.M.Step(k, nb)
     }
     best I64 = 0
@@ -438,7 +438,7 @@ fn (w Whisper&) Cut(gen Array<I32>&, offset F64, frames I64) Array<Segment>, I64
     for i in range 1, n + 1 {
         closes := (i < n and gen[i] >= tb and gen[i - 1] >= tb) or (i == n and lone and last > 0)
         if not closes: continue
-        seg := gen[last:i]
+        seg :~ gen[last:i]
         out.Push(Segment(offset + F64(seg[0] - tb) * 0.02, offset + F64(seg[seg.Len() - 1] - tb) * 0.02, w.T.Text(seg)))
         last = i
     }
@@ -569,7 +569,7 @@ fn (s mut Stream&) drop() {
     for i in range s.seek, s.buf.Len(): rest.Push(s.buf[i])
     s.base += s.seek.Min(s.buf.Len())
     s.seek = 0
-    s.buf = rest
+    s.buf ~ rest
 }
 
 # ---- checks against the reference ----
@@ -577,15 +577,15 @@ fn (s mut Stream&) drop() {
 # the reference's tokens of a decoding after its prompt, and its text
 fn reference(name String&, clip String&, kind String&) Array<I32>, String {
     path := mel.Cache() + "/ref/" + name + "/" + clip + ".json"
-    j := json.Json.Parse(os.ReadFile(path)!)!
+    j :~ json.Json.Parse(os.ReadFile(path)!)!
     toks := whisper.Ints(path, kind, "tokens")!
-    text := (j[kind]!)["text"]!.AsStr()!
+    text :~ (j[kind]!)["text"]!.AsStr()!
     return toks, text
 }
 
 # the reference's segments of a clip
 fn segmentsOf(name String&, clip String&) Array<Segment> {
-    j := json.Json.Parse(os.ReadFile(mel.Cache() + "/ref/" + name + "/" + clip + ".json")!)!
+    j :~ json.Json.Parse(os.ReadFile(mel.Cache() + "/ref/" + name + "/" + clip + ".json")!)!
     out := Vec<Segment>()
     for g in j["segments"]!.AsArr()! {
         out.Push(Segment(g["start"]!.AsNum()!, g["end"]!.AsNum()!, g["text"]!.AsStr()!))
@@ -629,8 +629,8 @@ fn holds(name String&) {
             all := Vec<I32>()
             for t in p: all.Push(t)
             for t in got: all.Push(t)
-            seq := all.ToArray()
-            if seq.Len() > 0 and seq[seq.Len() - 1] == w.T.Eot and (want.Len() == 0 or want[want.Len() - 1] != w.T.Eot): seq = seq[:seq.Len() - 1]
+            seq :~ all.ToArray()
+            if seq.Len() > 0 and seq[seq.Len() - 1] == w.T.Eot and (want.Len() == 0 or want[want.Len() - 1] != w.T.Eot): seq ~ seq[:seq.Len() - 1]
             assert seq == want, name + " " + clip + " " + kind + ":\n got  " + $seq + "\n want " + $want
             assert w.T.Text(got) == text, w.T.Text(got)
         }
@@ -713,7 +713,7 @@ type promptCase struct(Prompt String, Ids Array<I32>, Toks Array<I32>) {
 }
 
 fn promptCases(name String&, clip String&) Array<promptCase> {
-    j := json.Json.Parse(os.ReadFile(mel.Cache() + "/ref/" + name + "/" + clip + ".prompt.json")!)!
+    j :~ json.Json.Parse(os.ReadFile(mel.Cache() + "/ref/" + name + "/" + clip + ".prompt.json")!)!
     out := Vec<promptCase>()
     for c in j["cases"]!.AsArr()! {
         ids := Array<I32>[I32(x.AsInt()!) for x in c["prompt_ids"]!.AsArr()!]

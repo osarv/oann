@@ -73,7 +73,7 @@ fn unreserved(need I64, have I64) noreturn {
 
 # room for n elements of scratch; never shrinks
 fn (w mut Work<A>&) Reserve(n I64) {
-    if w.buf.Len() < n: w.buf = Array<A>(n)
+    if w.buf.Len() < n: w.buf ~ Array<A>(n)
 }
 
 # room for GatedScanChunked and GatedScanGradChunked over rows x cols cut as at (the sequential forms need none)
@@ -144,7 +144,7 @@ fn chunksOf(at Seq) I64 { return (at.Len + at.Chunk - 1) / at.Chunk }
 # h_t = a_t h_{t-1} + b_t x_t, per channel: positions r0 ... r1 - 1 (rows) and channels c0 ... c1 - 1, from the state in
 # sd[so ...] (indexed by channel), which is left holding the state after row r1 - 1
 fn scanSteps<S, A>(h mat.Mat<S>&, x mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, sd mut Array<A>&, so I64, r0 I64, r1 I64, c0 I64, c1 I64) {
-    hd := h.Data
+    hd :~ h.Data
     for r in range r0, r1 {
         ho := h.Off + r * h.Ld
         xo := x.Off + r * x.Ld
@@ -290,9 +290,9 @@ fn GatedScanChunked<S, A>(ws mut Work<A>&, h mut mat.Mat<S>&, state mut mat.Mat<
     seqs := h.Rows / at.Len
     chunks := chunksOf(at)
     size := seqs * chunks * cols
-    buf := ws.scratch(2 * size)
-    ps := buf[0:size]
-    es := buf[size:2 * size]
+    buf :~ ws.scratch(2 * size)
+    ps :~ buf[0:size]
+    es :~ buf[size:2 * size]
     job1 := scanSummaryJob<S, A>(x, a, b, ps, es, at)
     spread(job1, seqs * chunks * blocksOf(cols), ws.Threads)
     job2 := scanCarryJob<A>(state, ps, es, cols, chunks, false)
@@ -429,9 +429,9 @@ fn GatedScanGradChunked<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, da mut mat.Ma
     seqs := h.Rows / at.Len
     chunks := chunksOf(at)
     size := seqs * chunks * cols
-    buf := ws.scratch(2 * size)
-    ps := buf[0:size]
-    es := buf[size:2 * size]
+    buf :~ ws.scratch(2 * size)
+    ps :~ buf[0:size]
+    es :~ buf[size:2 * size]
     units := seqs * chunks * blocksOf(cols)
     job1 := scanGradSummaryJob<S, A>(dh, a, ps, es, at)
     spread(job1, units, ws.Threads)
@@ -469,9 +469,9 @@ fn selSteps<S, A>(f selArgs<S>&, y mat.Mat<S>&, sd mut Array<A>&, base I64, stri
     n := f.a.Rows
     cols := f.x.Cols
     chunks := chunksOf(f.at)
-    yb := w[0:scanWidth]
-    dlb := w[scanWidth:2 * scanWidth]
-    dxb := w[2 * scanWidth:3 * scanWidth]
+    yb :~ w[0:scanWidth]
+    dlb :~ w[scanWidth:2 * scanWidth]
+    dxb :~ w[2 * scanWidth:3 * scanWidth]
     for r in range r0, r1 {
         t := r - s * f.at.Len
         if keep.Len() > 0 and t % f.at.Chunk == 0: saveRows(keep, ((s * chunks + t / f.at.Chunk) * n) * cols, sd, base, stride, n, d0, d1, cols)
@@ -518,7 +518,7 @@ type selJob<S, A> struct(f selArgs<S>, y mat.Mat<S>, st mat.Mat<A>, keep mut Arr
 
 # unit u: sequence u / blocks, channel block u % blocks
 fn (j selJob<S, A>&) run(lo I64, hi I64, task I64) {
-    mine := j.z[task * j.per:(task + 1) * j.per]
+    mine :~ j.z[task * j.per:(task + 1) * j.per]
     cols := j.f.x.Cols
     blocks := blocksOf(cols)
     n := j.f.a.Rows
@@ -540,14 +540,14 @@ type selSummaryJob<S, A> struct(f selArgs<S>, ps mut Array<A>&, es mut Array<A>&
 }
 
 fn (j selSummaryJob<S, A>&) run(lo I64, hi I64, task I64) {
-    mine := j.z[task * j.per:(task + 1) * j.per]
+    mine :~ j.z[task * j.per:(task + 1) * j.per]
     f := j.f
     cols := f.x.Cols
     blocks := blocksOf(cols)
     chunks := chunksOf(f.at)
     n := f.a.Rows
-    dlb := mine[0:scanWidth]
-    dxb := mine[scanWidth:2 * scanWidth]
+    dlb :~ mine[0:scanWidth]
+    dxb :~ mine[scanWidth:2 * scanWidth]
     for u in range lo, hi {
         sk := u / blocks
         d0 := u % blocks * scanWidth
@@ -593,7 +593,7 @@ type selChunkJob<S, A> struct(f selArgs<S>, y mat.Mat<S>, es mut Array<A>&, keep
 }
 
 fn (j selChunkJob<S, A>&) run(lo I64, hi I64, task I64) {
-    mine := j.z[task * j.per:(task + 1) * j.per]
+    mine :~ j.z[task * j.per:(task + 1) * j.per]
     f := j.f
     cols := f.x.Cols
     blocks := blocksOf(cols)
@@ -615,7 +615,7 @@ fn (j selChunkJob<S, A>&) run(lo I64, hi I64, task I64) {
 fn SelectiveScan<S, A>(ws mut Work<A>&, y mut mat.Mat<S>&, state mut mat.Mat<A>&, x mat.Mat<S>&, delta mat.Mat<S>&, a mat.Mat<S>&, b mat.Mat<S>&, c mat.Mat<S>&, skip Array<S>&, at Seq, keep mut Array<A>& = Array<A>(0)) {
     units := x.Rows / at.Len * blocksOf(x.Cols)
     tasks := ws.Threads if ws.Threads < units else units
-    z := ws.scratch(tasks * 3 * scanWidth)
+    z :~ ws.scratch(tasks * 3 * scanWidth)
     job := selJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), y, state, keep, z, 3 * scanWidth)
     spread(job, units, ws.Threads)
 }
@@ -630,10 +630,10 @@ fn SelectiveScanChunked<S, A>(ws mut Work<A>&, y mut mat.Mat<S>&, state mut mat.
     size := seqs * n * chunks * cols
     units := seqs * chunks * blocksOf(cols)
     tasks := ws.Threads if ws.Threads < units else units
-    z := ws.scratch(tasks * 3 * scanWidth + 2 * size)
-    vecs := z[0:tasks * 3 * scanWidth]
-    ps := z[tasks * 3 * scanWidth:tasks * 3 * scanWidth + size]
-    es := z[tasks * 3 * scanWidth + size:tasks * 3 * scanWidth + 2 * size]
+    z :~ ws.scratch(tasks * 3 * scanWidth + 2 * size)
+    vecs :~ z[0:tasks * 3 * scanWidth]
+    ps :~ z[tasks * 3 * scanWidth:tasks * 3 * scanWidth + size]
+    es :~ z[tasks * 3 * scanWidth + size:tasks * 3 * scanWidth + 2 * size]
     job1 := selSummaryJob<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), ps, es, vecs, 3 * scanWidth)
     spread(job1, units, ws.Threads)
     job2 := scanCarryJob<A>(state, ps, es, cols, chunks, false)
@@ -680,7 +680,7 @@ type selGradJob<S, A> struct(g selGradArgs<S, A>, z mut Array<A>&, per I64, pdb 
 }
 
 fn (j selGradJob<S, A>&) run(lo I64, hi I64, task I64) {
-    mine := j.z[task * j.per:(task + 1) * j.per]
+    mine :~ j.z[task * j.per:(task + 1) * j.per]
     f := j.g.f
     cols := f.x.Cols
     blocks := blocksOf(cols)
@@ -699,8 +699,8 @@ fn (j selGradJob<S, A>&) sweep(s I64, u I64, d0 I64, d1 I64, n I64, w mut Array<
     f := g.f
     cols := f.x.Cols
     chunks := chunksOf(f.at)
-    hs := w[0:(f.at.Chunk + 1) * n * scanWidth]
-    vecs := w[(f.at.Chunk + 1) * n * scanWidth:(f.at.Chunk + 1) * n * scanWidth + 6 * scanWidth]
+    hs :~ w[0:(f.at.Chunk + 1) * n * scanWidth]
+    vecs :~ w[(f.at.Chunk + 1) * n * scanWidth:(f.at.Chunk + 1) * n * scanWidth + 6 * scanWidth]
     gbase := g.ds.Off + s * n * g.ds.Ld
     for i in range chunks {
         k := chunks - 1 - i
@@ -719,7 +719,7 @@ fn (j selGradJob<S, A>&) sweep(s I64, u I64, d0 I64, d1 I64, n I64, w mut Array<
 fn selStates<S, A>(f selArgs<S>&, keep Array<A>&, at I64, r0 I64, r1 I64, d0 I64, d1 I64, hs mut Array<A>&, w mut Array<A>&) {
     n := f.a.Rows
     cols := f.x.Cols
-    dl := w[0:scanWidth]
+    dl :~ w[0:scanWidth]
     for k in range n {
         for d in range d0, d1: hs[k * scanWidth + d - d0] = keep[at + k * cols + d]
     }
@@ -742,12 +742,12 @@ fn selGradStep<S, A>(g selGradArgs<S, A>&, r I64, t I64, s I64, u I64, d0 I64, d
     f := g.f
     n := f.a.Rows
     cols := f.x.Cols
-    dl := w[0:scanWidth]
-    xv := w[scanWidth:2 * scanWidth]
-    dyv := w[2 * scanWidth:3 * scanWidth]
-    ddl := w[3 * scanWidth:4 * scanWidth]
-    dxg := w[4 * scanWidth:5 * scanWidth]
-    gdl := w[5 * scanWidth:6 * scanWidth]
+    dl :~ w[0:scanWidth]
+    xv :~ w[scanWidth:2 * scanWidth]
+    dyv :~ w[2 * scanWidth:3 * scanWidth]
+    ddl :~ w[3 * scanWidth:4 * scanWidth]
+    dxg :~ w[4 * scanWidth:5 * scanWidth]
+    gdl :~ w[5 * scanWidth:6 * scanWidth]
     width := d1 - d0
     pt := (u * f.at.Len + r - s * f.at.Len) * n
     for d in range d0, d1 {
@@ -800,12 +800,12 @@ fn SelectiveScanGrad<S, A>(ws mut Work<A>&, dx mut mat.Mat<S>&, ddelta mut mat.M
     per := selGradScratch(at, n)
     partial := units * at.Len * n
     total := tasks * per + 2 * partial + seqs * n * cols + seqs * cols
-    z := ws.scratch(total)
+    z :~ ws.scratch(total)
     o := tasks * per
-    pdb := z[o:o + partial]
-    pdc := z[o + partial:o + 2 * partial]
-    pda := z[o + 2 * partial:o + 2 * partial + seqs * n * cols]
-    pds := z[o + 2 * partial + seqs * n * cols:total]
+    pdb :~ z[o:o + partial]
+    pdc :~ z[o + partial:o + 2 * partial]
+    pda :~ z[o + 2 * partial:o + 2 * partial + seqs * n * cols]
+    pds :~ z[o + 2 * partial + seqs * n * cols:total]
     for i in range seqs * n * cols: pda[i] = 0.0
     for i in range seqs * cols: pds[i] = 0.0
     job := selGradJob<S, A>(selGradArgs<S, A>(selArgs<S>(x, delta, a, b, c, skip, at), dx, ddelta, da, db, dc, dskip, dstate, dy, keep, add), z, per, pdb, pdc, pda, pds)
@@ -885,11 +885,11 @@ fn deltaSteps<S, A>(a deltaArgs<S>&, out mat.Mat<S>&, st mat.Mat<A>&, keep mut A
     dk := a.dk()
     dv := a.dv()
     base := st.Off + (s * a.at.Heads + h) * dk * st.Ld
-    sd := st.Data
+    sd :~ st.Data
     chunks := chunksOf(a.at)
-    av := w[0:dv]
-    ev := w[dv:2 * dv]
-    ov := w[2 * dv:3 * dv]
+    av :~ w[0:dv]
+    ev :~ w[dv:2 * dv]
+    ov :~ w[2 * dv:3 * dv]
     for t in range a.at.Len {
         if t % a.at.Chunk == 0 and keep.Len() > 0: saveState(keep, ((s * a.at.Heads + h) * chunks + t / a.at.Chunk) * dk * dv, st, base, dk, dv)
         r := s * a.at.Len + t
@@ -958,33 +958,33 @@ fn deltaChunkSize(c I64, dk I64, dv I64) I64 { return 4 * c * dk + 4 * c * c + c
 
 fn deltaBuf<A>.Carve(z mut Array<A>&, c I64, dk I64, dv I64) deltaBuf<A> {
     o I64 = 0
-    qc := z[o:o + c * dk]
+    qc :~ z[o:o + c * dk]
     o += c * dk
-    qs := z[o:o + c * dk]
+    qs :~ z[o:o + c * dk]
     o += c * dk
-    kc := z[o:o + c * dk]
+    kc :~ z[o:o + c * dk]
     o += c * dk
-    kg := z[o:o + c * dk]
+    kg :~ z[o:o + c * dk]
     o += c * dk
-    kk := z[o:o + c * c]
+    kk :~ z[o:o + c * c]
     o += c * c
-    qk := z[o:o + c * c]
+    qk :~ z[o:o + c * c]
     o += c * c
-    gm := z[o:o + c * c]
+    gm :~ z[o:o + c * c]
     o += c * c
-    ag := z[o:o + c * c]
+    ag :~ z[o:o + c * c]
     o += c * c
-    x := z[o:o + c * (dv + dk)]
+    x :~ z[o:o + c * (dv + dk)]
     o += c * (dv + dk)
-    d := z[o:o + c * dv]
+    d :~ z[o:o + c * dv]
     o += c * dv
-    oc := z[o:o + c * dv]
+    oc :~ z[o:o + c * dv]
     o += c * dv
-    bet := z[o:o + c]
+    bet :~ z[o:o + c]
     o += c
-    alp := z[o:o + c]
+    alp :~ z[o:o + c]
     o += c
-    gam := z[o:o + c]
+    gam :~ z[o:o + c]
     return deltaBuf<A>(qc, qs, kc, kg, kk, qk, gm, ag, x, d, oc, bet, alp, gam, c, dk, dv)
 }
 
@@ -1102,7 +1102,7 @@ type deltaJob<S, A, K> struct(args deltaArgs<S>, out mat.Mat<S>, st mat.Mat<A>, 
 
 # unit u: sequence u / Heads, head u % Heads; task t works in z's t-th share
 fn (j deltaJob<S, A, K>&) run(lo I64, hi I64, task I64) {
-    mine := j.z[task * j.per:(task + 1) * j.per]
+    mine :~ j.z[task * j.per:(task + 1) * j.per]
     heads := j.args.at.Heads
     match K {
         case chunkwise {
@@ -1131,7 +1131,7 @@ fn deltaRun<S, A, K>(ws mut Work<A>&, kind K, out mut mat.Mat<S>&, state mut mat
     units := q.Rows / at.Len * at.Heads
     tasks := ws.Threads if ws.Threads < units else units
     per := deltaScratch(not isChunked(kind), at, q.Cols / at.Heads, v.Cols / at.Heads)
-    z := ws.scratch(tasks * per)
+    z :~ ws.scratch(tasks * per)
     if isChunked(kind) and ws.products.Len() < tasks: unreserved(tasks, ws.products.Len())
     args := deltaArgs<S>(q, k, v, beta, gate, at)
     job := deltaJob<S, A, K>(args, out, state, keep, z, per, kind, ws.products)
@@ -1205,12 +1205,12 @@ fn deltaGradStep<S, A>(g deltaGradArgs<S, A>&, r I64, h I64, p Array<A>&, po I64
     f := g.f
     dk := f.dk()
     dv := f.dv()
-    av := w[0:dv]
-    uv := w[dv:2 * dv]
-    ev := w[2 * dv:3 * dv]
-    de := w[3 * dv:4 * dv]
-    da := w[4 * dv:5 * dv]
-    dov := w[5 * dv:6 * dv]
+    av :~ w[0:dv]
+    uv :~ w[dv:2 * dv]
+    ev :~ w[2 * dv:3 * dv]
+    de :~ w[3 * dv:4 * dv]
+    da :~ w[4 * dv:5 * dv]
+    dov :~ w[5 * dv:6 * dv]
     bt := A(f.beta.Data[f.beta.Off + r * f.beta.Ld + h])
     al := A(f.gate.Data[f.gate.Off + r * f.gate.Ld + h])
     qo := f.q.Off + r * f.q.Ld + h * dk
@@ -1273,8 +1273,8 @@ fn deltaGradSteps<S, A>(g deltaGradArgs<S, A>&, w mut Array<A>&, s I64, h I64) {
     dv := f.dv()
     size := dk * dv
     chunks := chunksOf(f.at)
-    ps := w[0:f.at.Chunk * size]
-    vecs := w[f.at.Chunk * size:f.at.Chunk * size + 6 * dv]
+    ps :~ w[0:f.at.Chunk * size]
+    vecs :~ w[f.at.Chunk * size:f.at.Chunk * size + 6 * dv]
     gb := g.ds.Off + (s * f.at.Heads + h) * dk * g.ds.Ld
     for i in range chunks {
         k := chunks - 1 - i
@@ -1319,37 +1319,37 @@ fn deltaGradChunkSize(c I64, dk I64, dv I64) I64 { return 2 * c * dv + c * (dv +
 
 fn deltaGradBuf<A>.Carve(z mut Array<A>&, c I64, dk I64, dv I64) deltaGradBuf<A> {
     o I64 = 0
-    dom := z[o:o + c * dv]
+    dom :~ z[o:o + c * dv]
     o += c * dv
-    dd := z[o:o + c * dv]
+    dd :~ z[o:o + c * dv]
     o += c * dv
-    dx := z[o:o + c * (dv + dk)]
+    dx :~ z[o:o + c * (dv + dk)]
     o += c * (dv + dk)
-    dq := z[o:o + c * dk]
+    dq :~ z[o:o + c * dk]
     o += c * dk
-    dkm := z[o:o + c * dk]
+    dkm :~ z[o:o + c * dk]
     o += c * dk
-    dkg := z[o:o + c * dk]
+    dkg :~ z[o:o + c * dk]
     o += c * dk
-    dag := z[o:o + c * c]
+    dag :~ z[o:o + c * c]
     o += c * c
-    dgm := z[o:o + c * c]
+    dgm :~ z[o:o + c * c]
     o += c * c
-    zz := z[o:o + c * c]
+    zz :~ z[o:o + c * c]
     o += c * c
-    dkk := z[o:o + c * c]
+    dkk :~ z[o:o + c * c]
     o += c * c
-    ee := z[o:o + c * c]
+    ee :~ z[o:o + c * c]
     o += c * c
-    s0 := z[o:o + dk * dv]
+    s0 :~ z[o:o + dk * dv]
     o += dk * dv
-    ds0 := z[o:o + dk * dv]
+    ds0 :~ z[o:o + dk * dv]
     o += dk * dv
-    dgam := z[o:o + c]
+    dgam :~ z[o:o + c]
     o += c
-    dalp := z[o:o + c]
+    dalp :~ z[o:o + c]
     o += c
-    dbet := z[o:o + c]
+    dbet :~ z[o:o + c]
     return deltaGradBuf<A>(dom, dd, dx, dq, dkm, dkg, dag, dgm, zz, dkk, ee, s0, ds0, dgam, dalp, dbet)
 }
 
@@ -1450,10 +1450,10 @@ fn deltaGradChunk<S, A>(g deltaGradArgs<S, A>&, ws mut gemm.Workspace<A>&, b del
     # N X = diag(beta) R, N = I + diag(beta) tril(gm * kk, -1):  dY = N^-T dX (back substitution, in dx)
     for j in range rows {
         t := last - j
-        xt := gb.dx[t * wd:(t + 1) * wd]
+        xt :~ gb.dx[t * wd:(t + 1) * wd]
         for u in range t + 1, rows {
             coef := b.bet[u] * b.gm[u * c + t] * b.kk[u * c + t]
-            xu := gb.dx[u * wd:(u + 1) * wd]
+            xu :~ gb.dx[u * wd:(u + 1) * wd]
             for e in range wd: xt[e] -= coef * xu[e]
         }
     }
@@ -1533,11 +1533,11 @@ type deltaGradJob<S, A, K> struct(g deltaGradArgs<S, A>, z mut Array<A>&, per I6
 }
 
 fn (j deltaGradJob<S, A, K>&) run(lo I64, hi I64, task I64) {
-    mine := j.z[task * j.per:(task + 1) * j.per]
+    mine :~ j.z[task * j.per:(task + 1) * j.per]
     heads := j.g.f.at.Heads
     match K {
         case chunkwise {
-            products := j.products[task]
+            products :~ j.products[task]
             c, dk, dv := j.g.f.at.Chunk, j.g.f.dk(), j.g.f.dv()
             b := deltaBuf<A>.Carve(mine, c, dk, dv)
             gb := deltaGradBuf<A>.Carve(mine[deltaChunkSize(c, dk, dv):], c, dk, dv)
@@ -1555,7 +1555,7 @@ fn deltaGradRun<S, A, K>(ws mut Work<A>&, kind K, dq mut mat.Mat<S>&, dk mut mat
     kd := q.Cols / at.Heads
     vd := v.Cols / at.Heads
     per := deltaChunkSize(at.Chunk, kd, vd) + deltaGradChunkSize(at.Chunk, kd, vd) if isChunked(kind) else deltaGradScratch(at, kd, vd)
-    z := ws.scratch(tasks * per)
+    z :~ ws.scratch(tasks * per)
     if isChunked(kind) and ws.products.Len() < tasks: unreserved(tasks, ws.products.Len())
     job := deltaGradJob<S, A, K>(deltaGradArgs<S, A>(deltaArgs<S>(q, k, v, beta, gate, at), dq, dk, dv, dbeta, dgate, dout, dstate, keep, add), z, per, kind, ws.products)
     spread(job, units, ws.Threads)
