@@ -1,7 +1,8 @@
 # llm
 
 Inference for openly licensed decoder-only language models on the CPU: Hugging Face checkpoints of the Qwen2, Qwen3,
-Llama (Llama 3, SmolLM2), Mistral, Granite and SmolLM3 architectures loaded as they are published, run in batches on AMX tiles, and `oann-gen`, a command that writes
+Llama (Llama 3, SmolLM2), Mistral, Granite and SmolLM3 architectures and the mixtures of experts of Qwen3-MoE,
+Granite-MoE and OLMoE loaded as they are published, run in batches on AMX tiles, and `oann-gen`, a command that writes
 completions of a file of prompts as one long, resumable job. Nothing here trains; the weights are never committed.
 
 | file | what |
@@ -79,7 +80,22 @@ sin times the attention factor); grouped-query attention, over a sliding window 
 biases on the query, key and value projections; Qwen3's RMSNorm of each query and key head before the rotation;
 Granite's multipliers (the embedding, each residual branch, the scores in place of 1/sqrt(d), the logits divided);
 SmolLM3's layers without rotation (`no_rope_layers`); the head tied to the embedding or its own, its rows padded to a
-multiple of 16 (Granite's vocabulary of 49159). Gemma, Phi and the mixture-of-experts models are not run yet.
+multiple of 16 (Granite's vocabulary of 49159). Gemma and Phi are not run yet.
+
+**Mixtures of experts** (Qwen3-MoE, Granite-MoE, OLMoE). Each row's router logits (F32) go through a softmax; the top
+k experts are kept, their weights renormalized where the config's `norm_topk_prob` says (Granite-MoE's softmax over the
+k is the same thing). A step's (row, choice) pairs are grouped by expert, so an expert's weights are read once a step for
+all the rows that chose it; on AMX whole experts are spread over the tasks, most rows first, each run on one core (an
+expert's products are too small to split), and the outputs summed into the rows, weighted. Qwen3-MoE's dense layers
+(`mlp_only_layers`, `decoder_sparse_step`) run the dense perceptron; OLMoE's QK-norm is over a row's whole queries and
+keys. Shared experts (Qwen2-MoE) are not run. Because only k experts' weights are read per row, a mixture decodes much
+faster than a dense model of its size:
+
+| model | weights | batch 1 | batch 16 | batch 64 | peak |
+|---|---|---|---|---|---|
+| granite-3.1-3b-a800m-instruct (3.3B, 0.8B active) | BF16, 6.3 GB | 9.0 | 70 | 141 | 8.8 GB |
+| granite-3.1-3b-a800m-instruct | INT8 | 7.1 | 50 | 110 | 6.1 GB |
+| granite-3.3-2b-instruct (dense 2.5B), for comparison | BF16, 4.8 GB | 4.0 | | | |
 
 **Tokens.** tokenizer.json's byte-level BPE: added tokens (`<|im_start|>`, `<think>`, ...) are matched in the text
 first, the stretches between them split by the pre-tokenizer's pattern over the Unicode letter and number classes -
@@ -93,13 +109,16 @@ normalizer is not applied, which matters only for text not already in NFC.
 ## Checks
 
 `llm/tools/reference.py` builds a small model of random weights for each architecture and option (Llama 3's and YaRN's
-rope scaling, Granite's multipliers, SmolLM3's layers without rotation, Mistral's window of 50 over 150 positions) and
+rope scaling, Granite's multipliers, SmolLM3's layers without rotation, Mistral's window of 50 over 150 positions, the
+mixtures of Qwen3-MoE (a dense layer among them), Granite-MoE and OLMoE) and
 writes the logits transformers gives at every position; with `--real DIR ...` it writes a real checkpoint's last-position
 logits and ten greedy tokens. `llm/tools/tokref.py DIR ...` writes the tokenizers library's ids of fixed texts (nine
 languages and scripts, code, numbers, emoji, whitespace) and the chat template's prompt. The tests read them where
-`$OANN_MODELS` has them: every position of every small model within 1e-4 on the exact path (0.03 on AMX's); SmolLM2-135M,
-Llama-3.2-1B and Granite-3.3-2B within 1e-3 of the largest logit over the whole vocabulary and the same ten greedy
-tokens on both paths; the ids of Qwen3, Llama 3.2, SmolLM2 and Granite 3.3's tokenizers exactly the library's; the chat
+`$OANN_MODELS` has them: every position of every small model within 1e-4 on the exact path (on AMX's, BF16 activations,
+where a router may take another expert at a near tie: the mean difference within 1% and the same greedy token at 95% of
+positions); SmolLM2-135M, Llama-3.2-1B, Granite-3.3-2B and Granite-3.1-1B-A400M within 1e-3 of the largest logit over
+the whole vocabulary and the same ten greedy tokens on the exact path, five on AMX's (Granite-3.3's sixth is a near tie
+that transformers in BF16 also takes the other way); the ids of Qwen3, Llama 3.2, SmolLM2 and Granite 3.3's tokenizers exactly the library's; the chat
 prompts exactly the templates'.
 
 The tests (`make test`) build small random Qwen2 and Qwen3 checkpoints and hold the AMX path to the exact one within
@@ -173,6 +192,9 @@ architectures known to run, and their licences (each model's own LICENSE file is
 | HuggingFaceTB/SmolLM2-135M-Instruct, 360M-Instruct, 1.7B-Instruct | llama | Apache 2.0 |
 | HuggingFaceTB/SmolLM3-3B | smollm3 | Apache 2.0 |
 | ibm-granite/granite-3.3-2b-instruct, granite-3.3-8b-instruct | granite | Apache 2.0 |
+| ibm-granite/granite-3.1-1b-a400m-instruct, granite-3.1-3b-a800m-instruct | granitemoe | Apache 2.0 |
+| allenai/OLMoE-1B-7B-0125-Instruct | olmoe | Apache 2.0 (14 GB in BF16: INT8 on 16 GB) |
+| Qwen/Qwen3-30B-A3B | qwen3_moe | Apache 2.0 (61 GB in BF16: does not fit a 16 GB machine yet) |
 | mistralai/Mistral-7B-Instruct-v0.3 | mistral | Apache 2.0 (its tokenizer is SentencePiece's: not read yet) |
 | Qwen/Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B, Qwen3-8B | qwen3 | Apache 2.0 |
 | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B, DeepSeek-R1-Distill-Qwen-7B | qwen2 | MIT (built from Qwen2.5, Apache 2.0) |
