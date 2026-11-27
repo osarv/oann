@@ -10,6 +10,7 @@
 import "graph"
 import "mirror"
 import "../kernels/mat"
+import "../kernels/nf4"
 import "../kernels/elem"
 import "../kernels/device"
 import gdev "../kernels/gpu/device"
@@ -742,6 +743,59 @@ fn frozenCase() {
 }
 
 test frozenCase "a frozen weight on the GPU goes up once, not at every Forward, and again only when the host set it; forward and backward within rounding of the CPU's" { frozenCase() }
+
+# a perceptron between two NF4 weights (graph.NF4, kernels/nf4): x (watched) through NF4 [24, 20], a trained [32, 24]
+# and NF4 [10, 32]; the NF4 weights are nodes 2 and 4
+fn Net.nf4(g mut graph.Graph<F32>&) Net {
+    x := g.Input(20)
+    y := g.Classes()
+    g.Watch(x)
+    w0 := g.NF4(24, 20)
+    w1 := g.Param(graph.Init.Uniform(-0.3, 0.3), true, 32, 24)
+    wf := g.NF4(10, 32)
+    logits := g.Linear(g.Act(g.Linear(g.Act(g.Linear(x, w0), mat.Act.Tanh), w1), mat.Act.Tanh), wf)
+    g.Keep(logits)
+    return Net(x, y, logits, g.CrossEntropy(logits, y), false)
+}
+
+# the NF4 weights of Net.nf4 quantized from values drawn by k
+fn setNF4(g mut graph.Graph<F32>&, k I64) {
+    setOneNF4(g, 2, 24, 20, k)
+    setOneNF4(g, 4, 10, 32, k)
+}
+
+fn setOneNF4(g mut graph.Graph<F32>&, v I64, rows I64, cols I64, k I64) {
+    w := Array<F32>(rows * cols)
+    for i in range w.Len(): w[i] = F32(F64((i * 7 + k) % 13) * 0.05 - 0.3)
+    g.SetNF4(graph.Var(v), nf4.NF4.Quantize(w, rows, cols))
+}
+
+fn nf4Case() {
+    if not device.GpuAvailable() {
+        gdev.Skip("NF4 weights")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.nf4(g) }, 16, 5)
+    assert gpu.ParamCount == 32 * 24
+    for k in Array<I64>[1, 4] {
+        setNF4(cpu, k)
+        setNF4(gpu, k)
+        for n in Array<I64>[16, 11] {
+            feed(cpu, net, n, U64(n) + 3, 10)
+            feed(gpu, net, n, U64(n) + 3, 10)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 2.0e-4, "NF4 weights at " + $n)
+            wx, bx := worst(gpu.Grad(net.x).Flat()!, cpu.Grad(net.x).Flat()!)
+            assert wx <= 2.0e-4 * (1.0 + bx), "NF4 weights at " + $n + ": the input's gradients differ by " + $wx
+        }
+    }
+    assert gpu.FrozenUploads() == 4, "the NF4 weights went up " + $gpu.FrozenUploads() + " times: twice each, once a setting"
+}
+
+test nf4Case "NF4 weights on the GPU: dequantized on the device before each product, forward and backward within rounding of the CPU's; their codes go up once a setting" { nf4Case() }
 
 # Qwen3 as a graph of frozen weights (models/qwen) on both backends, in T: the logits of a batch of 2 x 24 tokens and the
 # largest difference against the largest logit; the frozen weights went up once over two Forwards

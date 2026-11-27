@@ -2393,3 +2393,23 @@ GPT's forward and backward against the CPU's BF16 graph, then 15 steps of GpuAda
 AdamW, the arena the masters rounded, then `Train`); the kernels compile under nvcc for F32, F64 and BF16. **Not yet
 run on a GPU** - the first run is on the RTX 4060: `make gputest`, then `make gpulm` (G-M6) at 124M and 300M sizes.
 
+
+## NF4 weights: QLoRA's 4-bit base (wt-nf4, 2026-11-27)
+
+`kernels/nf4.olang`: 4-bit NormalFloat (Dettmers et al. 2023) - sixteen levels (bitsandbytes' table; a test derives
+them from the normal's quantiles at offset 0.9677083 and checks bitsandbytes' decision thresholds), one F32 absmax per
+block of 64, two codes a byte with the first in the high nibble (bitsandbytes' layout): 4.5 bits a weight. `Quantize`
+from F32, BF16 or F64; `Dequantize` into any float type, the level times the scale formed in F32 and rounded once.
+
+`ad/graph`: `g.NF4(rows, cols)` is a frozen Linear weight held as NF4 (set after Plan by `SetNF4`); a Linear reading it
+dequantizes it into the graph's element type just before its forward product and its input-gradient product, into one
+buffer all NF4 weights share (the largest one's size), so the arena holds one dequantized matrix, not every one. On the
+GPU the codes and scales stay resident (uploaded once a setting) and `oann_ad_nf4` (ad.cu) dequantizes before cuBLAS.
+Read by a Linear alone (anything else, a Watch, or an eager graph is refused by Plan). Double quantization of the
+scales and a fused dequant-GEMM are not built.
+
+**Tests**: kernels/nf4 (the table, rounding and packing, re-quantizing what NF4 gives back gives the same codes); ad/graph
+`Graph.NF4` (two NF4 layers around a trained one: output and gradients bit for bit those of plain frozen weights holding
+the dequantized values, F32 and BF16; the refusals); ad/gpu_test `nf4Case` (against the CPU within 2e-4, the input's
+gradient too, codes uploaded once a setting) - compiled in the cloud with no device, so skipped there; the kernel
+compiles under nvcc (sm_89, F32 and F64). Not yet run on a GPU.
