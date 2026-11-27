@@ -101,6 +101,11 @@ arenaad:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_arena_ad bench/arena_ad.olang
 	$(GPUENV) ./build/bench_arena_ad $(ARGS)
 
+# G-M6: what language model fits on the GPU and how fast it trains - ARGS: dim layers heads ctx batch steps f32|bf16 [vocab]
+gpulm:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_gpulm bench/gpulm.olang
+	$(GPUENV) ./build/bench_gpulm $(ARGS)
+
 # the activation arena of a BF16 model at Qwen3's sizes: full cross entropy, ChunkedCE, ChunkedCE with Recompute
 bigvocab:
 	$(OLANG) build -output build/bench_bigvocab bench/bigvocab.olang
