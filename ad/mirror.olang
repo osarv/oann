@@ -59,6 +59,7 @@ type Work enum {
     Log
     Stablemax       # stablemax cross entropy
     Rope
+    ChunkCE         # cross entropy of x w^T, the vocabulary a chunk at a time (ChunkedCE)
 }
 
 # one node, lowered: offsets are elements of the arena (-1: none), ints those of the I32 region
@@ -92,6 +93,9 @@ type Step struct(Do Work) {
     Node I64 = -1           # the graph's node it is
     QCodes I64 = -1         # Linear of NF4 weights: their codes' first byte in the mirror's QCodes (-1: not NF4) ...
     QScales I64 = -1        # ... and their first scale in QScales; dequantized into B before each product reading B
+    Vocab I64 = 0           # ChunkCE: w's rows, the chunk's columns, and its rows' state in the mirror's Side (3 Rows)
+    Chunk I64 = 0
+    Side I64 = -1
 }
 
 # a view's geometry, GeoSize numbers in the mirror's table: the rank, the window's axis (-1: none), its low and high
@@ -158,6 +162,8 @@ KSmRows := 43
 KSmGrad := 44
 KRope := 45
 KNf4 := 46
+KCceRows := 47
+KCceGrad := 48
 
 Names := Array<String>["oann_ad_act", "oann_ad_act_grad", "oann_ad_leaky", "oann_ad_leaky_grad", "oann_ad_fill", "oann_ad_copy", "oann_ad_put"
     "oann_ad_combine", "oann_ad_mul", "oann_ad_mul_grad", "oann_ad_scale", "oann_ad_bias", "oann_ad_colsum", "oann_ad_softmax"
@@ -165,7 +171,8 @@ Names := Array<String>["oann_ad_act", "oann_ad_act_grad", "oann_ad_leaky", "oann
     "oann_ad_norm_grad", "oann_ad_norm_param_grad", "oann_ad_embed", "oann_ad_embed_grad", "oann_ad_positions", "oann_ad_positions_grad"
     "oann_ad_sumlast", "oann_ad_sumlast_grad", "oann_ad_ce_rows", "oann_ad_ce_total", "oann_ad_ce_grad", "oann_ad_mse", "oann_ad_mse_grad"
     "oann_ad_sumsq", "oann_ad_clip", "oann_ad_adamw", "oann_ad_gather", "oann_ad_unexpand", "oann_ad_shift", "oann_ad_sqrt"
-    "oann_ad_sqrt_grad", "oann_ad_log", "oann_ad_log_grad", "oann_ad_sm_rows", "oann_ad_sm_grad", "oann_ad_rope", "oann_ad_nf4"]
+    "oann_ad_sqrt_grad", "oann_ad_log", "oann_ad_log_grad", "oann_ad_sm_rows", "oann_ad_sm_grad", "oann_ad_rope", "oann_ad_nf4"
+    "oann_ad_cce_rows", "oann_ad_cce_grad"]
 
 # the text of the kernels for real type T: the prelude, elem.cu, the typedef, ad.cu
 fn Source<T>(like T) String {
@@ -250,8 +257,8 @@ type AdamW<T> unique struct(m gdev.Buf<U8>, v gdev.Buf<U8>, mask gdev.Buf<U8>, h
 
 # a planned graph's mirror on dev: Mem the arena (size elements, the first params of them the parameters, the gradients
 # the next params), Ints the tokens and classes, Stats two F64 a node (a loss's value and the entries it counted; two
-# more at the end for the gradients' norm), RowLoss a cross entropy's rows' losses
-type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, geo Array<I64>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>, masters gdev.Buf<F32>, qcodes gdev.Buf<U8>, qscales gdev.Buf<F32>) {
+# more at the end for the gradients' norm), RowLoss a cross entropy's rows' losses, Side ChunkCE's rows' state
+type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64, params I64, batch I64, rowloss I64, kit kern.Kit, steps Array<Step>, geo Array<I64>, mem gdev.Buf<T>, intMem gdev.Buf<I32>, stats gdev.Buf<F64>, losses gdev.Buf<F64>, masters gdev.Buf<F32>, qcodes gdev.Buf<U8>, qscales gdev.Buf<F32>, side gdev.Buf<F64>) {
     dev
     geo
     Size I64 = size
@@ -266,6 +273,7 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
     Masters gdev.Buf<F32> = masters     # a BF16 graph's parameters in F32 (what AdamW steps), else one unused word
     QCodes gdev.Buf<U8> = qcodes        # the graph's NF4 weights (kernels/nf4): codes two a byte, at the host's offsets
     QScales gdev.Buf<F32> = qscales     # and their blocks' absmax
+    Side gdev.Buf<F64> = side           # ChunkCE's running maxima, sums, class logits, then log-sum-exps (Step.Side)
     HasMasters Bool = hasMasters<T>()
     plans mut Vec<AttnPlan<T>>& = Vec<AttnPlan<T>>()
     mplans mut Vec<MatPlan<T>>& = Vec<MatPlan<T>>()
@@ -279,10 +287,10 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
 
 # the mirror of a graph of these steps, its arena of size elements (params of them parameters), ints I32s, planned for
 # batch entries: the buffers allocated and the kernels compiled now. rowloss: the most rows a cross entropy takes; geo
-# the views' geometries (Step.Geo); qcodes and qscales the NF4 weights' bytes of codes and scales (0: none)
-fn Mirror<T>.Make(dev mut gdev.Device&, steps Array<Step>&, geo Array<I64>&, size I64, params I64, ints I64, batch I64, rowloss I64, qcodes I64 = 0, qscales I64 = 0) Mirror<T> ? gdev.GpuError {
+# the views' geometries (Step.Geo); qcodes and qscales the NF4 weights' bytes of codes and scales (0: none); side the F64s of ChunkCE's rows' state (Step.Side)
+fn Mirror<T>.Make(dev mut gdev.Device&, steps Array<Step>&, geo Array<I64>&, size I64, params I64, ints I64, batch I64, rowloss I64, qcodes I64 = 0, qscales I64 = 0, side I64 = 1) Mirror<T> ? gdev.GpuError {
     z T
-    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, geo, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss), try gdev.Buf<F32>.Make(dev, params if hasMasters<T>() else 1), try gdev.Buf<U8>.Make(dev, qcodes.Max(1)), try gdev.Buf<F32>.Make(dev, qscales.Max(1)))
+    m := Mirror<T>(dev, size, ints, steps.Len(), params, batch, rowloss, try kern.Kit.Compile(dev, Source(z), Names), steps, geo, try gdev.Buf<T>.Make(dev, size), try gdev.Buf<I32>.Make(dev, ints), try gdev.Buf<F64>.Make(dev, 2 * steps.Len() + 4), try gdev.Buf<F64>.Make(dev, rowloss), try gdev.Buf<F32>.Make(dev, params if hasMasters<T>() else 1), try gdev.Buf<U8>.Make(dev, qcodes.Max(1)), try gdev.Buf<F32>.Make(dev, qscales.Max(1)), try gdev.Buf<F64>.Make(dev, side.Max(1)))
     try m.planAll()
     kern.Zero(dev, m.Mem.Addr(0), size * T.Size)
     kern.Zero(dev, m.Stats.Addr(0), (2 * steps.Len() + 4) * 8)
@@ -503,7 +511,34 @@ fn (m mut Mirror<T>&) Forward(s Step&, n I64, pos I64) {
             m.once(KCeTotal, m.Stats.Addr(2 * s.Inner), m.at(s.Y), m.RowLoss.Addr(0), m.Ints.Addr(s.IntA), n64(rows))
         }
         case Work.Rope: m.rope(s, s.Y, s.A, rows, cols, pos, 1.0, false)
+        case Work.ChunkCE: m.chunkedForward(s, rows)
         case _ { }
+    }
+}
+
+# ChunkCE's forward: each chunk's logits x w_c^T into the scratch, folded into the rows' state; the mean of the rows'
+# losses after the last
+fn (m mut Mirror<T>&) chunkedForward(s Step&, rows I64) {
+    for q in range (s.Vocab + s.Chunk - 1) / s.Chunk {
+        v0 := q * s.Chunk
+        c := s.Chunk.Min(s.Vocab - v0)
+        m.product(s.Scratch, rows, c, s.A, rows, s.Cols, false, s.B + v0 * s.Cols, c, s.Cols, true, false)
+        m.rowk(KCceRows, rows, c, m.Side.Addr(s.Side), m.RowLoss.Addr(0), m.at(s.Scratch), m.Ints.Addr(s.IntA), n64(s.Rows), n64(c), n64(v0), flag(v0 + c >= s.Vocab))
+    }
+    m.once(KCeTotal, m.Stats.Addr(2 * s.Inner), m.at(s.Y), m.RowLoss.Addr(0), m.Ints.Addr(s.IntA), n64(rows))
+}
+
+# ChunkCE's backward: each chunk's logits again, made their gradient in place, then dx (+)= dz_c w_c and
+# dw_c (+)= dz_c^T x
+fn (m mut Mirror<T>&) chunkedBackward(s Step&, rows I64, add0 Bool, add1 Bool) {
+    if s.DA < 0 and s.DB < 0: return
+    for q in range (s.Vocab + s.Chunk - 1) / s.Chunk {
+        v0 := q * s.Chunk
+        c := s.Chunk.Min(s.Vocab - v0)
+        m.product(s.Scratch, rows, c, s.A, rows, s.Cols, false, s.B + v0 * s.Cols, c, s.Cols, true, false)
+        m.elems(KCceGrad, rows * c, m.at(s.Scratch), m.Side.Addr(s.Side), m.Ints.Addr(s.IntA), m.at(s.DY), m.Stats.Addr(2 * s.Inner), n64(rows * c), n64(c), n64(v0))
+        if s.DA >= 0: m.product(s.DA, rows, s.Cols, s.Scratch, rows, c, false, s.B + v0 * s.Cols, c, s.Cols, false, add0 or v0 > 0)
+        if s.DB >= 0: m.product(s.DB + v0 * s.Cols, c, s.Cols, s.Scratch, rows, c, true, s.A, rows, s.Cols, false, add1)
     }
 }
 
@@ -771,6 +806,7 @@ fn (m mut Mirror<T>&) Backward(s Step&, n I64, pos I64, add0 Bool, add1 Bool, ad
         case Work.Rope {
             if s.DA >= 0: m.rope(s, s.DA, s.DY, rows, cols, pos, -1.0, add0)
         }
+        case Work.ChunkCE: m.chunkedBackward(s, rows, add0, add1)
         case Work.CrossEntropy {
             if s.DA >= 0: m.elems(KCeGrad, count, m.at(s.DA), m.at(s.Saved), m.Ints.Addr(s.IntA), m.at(s.DY), m.Stats.Addr(2 * s.Inner), n64(count), n64(cols), flag(add0))
         }

@@ -2413,3 +2413,31 @@ scales and a fused dequant-GEMM are not built.
 the dequantized values, F32 and BF16; the refusals); ad/gpu_test `nf4Case` (against the CPU within 2e-4, the input's
 gradient too, codes uploaded once a setting) - compiled in the cloud with no device, so skipped there; the kernel
 compiles under nvcc (sm_89, F32 and F64). Not yet run on a GPU.
+
+## Large vocabularies: chunked cross entropy and activation checkpointing (wt-bigvocab, 2026-11-27)
+
+For fine-tuning Qwen3 (a 151936-token head) on the RTX 4060, the two largest activation costs are gone:
+- **ChunkedCE** (ad/graph `g.ChunkedCE(x, w, classes, chunk)`, ad/ops, ad.cu `oann_ad_cce_rows`/`_grad`): the loss of
+  x w^T against classes with the vocabulary taken a chunk at a time - forward a running maximum and sum per row, the
+  backward each chunk's logits again (two products more than the full head), never the [rows, V] logits, their softmax
+  or their gradient. Its scratch is alive at its forward and its backward only (a buffer of two spans in the plan).
+- **Recompute** (`g.Recompute(from, out)`, per block): the block's values and kept tensors are free in the plan from
+  their last forward reader until half a step before the first backward reading them, when the segment's forward runs
+  again (CPU, GPU, CUDA graphs). Costs one more forward of each block a step.
+- nn/layers `Transformer.Loss(g, tokens, classes, chunk, checkpoint)` and `Hidden` record both.
+
+**Measured** (`make bigvocab`, the arena as Plan lays it, BF16, Qwen3-0.6B's sizes: width 1024, 28 layers, 16 heads, a
+batch of 1; MB on the GPU / the CPU):
+
+| context | full CrossEntropy | ChunkedCE | ChunkedCE + Recompute |
+|---|---|---|---|
+| 1024 | 2664 / 1724 | 2063 / 1122 | 147 / 109 |
+| 4096 | 21929 / 6896 | 19895 / 4488 | 1393 / 437 |
+
+On the GPU attention keeps its weights (heads x t x t a layer), which checkpointing frees for all but one block.
+**Tests**: ad/graph (ChunkedCE equals CrossEntropy(Linear) - F64 within 1e-12, F32, BF16, uneven chunks, ignored rows,
+a short batch, rows split over tasks; checkpointed blocks give the loss and every gradient bit for bit over steps and a
+short batch, at 1 and 2 threads, the arena under 3/4 and growing under a third as fast with depth; refusals), nn/layers
+(Transformer.Loss against CrossEntropy(Apply), checkpointed equal), ad/gpu_test `bigVocabCase` (CPU against GPU in
+F32 and BF16, checkpointed against plain bit for bit on the device, Train as a CUDA graph) - compiled, skipped without a
+device; the kernels compile under nvcc for F32, F64 and BF16. **Not yet run on a GPU.**

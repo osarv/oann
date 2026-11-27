@@ -1,0 +1,54 @@
+# bench/bigvocab - what ChunkedCE and Recompute save: the activation arena of a BF16 language model at Qwen3's sizes
+# (a vocabulary of 151936, tied, RMS norms, rotary positions, gated perceptrons), laid out as Plan lays it - nothing
+# allocated, so it runs anywhere - for the GPU (attention keeps its weights) and the CPU (the flash form keeps none),
+# three ways: the full logits and CrossEntropy, the loss chunked over the vocabulary, and chunked with every block
+# recomputed in the backward. Arguments, all optional: width (1024), layers (28), heads (16), context (1024), batch (1),
+# chunk (8192). Build and run from the repository's root (make bigvocab):
+#   olang build -output build/bench_bigvocab bench/bigvocab.olang && build/bench_bigvocab 1024 28 16 1024 1
+
+import "std/io"
+import "std/os"
+import "../ad/graph"
+import "../nn/layers"
+import "../kernels/device"
+import "../tensor"
+
+Vocab := 151936
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn main() ? io.Error, os.Error, ParseError, tensor.ShapeError {
+    args :~ os.Args()
+    width := try number(args, 1, 1024)
+    depth := try number(args, 2, 28)
+    heads := try number(args, 3, 16)
+    ctx := try number(args, 4, 1024)
+    batch := try number(args, 5, 1)
+    chunk := try number(args, 6, 8192)
+    Println("BF16, vocabulary " + $Vocab + ", width " + $width + ", " + $depth + " layers, " + $heads + " heads, context " + $ctx + ", batch " + $batch + ", chunk " + $chunk)
+    Println("activation arena in MB (logits alone: " + $(mb(batch * ctx * Vocab)) + ")")
+    Println("way                      GPU      CPU")
+    for way in range 3 {
+        gpu := try arena(width, depth, heads, ctx, batch, chunk, way, device.Backend.Gpu)
+        cpu := try arena(width, depth, heads, ctx, batch, chunk, way, device.Backend.Cpu)
+        name := Array<String>["full CrossEntropy    ", "ChunkedCE            ", "ChunkedCE + Recompute"][way]
+        Println(name + "  " + $mb(gpu) + "  " + $mb(cpu))
+    }
+}
+
+# BF16 elements in MB, rounded
+fn mb(n I64) I64 { return (2 * n + 500000) / 1000000 }
+
+# the model's activation region on a backend: way 0 the full logits, 1 chunked, 2 chunked and checkpointed
+fn arena(width I64, depth I64, heads I64, ctx I64, batch I64, chunk I64, way I64, on device.Backend) I64 ? tensor.ShapeError {
+    g := graph.Graph<BF16>(batch)
+    tok := g.Tokens(ctx)
+    y := g.Classes(ctx)
+    t := layers.Transformer.New(g, Vocab, ctx, width, heads, depth, true, 0.0, true, true, true)
+    if way == 0 { g.CrossEntropy(t.Apply(g, tok), y) } else { t.Loss(g, tok, y, chunk, way == 2) }
+    l := try g.Lay(on)
+    return l.ActivationSize
+}

@@ -261,10 +261,27 @@ fn Transformer.New<T>(g mut graph.Graph<T>&, vocab I64, ctx I64, D I64, heads I6
 
 # the logits of each position's next token, from a Tokens() node: [batch, ctx, Vocab]
 fn (t Transformer&) Apply<T>(g mut graph.Graph<T>&, tokens graph.Var) graph.Var {
+    return t.Head.Logits(g, t.Hidden(g, tokens))
+}
+
+# the final normalization's output, from a Tokens() node: [batch, ctx, D]; each block recomputed in the backward where
+# checkpoint (graph.Recompute: one block's activations held at a time)
+fn (t Transformer&) Hidden<T>(g mut graph.Graph<T>&, tokens graph.Var, checkpoint Bool = false) graph.Var {
     e := t.Embed.Apply(g, tokens)
     h := dropped(g, e if t.Positions == graph.None else g.Positions(e, t.Positions), t.Drop)
-    for b in t.Blocks: h = b.Apply(g, h)
-    return t.Head.Logits(g, t.Final.Apply(g, h))
+    for b in t.Blocks {
+        from := g.Size()
+        h = b.Apply(g, h)
+        if checkpoint: g.Recompute(from, h)
+    }
+    return t.Final.Apply(g, h)
+}
+
+# the loss of each position's next token against classes, CrossEntropy(Apply(tokens), classes)'s, the vocabulary
+# taken chunk at a time (graph.ChunkedCE: the [batch, ctx, Vocab] logits never held), each block recomputed in the
+# backward where checkpoint
+fn (t Transformer&) Loss<T>(g mut graph.Graph<T>&, tokens graph.Var, classes graph.Var, chunk I64 = 8192, checkpoint Bool = false) graph.Var {
+    return g.ChunkedCE(t.Hidden(g, tokens, checkpoint), t.Head.Table, classes, chunk)
 }
 
 # ---- scan-based blocks ----
@@ -503,6 +520,40 @@ test Transformer "gradients agree with central differences: tied and untied, lay
         assert gradcheck.GradientError(g, loss, 2) < 1e-5
         assert gradcheck.GradientError(g, loss, 1) < 1e-5
     }
+}
+
+test Transformer.Loss "the chunked loss is CrossEntropy(Apply)'s and checkpointed blocks give the same gradients, in a smaller arena" {
+    sizes := Array<I64>(3)
+    grads := Vec<tensor.Tensor<F64>>()
+    losses := Array<F64>(3)
+    for way in range 3 {
+        g := graph.Graph<F64>(2)
+        tok := g.Tokens(5)
+        y := g.Classes(5)
+        t := Transformer.New(g, 40, 5, 8, 2, 3, true, 0.0, true, true, true)
+        loss := g.CrossEntropy(t.Apply(g, tok), y) if way == 0 else t.Loss(g, tok, y, 16, way == 2)
+        r := rand.Rand(4)
+        try g.Plan(r)
+        perturb(g, r, 0.3)
+        td :~ g.Ints(tok).Flat()!
+        yd :~ g.Ints(y).Flat()!
+        q := rand.Rand(9)
+        for i in range 10 {
+            td[i] = I32(q.Below(40))
+            yd[i] = I32(q.Below(40))
+        }
+        g.Forward(2)
+        g.Backward(loss)
+        losses[way] = g.Scalar(loss)
+        grads.Push(g.ParamGrads().Copy())
+        sizes[way] = g.ActivationSize
+    }
+    assert (losses[0] - losses[1]).Abs() < 1e-12 and losses[1] == losses[2]
+    a :~ grads[0].Flat()!
+    b :~ grads[1].Flat()!
+    for i in range a.Len(): assert (a[i] - b[i]).Abs() < 1e-12
+    assert grads[1] == grads[2]
+    assert sizes[2] < sizes[1] and sizes[1] < sizes[0], $sizes[0] + ", " + $sizes[1] + ", " + $sizes[2]
 }
 
 test SsmBlock "gradients agree with central differences, the input's too; the block adds to its input and keeps its shape" {

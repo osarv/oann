@@ -5,7 +5,8 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 - `layers.olang` - layers as plain data (handles and sizes) with a `New` on a graph that registers the parameters and an
   `Apply` that records the operations: `Dense`, `Embedding` (also a tied output head), `Norm` (layer or RMS), `Mlp`,
   `Conv`, `SelfAttention` (rotary positions optional; `window` W > 0 for sliding-window attention, the graph's `Attention(..., window)`; `gate` for a per-head output gate, head h's output times sigmoid(W x)_h with W [heads, D] - `HeadGate` applies one to any [b, t, D]), `AttentionBlock` (pre-normalized, a GELU or gated SwiGLU `Feed`,
-  dropout), `Transformer` (GPT-2's decoder), and the scan-based residual blocks `SsmBlock` (Mamba's selective scan over
+  dropout), `Transformer` (GPT-2's decoder; `Loss` its loss by the graph's `ChunkedCE`, never holding the logits, each block
+  recomputed in the backward with `checkpoint` - the graph's `Recompute`), and the scan-based residual blocks `SsmBlock` (Mamba's selective scan over
   the graph's `SelectiveScan`) and `DeltaBlock` (the gated delta rule: the graph's `DeltaRule`, chunked in the WY form for training, the recurrent form a position at a time while decoding, its state carried between Forward calls). Starting values are PyTorch's for `Dense` and
   `Conv`, GPT-2's for the transformer.
 - Packed documents (several documents to a sequence): `DocStarts(g, tokens, sep, docs, keep)` fills, from the batch's
