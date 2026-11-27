@@ -21,6 +21,9 @@ import "../tensor"
 import "optim"
 import "train"
 
+# the GPU built in (-define Gpu=true)
+Gpu Bool = false
+
 # what a run is: how many steps (optimizer steps), the learning rate of each, the batches a step accumulates, the
 # clipping norm (none when 0), how often it reports and measures validation (EvalBatches batches of it), the checkpoint
 # it writes every CheckpointEvery steps and at the end and resumes from when it exists (none when ""), and the run's
@@ -66,6 +69,28 @@ fn scale<G>(grads tensor.Tensor<G>&, k F64) {
     }
 }
 
+# the gradients times k (when not 1) and clipped to norm "clip" (when above 0): the norm before clipping (0 when not
+# clipped). Where the graph is planned on the GPU, on the device, so an optimizer there (optim.GpuAdamW) steps them
+fn prepare<E>(g mut graph.Graph<E>&, k F64, clip F64) F64 {
+    if g.OnGpu: return onDevice(g, k, clip)
+    grads := g.ParamGrads()
+    if k != 1.0: scale(grads, k)
+    return optim.ClipNorm(grads, clip) if clip > 0.0 else 0.0
+}
+
+if Gpu {
+    fn onDevice<E>(g mut graph.Graph<E>&, k F64, clip F64) F64 {
+        g.DeviceReady()
+        m :~ g.Mirror()
+        if k != 1.0: m.ScaleGrads(k)
+        if clip <= 0.0: return 0.0
+        m.ClipNorm(clip)
+        return m.GradNorm()
+    }
+} else {
+    fn onDevice<E>(g mut graph.Graph<E>&, k F64, clip F64) F64 { unreachable "oann: a graph on the GPU in a build without it" }
+}
+
 # one optimizer step over "accum" batches of src: the mean of their losses, and the norm of the mean gradient before
 # clipping to "clip" (none when 0)
 fn Step<E, S, O>(g mut graph.Graph<E>&, m train.LanguageModel&, src mut S&, o mut O&, rate F64, clip F64, accum I64) F64, F64 ? {
@@ -77,9 +102,7 @@ fn Step<E, S, O>(g mut graph.Graph<E>&, m train.LanguageModel&, src mut S&, o mu
         g.Backward(m.Loss, accumulate = k > 0)
         total += g.Scalar(m.Loss)
     }
-    grads := g.ParamGrads()
-    if accum > 1: scale(grads, 1.0 / F64(accum))
-    norm F64 = optim.ClipNorm(grads, clip) if clip > 0.0 else 0.0
+    norm := prepare(g, 1.0 / F64(accum), clip)
     o.SetRate(rate)
     o.Step()
     g.SyncParams()

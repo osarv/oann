@@ -1,0 +1,220 @@
+# nn/qlora - QLoRA fine-tuning of a Qwen3 (or Qwen2) checkpoint on chat conversations, the pieces put together: the
+# model as a graph (models/qwen) with its seven projections in 4-bit NF4 and the rest frozen, filled straight from the
+# checkpoint's files (FillFrom: a tensor at a time, sharded models too), LoRA adapters on the projections named
+# (nn/lora), the loss over the vocabulary a chunk at a time (no logits) and each block recomputed in the backward; the
+# conversations of a JSON-lines file rendered through Qwen's chat template and its tokenizer.json (data/chat), a share
+# of them held out for validation; the loop nn/tune runs (gradient accumulation, the validation loss every EvalEvery
+# steps, resumable checkpoints); the adapter saved as PEFT writes it, and optionally merged into a copy of the model.
+#
+# Before anything is allocated the run is laid out (models/qwen's Footprint) and what it takes printed - on the GPU a run
+# that would not fit the device's Budget MB is refused there and then. The device is the GPU where there is one (a
+# BF16 graph, F32 masters and moments), else the CPU (an F32 graph); Device and Bf16 override it.
+#
+# The output directory holds run.ckpt (the run so far: run again with the same options and it carries on where it
+# stopped), log.jsonl (io/runlog's record), adapter/ (adapter_model.safetensors and adapter_config.json, at the end) and,
+# where Merge names a directory, the merged model there.
+#
+# Use: `qlora.Options(model, data, out, Rank = 16, Steps = 200).Run(fn(line String&): Println(line))`;
+# examples/qlora.olang (make qlora) takes the options from the command line.
+
+import "std/os"
+import "std/rand"
+import "../ad/graph"
+import "../data/chat"
+import "../kernels/device"
+import "../llm/bpe"
+import "../llm/model"
+import "../models/qwen"
+import "lora"
+import "optim"
+import "train"
+import "tune"
+
+# the GPU built in (-define Gpu=true)
+Gpu Bool = false
+
+# a run: the model's directory (config.json, tokenizer.json, model.safetensors or its shards), the training file
+# (JSON lines of conversations) and the output directory; LoRA's rank, alpha and target projections; the peak learning
+# rate, reached after Warmup steps and decayed linearly to 0 at the last step; the optimizer steps (when 0, Epochs passes
+# over the training rows); the context, the sequences a batch holds and the batches a step accumulates; NF4 base weights,
+# blocks recomputed, the vocabulary's chunk (0: full logits); the validation share, how often it is measured and on how
+# many batches; how often a line is reported and a checkpoint written; the seed; where to merge the adapter (none: "");
+# "auto", "cpu" or "gpu"; BF16 arena ("auto": on the GPU); the device's memory in MB; gradient clipping (0: none); and
+# Stop, a step to stop at with the run's checkpoint written (0: the end), as an interruption would
+type Options struct(Model String, Data String, Out String, Rank I64 = 16, Alpha F64 = 32.0
+        Targets Array<String> = Array<String>["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        Rate F64 = 2e-4, Warmup I64 = 0, Steps I64 = 0, Epochs F64 = 1.0, Ctx I64 = 1024, Batch I64 = 1, Accum I64 = 1
+        Nf4 Bool = true, Recompute Bool = true, Chunk I64 = 8192, Valid F64 = 0.05, EvalEvery I64 = 50, EvalBatches I64 = 8
+        Every I64 = 10, CheckpointEvery I64 = 50, Seed I64 = 1, Merge String = "", Device String = "auto", Bf16 String = "auto"
+        Budget I64 = 8192, Clip F64 = 1.0, Stop I64 = 0) {
+    Model
+    Data
+    Out
+    Rank
+    Alpha
+    Targets
+    Rate
+    Warmup
+    Steps
+    Epochs
+    Ctx
+    Batch
+    Accum
+    Nf4
+    Recompute
+    Chunk
+    Valid
+    EvalEvery
+    EvalBatches
+    Every
+    CheckpointEvery
+    Seed
+    Merge
+    Device
+    Bf16
+    Budget
+    Clip
+    Stop
+}
+
+type QloraError error {
+    Options(what String)        # an option that cannot be: what it is
+    TooBig(what String)         # the run would not fit the device: what it would take
+}
+
+# what a run did: the steps it was to run and where it ended, the first and last reported training losses (NaN where it
+# reported none), the last validation loss, and the memory it was laid out to take
+type Result struct(Steps I64, Last train.Progress, First F64, Footprint qwen.Footprint) {
+    Steps
+    Last
+    First
+    Footprint
+}
+
+# MB, rounded
+fn mb(bytes I64) I64 { return (bytes + 524288) / 1048576 }
+
+# the learning rate at step: a linear warmup over "warm" steps to peak, then a linear decay to 0 at "steps"
+fn Schedule(peak F64, warm I64, steps I64, step I64) F64 {
+    if step < warm: return peak * F64(step + 1) / F64(warm)
+    return peak * F64(steps - step) / F64((steps - warm).Max(1))
+}
+
+# trains o.Model's LoRA adapter on o.Data as o asks, reporting each line to "on"
+fn (o Options&) Run(on fn&(line String&)) Result ? {
+    if o.Rank < 1 or o.Ctx < 2 or o.Batch < 1 or o.Accum < 1: error QloraError.Options("rank, context, batch and accumulation are positive")
+    cfg := try model.Config.Parse(try os.ReadFile(o.Model + "/config.json"))
+    t := try bpe.Bpe.Load(o.Model + "/tokenizer.json")
+    data := try chat.ChatData.Load(o.Data, t, o.Ctx, o.Valid, U64(o.Seed))
+    on("data: " + $data.Train.Rows + " training rows and " + $data.Valid.Rows + " validation rows of " + $o.Ctx + " tokens (" + $data.Train.Trained() + " trained tokens), " + $data.Dropped + " conversations dropped")
+    gpu := o.Device == "gpu" or (o.Device == "auto" and device.GpuAvailable())
+    if o.Device == "gpu" and not device.GpuAvailable(): error QloraError.Options("device gpu: no GPU here")
+    rows := o.Batch * o.Accum
+    steps I64 = o.Steps if o.Steps > 0 else I64((o.Epochs * F64(data.Train.Rows) / F64(rows)).Ceil()).Max(1)
+    try os.MkDirAll(o.Out)
+    bf16 := o.Bf16 == "on" or (o.Bf16 == "auto" and gpu)
+    if bf16: return try o.runAs<BF16>(cfg, data, steps, gpu, on)
+    return try o.runAs<F32>(cfg, data, steps, gpu, on)
+}
+
+# the run in a graph of T
+fn (o Options&) runAs<T>(cfg model.Config&, data mut chat.ChatData&, steps I64, gpu Bool, on fn&(line String&)) Result ? {
+    backend := device.Backend.Gpu if gpu else device.Backend.Cpu
+    lc := lora.Config(o.Rank, o.Alpha, o.Targets)
+    fp := try qwen.Footprint.Of<T>(cfg, o.Ctx, o.Batch, o.Nf4, o.Recompute, o.Chunk, lc, backend)
+    where := "GPU" if gpu else "CPU"
+    on("planned on the " + $where + ": " + $mb(fp.Total) + " MB (arena " + $mb(fp.Arena) + ", NF4 weights " + $mb(fp.Quant) + ", moments " + $mb(fp.Moments) + "), " + $fp.Params + " adapter parameters")
+    if gpu and mb(fp.Total) > o.Budget: error QloraError.TooBig($mb(fp.Total) + " MB on a device of " + $o.Budget + " MB")
+    g mut graph.Graph<T>& = graph.Graph<T>(o.Batch)
+    q := try qwen.Qwen.New(g, cfg, o.Ctx, o.Nf4, o.Recompute)
+    s := try q.AddLora(g, lc)
+    lm := q.Lm(g, true, o.Chunk)
+    try g.Plan(rand.Rand(U64(o.Seed)), backend)
+    try q.FillFrom(g, o.Model)
+    if gpu: return try o.fitGpu(g, s, lm, data, steps, fp, on)
+    match T {
+        case BF16 {
+            opt := optim.AdamW(g.Masters(), g.ParamGrads(), o.Rate, spans = optim.Spans(g))
+            return try o.fit(g, s, lm, data, opt, steps, fp, on)
+        }
+        case _ {
+            opt := optim.AdamW(g.Params(), g.ParamGrads(), o.Rate, spans = optim.Spans(g))
+            return try o.fit(g, s, lm, data, opt, steps, fp, on)
+        }
+    }
+}
+
+# the run on the GPU: AdamW's moments on the device
+if Gpu {
+    fn (o Options&) fitGpu<T>(g mut graph.Graph<T>&, s lora.Set&, lm train.LanguageModel&, data mut chat.ChatData&, steps I64
+            fp qwen.Footprint, on fn&(line String&)) Result ? {
+        opt := try optim.GpuAdamW<T>.For(g, o.Rate)
+        return try o.fit(g, s, lm, data, opt, steps, fp, on)
+    }
+} else {
+    fn (o Options&) fitGpu<T>(g mut graph.Graph<T>&, s lora.Set&, lm train.LanguageModel&, data mut chat.ChatData&, steps I64
+            fp qwen.Footprint, on fn&(line String&)) Result ? {
+        unreachable "oann: a graph on the GPU in a build without it"
+    }
+}
+
+# nn/tune's loop over the planned graph, then the adapter saved (and merged) when the run reached its end
+fn (o Options&) fit<T, O>(g mut graph.Graph<T>&, s lora.Set&, lm train.LanguageModel&, data mut chat.ChatData&, opt mut O&
+        steps I64, fp qwen.Footprint, on fn&(line String&)) Result ? {
+    peak, warm := o.Rate, o.Warmup
+    rate := fn(step I64): return Schedule(peak, warm, steps, step)
+    stop := o.Stop if o.Stop > 0 and o.Stop < steps else steps
+    first mut Array<F64>& = Array<F64>[F64.NaN]
+    report := fn(p train.Progress&) {
+        if first[0].IsNan(): first[0] = p.Loss
+        line := "step " + $p.Step + "/" + $steps + ": loss " + $p.Loss + ", gradient norm " + $p.Norm + ", rate " + $p.Rate + ", " + $p.Seconds + " s"
+        on(line + ("" if p.Validation.IsNan() else ", validation " + $p.Validation))
+    }
+    tc := tune.Tune(stop, rate, Accum = o.Accum, Clip = o.Clip, Every = o.Every, EvalEvery = o.EvalEvery, EvalBatches = o.EvalBatches
+        Checkpoint = o.Out + "/run.ckpt", CheckpointEvery = o.CheckpointEvery, Name = "qlora", Seed = o.Seed, Log = o.Out + "/log.jsonl")
+    last := try tune.Fit(g, lm, data.Train, data.Valid, opt, tc, report)
+    if stop < steps {
+        on("stopped at step " + $stop + " of " + $steps + ": run again to carry on")
+        return Result(steps, last, first[0], fp)
+    }
+    try s.Save(g, o.Out + "/adapter")
+    on("adapter saved in " + o.Out + "/adapter")
+    if o.Merge != "" {
+        try lora.Merge(o.Model, o.Out + "/adapter", o.Merge)
+        on("merged into " + o.Merge)
+    }
+    return Result(steps, last, first[0], fp)
+}
+
+# ---- tests ----
+
+# a tiny Qwen3 (tied, vocabulary 272) with data/chat's tiny tokenizer beside it: a model directory a run reads
+fn tinyModel(seed U64) String {
+    dir := model.TinyTied(true, seed, true, 272)
+    os.WriteFile(dir + "/tokenizer.json", chat.TinyTokenizer())!
+    return dir
+}
+
+fn quiet(line String&) { }
+
+fn Options.Tiny(dir String&, out String&, stop I64) Options {
+    return Options(dir, chat.Sample, out, Rank = 4, Alpha = 8.0, Rate = 1e-2, Warmup = 2, Steps = 8, Ctx = 48, Batch = 2, Accum = 2
+        Chunk = 40, Valid = 0.2, EvalEvery = 4, EvalBatches = 2, Every = 2, CheckpointEvery = 0, Device = "cpu", Stop = stop)
+}
+
+test Run "QLoRA on a tiny Qwen3 and chat lines: the training loss falls; a run stopped at step 4 and run again ends with the uninterrupted run's numbers and adapter" {
+    dir := tinyModel(3)
+    whole := os.MkTemp("", "qlora")!
+    a := Options.Tiny(dir, whole, 0).Run(quiet)!
+    assert a.Last.Step == 8 and a.Last.Loss < 0.8 * a.First, "the loss went from " + $a.First + " to " + $a.Last.Loss
+    assert os.Exists(whole + "/adapter/adapter_model.safetensors") and a.Footprint.Quant > 0
+    split := os.MkTemp("", "qlora")!
+    half := Options.Tiny(dir, split, 4).Run(quiet)!
+    assert half.Last.Step == 4 and not os.Exists(split + "/adapter")
+    rest := Options.Tiny(dir, split, 0).Run(quiet)!
+    assert rest.Last.Step == 8 and rest.Last.Loss == a.Last.Loss and rest.Last.Validation == a.Last.Validation
+    assert os.ReadFile(split + "/adapter/adapter_model.safetensors")! == os.ReadFile(whole + "/adapter/adapter_model.safetensors")!
+    os.RemoveAll(whole)!
+    os.RemoveAll(split)!
+    os.RemoveAll(dir)!
+}
