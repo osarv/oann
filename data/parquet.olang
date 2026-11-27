@@ -1,0 +1,619 @@
+# parquet - Apache Parquet files read a column at a time, as Hugging Face's datasets are published: the footer's
+# metadata (Thrift's compact protocol) gives the schema and the row groups, and each column of a row group is read
+# from its byte range - its pages decompressed (none or SNAPPY) and decoded (PLAIN, or a dictionary page and
+# RLE_DICTIONARY indices) - into one value a row: text for a BYTE_ARRAY column, a number for INT32, INT64, FLOAT and
+# DOUBLE. Flat schemas only (every column a top-level field, required or optional - a null reads as "" or NaN); data
+# pages of version 1 and 2. A file of 2 GB costs one column chunk of memory at a time (a few MB), read with pread.
+#
+# The format: "PAR1", the column chunks, the footer, its length as four little-endian bytes, "PAR1". A page is a
+# PageHeader (Thrift) then its bytes; in a data page an optional column's definition levels (bit width 1) come before
+# the values, in Parquet's RLE/bit-packed hybrid - a varint header, even: a run of one value repeated header >> 1
+# times, odd: (header >> 1) groups of eight values packed in bit width bits each, low bits first.
+
+import "std/os"
+import unistd "unistd.h"
+import "snappy"
+
+type ParquetError error {
+    Malformed   # not a Parquet file, or metadata or a page this reader cannot follow
+    Unsupported # a codec, encoding or type it does not read (nested columns, GZIP, ZSTD, ...)
+    NoColumn    # no column of that name
+}
+
+# ---- Thrift's compact protocol ----
+
+type thrift struct(src Array<U8>&, pos I64) {
+    src
+    pos
+}
+
+fn (t mut thrift&) byte() I64 ? ParquetError {
+    if t.pos >= t.src.Len(): error ParquetError.Malformed
+    b := I64(t.src[t.pos])
+    t.pos += 1
+    return b
+}
+
+fn (t mut thrift&) varint() I64 ? ParquetError {
+    v I64 = 0
+    shift I64 = 0
+    for {
+        b := try t.byte()
+        v |= (b & 127) << shift
+        if b < 128: return v
+        shift += 7
+        if shift > 63: error ParquetError.Malformed
+    }
+}
+
+fn (t mut thrift&) zigzag() I64 ? ParquetError {
+    v := try t.varint()
+    return I64(U64(v) >> 1) ^ -(v & 1)
+}
+
+fn (t mut thrift&) binary() Array<U8>& ? ParquetError {
+    n := try t.varint()
+    if n < 0 or t.pos + n > t.src.Len(): error ParquetError.Malformed
+    b := t.src[t.pos:t.pos + n]
+    t.pos += n
+    return b
+}
+
+# a field header: its id (the last one's plus the delta, or written out) and type; type 0 ends the struct
+fn (t mut thrift&) field(last I64) I64, I64 ? ParquetError {
+    h := try t.byte()
+    kind := h & 15
+    if kind == 0: return 0, 0
+    delta := h >> 4
+    if delta != 0: return last + delta, kind
+    return try t.zigzag(), kind
+}
+
+# a list header: its length and element type
+fn (t mut thrift&) list() I64, I64 ? ParquetError {
+    h := try t.byte()
+    n := h >> 4
+    if n == 15: n = try t.varint()
+    return n, h & 15
+}
+
+# a value of the type skipped
+fn (t mut thrift&) skip(kind I64) ? ParquetError {
+    match kind {
+        case 1, 2: return
+        case 3: t.pos += 1
+        case 4, 5, 6: try t.varint()
+        case 7: t.pos += 8
+        case 8: try t.binary()
+        case 9, 10 {
+            n, elem := try t.list()
+            for _ in range n: try t.skip(elem if elem != 1 and elem != 2 else 3)
+        }
+        case 11 {
+            n := try t.varint()
+            if n == 0: return
+            kv := try t.byte()
+            for _ in range n {
+                try t.skip(kv >> 4)
+                try t.skip(kv & 15)
+            }
+        }
+        case 12 {
+            id I64 = 0
+            for {
+                f, k := try t.field(id)
+                if k == 0: return
+                try t.skip(k)
+                id = f
+            }
+        }
+        case _: error ParquetError.Malformed
+    }
+    if t.pos > t.src.Len(): error ParquetError.Malformed
+}
+
+# ---- the metadata ----
+
+# a column of a row group: where its chunk is and how it is stored
+type chunk struct() {
+    kind I64 = 0        # the physical type: 1 INT32, 2 INT64, 4 FLOAT, 5 DOUBLE, 6 BYTE_ARRAY
+    codec I64 = 0       # 0 UNCOMPRESSED, 1 SNAPPY
+    values I64 = 0
+    start I64 = 0       # the dictionary page's offset if there is one, else the first data page's
+    size I64 = 0        # total_compressed_size
+    optional Bool = true
+}
+
+type group struct(Rows I64, chunks Array<chunk>&) {
+    Rows
+    chunks
+}
+
+fn (t mut thrift&) columnMeta(c mut chunk&) ? ParquetError {
+    id I64 = 0
+    data I64 = 0
+    dict I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: break
+        id = f
+        match f {
+            case 1: c.kind = try t.zigzag()
+            case 4: c.codec = try t.zigzag()
+            case 5: c.values = try t.zigzag()
+            case 7: c.size = try t.zigzag()
+            case 9: data = try t.zigzag()
+            case 11: dict = try t.zigzag()
+            case _: try t.skip(k)
+        }
+    }
+    c.start = dict if dict > 0 and dict < data else data
+}
+
+fn (t mut thrift&) columnChunk() chunk ? ParquetError {
+    c := chunk()
+    id I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: return c
+        id = f
+        if f == 3 and k == 12 {
+            try t.columnMeta(c)
+            continue
+        }
+        try t.skip(k)
+    }
+}
+
+fn (t mut thrift&) rowGroup(optional Array<Bool>&) group ? ParquetError {
+    chunks := Vec<chunk>()
+    rows I64 = 0
+    id I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: break
+        id = f
+        if f == 1 and k == 9 {
+            n, _ := try t.list()
+            for i in range n {
+                c := try t.columnChunk()
+                if i >= optional.Len(): error ParquetError.Malformed
+                c.optional = optional[i]
+                chunks.Push(c)
+            }
+            continue
+        }
+        if f == 3 {
+            rows = try t.zigzag()
+            continue
+        }
+        try t.skip(k)
+    }
+    return group(rows, chunks.ToArray())
+}
+
+# a schema element: its name, and whether it is optional (repetition 1) - the root, with children, is left out
+fn (t mut thrift&) schemaElement(names mut Vec<String&>&, optional mut Vec<Bool>&) ? ParquetError {
+    id I64 = 0
+    name String& = ""
+    rep I64 = 0
+    children I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: break
+        id = f
+        match f {
+            case 3: rep = try t.zigzag()
+            case 4: name ~ String(try t.binary())
+            case 5: children = try t.zigzag()
+            case _: try t.skip(k)
+        }
+    }
+    if children > 0 and names.Len() == 0 and optional.Len() == 0 {
+        optional.Push(false)  # the root's place, dropped by the caller
+        return
+    }
+    if children > 0: error ParquetError.Unsupported
+    names.Push(name)
+    optional.Push(rep == 1)
+}
+
+# ---- the file ----
+
+# a Parquet file open for reading: its columns' names, its row groups
+type Parquet unique struct(file os.File, Rows I64, Names Array<String&>&, groups Array<group>&) {
+    file
+    Rows
+    Names
+    groups
+}
+
+fn readAt(fd I32, at I64, n I64) Array<U8>& ? ParquetError {
+    buf := Array<U8>(n)
+    got I64 = 0
+    for got < n {
+        r := unistd.pread(fd, buf[got:], U64(n - got), at + got)
+        if r <= 0: error ParquetError.Malformed
+        got += r
+    }
+    return buf
+}
+
+# the Parquet file at path, its footer read
+fn Parquet.Open(path String&) Parquet ? os.Error, ParquetError {
+    size := (try os.FileInfo.Stat(path)).Size
+    if size < 12: error ParquetError.Malformed
+    footer := try os.File.Open(path)
+    tail := try readAt(footer.Fd(), size - 8, 8)
+    if String(tail[4:]) != "PAR1": error ParquetError.Malformed
+    n := I64(tail[0]) | (I64(tail[1]) << 8) | (I64(tail[2]) << 16) | (I64(tail[3]) << 24)
+    if n <= 0 or n > size - 12: error ParquetError.Malformed
+    t := thrift(try readAt(footer.Fd(), size - 8 - n, n), 0)
+    names := Vec<String&>()
+    optional := Vec<Bool>()
+    groups := Vec<group>()
+    rows I64 = 0
+    id I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: break
+        id = f
+        if f == 2 and k == 9 {
+            m, _ := try t.list()
+            for _ in range m: try t.schemaElement(names, optional)
+            continue
+        }
+        if f == 3 {
+            rows = try t.zigzag()
+            continue
+        }
+        if f == 4 and k == 9 {
+            m, _ := try t.list()
+            flags := optional.ToArray()[optional.Len() - names.Len():]
+            for _ in range m: groups.Push(try t.rowGroup(flags))
+            continue
+        }
+        try t.skip(k)
+    }
+    for g in groups {
+        if g.chunks.Len() != names.Len(): error ParquetError.Malformed
+    }
+    return Parquet(try os.File.Open(path), rows, names.ToArray(), groups.ToArray())
+}
+
+# how many row groups
+fn (p Parquet&) Groups() I64 { return p.groups.Len() }
+
+# the rows of row group g
+fn (p Parquet&) GroupRows(g I64) I64 { return p.groups[g].Rows }
+
+# the index of the column named
+fn (p Parquet&) Column(name String&) I64 ? ParquetError {
+    for i, n in p.Names {
+        if n == name: return i
+    }
+    error ParquetError.NoColumn
+}
+
+# ---- pages ----
+
+# a page's header: its type, sizes and what a data page says
+type page struct() {
+    kind I64 = -1          # 0 DATA_PAGE, 2 DICTIONARY_PAGE, 3 DATA_PAGE_V2
+    raw I64 = 0            # uncompressed_page_size
+    packed I64 = 0         # compressed_page_size
+    values I64 = 0
+    encoding I64 = 0
+    defBytes I64 = 0       # v2: the definition levels' length, stored uncompressed
+    repBytes I64 = 0
+    compressed Bool = true # v2: is_compressed
+}
+
+fn (t mut thrift&) pageHeader() page ? ParquetError {
+    h := page()
+    id I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: return h
+        id = f
+        match f {
+            case 1: h.kind = try t.zigzag()
+            case 2: h.raw = try t.zigzag()
+            case 3: h.packed = try t.zigzag()
+            case 5, 7, 8 {
+                if k != 12: error ParquetError.Malformed
+                try t.subHeader(h, f)
+            }
+            case _: try t.skip(k)
+        }
+    }
+}
+
+# a DataPageHeader (5), DictionaryPageHeader (7) or DataPageHeaderV2 (8) into h
+fn (t mut thrift&) subHeader(h mut page&, which I64) ? ParquetError {
+    id I64 = 0
+    for {
+        f, k := try t.field(id)
+        if k == 0: return
+        id = f
+        if f == 1 {
+            h.values = try t.zigzag()
+            continue
+        }
+        if which != 8 and f == 2 or which == 8 and f == 4 {
+            h.encoding = try t.zigzag()
+            continue
+        }
+        if which == 8 and f == 5 {
+            h.defBytes = try t.zigzag()
+            continue
+        }
+        if which == 8 and f == 6 {
+            h.repBytes = try t.zigzag()
+            continue
+        }
+        if which == 8 and f == 7 {
+            h.compressed = k == 1
+            continue
+        }
+        try t.skip(k)
+    }
+}
+
+# the hybrid RLE/bit-packed runs of src, n values of bit width w, into out
+fn hybrid(src Array<U8>&, w I64, n I64, out mut Array<I32>&) ? ParquetError {
+    t := thrift(src, 0)
+    bytes := (w + 7) / 8
+    mask := (I64(1) << w) - 1
+    o I64 = 0
+    for o < n {
+        h := try t.varint()
+        if h & 1 == 0 {
+            if t.pos + bytes > src.Len(): error ParquetError.Malformed
+            v I64 = 0
+            for k in range bytes: v |= I64(src[t.pos + k]) << (8 * k)
+            t.pos += bytes
+            run := (h >> 1).Min(n - o)
+            for k in range run: out[o + k] = I32(v)
+            o += run
+            continue
+        }
+        count := (h >> 1) * 8
+        if t.pos + (h >> 1) * w > src.Len(): error ParquetError.Malformed
+        bit := t.pos * 8
+        for k in range count.Min(n - o) {
+            at := bit + k * w
+            v I64 = 0
+            for b in range w: v |= ((I64(src[(at + b) >> 3]) >> ((at + b) & 7)) & 1) << b
+            out[o + k] = I32(v & mask)
+        }
+        t.pos += (h >> 1) * w
+        o += count.Min(n - o)
+    }
+}
+
+# what one column of a row group decodes to: the dictionary's values and each row's, as byte ranges of the pages'
+# bytes kept (text), or numbers
+type decoded struct() {
+    bufs mut Vec<Array<U8>&>& = Vec<Array<U8>&>()
+    dictBuf I64 = -1
+    dictStarts mut Vec<I64>& = Vec<I64>()
+    dictLens mut Vec<I64>& = Vec<I64>()
+    dictNums mut Vec<F64>& = Vec<F64>()
+    texts mut Vec<String&>& = Vec<String&>()
+    nums mut Vec<F64>& = Vec<F64>()
+}
+
+# the plain value of type kind at body[at:]: its number (text gives NaN), and where it ends
+fn plainNumber(body Array<U8>&, at I64, kind I64) F64, I64 ? ParquetError {
+    width := 4 if kind == 1 or kind == 4 else 8
+    if at + width > body.Len(): error ParquetError.Malformed
+    v U64 = 0
+    for k in range width: v |= U64(body[at + k]) << U64(8 * k)
+    x := match kind {
+        case 1: F64(I32(U32(v)))
+        case 2: F64(I64(v))
+        case 4: F64(F32.FromBits(U32(v)))
+        case _: F64.FromBits(v)
+    }
+    return x, at + width
+}
+
+fn (c chunk&) numeric() Bool { return c.kind == 1 or c.kind == 2 or c.kind == 4 or c.kind == 5 }
+
+# the page's body, decompressed
+fn unpack(c chunk&, body Array<U8>&, raw I64) Array<U8>& ? ParquetError {
+    if c.codec == 0: return body
+    if c.codec != 1: error ParquetError.Unsupported
+    out := Array<U8>(raw)
+    try snappy.Unsnappy(body, out) catch { error ParquetError.Malformed }
+    return out
+}
+
+# the dictionary page's values, PLAIN, into d
+fn (d mut decoded&) dictionary(c chunk&, body Array<U8>&, n I64) ? ParquetError {
+    d.bufs.Push(body)
+    d.dictBuf = d.bufs.Len() - 1
+    at I64 = 0
+    for _ in range n {
+        if c.numeric() {
+            x, next := try plainNumber(body, at, c.kind)
+            d.dictNums.Push(x)
+            at = next
+            continue
+        }
+        if at + 4 > body.Len(): error ParquetError.Malformed
+        len := I64(body[at]) | (I64(body[at + 1]) << 8) | (I64(body[at + 2]) << 16) | (I64(body[at + 3]) << 24)
+        if at + 4 + len > body.Len(): error ParquetError.Malformed
+        d.dictStarts.Push(at + 4)
+        d.dictLens.Push(len)
+        at += 4 + len
+    }
+}
+
+# n rows of a data page: defs says which are present (1) or null (0); values from body[at:]
+fn (d mut decoded&) values(c chunk&, body Array<U8>&, at I64, encoding I64, defs Array<I32>&, n I64) ? ParquetError {
+    present := defs.Count(fn(x): return x == 1)
+    if encoding == 2 or encoding == 8 {
+        if at >= body.Len() and present > 0: error ParquetError.Malformed
+        idx := Array<I32>(present)
+        if present > 0: try hybrid(body[at + 1:], I64(body[at]), present, idx)
+        k I64 = 0
+        dict := d.bufs.At(d.dictBuf) if d.dictBuf >= 0 else Array<U8>(0)
+        for r in range n {
+            if defs[r] == 0 {
+                d.push(c, "", F64.NaN)
+                continue
+            }
+            i := I64(idx[k])
+            k += 1
+            if c.numeric() {
+                if i >= d.dictNums.Len(): error ParquetError.Malformed
+                d.nums.Push(d.dictNums.At(i))
+                continue
+            }
+            if i >= d.dictStarts.Len(): error ParquetError.Malformed
+            s := d.dictStarts.At(i)
+            d.texts.Push(String(dict[s:s + d.dictLens.At(i)]))
+        }
+        return
+    }
+    if encoding != 0: error ParquetError.Unsupported
+    for r in range n {
+        if defs[r] == 0 {
+            d.push(c, "", F64.NaN)
+            continue
+        }
+        if c.numeric() {
+            x, next := try plainNumber(body, at, c.kind)
+            d.nums.Push(x)
+            at = next
+            continue
+        }
+        if at + 4 > body.Len(): error ParquetError.Malformed
+        len := I64(body[at]) | (I64(body[at + 1]) << 8) | (I64(body[at + 2]) << 16) | (I64(body[at + 3]) << 24)
+        if at + 4 + len > body.Len(): error ParquetError.Malformed
+        d.texts.Push(String(body[at + 4:at + 4 + len]))
+        at += 4 + len
+    }
+}
+
+fn (d mut decoded&) push(c chunk&, text String&, x F64) {
+    if c.numeric() {
+        d.nums.Push(x)
+        return
+    }
+    d.texts.Push(text)
+}
+
+# column col of row group g, decoded
+fn (p Parquet&) decode(g I64, col I64) decoded ? ParquetError {
+    c := p.groups[g].chunks[col]
+    if c.kind != 6 and not c.numeric(): error ParquetError.Unsupported
+    raw := try readAt(p.file.Fd(), c.start, c.size)
+    t := thrift(raw, 0)
+    d := decoded()
+    rows I64 = 0
+    for rows < c.values and t.pos < raw.Len() {
+        h := try t.pageHeader()
+        if t.pos + h.packed > raw.Len(): error ParquetError.Malformed
+        stored := raw[t.pos:t.pos + h.packed]
+        t.pos += h.packed
+        if h.kind == 2 {
+            try d.dictionary(c, try unpack(c, stored, h.raw), h.values)
+            continue
+        }
+        if h.kind == 0 {
+            body := try unpack(c, stored, h.raw)
+            d.bufs.Push(body)
+            defs := Array<I32>(h.values)
+            at I64 = 0
+            if c.optional {
+                if body.Len() < 4: error ParquetError.Malformed
+                len := I64(body[0]) | (I64(body[1]) << 8) | (I64(body[2]) << 16) | (I64(body[3]) << 24)
+                if 4 + len > body.Len(): error ParquetError.Malformed
+                try hybrid(body[4:4 + len], 1, h.values, defs)
+                at = 4 + len
+            } else {
+                for r in range h.values: defs[r] = 1
+            }
+            try d.values(c, body, at, h.encoding, defs, h.values)
+            rows += h.values
+            continue
+        }
+        if h.kind == 3 {
+            levels := h.repBytes + h.defBytes
+            if h.repBytes != 0 or levels > stored.Len(): error ParquetError.Unsupported
+            defs := Array<I32>(h.values)
+            if c.optional {
+                try hybrid(stored[h.repBytes:levels], 1, h.values, defs)
+            } else {
+                for r in range h.values: defs[r] = 1
+            }
+            rest := stored[levels:]
+            body := try unpack(c, rest, h.raw - levels) if h.compressed else rest
+            d.bufs.Push(body)
+            try d.values(c, body, 0, h.encoding, defs, h.values)
+            rows += h.values
+            continue
+        }
+    }
+    if rows != c.values: error ParquetError.Malformed
+    return d
+}
+
+# column col of row group g as text, one a row (a null is ""); the texts are views of the pages read, nothing copied
+fn (p Parquet&) Texts(g I64, col I64) Array<String&>& ? ParquetError {
+    if p.groups[g].chunks[col].kind != 6: error ParquetError.Unsupported
+    d := try p.decode(g, col)
+    return d.texts.ToArray()
+}
+
+# column col of row group g as numbers, one a row (a null is NaN)
+fn (p Parquet&) Numbers(g I64, col I64) Array<F64>& ? ParquetError {
+    if not p.groups[g].chunks[col].numeric(): error ParquetError.Unsupported
+    d := try p.decode(g, col)
+    return d.nums.ToArray()
+}
+
+# ---- tests ----
+
+test hybrid "an RLE run then a bit-packed group" {
+    # run of 3 ones (header 6, value 1), then one group of 8 at width 1: 0b10110010
+    src := Array<U8>[6, 1, 3, 0b10110010]
+    out := Array<I32>(11)
+    try hybrid(src, 1, 11, out)
+    assert out[0] == 1 and out[2] == 1 and out[3] == 0 and out[4] == 1 and out[5] == 0 and out[7] == 1 and out[10] == 1
+}
+
+test thrift "fields, deltas, lists and skipped structs in the compact protocol" {
+    # struct { 1: i32 = -3 (zigzag 5), 2: list<i32> [1, 2], 5: struct { 1: binary "ab" }, 6: i64 = 7 } stop
+    src := Array<U8>[0x15, 5, 0x19, 0x25, 2, 4, 0x3C, 0x18, 2, 'a', 'b', 0, 0x16, 14, 0]
+    t := thrift(src, 0)
+    f, k := try t.field(0)
+    assert f == 1 and k == 5 and try t.zigzag() == -3
+    f2, k2 := try t.field(f)
+    assert f2 == 2 and k2 == 9
+    try t.skip(k2)
+    f3, k3 := try t.field(f2)
+    assert f3 == 5 and k3 == 12
+    try t.skip(k3)
+    f4, _ := try t.field(f3)
+    assert f4 == 6 and try t.zigzag() == 7
+    _, end := try t.field(f4)
+    assert end == 0 and t.pos == src.Len()
+}
+
+# a Hugging Face file when one has been fetched: OANN_PARQUET=path olang test data/parquet.olang
+test Parquet.Open "reads a real file's text and number columns when OANN_PARQUET names one" {
+    path := try os.Env("OANN_PARQUET") catch { return }
+    p := try Parquet.Open(path)
+    assert p.Groups() > 0 and p.Rows > 0
+    text := try p.Texts(0, try p.Column("text"))
+    assert text.Len() == p.GroupRows(0) and text[0].Len() > 0
+    total I64 = 0
+    for g in range p.Groups(): total += p.GroupRows(g)
+    assert total == p.Rows
+    score := try p.Numbers(0, try p.Column("int_score"))
+    assert score.Len() == p.GroupRows(0) and score[0] >= 0.0
+}
