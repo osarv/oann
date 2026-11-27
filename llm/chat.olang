@@ -1,5 +1,5 @@
-# llm/chat - what a model directory says about talking to it: the chat template its tokenizer has (ChatML for Qwen2.5
-# and Qwen3, DeepSeek-R1's for the models distilled from it), its stop tokens and sampling defaults
+# llm/chat - what a model directory says about talking to it: the chat template its tokenizer has (ChatML for Qwen2.5,
+# Qwen3, SmolLM; DeepSeek-R1's for the models distilled from it; Llama 3's; Granite's), its stop tokens and sampling defaults
 # (generation_config.json), and fetching a model's files from Hugging Face.
 #
 # Templates. Each model ships a Jinja template (tokenizer_config.json); these are the strings they make for a system
@@ -7,17 +7,27 @@
 #     ChatML (Qwen):      [<|im_start|>system\n{system}<|im_end|>\n]<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
 #                         and, with thinking off (Qwen3's enable_thinking=False), <think>\n\n</think>\n\n after it
 #     DeepSeek-R1:        <｜begin▁of▁sentence｜>{system}<｜User｜>{prompt}<｜Assistant｜><think>\n
+#     Llama 3:            <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\n
+#                         Today Date: 27 Nov 2026\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>
+#                         <|start_header_id|>assistant<|end_header_id|>\n\n
+#     Granite:            <|start_of_role|>system<|end_of_role|>{system}<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>
+#                         {prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>, the system by default Granite's own
+#                         (its knowledge cutoff, today's date, "You are Granite, developed by IBM. ...")
+# The dates are today's, as the templates' strftime_now writes them.
 # The family is told by the added tokens the tokenizer has. DeepSeek-R1's template opens the thinking itself, so
 # Opening() gives "<think>\n" there: a completion written after it reads as Qwen3's does, thinking first.
 
 import "std/io"
 import "std/json"
 import "std/os"
+import "std/time"
 import "bpe"
 
 type Family enum {
     ChatMl
     DeepSeek
+    Llama3
+    Granite
     Plain               # no chat template: the prompt as it is
 }
 
@@ -51,6 +61,8 @@ fn Chat.Load(dir String&, t bpe.Bpe&) Chat {
     family := Family.Plain
     if t.Find("<|im_start|>") >= 0: family = Family.ChatMl
     if t.Find("<｜User｜>") >= 0: family = Family.DeepSeek
+    if t.Find("<|start_header_id|>") >= 0: family = Family.Llama3
+    if t.Find("<|start_of_role|>") >= 0: family = Family.Granite
     stops := Vec<I32>()
     temp F64 = 0.6
     topP F64 = 0.95
@@ -72,12 +84,14 @@ fn num(j json.Json&, key String&, d F64) F64 {
 
 # the stop tokens: generation_config's, and the end of a turn of the family's template
 fn endTokens(t bpe.Bpe&, f Family, given mut Vec<I32>&) Array<I32> {
-    names := match f {
-        case Family.ChatMl: ["<|im_end|>", "<|endoftext|>"]
-        case Family.DeepSeek: ["<｜end▁of▁sentence｜>", "<|EOT|>"]
-        case Family.Plain: ["<|endoftext|>", "</s>"]
+    names :~ match f {
+        case Family.ChatMl: "<|im_end|> <|endoftext|>"
+        case Family.DeepSeek: "<｜end▁of▁sentence｜> <|EOT|>"
+        case Family.Llama3: "<|eot_id|> <|end_of_text|> <|eom_id|>"
+        case Family.Granite: "<|end_of_text|>"
+        case Family.Plain: "<|endoftext|> </s>"
     }
-    for n in names {
+    for n in names.Split(" ") {
         id := t.Find(n)
         if id < 0: continue
         seen := false
@@ -96,8 +110,25 @@ fn (c Chat&) Prompt(user String&, system String& = "", think Bool = true) String
         return sys + "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" + ("" if think else "<think>\n\n</think>\n\n")
     }
     if c.Kind == Family.DeepSeek: return "<｜begin▁of▁sentence｜>" + system + "<｜User｜>" + user + "<｜Assistant｜><think>\n"
+    if c.Kind == Family.Llama3 {
+        d := time.Date.Local()
+        today := pad2(d.Day) + " " + months[d.Month - 1][:3] + " " + $d.Year
+        return "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: " + today +
+            "\n\n" + system + "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n" + user + "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    }
+    if c.Kind == Family.Granite {
+        d := time.Date.Local()
+        sys :~ system if system.Len() > 0 else "Knowledge Cutoff Date: April 2024.\nToday's Date: " + months[d.Month - 1] + " " + pad2(d.Day) + ", " + $d.Year +
+            ".\nYou are Granite, developed by IBM. You are a helpful AI assistant."
+        return "<|start_of_role|>system<|end_of_role|>" + sys + "<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>" + user +
+            "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    }
     return system + user
 }
+
+months Array<String>& = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+fn pad2(n I64) String { return ("0" if n < 10 else "") + $n }
 
 # what the template wrote of the answer already: a completion is this followed by the generated text
 fn (c Chat&) Opening() String {
@@ -143,4 +174,24 @@ fn get(repo String&, name String&, dir String&, loud Bool) Bool {
     }
     try os.Rename(part, path) catch { return false }
     return true
+}
+
+# ---- tests ----
+
+# the models under $OANN_MODELS with a chatref.json (llm/tools/tokref.py: transformers' apply_chat_template, today)
+test Chat "writes the prompt the model's own template writes, for every model under $OANN_MODELS with a chatref.json" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: return
+    for name in os.ReadDir(root)! {
+        dir := root + "/" + name
+        if not os.Exists(dir + "/chatref.json"): continue
+        t := bpe.Bpe.Load(dir + "/tokenizer.json")!
+        c := Chat.Load(dir, t)
+        refs :~ json.Json.Parse(os.ReadFile(dir + "/chatref.json")!)!.AsArr()!
+        # ChatML's templates differ in their default system prompt (SmolLM2's has one, Qwen's none): only the turn
+        # after a system prompt is held to them
+        if c.Kind != Family.ChatMl: assert c.Prompt("Hi") == refs[0].AsStr()!, name + ": " + c.Prompt("Hi")
+        assert c.Prompt("Hi", "SYS") == refs[1].AsStr()!, name + ": " + c.Prompt("Hi", "SYS")
+        assert c.Stops.Len() > 0
+    }
 }

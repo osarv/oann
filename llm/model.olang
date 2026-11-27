@@ -1,8 +1,11 @@
-# llm/model - open-weight decoder-only transformers run for inference: the Qwen2 and Qwen3 architectures (dense), as
-# their Hugging Face checkpoints have them (config.json and model.safetensors, or shards listed by
-# model.safetensors.index.json) - RMSNorm, rotary positions (the model's theta, linear scaling), grouped-query
-# attention, a SwiGLU perceptron; Qwen2's biases on the query, key and value projections, Qwen3's RMSNorm of each
-# query and key head (QK-norm) before the rotation; a head tied to the embedding or one of its own.
+# llm/model - open-weight decoder-only transformers run for inference: the dense architectures of the Qwen2, Qwen3,
+# Llama (Llama 3, SmolLM2), Mistral, Granite and SmolLM3 families, as their Hugging Face checkpoints have them
+# (config.json and model.safetensors, or shards listed by model.safetensors.index.json) - RMSNorm, rotary positions
+# (the model's theta; linear, Llama 3's and YaRN's scaling), grouped-query attention, a SwiGLU perceptron; Qwen2's
+# biases on the query, key and value projections, Qwen3's RMSNorm of each query and key head (QK-norm) before the
+# rotation; Granite's multipliers of the embedding, the residual branches, the scores and the logits; SmolLM3's layers
+# without rotation; a sliding window of attention where the config sets one; a head tied to the embedding or one of
+# its own.
 #
 # A step runs any set of rows through the model at once - each row one token of one sequence at its position, so a
 # step mixes the prompts being read (many rows of one sequence) with the sequences being decoded (one row each): the
@@ -44,7 +47,7 @@ type ModelError error {
 # ---- the configuration ----
 
 type Config struct() {
-    Arch String             # config.json's model_type: qwen2 or qwen3
+    Arch String             # config.json's model_type: qwen2, qwen3, llama, mistral, granite or smollm3
     Vocab I64
     Dim I64                 # hidden_size
     Layers I64
@@ -59,6 +62,67 @@ type Config struct() {
     Bias Bool               # biases on the query, key and value projections (Qwen2)
     Tied Bool               # the head is the embedding
     MaxPos I64              # max_position_embeddings
+    Rope String = "default" # rope_scaling's type: default, linear, llama3 or yarn
+    RopeFactor F64 = 1.0    # its factor
+    RopeLow F64 = 1.0       # llama3: low_freq_factor; yarn: beta_slow
+    RopeHigh F64 = 4.0      # llama3: high_freq_factor; yarn: beta_fast
+    RopeOld I64 = 8192      # original_max_position_embeddings
+    RopeAttn F64 = 1.0      # yarn: the factor on cos and sin (attention_factor, 0.1 ln(factor) + 1 by default)
+    EmbedScale F64 = 1.0    # the embedding times this (Granite's embedding_multiplier)
+    ResScale F64 = 1.0      # each branch's output times this before it is added (residual_multiplier)
+    ScoreScale F64 = 0.0    # the scores times this (attention_multiplier); 0: 1 / sqrt(HeadDim)
+    LogitScale F64 = 1.0    # the logits divided by this (logits_scaling)
+    NoRope mut Array<Bool>& = Array<Bool>(0)    # each layer: positions not rotated (SmolLM3's no_rope_layers 0); empty: all rotated
+    Window mut Array<I64>& = Array<I64>(0)      # each layer: the positions a row attends to, itself included (0: all); empty: all
+}
+
+# the architectures run
+Archs Array<String>& = ["qwen2", "qwen3", "llama", "mistral", "granite", "smollm3"]
+
+# layer li's rows attend to the positions after pos - window (0 every position)
+fn (c Config&) WindowOf(li I64) I64 { return c.Window[li] if c.Window.Len() > 0 else 0 }
+
+# whether layer li rotates its queries and keys
+fn (c Config&) Rotates(li I64) Bool { return c.NoRope.Len() == 0 or not c.NoRope[li] }
+
+# the scale of the scores
+fn (c Config&) Scale() F64 { return c.ScoreScale if c.ScoreScale > 0.0 else 1.0 / F64(c.HeadDim).Sqrt() }
+
+# YaRN: the dimension whose frequency turns "turns" times over the original context
+fn (c Config&) turnDim(turns F64) F64 { return F64(c.HeadDim) * (F64(c.RopeOld) / (turns * 2.0 * Pi)).Log() / (2.0 * c.Theta.Log()) }
+
+# the rotary frequencies of the pairs of a head's dimensions (i and i + HeadDim / 2), scaled as rope_scaling says
+# (linear scaling is PosScale's, applied to the positions)
+fn (c Config&) Freqs() Array<F64> {
+    half := c.HeadDim / 2
+    f := Array<F64>[c.Theta.Pow(-2.0 * F64(i) / F64(c.HeadDim)) for i in range half]
+    if c.Rope == "llama3" {
+        # Llama 3.1's: long wavelengths divided by the factor, short ones kept, those between blended
+        lowWave := F64(c.RopeOld) / c.RopeLow
+        highWave := F64(c.RopeOld) / c.RopeHigh
+        for i in range half {
+            wave := 2.0 * Pi / f[i]
+            if wave < highWave: continue
+            if wave > lowWave {
+                f[i] = f[i] / c.RopeFactor
+                continue
+            }
+            smooth := (F64(c.RopeOld) / wave - c.RopeLow) / (c.RopeHigh - c.RopeLow)
+            f[i] = (1.0 - smooth) * f[i] / c.RopeFactor + smooth * f[i]
+        }
+    } else if c.Rope == "yarn" {
+        # YaRN: frequencies that turn fewer than beta_slow times over the original context interpolated (divided by
+        # the factor), more than beta_fast times kept, a linear ramp between
+        dim := F64(c.HeadDim)
+        lo := c.turnDim(c.RopeHigh).Floor().Max(0.0)
+        hi := c.turnDim(c.RopeLow).Ceil().Min(dim - 1.0)
+        if hi == lo: hi += 0.001
+        for i in range half {
+            ramp := ((F64(i) - lo) / (hi - lo)).Max(0.0).Min(1.0)
+            f[i] = f[i] / c.RopeFactor * ramp + f[i] * (1.0 - ramp)
+        }
+    }
+    return f
 }
 
 fn intOr(j json.Json&, key String&, d I64) I64 {
@@ -81,7 +145,11 @@ fn Config.Parse(text String&) Config ? ModelError {
     j :~ try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
     c := Config()
     c.Arch = try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
-    if c.Arch != "qwen2" and c.Arch != "qwen3": error ModelError.Unsupported("model_type " + c.Arch + " (qwen2 and qwen3 run)")
+    known := false
+    for a in Archs {
+        if a == c.Arch: known = true
+    }
+    if not known: error ModelError.Unsupported("model_type " + c.Arch + " (" + Archs.Join(", ") + " run)")
     c.Vocab = intOr(j, "vocab_size", 0)
     c.Dim = intOr(j, "hidden_size", 0)
     c.Layers = intOr(j, "num_hidden_layers", 0)
@@ -95,21 +163,63 @@ fn Config.Parse(text String&) Config ? ModelError {
     c.Bias = boolOr(j, "attention_bias", c.Arch == "qwen2")
     c.Tied = boolOr(j, "tie_word_embeddings", false)
     c.MaxPos = intOr(j, "max_position_embeddings", 32768)
-    if j.Has("rope_scaling") {
-        rs :~ try j["rope_scaling"] catch { error ModelError.Malformed("rope_scaling") }
+    # rope_scaling, or transformers 5's rope_parameters (rope_theta in it)
+    key :~ "rope_scaling" if j.Has("rope_scaling") else "rope_parameters"
+    if j.Has(key) {
+        rs :~ try j[key] catch { error ModelError.Malformed(key) }
         if not rs.IsNull() {
-            kind String& = ""
+            c.Theta = numOr(rs, "rope_theta", c.Theta)
+            kind String& = "default"
             if rs.Has("rope_type"): kind ~ try (try rs["rope_type"] catch { error ModelError.Malformed("rope_type") }).AsStr() catch { error ModelError.Malformed("rope_type") }
             else if rs.Has("type"): kind ~ try (try rs["type"] catch { error ModelError.Malformed("type") }).AsStr() catch { error ModelError.Malformed("type") }
-            if kind == "linear": c.PosScale = numOr(rs, "factor", 1.0)
-            else if kind != "default": error ModelError.Unsupported("rope_scaling " + kind)
+            c.RopeFactor = numOr(rs, "factor", 1.0)
+            c.RopeOld = intOr(rs, "original_max_position_embeddings", intOr(j, "original_max_position_embeddings", c.MaxPos))
+            if kind == "linear" {
+                c.PosScale = c.RopeFactor
+            } else if kind == "llama3" {
+                c.Rope = kind
+                c.RopeLow = numOr(rs, "low_freq_factor", 1.0)
+                c.RopeHigh = numOr(rs, "high_freq_factor", 4.0)
+            } else if kind == "yarn" {
+                c.Rope = kind
+                c.RopeLow = numOr(rs, "beta_slow", 1.0)
+                c.RopeHigh = numOr(rs, "beta_fast", 32.0)
+                c.RopeAttn = numOr(rs, "attention_factor", 0.1 * c.RopeFactor.Log() + 1.0 if c.RopeFactor > 1.0 else 1.0)
+            } else if kind != "default" {
+                error ModelError.Unsupported("rope_scaling " + kind)
+            }
+        }
+    }
+    if c.Arch == "granite" {
+        c.EmbedScale = numOr(j, "embedding_multiplier", 1.0)
+        c.ResScale = numOr(j, "residual_multiplier", 1.0)
+        c.ScoreScale = numOr(j, "attention_multiplier", 0.0)
+        c.LogitScale = numOr(j, "logits_scaling", 1.0)
+    }
+    if c.Layers > 0 and j.Has("no_rope_layers") {
+        nr :~ try (try j["no_rope_layers"] catch { error ModelError.Malformed("no_rope_layers") }).AsArr() catch { error ModelError.Malformed("no_rope_layers") }
+        if nr.Len() < c.Layers: error ModelError.Malformed("no_rope_layers")
+        c.NoRope ~ Array<Bool>[(try nr[i].AsInt() catch { error ModelError.Malformed("no_rope_layers") }) == 0 for i in range c.Layers]
+    }
+    # a sliding window: Mistral's sliding_window, Qwen2's where use_sliding_window is set (on the layers from
+    # max_window_layers), every layer's or the layer_types' "sliding_attention"
+    window := intOr(j, "sliding_window", 0)
+    if window > 0 and c.Layers > 0 and boolOr(j, "use_sliding_window", true) {
+        from := intOr(j, "max_window_layers", 0) if c.Arch == "qwen2" or c.Arch == "qwen3" else 0
+        c.Window ~ Array<I64>[window if i >= from else 0 for i in range c.Layers]
+        if j.Has("layer_types") {
+            lt :~ try (try j["layer_types"] catch { error ModelError.Malformed("layer_types") }).AsArr() catch { error ModelError.Malformed("layer_types") }
+            for i in range c.Layers.Min(lt.Len()) {
+                kind :~ try lt[i].AsStr() catch { error ModelError.Malformed("layer_types") }
+                c.Window[i] = window if kind == "sliding_attention" else 0
+            }
         }
     }
     if c.Vocab <= 0 or c.Dim <= 0 or c.Layers <= 0 or c.Heads <= 0 or c.KvHeads <= 0 or c.Ffn <= 0 or c.Heads % c.KvHeads != 0 {
         error ModelError.Malformed("config.json's sizes")
     }
-    if c.Dim % 32 != 0 or c.Ffn % 32 != 0 or c.HeadDim % 32 != 0 or c.Vocab % 16 != 0 or (c.Heads * c.HeadDim) % 32 != 0 {
-        error ModelError.Unsupported("sizes that are not multiples of 32 (16 for the vocabulary)")
+    if c.Dim % 32 != 0 or c.Ffn % 32 != 0 or c.HeadDim % 32 != 0 or (c.Heads * c.HeadDim) % 32 != 0 {
+        error ModelError.Unsupported("sizes that are not multiples of 32")
     }
     if c.Heads / c.KvHeads > 16: error ModelError.Unsupported("more than 16 query heads to a key-value head")
     return c
@@ -327,7 +437,7 @@ type Model struct(C Config, Tile Bool, Int8 Bool = false) {
     for _ in range C.Layers: made.Push(Layer(C, Tile, Int8))
     Layers mut Array<Layer>& = made.ToArray()
     Embed Linear = Linear(C.Dim, C.Vocab if not C.Tied else 0, 16, false)   # row-major; empty when tied
-    Head Linear = Linear(C.Dim, C.Vocab, blockOf([C.Vocab]), Tile)
+    Head Linear = Linear(C.Dim, roundUp(C.Vocab, 16), blockOf([roundUp(C.Vocab, 16)]), Tile)   # rows past Vocab 0
     Final mut Array<F32>& = Array<F32>(C.Dim)
     Threads I64 = gemm.Cores()
 }
@@ -463,7 +573,7 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     SplitK Bool = true                              # a few rows' attention split by pages over the tasks
     part mut Array<F32>& = Array<F32>(maxUnits(m.C, Rows, MaxCtx) * partWidth(m.C))   # split items' partial softmaxes
     uoff mut Array<I64>& = Array<I64>(Rows * m.C.KvHeads + 1)                         # each item's first unit
-    Logits mut Array<F32>& = Array<F32>(roundUp(Outs, 16) * m.C.Vocab)
+    Logits mut Array<F32>& = Array<F32>(roundUp(Outs, 16) * m.Head.Out)
     x mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
     h mut Array<F32>& = Array<F32>(roundUp(Rows, 16) * widest(m.C))
     qkv mut Array<F32>& = Array<F32>(roundUp(Rows, 16) * (m.C.Heads + 2 * m.C.KvHeads) * m.C.HeadDim)
@@ -474,12 +584,12 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     scs mut Array<F32>& = Array<F32>(m.Threads * 128)                                             # and its scales
     cos mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2)
     sin mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2)
-    freq Array<F64>& = Array<F64>[m.C.Theta.Pow(-2.0 * F64(i) / F64(m.C.HeadDim)) for i in range m.C.HeadDim / 2]
+    freq Array<F64>& = m.C.Freqs()
     tasks := Vec<Attend>()
     for _ in range m.Threads: tasks.Push(Attend(m.C, MaxCtx, m.Tile))
     work mut Array<Attend>& = tasks.ToArray()
     ws gemm.Workspace<F32> = gemm.Workspace<F32>(m.Threads)
-    ws.Reserve(m.C.Vocab.Max(2 * m.C.Ffn).Max(Rows))
+    ws.Reserve(m.Head.Out.Max(2 * m.C.Ffn).Max(Rows))
 }
 
 fn roundUp(n I64, m I64) I64 { return (n + m - 1) / m * m }
@@ -609,8 +719,8 @@ fn (m Model&) angles(s mut State&) {
         p := F64(s.Pos[r]) / m.C.PosScale
         for i in range half {
             a := p * s.freq[i]
-            s.cos[r * half + i] = F32(a.Cos())
-            s.sin[r * half + i] = F32(a.Sin())
+            s.cos[r * half + i] = F32(a.Cos() * m.C.RopeAttn)
+            s.sin[r * half + i] = F32(a.Sin() * m.C.RopeAttn)
         }
     }
 }
@@ -644,7 +754,12 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         } else {
             for i in range d: s.x[r * d + i] = F32(m.Embed.W[t * d + i])
         }
+        if c.EmbedScale != 1.0 {
+            es := F32(c.EmbedScale)
+            for i in range d: s.x[r * d + i] *= es
+        }
     }
+    rs := F32(c.ResScale)
     m.angles(s)
     for li in range c.Layers {
         l := m.Layers[li]
@@ -667,7 +782,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         t1 = time.Now()
         m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.att, n, l.O)
         tm += time.Since(t1)
-        for i in range n * d: s.x[i] += s.y[i]
+        for i in range n * d: s.x[i] += s.y[i] * rs
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm2, c.Eps)
         t1 = time.Now()
         m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.h, n, l.GateUp)
@@ -682,7 +797,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         t1 = time.Now()
         m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.h, n, l.Down)
         tm += time.Since(t1)
-        for i in range n * d: s.x[i] += s.y[i]
+        for i in range n * d: s.x[i] += s.y[i] * rs
     }
     # the final norm of the rows that want logits, gathered in order, and the head
     for r in range n {
@@ -692,6 +807,16 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
     }
     t1 = time.Now()
     m.linear(s.xb, s.deq, s.scs, s.ws, s.Logits, s.h, s.NOut, m.Head)
+    if m.Head.Out != c.Vocab {
+        # a vocabulary not a multiple of 16: the head's padded rows dropped, each row's logits moved down to Vocab apart
+        for j in range s.NOut {
+            for v in range c.Vocab: s.Logits[j * c.Vocab + v] = s.Logits[j * m.Head.Out + v]
+        }
+    }
+    if c.LogitScale != 1.0 {
+        ls := F32(1.0 / c.LogitScale)
+        for i in range s.NOut * c.Vocab: s.Logits[i] *= ls
+    }
     tm += time.Since(t1)
     all := time.Since(t0)
     s.Times[0] += tm
@@ -719,7 +844,7 @@ fn headsOf(c Config&, l Layer&, qkv mut Array<F32>&, cos Array<F32>&, sin Array<
         for hh in range c.Heads + c.KvHeads {
             ho := o + hh * hd
             if c.QkNorm: rmsNorm(qkv, ho, qkv, ho, 1, hd, hd, l.QNorm if hh < c.Heads else l.KNorm, c.Eps)
-            rotate(qkv, ho, cos, sin, r, hd / 2)
+            if c.Rotates(li): rotate(qkv, ho, cos, sin, r, hd / 2)
         }
         store(c, qkv, pos, slot, k, li, r)
     }
@@ -778,7 +903,8 @@ fn store(c Config&, qkv Array<F32>&, posOf Array<I64>&, slot Array<I64>&, k mut 
 fn (m Model&) attention(s mut State&, k Cache&, li I64) {
     items := s.N * m.C.KvHeads
     for it in range items {
-        np := s.Pos[it / m.C.KvHeads] / PageSize + 1
+        p := s.Pos[it / m.C.KvHeads]
+        np := p / PageSize + 1 - firstPos(m.C, li, p) / PageSize
         s.uoff[it + 1] = s.uoff[it] + ((np + ChunkPages - 1) / ChunkPages if s.SplitK else 1)
     }
     units := s.uoff[items]
@@ -791,6 +917,12 @@ fn (m Model&) attention(s mut State&, k Cache&, li I64) {
         }
     }
     if units > items: joinParts(m.C, s.att, s.part, s.uoff, items)
+}
+
+# the first position a row at position p attends to at layer li (its window's)
+fn firstPos(c Config&, li I64, p I64) I64 {
+    w := c.WindowOf(li)
+    return (p - w + 1).Max(0) if w > 0 else 0
 }
 
 # the pages of a run of an item's attention
@@ -848,7 +980,7 @@ fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
     g := c.Heads / c.KvHeads
     w3 := (c.Heads + 2 * c.KvHeads) * hd
     stride := a.s.Len() / 16
-    scale := F32(1.0 / F64(hd).Sqrt())
+    scale := F32(c.Scale())
     span := hd * PageSize
     pw := partWidth(c)
     # the item of u0
@@ -867,11 +999,14 @@ fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
         h := it % c.KvHeads
         p := pos[r]
         np := p / PageSize + 1
-        pa := (u - uoff[it]) * ChunkPages if chunks > 1 else 0
+        first := firstPos(c, li, p)
+        fp := first / PageSize                      # the window's first page
+        pa := fp + (u - uoff[it]) * ChunkPages if chunks > 1 else fp
         pb := (pa + ChunkPages).Min(np) if chunks > 1 else np
         row := slot[r] * k.MaxPages
         n := (pb - pa) * PageSize                   # the positions of the run's pages
         valid := (p + 1).Min(pb * PageSize) - pa * PageSize
+        skip := (first - pa * PageSize).Max(0)      # the run's positions before the window: weight 0
         if tile {
             for j in range g {
                 for i in range hd: a.q[j * hd + i] = BF16(qkv[r * w3 + (h * g + j) * hd + i])
@@ -908,9 +1043,10 @@ fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
         # a time)
         for j in range g {
             so := j * stride
-            top := elem.MaxIn<F32, F32>(a.s, so, valid) * scale
-            for t in range valid: a.s[so + t] = elem.FastExp(a.s[so + t] * scale - top)
-            total := elem.SumIn<F32, F32>(a.s, so, valid)
+            top := elem.MaxIn<F32, F32>(a.s, so + skip, valid - skip) * scale
+            for t in range skip, valid: a.s[so + t] = elem.FastExp(a.s[so + t] * scale - top)
+            total := elem.SumIn<F32, F32>(a.s, so + skip, valid - skip)
+            for t in range skip: a.s[so + t] = 0.0
             for t in range valid, n: a.s[so + t] = 0.0
             a.ml[j] = top
             a.ml[16 + j] = total
@@ -1017,6 +1153,38 @@ fn TinyTied(qwen3 Bool, seed U64, tied Bool, vocab I64 = 96) String {
             put(w, r, p + "self_attn.k_proj.bias", 1, kv, 0.5, 0.0)
             put(w, r, p + "self_attn.v_proj.bias", 1, kv, 0.5, 0.0)
         }
+    }
+    w.Save(dir + "/model.safetensors")!
+    return dir
+}
+
+# a small Llama-shaped model of random weights (no biases, no QK-norm, a head of its own) of architecture arch, the
+# config's other keys "extra" (",\"key\": value" ...), written as a Hugging Face checkpoint to a new directory
+fn TinyArch(arch String&, extra String&, seed U64) String {
+    dir :~ os.MkTemp("", "llm")!
+    vocab, dim, heads, kvHeads, hd, ffn, layers := 96, 64, 4, 2, 32, 96, 3
+    cfg := "{\"model_type\": \"" + arch + "\", \"vocab_size\": " + $vocab + ", \"hidden_size\": " + $dim +
+        ", \"num_hidden_layers\": " + $layers + ", \"num_attention_heads\": " + $heads + ", \"num_key_value_heads\": " + $kvHeads +
+        ", \"head_dim\": " + $hd + ", \"intermediate_size\": " + $ffn + ", \"rope_theta\": 10000.0, \"rms_norm_eps\": 1e-6, " +
+        "\"tie_word_embeddings\": false, \"max_position_embeddings\": 4096" + extra + "}"
+    os.WriteFile(dir + "/config.json", cfg)!
+    r := rand.Rand(seed)
+    w := checkpoint.Writer()
+    put(w, r, "model.embed_tokens.weight", vocab, dim, 1.0, 0.0)
+    put(w, r, "lm_head.weight", vocab, dim, 0.3, 0.0)
+    put(w, r, "model.norm.weight", 1, dim, 0.1, 1.0)
+    q, kv := heads * hd, kvHeads * hd
+    for i in range layers {
+        p := "model.layers." + $i + "."
+        put(w, r, p + "self_attn.q_proj.weight", q, dim, 0.15, 0.0)
+        put(w, r, p + "self_attn.k_proj.weight", kv, dim, 0.15, 0.0)
+        put(w, r, p + "self_attn.v_proj.weight", kv, dim, 0.15, 0.0)
+        put(w, r, p + "self_attn.o_proj.weight", dim, q, 0.1, 0.0)
+        put(w, r, p + "mlp.gate_proj.weight", ffn, dim, 0.15, 0.0)
+        put(w, r, p + "mlp.up_proj.weight", ffn, dim, 0.15, 0.0)
+        put(w, r, p + "mlp.down_proj.weight", dim, ffn, 0.1, 0.0)
+        put(w, r, p + "input_layernorm.weight", 1, dim, 0.1, 1.0)
+        put(w, r, p + "post_attention_layernorm.weight", 1, dim, 0.1, 1.0)
     }
     w.Save(dir + "/model.safetensors")!
     return dir
@@ -1181,6 +1349,52 @@ test Model "a row's logits do not depend on the other rows of its step: two sequ
     os.RemoveAll(dir)!
 }
 
+test Config "reads the Llama, Mistral, Granite and SmolLM3 configs: rope scaling, multipliers, windows, layers without rotation" {
+    c := Config.Parse("{\"model_type\": \"llama\", \"vocab_size\": 96, \"hidden_size\": 64, \"num_hidden_layers\": 2, \"num_attention_heads\": 2, " +
+        "\"intermediate_size\": 64, \"rope_theta\": 500000.0, \"rope_scaling\": {\"rope_type\": \"llama3\", \"factor\": 32.0, " +
+        "\"low_freq_factor\": 1.0, \"high_freq_factor\": 4.0, \"original_max_position_embeddings\": 8192}}")!
+    assert c.Rope == "llama3" and c.RopeFactor == 32.0 and c.RopeOld == 8192 and not c.Bias and not c.QkNorm
+    f := c.Freqs()
+    assert f[0] == 1.0 and f[f.Len() - 1] < 500000.0.Pow(-2.0 * F64(f.Len() - 1) / 32.0) / 31.0
+    y := Config.Parse("{\"model_type\": \"qwen3\", \"vocab_size\": 96, \"hidden_size\": 64, \"num_hidden_layers\": 2, \"num_attention_heads\": 2, " +
+        "\"intermediate_size\": 64, \"rope_scaling\": {\"rope_type\": \"yarn\", \"factor\": 4.0, \"original_max_position_embeddings\": 32768}, " +
+        "\"sliding_window\": 4096, \"use_sliding_window\": false}")!
+    assert y.Rope == "yarn" and (y.RopeAttn - (0.1 * 4.0.Log() + 1.0)).Abs() < 1e-12 and y.Window.Len() == 0
+    g := Config.Parse("{\"model_type\": \"granite\", \"vocab_size\": 96, \"hidden_size\": 64, \"num_hidden_layers\": 2, \"num_attention_heads\": 2, " +
+        "\"intermediate_size\": 64, \"embedding_multiplier\": 12.0, \"residual_multiplier\": 0.22, \"attention_multiplier\": 0.0078125, \"logits_scaling\": 8.0}")!
+    assert g.EmbedScale == 12.0 and g.ResScale == 0.22 and g.Scale() == 0.0078125 and g.LogitScale == 8.0
+    m := Config.Parse("{\"model_type\": \"mistral\", \"vocab_size\": 96, \"hidden_size\": 64, \"num_hidden_layers\": 2, \"num_attention_heads\": 2, " +
+        "\"intermediate_size\": 64, \"sliding_window\": 4096}")!
+    assert m.WindowOf(0) == 4096 and m.WindowOf(1) == 4096
+    n := Config.Parse("{\"model_type\": \"smollm3\", \"vocab_size\": 96, \"hidden_size\": 64, \"num_hidden_layers\": 4, \"num_attention_heads\": 2, " +
+        "\"intermediate_size\": 64, \"no_rope_layers\": [1, 1, 1, 0]}")!
+    assert n.Rotates(0) and not n.Rotates(3)
+    bad := try Config.Parse("{\"model_type\": \"gpt_neox\", \"vocab_size\": 96}") catch default Config()
+    assert bad.Arch == ""
+}
+
+test Model "a sliding window: decoding a token a step and in runs of one page give the logits of reading the prompt at once" {
+    dir := TinyArch("mistral", ", \"sliding_window\": 100", 23)
+    whole := TinyArch("mistral", "", 23)
+    for exact in [true, false] {
+        m := Model.Load(dir, exact)!
+        full := Model.Load(whole, exact)!
+        assert m.C.WindowOf(2) == 100
+        toks := tokens(250, 8)
+        want := prefill(m, toks, exact)
+        other := prefill(full, toks, exact)
+        v := m.C.Vocab
+        # the same until the window first leaves a position out, different after
+        assert worst(want[:100 * v], other[:100 * v]) < 1e-5 * biggest(want) and worst(want[200 * v:], other[200 * v:]) > 0.01 * biggest(want)
+        ChunkPages = 1
+        got := decode(m, toks, false) if not exact else want
+        ChunkPages = 16
+        assert worst(want, got) < 0.01 * biggest(want), "exact " + $exact + ": " + $worst(want, got)
+    }
+    os.RemoveAll(dir)!
+    os.RemoveAll(whole)!
+}
+
 # the directory of a Hugging Face model under $OANN_MODELS, "" where it is not there
 fn reference(name String&) String {
     root :~ try os.Env("OANN_MODELS") catch default ""
@@ -1232,5 +1446,49 @@ test Model "matches the reference implementation on Qwen3-0.6B and DeepSeek-R1-D
         toks2, seen2 := greedy(fast, prompt, 10)
         assert toks2 == cont, dir + " (AMX): " + $toks2
         for i in range 4: assert (F64(seen2[i]) - want[i]).Abs() < 0.3, dir + " (AMX): logit " + $i + " is " + $seen2[i]
+    }
+}
+
+# llm/tools/reference.py's small models (Hugging Face transformers, F32): the logits of every position of 150 tokens
+test Model "matches transformers on small models of each architecture and option, where $OANN_MODELS has them (llm/tools/reference.py)" {
+    for name in ["llama3", "yarn", "granite", "smollm3", "mistral"] {
+        dir := reference("oann-tiny-" + name)
+        if dir.Len() == 0: continue
+        j :~ json.Json.Parse(os.ReadFile(dir + "/ref.json")!)!
+        tj :~ j["tokens"]!.AsArr()!
+        lj :~ j["logits"]!.AsArr()!
+        toks := Array<I32>[I32(t.AsInt()!) for t in tj]
+        want := Array<F32>[F32(x.AsNum()!) for x in lj]
+        for exact in [true, false] {
+            m := Model.Load(dir, exact)!
+            got := prefill(m, toks, exact)
+            tol := 1e-4 if exact else 0.03
+            assert worst(want, got) < tol * biggest(want), name + " exact " + $exact + ": " + $worst(want, got) + " of " + $biggest(want)
+        }
+    }
+}
+
+# real checkpoints with a ref.json of llm/tools/reference.py --real (transformers, F32): the last position's logits
+# over the whole vocabulary and ten greedy tokens
+test Model "matches transformers on SmolLM2, Llama 3.2 and Granite 3.3 checkpoints, where $OANN_MODELS has them" {
+    for name in ["HuggingFaceTB--SmolLM2-135M-Instruct", "unsloth--Llama-3.2-1B-Instruct", "ibm-granite--granite-3.3-2b-instruct"] {
+        dir := reference(name)
+        if dir.Len() == 0 or not os.Exists(dir + "/ref.json"): continue
+        j :~ json.Json.Parse(os.ReadFile(dir + "/ref.json")!)!
+        prompt := Array<I32>[I32(t.AsInt()!) for t in j["tokens"]!.AsArr()!]
+        last := Array<F32>[F32(x.AsNum()!) for x in j["last"]!.AsArr()!]
+        cont := Array<I32>[I32(t.AsInt()!) for t in j["greedy"]!.AsArr()!]
+        for exact in [true, false] {
+            m := Model.Load(dir, exact)!
+            k := Cache(m.C, 8, 1, 8, exact)
+            for i in range 8: k.Table[i] = k.Take()
+            s := State(m, prompt.Len(), prompt.Len(), 256)
+            for i, t in prompt: s.Add(t, I64(i), 0, true)
+            m.Step(s, k)
+            lg :~ s.LogitsOf(prompt.Len() - 1, m.C.Vocab)
+            if exact: assert worst(last, lg) < 1e-3 * biggest(last), name + ": " + $worst(last, lg) + " of " + $biggest(last)
+            toks, _ := greedy(m, prompt, 10)
+            assert toks == cont, name + " exact " + $exact + ": " + $toks + ", not " + $cont
+        }
     }
 }
