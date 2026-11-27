@@ -1,0 +1,253 @@
+# nn/tune - the loop that fine-tunes a language model: any graph with token inputs, classes and a loss (a
+# train.LanguageModel's handles), any batch source that fills rows and can say where it stands (data/chat's ChatRows),
+# any optimizer over what the graph trains (Params() - so a LoRA graph, whose frozen base is no parameter, is stepped as
+# any other). What it adds to nn/train's Fit:
+#
+# - Gradient accumulation: a step is Accum batches, forward and backward each, the gradients summed (Backward's
+#   accumulate) and scaled by 1 / Accum before clipping and the optimizer's step - the mean of the batches' gradients,
+#   each batch weighted alike, as a batch Accum times larger would give where every batch counts as many entries.
+# - Checkpoints that resume a run exactly, including where the data stood: the parameters and the optimizer's moments
+#   and step count (train.Write), the batch source's position (its Save: the epoch, the place in it, its generator's
+#   state) and the graph's dropout generator. A run given a checkpoint path that exists continues from it - run the
+#   same command again after an interruption and it carries on as if it never stopped.
+
+import "std/io"
+import "std/os"
+import "std/time"
+import "../ad/graph"
+import "../io/checkpoint"
+import "../io/runlog"
+import "../tensor"
+import "optim"
+import "train"
+
+# what a run is: how many steps (optimizer steps), the learning rate of each, the batches a step accumulates, the
+# clipping norm (none when 0), how often it reports and measures validation (EvalBatches batches of it), the checkpoint
+# it writes every CheckpointEvery steps and at the end and resumes from when it exists (none when ""), and the run's
+# record (none when Log is "")
+type Tune struct(Steps I64, Rate fn&(step I64) F64, Accum I64 = 1, Clip F64 = 1.0, Every I64 = 10, EvalEvery I64 = 100
+        EvalBatches I64 = 8, Checkpoint String = "", CheckpointEvery I64 = 0, Name String = "tune", Seed I64 = 1
+        Log String = "") {
+    Steps
+    Rate
+    Accum
+    Clip
+    Every
+    EvalEvery
+    EvalBatches
+    Checkpoint
+    CheckpointEvery
+    Name
+    Seed
+    Log
+}
+
+# the numbers a run's record starts with
+type Settings struct(Steps I64, Accum I64, Clip F64, Every I64, EvalEvery I64, EvalBatches I64, From I64, Batch I64) {
+    Steps
+    Accum
+    Clip
+    Every
+    EvalEvery
+    EvalBatches
+    From
+    Batch
+}
+
+# every gradient times k
+fn scale<G>(grads tensor.Tensor<G>&, k F64) {
+    d :~ grads.Flat()!
+    match G {
+        case F64 { for i in range d.Len(): d[i] = d[i] * k }
+        case _ {
+            f F32 = F32(k)
+            for i in range d.Len(): d[i] = G(F32(d[i]) * f)
+        }
+    }
+}
+
+# one optimizer step over "accum" batches of src: the mean of their losses, and the norm of the mean gradient before
+# clipping to "clip" (none when 0)
+fn Step<E, S, O>(g mut graph.Graph<E>&, m train.LanguageModel&, src mut S&, o mut O&, rate F64, clip F64, accum I64) F64, F64 ? {
+    g.Training = true
+    total F64 = 0.0
+    for k in range accum {
+        try src.Random(g.Ints(m.Tokens).Flat()!, g.Ints(m.Targets).Flat()!, g.Batch)
+        g.Forward(g.Batch)
+        g.Backward(m.Loss, accumulate = k > 0)
+        total += g.Scalar(m.Loss)
+    }
+    grads := g.ParamGrads()
+    if accum > 1: scale(grads, 1.0 / F64(accum))
+    norm F64 = optim.ClipNorm(grads, clip) if clip > 0.0 else 0.0
+    o.SetRate(rate)
+    o.Step()
+    g.SyncParams()
+    return total / F64(accum), norm
+}
+
+# ---- checkpoints ----
+
+fn words(s Array<U64>&) String { return [$x for x in s].Join(" ") }
+
+# the run at "step" (train.Write's), where data stands (its Save) and the graph's dropout generator, written whole to a
+# file of its own and renamed into place
+fn Save<E, O, S>(path String&, g graph.Graph<E>&, o O&, data S&, step I64) ? os.Error, checkpoint.SafetensorsError {
+    w := checkpoint.Writer()
+    try train.Write(w, g, o, step)
+    data.Save(w)
+    w.Meta("graph.rng", words(g.Rng.State()))
+    part := $path + ".part"
+    try w.Save(part)
+    try os.Rename(part, path)
+}
+
+type TuneError error {
+    Rng     # a checkpoint's dropout generator that is not one
+}
+
+# the run a checkpoint holds put back into g, o and data, built as the saved ones were: gives the step it had reached
+fn Resume<E, O, S>(path String&, g mut graph.Graph<E>&, o mut O&, data mut S&) I64 ? {
+    step := try train.Resume(path, g, o)
+    f := try checkpoint.File.Load(path)
+    try data.Load(f)
+    parts :~ (try f.Meta.Get("graph.rng") catch { error TuneError.Rng }).Split(" ")
+    if parts.Len() != 4: error TuneError.Rng
+    state := Array<U64>(4)
+    for i in range 4: state[i] = try parts[i].ParseUint() catch { error TuneError.Rng }
+    try g.Rng.SetState(state) catch { error TuneError.Rng }
+    return step
+}
+
+# ---- the run ----
+
+fn record(log mut runlog.Log&, p train.Progress&) ? runlog.RunLogError, io.Error {
+    s := runlog.Step(p.Step)
+    s.Metric("loss", p.Loss)
+    s.Metric("gradient_norm", p.Norm)
+    s.Metric("rate", p.Rate)
+    s.Metric("validation", p.Validation)
+    s.Time("training", p.Seconds)
+    try log.Add(s)
+}
+
+# trains m for cfg.Steps optimizer steps of cfg.Accum batches from "data", from where cfg.Checkpoint left off when it
+# exists: the validation loss on "valid" every cfg.EvalEvery steps and at the end, a report to "on" and a line in the
+# record every cfg.Every steps, checkpoints as cfg asks. Gives the last report (its Step the step resumed at, with no
+# losses, when the checkpoint had finished the run)
+fn Fit<E, S, V, O>(g mut graph.Graph<E>&, m train.LanguageModel&, data mut S&, valid mut V&, o mut O&, cfg Tune&
+        on fn&(p train.Progress&)) train.Progress ? {
+    from I64 = 0
+    if cfg.Checkpoint != "" and os.Exists(cfg.Checkpoint): from = try Resume(cfg.Checkpoint, g, o, data)
+    log := try runlog.Log.Open(cfg.Log if cfg.Log != "" else "/dev/null", cfg.Name, cfg.Seed
+        Settings(cfg.Steps, cfg.Accum, cfg.Clip, cfg.Every, cfg.EvalEvery, cfg.EvalBatches, from, g.Batch))
+    spent I64 = 0
+    window F64 = 0.0
+    last := train.Progress(from, 0.0, 0.0, 0.0, 0.0, F64.NaN)
+    for step in range from, cfg.Steps {
+        t0 := time.Now()
+        rate := cfg.Rate(step)
+        loss, norm := try Step(g, m, data, o, rate, cfg.Clip, cfg.Accum)
+        spent += time.Since(t0)
+        window += loss
+        done := step + 1
+        if done % cfg.Every == 0 or done == cfg.Steps {
+            measured := done % cfg.EvalEvery == 0 or done == cfg.Steps
+            checked := try train.LmEvaluate(g, m, valid, cfg.EvalBatches) if measured else F64.NaN
+            seen := done % cfg.Every if done % cfg.Every != 0 else cfg.Every
+            last = train.Progress(done, window / F64(seen), norm, rate, F64(spent) * 1e-9, checked)
+            window = 0.0
+            on(last)
+            try record(log, last)
+        }
+        if cfg.CheckpointEvery > 0 and done % cfg.CheckpointEvery == 0 and done < cfg.Steps: try Save(cfg.Checkpoint, g, o, data, done)
+    }
+    if cfg.Checkpoint != "" and from < cfg.Steps: try Save(cfg.Checkpoint, g, o, data, cfg.Steps)
+    return last
+}
+
+# ---- tests ----
+
+import "std/rand"
+import "../data/chat"
+import "../data/text"
+import "../llm/bpe"
+
+fn cycle(seed U64) text.Windows {
+    return text.Windows(Array<I32>[I32(i % 4) for i in range 800], 8, seed)
+}
+
+fn gpt(batch I64, vocab I64, ctx I64, seed U64, dropout F64 = 0.0) graph.Graph<F32>, train.LanguageModel {
+    g mut graph.Graph<F32>& = graph.Graph<F32>(batch)
+    m := train.LanguageModel.Gpt(g, vocab, ctx, 16, 2, 1, dropout)
+    g.Plan(rand.Rand(seed))!
+    return g, m
+}
+
+test Step "two accumulated batches of 2 step as one batch of 4 does: the same parameters after, within rounding" {
+    g4, m := gpt(4, 4, 8, 5)
+    g2, _ := gpt(2, 4, 8, 5)
+    assert g4.Params().Flat()! == g2.Params().Flat()!
+    o4 := optim.AdamW(g4.Params(), g4.ParamGrads(), rate = 0.01)
+    o2 := optim.AdamW(g2.Params(), g2.ParamGrads(), rate = 0.01)
+    d4 := cycle(1)
+    d2 := cycle(1)
+    for _ in range 3 {
+        a, na := Step(g4, m, d4, o4, 0.01, 1e9, 1)
+        b, nb := Step(g2, m, d2, o2, 0.01, 1e9, 2)
+        assert (a - b).Abs() < 1e-5 and (na - nb).Abs() < 1e-4 * na, "losses " + $a + " " + $b + ", norms " + $na + " " + $nb
+    }
+    p :~ g4.Params().Flat()!
+    q :~ g2.Params().Flat()!
+    worst F64 = 0.0
+    for i in range p.Len(): worst = worst.Max(F64(p[i] - q[i]).Abs())
+    assert worst < 1e-5, "largest difference " + $worst
+}
+
+# conversations through the tiny tokenizer of data/chat's tests
+fn chats(ctx I64, seed U64) chat.ChatData {
+    t := try bpe.Bpe.Parse(chat.TinyTokenizer()) catch { unreachable }
+    return try chat.ChatData.Load(chat.Sample, t, ctx, 0.2, seed, false) catch { unreachable }
+}
+
+fn quiet(p train.Progress&) { }
+
+test Fit "a run stopped after 3 of 6 steps and run again continues exactly: parameters, moments, data position, dropout" {
+    try os.MkDirAll("build/tune_test")
+    path := "build/tune_test/run.ckpt"
+    try os.Remove(path) catch { }
+    rate := fn(step I64): return 0.003 + 0.001 * F64(step)
+    # the run that never stops
+    g1, m := gpt(2, 265, 64, 7, 0.1)
+    o1 := optim.AdamW(g1.Params(), g1.ParamGrads(), spans = optim.Spans(g1))
+    c1 := chats(64, 3)
+    whole := try Fit(g1, m, c1.Train, c1.Valid, o1, Tune(6, rate, Accum = 2, Every = 3, EvalEvery = 3), quiet)
+    # the run stopped at 3 (a checkpoint), then a fresh process's graph, optimizer and data resuming it
+    g2, _ := gpt(2, 265, 64, 7, 0.1)
+    o2 := optim.AdamW(g2.Params(), g2.ParamGrads(), spans = optim.Spans(g2))
+    c2 := chats(64, 3)
+    half := try Fit(g2, m, c2.Train, c2.Valid, o2, Tune(3, rate, Accum = 2, Every = 3, EvalEvery = 3, Checkpoint = path), quiet)
+    assert half.Step == 3 and os.Exists(path)
+    g3, _ := gpt(2, 265, 64, 99, 0.1)
+    o3 := optim.AdamW(g3.Params(), g3.ParamGrads(), spans = optim.Spans(g3))
+    c3 := chats(64, 3)
+    rest := try Fit(g3, m, c3.Train, c3.Valid, o3, Tune(6, rate, Accum = 2, Every = 3, EvalEvery = 3, Checkpoint = path), quiet)
+    assert rest.Step == 6 and rest.Loss == whole.Loss and rest.Validation == whole.Validation
+    assert g1.Params().Flat()! == g3.Params().Flat()!
+    assert c1.Train.Cursor == c3.Train.Cursor and c1.Train.Epoch == c3.Train.Epoch
+    # run again once finished: nothing more is done
+    g4, _ := gpt(2, 265, 64, 99, 0.1)
+    o4 := optim.AdamW(g4.Params(), g4.ParamGrads(), spans = optim.Spans(g4))
+    c4 := chats(64, 3)
+    again := try Fit(g4, m, c4.Train, c4.Valid, o4, Tune(6, rate, Accum = 2, Checkpoint = path), quiet)
+    assert again.Step == 6 and g4.Params().Flat()! == g1.Params().Flat()!
+}
+
+test Tune "fine-tuning on chat rows lowers the loss on the assistant turns, training and validation" {
+    g, m := gpt(4, 265, 64, 11)
+    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 0.01, spans = optim.Spans(g))
+    c := chats(64, 5)
+    before := train.LmEvaluate(g, m, c.Valid, 4)
+    last := try Fit(g, m, c.Train, c.Valid, o, Tune(60, fn(step I64): return 0.01, Accum = 2, Every = 20, EvalEvery = 60), quiet)
+    assert last.Validation < before * 0.5, "validation " + $before + " -> " + $last.Validation
+}

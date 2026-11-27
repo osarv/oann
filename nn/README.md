@@ -29,7 +29,13 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 - `train.olang` - the loops: `Epoch`/`Evaluate` for a classifier over a `loader.Loader`; `LmStep`/`LmEvaluate` for a Data parallel: `AverageGrads` and `BroadcastParams` over replicas - one single-thread graph a thread at its share of the batch, run at once (a join), the gradients averaged into the first, the optimizer stepping it, its parameters copied back; for small models whose products split poorly across threads.
   language model over any batch source with `Random` and `At` (data/text's `Windows`, data/tokens' `Tokens`); `Fit`, a
   whole run with reports, a record through io/runlog and checkpoints; `Save`/`Resume`, safetensors files holding the
-  parameters, the optimizer's state and the step, which resume a run bit for bit.
+  parameters, the optimizer's state and the step, which resume a run bit for bit (`Write` puts the same into a writer
+  for a loop that saves more).
+- `tune.olang` - the fine-tuning loop over any graph and anything its optimizer steps (`Params()`, so a LoRA graph's
+  adapters as well): `Step` accumulates `Accum` batches' gradients (their mean) before clipping and the optimizer's
+  step; `Fit` runs, reports, measures validation and checkpoints - the parameters, the optimizer's moments, where the
+  batch source stands (data/chat's `ChatRows.Save`) and the dropout generator - and resumes from its checkpoint when it
+  exists, so running the same command again after an interruption carries on exactly.
 - `dist.olang` - one model trained by workers that share no network, only a store of named blobs: DiLoCo. Each worker
   trains its own copy for H steps with its own optimizer, `Sync` hands in its delta (global - local) and takes back the
   outer step the coordinator (worker 0) took on the average - Nesterov momentum, DiLoCo's 0.7 and 0.9. `Store` is the
