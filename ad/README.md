@@ -21,6 +21,13 @@ precision where softmax saturates; ignored classes (negative) as `CrossEntropy`.
 Evaluation without gradients: set `g.NoGrad = true` before `Plan`. The graph then plans no gradient buffers (a smaller
 arena) and `Backward` is refused; Forward is the same numbers.
 
+Frozen and 4-bit weights (a fine-tuning's base): `g.Frozen(dims...)` is a Constant the caller fills once (loaded
+weights), with no gradient or optimizer state, resident on the GPU (uploaded once, again only after the host was handed
+it). `g.NF4(rows, cols)` is a frozen Linear weight in 4-bit NormalFloat (kernels/nf4, QLoRA's base), set after `Plan`
+by `g.SetNF4(w, nf4.NF4.Quantize(values, rows, cols))`: the graph keeps 4.5 bits a weight and dequantizes it into its
+element type just before each product reading it (a Linear's forward and its input's gradient), into one buffer all NF4
+weights share - on the GPU by the `oann_ad_nf4` kernel, then cuBLAS. A Linear's weights alone; captured graphs only.
+
 One parameter set in two graphs (a model and a copy of it on other inputs, a target network): record both the same
 way, `b.CopyParamsFrom(a)` before each of b's Forward (after a's optimizer step), run both Backwards, then
 `a.AddGradsFrom(b)` - a's `ParamGrads()` is then the gradient of the sum of the two losses, which a's optimizer steps.

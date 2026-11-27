@@ -57,6 +57,7 @@ import "../kernels/fpmode"
 import "../kernels/attention"
 import "../kernels/conv"
 import "../kernels/device"
+import "../kernels/nf4"
 import "../io/checkpoint"
 import "ops"
 import "std/rand"
@@ -237,6 +238,8 @@ type Node struct(Kind Op, Dims tensor.Shape, Batched Bool) {
     Keep Bool = false           # its value and gradient kept to the step's end
     Watch Bool = false          # its gradient wanted though it depends on no parameter (an input's)
     Frozen Bool = false         # a Constant that stays on the device: uploaded only after the host was handed it (Frozen)
+    Quant I64 = -1              # 4-bit NF4 weights (NF4): their codes' first byte in the graph's store, else -1
+    QScale I64 = -1             # ... and their first block's absmax
 }
 
 # a batch decoding several sequences at once stores its batched nodes position by position - [ctx, batch, ...] - so that
@@ -445,6 +448,10 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     Int8 Bool = false               # once QuantizeLinear has run: every Linear's product in 8-bit integers
     q8 mut list.List<q8Weights>& = list.List<q8Weights>()   # each Linear's weights quantized (QuantizeLinear)
     q8At mut list.List<I64>& = list.List<I64>()             # by node: its weights' index in q8, or -1
+    qCodes mut Array<U8>& = Array<U8>(0)        # every NF4 weight's codes (NF4), two a byte, laid out as recorded
+    qScales mut Array<F32>& = Array<F32>(0)     # and their blocks' absmax
+    qCodeLen I64 = 0
+    qScaleLen I64 = 0
     q8Acts mut Array<U8>& = Array<U8>(0)        # a Linear's input quantized
     q8Sums mut Array<I32>& = Array<I32>(0)      # its integer products
     q8Scale mut Array<F32>& = Array<F32>(0)     # its dequantization, per output
@@ -475,6 +482,16 @@ fn (g Graph<T>&) Check() ? tensor.ShapeError {
 
 fn (g mut Graph<T>&) add(kind Op, dims tensor.Shape, batched Bool) Var {
     if g.planned and not g.Eager: unreachable "oann: operations are recorded before Plan"
+    ins := inputsOf(kind)
+    for j in range ins.Len() {
+        x := ins[j]
+        if x < 0 or g.nodes[x].Quant < 0: continue
+        linear := match kind {
+            case Op.Linear(_, _, _): j == 1
+            case _: false
+        }
+        if not linear: g.fail("NF4 weights (node " + $x + ") are read by a Linear alone, as its weights")
+    }
     nd := Node(kind, dims, batched)
     if g.Decode and batched and dims.Rank >= 2 and dims[0] > 1: nd.Strides = positionMajor(dims)
     g.nodes.Push(nd)
@@ -526,6 +543,42 @@ fn (g mut Graph<T>&) Frozen(dims ...I64) Var {
     return v
 }
 
+# a frozen weight in 4-bit NormalFloat (kernels/nf4, QLoRA's base weights): [rows, cols] of a Linear, set by SetNF4 after
+# Plan. It holds 4.5 bits a weight (codes and a scale a block of 64); each product reading it - a Linear's forward and
+# its input's gradient - dequantizes it into the graph's element type just before, into one buffer every NF4 weight
+# shares (the largest one's size), on the CPU and on the GPU. So Value(w) is that buffer: the weights of whichever
+# product ran last. Read by a Linear alone, as its weights; a captured graph's
+fn (g mut Graph<T>&) NF4(rows I64, cols I64) Var {
+    if g.Eager: g.fail("NF4 weights in an eager graph: they are a captured graph's")
+    v := g.Frozen(rows, cols)
+    nd := g.nodes[v]
+    nd.Quant = g.qCodeLen
+    nd.QScale = g.qScaleLen
+    g.nodes[v] = nd
+    g.qCodeLen += (rows * cols + 1) / 2
+    g.qScaleLen += (rows * cols + nf4.Block - 1) / nf4.Block
+    return v
+}
+
+# the NF4 weights of v (made by NF4) set to q, of v's shape, after Plan; on the GPU they go up at the next Forward
+fn (g mut Graph<T>&) SetNF4(v Var, q nf4.NF4&) {
+    nd := g.nodes[v]
+    if nd.Quant < 0: unreachable "oann: SetNF4 of node " + $v + ", which is no NF4 weight"
+    if q.Rows != nd.Dims[0] or q.Cols != nd.Dims[1]: unreachable "oann: NF4 weights " + $q.Rows + " x " + $q.Cols + " set into " + $nd.Dims
+    if not g.planned: unreachable "oann: NF4 weights are set after Plan"
+    for i in range q.Codes.Len(): g.qCodes[nd.Quant + i] = q.Codes[i]
+    for i in range q.Absmax.Len(): g.qScales[nd.QScale + i] = q.Absmax[i]
+    if Gpu {
+        if g.OnGpu: g.gpu.Touched[v] = true
+    }
+}
+
+# v's NF4 weights dequantized into its value (the buffer every NF4 weight shares), before a product reads them
+fn (g mut Graph<T>&) dequantize(v Var) {
+    nd := g.nodes[v]
+    nf4.DequantizeRun(g.mem, nd.Offset, nd.Dims.Count(), g.qCodes, nd.Quant, g.qScales, nd.QScale)
+}
+
 # a trainable tensor, set by init when the graph is planned; weight decay applies to it where decay
 fn (g mut Graph<T>&) Param(init Init, decay Bool, dims ...I64) Var {
     return g.add(Op.Param(init, decay), tensor.Shape.Of(...dims), false)
@@ -534,6 +587,7 @@ fn (g mut Graph<T>&) Param(init Init, decay Bool, dims ...I64) Var {
 # v's gradient wanted though it depends on no parameter (an input's), and kept to the step's end
 fn (g mut Graph<T>&) Watch(v Var) {
     if not g.known("Watch", v): return
+    if g.nodes[v].Quant >= 0: g.fail("Watch of NF4 weights (node " + $v + "): they have no gradient")
     nd := g.nodes[v]
     nd.Watch = true
     nd.Keep = true
@@ -589,7 +643,7 @@ fn (g mut Graph<T>&) PackConstants(backward Bool = true) {
     for i in range g.nodes.Len() {
         match g.nodes[i].Kind {
             case Op.Linear(_, w, _) {
-                if g.nodes[w].Kind == Op.Constant {
+                if g.nodes[w].Kind == Op.Constant and g.nodes[w].Quant < 0 {
                     m := g.Value(w).Mat()!
                     g.packFwd[i] = packs.Len()
                     packs.Push(g.ws32.PackTiles(m, true))
@@ -1356,6 +1410,8 @@ fn (g mut Graph<T>&) begin(r mut rand.Rand&) {
 fn (g mut Graph<T>&) arrange(l Layout&, r mut rand.Rand&) {
     g.mem ~ Array<T>(l.Size)
     g.intMem ~ Array<I32>(l.Ints)
+    g.qCodes ~ Array<U8>(g.qCodeLen)
+    g.qScales ~ Array<F32>(g.qScaleLen)
     match T {
         case F64: g.acc64 ~ Array<F64>(l.Accs)
         case _: g.acc32 ~ Array<F32>(l.Accs)
@@ -1437,8 +1493,14 @@ fn (g mut Graph<T>&) placeParams() I64 {
 # end of the region
 fn (g mut Graph<T>&) placeFixed(from I64) I64 {
     at := from
+    shared I64 = 0
     for i in range g.nodes.Len() {
         nd := g.nodes[i]
+        if nd.Quant >= 0 {
+            # NF4 weights: one buffer for all, placed after the loop
+            shared = shared.Max(nd.Dims.Count())
+            continue
+        }
         fixed := nd.Kind == Op.Input or nd.Kind == Op.Constant
         if fixed {
             nd.Offset = at
@@ -1454,7 +1516,14 @@ fn (g mut Graph<T>&) placeFixed(from I64) I64 {
         }
         g.nodes[i] = nd
     }
-    return at
+    if shared == 0: return at
+    for i in range g.nodes.Len() {
+        nd := g.nodes[i]
+        if nd.Quant < 0: continue
+        nd.Offset = at
+        g.nodes[i] = nd
+    }
+    return at + padded(shared)
 }
 
 # the times over a step: node i's forward runs at i, its backward at 2n - 1 - i, and the step ends at 2n
@@ -2217,6 +2286,7 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
     y := g.Value(Var(i))
     match nd.Kind {
         case Op.Linear(x, w, b) {
+            if g.nodes[w].Quant >= 0 and not g.Int8: g.dequantize(w)
             if g.Int8 { g.linearInt8(i, x, b) } else { ops.Linear<T, A>(ws, y, g.Value(x), g.Value(w), g.opt(b), g.tilePacks[g.packFwd[i] if g.packFwd.Len() > i else 0]) }
         }
         case Op.MatMul(a, b, ta, tb): ops.MatMul<T, A>(ws, y, g.Value(a), ta, g.Value(b), tb)
@@ -2452,6 +2522,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             aw := g.acc(w)
             db := g.gradOf(b)
             ab := g.acc(b)
+            if g.nodes[w].Quant >= 0 and ops.Wanted(dx): g.dequantize(w)
             ops.LinearBackward<T, A>(ws, dy, g.Value(x), g.Value(w), dx, ax, dw, aw, db, ab, g.tilePacks[g.packBwd[i] if g.packBwd.Len() > i else 0])
         }
         case Op.MatMul(a, b, ta, tb) {
@@ -2740,6 +2811,7 @@ if Gpu {
                 s.Inner = last
                 s.A, s.B, s.C = g.valAt(x), g.valAt(w), g.valAt(b)
                 s.DA, s.DB, s.DC = g.gradAt(x), g.gradAt(w), g.gradAt(b)
+                s.QCodes, s.QScales = g.nodes[w].Quant, g.nodes[w].QScale
             }
             case Op.MatMul(a, b, ta, tb) {
                 s.Do = mirror.Work.MatMul
@@ -2932,7 +3004,7 @@ if Gpu {
         }
         all := steps.ToArray()
         g.gpu.Steps = all
-        g.gpu.M ~ try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
+        g.gpu.M ~ try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss, g.qCodes.Len(), g.qScales.Len()) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
         g.OnGpu = true
         g.gpu.HostParams = true
         for i in range g.nodes.Len(): g.gpu.Touched[i] = g.nodes[i].Frozen
@@ -2994,13 +3066,24 @@ if Gpu {
                 case Op.Input { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
                 case Op.Constant {
                     if nd.Frozen and not handed: continue
-                    m.Upload(g.mem, nd.Offset, nd.Dims.Count())
-                    if nd.Frozen: g.gpu.FrozenUploads++
+                    g.uploadConstant(nd)
                 }
                 case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
                 case _ { }
             }
         }
+    }
+
+    # a constant up: its value, or NF4 weights' codes and scales (the device dequantizes them itself, before each product)
+    fn (g Graph<T>&) uploadConstant(nd Node&) {
+        m :~ g.gpu.M!
+        if nd.Frozen: g.gpu.FrozenUploads++
+        if nd.Quant < 0 {
+            m.Upload(g.mem, nd.Offset, nd.Dims.Count())
+            return
+        }
+        n := nd.Dims.Count()
+        m.UploadQuant(g.qCodes, nd.Quant, (n + 1) / 2, g.qScales, nd.QScale, (n + nf4.Block - 1) / nf4.Block)
     }
 
     # how many times a frozen weight went up to the device (Frozen): once each, unless the host was handed it again
@@ -3108,10 +3191,8 @@ if Gpu {
             g.gpu.Touched[i] = false
             nd := g.nodes[i]
             match nd.Kind {
-                case Op.Input, Op.Constant {
-                    m.Upload(g.mem, nd.Offset, nd.Dims.Count())
-                    if nd.Frozen: g.gpu.FrozenUploads++
-                }
+                case Op.Input { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
+                case Op.Constant { g.uploadConstant(nd) }
                 case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
                 case _ { }
             }
@@ -3437,6 +3518,93 @@ test Graph.Frozen "a frozen weight: no gradient, no place among the parameters, 
         if frozen: assert g.Value(w2).Flat()! == before
     }
     assert grads[0] == grads[2] and grads[1] == grads[3]
+}
+
+# a two-layer network with frozen weights on both sides of a trained one, as NF4 or as plain frozen weights holding the
+# same values dequantized: the input's and the parameter's gradients, and the output, as flat arrays
+fn nf4Run<T>(quant Bool) Array<Array<F64>> {
+    g := Graph<T>(3)
+    x := g.Input(8)
+    g.Watch(x)
+    w1 := g.NF4(16, 8) if quant else g.Frozen(16, 8)
+    w2 := g.Param(Init.Normal(0.0, 0.3), true, 12, 16)
+    w3 := g.NF4(4, 12) if quant else g.Frozen(4, 12)
+    b3 := g.Frozen(4)
+    out := g.Linear(g.Act(g.Linear(g.Act(g.Linear(x, w1), mat.Act.Tanh), w2), mat.Act.Silu), w3, b3)
+    g.Keep(out)
+    target := g.Input(4)
+    loss := g.Mse(out, target)
+    g.Plan(rand.Rand(9))!
+    r1 := Array<F32>(128)
+    for i in range 128: r1[i] = F32(((i * 29) % 67) - 33) * 0.02
+    r3 := Array<F32>(48)
+    for i in range 48: r3[i] = F32(((i * 13) % 31) - 15) * 0.05
+    q1 := nf4.NF4.Quantize(r1, 16, 8)
+    q3 := nf4.NF4.Quantize(r3, 4, 12)
+    if quant {
+        g.SetNF4(w1, q1)
+        g.SetNF4(w3, q3)
+    } else {
+        q1.Dequantize(g.Value(w1).Flat()!, 0)
+        q3.Dequantize(g.Value(w3).Flat()!, 0)
+    }
+    bv :~ g.Value(b3).Flat()!
+    for i in range 4: bv[i] = T(0.1 * F64(i))
+    xv :~ g.Value(x).Flat()!
+    for i in range 24: xv[i] = T(F64(i % 7) * 0.25 - 0.7)
+    tv :~ g.Value(target).Flat()!
+    for i in range 12: tv[i] = T(F64(i) * 0.1 - 0.5)
+    g.Forward(3)
+    g.Backward(loss)
+    return Array<Array<F64>>[widen(g.Value(out)), widen(g.Grad(x)), widen(g.Grad(w2))]
+}
+
+fn widen<T>(t tensor.Tensor<T>) Array<F64> {
+    f := t.Flat()!
+    out := Array<F64>(f.Len())
+    for i in range f.Len(): out[i] = F64(f[i])
+    return out
+}
+
+test Graph.NF4 "a Linear of NF4 weights computes what one of the same weights dequantized does, forward and backward, in F32 and BF16, the two NF4 weights sharing one buffer" {
+    a := nf4Run<F32>(true)
+    b := nf4Run<F32>(false)
+    for k in range 3: assert a[k] == b[k], "F32 result " + $k
+    assert a[2][0] != 0.0
+    c := nf4Run<BF16>(true)
+    d := nf4Run<BF16>(false)
+    for k in range 3: assert c[k] == d[k], "BF16 result " + $k
+    # the store: 4.5 bits a weight, and one dequantization buffer of the larger weights' size
+    g := Graph<F32>(1)
+    x := g.Input(64)
+    w := g.NF4(32, 64)
+    v := g.NF4(16, 32)
+    g.Linear(g.Linear(x, w), v)
+    g.Plan(rand.Rand(1))!
+    assert g.qCodes.Len() == 1024 + 256 and g.qScales.Len() == 32 + 8
+    assert g.Info(w).Offset == g.Info(v).Offset and g.Info(w).GradOffset < 0 and g.ParamCount == 0
+}
+
+test Graph.NF4 "NF4 weights are read by a Linear alone, have no gradient to watch, and are a captured graph's" {
+    g := Graph<F32>(2)
+    a := g.Input(4, 4)
+    w := g.NF4(4, 4)
+    g.MatMul(a, w)
+    said := ""
+    try g.Plan(rand.Rand(1)) catch tensor.ShapeError err { said = $err }
+    assert said.Contains("Linear alone"), said
+    h := Graph<F32>(2)
+    v := h.NF4(4, 4)
+    h.Watch(v)
+    said = ""
+    try h.Plan(rand.Rand(1)) catch tensor.ShapeError err { said = $err }
+    assert said.Contains("no gradient"), said
+    e := Graph<F32>(1, 1, Mode.Eager)
+    e.Plan(rand.Rand(1))!
+    e.NF4(2, 2)
+    said = ""
+    try e.Check() catch tensor.ShapeError err { said = $err }
+    assert said.Contains("captured"), said
 }
 
 test Graph "the kernels compute what they say: ReLU, a product, a linear layer, softmax cross-entropy" {
