@@ -28,6 +28,7 @@ import "std/json"
 import "std/os"
 import "std/time"
 import "bpe"
+import "gguf"
 import "jinja"
 
 type Family enum {
@@ -81,6 +82,7 @@ fn Chat.Load(dir String&, t bpe.Bpe&) Chat {
     topP F64 = 0.95
     topK I64 = 0
     cfg :~ try os.ReadFile(dir + "/tokenizer_config.json") catch default "{}"
+    if dir.EndsWith(".gguf"): cfg ~ ggufConfig(dir)
     tc :~ try json.Json.Parse(cfg) catch default json.Json.Null
     source := templateOf(dir, tc)
     tmpl := try jinja.Template.Parse(source) catch {
@@ -100,7 +102,13 @@ fn Chat.Load(dir String&, t bpe.Bpe&) Chat {
     return Chat(family, endTokens(t, family, stops), temp, topP, topK, source, tmpl, tokens)
 }
 
-# the chat template of the model in dir: chat_template.jinja, else tokenizer_config's chat_template (a string, or the
+# a GGUF file's chat template and special tokens as a tokenizer_config.json
+fn ggufConfig(path String&) String {
+    f := try gguf.File.Open(path) catch { return "{}" }
+    return f.TokenizerConfigJson()
+}
+
+# the chat template of the model in dir (a GGUF file: its tokenizer.chat_template): chat_template.jinja, else tokenizer_config's chat_template (a string, or the
 # "default" of a list of named ones); "" where there is none
 fn templateOf(dir String&, tc json.Json&) String {
     file :~ try os.ReadFile(dir + "/chat_template.jinja") catch default ""
