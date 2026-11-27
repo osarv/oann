@@ -2,7 +2,7 @@
 # highest, its output the sum of their outputs weighted by the router's gates. Only the chosen experts run, so a token
 # costs K experts' products while the layer holds E experts' weights.
 #
-#     op := moe.Experts(tokens = batch * ctx, D, hidden, experts = 8, k = 2, threads)   # one per layer, kept as long as the graph
+#     op := moe.Experts<BF16>(tokens = batch * ctx, D, hidden, experts = 8, k = 2, threads)   # one per layer, kept as long as the graph
 #     m := moe.Moe.New(g, D, hidden, experts = 8)
 #     y := m.Apply(g, op, x)                 # x [..., D] -> [..., D]
 #     ...after each optimizer step: op.Balance(1e-3)
@@ -23,7 +23,8 @@
 # kernels/gemm over the tokens routed to it, gathered into rows in expert order; the op's buffers are made once for at
 # most `tokens` tokens, so a step through it allocates nothing.
 #
-# The operation runs in F32 (a graph.Custom); a BF16 graph converts at its edge. On the CPU only for now.
+# The operation is a graph.Custom: it takes and gives F32 (a BF16 graph converts at its edge); Experts<BF16> keeps the
+# experts' product operands in BF16 (summed in F32), as a BF16 graph's own products are. On the CPU only for now.
 
 import "../ad/graph"
 import "../kernels/gemm"
@@ -33,8 +34,10 @@ import "../tensor"
 # ---- the operation ----
 
 # the experts' computation for at most `tokens` tokens of width D, hidden width H, E experts, K chosen per token.
-# Inputs: x [..., D], the router [E, D], then E Gate matrices, E Up matrices, E Down matrices
-type Experts struct(tokens I64, D I64, H I64, E I64, K I64, threads I64 = 1) {
+# Inputs: x [..., D], the router [E, D], then E Gate matrices, E Up matrices, E Down matrices. S is the storage of the
+# experts' product operands - the gathered rows, the activations, their gradients and a copy of the expert weights made
+# at each Forward - F32, or BF16 under a BF16 graph (products summed in F32 either way, as the graph's own)
+type Experts<S> struct(tokens I64, D I64, H I64, E I64, K I64, threads I64 = 1) {
     Tokens I64 = tokens
     D
     H
@@ -48,32 +51,36 @@ type Experts struct(tokens I64, D I64, H I64, E I64, K I64, threads I64 = 1) {
     logits mut Array<F32>& = Array<F32>(tokens * E)   # l, then (backward) dL/dl
     probs mut Array<F32>& = Array<F32>(tokens * E)    # p = softmax(l)
     sel mut Array<I32>& = Array<I32>(tokens * K)      # token t's j-th expert at t K + j
-    gate mut Array<F32>& = Array<F32>(tokens * K)     # its gate, then (backward) dL/dgate
+    gate mut Array<F32>& = Array<F32>(tokens * K)     # its gate
+    dgate mut Array<F32>& = Array<F32>(tokens * K)    # its gate's gradient
     pos mut Array<I32>& = Array<I32>(tokens * K)      # its row in the gathered buffers
     tok mut Array<I32>& = Array<I32>(tokens * K)      # a gathered row's token
     count mut Array<I64>& = Array<I64>(E)             # rows per expert this step
     start mut Array<I64>& = Array<I64>(E)             # an expert's first row
-    xg mut Array<F32>& = Array<F32>(tokens * K * D)   # the tokens' rows by expert, then (backward) their gradient
+    w mut Array<S>& = Array<S>(3 * E * H * D)         # the experts' weights: Gate e at e H D, Up at (E + e) H D, Down at (2 E + e) H D
+    xg mut Array<S>& = Array<S>(tokens * K * D)       # the tokens' rows by expert
     h1 mut Array<F32>& = Array<F32>(tokens * K * H)   # x Gate^T
     h3 mut Array<F32>& = Array<F32>(tokens * K * H)   # x Up^T
-    act mut Array<F32>& = Array<F32>(tokens * K * H)  # silu(h1) h3
+    act mut Array<S>& = Array<S>(tokens * K * H)      # silu(h1) h3
     yg mut Array<F32>& = Array<F32>(tokens * K * D)   # each expert's output, ungated
-    dyg mut Array<F32>& = Array<F32>(tokens * K * D)  # their output gradient, then their input gradient
-    dgate mut Array<F32>& = Array<F32>(tokens * K)
-    dh1 mut Array<F32>& = Array<F32>(tokens * K * H)
-    dh3 mut Array<F32>& = Array<F32>(tokens * K * H)
+    dyg mut Array<S>& = Array<S>(tokens * K * D)      # its output's gradient, gated
+    da mut Array<F32>& = Array<F32>(tokens * K * H)   # act's gradient
+    dh1 mut Array<S>& = Array<S>(tokens * K * H)
+    dh3 mut Array<S>& = Array<S>(tokens * K * H)
+    dxg mut Array<F32>& = Array<F32>(tokens * K * D)  # the rows' input gradient
     n I64 = 0                                         # the tokens of the last Forward
 }
 
 # the gemm workspace's room for every product of a step, made where the operation is (a step then allocates nothing)
-fn (m mut Experts&) Reserve() {
-    m.ws.ReserveLayer(m.Tokens * m.K, m.D, m.H, F32(0))
+fn (m mut Experts<S>&) Reserve() {
+    like S
+    m.ws.ReserveLayer(m.Tokens * m.K, m.D, m.H, like)
     m.ws.ReserveLayer(m.Tokens, m.D, m.E, F32(0))
 }
 
-fn (m Experts&) Shape(inputs Array<tensor.Shape>&) tensor.Shape { return inputs[0] }
+fn (m Experts<S>&) Shape(inputs Array<tensor.Shape>&) tensor.Shape { return inputs[0] }
 
-fn (m mut Experts&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) {
+fn (m mut Experts<S>&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) {
     x :~ inputs[0].Flat()!
     n := x.Len() / m.D
     if n > m.Tokens: unreachable "moe.Experts made for fewer tokens than the graph gives it"
@@ -83,29 +90,46 @@ fn (m mut Experts&) Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Ten
     gemm.Gemm(m.ws, lm, xm, false, inputs[1].Mat()!, true)
     m.route(n)
     m.gather(x, n)
-    for e in range m.E: m.expertForward(e, inputs)
+    m.copyWeights(inputs)
+    for e in range m.E: m.expertForward(e)
     m.combine(out.Flat()!, n)
 }
 
+# the experts' weights into w, in S
+fn (m mut Experts<S>&) copyWeights(inputs Array<tensor.Tensor<F32>>&) {
+    size := m.H * m.D
+    for j in range 3 * m.E {
+        from :~ inputs[2 + j].Flat()!
+        for i in range size: m.w[j * size + i] = S(from[i])
+    }
+}
+
+# expert e's Gate (j 0), Up (1) or Down (2) in w: [H, D], or [D, H] for Down
+fn (m Experts<S>&) weight(j I64, e I64) mat.Mat<S> {
+    at := (j * m.E + e) * m.H * m.D
+    if j == 2: return mat.Mat<S>(m.w, at, m.D, m.H, m.H)
+    return mat.Mat<S>(m.w, at, m.H, m.D, m.D)
+}
+
 # expert e's rows through its SwiGLU: h1 = x Gate^T, h3 = x Up^T, act = silu(h1) h3, y = act Down^T
-fn (m mut Experts&) expertForward(e I64, inputs Array<tensor.Tensor<F32>>&) {
+fn (m mut Experts<S>&) expertForward(e I64) {
     c, o := m.count[e], m.start[e]
     if c == 0: return
-    xe := mat.Mat<F32>(m.xg, o * m.D, c, m.D, m.D)
+    xe := mat.Mat<S>(m.xg, o * m.D, c, m.D, m.D)
     h1 := mat.Mat<F32>(m.h1, o * m.H, c, m.H, m.H)
     h3 := mat.Mat<F32>(m.h3, o * m.H, c, m.H, m.H)
-    gemm.Gemm(m.ws, h1, xe, false, inputs[2 + e].Mat()!, true)
-    gemm.Gemm(m.ws, h3, xe, false, inputs[2 + m.E + e].Mat()!, true)
-    for i in range o * m.H, (o + c) * m.H: m.act[i] = silu(m.h1[i]) * m.h3[i]
-    ae := mat.Mat<F32>(m.act, o * m.H, c, m.H, m.H)
+    gemm.Gemm(m.ws, h1, xe, false, m.weight(0, e), true)
+    gemm.Gemm(m.ws, h3, xe, false, m.weight(1, e), true)
+    for i in range o * m.H, (o + c) * m.H: m.act[i] = S(silu(m.h1[i]) * m.h3[i])
+    ae := mat.Mat<S>(m.act, o * m.H, c, m.H, m.H)
     ye := mat.Mat<F32>(m.yg, o * m.D, c, m.D, m.D)
-    gemm.Gemm(m.ws, ye, ae, false, inputs[2 + 2 * m.E + e].Mat()!, true)
+    gemm.Gemm(m.ws, ye, ae, false, m.weight(2, e), true)
 }
 
 fn silu(v F32) F32 { return v / (1.0 + (-v).Exp()) }
 
 # each token's probabilities, its K experts (by logit plus bias), their gates, and the rows they take, grouped by expert
-fn (m mut Experts&) route(n I64) {
+fn (m mut Experts<S>&) route(n I64) {
     for e in range m.E: m.count[e] = 0
     for t in range n {
         m.softmaxRow(t)
@@ -127,7 +151,7 @@ fn (m mut Experts&) route(n I64) {
     }
 }
 
-fn (m mut Experts&) softmaxRow(t I64) {
+fn (m mut Experts<S>&) softmaxRow(t I64) {
     row := t * m.E
     hi := m.logits[row]
     for e in range 1, m.E: hi = hi.Max(m.logits[row + e])
@@ -141,7 +165,7 @@ fn (m mut Experts&) softmaxRow(t I64) {
 }
 
 # token t's K experts, best first, and their gates
-fn (m mut Experts&) choose(t I64) {
+fn (m mut Experts<S>&) choose(t I64) {
     row, s0 := t * m.E, t * m.K
     for j in range m.K {
         best := -1
@@ -159,7 +183,7 @@ fn (m mut Experts&) choose(t I64) {
     for j in range m.K: m.gate[s0 + j] = m.gate[s0 + j] / sum
 }
 
-fn (m Experts&) taken(s0 I64, j I64, e I64) Bool {
+fn (m Experts<S>&) taken(s0 I64, j I64, e I64) Bool {
     for i in range j {
         if I64(m.sel[s0 + i]) == e: return true
     }
@@ -167,15 +191,15 @@ fn (m Experts&) taken(s0 I64, j I64, e I64) Bool {
 }
 
 # the routed tokens' rows into xg, by expert
-fn (m mut Experts&) gather(x Array<F32>&, n I64) {
+fn (m mut Experts<S>&) gather(x Array<F32>&, n I64) {
     for p in range n * m.K {
         from, to := I64(m.tok[p]) * m.D, p * m.D
-        for i in range m.D: m.xg[to + i] = x[from + i]
+        for i in range m.D: m.xg[to + i] = S(x[from + i])
     }
 }
 
 # out[t] = sum over t's experts of gate times the expert's output
-fn (m Experts&) combine(out mut Array<F32>&, n I64) {
+fn (m Experts<S>&) combine(out mut Array<F32>&, n I64) {
     for t in range n {
         o := t * m.D
         for i in range m.D: out[o + i] = 0.0
@@ -187,15 +211,15 @@ fn (m Experts&) combine(out mut Array<F32>&, n I64) {
     }
 }
 
-fn (m mut Experts&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
+fn (m mut Experts<S>&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
     n := m.n
     m.scatterGrad(dout.Flat()!, n)
-    for e in range m.E: m.expertBackward(e, inputs, dinputs)
+    for e in range m.E: m.expertBackward(e, dinputs)
     dx :~ dinputs[0].Flat()!
     for i in range n * m.D: dx[i] = 0.0
     for s in range n * m.K {
         from, to := I64(m.pos[s]) * m.D, (s / m.K) * m.D
-        for i in range m.D: dx[to + i] += m.dyg[from + i]
+        for i in range m.D: dx[to + i] += m.dxg[from + i]
     }
     for t in range n: m.routerGrad(t, n)
     x :~ inputs[0].Flat()!
@@ -208,21 +232,21 @@ fn (m mut Experts&) Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tenso
 }
 
 # each slot's output gradient (its gate times its token's) into dyg, and its gate's gradient (dy . y) into dgate
-fn (m mut Experts&) scatterGrad(dy Array<F32>&, n I64) {
+fn (m mut Experts<S>&) scatterGrad(dy Array<F32>&, n I64) {
     for s in range n * m.K {
         t, p := (s / m.K) * m.D, I64(m.pos[s]) * m.D
         g := m.gate[s]
         dg F32 = 0.0
         for i in range m.D {
             dg += dy[t + i] * m.yg[p + i]
-            m.dyg[p + i] = g * dy[t + i]
+            m.dyg[p + i] = S(g * dy[t + i])
         }
         m.dgate[s] = dg
     }
 }
 
-# expert e's weights' gradients, and its rows' input gradient into dyg (whose output gradient it no longer needs)
-fn (m mut Experts&) expertBackward(e I64, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) {
+# expert e's weights' gradients, and its rows' input gradient into dxg
+fn (m mut Experts<S>&) expertBackward(e I64, dinputs mut Array<tensor.Tensor<F32>>&) {
     c, o := m.count[e], m.start[e]
     if c == 0 {
         for j in range 3 {
@@ -231,31 +255,33 @@ fn (m mut Experts&) expertBackward(e I64, inputs Array<tensor.Tensor<F32>>&, din
         }
         return
     }
-    xe := mat.Mat<F32>(m.xg, o * m.D, c, m.D, m.D)
-    ae := mat.Mat<F32>(m.act, o * m.H, c, m.H, m.H)
-    dye := mat.Mat<F32>(m.dyg, o * m.D, c, m.D, m.D)
-    d1 := mat.Mat<F32>(m.dh1, o * m.H, c, m.H, m.H)
-    d3 := mat.Mat<F32>(m.dh3, o * m.H, c, m.H, m.H)
-    gemm.Gemm(m.ws, d1, dye, false, inputs[2 + 2 * m.E + e].Mat()!, false)
+    xe := mat.Mat<S>(m.xg, o * m.D, c, m.D, m.D)
+    ae := mat.Mat<S>(m.act, o * m.H, c, m.H, m.H)
+    dye := mat.Mat<S>(m.dyg, o * m.D, c, m.D, m.D)
+    da := mat.Mat<F32>(m.da, o * m.H, c, m.H, m.H)
+    gemm.Gemm(m.ws, da, dye, false, m.weight(2, e), false)
     dd := dinputs[2 + 2 * m.E + e].Mat()!
     gemm.Gemm(m.ws, dd, dye, true, ae, false)
     for i in range o * m.H, (o + c) * m.H {
-        v, da := m.h1[i], m.dh1[i]
+        v, d := m.h1[i], m.da[i]
         sg := 1.0 / (1.0 + (-v).Exp())
-        m.dh1[i] = da * m.h3[i] * sg * (1.0 + v * (1.0 - sg))
-        m.dh3[i] = da * v * sg
+        m.dh1[i] = S(d * m.h3[i] * sg * (1.0 + v * (1.0 - sg)))
+        m.dh3[i] = S(d * v * sg)
     }
+    d1 := mat.Mat<S>(m.dh1, o * m.H, c, m.H, m.H)
+    d3 := mat.Mat<S>(m.dh3, o * m.H, c, m.H, m.H)
     dg := dinputs[2 + e].Mat()!
     du := dinputs[2 + m.E + e].Mat()!
     gemm.Gemm(m.ws, dg, d1, true, xe, false)
     gemm.Gemm(m.ws, du, d3, true, xe, false)
-    gemm.Gemm(m.ws, dye, d1, false, inputs[2 + e].Mat()!, false)
-    gemm.Gemm(m.ws, dye, d3, false, inputs[2 + m.E + e].Mat()!, false, F32(1.0), F32(1.0))
+    dxe := mat.Mat<F32>(m.dxg, o * m.D, c, m.D, m.D)
+    gemm.Gemm(m.ws, dxe, d1, false, m.weight(0, e), false)
+    gemm.Gemm(m.ws, dxe, d3, false, m.weight(1, e), false, F32(1.0), F32(1.0))
 }
 
 # token t's logits' gradient, written over its logits: through the gates (softmax over the chosen experts where
 # Renorm, else p's values) and, where Aux > 0, the balance loss's
-fn (m mut Experts&) routerGrad(t I64, n I64) {
+fn (m mut Experts<S>&) routerGrad(t I64, n I64) {
     row, s0 := t * m.E, t * m.K
     for e in range m.E: m.logits[row + e] = 0.0
     dot F32 = 0.0
@@ -272,7 +298,7 @@ fn (m mut Experts&) routerGrad(t I64, n I64) {
 }
 
 # the balance loss Aux E sum_e f_e P_e's gradient in token row's logits: dL/dp_e = Aux E f_e / n, through the softmax
-fn (m mut Experts&) auxGrad(row I64, n I64) {
+fn (m mut Experts<S>&) auxGrad(row I64, n I64) {
     scale := F32(m.Aux * F64(m.E) / (F64(n) * F64(n * m.K)))
     mean F32 = 0.0
     for e in range m.E: mean += m.probs[row + e] * F32(m.count[e])
@@ -283,7 +309,7 @@ fn (m mut Experts&) auxGrad(row I64, n I64) {
 
 # each expert's selection bias moved by rate toward an even load - up where it took fewer tokens than the mean since
 # the last call, down where more - and the load counts cleared. Call after each optimizer step
-fn (m mut Experts&) Balance(rate F64) {
+fn (m mut Experts<S>&) Balance(rate F64) {
     total I64 = 0
     for e in range m.E: total += m.Load[e]
     mean := F64(total) / F64(m.E)
@@ -294,12 +320,12 @@ fn (m mut Experts&) Balance(rate F64) {
     m.ResetLoad()
 }
 
-fn (m mut Experts&) ResetLoad() {
+fn (m mut Experts<S>&) ResetLoad() {
     for e in range m.E: m.Load[e] = 0
 }
 
 # the busiest expert's tokens over the mean, since the last Balance or ResetLoad: 1 when even, E when one takes all
-fn (m Experts&) Imbalance() F64 {
+fn (m Experts<S>&) Imbalance() F64 {
     total, most := I64(0), I64(0)
     for e in range m.E {
         total += m.Load[e]
@@ -309,8 +335,10 @@ fn (m Experts&) Imbalance() F64 {
     return F64(most) * F64(m.E) / F64(total)
 }
 
-assert not Experts.Forward.Allocates, "a mixture-of-experts forward allocates"
-assert not Experts.Backward.Allocates, "a mixture-of-experts backward allocates"
+assert not Experts<F32>.Forward.Allocates, "a mixture-of-experts forward allocates"
+assert not Experts<F32>.Backward.Allocates, "a mixture-of-experts backward allocates"
+assert not Experts<BF16>.Forward.Allocates, "a BF16 mixture-of-experts forward allocates"
+assert not Experts<BF16>.Backward.Allocates, "a BF16 mixture-of-experts backward allocates"
 
 # ---- the layer ----
 
@@ -337,7 +365,7 @@ fn Moe.New<T>(g mut graph.Graph<T>&, D I64, H I64, E I64, out graph.Init = graph
 }
 
 # the layer on x [..., D] through op (made for this layer's sizes)
-fn (l Moe&) Apply<T>(g mut graph.Graph<T>&, op mut Experts&, x graph.Var) graph.Var {
+fn (l Moe&) Apply<T, S>(g mut graph.Graph<T>&, op mut Experts<S>&, x graph.Var) graph.Var {
     ins := Vec<graph.Var>()
     ins.Push(x)
     ins.Push(l.Router)
@@ -376,7 +404,7 @@ fn randomInputs(n I64, D I64, H I64, E I64, r mut rand.Rand&) Array<tensor.Tenso
 }
 
 # sum_i out_i c_i, in F64, for weights c
-fn weighed(m mut Experts&, ins Array<tensor.Tensor<F32>>&, out mut tensor.Tensor<F32>&, c Array<F32>&) F64 {
+fn weighed(m mut Experts<F32>&, ins Array<tensor.Tensor<F32>>&, out mut tensor.Tensor<F32>&, c Array<F32>&) F64 {
     m.Forward(out, ins)
     o :~ out.Flat()!
     sum F64 = 0.0
@@ -389,7 +417,7 @@ test Experts "the gradients of x, the router and every kind of expert weight mat
     for k in Array<I64>[1, 2] {
         for renorm in Array<Bool>[false, true] {
             r := rand.Rand(U64(7 + k))
-            m := Experts(n, D, H, E, k)
+            m := Experts<F32>(n, D, H, E, k)
             m.Renorm = renorm
             m.Reserve()
             ins := randomInputs(n, D, H, E, r)
@@ -426,7 +454,7 @@ test Moe "one expert chosen of one is the dense SwiGLU perceptron (layers.Feed's
     D, H := I64(8), I64(12)
     a := graph.Graph<F32>(6)
     b := graph.Graph<F32>(6)
-    op := Experts(6, D, H, 1, 1)
+    op := Experts<F32>(6, D, H, 1, 1)
     xa := a.Input(D)
     xb := b.Input(D)
     m := Moe.New(a, D, H, 1)
@@ -475,7 +503,7 @@ test Moe "one expert chosen of one is the dense SwiGLU perceptron (layers.Feed's
 test Experts "Balance moves the selection bias until a router that favours one expert spreads the tokens evenly" {
     n, D, H, E := I64(256), I64(8), I64(4), I64(8)
     r := rand.Rand(11)
-    m := Experts(n, D, H, E, 2)
+    m := Experts<F32>(n, D, H, E, 2)
     m.Reserve()
     ins := randomInputs(n, D, H, E, r)
     wr :~ ins[1].Flat()!
@@ -494,7 +522,7 @@ test Experts "Balance moves the selection bias until a router that favours one e
 }
 
 # Aux E sum_e f_e P_e at the operation's last forward, the shares f held at their values
-fn auxLoss(m Experts&, n I64) F64 {
+fn auxLoss(m Experts<F32>&, n I64) F64 {
     sum F64 = 0.0
     for e in range m.E {
         p F64 = 0.0
@@ -507,7 +535,7 @@ fn auxLoss(m Experts&, n I64) F64 {
 test Experts "the balance loss's gradient in the router matches central differences of Aux E sum f_e P_e" {
     n, D, H, E := I64(12), I64(5), I64(3), I64(4)
     r := rand.Rand(5)
-    m := Experts(n, D, H, E, 2)
+    m := Experts<F32>(n, D, H, E, 2)
     m.Aux = 0.5
     m.Reserve()
     ins := randomInputs(n, D, H, E, r)
@@ -533,4 +561,44 @@ test Experts "the balance loss's gradient in the router matches central differen
         most = most.Max(F64(gw[i]).Abs())
     }
     assert most > 1e-3 and worst < 1e-3, $most + " " + $worst
+}
+
+test Experts "BF16 operands give the F32 operation's outputs and gradients to BF16's precision" {
+    n, D, H, E := I64(64), I64(32), I64(24), I64(4)
+    r := rand.Rand(9)
+    a := Experts<F32>(n, D, H, E, 2)
+    b := Experts<BF16>(n, D, H, E, 2)
+    a.Reserve()
+    b.Reserve()
+    ins := randomInputs(n, D, H, E, r)
+    oa, ob := tensor.Tensor<F32>.Zeros(n, D), tensor.Tensor<F32>.Zeros(n, D)
+    a.Forward(oa, ins)
+    b.Forward(ob, ins)
+    dy := tensor.Tensor<F32>.Zeros(n, D)
+    dy.FillNormal(r, 0.0, 1.0)
+    ga, gb := Vec<tensor.Tensor<F32>>(), Vec<tensor.Tensor<F32>>()
+    for t in ins {
+        ga.Push(tensor.Tensor<F32>.Zeros(t.Dims[0], t.Dims[1]))
+        gb.Push(tensor.Tensor<F32>.Zeros(t.Dims[0], t.Dims[1]))
+    }
+    da, db := ga.ToArray(), gb.ToArray()
+    a.Backward(dy, ins, da)
+    b.Backward(dy, ins, db)
+    pairs := Vec<tensor.Tensor<F32>>()
+    pairs.Push(oa)
+    pairs.Push(ob)
+    for j in range ins.Len() {
+        pairs.Push(da[j])
+        pairs.Push(db[j])
+    }
+    for k in range 0, pairs.Len(), 2 {
+        u :~ pairs[k].Flat()!
+        v :~ pairs[k + 1].Flat()!
+        scale, worst := F64(0.0), F64(0.0)
+        for i in range u.Len() {
+            scale = scale.Max(F64(u[i]).Abs())
+            worst = worst.Max(F64(u[i] - v[i]).Abs())
+        }
+        assert worst <= 2e-2 * scale, "tensor " + $(k / 2) + ": " + $worst + " of " + $scale
+    }
 }
