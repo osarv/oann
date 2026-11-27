@@ -3,7 +3,8 @@
 #     oann-gen MODEL prompts.jsonl out.jsonl [--n K] [--temp T] [--top-p P] [--top-k K] [--max-tokens M] [--batch B]
 #              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--kv8] [--exact]
 #
-# MODEL is a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors or its shards)
+# MODEL is a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors or its shards),
+# a GGUF file (llm/gguf: its weights widened to BF16, or requantized to INT8, as they load),
 # or a repository's name ("Qwen/Qwen3-4B"), fetched once into $OANN_MODELS (by default ~/.cache/oann/models). Each line
 # of prompts.jsonl is an object: "prompt" (one user turn, put through the model's chat template, with "system" if
 # given) or "text" (read as it is), and an "id" (the line's number where it has none). K completions of each are
@@ -22,6 +23,7 @@ import "std/time"
 import "bpe"
 import "chat"
 import "engine"
+import "gguf"
 import "model"
 
 type job struct(id String&, sample I64, prompt Array<I32>&) {
@@ -76,13 +78,19 @@ fn say(msg String&) { try io.PutErrLn("oann-gen: " + msg) catch { } }
 
 # the model's directory: MODEL itself, or the repository fetched
 fn modelDir(name String&) String {
-    if os.IsDir(name): return name
+    if os.IsDir(name) or (name.EndsWith(".gguf") and os.Exists(name)): return name
     if not name.Contains("/"): fail("no model directory " + name)
     root :~ try os.Env("OANN_MODELS") catch default ""
     if root.Len() == 0: root ~ (try os.Env("HOME") catch default "/tmp") + "/.cache/oann/models"
     dir := root + "/" + name.Replace("/", "--")
     try chat.Fetch(name, dir) catch { fail("could not fetch " + name + " from Hugging Face") }
     return dir
+}
+
+# the tokenizer of a model directory, or of a GGUF file's metadata
+fn tokenizer(dir String&) bpe.Bpe ? bpe.BpeError, json.Error, os.Error, gguf.GgufError {
+    if not dir.EndsWith(".gguf"): return try bpe.Bpe.Load(dir + "/tokenizer.json")
+    return try bpe.Bpe.Parse(try (try gguf.File.Open(dir)).TokenizerJson())
 }
 
 fn main() {
@@ -112,7 +120,7 @@ fn main() {
     dir := modelDir(args[0])
     outPath :~ args[2]
     t0 := time.Now()
-    tok := try bpe.Bpe.Load(dir + "/tokenizer.json") catch { fail("cannot read " + dir + "/tokenizer.json") }
+    tok := try tokenizer(dir) catch { fail("cannot read the tokenizer of " + dir) }
     ch := chat.Chat.Load(dir, tok)
     m := try model.Model.Load(dir, exact.Get(), int8.Get()) catch { fail("cannot load the model in " + dir) }
     say("loaded " + dir + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(m.Bytes() / 1048576) + " MB" + (" (INT8)" if m.Int8 else "") + ", " +

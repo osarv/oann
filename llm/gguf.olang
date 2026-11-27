@@ -1,0 +1,537 @@
+# llm/gguf - GGUF files (llama.cpp's format, version 2 and 3) read for llm/model: the metadata, the tensors' names,
+# shapes, types and places, rows of a tensor widened to F32, and the metadata written out as the config.json and
+# tokenizer.json llm/model and llm/bpe read, so a GGUF file loads as a Hugging Face directory does.
+#
+# The file: "GGUF", the version, the counts of tensors and of metadata pairs; the pairs (a key, a type, a value - a
+# number, a bool, a string, or an array of them); each tensor's name, dimensions (the first the fastest: a row's
+# length), type and offset; then the data, from the first multiple of general.alignment (32) after the header, each
+# tensor at its offset from there.
+#
+# Types widened: F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1 (blocks of 32 with a scale, and a minimum or fifth bits)
+# and the k-quants Q4_K, Q5_K, Q6_K (blocks of 256 in sub-blocks of 16 or 32 with scales of their own), as ggml
+# dequantizes them. Q2_K, Q3_K and the i-quants are not read.
+#
+# llama.cpp's converter stores the query and key rows of Llama-family models (llama, mistral, granite, smollm3) in
+# another order for its rotation (the pairs of a head interleaved): Rows puts them back as Hugging Face has them where
+# Permuted says so. Its norms of Gemma models carry the 1 + w already; Gemma is not read here.
+
+import "std/os"
+import "std/io"
+import "std/json"
+import "../io/checkpoint"
+
+type GgufError error {
+    Malformed(what String)      # not a GGUF file, or one that does not hold what it says
+    Unsupported(what String)    # a tensor type or an architecture this module does not read
+}
+
+# a tensor: its name, dimensions (the first a row's length), ggml type and where its data starts in the file
+type Tensor struct(Name String, Dims Array<I64>&, Type I64, At I64) {
+    Name
+    Dims
+    Type
+    At
+}
+
+# the tensor types read: their ggml numbers
+TypeF32 I64 = 0
+TypeF16 I64 = 1
+TypeQ4_0 I64 = 2
+TypeQ4_1 I64 = 3
+TypeQ5_0 I64 = 6
+TypeQ5_1 I64 = 7
+TypeQ8_0 I64 = 8
+TypeQ4_K I64 = 12
+TypeQ5_K I64 = 13
+TypeQ6_K I64 = 14
+TypeBF16 I64 = 30
+
+# a type's elements a block and bytes a block (0: not read)
+fn blockOf(t I64) I64 {
+    if t == TypeF32 or t == TypeF16 or t == TypeBF16: return 1
+    if t == TypeQ4_K or t == TypeQ5_K or t == TypeQ6_K: return 256
+    return 32
+}
+
+fn bytesOf(t I64) I64 {
+    return match t {
+        case 0: 4
+        case 1: 2
+        case 30: 2
+        case 2: 18
+        case 3: 20
+        case 6: 22
+        case 7: 24
+        case 8: 34
+        case 12: 144
+        case 13: 176
+        case 14: 210
+        case _: 0
+    }
+}
+
+# a GGUF file: its metadata as a JSON object (numbers, bools, strings, arrays), its tensors by name
+type File struct(Path String, Meta json.Json&, Tensors Map<String, Tensor>) {
+    Path
+    Meta
+    Tensors
+    Arch String = ""
+    buf mut Array<U8>& = Array<U8>(0)
+}
+
+# reads a file's header a megabyte at a time
+type reader struct(f os.File&) {
+    f
+    buf mut Array<U8>& = Array<U8>(1048576)
+    n I64 = 0                   # bytes in buf
+    pos I64 = 0                 # the next byte's place in buf
+    base I64 = 0                # the file offset of buf[0]
+}
+
+fn (r mut reader&) more() ? GgufError {
+    keep := r.n - r.pos
+    for i in range keep: r.buf[i] = r.buf[r.pos + i]
+    r.base += r.pos
+    r.pos = 0
+    r.n = keep
+    got :~ try r.f.Read(r.buf[keep:]) catch io.Error { error GgufError.Malformed("a read failed") }
+    if got.Len() == 0: error GgufError.Malformed("the file ends inside its header")
+    r.n += got.Len()
+}
+
+fn (r mut reader&) need(k I64) ? GgufError {
+    for r.n - r.pos < k: try r.more()
+}
+
+fn (r mut reader&) u(width I64) U64 ? GgufError {
+    try r.need(width)
+    v U64 = 0
+    for i in range width: v = v | (U64(r.buf[r.pos + i]) << U64(8 * i))
+    r.pos += width
+    return v
+}
+
+fn (r mut reader&) text() String ? GgufError {
+    n := I64(try r.u(8))
+    if n < 0 or n > 1 << 30: error GgufError.Malformed("a string's length")
+    sb := StringBuilder()
+    left := n
+    for left > 0 {
+        if r.pos == r.n: try r.more()
+        k := left.Min(r.n - r.pos)
+        for i in range k: sb.PushChar(Char(r.buf[r.pos + i]))
+        r.pos += k
+        left -= k
+    }
+    return sb.ToString()
+}
+
+# a metadata value of type t
+fn (r mut reader&) value(t I64) json.Json& ? GgufError {
+    return match t {
+        case 0: json.Json.Int(I64(try r.u(1)))
+        case 1: json.Json.Int(I64(I8(U8(try r.u(1)))))
+        case 2: json.Json.Int(I64(try r.u(2)))
+        case 3: json.Json.Int(I64(I16(U16(try r.u(2)))))
+        case 4: json.Json.Int(I64(try r.u(4)))
+        case 5: json.Json.Int(I64(I32(U32(try r.u(4)))))
+        case 6: json.Json.Num(F64(F32.FromBits(U32(try r.u(4)))))
+        case 7: json.Json.Bool((try r.u(1)) != 0)
+        case 8: json.Json.Str(try r.text())
+        case 10: json.Json.Int(I64(try r.u(8)))
+        case 11: json.Json.Int(I64(try r.u(8)))
+        case 12: json.Json.Num(F64.FromBits(try r.u(8)))
+        case 9: try r.array()
+        case _: error GgufError.Malformed("a metadata type " + $t)
+    }
+}
+
+fn (r mut reader&) array() json.Json& ? GgufError {
+    et := I64(try r.u(4))
+    n := I64(try r.u(8))
+    items := Array<json.Json&>(n, json.Json.Null)
+    for i in range n: items[i] ~ try r.value(et)
+    return json.Json.Arr(items)
+}
+
+# the GGUF file at path: its header read, its data left on disk
+fn File.Open(path String&) File ? GgufError {
+    f := try os.File.Open(path) catch os.Error { error GgufError.Malformed("cannot open " + path) }
+    r := reader(f)
+    if (try r.u(4)) != 0x46554747: error GgufError.Malformed(path + " is not a GGUF file")
+    version := try r.u(4)
+    if version < 2 or version > 3: error GgufError.Unsupported("GGUF version " + $version)
+    nt := I64(try r.u(8))
+    nk := I64(try r.u(8))
+    keys := Array<String&>(nk, "")
+    vals := Array<json.Json&>(nk, json.Json.Null)
+    for i in range nk {
+        keys[i] ~ try r.text()
+        vals[i] ~ try r.value(I64(try r.u(4)))
+    }
+    meta :~ json.Json.Obj(try json.Object(keys, vals) catch json.Error { error GgufError.Malformed("metadata") })
+    infos := Vec<Tensor>()
+    for _ in range nt {
+        name := try r.text()
+        nd := I64(try r.u(4))
+        dims := Array<I64>(nd)
+        for d in range nd: dims[d] = I64(try r.u(8))
+        t := I64(try r.u(4))
+        at := I64(try r.u(8))
+        infos.Push(Tensor(name, dims, t, at))
+    }
+    align := try (try meta["general.alignment"] catch default json.Json.Int(32)).AsInt() catch default 32
+    here := r.base + r.pos
+    start := (here + align - 1) / align * align
+    tensors := Map<String, Tensor>()
+    for t in infos.View(): tensors.Put(t.Name, Tensor(t.Name, t.Dims, t.Type, start + t.At))
+    file := File(path, meta, tensors)
+    file.Arch = try (try meta["general.architecture"] catch { error GgufError.Malformed("no general.architecture") }).AsStr() catch { error GgufError.Malformed("general.architecture") }
+    return file
+}
+
+fn (f File&) Has(name String&) Bool { return f.Tensors.Has(name) }
+
+fn (f File&) Tensor(name String&) Tensor ? GgufError {
+    return try f.Tensors.Get(name) catch { error GgufError.Malformed("no tensor " + name) }
+}
+
+# the metadata value of key, or d
+fn (f File&) Int(key String&, d I64) I64 { return try (try f.Meta[key] catch { return d }).AsInt() catch default d }
+
+fn (f File&) Num(key String&, d F64) F64 { return try (try f.Meta[key] catch { return d }).AsNum() catch default d }
+
+fn (f File&) Str(key String&, d String&) String& { return try (try f.Meta[key] catch { return d }).AsStr() catch default d }
+
+# whether the query and key rows are in llama.cpp's interleaved order
+fn (f File&) Permuted() Bool {
+    return f.Arch == "llama" or f.Arch == "granite" or f.Arch == "granitemoe" or f.Arch == "smollm3"
+}
+
+# rows r0 .. r0 + n of tensor name (each Dims[0] long; a tensor of more dimensions read as Dims[0]-long rows) widened
+# to F32 into dst. The query and key rows of a Permuted file come out in Hugging Face's order: row r of a head of hd
+# rows is the file's row (r % (hd / 2)) 2 + r / (hd / 2) of that head
+fn (f mut File&) Rows(name String&, r0 I64, n I64, dst mut Array<F32>&, headDim I64 = 0) ? GgufError {
+    t := try f.Tensor(name)
+    cols := t.Dims[0]
+    bs := blockOf(t.Type)
+    bb := bytesOf(t.Type)
+    if bb == 0: error GgufError.Unsupported(name + ": ggml type " + $t.Type)
+    if cols % bs != 0: error GgufError.Malformed(name + ": a row of " + $cols)
+    rowBytes := cols / bs * bb
+    if f.buf.Len() < rowBytes: f.buf ~ Array<U8>(rowBytes)
+    fd := try os.File.Open(f.Path) catch os.Error { error GgufError.Malformed("cannot open " + f.Path) }
+    perm := headDim > 0 and f.Permuted() and (name.EndsWith("attn_q.weight") or name.EndsWith("attn_k.weight"))
+    for k in range n {
+        r := r0 + k
+        src := r
+        if perm {
+            half := headDim / 2
+            within := r % headDim
+            src = r - within + (within % half) * 2 + within / half
+        }
+        checkpoint.Seek(fd.Fd(), t.At + src * rowBytes, 0)
+        got I64 = 0
+        b :~ f.buf[:rowBytes]
+        for got < rowBytes {
+            part :~ try fd.Read(b[got:]) catch io.Error { error GgufError.Malformed("a read of " + name) }
+            if part.Len() == 0: error GgufError.Malformed("a short tensor " + name)
+            got += part.Len()
+        }
+        Dequant(b, t.Type, cols, dst, k * cols)
+    }
+}
+
+# ---- widening ----
+
+fn f16At(b Array<U8>&, i I64) F32 { return F32(F16.FromBits(U16(b[i]) | (U16(b[i + 1]) << 8))) }
+
+# n elements of type t from b into dst from o
+fn Dequant(b Array<U8>&, t I64, n I64, dst mut Array<F32>&, o I64) {
+    if t == TypeF32 {
+        for i in range n: dst[o + i] = F32.FromBits(U32(b[4 * i]) | (U32(b[4 * i + 1]) << 8) | (U32(b[4 * i + 2]) << 16) | (U32(b[4 * i + 3]) << 24))
+        return
+    }
+    if t == TypeF16 {
+        for i in range n: dst[o + i] = f16At(b, 2 * i)
+        return
+    }
+    if t == TypeBF16 {
+        for i in range n: dst[o + i] = F32(BF16.FromBits(U16(b[2 * i]) | (U16(b[2 * i + 1]) << 8)))
+        return
+    }
+    bs := blockOf(t)
+    bb := bytesOf(t)
+    for k in range n / bs {
+        p := k * bb
+        y := o + k * bs
+        match t {
+            case 8: q8_0(b, p, dst, y)
+            case 2: q4_0(b, p, dst, y, false)
+            case 3: q4_0(b, p, dst, y, true)
+            case 6: q5_0(b, p, dst, y, false)
+            case 7: q5_0(b, p, dst, y, true)
+            case 12: q4K(b, p, dst, y)
+            case 13: q5K(b, p, dst, y)
+            case _: q6K(b, p, dst, y)
+        }
+    }
+}
+
+fn q8_0(b Array<U8>&, p I64, dst mut Array<F32>&, y I64) {
+    d := f16At(b, p)
+    for j in range 32: dst[y + j] = d * F32(I8(b[p + 2 + j]))
+}
+
+# Q4_0: x = d (q - 8); Q4_1: x = d q + m. The low nibbles are the block's first 16, the high its last
+fn q4_0(b Array<U8>&, p I64, dst mut Array<F32>&, y I64, withMin Bool) {
+    d := f16At(b, p)
+    m := f16At(b, p + 2) if withMin else F32(0.0)
+    qs := p + (4 if withMin else 2)
+    off := F32(0.0) if withMin else F32(8.0)
+    for j in range 16 {
+        dst[y + j] = d * (F32(b[qs + j] & 15) - off) + m
+        dst[y + j + 16] = d * (F32(b[qs + j] >> 4) - off) + m
+    }
+}
+
+# Q5_0 and Q5_1: as Q4 with a fifth bit of each element in 32 bits after the scales
+fn q5_0(b Array<U8>&, p I64, dst mut Array<F32>&, y I64, withMin Bool) {
+    d := f16At(b, p)
+    m := f16At(b, p + 2) if withMin else F32(0.0)
+    hp := p + (4 if withMin else 2)
+    qh := U32(b[hp]) | (U32(b[hp + 1]) << 8) | (U32(b[hp + 2]) << 16) | (U32(b[hp + 3]) << 24)
+    qs := hp + 4
+    off := F32(0.0) if withMin else F32(16.0)
+    for j in range 16 {
+        h0 := ((qh >> U32(j)) << 4) & 16
+        h1 := (qh >> U32(j + 12)) & 16
+        dst[y + j] = d * (F32(U32(b[qs + j] & 15) | h0) - off) + m
+        dst[y + j + 16] = d * (F32(U32(b[qs + j] >> 4) | h1) - off) + m
+    }
+}
+
+# a k-quant's sub-block j's 6-bit scale and minimum from its 12 bytes of scales at s
+fn scaleMin(b Array<U8>&, s I64, j I64) F32, F32 {
+    if j < 4: return F32(b[s + j] & 63), F32(b[s + j + 4] & 63)
+    return F32((b[s + j + 4] & 15) | ((b[s + j - 4] >> 6) << 4)), F32((b[s + j + 4] >> 4) | ((b[s + j] >> 6) << 4))
+}
+
+# Q4_K: a scale d and a minimum dmin, eight sub-blocks of 32 with 6-bit scales and minimums, 4-bit elements
+fn q4K(b Array<U8>&, p I64, dst mut Array<F32>&, y I64) {
+    d := f16At(b, p)
+    dmin := f16At(b, p + 2)
+    s := p + 4
+    q := p + 16
+    for j in range 4 {
+        sc1, m1 := scaleMin(b, s, 2 * j)
+        sc2, m2 := scaleMin(b, s, 2 * j + 1)
+        for l in range 32 {
+            dst[y + 64 * j + l] = d * sc1 * F32(b[q + 32 * j + l] & 15) - dmin * m1
+            dst[y + 64 * j + 32 + l] = d * sc2 * F32(b[q + 32 * j + l] >> 4) - dmin * m2
+        }
+    }
+}
+
+# Q5_K: Q4_K with a fifth bit of each element in 32 bytes
+fn q5K(b Array<U8>&, p I64, dst mut Array<F32>&, y I64) {
+    d := f16At(b, p)
+    dmin := f16At(b, p + 2)
+    s := p + 4
+    qh := p + 16
+    ql := p + 48
+    for j in range 4 {
+        sc1, m1 := scaleMin(b, s, 2 * j)
+        sc2, m2 := scaleMin(b, s, 2 * j + 1)
+        u1 := U8(1) << U8(2 * j)
+        u2 := U8(2) << U8(2 * j)
+        for l in range 32 {
+            lo := F32(b[ql + 32 * j + l] & 15) + (F32(16.0) if (b[qh + l] & u1) != 0 else F32(0.0))
+            hi := F32(b[ql + 32 * j + l] >> 4) + (F32(16.0) if (b[qh + l] & u2) != 0 else F32(0.0))
+            dst[y + 64 * j + l] = d * sc1 * lo - dmin * m1
+            dst[y + 64 * j + 32 + l] = d * sc2 * hi - dmin * m2
+        }
+    }
+}
+
+# Q6_K: 4 low and 2 high bits an element, sixteen sub-blocks of 16 with 8-bit scales, one scale d last
+fn q6K(b Array<U8>&, p I64, dst mut Array<F32>&, y I64) {
+    d := f16At(b, p + 208)
+    for h in range 2 {
+        ql := p + 64 * h
+        qh := p + 128 + 32 * h
+        sc := p + 192 + 8 * h
+        o := y + 128 * h
+        for l in range 32 {
+            sub := l / 16
+            hb := I64(b[qh + l])
+            q1 := (I64(b[ql + l] & 15) | ((hb & 3) << 4)) - 32
+            q2 := (I64(b[ql + l + 32] & 15) | (((hb >> 2) & 3) << 4)) - 32
+            q3 := (I64(b[ql + l] >> 4) | (((hb >> 4) & 3) << 4)) - 32
+            q4 := (I64(b[ql + l + 32] >> 4) | (((hb >> 6) & 3) << 4)) - 32
+            dst[o + l] = d * F32(I8(b[sc + sub])) * F32(q1)
+            dst[o + l + 32] = d * F32(I8(b[sc + sub + 2])) * F32(q2)
+            dst[o + l + 64] = d * F32(I8(b[sc + sub + 4])) * F32(q3)
+            dst[o + l + 96] = d * F32(I8(b[sc + sub + 6])) * F32(q4)
+        }
+    }
+}
+
+# ---- as a Hugging Face directory ----
+
+# Hugging Face's model_type of a GGUF architecture
+fn hfArch(a String&) String ? GgufError {
+    return match a {
+        case "llama": "llama"
+        case "qwen2": "qwen2"
+        case "qwen3": "qwen3"
+        case "qwen3moe": "qwen3_moe"
+        case "granite": "granite"
+        case "granitemoe": "granitemoe"
+        case "olmoe": "olmoe"
+        case "smollm3": "smollm3"
+        case _: error GgufError.Unsupported("GGUF architecture " + a)
+    }
+}
+
+fn field(sb mut StringBuilder&, key String&, v String&) { sb.Push(", \"" + key + "\": " + v) }
+
+# the metadata as a config.json for llm/model
+fn (f File&) ConfigJson() String ? GgufError {
+    a := f.Arch + "."
+    sb := StringBuilder()
+    sb.Push("{\"model_type\": \"" + (try hfArch(f.Arch)) + "\"")
+    emb := try f.Tensor("token_embd.weight")
+    field(sb, "vocab_size", $emb.Dims[1])
+    dim := f.Int(a + "embedding_length", 0)
+    heads := f.Int(a + "attention.head_count", 0)
+    field(sb, "hidden_size", $dim)
+    field(sb, "num_hidden_layers", $f.Int(a + "block_count", 0))
+    field(sb, "num_attention_heads", $heads)
+    field(sb, "num_key_value_heads", $f.Int(a + "attention.head_count_kv", heads))
+    field(sb, "head_dim", $f.Int(a + "attention.key_length", dim / heads.Max(1)))
+    field(sb, "intermediate_size", $f.Int(a + "feed_forward_length", 0))
+    field(sb, "rope_theta", $f.Num(a + "rope.freq_base", 10000.0))
+    field(sb, "rms_norm_eps", $f.Num(a + "attention.layer_norm_rms_epsilon", 1e-6))
+    field(sb, "max_position_embeddings", $f.Int(a + "context_length", 4096))
+    field(sb, "tie_word_embeddings", "false" if f.Has("output.weight") else "true")
+    field(sb, "attention_bias", "true" if f.Has("blk.0.attn_q.bias") else "false")
+    experts := f.Int(a + "expert_count", 0)
+    if experts > 0 {
+        field(sb, "num_experts", $experts)
+        field(sb, "num_experts_per_tok", $f.Int(a + "expert_used_count", 0))
+        field(sb, "moe_intermediate_size", $f.Int(a + "expert_feed_forward_length", f.Int(a + "feed_forward_length", 0)))
+        if f.Arch == "qwen3moe": field(sb, "norm_topk_prob", "true")
+    }
+    kind :~ f.Str(a + "rope.scaling.type", "")
+    if kind == "linear" or kind == "yarn" {
+        sb.Push(", \"rope_scaling\": {\"rope_type\": \"" + kind + "\", \"factor\": " + $f.Num(a + "rope.scaling.factor", 1.0) +
+            ", \"original_max_position_embeddings\": " + $f.Int(a + "rope.scaling.original_context_length", 0) + "}")
+    }
+    if f.Arch == "granite" or f.Arch == "granitemoe" {
+        field(sb, "embedding_multiplier", $f.Num(a + "embedding_scale", 1.0))
+        field(sb, "residual_multiplier", $f.Num(a + "residual_scale", 1.0))
+        field(sb, "attention_multiplier", $f.Num(a + "attention.scale", 0.0))
+        field(sb, "logits_scaling", $f.Num(a + "logit_scale", 1.0))
+    }
+    sb.Push("}")
+    return sb.ToString()
+}
+
+# a JSON string literal of s
+fn quoted(s String&) String {
+    return json.Encode(s)
+}
+
+# the tokenizer as a tokenizer.json for llm/bpe: byte-level BPE (tokenizer.ggml.model "gpt2"), the pre-tokenizer by
+# tokenizer.ggml.pre, control and user-defined tokens (types 3 and 4) added
+fn (f File&) TokenizerJson() String ? GgufError {
+    model :~ f.Str("tokenizer.ggml.model", "")
+    if model != "gpt2": error GgufError.Unsupported("tokenizer.ggml.model " + model + " (gpt2's byte-level BPE is read)")
+    tokens :~ try (try f.Meta["tokenizer.ggml.tokens"] catch { error GgufError.Malformed("tokens") }).AsArr() catch { error GgufError.Malformed("tokens") }
+    types :~ try (try f.Meta["tokenizer.ggml.token_type"] catch { error GgufError.Malformed("token_type") }).AsArr() catch { error GgufError.Malformed("token_type") }
+    merges :~ try (try f.Meta["tokenizer.ggml.merges"] catch { error GgufError.Malformed("merges") }).AsArr() catch { error GgufError.Malformed("merges") }
+    pre :~ f.Str("tokenizer.ggml.pre", "default")
+    sb := StringBuilder()
+    sb.Push("{\"added_tokens\": [")
+    first := true
+    for i in range tokens.Len() {
+        ty := try types[i].AsInt() catch default 1
+        if ty != 3 and ty != 4: continue
+        if not first: sb.Push(", ")
+        first = false
+        sb.Push("{\"id\": " + $i + ", \"content\": " + quoted(try tokens[i].AsStr() catch default "") + ", \"special\": " + ("true" if ty == 3 else "false") + "}")
+    }
+    sb.Push("], \"normalizer\": null, \"pre_tokenizer\": ")
+    if pre == "qwen2" or pre == "deepseek-r1-qwen" {
+        sb.Push("{\"type\": \"Sequence\", \"pretokenizers\": [{\"type\": \"Split\", \"pattern\": {\"Regex\": \"\\\\p{N}|\"}}, {\"type\": \"ByteLevel\", \"use_regex\": false}]}")
+    } else if pre == "llama-bpe" or pre == "llama3" or pre == "smaug-bpe" {
+        sb.Push("{\"type\": \"Sequence\", \"pretokenizers\": [{\"type\": \"Split\", \"pattern\": {\"Regex\": \"\\\\p{N}{1,3}\"}}, {\"type\": \"ByteLevel\", \"use_regex\": false}]}")
+    } else if pre == "smollm" {
+        sb.Push("{\"type\": \"Sequence\", \"pretokenizers\": [{\"type\": \"Digits\", \"individual_digits\": true}, {\"type\": \"ByteLevel\", \"use_regex\": true}]}")
+    } else {
+        sb.Push("{\"type\": \"ByteLevel\", \"use_regex\": true}")
+    }
+    sb.Push(", \"model\": {\"type\": \"BPE\", \"ignore_merges\": " + ("true" if pre == "llama-bpe" or pre == "llama3" else "false") + ", \"vocab\": {")
+    for i in range tokens.Len() {
+        if i > 0: sb.Push(", ")
+        sb.Push(quoted(try tokens[i].AsStr() catch default "") + ": " + $i)
+    }
+    sb.Push("}, \"merges\": [")
+    for i in range merges.Len() {
+        if i > 0: sb.Push(", ")
+        sb.Push(quoted(try merges[i].AsStr() catch default ""))
+    }
+    sb.Push("]}}")
+    return sb.ToString()
+}
+
+# the end-of-text tokens the metadata names
+fn (f File&) EosIds() Array<I32> {
+    out := Vec<I32>()
+    for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"] {
+        id := f.Int(key, -1)
+        if id >= 0: out.Push(I32(id))
+    }
+    return out.ToArray()
+}
+
+# ---- tests ----
+
+# the GGUF files under $OANN_MODELS/gguf with a FILE.deq.json (llm/tools/ggufref.py: gguf-py's dequantization of the
+# first two rows of a tensor of each type)
+test Dequant "widens every quantization type as gguf-py does, for the GGUF files under $OANN_MODELS/gguf" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0 or not os.Exists(root + "/gguf"): return
+    for name in os.ReadDir(root + "/gguf")! {
+        path := root + "/gguf/" + name
+        if not name.EndsWith(".gguf") or not os.Exists(path + ".deq.json"): continue
+        f := File.Open(path)!
+        refs :~ json.Json.Parse(os.ReadFile(path + ".deq.json")!)!.AsObj()!
+        for k in range refs.Len() {
+            rows :~ refs.Values[k]["rows"]!.AsArr()!
+            flat := Vec<F32>()
+            for row in rows {
+                for x in row.AsArr()!: flat.Push(F32(x.AsNum()!))
+            }
+            want := flat.ToArray()
+            got := Array<F32>(want.Len())
+            f.Rows(refs.Keys[k], 0, rows.Len(), got)!
+            for i in range want.Len() {
+                assert (got[i] - want[i]).Abs() <= 1e-5 + 1e-5 * want[i].Abs(), name + " " + refs.Keys[k] + " [" + $i + "]: " + $got[i] + ", not " + $want[i]
+            }
+        }
+    }
+}
+
+test File "reads the metadata as a config and a tokenizer, for the GGUF files under $OANN_MODELS/gguf" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0 or not os.Exists(root + "/gguf"): return
+    for name in os.ReadDir(root + "/gguf")! {
+        if not name.EndsWith(".gguf"): continue
+        f := File.Open(root + "/gguf/" + name)!
+        assert json.Json.Parse(f.ConfigJson()!)!.Has("hidden_size")
+        assert json.Json.Parse(f.TokenizerJson()!)!.Has("model")
+        assert f.EosIds().Len() > 0
+    }
+}

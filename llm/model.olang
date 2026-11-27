@@ -39,6 +39,7 @@ import "std/os"
 import "std/io"
 import stdtile "std/tile"
 import "../io/checkpoint"
+import "gguf"
 import "../kernels/gemm"
 import "../kernels/mat"
 import "../kernels/elem"
@@ -88,6 +89,7 @@ type Config struct() {
     PostNorms Bool = false  # each branch's output normed before it is added (Gemma's post_attention and post_feedforward)
     NormPlus F32 = 0.0      # added to every norm weight as it is read (Gemma's 1 + w)
     ThetaLocal F64 = 0.0    # the sliding-window layers' rope theta, unscaled (Gemma's rope_local_base_freq); 0: Theta
+    FreqDiv mut Array<F64>& = Array<F64>(0)     # each rotary frequency divided by its factor (a GGUF's rope_freqs); empty: none
 }
 
 # whether layer li rotates by the local frequencies (a window's, where ThetaLocal is set)
@@ -146,6 +148,9 @@ fn (c Config&) Freqs() Array<F64> {
             ramp := ((F64(i) - lo) / (hi - lo)).Max(0.0).Min(1.0)
             f[i] = f[i] / c.RopeFactor * ramp + f[i] * (1.0 - ramp)
         }
+    }
+    if c.FreqDiv.Len() == half {
+        for i in range half: f[i] = f[i] / c.FreqDiv[i]
     }
     return f
 }
@@ -373,7 +378,52 @@ type Weights struct(files Array<checkpoint.File>&, where Map<String, I64>, paths
     paths
     base                    # where each file's data starts
     buf mut Array<U8>& = Array<U8>(0)
+    row mut Array<F32>& = Array<F32>(0)
+    gg mut Vec<gguf.File>& = Vec<gguf.File>()     # a GGUF file in place of the safetensors (its one element)
+    headDim I64 = 0
 }
+
+# the weights of a GGUF file, read by their Hugging Face names
+fn Weights.Gguf(f gguf.File, headDim I64) Weights {
+    w := Weights(Array<checkpoint.File>(0), Map<String, I64>(), Array<String>(0), Array<I64>(0))
+    w.gg.Push(f)
+    w.headDim = headDim
+    return w
+}
+
+# a Hugging Face tensor's name in a GGUF file, and its expert (a mixture's experts are one tensor there; -1: none)
+fn ggufName(name String&) String, I64 {
+    if name == "model.embed_tokens.weight": return "token_embd.weight", -1
+    if name == "lm_head.weight": return "output.weight", -1
+    if name == "model.norm.weight": return "output_norm.weight", -1
+    if not name.StartsWith("model.layers."): return name, -1
+    rest :~ name["model.layers.".Len():]
+    dot := try rest.Find(".") catch default 0
+    blk := "blk." + rest[:dot] + "."
+    part :~ rest[dot + 1:]
+    if part.StartsWith("mlp.experts.") {
+        tail :~ part["mlp.experts.".Len():]
+        d := try tail.Find(".") catch default 0
+        e := try tail[:d].ParseInt() catch default -1
+        kind :~ tail[d + 1:]
+        if kind == "gate_proj.weight": return blk + "ffn_gate_exps.weight", e
+        if kind == "up_proj.weight": return blk + "ffn_up_exps.weight", e
+        return blk + "ffn_down_exps.weight", e
+    }
+    for pair in ggufNames {
+        if part == pair[0]: return blk + pair[1], -1
+    }
+    return blk + part, -1
+}
+
+ggufNames Array<Array<String>&>& = [
+    ["self_attn.q_proj.weight", "attn_q.weight"], ["self_attn.k_proj.weight", "attn_k.weight"]
+    ["self_attn.v_proj.weight", "attn_v.weight"], ["self_attn.o_proj.weight", "attn_output.weight"]
+    ["self_attn.q_proj.bias", "attn_q.bias"], ["self_attn.k_proj.bias", "attn_k.bias"], ["self_attn.v_proj.bias", "attn_v.bias"]
+    ["self_attn.q_norm.weight", "attn_q_norm.weight"], ["self_attn.k_norm.weight", "attn_k_norm.weight"]
+    ["mlp.gate_proj.weight", "ffn_gate.weight"], ["mlp.up_proj.weight", "ffn_up.weight"], ["mlp.down_proj.weight", "ffn_down.weight"]
+    ["input_layernorm.weight", "attn_norm.weight"], ["post_attention_layernorm.weight", "ffn_norm.weight"]
+    ["mlp.gate.weight", "ffn_gate_inp.weight"]]
 
 # file "path" opened, and where its data starts (after the 8 bytes of the header's length and the header)
 fn opened(path String&, paths mut Vec<String>&, base mut Vec<I64>&) ? ModelError, os.Error {
@@ -418,7 +468,40 @@ fn Weights.Open(dir String&) Weights ? ModelError, os.Error {
     return Weights(files.ToArray(), where, paths.ToArray(), base.ToArray())
 }
 
-fn (w Weights&) Has(name String&) Bool { return w.where.Has(name) }
+fn (w Weights&) Has(name String&) Bool {
+    if w.gg.Len() > 0 {
+        g, _ := ggufName(name)
+        return w.gg[0].Has(g)
+    }
+    return w.where.Has(name)
+}
+
+# rows at..at + n of tensor "name" (each cols long; a tensor of 3 dimensions read as its rows one after another) as
+# F32 into dst
+fn (w mut Weights&) rowsOf(name String&, at I64, n I64, cols I64, dst mut Array<F32>&) ? ModelError {
+    if w.gg.Len() > 0 {
+        g, e := ggufName(name)
+        t := try w.gg[0].Tensor(g) catch gguf.GgufError { error ModelError.Malformed("no tensor " + g) }
+        if t.Dims[0] != cols: error ModelError.Malformed(g + " has rows of " + $t.Dims[0] + ", not " + $cols)
+        total I64 = 1
+        for d in range 1, t.Dims.Len(): total *= t.Dims[d]
+        first := at + (e * n if e >= 0 else 0)
+        if first + n > total: error ModelError.Malformed(g + " has " + $total + " rows")
+        try w.gg.RefMut(0).Rows(g, first, n, dst, w.headDim) catch gguf.GgufError { error ModelError.Malformed("a read of " + g) }
+        return
+    }
+    e, k := try w.entry(name)
+    last := e.Shape[e.Shape.Len() - 1]
+    total I64 = 1
+    for d in range e.Shape.Len() - 1: total *= e.Shape[d]
+    ok := e.Type == checkpoint.Dtype.BF16 or e.Type == checkpoint.Dtype.F16 or e.Type == checkpoint.Dtype.F32
+    if not ok or last != cols or at + n > total.Max(1): error ModelError.Malformed(e.Key + " is " + $e.Shape + " " + e.Type.Name() + ", not rows of " + $cols)
+    width := e.Type.Width()
+    if w.buf.Len() < n * cols * width: w.buf ~ Array<U8>(n * cols * width)
+    b :~ w.buf[:n * cols * width]
+    try w.read(k, e.Begin + at * cols * width, b)
+    for i in range n * cols: dst[i] = valueAt(b, i, e.Type)
+}
 
 fn (w Weights&) entry(name String&) checkpoint.Entry, I64 ? ModelError {
     k := try w.where.Get(name) catch { error ModelError.Malformed("no tensor " + name) }
@@ -447,35 +530,15 @@ fn valueAt(b Array<U8>&, i I64, d checkpoint.Dtype) F32 {
     }
 }
 
-# element i of raw data of dtype d, as BF16 (BF16 data: its bits)
-fn bf16At(b Array<U8>&, i I64, d checkpoint.Dtype) BF16 {
-    if d == checkpoint.Dtype.BF16: return BF16.FromBits(U16(b[2 * i]) | (U16(b[2 * i + 1]) << 8))
-    return BF16(valueAt(b, i, d))
-}
-
-fn (w Weights&) check(e checkpoint.Entry&, rows I64, cols I64) ? ModelError {
-    ok := e.Type == checkpoint.Dtype.BF16 or e.Type == checkpoint.Dtype.F16 or e.Type == checkpoint.Dtype.F32
-    shapeOk := (e.Shape.Len() == 2 and e.Shape[0] == rows and e.Shape[1] == cols) or (e.Shape.Len() == 1 and rows == 1 and e.Shape[0] == cols)
-    if not ok or not shapeOk: error ModelError.Malformed(e.Key + " is " + $e.Shape + " " + e.Type.Name() + ", not [" + $rows + ", " + $cols + "] of a float type")
-}
-
 # tensor "name", [rows, In], into outputs from..from + rows of l; or its rows at..at + rows, where it is [n, m, In] (a
 # mixture's experts in one tensor) or holds more rows
 fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64 = 0) ? ModelError {
-    e, k := try w.entry(name)
-    if at == 0 and e.Shape.Len() < 3 {
-        try w.check(e, rows, l.In)
-    } else {
-        total := e.Shape[0] * (e.Shape[1] if e.Shape.Len() == 3 else 1)
-        if e.Shape.Len() < 2 or e.Shape[e.Shape.Len() - 1] != l.In or total < at + rows: error ModelError.Malformed(e.Key + " is " + $e.Shape)
-    }
-    width := e.Type.Width()
-    per := (16 * 1048576 / (l.In * width)).Max(1)
-    if w.buf.Len() < per * l.In * width: w.buf ~ Array<U8>(per * l.In * width)
+    per := (4 * 1048576 / l.In).Max(1)
+    if w.row.Len() < per * l.In: w.row ~ Array<F32>(per * l.In)
     for r0 in range 0, rows, per {
         n := per.Min(rows - r0)
-        b :~ w.buf[:n * l.In * width]
-        try w.read(k, e.Begin + (at + r0) * l.In * width, b)
+        try w.rowsOf(name, at + r0, n, l.In, w.row)
+        b :~ w.row
         for r in range n {
             o := from + r0 + r
             if l.Int8 {
@@ -483,22 +546,22 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
                 for g0 in range 0, l.In, l.Group {
                     top F32 = 0.0
                     for i in range g0, g0 + l.Group {
-                        v := valueAt(b, r * l.In + i, e.Type)
+                        v := b[r * l.In + i]
                         top = v if v > top else (-v if -v > top else top)
                     }
                     sc := top / 127.0 if top > 0.0 else F32(1.0)
                     l.Scale[(o * l.In + g0) / l.Group] = sc
                     inv := 1.0 / sc
                     for i in range g0, g0 + l.Group {
-                        v := (valueAt(b, r * l.In + i, e.Type) * inv).Round()
+                        v := (b[r * l.In + i] * inv).Round()
                         l.Q[l.at(o, i)] = I8(v if v < 127.0 and v > -127.0 else (F32(127.0) if v > 0.0 else F32(-127.0)))
                     }
                 }
             } else if l.Packed {
                 base := (o / l.Nb) * l.In * l.Nb + (o % l.Nb) * 2
-                for i in range l.In: l.W[base + (i / 2) * l.Nb * 2 + i % 2] = bf16At(b, r * l.In + i, e.Type)
+                for i in range l.In: l.W[base + (i / 2) * l.Nb * 2 + i % 2] = BF16(b[r * l.In + i])
             } else {
-                for i in range l.In: l.W[o * l.In + i] = bf16At(b, r * l.In + i, e.Type)
+                for i in range l.In: l.W[o * l.In + i] = BF16(b[r * l.In + i])
             }
         }
     }
@@ -506,20 +569,14 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
 
 # a matrix "name" of rows x cols into dst, F32, row-major
 fn (w mut Weights&) matrix(dst mut Array<F32>&, name String&, rows I64, cols I64) ? ModelError {
-    e, k := try w.entry(name)
-    try w.check(e, rows, cols)
-    b := Array<U8>(rows * cols * e.Type.Width())
-    try w.read(k, e.Begin, b)
-    for i in range rows * cols: dst[i] = valueAt(b, i, e.Type)
+    try w.rowsOf(name, 0, rows, cols, dst)
 }
 
 # a vector "name" of n elements into dst from "from"
 fn (w mut Weights&) vector(dst mut Array<F32>&, name String&, from I64, n I64) ? ModelError {
-    e, k := try w.entry(name)
-    try w.check(e, 1, n)
-    b := Array<U8>(n * e.Type.Width())
-    try w.read(k, e.Begin, b)
-    for i in range n: dst[from + i] = valueAt(b, i, e.Type)
+    v := Array<F32>(n)
+    try w.rowsOf(name, 0, 1, n, v)
+    for i in range n: dst[from + i] = v[i]
 }
 
 # ---- the model ----
@@ -540,10 +597,27 @@ type Model struct(C Config, Tile Bool, Int8 Bool = false) {
 # the model in directory dir (config.json, model.safetensors or its shards): exact (F32 activations, gemm's products)
 # where AMX is missing or exact is set
 fn Model.Load(dir String&, exact Bool = false, int8 Bool = false) Model ? ModelError, os.Error {
+    if dir.EndsWith(".gguf") {
+        g := try gguf.File.Open(dir) catch gguf.GgufError { error ModelError.Malformed(dir + " (GGUF)") }
+        c := try Config.Parse(try g.ConfigJson() catch gguf.GgufError { error ModelError.Unsupported(dir + ": " + g.Arch) })
+        w := Weights.Gguf(g, c.HeadDim)
+        return try Model.From(c, w, exact, int8)
+    }
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
+    w := try Weights.Open(dir)
+    return try Model.From(c, w, exact, int8)
+}
+
+# the model of config c with weights w
+fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool) Model ? ModelError {
     if exact and int8: error ModelError.Unsupported("exact products of 8-bit weights")
     m := Model(c, TargetHasTileDot and not exact, int8 and TargetHasTileDot)
-    w := try Weights.Open(dir)
+    if w.Has("rope_freqs.weight") {
+        m.C.FreqDiv ~ Array<F64>(c.HeadDim / 2)
+        v := Array<F32>(c.HeadDim / 2)
+        try w.vector(v, "rope_freqs.weight", 0, c.HeadDim / 2)
+        for i in range v.Len(): m.C.FreqDiv[i] = F64(v[i])
+    }
     q := c.Heads * c.HeadDim
     kv := c.KvHeads * c.HeadDim
     for i in range c.Layers {
@@ -601,7 +675,7 @@ fn Model.Load(dir String&, exact Bool = false, int8 Bool = false) Model ? ModelE
 # Granite-MoE's all experts in one ([E, 2 MoeFfn, Dim] gate and up halves, [E, Dim, MoeFfn])
 fn loadExperts(w mut Weights&, l mut Layer&, c Config&, p String&) ? ModelError {
     f := c.MoeFfn
-    if c.Arch == "granitemoe" {
+    if c.Arch == "granitemoe" and w.gg.Len() == 0 {
         try w.matrix(l.Router, p + "block_sparse_moe.router.layer.weight", c.Experts, c.Dim)
         for e in range c.Experts {
             try w.fill(l.Ups[e], p + "block_sparse_moe.input_linear.weight", 0, 2 * f, e * 2 * f)
@@ -1841,6 +1915,37 @@ test Model "matches transformers on SmolLM2, Llama 3.2, Granite 3.3 and Granite 
             # path is held to the first five
             n := 10 if exact else 5
             assert toks[:n] == cont[:n], name + " exact " + $exact + ": " + $toks + ", not " + $cont
+        }
+    }
+}
+
+# GGUF files under $OANN_MODELS/gguf with a FILE.ref.json of llm/tools/ggufref.py (transformers reading the file,
+# dequantized to F32): the weights here are the dequantized ones rounded to BF16, so the logits are held to a mean
+# difference of 1% of the largest and the greedy tokens to the first five
+test Model "loads GGUF files (Q8_0, Q4_0, Q4_1, the k-quants): the logits and greedy tokens of transformers reading them, where $OANN_MODELS/gguf has them" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0 or not os.Exists(root + "/gguf"): return
+    for name in os.ReadDir(root + "/gguf")! {
+        path := root + "/gguf/" + name
+        if not name.EndsWith(".gguf") or not os.Exists(path + ".ref.json"): continue
+        j :~ json.Json.Parse(os.ReadFile(path + ".ref.json")!)!
+        prompt := Array<I32>[I32(t.AsInt()!) for t in j["tokens"]!.AsArr()!]
+        last := Array<F32>[F32(x.AsNum()!) for x in j["last"]!.AsArr()!]
+        cont := Array<I32>[I32(t.AsInt()!) for t in j["greedy"]!.AsArr()!]
+        for exact in [true, false] {
+            m := Model.Load(path, exact)!
+            toks, _ := greedy(m, prompt, 5)
+            k := Cache(m.C, 8, 1, 8, exact)
+            for i in range 8: k.Table[i] = k.Take()
+            s := State(m, prompt.Len(), prompt.Len(), 256)
+            for i, t in prompt: s.Add(t, I64(i), 0, true)
+            m.Step(s, k)
+            lg :~ s.LogitsOf(prompt.Len() - 1, m.C.Vocab)
+            diff F64 = 0.0
+            for i in range last.Len(): diff += F64((lg[i] - last[i]).Abs())
+            mean := diff / F64(last.Len())
+            assert mean < 0.01 * biggest(last), name + " exact " + $exact + ": mean " + $mean + " of " + $biggest(last) + ", worst " + $worst(last, lg)
+            assert toks == cont[:5], name + " exact " + $exact + ": " + $toks + ", not " + $cont
         }
     }
 }

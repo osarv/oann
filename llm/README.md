@@ -8,11 +8,12 @@ completions of a file of prompts as one long, resumable job. Nothing here trains
 | file | what |
 |---|---|
 | `model.olang` | `Config` (config.json), `Model.Load` (safetensors, one file or the shards of an index; BF16, F16 or F32 stored), `Step` (any rows of any sequences through every layer), `Cache` (the paged key-value cache), `State` (a step's rows and buffers) |
+| `gguf.olang` | GGUF files (llama.cpp's): the header and metadata, rows of a tensor widened to F32 (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K), the metadata as the config.json and tokenizer.json the rest reads; `Model.Load` and `oann-gen` take a `.gguf` path in place of a directory (llama, qwen2, qwen3, qwen3moe, granite, granitemoe, olmoe, smollm3; not Gemma) |
 | `bpe.olang` | `Bpe`, Hugging Face's BPE (tokenizer.json), byte-level or SentencePiece's (Gemma: "▁" for spaces, byte fallback): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
 | `chat.olang` | `Chat`: the chat template (ChatML, DeepSeek-R1's, Llama 3's, Granite's, Gemma's), stop tokens and sampling defaults of a model directory; `Fetch` from Hugging Face |
 | `gen.olang` | `oann-gen` |
-| `tools/reference.py`, `tools/tokref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
+| `tools/reference.py`, `tools/tokref.py`, `tools/ggufref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
 ## Using it
 
@@ -126,6 +127,14 @@ positions); SmolLM2-135M, Llama-3.2-1B, Granite-3.3-2B, Granite-3.1-1B-A400M and
 the whole vocabulary and the same ten greedy tokens on the exact path, five on AMX's (Granite-3.3's sixth is a near tie
 that transformers in BF16 also takes the other way); the ids of Qwen3, Llama 3.2, SmolLM2, Granite 3.3 and Gemma 3's tokenizers exactly the library's; the chat
 prompts exactly the templates'.
+
+A GGUF file's weights load widened to F32 and then rounded to BF16 (or requantized to INT8 with `--int8`): the file's
+4 or 8 bits save disk and download, not memory or time. The query and key rows of the Llama family come out of
+llama.cpp's interleaved order, and Llama 3's `rope_freqs` divides the frequencies. `llm/tools/ggufref.py FILE.gguf ...`
+writes transformers' own reading of each file (dequantized, F32) and gguf-py's dequantization of two rows of a tensor of
+each type; the tests hold the rows to 1e-5 and the model, on both paths, to a mean logit difference under 1% of the
+largest and the same five greedy tokens (Qwen3-0.6B in Q8_0, Q4_0 with Q4_1 and Q6_K, Q4_K_M, Q5_K_M; Llama-3.2-1B in
+Q4_K_M).
 
 The tests (`make test`) build small random Qwen2 and Qwen3 checkpoints and hold the AMX path to the exact one within
 BF16's rounding, decoding through the cache a token a step to reading the prompt at once (over pages), a row's logits
