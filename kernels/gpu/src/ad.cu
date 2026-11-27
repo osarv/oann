@@ -166,6 +166,24 @@ extern "C" __global__ void oann_ad_mul_grad(store *dx, const store *dy, const st
     OANN_LOOP(i, n) { real v = (real)1.0 * dy[i] * b[i]; dx[i] = add ? dx[i] + v : v; }
 }
 
+// w[i] = level[code i] * absmax[i / 64]: a Linear's NF4 weights (kernels/nf4) dequantized into the arena before a product,
+// two codes a byte (weight 2j in byte j's high nibble), the level times its block's scale formed in float as the CPU
+// does, then stored (rounded once in a BF16 graph)
+__constant__ float oann_nf4_levels[16] = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+    0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f};
+
+extern "C" __global__ void oann_ad_nf4(store *w, const unsigned char *codes, const float *absmax, long long n) {
+    OANN_LOOP(i, n) {
+        unsigned int b = codes[i >> 1];
+        unsigned int q = (i & 1) ? (b & 15u) : (b >> 4);
+        float v = oann_nf4_levels[q] * absmax[i >> 6];
+        w[i] = (real)v;
+    }
+}
+
 extern "C" __global__ void oann_ad_scale(store *y, const store *x, real k, long long n) { OANN_LOOP(i, n) y[i] = k * x[i]; }
 
 // y[r, c] += b[c]: the bias after a product
