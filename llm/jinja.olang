@@ -1,0 +1,2119 @@
+# llm/jinja - the subset of Jinja2 that Hugging Face chat templates are written in, so a model's prompt is made by its
+# own template (tokenizer_config.json's chat_template) as transformers' apply_chat_template makes it.
+#
+#     t := try jinja.Template.Parse(text)
+#     prompt := try t.Render(ctx)          # ctx: a Val.Dict of the template's variables
+#
+# The environment is transformers': trim_blocks and lstrip_blocks on, `-` on either side of a tag stripping the
+# whitespace beside it, an undefined name an empty value that fails when an attribute or item is asked of it, tojson
+# writing Python's json.dumps(x, ensure_ascii=False) (", " and ": " between parts, the key order kept; with indent
+# "," at the line ends), and the globals raise_exception(msg) (Render fails with Error.Raised(msg)), namespace(...),
+# strftime_now(fmt) (local time), range(...) and dict(...).
+#
+# Statements: if/elif/else, for (loop.index0, index, revindex, revindex0, first, last, length, previtem, nextitem;
+# "for x in xs if cond"; else; several targets "for k, v in d.items()"), set (a name, a namespace's attribute
+# "set ns.a = ...", a block "{% set x %}...{% endset %}"), macro (called as a function, its body rendered), generation
+# (its body rendered), break and continue. A for loop's body and a macro's are scopes of their own, as in Jinja: a name
+# set inside one is gone after it (namespaces carry values out).
+#
+# Expressions: literals ('..' and ".." with Python's escapes, integers, floats, true/false/none in either case), lists,
+# dicts, tuples (as lists), attributes and items (a dict's keys by either), slices ([::-1]), + - * / // % **, ~,
+# comparisons, in and not in, and/or/not, "a if c else b", filters (trim, tojson, length/count, first, last, string,
+# upper, lower, title, capitalize, join, list, default/d, items, int, float, abs, reverse, safe, map, select, reject,
+# selectattr, rejectattr, replace, round), tests (defined, undefined, none, string, mapping, iterable, sequence, number,
+# integer, float, boolean, true, false, callable, eq/equalto/==, ne, lt, gt, le, ge, in, odd, even, divisibleby), and
+# the methods of strings (startswith, endswith, strip, lstrip, rstrip, split, replace, upper, lower, title, capitalize,
+# find, join, format) and dicts (items, keys, values, get).
+#
+# How it works: Parse lexes the text once - whitespace control applied to the text between tags - into tokens, and a
+# recursive-descent parser with Jinja's precedence builds the expressions, statements and blocks into three arrays
+# that refer to each other by index. Render walks them with a stack of scopes. Values are a Val, held by value: a list
+# or dict copies as any value does (templates are small); a namespace is a handle to the attributes the render keeps.
+#
+# Not Python: a float written whole in a JSON text read by Val.FromJson ("22.0") becomes an integer, as std/json reads it.
+
+import "std/json"
+import "std/time"
+
+type Error error {
+    Syntax(msg String, line I64)    # the template does not parse: what was wrong, the line it is on (from 1)
+    Undefined(msg String)           # an attribute or item asked of an undefined value, or an undefined value used
+    Type(msg String)                # an operation on values it does not take: "a" + 1, a call of a string
+    Raised(msg String)              # the template called raise_exception(msg)
+}
+
+# a value of a template: what Python's types would be
+type Val enum {
+    Undef
+    None
+    Bool(v Bool)
+    Int(v I64)
+    Float(v F64)
+    Str(s String)
+    List(items Vec<Val>)
+    Dict(kv Vec<Val>)                           # keys (Str) and values by turns, in insertion order
+    Ns(id I64)                                  # a namespace: its attributes kept by the render
+    Macro(node I64)                             # a macro defined by the template
+    Func(name String)                           # a global function
+}
+
+# ---- building values ----
+
+# the value std/json read: objects as dicts in their order, whole numbers as integers
+fn Val.FromJson(j json.Json&) Val {
+    match j {
+        case json.Json.Null: return Val.None
+        case json.Json.Bool(b): return Val.Bool(b)
+        case json.Json.Int(n): return Val.Int(n)
+        case json.Json.Uint(n): return Val.Int(I64(n))
+        case json.Json.Num(x) {
+            if x == x.Trunc() and x.Abs() < 9007199254740992.0: return Val.Int(I64(x))
+            return Val.Float(x)
+        }
+        case json.Json.Str(s): return Val.Str(s)
+        case json.Json.Arr(items) {
+            l := Vec<Val>()
+            for x in items: l.Push(Val.FromJson(x))
+            return Val.List(l)
+        }
+        case json.Json.Obj(o) {
+            kv := Vec<Val>()
+            for k in range o.Len() {
+                kv.Push(Val.Str(o.Keys[k]))
+                kv.Push(Val.FromJson(o.Values[k]))
+            }
+            return Val.Dict(kv)
+        }
+    }
+}
+
+# an empty dict, to Put into
+fn Val.NewDict() Val { return Val.Dict(Vec<Val>()) }
+
+# a dict with key set to v: replaced where it is, else added last. Nothing on a value that is no dict
+fn (d mut Val&) Put(key String&, v Val) {
+    if d != Val.Dict: return
+    kv := (d as Val.Dict)!
+    k := Val.Str(key)
+    for i in range 0, kv.Len(), 2 {
+        if kv.At(i) == k {
+            kv.SetAt(i + 1, v)
+            d = Val.Dict(kv)
+            return
+        }
+    }
+    kv.Push(k)
+    kv.Push(v)
+    d = Val.Dict(kv)
+}
+
+# the member key of a dict, Undef where there is none or the value is no dict
+fn (d Val&) Get(key String&) Val {
+    kv := kvOf(d)
+    k := Val.Str(key)
+    for i in range 0, kv.Len(), 2 {
+        if kv.At(i) == k: return kv.At(i + 1)
+    }
+    return Val.Undef
+}
+
+# a list's items, a dict's keys and values by turns, a string's text; empty for any other value
+fn listOf(v Val&) Vec<Val> {
+    if v == Val.List: return (v as Val.List)!
+    return Vec<Val>()
+}
+
+fn kvOf(v Val&) Vec<Val> {
+    if v == Val.Dict: return (v as Val.Dict)!
+    return Vec<Val>()
+}
+
+fn textOf(v Val&) String {
+    if v == Val.Str: return (v as Val.Str)!
+    return ""
+}
+
+# ---- tokens ----
+
+type tk enum {
+    Text
+    VarOpen
+    VarClose
+    BlockOpen
+    BlockClose
+    Name
+    Str
+    Int
+    Float
+    Op
+    End
+}
+
+type token struct(Kind tk, Text String, Line I64) {
+    Kind
+    Text
+    Line
+}
+
+type lexer struct(src String&) {
+    src
+    pos I64 = 0
+    toks Vec<token> = Vec<token>()
+    lineStart Bool = true           # the last tag's end (with what it stripped) ended a line: lstrip_blocks applies
+}
+
+fn (l lexer&) line(at I64) I64 {
+    n I64 = 1
+    for i in range at.Min(l.src.Len()) {
+        if l.src[i] == '\n': n++
+    }
+    return n
+}
+
+fn (l mut lexer&) add(k tk, text String, at I64) { l.toks.Push(token(k, text, l.line(at))) }
+
+fn isSpace(c Char) Bool { return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12 }
+
+# where the next tag opens at or after from ({{, {% or {#), or the text's length
+fn tagStart(s String&, from I64) I64 {
+    i I64 = from
+    for i + 1 < s.Len() {
+        if s[i] == '{' and (s[i + 1] == '{' or s[i + 1] == '%' or s[i + 1] == '#'): return i
+        i++
+    }
+    return s.Len()
+}
+
+# the text before a tag at at, as whitespace control leaves it
+fn (l mut lexer&) text(at I64) {
+    end I64 = at
+    if at < l.src.Len() {
+        kind := l.src[at + 1]
+        sign Char = l.src[at + 2] if at + 2 < l.src.Len() else 0
+        if sign == '-' {
+            for end > l.pos and isSpace(l.src[end - 1]): end--
+        } else if sign != '+' and kind != '{' {
+            # lstrip_blocks: blanks from the line's start to a block or comment tag
+            b I64 = at
+            for b > l.pos and (l.src[b - 1] == ' ' or l.src[b - 1] == '\t'): b--
+            if b < at and ((b > l.pos and l.src[b - 1] == '\n') or (b == l.pos and l.lineStart)): end = b
+        }
+    }
+    if end > l.pos: l.add(tk.Text, $l.src[l.pos:end], l.pos)
+}
+
+# past a tag's end at p (its closing two characters there, after a '-' when minus): '-' strips the whitespace after,
+# trim_blocks one newline after a block or comment
+fn (l mut lexer&) closeTag(p I64, minus Bool, block Bool) {
+    q I64 = p + 2
+    if minus {
+        for q < l.src.Len() and isSpace(l.src[q]): q++
+    } else if block and q < l.src.Len() and l.src[q] == '\n' {
+        q++
+    }
+    l.lineStart = l.src[q - 1] == '\n'
+    l.pos = q
+}
+
+fn (l mut lexer&) run() ? Error {
+    for l.pos < l.src.Len() {
+        at := tagStart(l.src, l.pos)
+        l.text(at)
+        if at == l.src.Len(): break
+        kind := l.src[at + 1]
+        p I64 = at + 2
+        if p < l.src.Len() and (l.src[p] == '-' or l.src[p] == '+'): p++
+        if kind == '#' {
+            e := p + (try l.src[p:].Find("#}") catch { error Error.Syntax("a comment is not closed", l.line(at)) })
+            minus := l.src[e - 1] == '-' and e - 1 >= p
+            l.closeTag(e, minus, true)
+            continue
+        }
+        closer Char = '}' if kind == '{' else '%'
+        l.add(tk.VarOpen if kind == '{' else tk.BlockOpen, "", at)
+        l.pos = p
+        try l.inside(closer)
+    }
+    l.add(tk.End, "", l.src.Len())
+}
+
+# the tokens of a tag's contents, up to and past its end (closer followed by '}')
+fn (l mut lexer&) inside(closer Char) ? Error {
+    s :~ l.src
+    for {
+        for l.pos < s.Len() and isSpace(s[l.pos]): l.pos++
+        if l.pos >= s.Len(): error Error.Syntax("a tag is not closed", l.line(l.pos))
+        c := s[l.pos]
+        if c == '-' and l.pos + 2 < s.Len() and s[l.pos + 1] == closer and s[l.pos + 2] == '}' {
+            l.add(tk.VarClose if closer == '}' else tk.BlockClose, "", l.pos)
+            l.closeTag(l.pos + 1, true, closer == '%')
+            return
+        }
+        if c == closer and l.pos + 1 < s.Len() and s[l.pos + 1] == '}' {
+            l.add(tk.VarClose if closer == '}' else tk.BlockClose, "", l.pos)
+            l.closeTag(l.pos, false, closer == '%')
+            return
+        }
+        if c == '+' and closer == '%' and l.pos + 2 < s.Len() and s[l.pos + 1] == '%' and s[l.pos + 2] == '}' {
+            l.add(tk.BlockClose, "", l.pos)
+            l.lineStart = false
+            l.pos += 3
+            return
+        }
+        start I64 = l.pos
+        if isAlpha(c) or c == '_' {
+            for l.pos < s.Len() and (isAlpha(s[l.pos]) or s[l.pos].IsDigit() or s[l.pos] == '_'): l.pos++
+            l.add(tk.Name, $s[start:l.pos], start)
+        } else if c.IsDigit() {
+            try l.number()
+        } else if c == '\'' or c == '"' {
+            l.add(tk.Str, try l.str(c), start)
+        } else {
+            two := $s[l.pos:(l.pos + 2).Min(s.Len())]
+            if two == "//" or two == "**" or two == "==" or two == "!=" or two == "<=" or two == ">=" {
+                l.pos += 2
+                l.add(tk.Op, two, start)
+            } else if "+-*/%~<>=.,:|()[]{}".Contains($s[l.pos:l.pos + 1]) {
+                l.pos++
+                l.add(tk.Op, $s[start:l.pos], start)
+            } else {
+                error Error.Syntax("unexpected character '" + $s[l.pos:l.pos + 1] + "'", l.line(l.pos))
+            }
+        }
+    }
+}
+
+fn (l mut lexer&) number() ? Error {
+    s :~ l.src
+    start I64 = l.pos
+    isFloat := false
+    for l.pos < s.Len() and (s[l.pos].IsDigit() or s[l.pos] == '_'): l.pos++
+    if l.pos + 1 < s.Len() and s[l.pos] == '.' and s[l.pos + 1].IsDigit() {
+        isFloat = true
+        l.pos++
+        for l.pos < s.Len() and (s[l.pos].IsDigit() or s[l.pos] == '_'): l.pos++
+    }
+    if l.pos < s.Len() and (s[l.pos] == 'e' or s[l.pos] == 'E') {
+        q I64 = l.pos + 1
+        if q < s.Len() and (s[q] == '+' or s[q] == '-'): q++
+        if q < s.Len() and s[q].IsDigit() {
+            isFloat = true
+            l.pos = q
+            for l.pos < s.Len() and s[l.pos].IsDigit(): l.pos++
+        }
+    }
+    l.add(tk.Float if isFloat else tk.Int, $s[start:l.pos].Replace("_", ""), start)
+}
+
+# a quoted string at pos, its escapes as Python reads them
+fn (l mut lexer&) str(q Char) String ? Error {
+    s :~ l.src
+    start I64 = l.pos
+    l.pos++
+    sb := StringBuilder()
+    for {
+        if l.pos >= s.Len(): error Error.Syntax("a string is not closed", l.line(start))
+        c := s[l.pos]
+        if c == q {
+            l.pos++
+            return sb.Str()
+        }
+        if c != '\\' or l.pos + 1 >= s.Len() {
+            sb.PushChar(c)
+            l.pos++
+            continue
+        }
+        e := s[l.pos + 1]
+        l.pos += 2
+        if e == 'n': sb.PushChar('\n')
+        else if e == 't': sb.PushChar('\t')
+        else if e == 'r': sb.PushChar('\r')
+        else if e == '0': sb.PushChar(0)
+        else if e == '\\' or e == '\'' or e == '"': sb.PushChar(e)
+        else if e == '\n' { }
+        else if e == 'x' or e == 'u' or e == 'U' {
+            n I64 = 2 if e == 'x' else (4 if e == 'u' else 8)
+            cp := try s[l.pos:(l.pos + n).Min(s.Len())].ParseInt(16) catch { error Error.Syntax("a bad \\" + $s[l.pos - 1:l.pos] + " escape", l.line(start)) }
+            l.pos += n
+            putUtf8(sb, cp)
+        } else {
+            sb.PushChar('\\')
+            sb.PushChar(e)
+        }
+    }
+}
+
+fn putUtf8(sb mut StringBuilder&, cp I64) {
+    if cp < 0x80 {
+        sb.PushChar(Char(cp))
+    } else if cp < 0x800 {
+        sb.PushChar(Char(0xC0 | (cp >> 6)))
+        sb.PushChar(Char(0x80 | (cp & 0x3F)))
+    } else if cp < 0x10000 {
+        sb.PushChar(Char(0xE0 | (cp >> 12)))
+        sb.PushChar(Char(0x80 | ((cp >> 6) & 0x3F)))
+        sb.PushChar(Char(0x80 | (cp & 0x3F)))
+    } else {
+        sb.PushChar(Char(0xF0 | (cp >> 18)))
+        sb.PushChar(Char(0x80 | ((cp >> 12) & 0x3F)))
+        sb.PushChar(Char(0x80 | ((cp >> 6) & 0x3F)))
+        sb.PushChar(Char(0x80 | (cp & 0x3F)))
+    }
+}
+
+# ---- the parsed template ----
+
+type Expr enum {
+    Const(v Val)
+    Var(name String)
+    Attr(obj I64, name String)
+    Item(obj I64, key I64)
+    Slice(obj I64, lo I64, hi I64, step I64)        # -1 where a bound is not written
+    Neg(a I64)
+    Not(a I64)
+    Bin(op String, a I64, b I64)                    # + - * / // % ** ~ == != < > <= >= in notin and or
+    Cond(c I64, a I64, b I64)                       # b -1: no else
+    ListOf(items Vec<I64>)
+    DictOf(keys Vec<I64>, vals Vec<I64>)
+    Call(f I64, args Vec<I64>, names Vec<String>)   # a keyword argument's name, "" for a positional one
+    Filter(a I64, name String, args Vec<I64>, names Vec<String>)
+    Test(a I64, name String, args Vec<I64>, neg Bool)
+}
+
+type Node enum {
+    Text(s String)
+    Out(e I64)
+    If(conds Vec<I64>, bodies Vec<I64>)             # a body per condition, and one more for an else
+    For(names Vec<String>, iter I64, cond I64, body I64, els I64)   # cond, els -1 where not written
+    Set(name String, attr String, e I64)            # attr "" unless "set ns.attr = e"
+    SetBlock(name String, body I64)
+    Macro(name String, params Vec<String>, defaults Vec<I64>, body I64)    # a default -1 where none is written
+    Block(body I64)
+    Break
+    Continue
+}
+
+type Template struct(exprs Vec<Expr>, nodes Vec<Node>, blocks Vec<Vec<I64>>, root I64) {
+    exprs
+    nodes
+    blocks                                          # each a run of nodes
+    root
+}
+
+# the template text parses into
+fn Template.Parse(text String&) Template ? Error {
+    l := lexer(text)
+    try l.run()
+    p := parser(l.toks)
+    p.root = try p.block("")
+    return Template(p.exprs, p.nodes, p.blocks, p.root)
+}
+
+# ---- parsing ----
+
+type parser struct(toks Vec<token>) {
+    toks
+    pos I64 = 0
+    exprs Vec<Expr> = Vec<Expr>()
+    nodes Vec<Node> = Vec<Node>()
+    blocks Vec<Vec<I64>> = Vec<Vec<I64>>()
+    root I64 = 0
+}
+
+fn (p parser&) at() token& { return p.toks.Ref(p.pos) }
+
+fn (p parser&) isOp(s String&) Bool { return p.at().Kind == tk.Op and p.at().Text == s }
+
+fn (p parser&) isName(s String&) Bool { return p.at().Kind == tk.Name and p.at().Text == s }
+
+fn (p parser&) line() I64 { return p.at().Line }
+
+fn (p mut parser&) op(s String&) ? Error {
+    if not p.isOp(s): error Error.Syntax("expected '" + s + "'", p.line())
+    p.pos++
+}
+
+fn (p mut parser&) name() String ? Error {
+    if p.at().Kind != tk.Name: error Error.Syntax("expected a name", p.line())
+    p.pos++
+    return p.toks.At(p.pos - 1).Text
+}
+
+fn (p mut parser&) close() ? Error {
+    if p.at().Kind != tk.BlockClose: error Error.Syntax("expected the end of the tag", p.line())
+    p.pos++
+}
+
+fn (p mut parser&) expr(e Expr) I64 {
+    p.exprs.Push(e)
+    return p.exprs.Len() - 1
+}
+
+fn (p mut parser&) node(n Node) I64 {
+    p.nodes.Push(n)
+    return p.nodes.Len() - 1
+}
+
+# whether the space-separated words stop hold w
+fn stopsAt(stop String&, w String&) Bool {
+    for s in stop.Split(" ") {
+        if s == w: return true
+    }
+    return false
+}
+
+# the nodes up to a block tag whose name stop holds (left to read) or the end, as a block
+fn (p mut parser&) block(stop String&) I64 ? Error {
+    items := Vec<I64>()
+    for {
+        t := p.toks.At(p.pos)
+        if t.Kind == tk.End {
+            if stop.Len() > 0: error Error.Syntax("the template ends before one of: " + stop, p.line())
+            break
+        }
+        if t.Kind == tk.Text {
+            items.Push(p.node(Node.Text(t.Text)))
+            p.pos++
+        } else if t.Kind == tk.VarOpen {
+            p.pos++
+            e := try p.expression()
+            if p.at().Kind != tk.VarClose: error Error.Syntax("expected '}}'", p.line())
+            p.pos++
+            items.Push(p.node(Node.Out(e)))
+        } else {
+            kw := p.toks.At(p.pos + 1).Text
+            if stopsAt(stop, kw): break
+            p.pos += 2
+            items.Push(try p.statement(kw))
+        }
+    }
+    p.blocks.Push(items)
+    return p.blocks.Len() - 1
+}
+
+# past the "{% word" of the tag ending a block
+fn (p mut parser&) ending() String {
+    p.pos += 2
+    return p.toks.At(p.pos - 1).Text
+}
+
+fn (p mut parser&) statement(kw String&) I64 ? Error {
+    if kw == "if" {
+        conds := Vec<I64>()
+        bodies := Vec<I64>()
+        conds.Push(try p.expression())
+        try p.close()
+        bodies.Push(try p.block("elif else endif"))
+        for {
+            w := p.ending()
+            if w == "elif" {
+                conds.Push(try p.expression())
+                try p.close()
+                bodies.Push(try p.block("elif else endif"))
+            } else if w == "else" {
+                try p.close()
+                bodies.Push(try p.block("endif"))
+            } else {
+                try p.close()
+                break
+            }
+        }
+        return p.node(Node.If(conds, bodies))
+    }
+    if kw == "for" {
+        names := Vec<String>()
+        names.Push(try p.name())
+        for p.isOp(",") {
+            p.pos++
+            names.Push(try p.name())
+        }
+        if not p.isName("in"): error Error.Syntax("expected 'in'", p.line())
+        p.pos++
+        iter := try p.orExpr()
+        cond I64 = -1
+        if p.isName("if") {
+            p.pos++
+            cond = try p.orExpr()
+        }
+        if p.isName("recursive"): error Error.Syntax("recursive loops are not supported", p.line())
+        try p.close()
+        body := try p.block("else endfor")
+        els I64 = -1
+        if p.ending() == "else" {
+            try p.close()
+            els = try p.block("endfor")
+            p.ending()
+        }
+        try p.close()
+        return p.node(Node.For(names, iter, cond, body, els))
+    }
+    if kw == "set" {
+        name := try p.name()
+        field := ""
+        if p.isOp(".") {
+            p.pos++
+            field = try p.name()
+        }
+        if p.isOp("=") {
+            p.pos++
+            e := try p.expression()
+            try p.close()
+            return p.node(Node.Set(name, field, e))
+        }
+        try p.close()
+        body := try p.block("endset")
+        p.ending()
+        try p.close()
+        return p.node(Node.SetBlock(name, body))
+    }
+    if kw == "macro" {
+        name := try p.name()
+        params := Vec<String>()
+        defaults := Vec<I64>()
+        try p.op("(")
+        for not p.isOp(")") {
+            params.Push(try p.name())
+            d I64 = -1
+            if p.isOp("=") {
+                p.pos++
+                d = try p.expression()
+            }
+            defaults.Push(d)
+            if not p.isOp(","): break
+            p.pos++
+        }
+        try p.op(")")
+        try p.close()
+        body := try p.block("endmacro")
+        p.ending()
+        if p.at().Kind == tk.Name: p.pos++
+        try p.close()
+        return p.node(Node.Macro(name, params, defaults, body))
+    }
+    if kw == "generation" {
+        try p.close()
+        body := try p.block("endgeneration")
+        p.ending()
+        try p.close()
+        return p.node(Node.Block(body))
+    }
+    if kw == "break" or kw == "continue" {
+        try p.close()
+        return p.node(Node.Break if kw == "break" else Node.Continue)
+    }
+    error Error.Syntax("unknown tag '" + kw + "'", p.line())
+}
+
+# ---- expressions, by Jinja's precedence ----
+
+fn (p mut parser&) expression() I64 ? Error {
+    a := try p.orExpr()
+    for p.isName("if") {
+        p.pos++
+        c := try p.orExpr()
+        b I64 = -1
+        if p.isName("else") {
+            p.pos++
+            b = try p.expression()
+        }
+        a = p.expr(Expr.Cond(c, a, b))
+    }
+    return a
+}
+
+fn (p mut parser&) orExpr() I64 ? Error {
+    a := try p.andExpr()
+    for p.isName("or") {
+        p.pos++
+        a = p.expr(Expr.Bin("or", a, try p.andExpr()))
+    }
+    return a
+}
+
+fn (p mut parser&) andExpr() I64 ? Error {
+    a := try p.notExpr()
+    for p.isName("and") {
+        p.pos++
+        a = p.expr(Expr.Bin("and", a, try p.notExpr()))
+    }
+    return a
+}
+
+fn (p mut parser&) notExpr() I64 ? Error {
+    if not p.isName("not"): return try p.compare()
+    p.pos++
+    return p.expr(Expr.Not(try p.notExpr()))
+}
+
+fn (p mut parser&) compare() I64 ? Error {
+    a := try p.math1()
+    for {
+        t := p.toks.At(p.pos)
+        if t.Kind == tk.Op and (t.Text == "==" or t.Text == "!=" or t.Text == "<" or t.Text == ">" or t.Text == "<=" or t.Text == ">=") {
+            p.pos++
+            a = p.expr(Expr.Bin(t.Text, a, try p.math1()))
+        } else if p.isName("in") {
+            p.pos++
+            a = p.expr(Expr.Bin("in", a, try p.math1()))
+        } else if p.isName("not") and p.toks.At(p.pos + 1).Kind == tk.Name and p.toks.At(p.pos + 1).Text == "in" {
+            p.pos += 2
+            a = p.expr(Expr.Bin("notin", a, try p.math1()))
+        } else {
+            return a
+        }
+    }
+}
+
+fn (p mut parser&) math1() I64 ? Error {
+    a := try p.concat()
+    for p.isOp("+") or p.isOp("-") {
+        op := p.at().Text
+        p.pos++
+        a = p.expr(Expr.Bin(op, a, try p.concat()))
+    }
+    return a
+}
+
+fn (p mut parser&) concat() I64 ? Error {
+    a := try p.math2()
+    for p.isOp("~") {
+        p.pos++
+        a = p.expr(Expr.Bin("~", a, try p.math2()))
+    }
+    return a
+}
+
+fn (p mut parser&) math2() I64 ? Error {
+    a := try p.pow()
+    for p.isOp("*") or p.isOp("/") or p.isOp("//") or p.isOp("%") {
+        op := p.at().Text
+        p.pos++
+        a = p.expr(Expr.Bin(op, a, try p.pow()))
+    }
+    return a
+}
+
+fn (p mut parser&) pow() I64 ? Error {
+    a := try p.unary(true)
+    for p.isOp("**") {
+        p.pos++
+        a = p.expr(Expr.Bin("**", a, try p.unary(true)))
+    }
+    return a
+}
+
+fn (p mut parser&) unary(withFilter Bool) I64 ? Error {
+    a I64 = 0
+    if p.isOp("-") {
+        p.pos++
+        a = p.expr(Expr.Neg(try p.unary(false)))
+    } else if p.isOp("+") {
+        p.pos++
+        a = try p.unary(false)
+    } else {
+        a = try p.primary()
+    }
+    a = try p.postfix(a)
+    if withFilter: a = try p.filters(a)
+    return a
+}
+
+fn (p mut parser&) primary() I64 ? Error {
+    t := p.toks.At(p.pos)
+    p.pos++
+    if t.Kind == tk.Name {
+        n := t.Text
+        if n == "true" or n == "True": return p.expr(Expr.Const(Val.Bool(true)))
+        if n == "false" or n == "False": return p.expr(Expr.Const(Val.Bool(false)))
+        if n == "none" or n == "None": return p.expr(Expr.Const(Val.None))
+        return p.expr(Expr.Var(n))
+    }
+    if t.Kind == tk.Str {
+        s := t.Text
+        for p.at().Kind == tk.Str {
+            s = s + p.at().Text
+            p.pos++
+        }
+        return p.expr(Expr.Const(Val.Str(s)))
+    }
+    if t.Kind == tk.Int: return p.expr(Expr.Const(Val.Int(try t.Text.ParseInt() catch { error Error.Syntax("a bad integer", p.line()) })))
+    if t.Kind == tk.Float: return p.expr(Expr.Const(Val.Float(try t.Text.ParseFloat() catch { error Error.Syntax("a bad float", p.line()) })))
+    if t.Kind == tk.Op and t.Text == "(" {
+        if p.isOp(")") {
+            p.pos++
+            return p.expr(Expr.ListOf(Vec<I64>()))
+        }
+        a := try p.expression()
+        if p.isOp(")") {
+            p.pos++
+            return a
+        }
+        items := Vec<I64>()
+        items.Push(a)
+        for p.isOp(",") {
+            p.pos++
+            if p.isOp(")"): break
+            items.Push(try p.expression())
+        }
+        try p.op(")")
+        return p.expr(Expr.ListOf(items))
+    }
+    if t.Kind == tk.Op and t.Text == "[" {
+        items := Vec<I64>()
+        for not p.isOp("]") {
+            items.Push(try p.expression())
+            if not p.isOp(","): break
+            p.pos++
+        }
+        try p.op("]")
+        return p.expr(Expr.ListOf(items))
+    }
+    if t.Kind == tk.Op and t.Text == "{" {
+        keys := Vec<I64>()
+        vals := Vec<I64>()
+        for not p.isOp("}") {
+            keys.Push(try p.expression())
+            try p.op(":")
+            vals.Push(try p.expression())
+            if not p.isOp(","): break
+            p.pos++
+        }
+        try p.op("}")
+        return p.expr(Expr.DictOf(keys, vals))
+    }
+    p.pos--
+    error Error.Syntax("unexpected '" + t.Text + "'", p.line())
+}
+
+fn (p mut parser&) postfix(from I64) I64 ? Error {
+    a I64 = from
+    for {
+        if p.isOp(".") {
+            p.pos++
+            t := p.toks.At(p.pos)
+            p.pos++
+            if t.Kind == tk.Int {
+                n := try t.Text.ParseInt() catch { error Error.Syntax("a bad index", p.line()) }
+                a = p.expr(Expr.Item(a, p.expr(Expr.Const(Val.Int(n)))))
+            } else if t.Kind == tk.Name {
+                a = p.expr(Expr.Attr(a, t.Text))
+            } else {
+                error Error.Syntax("expected an attribute's name", p.line())
+            }
+        } else if p.isOp("[") {
+            p.pos++
+            a = try p.subscript(a)
+        } else if p.isOp("(") {
+            a = try p.call(a)
+        } else {
+            return a
+        }
+    }
+}
+
+fn (p mut parser&) subscript(a I64) I64 ? Error {
+    lo I64 = -1
+    if not p.isOp(":"): lo = try p.expression()
+    if p.isOp("]") {
+        p.pos++
+        return p.expr(Expr.Item(a, lo))
+    }
+    try p.op(":")
+    hi I64 = -1
+    step I64 = -1
+    if not p.isOp(":") and not p.isOp("]"): hi = try p.expression()
+    if p.isOp(":") {
+        p.pos++
+        if not p.isOp("]"): step = try p.expression()
+    }
+    try p.op("]")
+    return p.expr(Expr.Slice(a, lo, hi, step))
+}
+
+# the arguments of a call, at its '('
+fn (p mut parser&) args(args mut Vec<I64>&, names mut Vec<String>&) ? Error {
+    try p.op("(")
+    for not p.isOp(")") {
+        n := ""
+        if p.at().Kind == tk.Name and p.toks.At(p.pos + 1).Kind == tk.Op and p.toks.At(p.pos + 1).Text == "=" {
+            n = p.at().Text
+            p.pos += 2
+        }
+        args.Push(try p.expression())
+        names.Push(n)
+        if not p.isOp(","): break
+        p.pos++
+    }
+    try p.op(")")
+}
+
+fn (p mut parser&) call(f I64) I64 ? Error {
+    args := Vec<I64>()
+    names := Vec<String>()
+    try p.args(args, names)
+    return p.expr(Expr.Call(f, args, names))
+}
+
+fn (p mut parser&) filters(from I64) I64 ? Error {
+    a I64 = from
+    for {
+        if p.isOp("|") {
+            p.pos++
+            name := try p.name()
+            args := Vec<I64>()
+            names := Vec<String>()
+            if p.isOp("("): try p.args(args, names)
+            a = p.expr(Expr.Filter(a, name, args, names))
+        } else if p.isName("is") {
+            p.pos++
+            neg := p.isName("not")
+            if neg: p.pos++
+            name := try p.name()
+            args := Vec<I64>()
+            names := Vec<String>()
+            t := p.at()
+            if p.isOp("(") {
+                try p.args(args, names)
+            } else if (t.Kind == tk.Str or t.Kind == tk.Int or t.Kind == tk.Float or (t.Kind == tk.Name and t.Text != "else" and t.Text != "or" and t.Text != "and")) {
+                args.Push(try p.postfix(try p.primary()))
+            }
+            a = p.expr(Expr.Test(a, name, args, neg))
+        } else if p.isOp("(") {
+            a = try p.call(a)
+        } else {
+            return a
+        }
+    }
+}
+
+# ---- rendering ----
+
+type flow enum {
+    Next
+    Break
+    Continue
+}
+
+# what a render keeps: its scopes (frame 0 the template's own, the context's variables), the namespaces made
+type state struct() {
+    frames Vec<Map<String, Val>> = Vec<Map<String, Val>>()
+    floor I64 = 1                                   # a macro's body sees frames from here up, and frame 0
+    spaces Vec<Val> = Vec<Val>()                    # each namespace's attributes, a dict
+}
+
+globals String = " namespace raise_exception strftime_now range dict "
+
+fn (s state&) lookup(name String&) Val {
+    i I64 = s.frames.Len() - 1
+    for i >= s.floor {
+        f :~ s.frames.Ref(i)
+        if f.Has(name): return f.Get(name)!
+        i--
+    }
+    if s.frames.Ref(0).Has(name): return s.frames.Ref(0).Get(name)!
+    if globals.Contains(" " + name + " "): return Val.Func(name)
+    return Val.Undef
+}
+
+fn (s mut state&) set(name String&, v Val) { s.frames.RefMut(s.frames.Len() - 1).Put(name, v) }
+
+fn (s mut state&) push() { s.frames.Push(Map<String, Val>()) }
+
+fn (s mut state&) pop() { s.frames.Truncate(s.frames.Len() - 1) }
+
+# the text the template makes of the variables ctx holds (a dict)
+fn (t Template&) Render(ctx Val&) String ? Error {
+    s := state()
+    s.push()
+    match ctx {
+        case Val.Dict(_) {
+            kv := kvOf(ctx)
+            for i in range 0, kv.Len(), 2: s.set(textOf(kv.At(i)), kv.At(i + 1))
+        }
+        case _ { }
+    }
+    out := StringBuilder()
+    try t.exec(t.root, s, out)
+    return out.Str()
+}
+
+fn (t Template&) exec(b I64, s mut state&, out mut StringBuilder&) flow ? Error {
+    for n in t.blocks.Ref(b).View() {
+        f := try t.run(n, s, out)
+        if f != flow.Next: return f
+    }
+    return flow.Next
+}
+
+fn (t Template&) run(n I64, s mut state&, out mut StringBuilder&) flow ? Error {
+    match t.nodes.Ref(n) {
+        case Node.Text(text): out.Push(text)
+        case Node.Out(e): out.Push(s.str(try t.eval(e, s)))
+        case Node.If(conds, bodies) {
+            for i in range conds.Len() {
+                if s.truthy(try t.eval(conds.At(i), s)): return try t.exec(bodies.At(i), s, out)
+            }
+            if bodies.Len() > conds.Len(): return try t.exec(bodies.At(conds.Len()), s, out)
+        }
+        case Node.For(names, iter, cond, body, els): try t.loop(names, iter, cond, body, els, s, out)
+        case Node.Set(name, attr, e) {
+            v := try t.eval(e, s)
+            if attr.Len() == 0 {
+                s.set(name, v)
+                return flow.Next
+            }
+            ns := s.lookup(name)
+            if ns != Val.Ns: error Error.Type("cannot set an attribute of " + name + ", which is no namespace")
+            s.spaces.RefMut((ns as Val.Ns)!).Put(attr, v)
+        }
+        case Node.SetBlock(name, body) {
+            sb := StringBuilder()
+            try t.exec(body, s, sb)
+            s.set(name, Val.Str(sb.Str()))
+        }
+        case Node.Macro(name, _, _, _): s.set(name, Val.Macro(n))
+        case Node.Block(body): return try t.exec(body, s, out)
+        case Node.Break: return flow.Break
+        case Node.Continue: return flow.Continue
+    }
+    return flow.Next
+}
+
+# binds a for loop's targets to one item
+fn (s mut state&) bind(names Vec<String>&, x Val&) ? Error {
+    if names.Len() == 1 {
+        s.set(names.At(0), x)
+        return
+    }
+    parts := try s.items(x)
+    if parts.Len() != names.Len(): error Error.Type("cannot unpack " + $parts.Len() + " values into " + $names.Len())
+    for i in range names.Len(): s.set(names.At(i), parts.At(i))
+}
+
+fn (t Template&) loop(names Vec<String>&, iter I64, cond I64, body I64, els I64, s mut state&, out mut StringBuilder&) ? Error {
+    all := try s.items(try t.eval(iter, s))
+    xs := Vec<Val>()
+    for x in all.View() {
+        if cond < 0 {
+            xs.Push(x)
+            continue
+        }
+        s.push()
+        try s.bind(names, x)
+        keep := s.truthy(try t.eval(cond, s))
+        s.pop()
+        if keep: xs.Push(x)
+    }
+    if xs.Len() == 0 and els >= 0 {
+        try t.exec(els, s, out)
+        return
+    }
+    n := xs.Len()
+    for i in range n {
+        s.push()
+        try s.bind(names, xs.At(i))
+        lp := Val.NewDict()
+        lp.Put("index0", Val.Int(i))
+        lp.Put("index", Val.Int(i + 1))
+        lp.Put("revindex", Val.Int(n - i))
+        lp.Put("revindex0", Val.Int(n - i - 1))
+        lp.Put("first", Val.Bool(i == 0))
+        lp.Put("last", Val.Bool(i == n - 1))
+        lp.Put("length", Val.Int(n))
+        if i > 0: lp.Put("previtem", xs.At(i - 1))
+        if i < n - 1: lp.Put("nextitem", xs.At(i + 1))
+        s.set("loop", lp)
+        f := try t.exec(body, s, out)
+        s.pop()
+        if f == flow.Break: break
+    }
+}
+
+# ---- expressions ----
+
+fn (t Template&) eval(e I64, s mut state&) Val ? Error {
+    match t.exprs.Ref(e) {
+        case Expr.Const(_): return (t.exprs.Ref(e) as Expr.Const)!
+        case Expr.Var(name): return s.lookup(name)
+        case Expr.Attr(obj, name) {
+            o := try t.eval(obj, s)
+            if o == Val.Ns: return s.spaces.At((o as Val.Ns)!).Get(name)
+            return try attrOf(o, name)
+        }
+        case Expr.Item(obj, key): return try itemOf(try t.eval(obj, s), try t.eval(key, s))
+        case Expr.Slice(obj, lo, hi, step) {
+            v := try t.eval(obj, s)
+            a := try t.opt(lo, s)
+            b := try t.opt(hi, s)
+            c := try t.opt(step, s)
+            return try sliceOf(v, a, b, c)
+        }
+        case Expr.Neg(a) {
+            v := try t.eval(a, s)
+            match v {
+                case Val.Int(n): return Val.Int(-n)
+                case Val.Float(x): return Val.Float(-x)
+                case Val.Bool(b): return Val.Int(-1 if b else 0)
+                case _: error Error.Type("bad operand for unary -")
+            }
+        }
+        case Expr.Not(a): return Val.Bool(not s.truthy(try t.eval(a, s)))
+        case Expr.Bin(op, a, b) {
+            x := try t.eval(a, s)
+            if op == "and": return try t.eval(b, s) if s.truthy(x) else x
+            if op == "or": return x if s.truthy(x) else try t.eval(b, s)
+            return try s.binary(op, x, try t.eval(b, s))
+        }
+        case Expr.Cond(c, a, b) {
+            if s.truthy(try t.eval(c, s)): return try t.eval(a, s)
+            return try t.eval(b, s) if b >= 0 else Val.Undef
+        }
+        case Expr.ListOf(items) {
+            l := Vec<Val>()
+            for x in items.View(): l.Push(try t.eval(x, s))
+            return Val.List(l)
+        }
+        case Expr.DictOf(keys, vals) {
+            d := Val.NewDict()
+            for i in range keys.Len() {
+                k := try t.eval(keys.At(i), s)
+                if k != Val.Str: error Error.Type("a dict's keys are strings here")
+                d.Put(textOf(k), try t.eval(vals.At(i), s))
+            }
+            return d
+        }
+        case Expr.Call(f, args, names) {
+            vs := try t.evalAll(args, s)
+            if t.exprs.Ref(f) == Expr.Attr {
+                obj, name := (t.exprs.Ref(f) as Expr.Attr)!
+                o := try t.eval(obj, s)
+                if hasMethod(o, name): return try s.method(o, name, vs, names)
+                return try t.call(try attrOf(o, name), vs, names, s)
+            }
+            return try t.call(try t.eval(f, s), vs, names, s)
+        }
+        case Expr.Filter(a, name, args, names) {
+            vs := try t.evalAll(args, s)
+            return try t.filter(name, try t.eval(a, s), vs, names, s)
+        }
+        case Expr.Test(a, name, args, neg) {
+            vs := try t.evalAll(args, s)
+            r := try s.test(name, try t.eval(a, s), vs)
+            return Val.Bool(r != neg)
+        }
+    }
+}
+
+fn (t Template&) opt(e I64, s mut state&) Val ? Error {
+    if e < 0: return Val.None
+    return try t.eval(e, s)
+}
+
+fn (t Template&) evalAll(es Vec<I64>&, s mut state&) Vec<Val> ? Error {
+    vs := Vec<Val>()
+    for e in es.View(): vs.Push(try t.eval(e, s))
+    return vs
+}
+
+# the argument named name, or else the one at position at, or else d
+fn argOf(vs Vec<Val>&, names Vec<String>&, at I64, name String&, d Val) Val {
+    for i in range names.Len() {
+        if name.Len() > 0 and names.At(i) == name: return vs.At(i)
+    }
+    k I64 = 0
+    for i in range vs.Len() {
+        if names.At(i).Len() > 0: continue
+        if k == at: return vs.At(i)
+        k++
+    }
+    return d
+}
+
+fn (t Template&) call(f Val&, vs Vec<Val>&, names Vec<String>&, s mut state&) Val ? Error {
+    match f {
+        case Val.Macro(n) {
+            _, params, defaults, body := (t.nodes.Ref(n) as Node.Macro)!
+            floor := s.floor
+            s.push()
+            s.floor = s.frames.Len() - 1
+            defer {
+                s.pop()
+                s.floor = floor
+            }
+            for i in range params.Len() {
+                v := argOf(vs, names, i, params.At(i), Val.Undef)
+                if v == Val.Undef and defaults.At(i) >= 0: v = try t.eval(defaults.At(i), s)
+                s.set(params.At(i), v)
+            }
+            sb := StringBuilder()
+            try t.exec(body, s, sb)
+            return Val.Str(sb.Str())
+        }
+        case Val.Func(name): return try s.global(name, vs, names)
+        case Val.Undef: error Error.Undefined("an undefined value is called")
+        case _: error Error.Type("'" + s.str(f) + "' is not callable")
+    }
+}
+
+fn (s mut state&) global(name String&, vs Vec<Val>&, names Vec<String>&) Val ? Error {
+    if name == "raise_exception": error Error.Raised(s.str(argOf(vs, names, 0, "message", Val.Str(""))))
+    if name == "strftime_now": return Val.Str(strftime(s.str(argOf(vs, names, 0, "format", Val.Str(""))), time.Date.Local()))
+    if name == "namespace" or name == "dict" {
+        d := Val.NewDict()
+        for i in range vs.Len() {
+            if names.At(i).Len() > 0 {
+                d.Put(names.At(i), vs.At(i))
+            } else {
+                match vs.At(i) {
+                    case Val.Dict(_) {
+                        kv := kvOf(vs.At(i))
+                        for k in range 0, kv.Len(), 2: d.Put(textOf(kv.At(k)), kv.At(k + 1))
+                    }
+                    case _: error Error.Type(name + "() takes a dict or keywords")
+                }
+            }
+        }
+        if name == "dict": return d
+        s.spaces.Push(d)
+        return Val.Ns(s.spaces.Len() - 1)
+    }
+    # range
+    nums := Vec<I64>()
+    for v in vs.View(): nums.Push(try toInt(v))
+    lo I64 = 0
+    hi I64 = 0
+    step I64 = 1
+    if nums.Len() == 1: hi = nums.At(0)
+    if nums.Len() >= 2 {
+        lo = nums.At(0)
+        hi = nums.At(1)
+    }
+    if nums.Len() >= 3: step = nums.At(2)
+    if step == 0: error Error.Type("range() step is zero")
+    l := Vec<Val>()
+    i := lo
+    for (step > 0 and i < hi) or (step < 0 and i > hi) {
+        l.Push(Val.Int(i))
+        i += step
+    }
+    return Val.List(l)
+}
+
+fn toInt(v Val&) I64 ? Error {
+    match v {
+        case Val.Int(n): return n
+        case Val.Bool(b): return 1 if b else 0
+        case _: error Error.Type("an integer is wanted")
+    }
+}
+
+fn attrOf(o Val&, name String&) Val ? Error {
+    match o {
+        case Val.Undef: error Error.Undefined("'" + name + "' asked of an undefined value")
+        case Val.Dict(_): return o.Get(name)
+        case _: return Val.Undef
+    }
+}
+
+# the index i of a sequence n long, from its end where negative; -1 when outside
+fn indexIn(i I64, n I64) I64 {
+    j := i + n if i < 0 else i
+    return j if j >= 0 and j < n else -1
+}
+
+fn itemOf(o Val&, k Val&) Val ? Error {
+    match o {
+        case Val.Undef: error Error.Undefined("an item asked of an undefined value")
+        case Val.Dict(_) {
+            return o.Get(textOf(k)) if k == Val.Str else Val.Undef
+        }
+        case Val.List(_) {
+            if k != Val.Int and k != Val.Bool: return Val.Undef
+            items := listOf(o)
+            j := indexIn(try toInt(k), items.Len())
+            return items.At(j) if j >= 0 else Val.Undef
+        }
+        case Val.Str(_) {
+            if k != Val.Int: return Val.Undef
+            cs := charsOf(textOf(o))
+            j := indexIn(try toInt(k), cs.Len())
+            return cs.At(j) if j >= 0 else Val.Undef
+        }
+        case Val.Ns(_): return Val.Undef
+        case _: return Val.Undef
+    }
+}
+
+# a text's characters (code points), each a string
+fn charsOf(text String&) Vec<Val> {
+    out := Vec<Val>()
+    i I64 = 0
+    for i < text.Len() {
+        j := i + 1
+        for j < text.Len() and (text[j] & 0xC0) == 0x80: j++
+        out.Push(Val.Str($text[i:j]))
+        i = j
+    }
+    return out
+}
+
+# Python's slice of a list or a text
+fn sliceOf(v Val&, a Val&, b Val&, c Val&) Val ? Error {
+    xs := Vec<Val>()
+    isText := v == Val.Str
+    if isText: xs = charsOf(textOf(v))
+    else if v == Val.List: xs = listOf(v)
+    else: error Error.Type("only lists and strings are sliced")
+    n := xs.Len()
+    step I64 = 1 if c == Val.None else try toInt(c)
+    if step == 0: error Error.Type("slice step cannot be zero")
+    lo I64 = 0 if step > 0 else n - 1
+    hi I64 = n if step > 0 else -n - 1
+    if a != Val.None: lo = try toInt(a)
+    if b != Val.None: hi = try toInt(b)
+    lo = boundIn(lo, n, step)
+    hi = boundIn(hi, n, step)
+    out := Vec<Val>()
+    i := lo
+    for (step > 0 and i < hi) or (step < 0 and i > hi) {
+        out.Push(xs.At(i))
+        i += step
+    }
+    if not isText: return Val.List(out)
+    sb := StringBuilder()
+    for x in out.View(): sb.Push(textOf(x))
+    return Val.Str(sb.Str())
+}
+
+# a slice's bound i made to fit a sequence n long, as Python does
+fn boundIn(i I64, n I64, step I64) I64 {
+    j := i + n if i < 0 else i
+    if step > 0: return j.Max(0).Min(n)
+    return j.Max(-1).Min(n - 1)
+}
+
+# ---- what a value is ----
+
+fn (s state&) truthy(v Val&) Bool {
+    match v {
+        case Val.Undef: return false
+        case Val.None: return false
+        case Val.Bool(b): return b
+        case Val.Int(n): return n != 0
+        case Val.Float(x): return x != 0.0
+        case Val.Str(text): return text.Len() > 0
+        case Val.List(items): return items.Len() > 0
+        case Val.Dict(kv): return kv.Len() > 0
+        case _: return true
+    }
+}
+
+# the value as str() writes it
+fn (s state&) str(v Val&) String {
+    match v {
+        case Val.Undef: return ""
+        case Val.Str(_): return textOf(v)
+        case _ {
+            sb := StringBuilder()
+            s.repr(v, sb)
+            return sb.Str()
+        }
+    }
+}
+
+# the value as Python's repr() writes it
+fn (s state&) repr(v Val&, sb mut StringBuilder&) {
+    match v {
+        case Val.Undef { }
+        case Val.None: sb.Push("None")
+        case Val.Bool(b): sb.Push("True" if b else "False")
+        case Val.Int(n): sb.Push($n)
+        case Val.Float(x): sb.Push(pyFloat(x))
+        case Val.Str(text): reprStr(text, sb)
+        case Val.List(items) {
+            sb.Push("[")
+            for i in range items.Len() {
+                if i > 0: sb.Push(", ")
+                s.repr(items.At(i), sb)
+            }
+            sb.Push("]")
+        }
+        case Val.Dict(kv) {
+            sb.Push("{")
+            for i in range 0, kv.Len(), 2 {
+                if i > 0: sb.Push(", ")
+                s.repr(kv.At(i), sb)
+                sb.Push(": ")
+                s.repr(kv.At(i + 1), sb)
+            }
+            sb.Push("}")
+        }
+        case Val.Ns(id) {
+            sb.Push("<Namespace ")
+            s.repr(s.spaces.At(id), sb)
+            sb.Push(">")
+        }
+        case Val.Macro(_): sb.Push("<Macro>")
+        case Val.Func(name): sb.Push("<function " + name + ">")
+    }
+}
+
+fn reprStr(text String&, sb mut StringBuilder&) {
+    q Char = '"' if text.Contains("'") and not text.Contains("\"") else '\''
+    sb.PushChar(q)
+    for c in text {
+        if c == q or c == '\\' {
+            sb.PushChar('\\')
+            sb.PushChar(c)
+        } else if c == '\n' {
+            sb.Push("\\n")
+        } else if c == '\t' {
+            sb.Push("\\t")
+        } else if c == '\r' {
+            sb.Push("\\r")
+        } else if c < 0x20 or c == 0x7F {
+            sb.Push("\\x" + hex2(c))
+        } else {
+            sb.PushChar(c)
+        }
+    }
+    sb.PushChar(q)
+}
+
+fn hex2(c Char) String {
+    digits := "0123456789abcdef"
+    return $digits[I64(c >> 4):I64(c >> 4) + 1] + $digits[I64(c & 15):I64(c & 15) + 1]
+}
+
+# a float as Python's repr writes it: the shortest digits that read back, ".0" on a whole number, an exponent below
+# 1e-4 and from 1e16
+fn pyFloat(x F64) String {
+    if x != x: return "nan"
+    if x == x + 1.0 and x != 0.0 and (x > 1e300 or x < -1e300): return "inf" if x > 0.0 else "-inf"
+    sign := "-" if x < 0.0 or (x == 0.0 and 1.0 / x < 0.0) else ""
+    if x == 0.0: return sign + "0.0"
+    d, e := try x.Abs().ShortestDecimal() catch { return "inf" }
+    digits := $d
+    n := digits.Len()
+    dp := n + e                                     # where the point goes, counted from the digits' start
+    if dp - 1 >= -4 and dp - 1 < 16 {
+        if dp <= 0: return sign + "0." + repeat("0", -dp) + digits
+        if dp >= n: return sign + digits + repeat("0", dp - n) + ".0"
+        return sign + $digits[:dp] + "." + $digits[dp:]
+    }
+    m := $digits[:1] + ("." + $digits[1:] if n > 1 else "")
+    ex := dp - 1
+    return sign + m + "e" + ("-" if ex < 0 else "+") + ("0" if ex.Abs() < 10 else "") + $ex.Abs()
+}
+
+# ---- operators ----
+
+fn isNum(v Val&) Bool { return v == Val.Int or v == Val.Float or v == Val.Bool }
+
+fn toF(v Val&) F64 {
+    match v {
+        case Val.Int(n): return F64(n)
+        case Val.Float(x): return x
+        case Val.Bool(b): return 1.0 if b else 0.0
+        case _: return 0.0
+    }
+}
+
+fn (s state&) equal(a Val&, b Val&) Bool {
+    if isNum(a) and isNum(b) {
+        if a == Val.Float or b == Val.Float: return toF(a) == toF(b)
+        return (try toInt(a) catch default 0) == (try toInt(b) catch default 1)
+    }
+    match a {
+        case Val.Str(x): return b == Val.Str and x == textOf(b)
+        case Val.None: return b == Val.None
+        case Val.Undef: return b == Val.Undef
+        case Val.List(xs) {
+            if b != Val.List: return false
+            ys := listOf(b)
+            if xs.Len() != ys.Len(): return false
+            for i in range xs.Len() {
+                if not s.equal(xs.At(i), ys.At(i)): return false
+            }
+            return true
+        }
+        case Val.Dict(kv) {
+            if b != Val.Dict: return false
+            for i in range 0, kv.Len(), 2 {
+                if not s.equal(kv.At(i + 1), b.Get(textOf(kv.At(i)))): return false
+            }
+            return s.length(b) == kv.Len() / 2
+        }
+        case Val.Ns(i): return b == Val.Ns(i)
+        case _: return false
+    }
+}
+
+fn (s state&) length(v Val&) I64 {
+    match v {
+        case Val.Str(text) {
+            n I64 = 0
+            for c in text {
+                if (c & 0xC0) != 0x80: n++
+            }
+            return n
+        }
+        case Val.List(items): return items.Len()
+        case Val.Dict(kv): return kv.Len() / 2
+        case _: return 0
+    }
+}
+
+# a < b, as Python orders numbers, strings and lists
+fn (s state&) less(a Val&, b Val&) Bool ? Error {
+    if isNum(a) and isNum(b): return toF(a) < toF(b)
+    if a == Val.Str and b == Val.Str {
+        x := try a as Val.Str catch default ""
+        y := try b as Val.Str catch default ""
+        for i in range x.Len().Min(y.Len()) {
+            if x[i] != y[i]: return x[i] < y[i]
+        }
+        return x.Len() < y.Len()
+    }
+    error Error.Type("'<' between " + s.kind(a) + " and " + s.kind(b))
+}
+
+fn (s state&) kind(v Val&) String {
+    match v {
+        case Val.Undef: return "Undefined"
+        case Val.None: return "NoneType"
+        case Val.Bool(_): return "bool"
+        case Val.Int(_): return "int"
+        case Val.Float(_): return "float"
+        case Val.Str(_): return "str"
+        case Val.List(_): return "list"
+        case Val.Dict(_): return "dict"
+        case Val.Ns(_): return "Namespace"
+        case _: return "function"
+    }
+}
+
+fn (s state&) contains(c Val&, x Val&) Bool ? Error {
+    match c {
+        case Val.Undef: return false
+        case Val.Str(text) {
+            if x != Val.Str: error Error.Type("'in <string>' requires a string")
+            return text.Contains(textOf(x))
+        }
+        case Val.List(items) {
+            for y in items.View() {
+                if s.equal(x, y): return true
+            }
+            return false
+        }
+        case Val.Dict(_) {
+            if x != Val.Str: return false
+            kv := kvOf(c)
+            for i in range 0, kv.Len(), 2 {
+                if kv.At(i) == x: return true
+            }
+            return false
+        }
+        case _: error Error.Type("argument of type '" + s.kind(c) + "' is not iterable")
+    }
+}
+
+fn floorDiv(a I64, b I64) I64 {
+    q := a / b
+    if (a % b != 0) and ((a < 0) != (b < 0)): q--
+    return q
+}
+
+fn (s state&) binary(op String&, a Val&, b Val&) Val ? Error {
+    if op == "~": return Val.Str(s.str(a) + s.str(b))
+    if op == "==": return Val.Bool(s.equal(a, b))
+    if op == "!=": return Val.Bool(not s.equal(a, b))
+    if op == "<": return Val.Bool(try s.less(a, b))
+    if op == ">": return Val.Bool(try s.less(b, a))
+    if op == "<=": return Val.Bool(not try s.less(b, a))
+    if op == ">=": return Val.Bool(not try s.less(a, b))
+    if op == "in": return Val.Bool(try s.contains(b, a))
+    if op == "notin": return Val.Bool(not try s.contains(b, a))
+    if a == Val.Undef or b == Val.Undef: error Error.Undefined("an undefined value used with '" + op + "'")
+    if op == "+" {
+        if a == Val.Str and b == Val.Str: return Val.Str(s.str(a) + s.str(b))
+        if a == Val.List and b == Val.List {
+            l := listOf(a)
+            for x in listOf(b).View(): l.Push(x)
+            return Val.List(l)
+        }
+    }
+    if op == "*" and a == Val.Str and b == Val.Int: return Val.Str(repeat(s.str(a), try toInt(b)))
+    if not isNum(a) or not isNum(b): error Error.Type("unsupported operand types for " + op + ": '" + s.kind(a) + "' and '" + s.kind(b) + "'")
+    if op == "/": return Val.Float(toF(a) / toF(b))
+    if a == Val.Float or b == Val.Float {
+        x := toF(a)
+        y := toF(b)
+        if op == "+": return Val.Float(x + y)
+        if op == "-": return Val.Float(x - y)
+        if op == "*": return Val.Float(x * y)
+        if op == "//": return Val.Float((x / y).Floor())
+        if op == "%": return Val.Float(x - y * (x / y).Floor())
+        return Val.Float(x.Pow(y))
+    }
+    x := try toInt(a)
+    y := try toInt(b)
+    if (op == "//" or op == "%") and y == 0: error Error.Type("integer division or modulo by zero")
+    if op == "+": return Val.Int(x + y)
+    if op == "-": return Val.Int(x - y)
+    if op == "*": return Val.Int(x * y)
+    if op == "//": return Val.Int(floorDiv(x, y))
+    if op == "%": return Val.Int(x - y * floorDiv(x, y))
+    if y < 0: return Val.Float(F64(x).Pow(F64(y)))
+    r I64 = 1
+    for _ in range y: r *= x
+    return Val.Int(r)
+}
+
+# what a for loop walks: a list's items, a dict's keys, a text's characters
+fn (s state&) items(v Val&) Vec<Val> ? Error {
+    match v {
+        case Val.Undef: return Vec<Val>()
+        case Val.List(_): return listOf(v)
+        case Val.Dict(_) {
+            kv := kvOf(v)
+            l := Vec<Val>()
+            for i in range 0, kv.Len(), 2: l.Push(kv.At(i))
+            return l
+        }
+        case Val.Str(_): return charsOf(textOf(v))
+        case _: error Error.Type("'" + s.kind(v) + "' object is not iterable")
+    }
+}
+
+fn isAlpha(c Char) Bool { return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') }
+
+fn repeat(text String&, n I64) String {
+    sb := StringBuilder()
+    for _ in range n.Max(0): sb.Push(text)
+    return sb.Str()
+}
+
+# ---- filters ----
+
+fn (t Template&) filter(name String&, v Val&, vs Vec<Val>&, names Vec<String>&, s mut state&) Val ? Error {
+    if name == "safe" or name == "e" or name == "escape" or name == "string": return Val.Str(s.str(v)) if name == "string" else v
+    if name == "default" or name == "d" {
+        empty := v == Val.Undef or (s.truthy(argOf(vs, names, 1, "boolean", Val.Bool(false))) and not s.truthy(v))
+        return argOf(vs, names, 0, "default_value", Val.Str("")) if empty else v
+    }
+    if name == "tojson" {
+        ind := argOf(vs, names, 0, "indent", Val.None)
+        sb := StringBuilder()
+        try s.json(v, (try toInt(ind)) if ind != Val.None else -1, 0, sb)
+        return Val.Str(sb.Str())
+    }
+    if name == "length" or name == "count": return Val.Int(s.length(v))
+    if name == "list": return Val.List(try s.items(v))
+    if name == "first" or name == "last" {
+        xs := try s.items(v)
+        if xs.Len() == 0: return Val.Undef
+        return xs.At(0) if name == "first" else xs.At(xs.Len() - 1)
+    }
+    if name == "reverse" {
+        xs := try s.items(v)
+        xs.Reverse()
+        if v != Val.Str: return Val.List(xs)
+        sb := StringBuilder()
+        for x in xs.View(): sb.Push(textOf(x))
+        return Val.Str(sb.Str())
+    }
+    if name == "join" {
+        sep := s.str(argOf(vs, names, 0, "d", Val.Str("")))
+        at := argOf(vs, names, 1, "attribute", Val.None)
+        sb := StringBuilder()
+        xs := try s.items(v)
+        for i in range xs.Len() {
+            if i > 0: sb.Push(sep)
+            sb.Push(s.str(try s.pick(xs.At(i), at)))
+        }
+        return Val.Str(sb.Str())
+    }
+    if name == "items" {
+        if v == Val.Undef: return Val.List(Vec<Val>())
+        if v != Val.Dict: error Error.Type("items of a " + s.kind(v))
+        return pairs(v)
+    }
+    if name == "int" {
+        match v {
+            case Val.Int(_): return v
+            case Val.Bool(b): return Val.Int(1 if b else 0)
+            case Val.Float(x): return Val.Int(I64(x))
+            case Val.Str(_): return Val.Int(try textOf(v).Trim().ParseInt() catch default (try toInt(argOf(vs, names, 0, "default", Val.Int(0)))))
+            case _: return argOf(vs, names, 0, "default", Val.Int(0))
+        }
+    }
+    if name == "float" {
+        if isNum(v): return Val.Float(toF(v))
+        if v == Val.Str: return Val.Float(try textOf(v).Trim().ParseFloat() catch default 0.0)
+        return Val.Float(0.0)
+    }
+    if name == "abs" {
+        if v == Val.Float: return Val.Float(toF(v).Abs())
+        return Val.Int((try toInt(v)).Abs())
+    }
+    if name == "round" {
+        prec := try toInt(argOf(vs, names, 0, "precision", Val.Int(0)))
+        how := s.str(argOf(vs, names, 1, "method", Val.Str("common")))
+        m := 10.0.Pow(F64(prec))
+        x := toF(v) * m
+        r := x.Floor() if how == "floor" else (x.Ceil() if how == "ceil" else (x.Abs() + 0.5).Floor() * (-1.0 if x < 0.0 else 1.0))
+        return Val.Float(r / m)
+    }
+    if name == "map" {
+        at := argOf(vs, names, -1, "attribute", Val.None)
+        out := Vec<Val>()
+        for x in (try s.items(v)).View() {
+            if at != Val.None {
+                y := try s.pick(x, at)
+                if y == Val.Undef: y = argOf(vs, names, -1, "default", Val.Undef)
+                out.Push(y)
+                continue
+            }
+            rest := Vec<Val>()
+            restNames := Vec<String>()
+            for i in range 1, vs.Len() {
+                rest.Push(vs.At(i))
+                restNames.Push(names.At(i))
+            }
+            out.Push(try t.filter(s.str(vs.At(0)), x, rest, restNames, s))
+        }
+        return Val.List(out)
+    }
+    if name == "select" or name == "reject" or name == "selectattr" or name == "rejectattr" {
+        byAttr := name.EndsWith("attr")
+        keep := name.StartsWith("select")
+        first I64 = 1 if byAttr else 0
+        out := Vec<Val>()
+        for x in (try s.items(v)).View() {
+            y := try s.pick(x, vs.At(0)) if byAttr else x
+            ok := s.truthy(y)
+            if vs.Len() > first {
+                rest := Vec<Val>()
+                for i in range first + 1, vs.Len(): rest.Push(vs.At(i))
+                ok = try s.test(s.str(vs.At(first)), y, rest)
+            }
+            if ok == keep: out.Push(x)
+        }
+        return Val.List(out)
+    }
+    if v == Val.Str or name == "trim" or name == "upper" or name == "lower": return try s.method(Val.Str(s.str(v)), "strip" if name == "trim" else name, vs, names)
+    error Error.Type("no filter named '" + name + "'")
+}
+
+# an item's attribute, or the item itself where none is named (at is None); "a.b" walks
+fn (s state&) pick(x Val&, at Val&) Val ? Error {
+    if at == Val.None: return x
+    if at == Val.Int: return try itemOf(x, at)
+    y := x
+    for part in s.str(at).Split(".") {
+        n := try part.ParseInt() catch default -1
+        if n >= 0 and y == Val.List: y = try itemOf(y, Val.Int(n))
+        else: y = try attrOf(y, part)
+        if y == Val.Undef: return y
+    }
+    return y
+}
+
+# a dict's members as [key, value] pairs
+fn pairs(d Val&) Val {
+    kv := kvOf(d)
+    out := Vec<Val>()
+    for i in range 0, kv.Len(), 2 {
+        p := Vec<Val>()
+        p.Push(kv.At(i))
+        p.Push(kv.At(i + 1))
+        out.Push(Val.List(p))
+    }
+    return Val.List(out)
+}
+
+# ---- tests ----
+
+fn (s state&) test(name String&, v Val&, vs Vec<Val>&) Bool ? Error {
+    a := vs.At(0) if vs.Len() > 0 else Val.Undef
+    if name == "defined": return v != Val.Undef
+    if name == "undefined": return v == Val.Undef
+    if name == "none": return v == Val.None
+    if name == "string": return v == Val.Str
+    if name == "mapping": return v == Val.Dict
+    if name == "iterable": return v == Val.List or v == Val.Dict or v == Val.Str or v == Val.Undef
+    if name == "sequence": return v == Val.List or v == Val.Dict or v == Val.Str
+    if name == "number": return isNum(v)
+    if name == "integer": return v == Val.Int
+    if name == "float": return v == Val.Float
+    if name == "boolean": return v == Val.Bool
+    if name == "true": return v == Val.Bool(true)
+    if name == "false": return v == Val.Bool(false)
+    if name == "callable": return v == Val.Macro or v == Val.Func
+    if name == "eq" or name == "equalto" or name == "==" or name == "sameas": return s.equal(v, a)
+    if name == "ne" or name == "!=": return not s.equal(v, a)
+    if name == "lt" or name == "<" or name == "lessthan": return try s.less(v, a)
+    if name == "gt" or name == ">" or name == "greaterthan": return try s.less(a, v)
+    if name == "le" or name == "<=": return not try s.less(a, v)
+    if name == "ge" or name == ">=": return not try s.less(v, a)
+    if name == "in": return try s.contains(a, v)
+    if name == "odd": return (try toInt(v)) % 2 != 0
+    if name == "even": return (try toInt(v)) % 2 == 0
+    if name == "divisibleby": return (try toInt(v)) % (try toInt(a)) == 0
+    if name == "lower": return v == Val.Str and textOf(v) == textOf(v).ToLower()
+    if name == "upper": return v == Val.Str and textOf(v) == textOf(v).ToUpper()
+    error Error.Type("no test named '" + name + "'")
+}
+
+# ---- methods ----
+
+fn hasMethod(o Val&, name String&) Bool {
+    if o == Val.Dict: return " items keys values get ".Contains(" " + name + " ")
+    if o == Val.Str: return " startswith endswith strip lstrip rstrip split rsplit replace upper lower title capitalize find join format count ".Contains(" " + name + " ")
+    return false
+}
+
+fn (s mut state&) method(o Val&, name String&, vs Vec<Val>&, names Vec<String>&) Val ? Error {
+    a := argOf(vs, names, 0, "", Val.None)
+    if o == Val.Dict {
+        if name == "items": return pairs(o)
+        if name == "keys": return Val.List(try s.items(o))
+        if name == "get" {
+            k := textOf(a)
+            v := o.Get(k)
+            return argOf(vs, names, 1, "", Val.None) if v == Val.Undef else v
+        }
+        kv := kvOf(o)
+        out := Vec<Val>()
+        for i in range 1, kv.Len(), 2: out.Push(kv.At(i))
+        return Val.List(out)
+    }
+    text := textOf(o)
+    if name == "startswith" or name == "endswith" {
+        cands := listOf(a) if a == Val.List else Vec<Val>()
+        if a != Val.List: cands.Push(a)
+        for c in cands.View() {
+            if name == "startswith" and text.StartsWith(textOf(c)): return Val.Bool(true)
+            if name == "endswith" and text.EndsWith(textOf(c)): return Val.Bool(true)
+        }
+        return Val.Bool(false)
+    }
+    if name == "strip" or name == "lstrip" or name == "rstrip": return Val.Str(strip(text, a, name != "rstrip", name != "lstrip"))
+    if name == "upper": return Val.Str(text.ToUpper())
+    if name == "lower": return Val.Str(text.ToLower())
+    if name == "title" or name == "capitalize": return Val.Str(title(text, name == "title"))
+    if name == "replace" {
+        n := try toInt(argOf(vs, names, 2, "count", Val.Int(-1)))
+        return Val.Str(replace(text, textOf(a), s.str(argOf(vs, names, 1, "", Val.Str(""))), n))
+    }
+    if name == "find" or name == "count" {
+        if name == "count": return Val.Int(text.Split(textOf(a)).Len() - 1)
+        return Val.Int(try text.Find(textOf(a)) catch default -1)
+    }
+    if name == "join" {
+        sb := StringBuilder()
+        xs := try s.items(a)
+        for i in range xs.Len() {
+            if i > 0: sb.Push(text)
+            sb.Push(s.str(xs.At(i)))
+        }
+        return Val.Str(sb.Str())
+    }
+    if name == "format": return Val.Str(try s.format(text, vs, names))
+    # split, rsplit
+    max := try toInt(argOf(vs, names, 1, "maxsplit", Val.Int(-1)))
+    return Val.List(split(text, argOf(vs, names, 0, "sep", Val.None), max, name == "rsplit"))
+}
+
+# text without the characters chars holds (whitespace when None) at its start, its end, or both
+fn strip(text String&, chars Val&, start Bool, end Bool) String {
+    set := textOf(chars)
+    a I64 = 0
+    b I64 = text.Len()
+    for start and a < b and (isSpace(text[a]) if chars == Val.None else set.Contains($text[a:a + 1])): a++
+    for end and b > a and (isSpace(text[b - 1]) if chars == Val.None else set.Contains($text[b - 1:b])): b--
+    return $text[a:b]
+}
+
+fn title(text String&, every Bool) String {
+    sb := StringBuilder()
+    prev := false                                   # the character before is a letter
+    for i in range text.Len() {
+        c := text[i]
+        up := not prev if every else i == 0
+        sb.PushChar(c.ToUpper() if up else c.ToLower())
+        prev = isAlpha(c) or (c >= 0x80)
+    }
+    return sb.Str()
+}
+
+fn replace(text String&, old String&, new String&, count I64) String {
+    if old.Len() == 0: return text
+    sb := StringBuilder()
+    i I64 = 0
+    done I64 = 0
+    for i < text.Len() {
+        if (count < 0 or done < count) and text[i:].StartsWith(old) {
+            sb.Push(new)
+            i += old.Len()
+            done++
+            continue
+        }
+        sb.PushChar(text[i])
+        i++
+    }
+    return sb.Str()
+}
+
+# Python's str.split (sep None: runs of whitespace, no empty pieces) and rsplit, at most max splits where max >= 0
+fn split(text String&, sep Val&, max I64, fromEnd Bool) Vec<Val> {
+    out := Vec<Val>()
+    if sep == Val.None {
+        words := Vec<Val>()
+        i I64 = 0
+        for i < text.Len() {
+            for i < text.Len() and isSpace(text[i]): i++
+            if i == text.Len(): break
+            j := i
+            for j < text.Len() and not isSpace(text[j]): j++
+            words.Push(Val.Str($text[i:j]))
+            i = j
+        }
+        if max < 0 or words.Len() <= max + 1: return words
+        # the rest after max splits keeps its inner whitespace
+        rest := strip(text, Val.None, true, true)
+        for _ in range max {
+            k := try rest.Find(" ") catch default rest.Len()
+            out.Push(Val.Str($rest[:k]))
+            rest = strip($rest[k:], Val.None, true, false)
+        }
+        out.Push(Val.Str(rest))
+        return out
+    }
+    sp := textOf(sep)
+    pieces := text.Split(sp)
+    n := pieces.Len()
+    if max < 0 or n <= max + 1 {
+        for p in pieces: out.Push(Val.Str(p))
+        return out
+    }
+    if not fromEnd {
+        for i in range max: out.Push(Val.Str(pieces[i]))
+        out.Push(Val.Str(joinFrom(pieces, max, n, sp)))
+        return out
+    }
+    out.Push(Val.Str(joinFrom(pieces, 0, n - max, sp)))
+    for i in range n - max, n: out.Push(Val.Str(pieces[i]))
+    return out
+}
+
+fn joinFrom(pieces Array<String&>&, from I64, to I64, sep String&) String {
+    sb := StringBuilder()
+    for i in range from, to {
+        if i > from: sb.Push(sep)
+        sb.Push(pieces[i])
+    }
+    return sb.Str()
+}
+
+# str.format's {} {0} {name} and {{ }}
+fn (s state&) format(text String&, vs Vec<Val>&, names Vec<String>&) String ? Error {
+    sb := StringBuilder()
+    next I64 = 0
+    i I64 = 0
+    for i < text.Len() {
+        c := text[i]
+        if (c == '{' or c == '}') and i + 1 < text.Len() and text[i + 1] == c {
+            sb.PushChar(c)
+            i += 2
+            continue
+        }
+        if c != '{' {
+            sb.PushChar(c)
+            i++
+            continue
+        }
+        j := i + (try text[i:].Find("}") catch { error Error.Type("a '{' in a format is not closed") })
+        field := $text[i + 1:j]
+        v := Val.Undef
+        if field.Len() == 0 {
+            v = argOf(vs, names, next, "", Val.Undef)
+            next++
+        } else {
+            n := try field.ParseInt() catch default -1
+            v = argOf(vs, names, n, field, Val.Undef) if n >= 0 else argOf(vs, names, -1, field, Val.Undef)
+        }
+        sb.Push(s.str(v))
+        i = j + 1
+    }
+    return sb.Str()
+}
+
+# ---- tojson: Python's json.dumps(v, ensure_ascii=False, indent=indent) ----
+
+fn (s state&) json(v Val&, indent I64, depth I64, sb mut StringBuilder&) ? Error {
+    match v {
+        case Val.None: sb.Push("null")
+        case Val.Bool(b): sb.Push("true" if b else "false")
+        case Val.Int(n): sb.Push($n)
+        case Val.Float(x) {
+            if x != x: sb.Push("NaN")
+            else if x - x != 0.0: sb.Push("Infinity" if x > 0.0 else "-Infinity")
+            else: sb.Push(pyFloat(x))
+        }
+        case Val.Str(_): jsonStr(textOf(v), sb)
+        case Val.List(_) {
+            xs := listOf(v)
+            if xs.Len() == 0 {
+                sb.Push("[]")
+                return
+            }
+            sb.Push("[")
+            for i in range xs.Len() {
+                if i > 0: sb.Push("," if indent >= 0 else ", ")
+                newline(indent, depth + 1, sb)
+                try s.json(xs.At(i), indent, depth + 1, sb)
+            }
+            newline(indent, depth, sb)
+            sb.Push("]")
+        }
+        case Val.Dict(_) {
+            kv := kvOf(v)
+            if kv.Len() == 0 {
+                sb.Push("{}")
+                return
+            }
+            sb.Push("{")
+            for i in range 0, kv.Len(), 2 {
+                if i > 0: sb.Push("," if indent >= 0 else ", ")
+                newline(indent, depth + 1, sb)
+                jsonStr(textOf(kv.At(i)), sb)
+                sb.Push(": ")
+                try s.json(kv.At(i + 1), indent, depth + 1, sb)
+            }
+            newline(indent, depth, sb)
+            sb.Push("}")
+        }
+        case Val.Ns(id): try s.json(s.spaces.At(id), indent, depth, sb)
+        case _: error Error.Type("Object of type " + s.kind(v) + " is not JSON serializable")
+    }
+}
+
+fn newline(indent I64, depth I64, sb mut StringBuilder&) {
+    if indent < 0: return
+    sb.PushChar('\n')
+    sb.Push(repeat(" ", indent * depth))
+}
+
+fn jsonStr(text String&, sb mut StringBuilder&) {
+    sb.PushChar('"')
+    for c in text {
+        if c == '"': sb.Push("\\\"")
+        else if c == '\\': sb.Push("\\\\")
+        else if c == '\n': sb.Push("\\n")
+        else if c == '\r': sb.Push("\\r")
+        else if c == '\t': sb.Push("\\t")
+        else if c == 8: sb.Push("\\b")
+        else if c == 12: sb.Push("\\f")
+        else if c < 0x20: sb.Push("\\u00" + hex2(c))
+        else: sb.PushChar(c)
+    }
+    sb.PushChar('"')
+}
+
+# ---- strftime ----
+
+days Array<String>& = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+monthNames Array<String>& = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+fn pad(n I64, w I64) String { return ($n).PadStart(w, '0') }
+
+# Python's strftime for the directives chat templates use: %d %m %Y %y %H %I %M %S %p %b %B %a %A %j %%
+fn strftime(f String&, d time.Date&) String {
+    sb := StringBuilder()
+    i I64 = 0
+    for i < f.Len() {
+        c := f[i]
+        if c != '%' or i + 1 == f.Len() {
+            sb.PushChar(c)
+            i++
+            continue
+        }
+        k := f[i + 1]
+        i += 2
+        if k == 'd': sb.Push(pad(d.Day, 2))
+        else if k == 'm': sb.Push(pad(d.Month, 2))
+        else if k == 'Y': sb.Push($d.Year)
+        else if k == 'y': sb.Push(pad(d.Year % 100, 2))
+        else if k == 'H': sb.Push(pad(d.Hour, 2))
+        else if k == 'I': sb.Push(pad((d.Hour + 11) % 12 + 1, 2))
+        else if k == 'M': sb.Push(pad(d.Minute, 2))
+        else if k == 'S': sb.Push(pad(d.Second, 2))
+        else if k == 'p': sb.Push("AM" if d.Hour < 12 else "PM")
+        else if k == 'B': sb.Push(monthNames[d.Month - 1])
+        else if k == 'b': sb.Push($monthNames[d.Month - 1][:3])
+        else if k == 'A': sb.Push(days[d.Weekday()])
+        else if k == 'a': sb.Push($days[d.Weekday()][:3])
+        else if k == 'j': sb.Push(pad(d.YearDay(), 3))
+        else if k == '%': sb.PushChar('%')
+        else {
+            sb.PushChar('%')
+            sb.PushChar(k)
+        }
+    }
+    return sb.Str()
+}
+
+# ---- tests ----
+
+# what src renders to with ctx's variables (a JSON object), or the error it fails with
+fn try_(src String&, ctx String& = "{}") String {
+    t := try Template.Parse(src) catch Error e { return "error " + $e }
+    j := try json.Json.Parse(ctx) catch { return "bad ctx" }
+    return try t.Render(Val.FromJson(j)) catch Error e { return "error " + $e }
+}
+
+test Template "renders text, expressions and whitespace control as Jinja2 does with trim_blocks and lstrip_blocks" {
+    assert try_("a {{ 1 + 2 }} b") == "a 3 b"
+    assert try_("{% if true %}\nx\n{% endif %}\ny") == "x\ny"
+    assert try_("  {% if true %}\n  x\n  {% endif %}\n") == "  x\n"
+    assert try_("a  {{- 'b' -}}  c") == "abc"
+    assert try_("a\n  {%- if 1 %} b {% endif -%}\n  c") == "a b c"
+    assert try_("{# note #}\nx{# y -#}  z") == "xz"
+    assert try_("{%+ if 1 %}x{% endif %}") == "x"
+}
+
+test Template "evaluates Jinja's expressions" {
+    assert try_("{{ 'a\\n\\'b\"' }}|{{ \"c\\td\" }}") == "a\n'b\"|c\td"
+    assert try_("{{ 7 // 2 }} {{ -7 // 2 }} {{ 7 % 3 }} {{ -7 % 3 }} {{ 7 / 2 }} {{ 2 ** 10 }} {{ 1.5 * 2 }}") == "3 -4 1 2 3.5 1024 3.0"
+    assert try_("{{ 'a' ~ 1 ~ none }} {{ [1, 'a', none, true] }} {{ {'k': 1.0} }}") == "a1None [1, 'a', None, True] {'k': 1.0}"
+    assert try_("{{ x[::-1] }} {{ x[1:] }} {{ x[-1] }} {{ 'abc'[1:] }} {{ x | length - 1 }}", "{\"x\": [1, 2, 3]}") == "[3, 2, 1] [2, 3] 3 bc 2"
+    assert try_("{{ d.a }} {{ d['a'] }} {{ d.b is defined }} {{ 'a' in d }} {{ 2 not in [1] }}", "{\"d\": {\"a\": 5}}") == "5 5 False True True"
+    assert try_("{{ 1 if x else 2 }} {{ 'y' if not x }}|{{ x or 'z' }} {{ 0 and 1 }}", "{\"x\": false}") == "2 y|z 0"
+    assert try_("{{ 1 < 2 and 'b' > 'a' and [1] == [1] and 1 == 1.0 and true == 1 }}") == "True"
+    assert try_("{{ u.x }}").StartsWith("error")
+    assert try_("{{ raise_exception('no') }}").Contains("Raised(\"no\")")
+}
+
+test Template "runs Jinja's statements" {
+    assert try_("{% for x in xs %}{{ loop.index0 }}{{ loop.index }}{{ loop.revindex }}{{ loop.first }}{{ loop.last }}{{ loop.length }};{% endfor %}", "{\"xs\": [5, 6]}") == "012TrueFalse2;121FalseTrue2;"
+    assert try_("{% for x in xs if x > 1 %}{{ x }}{% else %}none{% endfor %}|{% for x in [] %}{% else %}empty{% endfor %}", "{\"xs\": [1, 2, 3]}") == "23|empty"
+    assert try_("{% for k, v in d.items() %}{{ k }}={{ v }},{% endfor %}{% for k in d %}{{ k }}{% endfor %}", "{\"d\": {\"b\": 1, \"a\": 2}}") == "b=1,a=2,ba"
+    assert try_("{% for x in [1, 2, 3, 4] %}{% if x == 2 %}{% continue %}{% endif %}{% if x == 4 %}{% break %}{% endif %}{{ x }}{% endfor %}") == "13"
+    assert try_("{% set x = 1 %}{% for i in [1] %}{% set x = 2 %}{% endfor %}{{ x }}") == "1"
+    assert try_("{% set ns = namespace(n=0) %}{% for i in range(4) %}{% set ns.n = ns.n + i %}{% endfor %}{{ ns.n }}") == "6"
+    assert try_("{% set b %}in {{ 1 }}{% endset %}[{{ b }}]") == "[in 1]"
+    assert try_("{% macro m(a, b='x') %}{{ a }}{{ b }}{% endmacro %}{{ m(1) }} {{ m(2, b=3) }}") == "1x 23"
+    assert try_("{% if a %}1{% elif b %}2{% else %}3{% endif %}{% generation %}g{% endgeneration %}", "{\"b\": 1}") == "2g"
+}
+
+test Template "has the filters, tests and methods chat templates use" {
+    assert try_("{{ d | tojson }}|{{ d | tojson(indent=2) }}|{{ [] | tojson(indent=2) }}", "{\"d\": {\"a\": [1, \"é\\n\"], \"b\": null}}") == "{\"a\": [1, \"é\\n\"], \"b\": null}|{\n  \"a\": [\n    1,\n    \"é\\n\"\n  ],\n  \"b\": null\n}|[]"
+    assert try_("{{ ' a ' | trim }}|{{ x | first }}{{ x | last }}|{{ x | join('-') }}|{{ x | reverse | list }}|{{ 'ab' | upper }}|{{ u | default('d') }}|{{ '3' | int + 1 }}|{{ 2.567 | round(2) }}", "{\"x\": [1, 2]}") == "a|12|1-2|[2, 1]|AB|d|4|2.57"
+    assert try_("{{ xs | map(attribute='n') | list }} {{ xs | selectattr('n', 'equalto', 2) | list | length }} {{ xs | rejectattr('m', 'defined') | list | length }}", "{\"xs\": [{\"n\": 1}, {\"n\": 2, \"m\": 0}]}") == "[1, 2] 1 1"
+    assert try_("{{ 1 is number }}{{ 'a' is string }}{{ {} is mapping }}{{ 'a' is iterable }}{{ none is none }}{{ false is false }}{{ 1 is integer }}{{ x is not defined }}") == "TrueTrueTrueTrueTrueTrueTrueTrue"
+    assert try_("{{ 'a</think>b'.split('</think>')[0] }}{{ '\\n\\nx\\n'.strip('\\n') }}{{ 'xy'.startswith('x') }}{{ 'a b'.replace(' ', '_') }}{{ 'hi there'.title() }}{{ '{} {}'.format(1, 'b') }}") == "axTruea_bHi There1 b"
+    assert try_("{{ d.get('a') }} {{ d.get('z', 0) }} {{ d.keys() | list }} {{ d.values() | list }}", "{\"d\": {\"a\": 1}}") == "1 0 ['a'] [1]"
+    assert try_("{{ strftime_now('%Y') | length }}") == "4"
+}
