@@ -14,7 +14,12 @@
 #                         {prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>, the system by default Granite's own
 #                         (its knowledge cutoff, today's date, "You are Granite, developed by IBM. ...")
 #     Gemma:              <bos><start_of_turn>user\n[{system}\n\n]{prompt}<end_of_turn>\n<start_of_turn>model\n
-# The dates are today's, as the templates' strftime_now writes them.
+# The dates are today's, as the templates' strftime_now writes them. These strings are the fallback: where the model
+# directory has its template (chat_template.jinja, or tokenizer_config.json's chat_template - a string, or a list of
+# {name, template} of which "default" is taken), Prompt and Render run it with llm/jinja, as transformers'
+# apply_chat_template does: the variables messages, tools, documents (none), add_generation_prompt, the special
+# tokens of tokenizer_config.json (bos_token, eos_token, unk_token, pad_token, ...) and any extra ones given
+# (enable_thinking).
 # The family is told by the added tokens the tokenizer has. DeepSeek-R1's template opens the thinking itself, so
 # Opening() gives "<think>\n" there: a completion written after it reads as Qwen3's does, thinking first.
 
@@ -23,6 +28,7 @@ import "std/json"
 import "std/os"
 import "std/time"
 import "bpe"
+import "jinja"
 
 type Family enum {
     ChatMl
@@ -33,12 +39,16 @@ type Family enum {
     Plain               # no chat template: the prompt as it is
 }
 
-type Chat struct(Kind Family, Stops Array<I32>&, Temp F64, TopP F64, TopK I64) {
+type Chat struct(Kind Family, Stops Array<I32>&, Temp F64, TopP F64, TopK I64, Source String, template jinja.Template
+        tokens jinja.Val) {
     Kind
     Stops               # the tokens that end a completion
     Temp                # generation_config's sampling defaults (0.6, 0.95, 0 where it has none)
     TopP
     TopK
+    Source              # the model's chat template, "" where it has none (or one llm/jinja does not parse)
+    template
+    tokens              # the special tokens the template reads (bos_token, ...), a dict
 }
 
 fn ints(j json.Json&, key String&, out mut Vec<I32>&) {
@@ -70,13 +80,72 @@ fn Chat.Load(dir String&, t bpe.Bpe&) Chat {
     temp F64 = 0.6
     topP F64 = 0.95
     topK I64 = 0
+    cfg :~ try os.ReadFile(dir + "/tokenizer_config.json") catch default "{}"
+    tc :~ try json.Json.Parse(cfg) catch default json.Json.Null
+    source := templateOf(dir, tc)
+    tmpl := try jinja.Template.Parse(source) catch {
+        source = ""
+    } default jinja.Template.Parse("")!
+    tokens := jinja.Val.NewDict()
+    for k in ["bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token"] {
+        tok := tokenText(tc, k)
+        if tok.Len() > 0: tokens.Put(k, jinja.Val.Str(tok))
+    }
     text :~ try os.ReadFile(dir + "/generation_config.json") catch default "{}"
-    j :~ try json.Json.Parse(text) catch { return Chat(family, endTokens(t, family, stops), temp, topP, topK) }
+    j :~ try json.Json.Parse(text) catch { return Chat(family, endTokens(t, family, stops), temp, topP, topK, source, tmpl, tokens) }
     ints(j, "eos_token_id", stops)
     temp = num(j, "temperature", temp)
     topP = num(j, "top_p", topP)
     topK = I64(num(j, "top_k", 0.0))
-    return Chat(family, endTokens(t, family, stops), temp, topP, topK)
+    return Chat(family, endTokens(t, family, stops), temp, topP, topK, source, tmpl, tokens)
+}
+
+# the chat template of the model in dir: chat_template.jinja, else tokenizer_config's chat_template (a string, or the
+# "default" of a list of named ones); "" where there is none
+fn templateOf(dir String&, tc json.Json&) String {
+    file :~ try os.ReadFile(dir + "/chat_template.jinja") catch default ""
+    if file.Len() > 0: return file
+    if not tc.Has("chat_template"): return ""
+    v :~ try tc["chat_template"] catch { return "" }
+    if v == json.Json.Str: return $(try v.AsStr() catch default "")
+    items :~ try v.AsArr() catch { return "" }
+    for x in items {
+        name :~ try (try x["name"] catch { continue }).AsStr() catch { continue }
+        if name != "default": continue
+        return $(try (try x["template"] catch { continue }).AsStr() catch default "")
+    }
+    return ""
+}
+
+# a special token of tokenizer_config.json: a string, or an object whose content it is
+fn tokenText(tc json.Json&, key String&) String {
+    if not tc.Has(key): return ""
+    v :~ try tc[key] catch { return "" }
+    if v == json.Json.Str: return $(try v.AsStr() catch default "")
+    if not v.Has("content"): return ""
+    return $(try (try v["content"] catch { return "" }).AsStr() catch default "")
+}
+
+# the prompt the model's template writes for messages (a list of dicts with role, content and, for tool calls,
+# tool_calls), tools (a list of JSON schemas, or None), whether the assistant's turn is opened after them, and extra
+# variables (a dict: enable_thinking, ...). Fails where the model has no template, or the template fails
+# (raise_exception: a conversation it does not take)
+fn (c Chat&) Render(messages jinja.Val&, tools jinja.Val&, addGenerationPrompt Bool, extra jinja.Val&) String ? jinja.Error {
+    if c.Source.Len() == 0: error jinja.Error.Type("the model has no chat template")
+    ctx := c.tokens
+    ctx.Put("messages", messages)
+    ctx.Put("tools", tools)
+    ctx.Put("documents", jinja.Val.None)
+    ctx.Put("add_generation_prompt", jinja.Val.Bool(addGenerationPrompt))
+    ctx.Merge(extra)
+    return try c.template.Render(ctx)
+}
+
+fn message(role String&, content String&) jinja.Val {
+    m := jinja.Val.NewDict()
+    m.Put("role", jinja.Val.Str(role))
+    m.Put("content", jinja.Val.Str(content))
+    return m
 }
 
 fn num(j json.Json&, key String&, d F64) F64 {
@@ -109,6 +178,18 @@ fn endTokens(t bpe.Bpe&, f Family, given mut Vec<I32>&) Array<I32> {
 
 # the text a model reads for one user turn after an optional system prompt, ready for its answer
 fn (c Chat&) Prompt(user String&, system String& = "", think Bool = true) String {
+    if c.Source.Len() > 0 {
+        msgs := Vec<jinja.Val>()
+        if system.Len() > 0: msgs.Push(message("system", system))
+        msgs.Push(message("user", user))
+        extra := jinja.Val.NewDict()
+        if not think: extra.Put("enable_thinking", jinja.Val.Bool(false))
+        done := true
+        text := try c.Render(jinja.Val.List(msgs), jinja.Val.None, true, extra) catch {
+            done = false
+        } default ""
+        if done: return text
+    }
     if c.Kind == Family.ChatMl {
         sys :~ "<|im_start|>system\n" + system + "<|im_end|>\n" if system.Len() > 0 else ""
         return sys + "<|im_start|>user\n" + user + "<|im_end|>\n<|im_start|>assistant\n" + ("" if think else "<think>\n\n</think>\n\n")
@@ -201,5 +282,30 @@ test Chat "writes the prompt the model's own template writes, for every model un
         if c.Kind != Family.ChatMl: assert c.Prompt("Hi") == refs[0].AsStr()!, name + ": " + c.Prompt("Hi")
         assert c.Prompt("Hi", "SYS") == refs[1].AsStr()!, name + ": " + c.Prompt("Hi", "SYS")
         assert c.Stops.Len() > 0
+    }
+}
+
+# the models under $OANN_MODELS with a jinjaref.json (llm/tools/chatref.py: transformers' apply_chat_template, today):
+# each conversation rendered by the model's template through llm/jinja, byte for byte, failing where it fails
+test Chat "renders each reference conversation as transformers does, tool calls included, for every model with a jinjaref.json" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: return
+    for name in os.ReadDir(root)! {
+        dir := root + "/" + name
+        if not os.Exists(dir + "/jinjaref.json"): continue
+        c := Chat.Load(dir, bpe.Bpe.Load(dir + "/tokenizer.json")!)
+        assert c.Source.Len() > 0, name + ": no template"
+        for r in json.Json.Parse(os.ReadFile(dir + "/jinjaref.json")!)!.AsArr()! {
+            what := name + " " + r["name"]!.AsStr()!
+            tools := jinja.Val.FromJson(r["tools"]!) if r.Has("tools") else jinja.Val.None
+            extra := jinja.Val.FromJson(r["extra"]!) if r.Has("extra") else jinja.Val.NewDict()
+            msgs := jinja.Val.FromJson(r["messages"]!)
+            got := try c.Render(msgs, tools, r["add_generation_prompt"]!.AsBool()!, extra) catch jinja.Error e {
+                assert r.Has("error"), what + ": " + $e
+                continue
+            }
+            assert not r.Has("error"), what + ": renders where transformers fails"
+            assert got == r["text"]!.AsStr()!, what + ":\n" + got + "\n---- expected ----\n" + r["text"]!.AsStr()!
+        }
     }
 }
