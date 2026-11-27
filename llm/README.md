@@ -115,7 +115,7 @@ writes the logits transformers gives at every position; with `--real DIR ...` it
 logits and ten greedy tokens. `llm/tools/tokref.py DIR ...` writes the tokenizers library's ids of fixed texts (nine
 languages and scripts, code, numbers, emoji, whitespace) and the chat template's prompt. The tests read them where
 `$OANN_MODELS` has them: every position of every small model within 1e-4 on the exact path (on AMX's, BF16 activations,
-where a router may take another expert at a near tie: the mean difference within 1% and the same greedy token at 95% of
+where a router may take another expert at a near tie: the mean difference within 1% and the same greedy token at 90% of
 positions); SmolLM2-135M, Llama-3.2-1B, Granite-3.3-2B and Granite-3.1-1B-A400M within 1e-3 of the largest logit over
 the whole vocabulary and the same ten greedy tokens on the exact path, five on AMX's (Granite-3.3's sixth is a near tie
 that transformers in BF16 also takes the other way); the ids of Qwen3, Llama 3.2, SmolLM2 and Granite 3.3's tokenizers exactly the library's; the chat

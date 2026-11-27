@@ -1,5 +1,5 @@
 # llm/chat - what a model directory says about talking to it: the chat template its tokenizer has (ChatML for Qwen2.5,
-# Qwen3, SmolLM; DeepSeek-R1's for the models distilled from it; Llama 3's; Granite's), its stop tokens and sampling defaults
+# Qwen3, SmolLM; DeepSeek-R1's for the models distilled from it; Llama 3's; Granite's; Gemma's), its stop tokens and sampling defaults
 # (generation_config.json), and fetching a model's files from Hugging Face.
 #
 # Templates. Each model ships a Jinja template (tokenizer_config.json); these are the strings they make for a system
@@ -13,6 +13,7 @@
 #     Granite:            <|start_of_role|>system<|end_of_role|>{system}<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>
 #                         {prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>, the system by default Granite's own
 #                         (its knowledge cutoff, today's date, "You are Granite, developed by IBM. ...")
+#     Gemma:              <bos><start_of_turn>user\n[{system}\n\n]{prompt}<end_of_turn>\n<start_of_turn>model\n
 # The dates are today's, as the templates' strftime_now writes them.
 # The family is told by the added tokens the tokenizer has. DeepSeek-R1's template opens the thinking itself, so
 # Opening() gives "<think>\n" there: a completion written after it reads as Qwen3's does, thinking first.
@@ -28,6 +29,7 @@ type Family enum {
     DeepSeek
     Llama3
     Granite
+    Gemma
     Plain               # no chat template: the prompt as it is
 }
 
@@ -63,6 +65,7 @@ fn Chat.Load(dir String&, t bpe.Bpe&) Chat {
     if t.Find("<｜User｜>") >= 0: family = Family.DeepSeek
     if t.Find("<|start_header_id|>") >= 0: family = Family.Llama3
     if t.Find("<|start_of_role|>") >= 0: family = Family.Granite
+    if t.Find("<start_of_turn>") >= 0: family = Family.Gemma
     stops := Vec<I32>()
     temp F64 = 0.6
     topP F64 = 0.95
@@ -89,6 +92,7 @@ fn endTokens(t bpe.Bpe&, f Family, given mut Vec<I32>&) Array<I32> {
         case Family.DeepSeek: "<｜end▁of▁sentence｜> <|EOT|>"
         case Family.Llama3: "<|eot_id|> <|end_of_text|> <|eom_id|>"
         case Family.Granite: "<|end_of_text|>"
+        case Family.Gemma: "<end_of_turn> <eos>"
         case Family.Plain: "<|endoftext|> </s>"
     }
     for n in names.Split(" ") {
@@ -122,6 +126,10 @@ fn (c Chat&) Prompt(user String&, system String& = "", think Bool = true) String
             ".\nYou are Granite, developed by IBM. You are a helpful AI assistant."
         return "<|start_of_role|>system<|end_of_role|>" + sys + "<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>" + user +
             "<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+    }
+    if c.Kind == Family.Gemma {
+        sys :~ system + "\n\n" if system.Len() > 0 else ""
+        return "<bos><start_of_turn>user\n" + sys + user + "<end_of_turn>\n<start_of_turn>model\n"
     }
     return system + user
 }

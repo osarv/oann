@@ -11,7 +11,12 @@
 # and, where a Digits pre-tokenizer comes first (SmolLM's individual_digits), every digit a chunk of its own. A
 # hand-written scanner reads them over code points with the Unicode classes of llm/unicode; each chunk's bytes are
 # merged lowest rank first, leftmost first (a heap over its positions, as the tokenizer module's encoder does) - or,
-# where the model sets ignore_merges (Llama 3), a chunk the vocabulary holds whole is that token. The normalizer's NFC is not applied: text already in NFC (nearly all text) encodes
+# where the model sets ignore_merges (Llama 3), a chunk the vocabulary holds whole is that token.
+#
+# SentencePiece's BPE as tokenizer.json has it (Gemma, Mistral, Llama 2): spaces written "▁" (a normalizer's Replace or
+# a Metaspace pre-tokenizer, "▁" put before the text where its prepend_scheme says), the text not split, its
+# characters the starting symbols - a character the vocabulary lacks as its UTF-8 bytes' <0xXX> tokens (byte_fallback)
+# - merged lowest rank first as above. Decoding writes "▁" as a space and <0xXX> as its byte. The normalizer's NFC is not applied: text already in NFC (nearly all text) encodes
 # as the library encodes it. Decoding writes each token's bytes.
 
 import "std/json"
@@ -50,6 +55,9 @@ type Bpe struct(Size I64, starts Array<I64>&, bytes Array<Char>&, byteId Array<I
     Split Pre = Pre.Qwen2   # the pre-tokenizer's pattern
     Digits Bool = false     # every digit a chunk of its own, before the pattern
     whole mut Map<String, I32>& = Map<String, I32>()    # ignore_merges: the vocabulary's tokens by their bytes
+    Sp Bool = false         # SentencePiece's BPE: characters, not bytes, the starting symbols; spaces as "▁"
+    SpPrefix I64 = 0        # "▁" put before the text: 0 never, 1 before the text's first stretch, 2 before every stretch
+    chars mut Map<String, I32>& = Map<String, I32>()    # Sp: the vocabulary's tokens by their text
 }
 
 fn firstBytes(added Array<AddedToken>&) Array<Bool> {
@@ -128,13 +136,17 @@ fn Bpe.Parse(text String&) Bpe ? BpeError, json.Error {
         texts[id] ~ content
         if content.Len() > 0: added.Push(AddedToken(content, I32(id)))
     }
+    form := spForm.Of(doc)
+    isSp := form.Sp
     starts := Array<I64>(size + 1)
     all := Vec<Char>()
     ids := Map<String&, I64>()
     for id in range size {
         starts[id] = all.Len()
-        if isAdded[id] {
+        if isAdded[id] and not isSp {
             for c in texts[id]: all.Push(c)
+        } else if isSp {
+            spBytes(texts[id], all)
         } else {
             try unprint(texts[id], back, all)
         }
@@ -143,6 +155,10 @@ fn Bpe.Parse(text String&) Bpe ? BpeError, json.Error {
     starts[size] = all.Len()
     byteId := Array<I32>(256, -1)
     for b in range 256 {
+        if isSp {
+            byteId[b] = I32(try ids.Get(byteName(b)) catch default -1)
+            continue
+        }
         cp := b if printableByte(b) else -1
         if cp < 0 {
             n I64 = 0
@@ -198,12 +214,91 @@ fn Bpe.Parse(text String&) Bpe ? BpeError, json.Error {
     sorted.Sort(fn(x AddedToken, y AddedToken) Bool { return x.Text.Len() > y.Text.Len() })
     t := Bpe(size, starts, all.ToArray(), byteId, table, mergeTo, sorted)
     readPre(t, doc)
+    if isSp {
+        t.Sp = true
+        t.SpPrefix = form.Prefix
+        for id in range size {
+            if not isAdded[id]: t.chars.Put(texts[id], I32(id))
+        }
+    }
     if model.Has("ignore_merges") and (try (try model["ignore_merges"]).AsBool() catch default false) {
         for id in range size {
             if not isAdded[id]: t.whole.Put(String(t.bytes[t.starts[id]:t.starts[id + 1]]), I32(id))
         }
     }
     return t
+}
+
+# a byte fallback token's text: <0xHH>
+fn byteName(b I64) String {
+    hex := "0123456789ABCDEF"
+    return "<0x" + String([hex[b >> 4], hex[b & 15]]) + ">"
+}
+
+# a SentencePiece token's bytes: "▁" a space, <0xHH> its byte
+fn spBytes(text String&, dst mut Vec<Char>&) {
+    if text.Len() == 6 and text[:3] == "<0x" and text[5] == '>' {
+        v := hexVal(text[3]) * 16 + hexVal(text[4])
+        if v >= 0 {
+            dst.Push(Char(U8(v)))
+            return
+        }
+    }
+    i I64 = 0
+    for i < text.Len() {
+        if i + 3 <= text.Len() and text[i:i + 3] == "▁" {
+            dst.Push(' ')
+            i += 3
+            continue
+        }
+        dst.Push(text[i])
+        i++
+    }
+}
+
+fn hexVal(c Char) I64 {
+    if c >= '0' and c <= '9': return I64(U8(c)) - 48
+    if c >= 'A' and c <= 'F': return I64(U8(c)) - 55
+    return -1000
+}
+
+# whether tokenizer.json is SentencePiece's BPE (spaces replaced by "▁" by its normalizer, or a Metaspace
+# pre-tokenizer), and where "▁" goes before the text (0 never, 1 the first stretch, 2 every stretch)
+type spForm struct(Sp Bool, Prefix I64) {
+    Sp
+    Prefix
+}
+
+fn spForm.Of(doc json.Json&) spForm {
+    sp := false
+    prefix I64 = 0
+    for key in ["normalizer", "pre_tokenizer"] {
+        if not doc.Has(key): continue
+        x :~ try doc[key] catch { continue }
+        if x.IsNull(): continue
+        parts := Vec<json.Json&>()
+        for k2 in ["normalizers", "pretokenizers"] {
+            if x.Has(k2) {
+                seq :~ try (try x[k2] catch { continue }).AsArr() catch { continue }
+                for y in seq: parts.Push(y)
+            }
+        }
+        if parts.Len() == 0: parts.Push(x)
+        for y in parts.View() {
+            kind :~ try (try y["type"] catch { continue }).AsStr() catch { continue }
+            if kind == "Replace" {
+                content :~ try (try y["content"] catch { continue }).AsStr() catch { continue }
+                if content == "▁": sp = true
+            } else if kind == "Prepend" {
+                prefix = 2
+            } else if kind == "Metaspace" {
+                sp = true
+                scheme :~ try (try y["prepend_scheme"] catch { continue }).AsStr() catch default "always"
+                prefix = 0 if scheme == "never" else (1 if scheme == "first" else 2)
+            }
+        }
+    }
+    return spForm(sp, prefix)
 }
 
 # the pre-tokenizer of tokenizer.json: a Split by Llama 3's or Qwen2's pattern, or ByteLevel's own; a Digits before it
@@ -521,21 +616,48 @@ fn heapPop(h mut list.List<I64>&) I64 {
 
 # piece's tokens appended to out: its bytes merged lowest rank first, leftmost first
 fn (t Bpe&) encodeChunk(piece String&, e mut encoder&, out mut Vec<I32>&) {
-    n := piece.Len()
+    if t.Sp {
+        t.encodeSp(piece, e, out)
+        return
+    }
     if t.whole.Len() > 0 and t.whole.Has(piece) {
         out.Push(try t.whole.Get(piece) catch { unreachable })
         return
     }
+    e.syms.Clear()
+    for j in range piece.Len(): e.syms.Push(I64(t.byteId[I64(U8(piece[j]))]))
+    t.merge(e, out)
+}
+
+# a SentencePiece piece's tokens: its characters the starting symbols (one the vocabulary lacks: its bytes' tokens),
+# merged as merge does
+fn (t Bpe&) encodeSp(piece String&, e mut encoder&, out mut Vec<I32>&) {
+    e.syms.Clear()
+    i I64 = 0
+    for i < piece.Len() {
+        _, w := pointAt(piece, i)
+        id := try t.chars.Get(piece[i:i + w]) catch default -1
+        if id >= 0 {
+            e.syms.Push(I64(id))
+        } else {
+            for q in range i, i + w: e.syms.Push(I64(t.byteId[I64(U8(piece[q]))]))
+        }
+        i += w
+    }
+    t.merge(e, out)
+}
+
+# e.syms merged lowest rank first, leftmost first, and the tokens appended to out
+fn (t Bpe&) merge(e mut encoder&, out mut Vec<I32>&) {
     syms :~ e.syms
     next :~ e.next
     prev :~ e.prev
     heap :~ e.heap
-    syms.Clear()
+    n := syms.Len()
     next.Clear()
     prev.Clear()
     heap.Clear()
     for j in range n {
-        syms.Push(I64(t.byteId[I64(U8(piece[j]))]))
         next.Push(j + 1)
         prev.Push(j - 1)
     }
@@ -592,8 +714,19 @@ fn (t Bpe&) Encode(text String&) Array<I32> {
             i++
             continue
         }
-        # the stretch before it, pre-tokenized
-        p I64 = start
+        # the stretch before it, pre-tokenized (SentencePiece's: whole, spaces as "▁")
+        if t.Sp {
+            if i > start {
+                sb := StringBuilder()
+                if t.SpPrefix == 2 or (t.SpPrefix == 1 and start == 0): sb.Push("▁")
+                for q in range start, i {
+                    if text[q] == ' ': sb.Push("▁")
+                    else: sb.PushChar(text[q])
+                }
+                t.encodeChunk(sb.ToString(), e, out)
+            }
+        }
+        p I64 = start if not t.Sp else i
         for p < i {
             end := chunkEnd(text[:i], p, t.Split, t.Digits)
             t.encodeChunk(text[p:end], e, out)

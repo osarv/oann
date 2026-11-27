@@ -1,6 +1,6 @@
 # The reference llm/model's architectures are held to: small models of random weights of each architecture and option
 # (Llama 3's and YaRN's rope scaling, Granite's multipliers, SmolLM3's layers without rotation, Mistral's sliding
-# window, the mixtures of experts of Qwen3-MoE (a dense layer among them), Granite-MoE and OLMoE), built and run by Hugging Face transformers in F32 on the CPU. Each is saved as a checkpoint under
+# window, Gemma 3's sliding and full layers, the mixtures of experts of Qwen3-MoE (a dense layer among them), Granite-MoE and OLMoE), built and run by Hugging Face transformers in F32 on the CPU. Each is saved as a checkpoint under
 # $OANN_MODELS/oann-tiny-NAME with ref.json: the token ids read and the logits of every position.
 #     python3 llm/tools/reference.py        (pip install torch transformers safetensors)
 import json, os, sys
@@ -23,6 +23,9 @@ cases = {
                                    mlp_only_layers=[1])),
     "granitemoe": ("granitemoe", dict(num_local_experts=8, num_experts_per_tok=3, embedding_multiplier=6.0,
                                       residual_multiplier=0.5, attention_multiplier=0.1, logits_scaling=2.0)),
+    "gemma3": ("gemma3_text", dict(sliding_window=50, layer_types=["sliding_attention", "sliding_attention",
+                                   "full_attention", "sliding_attention"], rope_local_base_freq=1000.0,
+                                   query_pre_attn_scalar=24, rope_theta=100000.0)),
     "olmoe": ("olmoe", dict(hidden_size=128, num_experts=8, num_experts_per_tok=2, norm_topk_prob=False, pad_token_id=0, eos_token_id=1,
                             bos_token_id=None)),
 }
@@ -58,7 +61,9 @@ if "--real" in sys.argv:
     from transformers import AutoTokenizer
     for d in sys.argv[sys.argv.index("--real") + 1:]:
         tok = AutoTokenizer.from_pretrained(d)
-        ids = tok("The capital of France is", add_special_tokens=False, return_tensors="pt").input_ids
+        # Gemma reads nothing sensible without its <bos>; the others as the text is
+        bos = json.load(open(os.path.join(d, "config.json")))["model_type"].startswith("gemma")
+        ids = tok("The capital of France is", add_special_tokens=bos, return_tensors="pt").input_ids
         m = AutoModelForCausalLM.from_pretrained(d, torch_dtype=torch.float32).eval()
         with torch.no_grad():
             last = m(ids).logits[0, -1]
