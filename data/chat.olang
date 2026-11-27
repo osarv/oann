@@ -1,0 +1,475 @@
+# data/chat - chat conversations for fine-tuning a model: a JSON-lines file of conversations, each rendered through the
+# model's chat template (Qwen's ChatML, as Qwen3's tokenizer_config.json writes it), tokenized with its tokenizer
+# (llm/bpe), and laid out in rows of a context's length that a language model's loop reads as it reads any batch source
+# (nn/train, nn/tune): token ids and, for each, the class it is trained to predict next - the next token where that token
+# belongs to an assistant's turn, -1 (ignored by the cross entropy) everywhere else.
+#
+# A line is one conversation, in either of the two shapes chat datasets come in:
+#     {"messages": [{"role": "system", "content": "..."}, {"role": "user", ...}, {"role": "assistant", ...}]}   (OpenAI)
+#     {"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}                  (ShareGPT)
+# with the roles system, user (human) and assistant (gpt). Blank lines are skipped; anything else is an error naming
+# its line.
+#
+# Rendering, as Qwen3's template does it: each message is "<|im_start|>{role}\n{content}<|im_end|>\n". An assistant turn
+# before the last user turn loses its reasoning (the text up to "</think>"); one after it keeps it as
+# "<think>\n{reasoning}\n</think>\n\n{answer}", and the last message, an assistant's without reasoning, is opened by an
+# empty "<think>\n\n</think>\n\n". What is trained: every assistant turn's text after its "<|im_start|>assistant\n",
+# through its "<|im_end|>" (so the model learns to stop) - but not the empty thinking block, which the template writes
+# itself (and Chat.Prompt with thinking off puts in the prompt). The whole conversation is encoded at once, exactly as the
+# tokenizer encodes it, and a token is trained when its first byte lies in a trained stretch of the text.
+#
+# Rows. A conversation of n tokens gives n - 1 (input, target) pairs. Packed (the default), conversations follow one
+# another in a row, each starting a new row when it does not fit in what is left of the current one; padded, each has a
+# row of its own, the rest filled with the tokenizer's <|endoftext|> and class -1. A conversation longer than the
+# context is cut to it; one left with nothing to train after the cut is dropped (a row of -1 only would give the loss
+# nothing to average). Packed rows let attention see the conversation before in the same row (no document mask).
+#
+# The validation split is carved from the file by the seed before anything is rendered - whole conversations, never a
+# row shared between the parts - so nothing trained on is measured on. Random gives the training rows in a new order
+# every epoch, shuffled by a generator of its own; At gives rows in the file's order, the same every pass. Where the
+# reading stands (the epoch, the place in it, the generator's state when the epoch was shuffled) goes into a checkpoint
+# (Save, Load), so a resumed run reads the rows it would have read.
+
+import "std/json"
+import "std/os"
+import "std/rand"
+import "../io/checkpoint"
+import "../llm/bpe"
+
+type ChatError error {
+    Shape(line I64)     # a line that is neither shape, a message without its role or text, or a role not known
+    Empty               # no conversation left with anything to train
+    Position            # a checkpoint's reading position that does not fit these rows
+}
+
+type Speaker enum {
+    System
+    User
+    Assistant
+}
+
+type Message struct(Who Speaker, Content String&) {
+    Who
+    Content
+}
+
+# ---- reading a line ----
+
+fn Speaker.Named(name String&, line I64) Speaker ? ChatError {
+    return match name {
+        case "system": Speaker.System
+        case "user", "human": Speaker.User
+        case "assistant", "gpt": Speaker.Assistant
+        case _: error ChatError.Shape(line)
+    }
+}
+
+# the messages of one line (counted from 1, for the error) of a JSON-lines file
+fn Parse(text String&, line I64) Array<Message> ? ChatError {
+    doc :~ try json.Json.Parse(text) catch { error ChatError.Shape(line) }
+    openAi := doc.Has("messages")
+    if not openAi and not doc.Has("conversations"): error ChatError.Shape(line)
+    items :~ try (try doc["messages" if openAi else "conversations"] catch { error ChatError.Shape(line) }).AsArr() catch { error ChatError.Shape(line) }
+    roleKey := "role" if openAi else "from"
+    textKey := "content" if openAi else "value"
+    out := Vec<Message>()
+    for m in items {
+        role :~ try (try m[roleKey] catch { error ChatError.Shape(line) }).AsStr() catch { error ChatError.Shape(line) }
+        body :~ try m[textKey] catch { error ChatError.Shape(line) }
+        content :~ "" if body.IsNull() else try body.AsStr() catch { error ChatError.Shape(line) }
+        out.Push(Message(try Speaker.Named(role, line), content))
+    }
+    return out.ToArray()
+}
+
+# ---- rendering ----
+
+# a conversation's text through Qwen3's template, and the stretches of it trained on: [Spans[2k], Spans[2k + 1])
+type Rendered struct(Text String, Spans Array<I64>) {
+    Text
+    Spans
+}
+
+fn roleName(s Speaker) String& {
+    return match s {
+        case Speaker.System: "system"
+        case Speaker.User: "user"
+        case Speaker.Assistant: "assistant"
+    }
+}
+
+fn trimNewlines(t String&) String& {
+    a I64 = 0
+    b := t.Len()
+    for a < b and t[a] == '\n': a++
+    for b > a and t[b - 1] == '\n': b--
+    return t[a:b]
+}
+
+fn Rendered.Of(msgs Array<Message>&) Rendered {
+    lastUser I64 = -1
+    for i, m in msgs {
+        if m.Who == Speaker.User: lastUser = i
+    }
+    sb := StringBuilder()
+    spans := Vec<I64>()
+    for i, m in msgs {
+        sb.Push("<|im_start|>" + roleName(m.Who) + "\n")
+        if m.Who != Speaker.Assistant {
+            sb.Push(m.Content + "<|im_end|>\n")
+            continue
+        }
+        reasoning String& = ""
+        answer String& = m.Content
+        cut := try m.Content.FindLast("</think>") catch default -1
+        if cut >= 0 {
+            head :~ m.Content[:cut]
+            opened := try head.FindLast("<think>") catch default -1
+            reasoning ~ trimNewlines(head[opened + 7:] if opened >= 0 else head)
+            answer ~ m.Content[cut + 8:].TrimStart()
+        }
+        if i > lastUser and i == msgs.Len() - 1 and reasoning.Len() == 0: sb.Push("<think>\n\n</think>\n\n")
+        spans.Push(sb.Len())
+        if i > lastUser and reasoning.Len() > 0: sb.Push("<think>\n" + reasoning + "\n</think>\n\n")
+        sb.Push(answer + "<|im_end|>")
+        spans.Push(sb.Len())
+        sb.Push("\n")
+    }
+    return Rendered(sb.ToString(), spans.ToArray())
+}
+
+# ---- tokens ----
+
+# a conversation's tokens and, for each, whether it is trained on
+type Example struct(Ids Array<I32>, Trained Array<Bool>) {
+    Ids
+    Trained
+}
+
+fn Example.Of(t bpe.Bpe&, r Rendered&) Example {
+    ids := t.Encode(r.Text)
+    trained := Array<Bool>(ids.Len())
+    at I64 = 0
+    k I64 = 0
+    for i, id in ids {
+        for k < r.Spans.Len() and r.Spans[k + 1] <= at: k += 2
+        trained[i] = k < r.Spans.Len() and r.Spans[k] <= at
+        at += t.Token(I64(id)).Len()
+    }
+    return Example(ids, trained)
+}
+
+# ---- rows ----
+
+# the rows of one part of the file: Rows rows of Ctx inputs (Tokens) and their classes (Targets), and where the reading
+# stands - the generator's state when this epoch was shuffled, the epoch, the place in it
+type ChatRows struct(Tokens Array<I32>&, Targets Array<I32>&, Ctx I64, seed U64 = 1) {
+    Tokens
+    Targets
+    Ctx
+    Rows I64 = Tokens.Len() / Ctx
+    Epoch I64 = 0                       # the epochs begun: the first Random begins the first
+    Cursor I64 = Rows
+    rng rand.Rand = rand.Rand(seed)
+    shuffled Array<U64> = rng.State()   # the generator's state before this epoch's shuffle
+    order Array<I64> = Array<I64>(Rows)
+}
+
+# the rows' entries that are trained on (a class that is not -1)
+fn (d ChatRows&) Trained() I64 {
+    n I64 = 0
+    for c in d.Targets {
+        if c >= 0: n++
+    }
+    return n
+}
+
+fn (d mut ChatRows&) shuffle() {
+    for i in range d.Rows: d.order[i] = i
+    d.rng.Shuffle(d.order)
+    d.Cursor = 0
+}
+
+fn (d ChatRows&) copy(row I64, b I64, tokens mut Array<I32>&, targets mut Array<I32>&) {
+    for t in range d.Ctx {
+        tokens[b * d.Ctx + t] = d.Tokens[row * d.Ctx + t]
+        targets[b * d.Ctx + t] = d.Targets[row * d.Ctx + t]
+    }
+}
+
+# the next B rows of this epoch's order into tokens and targets; a new epoch, in a new order, where this one runs out
+fn (d mut ChatRows&) Random(tokens mut Array<I32>&, targets mut Array<I32>&, B I64) {
+    for b in range B {
+        if d.Cursor == d.Rows {
+            d.Epoch++
+            d.shuffled = d.rng.State()
+            d.shuffle()
+        }
+        d.copy(d.order[d.Cursor], b, tokens, targets)
+        d.Cursor++
+    }
+}
+
+# rows first ... first + B - 1 in the file's order; gives how many there were (fewer at the end)
+fn (d ChatRows&) At(first I64, tokens mut Array<I32>&, targets mut Array<I32>&, B I64) I64 {
+    n := B.Min(d.Rows - first).Max(0)
+    for b in range n: d.copy(first + b, b, tokens, targets)
+    return n
+}
+
+# where the reading stands, into a checkpoint's metadata under "prefix"
+fn (d ChatRows&) Save(w mut checkpoint.Writer&, prefix String& = "data") {
+    w.Meta(prefix + ".rows", $d.Rows)
+    w.Meta(prefix + ".epoch", $d.Epoch)
+    w.Meta(prefix + ".cursor", $d.Cursor)
+    w.Meta(prefix + ".state", [$s for s in d.shuffled].Join(" "))
+}
+
+fn meta(f checkpoint.File&, key String&) String& ? ChatError {
+    return try f.Meta.Get(key) catch { error ChatError.Position }
+}
+
+# the reading put back where a checkpoint's Save left it: the same epoch's order, the same place in it
+fn (d mut ChatRows&) Load(f checkpoint.File&, prefix String& = "data") ? ChatError {
+    rows := try (try meta(f, prefix + ".rows")).ParseInt() catch { error ChatError.Position }
+    epoch := try (try meta(f, prefix + ".epoch")).ParseInt() catch { error ChatError.Position }
+    cursor := try (try meta(f, prefix + ".cursor")).ParseInt() catch { error ChatError.Position }
+    words :~ (try meta(f, prefix + ".state")).Split(" ")
+    if rows != d.Rows or cursor < 0 or cursor > rows or words.Len() != 4: error ChatError.Position
+    state := Array<U64>(4)
+    for i in range 4: state[i] = try words[i].ParseUint() catch { error ChatError.Position }
+    try d.rng.SetState(state) catch { error ChatError.Position }
+    d.shuffled = state
+    if epoch > 0: d.shuffle()
+    d.Epoch = epoch
+    d.Cursor = cursor
+}
+
+# rows of ctx (input, class) pairs, being filled: packed or one conversation a row
+type packer struct(ctx I64, pack Bool, pad I32) {
+    ctx
+    pack
+    pad
+    tokens Vec<I32> = Vec<I32>()
+    targets Vec<I32> = Vec<I32>()
+    used I64 = 0                        # pairs in the last row
+    Dropped I64 = 0
+}
+
+fn (p mut packer&) close() {
+    if p.used == 0: return
+    for _ in range p.used, p.ctx {
+        p.tokens.Push(p.pad)
+        p.targets.Push(-1)
+    }
+    p.used = 0
+}
+
+fn (p mut packer&) add(e Example&) {
+    pairs := (e.Ids.Len() - 1).Min(p.ctx)
+    some := false
+    for i in range pairs {
+        if e.Trained[i + 1]: some = true
+    }
+    if pairs <= 0 or not some {
+        p.Dropped++
+        return
+    }
+    if not p.pack or p.used + pairs > p.ctx: p.close()
+    for i in range pairs {
+        p.tokens.Push(e.Ids[i])
+        p.targets.Push(e.Ids[i + 1] if e.Trained[i + 1] else -1)
+    }
+    p.used += pairs
+}
+
+# a file's two parts, and the conversations dropped (nothing left to train after the cut to the context)
+type ChatData struct(Train ChatRows, Valid ChatRows, Dropped I64) {
+    Train
+    Valid
+    Dropped
+}
+
+# the JSON-lines file "path" as rows of ctx through tokenizer t: a share "valid" of its conversations, drawn by "seed",
+# held out for validation (at least one when the share is not 0 and there are two); packed or padded
+fn ChatData.Load(path String&, t bpe.Bpe&, ctx I64, valid F64 = 0.05, seed U64 = 1, pack Bool = true) ChatData ? ChatError, os.Error {
+    text :~ try os.ReadFile(path)
+    return try ChatData.Read(text, t, ctx, valid, seed, pack)
+}
+
+# ChatData.Load, of the file's text
+fn ChatData.Read(text String&, t bpe.Bpe&, ctx I64, valid F64 = 0.05, seed U64 = 1, pack Bool = true) ChatData ? ChatError {
+    lines := Vec<I64>()                 # the numbers of the lines that hold something, from 1
+    all :~ text.Split("\n")
+    for i, l in all {
+        if l.Trim().Len() > 0: lines.Push(i + 1)
+    }
+    n := lines.Len()
+    held := I64((F64(n) * valid).Ceil()) if valid > 0.0 and n >= 2 else 0
+    held = held.Min(n - 1).Max(0)
+    picks := Array<I64>[i for i in range n]
+    split := rand.Rand(seed ^ 0x5D1C0FFEE)
+    split.Shuffle(picks)
+    isValid := Array<Bool>(n)
+    for k in range held: isValid[picks[k]] = true
+    pad := t.Find("<|endoftext|>").Max(0)
+    tr := packer(ctx, pack, pad)
+    va := packer(ctx, pack, pad)
+    for k in range n {
+        msgs := try Parse(all[lines[k] - 1], lines[k])
+        e := Example.Of(t, Rendered.Of(msgs))
+        if isValid[k] { va.add(e) } else { tr.add(e) }
+    }
+    tr.close()
+    va.close()
+    if tr.tokens.Len() == 0: error ChatError.Empty
+    return ChatData(ChatRows(tr.tokens.ToArray(), tr.targets.ToArray(), ctx, seed)
+        ChatRows(va.tokens.ToArray(), va.targets.ToArray(), ctx, seed), tr.Dropped + va.Dropped)
+}
+
+# ---- tests ----
+
+# a byte-level tokenizer.json for tests and examples: the 256 bytes in GPT-2's printable form, a few merges, and Qwen's added tokens
+fn TinyTokenizer() String {
+    sb := StringBuilder()
+    sb.Push("{\"model\": {\"type\": \"BPE\", \"vocab\": {")
+    n I64 = 0
+    for b in range 256 {
+        cp := b
+        if not ((b >= 33 and b <= 126) or (b >= 161 and b <= 172) or b >= 174) {
+            cp = 256 + n
+            n++
+        }
+        if b > 0: sb.Push(", ")
+        sb.Push("\"")
+        if cp == 34 or cp == 92: sb.PushChar('\\')
+        if cp < 128 {
+            sb.PushChar(Char(U8(cp)))
+        } else {
+            sb.PushChar(Char(U8(192 | (cp >> 6))))
+            sb.PushChar(Char(U8(128 | (cp & 63))))
+        }
+        sb.Push("\": " + $b)
+    }
+    sb.Push(", \"he\": 256, \"ll\": 257, \"hell\": 258, \"hello\": 259}, \"merges\": [\"h e\", \"l l\", \"he ll\", \"hell o\"]},")
+    sb.Push(" \"added_tokens\": [{\"id\": 260, \"content\": \"<|endoftext|>\"}, {\"id\": 261, \"content\": \"<|im_start|>\"},")
+    sb.Push(" {\"id\": 262, \"content\": \"<|im_end|>\"}, {\"id\": 263, \"content\": \"<think>\"}, {\"id\": 264, \"content\": \"</think>\"}]}")
+    return sb.ToString()
+}
+
+fn tok() bpe.Bpe { return try bpe.Bpe.Parse(TinyTokenizer()) catch { unreachable } }
+
+# the trained text of an example: its trained tokens decoded, and "|" between stretches
+fn trainedText(t bpe.Bpe&, e Example&) String {
+    sb := StringBuilder()
+    for i, id in e.Ids {
+        if e.Trained[i] { sb.Push(t.Token(I64(id))) } else if i > 0 and e.Trained[i - 1] { sb.Push("|") }
+    }
+    return sb.ToString()
+}
+
+fn parseFails(line String&) String {
+    msgs := try Parse(line, 7) catch e { return $e }
+    return $msgs.Len()
+}
+
+fn readFails(text String&, t bpe.Bpe&, ctx I64) String {
+    d := try ChatData.Read(text, t, ctx, 0.0, 3) catch e { return $e }
+    return $d.Train.Rows
+}
+
+test Parse "the OpenAI and ShareGPT shapes read alike; a bad line names itself" {
+    a := try Parse("{\"messages\": [{\"role\": \"user\", \"content\": \"hi\"}, {\"role\": \"assistant\", \"content\": \"hello\"}]}", 1)
+    b := try Parse("{\"conversations\": [{\"from\": \"human\", \"value\": \"hi\"}, {\"from\": \"gpt\", \"value\": \"hello\"}]}", 2)
+    assert a.Len() == 2 and b.Len() == 2
+    for i in range 2: assert a[i].Who == b[i].Who and a[i].Content == b[i].Content
+    assert a[1].Who == Speaker.Assistant
+    assert parseFails("{\"messages\": [{\"role\": \"robot\", \"content\": \"x\"}]}") == "ChatError.Shape(7)"
+    assert parseFails("{\"text\": \"x\"}") == "ChatError.Shape(7)"
+}
+
+test Rendered.Of "Qwen3's template: earlier reasoning dropped, the last answer opened by an empty think block, only the assistant trained" {
+    msgs := Array<Message>[Message(Speaker.System, "be brief"), Message(Speaker.User, "a")
+        Message(Speaker.Assistant, "<think>\nmull\n</think>\n\nb"), Message(Speaker.User, "c"), Message(Speaker.Assistant, "hello")]
+    r := Rendered.Of(msgs)
+    want := "<|im_start|>system\nbe brief<|im_end|>\n<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\nb<|im_end|>\n" +
+        "<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nhello<|im_end|>\n"
+    assert r.Text == want, r.Text
+    t := tok()
+    e := Example.Of(t, r)
+    assert (try t.Decode(e.Ids)) == want
+    assert trainedText(t, e) == "b<|im_end|>|hello<|im_end|>|", trainedText(t, e)
+    # the last turn's reasoning after the last user turn is kept and trained
+    k := Rendered.Of(Array<Message>[Message(Speaker.User, "q"), Message(Speaker.Assistant, "<think>why</think>hello")])
+    assert k.Text == "<|im_start|>user\nq<|im_end|>\n<|im_start|>assistant\n<think>\nwhy\n</think>\n\nhello<|im_end|>\n", k.Text
+    assert trainedText(t, Example.Of(t, k)) == "<think>\nwhy\n</think>\n\nhello<|im_end|>|"
+}
+
+# the hand-written conversations of the tests: 20, both shapes, a blank line among them
+Sample := "data/testdata/chat.jsonl"
+
+fn sample() String { return try os.ReadFile(Sample) catch { unreachable } }
+
+test ChatData.Read "rows of the context, classes only on assistant tokens, a validation part of whole conversations never trained on" {
+    t := tok()
+    s := try ChatData.Read(sample(), t, 64, 0.2, 3)
+    assert s.Train.Rows > 0 and s.Valid.Rows > 0 and s.Dropped == 0
+    assert s.Train.Tokens.Len() == s.Train.Rows * 64 and s.Train.Targets.Len() == s.Train.Tokens.Len()
+    # every class is -1 or the next token, and the trained ones are the answers' and <|im_end|>
+    end := t.Find("<|im_end|>")
+    ends I64 = 0
+    for part in [s.Train, s.Valid] {
+        for i in range part.Tokens.Len() - 1 {
+            c := part.Targets[i]
+            if c >= 0 and (i + 1) % 64 != 0: assert c == part.Tokens[i + 1]
+            if c == end: ends++
+        }
+    }
+    assert ends == 20, "one trained <|im_end|> per conversation, " + $ends
+    # padded: one conversation a row, 4 held out of 20
+    p := try ChatData.Read(sample(), t, 64, 0.2, 3, false)
+    assert p.Train.Rows == 16 and p.Valid.Rows == 4
+    # no conversation is in both parts
+    for v in range p.Valid.Rows {
+        for r in range p.Train.Rows: assert p.Valid.Tokens[v * 64:(v + 1) * 64] != p.Train.Tokens[r * 64:(r + 1) * 64]
+    }
+    # the split is the seed's, and another seed's differs
+    q := try ChatData.Read(sample(), t, 64, 0.2, 4, false)
+    assert p.Valid.Tokens == (try ChatData.Read(sample(), t, 64, 0.2, 3, false)).Valid.Tokens
+    assert p.Valid.Tokens != q.Valid.Tokens
+    # a context too short for any answer: everything dropped
+    assert readFails(sample(), t, 4) == "ChatError.Empty"
+}
+
+test ChatRows "Random walks every row once an epoch in a seeded order; Save and Load resume it exactly" {
+    t := tok()
+    s := try ChatData.Load(Sample, t, 64, 0.0, 9, false)
+    d := s.Train
+    assert d.Rows == 20
+    x := Array<I32>(4 * 64)
+    y := Array<I32>(4 * 64)
+    seen := Array<I64>(20)
+    for _ in range 5 {
+        d.Random(x, y, 4)
+        for b in range 4 {
+            for r in range 20 {
+                if d.Tokens[r * 64:(r + 1) * 64] == x[b * 64:(b + 1) * 64]: seen[r]++
+            }
+        }
+    }
+    for r in range 20: assert seen[r] == 1, "row " + $r + " seen " + $seen[r]
+    d.Random(x, y, 3)                   # into the second epoch
+    try os.MkDirAll("build/chatdata_test")
+    w := checkpoint.Writer()
+    w.Meta("step", "1")
+    d.Save(w)
+    try w.Save("build/chatdata_test/pos.ckpt")
+    after := Array<I32>(4 * 64)
+    for _ in range 6: d.Random(after, y, 4)
+    e := try ChatData.Read(sample(), t, 64, 0.0, 9, false)
+    resumed := e.Train
+    try resumed.Load(try checkpoint.File.Load("build/chatdata_test/pos.ckpt"))
+    again := Array<I32>(4 * 64)
+    for _ in range 6: resumed.Random(again, y, 4)
+    assert again == after and resumed.Epoch == d.Epoch and resumed.Cursor == d.Cursor
+}
