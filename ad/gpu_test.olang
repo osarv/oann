@@ -20,6 +20,7 @@ import "../llm/model"
 import "std/os"
 import "../nn/optim"
 import "../nn/train"
+import "../nn/layers"
 import "../tensor"
 import "std/rand"
 
@@ -931,3 +932,82 @@ fn refused() ? {
 }
 
 test refused "a part with no GPU form is refused at Plan by name, and nothing is planned on the device" { try refused() }
+
+# ---- large vocabularies: the chunked loss and checkpointed blocks ----
+
+# a rotary, gated, RMS-normalized transformer on g, its loss chunked over a vocabulary of 300 in chunks of 64 (the last
+# 44 wide), each block recomputed where checkpoint
+fn bigVocabLm<T>(g mut graph.Graph<T>&, checkpoint Bool) graph.Var, graph.Var, graph.Var {
+    tok := g.Tokens(8)
+    y := g.Classes(8)
+    t := layers.Transformer.New(g, 300, 8, 16, 2, 3, true, 0.0, true, true, true)
+    return tok, y, t.Loss(g, tok, y, 64, checkpoint)
+}
+
+fn feedVocab<T>(g mut graph.Graph<T>&, tok graph.Var, y graph.Var, seed U64) {
+    r := rand.Rand(seed)
+    t :~ g.Ints(tok).Flat()!
+    c :~ g.Ints(y).Flat()!
+    for i in range t.Len(): t[i] = I32(r.Below(300))
+    for i in range c.Len(): c[i] = I32(-1) if i % 7 == 2 else I32(r.Below(300))
+}
+
+fn bigVocabCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("ChunkedCE and Recompute")
+        return
+    }
+    cpu := graph.Graph<F32>(4)
+    ct, cy, cl := bigVocabLm(cpu, false)
+    gpu := graph.Graph<F32>(4)
+    gt, gy, gl := bigVocabLm(gpu, true)
+    plain := graph.Graph<F32>(4)
+    pt, py, pl := bigVocabLm(plain, false)
+    try cpu.Plan(rand.Rand(5), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    try plain.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    assert gpu.ActivationSize < plain.ActivationSize
+    for n in Array<I64>[4, 3] {
+        feedVocab(cpu, ct, cy, U64(n))
+        feedVocab(gpu, gt, gy, U64(n))
+        feedVocab(plain, pt, py, U64(n))
+        cpu.Forward(n)
+        cpu.Backward(cl)
+        gpu.Forward(n)
+        gpu.Backward(gl)
+        plain.Forward(n)
+        plain.Backward(pl)
+        lc := cpu.Scalar(cl)
+        lg := gpu.Scalar(gl)
+        assert (lc - lg).Abs() <= 1.0e-4 * (1.0 + lc), "the loss " + $lg + " against the CPU's " + $lc
+        wg, bg := worst(gpu.ParamGrads().Flat()!, cpu.ParamGrads().Flat()!)
+        assert wg <= 1.0e-3 * (1.0 + bg), "the gradients differ by " + $wg + " of " + $bg + " at " + $n
+        # the checkpointed graph on the device is the plain one's bit for bit
+        assert lg == plain.Scalar(pl) and gpu.ParamGrads() == plain.ParamGrads(), "checkpointed against plain at " + $n
+    }
+    # a whole step as a CUDA graph (Train) recomputes too, and learns
+    og := try optim.GpuAdamW<F32>.For(gpu, rate = 0.01) catch { unreachable }
+    first := gpu.Scalar(gl)
+    for _ in range 8: og.Train(gl, 4, 1.0)
+    assert gpu.Scalar(gl) < first, "no learning: " + $first + " to " + $gpu.Scalar(gl)
+    # BF16: within BF16's rounding of the CPU's BF16 graph
+    cb := graph.Graph<BF16>(4)
+    bt, by, bl := bigVocabLm(cb, true)
+    gb := graph.Graph<BF16>(4)
+    ht, hy, hl := bigVocabLm(gb, true)
+    try cb.Plan(rand.Rand(5), device.Backend.Cpu) catch { unreachable }
+    try gb.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    feedVocab(cb, bt, by, 1)
+    feedVocab(gb, ht, hy, 1)
+    cb.Forward(4)
+    cb.Backward(bl)
+    gb.Forward(4)
+    gb.Backward(hl)
+    lc := cb.Scalar(bl)
+    lg := gb.Scalar(hl)
+    assert (lc - lg).Abs() <= 2.0e-2 * (1.0 + lc), "BF16: the loss " + $lg + " against the CPU's " + $lc
+    wb, bb := worstB(gb.ParamGrads(), cb.ParamGrads())
+    assert wb <= 5.0e-2 * (1.0 + bb), "BF16: the gradients differ by " + $wb + " of " + $bb
+}
+
+test bigVocabCase "ChunkedCE and checkpointed blocks on the GPU: within rounding of the CPU's (F32 and BF16), checkpointed equal to plain bit for bit, a short batch, and Train as a CUDA graph learns" { bigVocabCase() }

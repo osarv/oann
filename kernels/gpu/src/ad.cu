@@ -482,6 +482,46 @@ extern "C" __global__ void oann_ad_ce_grad(store *dz, const store *probs, const 
     }
 }
 
+// ---- cross entropy over a large vocabulary, a chunk at a time (ad/ops' ChunkedCE) ----
+
+// a chunk of c logits (columns v0 ...) folded into each row's running maximum and sum: state holds the maximum, the
+// sum and the class's logit, stride apart; the last chunk leaves the row's log-sum-exp in state[r] and its loss in
+// rowloss[r] (0 for an ignored row), which oann_ad_ce_total sums
+extern "C" __global__ void oann_ad_cce_rows(double *state, double *rowloss, const store *z, const int *classes, long long stride, long long c, long long v0, long long last) {
+    long long r = blockIdx.x;
+    const store *zr = z + r * c;
+    real top = zr[0];
+    for (long long j = threadIdx.x; j < c; j += blockDim.x) top = zr[j] > top ? (real)zr[j] : top;
+    top = oann_bmax(top);
+    double m = (double)top;
+    if (v0 > 0 && state[r] > m) m = state[r];
+    real s = (real)0;
+    for (long long j = threadIdx.x; j < c; j += blockDim.x) s += oann_exp((real)zr[j] - (real)m);
+    s = oann_bsum(s);
+    if (threadIdx.x != 0) return;
+    double sum = (double)s + (v0 > 0 ? state[stride + r] * exp(state[r] - m) : 0.0);
+    state[r] = m;
+    state[stride + r] = sum;
+    long long k = classes[r], cl = k - v0;
+    if (cl >= 0 && cl < c) state[2 * stride + r] = (double)(real)zr[cl];
+    if (!last) return;
+    state[r] = m + log(sum);
+    rowloss[r] = k < 0 ? 0.0 : state[r] - state[2 * stride + r];
+}
+
+// a chunk's logits (columns v0 ...) made their gradient in place: dloss (exp(z - lse) - onehot(class)) / counted, zero
+// for an ignored row; dloss = dy[0], counted = stats[1] (oann_ad_ce_total's)
+extern "C" __global__ void oann_ad_cce_grad(store *z, const double *state, const int *classes, const store *dloss, const double *stats, long long n, long long c, long long v0) {
+    real counted = (real)stats[1];
+    real k = (real)dloss[0] / (counted > (real)0 ? counted : (real)1);
+    OANN_LOOP(i, n) {
+        long long r = i / c, j = i % c;
+        long long cl = classes[r];
+        real v = cl < 0 ? (real)0 : k * (oann_exp((real)z[i] - (real)state[r]) - (v0 + j == cl ? (real)1.0 : (real)0.0));
+        z[i] = v;
+    }
+}
+
 // the mean of (a - b)^2 in double by one block; stats[0] = it; value = it in real
 extern "C" __global__ void oann_ad_mse(double *stats, store *value, const store *a, const store *b, long long n) {
     double s = 0.0;
