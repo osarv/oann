@@ -1,0 +1,102 @@
+# QLoRA fine-tuning of a Qwen3 (or Qwen2) checkpoint on a JSON-lines file of chat conversations (nn/qlora): the model's
+# projections in 4-bit NF4, LoRA adapters trained, the loss chunked over the vocabulary, blocks recomputed; on the GPU
+# where there is one. Arguments: the model's directory (config.json, tokenizer.json, the safetensors), the training file
+# and the output directory, then options as "-name value":
+#   -rank 16 -alpha 32 -targets q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj -lr 2e-4 -warmup 0
+#   -steps 0 (0: -epochs 1) -ctx 1024 -batch 1 -accum 1 -nf4 on -recompute on -chunk 8192 -valid 0.05 -evalevery 50
+#   -evalbatches 8 -every 10 -ckptevery 50 -seed 1 -merge DIR -device auto|cpu|gpu -bf16 auto|on|off -budget 8192
+#   -clip 1.0 -stop 0
+# Run the same command again after an interruption and it carries on from OUT/run.ckpt. With -plan alone (no training
+# file read; the model's directory needs only config.json) it prints what the run would take on the CPU and the GPU:
+#   make qlora ARGS="/home/user/data/qwen3-0.6b chat.jsonl build/qlora_out -steps 100 -ctx 512"
+#   make qlora ARGS="/home/user/data/qwen3-0.6b - - -plan -ctx 1024 -rank 16"
+
+import "std/os"
+import "../kernels/device"
+import "../llm/model"
+import "../models/qwen"
+import "../nn/lora"
+import "../nn/qlora"
+
+type ArgError error {
+    Usage(what String)
+}
+
+fn on(line String&) { Println(line) }
+
+fn flag(v String&) Bool ? ArgError {
+    if v == "on" or v == "true" or v == "1": return true
+    if v == "off" or v == "false" or v == "0": return false
+    error ArgError.Usage("on or off, not " + v)
+}
+
+# o with the option "-name value" set
+fn set(o mut qlora.Options&, name String&, v String&) ? ArgError, ParseError {
+    match name {
+        case "-rank": o.Rank = try v.ParseInt()
+        case "-alpha": o.Alpha = try v.ParseFloat()
+        case "-targets": o.Targets = Array<String>[$t for t in v.Split(",")]
+        case "-lr": o.Rate = try v.ParseFloat()
+        case "-warmup": o.Warmup = try v.ParseInt()
+        case "-steps": o.Steps = try v.ParseInt()
+        case "-epochs": o.Epochs = try v.ParseFloat()
+        case "-ctx": o.Ctx = try v.ParseInt()
+        case "-batch": o.Batch = try v.ParseInt()
+        case "-accum": o.Accum = try v.ParseInt()
+        case "-nf4": o.Nf4 = try flag(v)
+        case "-recompute": o.Recompute = try flag(v)
+        case "-chunk": o.Chunk = try v.ParseInt()
+        case "-valid": o.Valid = try v.ParseFloat()
+        case "-evalevery": o.EvalEvery = try v.ParseInt()
+        case "-evalbatches": o.EvalBatches = try v.ParseInt()
+        case "-every": o.Every = try v.ParseInt()
+        case "-ckptevery": o.CheckpointEvery = try v.ParseInt()
+        case "-seed": o.Seed = try v.ParseInt()
+        case "-merge": o.Merge = $v
+        case "-device": o.Device = $v
+        case "-bf16": o.Bf16 = $v
+        case "-budget": o.Budget = try v.ParseInt()
+        case "-clip": o.Clip = try v.ParseFloat()
+        case "-stop": o.Stop = try v.ParseInt()
+        case _: error ArgError.Usage("no option " + name)
+    }
+}
+
+# what the run would take, BF16 on the GPU and F32 on the CPU
+fn plan(o qlora.Options&) ? {
+    c := try model.Config.Parse(try os.ReadFile(o.Model + "/config.json"))
+    lc := lora.Config(o.Rank, o.Alpha, o.Targets)
+    Println("context " + $o.Ctx + ", batch " + $o.Batch + ", rank " + $o.Rank + ", NF4 " + $o.Nf4 + ", recompute " + $o.Recompute + ", chunk " + $o.Chunk)
+    gpu := try qwen.Footprint.Of<BF16>(c, o.Ctx, o.Batch, o.Nf4, o.Recompute, o.Chunk, lc, device.Backend.Gpu)
+    cpu := try qwen.Footprint.Of<F32>(c, o.Ctx, o.Batch, o.Nf4, o.Recompute, o.Chunk, lc, device.Backend.Cpu)
+    show("GPU, BF16", gpu)
+    show("CPU, F32", cpu)
+}
+
+fn show(name String&, f qwen.Footprint&) {
+    Println(name + ": " + $qlora.Mb(f.Total) + " MB (arena " + $qlora.Mb(f.Arena) + ", NF4 weights " + $qlora.Mb(f.Quant) + ", moments " + $qlora.Mb(f.Moments) + "), " + $f.Params + " adapter parameters")
+}
+
+fn main() ? {
+    args :~ os.Args()
+    if args.Len() < 4: error ArgError.Usage("qlora MODEL TRAIN.jsonl OUT [-name value ...] [-plan]")
+    o := qlora.Options($args[1], $args[2], $args[3])
+    planOnly := false
+    i I64 = 4
+    for i < args.Len() {
+        if args[i] == "-plan" {
+            planOnly = true
+            i++
+            continue
+        }
+        if i + 1 >= args.Len(): error ArgError.Usage(args[i] + " needs a value")
+        try set(o, args[i], args[i + 1])
+        i += 2
+    }
+    if planOnly {
+        try plan(o)
+        return
+    }
+    r := try o.Run(on)
+    Println("done: " + $r.Steps + " steps, training loss " + $r.First + " -> " + $r.Last.Loss + ", validation " + $r.Last.Validation)
+}

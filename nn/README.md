@@ -37,6 +37,13 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   step; `Fit` runs, reports, measures validation and checkpoints - the parameters, the optimizer's moments, where the
   batch source stands (data/chat's `ChatRows.Save`) and the dropout generator - and resumes from its checkpoint when it
   exists, so running the same command again after an interruption carries on exactly.
+- `qlora.olang` - QLoRA on a Qwen3 or Qwen2 checkpoint: `qlora.Options(model, data, out, ...).Run(on)` builds
+  models/qwen with its projections in NF4, LoRA adapters (rank, alpha, targets), the loss by ChunkedCE and blocks
+  recomputed, fills it straight from the checkpoint (`FillFrom`), lays it out first and prints what it takes (refusing
+  a GPU run over `Budget` MB), reads chat JSONL through the model's tokenizer.json (data/chat, a validation share
+  carved off), trains by `tune.Fit` with a linear warmup and decay (resumable from OUT/run.ckpt; `Stop` ends early with
+  the checkpoint written), saves the adapter as PEFT does and merges it where asked. GPU where there is one (a BF16
+  graph, `optim.GpuAdamW`, whose moments a checkpoint holds), else the CPU in F32. `examples/qlora.olang`, `make qlora`.
 - `dist.olang` - one model trained by workers that share no network, only a store of named blobs: DiLoCo. Each worker
   trains its own copy for H steps with its own optimizer, `Sync` hands in its delta (global - local) and takes back the
   outer step the coordinator (worker 0) took on the average - Nesterov momentum, DiLoCo's 0.7 and 0.9. `Store` is the

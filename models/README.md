@@ -34,6 +34,17 @@ models/FILE.olang`; `make test` runs them all.
 random Qwen3-shaped checkpoint (tied and untied heads, fewer key-value heads than query heads, Qwen2's biases) through
 both `llm/model` and the graph, F32 and BF16; ad/gpu_test runs it on the GPU against the CPU.
 
+For QLoRA (nn/qlora): `Qwen.New(g, cfg, ctx, quantized, recompute)` makes the seven projections 4-bit NF4 weights
+(`g.NF4`, quantized from F32 as filled) and recomputes each block in the backward (`g.Recompute`); `q.Lm(g, true, chunk)`
+gives the loss by `g.ChunkedCE` over the final norm's output and the head (the embedding where tied), no logits.
+`q.FillFrom(g, dir)` reads the checkpoint's files (model.safetensors, or the shards model.safetensors.index.json names)
+straight into the graph a tensor at a time - Fill's numbers bit for bit, without llm/model's copy - so a model fills
+within its largest tensor in F32 beyond the graph. `Footprint.Of<T>(cfg, ctx, batch, quantized, recompute, chunk, lora,
+backend)` lays such a graph out without allocating and gives the arena, the NF4 weights and AdamW's moments in bytes
+(the arena equals what Plan allocates, tested). At context 1024, batch 1, rank 16 on every projection, NF4 and
+recompute, chunk 8192, it plans on the GPU (BF16) Qwen3-0.6B 921 MB, 1.7B 2008 MB, 4B 3829 MB (CUDA's own context and
+cuBLAS's workspace come on top).
+
 It is fine-tuned by LoRA (`nn/lora`): `s := q.AddLora(g, lora.Config(8, 16.0, ["q_proj", "v_proj"]))?`, before `Lm`,
 gives each projection named (q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj, as PEFT's target_modules
 name them) an adapter, y = W x + (alpha / r) B A x with A [r, in] uniform in +-1/sqrt(in) and B [out, r] zero - so the

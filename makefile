@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -153,6 +153,13 @@ bpelm:
 qwenlora:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_qwen_lora examples/qwen_lora.olang
 	$(GPUENV) ./build/examples_qwen_lora $(ARGS)
+
+# QLoRA fine-tuning of Qwen3 on chat conversations (examples/qlora.olang, nn/qlora; GPU where there is one) - ARGS: the
+# model's directory, the training JSONL, the output directory, then "-name value" options (-steps, -ctx, -rank, ...), or
+# -plan for what a run would take
+qlora:
+	$(OLANG) build $(GPUDEFINE) -output build/examples_qlora examples/qlora.olang
+	$(GPUENV) ./build/examples_qlora $(ARGS)
 
 # oann-listen: speech to text by a Whisper model (speech/listen.olang, speech/README.md), built to build/oann-listen -
 # ARGS: MODEL CLIP.wav and its flags (none: only builds it)
