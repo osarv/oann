@@ -265,6 +265,8 @@ if Gpu {
         g
         Rate F64 = rate
         S mut mirror.AdamW<T>?& = null
+        hostM mut Array<U8>& = Array<U8>(0)        # the moments' host copies, for a checkpoint
+        hostV mut Array<U8>& = Array<U8>(0)
     }
 
     fn GpuAdamW<T>.For(g mut graph.Graph<T>&, rate F64 = 0.001, beta1 F64 = 0.9, beta2 F64 = 0.999, eps F64 = 1e-8, decay F64 = 0.0) GpuAdamW<T> ? device.DeviceError {
@@ -274,11 +276,35 @@ if Gpu {
         for r in Spans(g) {
             for k in range r.Lo, r.Hi: mask[k] = 1 if r.Decay else 0
         }
-        o.S = try g.Mirror().AdamW(mask, rate, beta1, beta2, eps, decay) catch gdev.GpuError err { error device.DeviceError.Failed("AdamW's moments: " + $err) }
+        o.S ~ try g.Mirror().AdamW(mask, rate, beta1, beta2, eps, decay) catch gdev.GpuError err { error device.DeviceError.Failed("AdamW's moments: " + $err) }
+        o.hostM ~ Array<U8>(o.S!.M.N)
+        o.hostV ~ Array<U8>(o.S!.V.N)
         return o
     }
 
     fn (o mut GpuAdamW<T>&) SetRate(rate F64) { o.Rate = rate }
+
+    # the moments down into host copies and written as AdamW's Save writes them (bytes of the real type), with the step
+    # count, for a checkpoint; Load puts them back on the device
+    fn (o GpuAdamW<T>&) Save(w mut checkpoint.Writer&) ? checkpoint.SafetensorsError {
+        s := o.S!
+        s.M.DownloadAll(o.hostM)
+        s.V.DownloadAll(o.hostV)
+        o.g.Mirror().Sync()
+        try w.Add("adam.m", tensor.Tensor<U8>.Over(o.hostM, 0, o.hostM.Len())!)
+        try w.Add("adam.v", tensor.Tensor<U8>.Over(o.hostV, 0, o.hostV.Len())!)
+        w.Meta("adam.steps", $s.Steps)
+    }
+
+    fn (o mut GpuAdamW<T>&) Load(f checkpoint.File&) ? checkpoint.SafetensorsError, tensor.ShapeError {
+        try f.Read("adam.m", tensor.Tensor<U8>.Over(o.hostM, 0, o.hostM.Len())!)
+        try f.Read("adam.v", tensor.Tensor<U8>.Over(o.hostV, 0, o.hostV.Len())!)
+        s := o.S!
+        s.M.UploadAll(o.hostM)
+        s.V.UploadAll(o.hostV)
+        s.Steps = try steps(f, "adam.steps")
+        o.g.Mirror().Sync()
+    }
 
     fn (o mut GpuAdamW<T>&) Step() {
         o.S!.Rate = o.Rate
@@ -298,12 +324,12 @@ if Gpu {
     # second call of a (loss, n, clip) and replayed after it (GP7): the step's hundreds of launches become one. The
     # inputs go up first, outside the graph. The loss is read afterwards with g.Scalar as always
     fn (o mut GpuAdamW<T>&) Train(loss graph.Var, n I64, clip F64 = 0.0) {
-        g := o.g
+        g :~ o.g
         g.GpuFeed(n)
         o.S!.Rate = o.Rate
-        m := g.Mirror()
+        m :~ g.Mirror()
         m.AdamScalars(o.S!)
-        key := m.Key
+        key :~ m.Key
         key[0], key[1], key[2], key[3] = U64(loss), U64(n), clip.Bits(), U64(g.Pos)
         key[4], key[5], key[6], key[7] = 0, 0, 0, 0
         d := device.Opened!

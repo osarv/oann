@@ -10,12 +10,19 @@
 import "graph"
 import "mirror"
 import "../kernels/mat"
+import "../kernels/nf4"
 import "../kernels/elem"
 import "../kernels/device"
 import gdev "../kernels/gpu/device"
 import "../kernels/gpu/kern"
 import "../models/gpt"
+import "../models/qwen"
+import "../nn/lora"
+import "../llm/model"
+import "std/os"
 import "../nn/optim"
+import "../nn/train"
+import "../nn/layers"
 import "../tensor"
 import "std/rand"
 
@@ -128,7 +135,7 @@ fn softmaxCase(d mut gdev.Device&, k kern.Kit&, rows I64, cols I64, ctx I64, cau
     }
     bx := try up(d, x)
     by := try gdev.Buf<F32>.Make(d, rows * cols)
-    kern.LaunchKit(d, k, mirror.KSoftmax, rows, mirror.RowBlock(cols), by.Addr(0), bx.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)))
+    kern.LaunchKit(d, k, mirror.KSoftmax, rows, mirror.RowBlock(cols), by.Addr(0), bx.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(I64(0)), U64(0), kern.Arg(I64(1)))
     got := try down(d, by)
     w, big := worst(got, want)
     what := "softmax " + $rows + " x " + $cols + (" causal ctx " + $ctx if causal else "")
@@ -143,7 +150,7 @@ fn softmaxCase(d mut gdev.Device&, k kern.Kit&, rows I64, cols I64, ctx I64, cau
     }
     bdy := try up(d, dy)
     bdx := try gdev.Buf<F32>.Make(d, rows * cols)
-    kern.LaunchKit(d, k, mirror.KSoftmaxGrad, rows, mirror.RowBlock(cols), bdx.Addr(0), bdy.Addr(0), by.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(F32(1.0)), kern.Arg(I64(0)))
+    kern.LaunchKit(d, k, mirror.KSoftmaxGrad, rows, mirror.RowBlock(cols), bdx.Addr(0), bdy.Addr(0), by.Addr(0), kern.Arg(cols), kern.Arg(ctx), kern.Arg(I64(1 if causal else 0)), kern.Arg(I64(0)), U64(0), kern.Arg(I64(1)), kern.Arg(F32(1.0)), kern.Arg(I64(0)))
     gotG := try down(d, bdx)
     wg, bigG := worst(gotG, wantG)
     assert wg <= 1.0e-6 * (1.0 + bigG), what + " backward: " + $wg
@@ -266,7 +273,7 @@ fn adamKernel() ? {
     bv := try gdev.Buf<F32>.Make(d, n)
     bmask := try gdev.Buf<U8>.Make(d, n)
     bmask.UploadAll(mask)
-    bhp := try gdev.Buf<F32>.Make(d, 3)
+    bhp := try gdev.Buf<F64>.Make(d, 3)
     kern.Zero(d, bm.Addr(0), n * 4)
     kern.Zero(d, bv.Addr(0), n * 4)
     for step in range 1, 8 {
@@ -276,8 +283,8 @@ fn adamKernel() ? {
         bg.UploadAll(g)
         corr1 F64 = 1.0 - F64(0.9).Pow(F64(step))
         corr2 F64 = 1.0 - F64(0.999).Pow(F64(step))
-        bhp.UploadAll(Array<F32>[F32(1.0 - 0.01 * 0.1), F32(0.01 / corr1), F32(1.0 / corr2.Sqrt())])
-        kern.LaunchKit(d, k, mirror.KAdamW, kern.Blocks(n), kern.Block, bp.Addr(0), bg.Addr(0), bm.Addr(0), bv.Addr(0), bmask.Addr(0), kern.Arg(n), kern.Arg(F32(0.9)), kern.Arg(F32(0.999)), kern.Arg(F32(1.0 - 0.9)), kern.Arg(F32(1.0 - 0.999))
+        bhp.UploadAll(Array<F64>[1.0 - 0.01 * 0.1, 0.01 / corr1, 1.0 / corr2.Sqrt()])
+        kern.LaunchKit(d, k, mirror.KAdamW, kern.Blocks(n), kern.Block, bp.Addr(0), bp.Addr(0), bg.Addr(0), bm.Addr(0), bv.Addr(0), bmask.Addr(0), kern.Arg(n), kern.Arg(F32(0.9)), kern.Arg(F32(0.999)), kern.Arg(F32(1.0 - 0.9)), kern.Arg(F32(1.0 - 0.999))
             bhp.Addr(0), kern.Arg(F32(1e-8)))
         got := try down(d, bp)
         want := cp.Flat()!
@@ -290,12 +297,13 @@ test adamKernel "AdamW's kernel is nn/optim's step bit for bit, decay only where
 # ---- whole graphs ----
 
 # a network recorded on a graph: its handles
-type Net struct(x graph.Var, y graph.Var, logits graph.Var, loss graph.Var, tokens Bool) {
+type Net struct(x graph.Var, y graph.Var, logits graph.Var, loss graph.Var, tokens Bool, docs graph.Var = graph.None) {
     x
     y
     logits
     loss
     tokens
+    docs    # packed documents' starts (a Tokens input), or None
 }
 
 fn Net.mlp(g mut graph.Graph<F32>&) Net {
@@ -323,16 +331,28 @@ fn charlmOf(c gpt.GptConfig) fn&(g mut graph.Graph<F32>&) Net {
 # fills the batch of n entries the same on both graphs: tokens or inputs and classes from the seed
 fn feed(g mut graph.Graph<F32>&, net Net&, n I64, seed U64, classes I64) {
     r := rand.Rand(seed)
+    if net.docs != graph.None {
+        # each sequence cut into documents at positions drawn from the seed: each position's document start
+        ds :~ g.Ints(net.docs).Flat()!
+        ctx := g.Info(net.docs).Dims[1]
+        for b in range ds.Len() / ctx {
+            start I32 = 0
+            for i in range ctx {
+                if i > 0 and r.Below(4) == 0: start = I32(i)
+                ds[b * ctx + i] = start
+            }
+        }
+    }
     if net.tokens {
-        t := g.Ints(net.x).Flat()!
-        c := g.Ints(net.y).Flat()!
+        t :~ g.Ints(net.x).Flat()!
+        c :~ g.Ints(net.y).Flat()!
         for i in range t.Len() { t[i] = I32(r.Below(classes)) }
         for i in range c.Len() { c[i] = I32(r.Below(classes)) }
         return
     }
-    xs := g.Data(net.x).Flat()!
+    xs :~ g.Data(net.x).Flat()!
     for i in range xs.Len(): xs[i] = F32(r.Uniform(-1.0, 1.0))
-    ys := g.Ints(net.y).Flat()!
+    ys :~ g.Ints(net.y).Flat()!
     for i in range ys.Len(): ys[i] = I32(r.Below(classes))
 }
 
@@ -421,6 +441,191 @@ fn charlmCase() {
 
 test charlmCase "the character transformer on the GPU, its variants too: forward and backward within rounding of the CPU's, twice alike" { charlmCase() }
 
+# attention in a band: a sliding window of 3, packed documents causal, and packed documents both ways (an encoder's) -
+# token embeddings, one attention of 2 heads, the logits; ctx 12
+fn bandsOf(variant I64) fn&(g mut graph.Graph<F32>&) Net {
+    return fn(g mut graph.Graph<F32>&) Net {
+        t := g.Tokens(12)
+        y := g.Classes(12)
+        docs := graph.None if variant == 0 else g.Tokens(12)
+        e := g.Embedding(t, g.Param(graph.Init.Normal(0.0, 0.5), true, 9, 16))
+        q := g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16))
+        k := g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16))
+        v := g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16))
+        a := g.Attention(q, k, v, 2, variant != 2, 3 if variant == 0 else 0, docs)
+        logits := g.Linear(g.Add(a, e), g.Param(graph.Init.Normal(0.0, 0.3), true, 9, 16))
+        g.Keep(logits)
+        return Net(t, y, logits, g.CrossEntropy(logits, y), true, docs)
+    }
+}
+
+fn bandsCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("windowed and document attention")
+        return
+    }
+    for variant in range 3 {
+        cpu, gpu, net := pair(bandsOf(variant), 4, U64(variant) + 21)
+        for n in Array<I64>[4, 3] {
+            feed(cpu, net, n, U64(n) + 5, 9)
+            feed(gpu, net, n, U64(n) + 5, 9)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 5.0e-4, "attention band " + $variant + " at " + $n)
+            first := Array<F32>[x for x in gpu.ParamGrads().Flat()!]
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            assert first == Array<F32>[x for x in gpu.ParamGrads().Flat()!], "attention band " + $variant + ": a second run differs"
+        }
+    }
+}
+
+test bandsCase "windowed attention and packed documents (causal, and both ways) on the GPU: within rounding of the CPU's, a short batch, twice alike" { bandsCase() }
+
+# rotary positions on q and k (base 10000, and 500), x + k, sqrt and log on the way, and stablemax cross entropy as the
+# loss - each against the CPU's, ctx 12, one in four classes ignored
+fn elemsOf(base F64) fn&(g mut graph.Graph<F32>&) Net {
+    return fn(g mut graph.Graph<F32>&) Net {
+        t := g.Tokens(12)
+        y := g.Classes(12)
+        e := g.Embedding(t, g.Param(graph.Init.Normal(0.0, 0.5), true, 9, 16))
+        q := g.Rope(g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16)), 2, base)
+        k := g.Rope(g.Linear(e, g.Param(graph.Init.Normal(0.0, 0.3), true, 16, 16)), 2, base)
+        a := g.Attention(q, k, e, 2, true)
+        sq := g.Sqrt(g.AddScalar(g.Mul(a, a), 0.5))
+        lg := g.Log(g.AddScalar(g.Mul(e, e), 1.0))
+        logits := g.Linear(g.Add(sq, lg), g.Param(graph.Init.Normal(0.0, 0.5), true, 9, 16))
+        g.Keep(logits)
+        return Net(t, y, logits, g.StablemaxCE(logits, y), true)
+    }
+}
+
+# every fourth class -1: ignored by the loss
+fn ignoreSome(g mut graph.Graph<F32>&, net Net&) {
+    ys :~ g.Ints(net.y).Flat()!
+    for i in range 0, ys.Len(), 4: ys[i] = -1
+}
+
+fn elemsCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("rope, sqrt, log, shift and stablemax")
+        return
+    }
+    for base in Array<F64>[10000.0, 500.0] {
+        cpu, gpu, net := pair(elemsOf(base), 4, 31)
+        for n in Array<I64>[4, 3] {
+            feed(cpu, net, n, U64(n) + 2, 9)
+            feed(gpu, net, n, U64(n) + 2, 9)
+            ignoreSome(cpu, net)
+            ignoreSome(gpu, net)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 5.0e-4, "rope and the element functions (base " + $base + ") at " + $n)
+        }
+    }
+}
+
+test elemsCase "rotary positions, AddScalar, Sqrt, Log and stablemax cross entropy (classes ignored too) on the GPU: within rounding of the CPU's, a short batch" { elemsCase() }
+
+# ---- BF16 graphs (mixed precision): the arena in BF16, every kernel computing in F32, F32 masters stepped on the device ----
+
+# the batch's tokens and targets from the seed, the same on any graph
+fn feedLm<T>(g mut graph.Graph<T>&, lm train.LanguageModel&, seed U64, vocab I64) {
+    r := rand.Rand(seed)
+    t :~ g.Ints(lm.Tokens).Flat()!
+    c :~ g.Ints(lm.Targets).Flat()!
+    for i in range t.Len(): t[i] = I32(r.Below(vocab))
+    for i in range c.Len(): c[i] = I32(r.Below(vocab))
+}
+
+# the largest |a - b| and |b| over two BF16 tensors' elements, in F64
+fn worstB(a tensor.Tensor<BF16>, b tensor.Tensor<BF16>) F64, F64 {
+    x :~ a.Flat()!
+    y :~ b.Flat()!
+    w F64 = 0.0
+    big F64 = 0.0
+    for i in range y.Len() {
+        w = w.Max((F64(x[i]) - F64(y[i])).Abs())
+        big = big.Max(F64(y[i]).Abs())
+    }
+    return w, big
+}
+
+fn bf16Case() {
+    if not device.GpuAvailable() {
+        gdev.Skip("BF16 graphs")
+        return
+    }
+    c := gpt.GptConfig.Variant(0)
+    cpu := graph.Graph<BF16>(4)
+    lm := gpt.Gpt.New(cpu, c).Lm(cpu)
+    gpu := graph.Graph<BF16>(4)
+    gpt.Gpt.New(gpu, c).Lm(gpu)
+    try cpu.Plan(rand.Rand(5), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    assert gpu.OnGpu and cpu.Masters() == gpu.Masters()
+    # one forward and backward: BF16's rounding (8 bits) differs where the sums' order does
+    feedLm(cpu, lm, 3, c.Vocab)
+    feedLm(gpu, lm, 3, c.Vocab)
+    cpu.Forward(4)
+    cpu.Backward(lm.Loss)
+    gpu.Forward(4)
+    gpu.Backward(lm.Loss)
+    lc := cpu.Scalar(lm.Loss)
+    lg := gpu.Scalar(lm.Loss)
+    assert (lc - lg).Abs() <= 2.0e-2 * (1.0 + lc.Abs()), "BF16: the loss " + $lg + " against the CPU's " + $lc
+    wg, bg := worstB(gpu.ParamGrads(), cpu.ParamGrads())
+    assert wg <= 5.0e-2 * (1.0 + bg), "BF16: the gradients differ by " + $wg + " of " + $bg
+    # training: the CPU's mixed AdamW on its masters against GpuAdamW on the device's, clipped, 15 steps
+    oc := optim.AdamW(cpu.Masters(), cpu.ParamGrads(), rate = 0.01, decay = 0.1, spans = optim.Spans(cpu))
+    og := try optim.GpuAdamW<BF16>.For(gpu, rate = 0.01, decay = 0.1) catch { unreachable }
+    first F64 = 0.0
+    last F64 = 0.0
+    for step in range 15 {
+        cpu.Forward(4)
+        cpu.Backward(lm.Loss)
+        optim.ClipNorm(cpu.ParamGrads(), 1.0)
+        oc.Step()
+        cpu.SyncParams()
+        gpu.Forward(4)
+        gpu.Backward(lm.Loss)
+        og.Clip(1.0)
+        og.Step()
+        lc2 := cpu.Scalar(lm.Loss)
+        lg2 := gpu.Scalar(lm.Loss)
+        assert (lc2 - lg2).Abs() <= 5.0e-2 * (1.0 + lc2), "BF16 step " + $step + ": the loss " + $lg2 + " against the CPU's " + $lc2
+        if step == 0: first = lg2
+        last = lg2
+    }
+    assert last < first, "BF16: no learning, " + $first + " to " + $last
+    # the masters read back, and the arena their rounding
+    mg :~ gpu.Masters().Flat()!
+    pg :~ gpu.Params().Flat()!
+    for i in range mg.Len(): assert pg[i] == BF16(mg[i]), "BF16: parameter " + $i + " is not its master rounded"
+    mc :~ cpu.Masters().Flat()!
+    # AdamW steps every weight by about the rate whatever its gradient's size, so a weight whose gradient is near zero
+    # steps by the sign of BF16's rounding noise and drifts apart (measured on the 4060: a few weights 0.1 apart after
+    # 15 steps at rate 0.01); the masters are compared as a whole, by the norm of their difference
+    d2 F64 = 0.0
+    n2 F64 = 0.0
+    for i in range mc.Len() {
+        d2 += (F64(mg[i]) - F64(mc[i])).Pow(2.0)
+        n2 += F64(mc[i]).Pow(2.0)
+    }
+    rel := (d2 / n2).Sqrt()
+    Println("BF16: the masters' difference after 15 steps, relative to their norm: " + $rel)
+    assert rel <= 5.0e-2, "BF16: the masters differ by " + $rel + " of their norm"
+    # Train (a whole step as a CUDA graph) runs a BF16 graph too, and learns on
+    for _ in range 5: og.Train(lm.Loss, 4, 1.0)
+    assert gpu.Scalar(lm.Loss) < first, "BF16: Train did not keep learning"
+}
+
+test bf16Case "a BF16 graph on the GPU: forward and backward within BF16's rounding of the CPU's BF16 graph, and trained by GpuAdamW on F32 masters as the CPU's mixed AdamW, then by Train" { bf16Case() }
+
 fn trained() {
     if not device.GpuAvailable() {
         gdev.Skip("training")
@@ -490,6 +695,228 @@ fn graphed() {
 }
 
 test graphed "Train, a whole step as a CUDA graph, equals the launches one by one bit for bit, over steps of changing batch size" { graphed() }
+
+# a perceptron whose second layer is a frozen weight (graph.Frozen), set by the host: Net.x the input, Net.y the
+# classes; the frozen weight is node 3
+fn Net.frozen(g mut graph.Graph<F32>&) Net {
+    x := g.Input(20)
+    y := g.Classes()
+    w1 := g.Param(graph.Init.Uniform(-0.3, 0.3), true, 32, 20)
+    wf := g.Frozen(10, 32)
+    logits := g.Linear(g.Act(g.Linear(x, w1), mat.Act.Tanh), wf)
+    g.Keep(logits)
+    return Net(x, y, logits, g.CrossEntropy(logits, y), false)
+}
+
+# the frozen weight of Net.frozen set from k
+fn setFrozen(g mut graph.Graph<F32>&, k I64) {
+    wv :~ g.Data(graph.Var(3)).Flat()!
+    for i in range wv.Len(): wv[i] = F32(F64((i * 7 + k) % 13) * 0.05 - 0.3)
+}
+
+fn frozenCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("frozen weights")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.frozen(g) }, 16, 5)
+    assert gpu.ParamCount == 32 * 20 and cpu.ParamCount == gpu.ParamCount
+    setFrozen(cpu, 1)
+    setFrozen(gpu, 1)
+    for n in Array<I64>[16, 11, 16] {
+        feed(cpu, net, n, U64(n) + 3, 10)
+        feed(gpu, net, n, U64(n) + 3, 10)
+        cpu.Forward(n)
+        cpu.Backward(net.loss)
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "a frozen weight at " + $n)
+    }
+    assert gpu.FrozenUploads() == 1, "the frozen weight went up " + $gpu.FrozenUploads() + " times over three steps"
+    # set again by the host: it goes up once more, and the device computes with the new values
+    setFrozen(cpu, 4)
+    setFrozen(gpu, 4)
+    for _ in range 2 {
+        feed(cpu, net, 16, 9, 10)
+        feed(gpu, net, 16, 9, 10)
+        cpu.Forward(16)
+        cpu.Backward(net.loss)
+        gpu.Forward(16)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "a frozen weight set again")
+    }
+    assert gpu.FrozenUploads() == 2, "set again, the frozen weight went up " + $gpu.FrozenUploads() + " times"
+}
+
+test frozenCase "a frozen weight on the GPU goes up once, not at every Forward, and again only when the host set it; forward and backward within rounding of the CPU's" { frozenCase() }
+
+# a perceptron between two NF4 weights (graph.NF4, kernels/nf4): x (watched) through NF4 [24, 20], a trained [32, 24]
+# and NF4 [10, 32]; the NF4 weights are nodes 2 and 4
+fn Net.nf4(g mut graph.Graph<F32>&) Net {
+    x := g.Input(20)
+    y := g.Classes()
+    g.Watch(x)
+    w0 := g.NF4(24, 20)
+    w1 := g.Param(graph.Init.Uniform(-0.3, 0.3), true, 32, 24)
+    wf := g.NF4(10, 32)
+    logits := g.Linear(g.Act(g.Linear(g.Act(g.Linear(x, w0), mat.Act.Tanh), w1), mat.Act.Tanh), wf)
+    g.Keep(logits)
+    return Net(x, y, logits, g.CrossEntropy(logits, y), false)
+}
+
+# the NF4 weights of Net.nf4 quantized from values drawn by k
+fn setNF4(g mut graph.Graph<F32>&, k I64) {
+    setOneNF4(g, 2, 24, 20, k)
+    setOneNF4(g, 4, 10, 32, k)
+}
+
+fn setOneNF4(g mut graph.Graph<F32>&, v I64, rows I64, cols I64, k I64) {
+    w := Array<F32>(rows * cols)
+    for i in range w.Len(): w[i] = F32(F64((i * 7 + k) % 13) * 0.05 - 0.3)
+    g.SetNF4(graph.Var(v), nf4.NF4.Quantize(w, rows, cols))
+}
+
+fn nf4Case() {
+    if not device.GpuAvailable() {
+        gdev.Skip("NF4 weights")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.nf4(g) }, 16, 5)
+    assert gpu.ParamCount == 32 * 24
+    for k in Array<I64>[1, 4] {
+        setNF4(cpu, k)
+        setNF4(gpu, k)
+        for n in Array<I64>[16, 11] {
+            feed(cpu, net, n, U64(n) + 3, 10)
+            feed(gpu, net, n, U64(n) + 3, 10)
+            cpu.Forward(n)
+            cpu.Backward(net.loss)
+            gpu.Forward(n)
+            gpu.Backward(net.loss)
+            closeTo(cpu, gpu, net, 2.0e-4, "NF4 weights at " + $n)
+            wx, bx := worst(gpu.Grad(net.x).Flat()!, cpu.Grad(net.x).Flat()!)
+            assert wx <= 2.0e-4 * (1.0 + bx), "NF4 weights at " + $n + ": the input's gradients differ by " + $wx
+        }
+    }
+    assert gpu.FrozenUploads() == 4, "the NF4 weights went up " + $gpu.FrozenUploads() + " times: twice each, once a setting"
+}
+
+test nf4Case "NF4 weights on the GPU: dequantized on the device before each product, forward and backward within rounding of the CPU's; their codes go up once a setting" { nf4Case() }
+
+# Qwen3 as a graph of frozen weights (models/qwen) on both backends, in T: the logits of a batch of 2 x 24 tokens and the
+# largest difference against the largest logit; the frozen weights went up once over two Forwards
+fn qwenOn<T>(m model.Model&) F64, F64 {
+    cpu mut graph.Graph<T>& = graph.Graph<T>(2)
+    gpu mut graph.Graph<T>& = graph.Graph<T>(2)
+    qc := qwen.Qwen.New(cpu, m.C, 24)!
+    qg := qwen.Qwen.New(gpu, m.C, 24)!
+    lc := qc.Lm(cpu)
+    lg := qg.Lm(gpu)
+    try cpu.Plan(rand.Rand(1), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    qc.Fill(cpu, m)
+    qg.Fill(gpu, m)
+    feedQwen(cpu, lc, m.C.Vocab)
+    feedQwen(gpu, lg, m.C.Vocab)
+    assert gpu.FrozenUploads() == qwenFrozen(m.C), "frozen weights went up " + $gpu.FrozenUploads() + " times"
+    a := cpu.Value(lc.Logits).Flat()!
+    b := gpu.Value(lg.Logits).Flat()!
+    w, big := F64(0.0), F64(0.0)
+    for i in range a.Len() {
+        w = w.Max((F64(a[i]) - F64(b[i])).Abs())
+        big = big.Max(F64(a[i]).Abs())
+    }
+    return w, big
+}
+
+# the same tokens and targets from one seed, then two Forwards
+fn feedQwen<T>(g mut graph.Graph<T>&, lm train.LanguageModel&, vocab I64) {
+    r := rand.Rand(7)
+    tc :~ g.Ints(lm.Tokens).Flat()!
+    yc :~ g.Ints(lm.Targets).Flat()!
+    for i in range tc.Len() {
+        tc[i] = I32(r.Below(vocab))
+        yc[i] = I32(r.Below(vocab))
+    }
+    g.Forward(2)
+    g.Forward(2)
+}
+
+# the frozen weights of a Qwen graph of config c
+fn qwenFrozen(c model.Config&) I64 {
+    block := 9 + (3 if c.Bias else 0) + (2 if c.QkNorm else 0)
+    return 2 + c.Layers * block + (0 if c.Tied else 1)
+}
+
+fn qwenCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("Qwen3 as a graph")
+        return
+    }
+    for tied in [true, false] {
+        dir := model.TinyTied(true, 3, tied)
+        m := model.Model.Load(dir, true)!
+        w, big := qwenOn<F32>(m)
+        assert w <= 2.0e-4 * big, "Qwen3 F32 (tied " + $tied + "): the logits differ by " + $w + " of " + $big
+        wb, bigb := qwenOn<BF16>(m)
+        assert wb <= 0.02 * bigb, "Qwen3 BF16 (tied " + $tied + "): the logits differ by " + $wb + " of " + $bigb
+        os.RemoveAll(dir)!
+    }
+}
+
+test qwenCase "Qwen3 of frozen weights on the GPU, F32 and BF16, grouped heads by Expand: the CPU's logits within rounding, each weight uploaded once" { qwenCase() }
+
+# LoRA on every projection of a tiny Qwen3 (models/qwen AddLora), F32, trained 10 AdamW steps on one batch on each
+# backend from the same start: the losses step by step within 1e-3 of the CPU's, the adapters after within 1e-3, the
+# loss lowered, and the frozen weights still uploaded once each
+fn loraCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("LoRA on Qwen3")
+        return
+    }
+    dir := model.TinyTied(true, 3, true)
+    m := model.Model.Load(dir, true)!
+    c := lora.Config(4, 8.0, Array<String>["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    cpu mut graph.Graph<F32>& = graph.Graph<F32>(2)
+    gpu mut graph.Graph<F32>& = graph.Graph<F32>(2)
+    qc := qwen.Qwen.New(cpu, m.C, 24)!
+    qg := qwen.Qwen.New(gpu, m.C, 24)!
+    qc.AddLora(cpu, c)!
+    qg.AddLora(gpu, c)!
+    lc := qc.Lm(cpu)
+    lg := qg.Lm(gpu)
+    try cpu.Plan(rand.Rand(1), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    qc.Fill(cpu, m)
+    qg.Fill(gpu, m)
+    feedQwen(cpu, lc, m.C.Vocab)
+    feedQwen(gpu, lg, m.C.Vocab)
+    oc := optim.AdamW(cpu.Params(), cpu.ParamGrads(), rate = 0.01, spans = optim.Spans(cpu))
+    og := try optim.GpuAdamW<F32>.For(gpu, rate = 0.01) catch { unreachable }
+    first, last := F64(0.0), F64(0.0)
+    for step in range 10 {
+        cpu.Forward(2)
+        cpu.Backward(lc.Loss)
+        oc.Step()
+        gpu.Forward(2)
+        gpu.Backward(lg.Loss)
+        og.Step()
+        a, b := cpu.Scalar(lc.Loss), gpu.Scalar(lg.Loss)
+        assert (a - b).Abs() <= 1e-3 * (1.0 + a), "LoRA step " + $step + ": the loss " + $b + " against the CPU's " + $a
+        if step == 0: first = b
+        last = b
+    }
+    assert last < 0.7 * first, "LoRA on the GPU: the loss went from " + $first + " to " + $last
+    pc :~ cpu.Params().Flat()!
+    pg :~ gpu.Params().Flat()!
+    w F64 = 0.0
+    for i in range pc.Len(): w = w.Max((F64(pc[i]) - F64(pg[i])).Abs())
+    assert w <= 1e-3, "LoRA on the GPU: the adapters differ by " + $w
+    assert gpu.FrozenUploads() == qwenFrozen(m.C), "frozen weights went up " + $gpu.FrozenUploads() + " times"
+    os.RemoveAll(dir)!
+}
+
+test loraCase "LoRA on a tiny Qwen3 trained on the GPU as on the CPU: the losses step by step, the adapters after, the frozen weights uploaded once" { loraCase() }
 
 # GP8: views on the GPU - Permute (rank 3 and 4, of a parameter, of a view), Slice (a middle axis and the last, of a
 # view), Expand (of a slice, of a parameter, then permuted) - each read through a Contiguous copy, and their gradients
@@ -601,11 +1028,11 @@ fn refused() ? {
     said := ""
     try g.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
     assert said.Contains("no GPU form of Dropout"), said
-    b := graph.Graph<BF16>(4)
+    b := graph.Graph<F16>(4)
     b.Linear(b.Input(3), b.Param(graph.Init.Zeros, true, 2, 3))
     said = ""
     try b.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { said = $e }
-    assert said.Contains("BF16"), said
+    assert said.Contains("F16"), said
     # a product reading a view's rows through leading strides of its own (no Contiguous copy is recorded for it), by a
     # matrix (a product of stacks reads them so)
     v := graph.Graph<F32>(4)
@@ -617,3 +1044,82 @@ fn refused() ? {
 }
 
 test refused "a part with no GPU form is refused at Plan by name, and nothing is planned on the device" { try refused() }
+
+# ---- large vocabularies: the chunked loss and checkpointed blocks ----
+
+# a rotary, gated, RMS-normalized transformer on g, its loss chunked over a vocabulary of 300 in chunks of 64 (the last
+# 44 wide), each block recomputed where checkpoint
+fn bigVocabLm<T>(g mut graph.Graph<T>&, checkpoint Bool) graph.Var, graph.Var, graph.Var {
+    tok := g.Tokens(8)
+    y := g.Classes(8)
+    t := layers.Transformer.New(g, 300, 8, 16, 2, 3, true, 0.0, true, true, true)
+    return tok, y, t.Loss(g, tok, y, 64, checkpoint)
+}
+
+fn feedVocab<T>(g mut graph.Graph<T>&, tok graph.Var, y graph.Var, seed U64) {
+    r := rand.Rand(seed)
+    t :~ g.Ints(tok).Flat()!
+    c :~ g.Ints(y).Flat()!
+    for i in range t.Len(): t[i] = I32(r.Below(300))
+    for i in range c.Len(): c[i] = I32(-1) if i % 7 == 2 else I32(r.Below(300))
+}
+
+fn bigVocabCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("ChunkedCE and Recompute")
+        return
+    }
+    cpu := graph.Graph<F32>(4)
+    ct, cy, cl := bigVocabLm(cpu, false)
+    gpu := graph.Graph<F32>(4)
+    gt, gy, gl := bigVocabLm(gpu, true)
+    plain := graph.Graph<F32>(4)
+    pt, py, pl := bigVocabLm(plain, false)
+    try cpu.Plan(rand.Rand(5), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    try plain.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    assert gpu.ActivationSize < plain.ActivationSize
+    for n in Array<I64>[4, 3] {
+        feedVocab(cpu, ct, cy, U64(n))
+        feedVocab(gpu, gt, gy, U64(n))
+        feedVocab(plain, pt, py, U64(n))
+        cpu.Forward(n)
+        cpu.Backward(cl)
+        gpu.Forward(n)
+        gpu.Backward(gl)
+        plain.Forward(n)
+        plain.Backward(pl)
+        lc := cpu.Scalar(cl)
+        lg := gpu.Scalar(gl)
+        assert (lc - lg).Abs() <= 1.0e-4 * (1.0 + lc), "the loss " + $lg + " against the CPU's " + $lc
+        wg, bg := worst(gpu.ParamGrads().Flat()!, cpu.ParamGrads().Flat()!)
+        assert wg <= 1.0e-3 * (1.0 + bg), "the gradients differ by " + $wg + " of " + $bg + " at " + $n
+        # the checkpointed graph on the device is the plain one's bit for bit
+        assert lg == plain.Scalar(pl) and gpu.ParamGrads() == plain.ParamGrads(), "checkpointed against plain at " + $n
+    }
+    # a whole step as a CUDA graph (Train) recomputes too, and learns
+    og := try optim.GpuAdamW<F32>.For(gpu, rate = 0.01) catch { unreachable }
+    first := gpu.Scalar(gl)
+    for _ in range 8: og.Train(gl, 4, 1.0)
+    assert gpu.Scalar(gl) < first, "no learning: " + $first + " to " + $gpu.Scalar(gl)
+    # BF16: within BF16's rounding of the CPU's BF16 graph
+    cb := graph.Graph<BF16>(4)
+    bt, by, bl := bigVocabLm(cb, true)
+    gb := graph.Graph<BF16>(4)
+    ht, hy, hl := bigVocabLm(gb, true)
+    try cb.Plan(rand.Rand(5), device.Backend.Cpu) catch { unreachable }
+    try gb.Plan(rand.Rand(5), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    feedVocab(cb, bt, by, 1)
+    feedVocab(gb, ht, hy, 1)
+    cb.Forward(4)
+    cb.Backward(bl)
+    gb.Forward(4)
+    gb.Backward(hl)
+    lc := cb.Scalar(bl)
+    lg := gb.Scalar(hl)
+    assert (lc - lg).Abs() <= 2.0e-2 * (1.0 + lc), "BF16: the loss " + $lg + " against the CPU's " + $lc
+    wb, bb := worstB(gb.ParamGrads(), cb.ParamGrads())
+    assert wb <= 5.0e-2 * (1.0 + bb), "BF16: the gradients differ by " + $wb + " of " + $bb
+}
+
+test bigVocabCase "ChunkedCE and checkpointed blocks on the GPU: within rounding of the CPU's (F32 and BF16), checkpointed equal to plain bit for bit, a short batch, and Train as a CUDA graph learns" { bigVocabCase() }

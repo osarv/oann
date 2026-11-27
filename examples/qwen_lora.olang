@@ -1,0 +1,59 @@
+# LoRA on a Qwen3 or Qwen2 checkpoint (models/qwen, nn/lora), on the CPU: a few AdamW steps on one fixed sequence of
+# tokens, the loss of each step printed and timed, then the adapter saved as PEFT writes it and merged into a copy of
+# the model, which llm/model loads. Arguments: the model's directory (/home/user/data/qwen3-0.6b), the steps (8), the
+# adapter's directory (none: not saved), the merged model's directory (none: not merged). The sequence is fixed token
+# ids, not text, so no tokenizer is needed.
+
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../io/checkpoint"
+import "../llm/model"
+import "../models/qwen"
+import "../nn/lora"
+import "../nn/optim"
+import "../tensor"
+
+Sentence Array<I32>& = Array<I32>[785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13, 576, 5562, 1558, 537, 3271, 13, 2938]
+
+fn main() ? os.Error, model.ModelError, lora.LoraError, checkpoint.SafetensorsError, tensor.ShapeError, ParseError {
+    args :~ os.Args()
+    dir := args[1] if args.Len() > 1 else "/home/user/data/qwen3-0.6b"
+    steps I64 = 8
+    if args.Len() > 2: steps = try args[2].ParseInt()
+    t0 := time.Now()
+    m := try model.Model.Load(dir, true)
+    ctx := Sentence.Len() - 1
+    g mut graph.Graph<F32>& = graph.Graph<F32>(1)
+    q := try qwen.Qwen.New(g, m.C, ctx)
+    s := try q.AddLora(g, lora.Config(8, 16.0, Array<String>["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]))
+    lm := q.Lm(g)
+    try g.Plan(rand.Rand(1))
+    q.Fill(g, m)
+    toks :~ g.Ints(lm.Tokens).Flat()!
+    ys :~ g.Ints(lm.Targets).Flat()!
+    for i in range ctx {
+        toks[i] = Sentence[i]
+        ys[i] = Sentence[i + 1]
+    }
+    Print("loaded and filled in " + $(F64(time.Now() - t0) / 1e9) + " s; " + $g.ParamCount + " adapter parameters\n")
+    o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 1e-3, spans = optim.Spans(g))
+    g.Training = true
+    for step in range steps {
+        t := time.Now()
+        g.Forward(1)
+        g.Backward(lm.Loss)
+        Print("step " + $step + ": loss " + $g.Scalar(lm.Loss) + " (" + $(F64(time.Now() - t) / 1e9) + " s)\n")
+        o.Step()
+    }
+    g.Forward(1)
+    Print("after " + $steps + " steps: loss " + $g.Scalar(lm.Loss) + "\n")
+    if args.Len() < 4: return
+    try s.Save(g, args[3])
+    if args.Len() < 5: return
+    t1 := time.Now()
+    try lora.Merge(dir, args[3], args[4])
+    merged := try model.Model.Load(args[4], true)
+    Print("merged and loaded by llm/model in " + $(F64(time.Now() - t1) / 1e9) + " s (" + $merged.C.Layers + " layers)\n")
+}
