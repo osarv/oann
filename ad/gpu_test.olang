@@ -685,6 +685,60 @@ fn graphed() {
 
 test graphed "Train, a whole step as a CUDA graph, equals the launches one by one bit for bit, over steps of changing batch size" { graphed() }
 
+# a perceptron whose second layer is a frozen weight (graph.Frozen), set by the host: Net.x the input, Net.y the
+# classes; the frozen weight is node 3
+fn Net.frozen(g mut graph.Graph<F32>&) Net {
+    x := g.Input(20)
+    y := g.Classes()
+    w1 := g.Param(graph.Init.Uniform(-0.3, 0.3), true, 32, 20)
+    wf := g.Frozen(10, 32)
+    logits := g.Linear(g.Act(g.Linear(x, w1), mat.Act.Tanh), wf)
+    g.Keep(logits)
+    return Net(x, y, logits, g.CrossEntropy(logits, y), false)
+}
+
+# the frozen weight of Net.frozen set from k
+fn setFrozen(g mut graph.Graph<F32>&, k I64) {
+    wv :~ g.Data(graph.Var(3)).Flat()!
+    for i in range wv.Len(): wv[i] = F32(F64((i * 7 + k) % 13) * 0.05 - 0.3)
+}
+
+fn frozenCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("frozen weights")
+        return
+    }
+    cpu, gpu, net := pair(fn(g mut graph.Graph<F32>&) Net { return Net.frozen(g) }, 16, 5)
+    assert gpu.ParamCount == 32 * 20 and cpu.ParamCount == gpu.ParamCount
+    setFrozen(cpu, 1)
+    setFrozen(gpu, 1)
+    for n in Array<I64>[16, 11, 16] {
+        feed(cpu, net, n, U64(n) + 3, 10)
+        feed(gpu, net, n, U64(n) + 3, 10)
+        cpu.Forward(n)
+        cpu.Backward(net.loss)
+        gpu.Forward(n)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "a frozen weight at " + $n)
+    }
+    assert gpu.FrozenUploads() == 1, "the frozen weight went up " + $gpu.FrozenUploads() + " times over three steps"
+    # set again by the host: it goes up once more, and the device computes with the new values
+    setFrozen(cpu, 4)
+    setFrozen(gpu, 4)
+    for _ in range 2 {
+        feed(cpu, net, 16, 9, 10)
+        feed(gpu, net, 16, 9, 10)
+        cpu.Forward(16)
+        cpu.Backward(net.loss)
+        gpu.Forward(16)
+        gpu.Backward(net.loss)
+        closeTo(cpu, gpu, net, 2.0e-4, "a frozen weight set again")
+    }
+    assert gpu.FrozenUploads() == 2, "set again, the frozen weight went up " + $gpu.FrozenUploads() + " times"
+}
+
+test frozenCase "a frozen weight on the GPU goes up once, not at every Forward, and again only when the host set it; forward and backward within rounding of the CPU's" { frozenCase() }
+
 # GP8: views on the GPU - Permute (rank 3 and 4, of a parameter, of a view), Slice (a middle axis and the last, of a
 # view), Expand (of a slice, of a parameter, then permuted) - each read through a Contiguous copy, and their gradients
 # back into their bases'; with a loss over [batch] vectors (the batch the last axis) whose weights the host sets after

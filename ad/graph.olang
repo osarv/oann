@@ -83,6 +83,7 @@ if Gpu {
         Touched mut Array<Bool>& = Array<Bool>(n)
         FreshParams Bool = false
         HostParams Bool = true
+        FrozenUploads I64 = 0       # frozen weights sent up (Frozen): each once, unless handed to the host again
         Capturing Bool = false      # a training step is being captured into a CUDA graph (GP7): nothing uploads meanwhile
     }
 } else {
@@ -235,6 +236,7 @@ type Node struct(Kind Op, Dims tensor.Shape, Batched Bool) {
     AccOffset I64 = -1          # elements in the type computed in: scan states, what a scan keeps, decoding's scores
     Keep Bool = false           # its value and gradient kept to the step's end
     Watch Bool = false          # its gradient wanted though it depends on no parameter (an input's)
+    Frozen Bool = false         # a Constant that stays on the device: uploaded only after the host was handed it (Frozen)
 }
 
 # a batch decoding several sequences at once stores its batched nodes position by position - [ctx, batch, ...] - so that
@@ -511,6 +513,18 @@ fn (g mut Graph<T>&) Classes(dims ...I64) Var { return g.add(Op.Classes, batchOf
 
 # a tensor the caller sets and nothing trains - a target, a mask, a fixed table
 fn (g mut Graph<T>&) Constant(dims ...I64) Var { return g.add(Op.Constant, tensor.Shape.Of(...dims), false) }
+
+# a frozen weight: a Constant the caller fills once (loaded weights) and nothing trains - no gradient of its own, no
+# optimizer state, not among Params(), in the arena's element type (BF16 in a BF16 graph). Gradients flow through it to
+# what it multiplies. On the GPU it stays resident: it goes up at the first Forward and again only after Value handed
+# it to the host (a read counts, since the host may have written it); an ordinary Constant goes up at every Forward
+fn (g mut Graph<T>&) Frozen(dims ...I64) Var {
+    v := g.Constant(...dims)
+    nd := g.nodes[v]
+    nd.Frozen = true
+    g.nodes[v] = nd
+    return v
+}
 
 # a trainable tensor, set by init when the graph is planned; weight decay applies to it where decay
 fn (g mut Graph<T>&) Param(init Init, decay Bool, dims ...I64) Var {
@@ -2921,6 +2935,7 @@ if Gpu {
         g.gpu.M ~ try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
         g.OnGpu = true
         g.gpu.HostParams = true
+        for i in range g.nodes.Len(): g.gpu.Touched[i] = g.nodes[i].Frozen
     }
 
     # before the optimizer steps the parameters on the device: any the host wrote are up, and the device's now newer
@@ -2973,14 +2988,23 @@ if Gpu {
         }
         for i in range g.nodes.Len() {
             nd := g.nodes[i]
+            handed := g.gpu.Touched[i]
             g.gpu.Touched[i] = false
             match nd.Kind {
-                case Op.Input, Op.Constant { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
+                case Op.Input { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
+                case Op.Constant {
+                    if nd.Frozen and not handed: continue
+                    m.Upload(g.mem, nd.Offset, nd.Dims.Count())
+                    if nd.Frozen: g.gpu.FrozenUploads++
+                }
                 case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
                 case _ { }
             }
         }
     }
+
+    # how many times a frozen weight went up to the device (Frozen): once each, unless the host was handed it again
+    fn (g Graph<T>&) FrozenUploads() I64 { return g.gpu.FrozenUploads }
 
     # a training step's start (nn/optim's GpuAdamW.Train): the batch's n entries in use, the inputs up
     fn (g mut Graph<T>&) GpuFeed(n I64) {
@@ -3084,7 +3108,10 @@ if Gpu {
             g.gpu.Touched[i] = false
             nd := g.nodes[i]
             match nd.Kind {
-                case Op.Input, Op.Constant { m.Upload(g.mem, nd.Offset, nd.Dims.Count()) }
+                case Op.Input, Op.Constant {
+                    m.Upload(g.mem, nd.Offset, nd.Dims.Count())
+                    if nd.Frozen: g.gpu.FrozenUploads++
+                }
                 case Op.Tokens, Op.Classes { m.UploadInts(g.intMem, nd.IntOffset, nd.Dims.Count()) }
                 case _ { }
             }
@@ -3376,6 +3403,40 @@ test Graph "records, plans and runs a small network" {
     assert g.Value(h).Get(1, 0) == 6.0
     g.Backward(loss)
     assert g.Grad(w).Get(0, 0) != 0.0
+}
+
+test Graph.Frozen "a frozen weight: no gradient, no place among the parameters, unchanged by a step, and the gradients through it a parameter's" {
+    grads := Vec<Array<F64>>()
+    for frozen in [false, true] {
+        g := Graph<F64>(3)
+        x := g.Input(4)
+        g.Watch(x)
+        w1 := g.Param(Init.Normal(0.0, 0.5), true, 5, 4)
+        w2 := g.Frozen(2, 5) if frozen else g.Param(Init.Zeros, true, 2, 5)
+        out := g.Linear(g.Act(g.Linear(x, w1), mat.Act.Tanh), w2)
+        target := g.Input(2)
+        loss := g.Mse(out, target)
+        g.Plan(rand.Rand(4))!
+        assert g.ParamCount == 20 + (0 if frozen else 10)
+        assert (g.Info(w2).GradOffset < 0) == frozen
+        wv :~ g.Value(w2).Flat()!
+        for i in range 10: wv[i] = F64((i * 7) % 10) * 0.1 - 0.45
+        xv :~ g.Value(x).Flat()!
+        for i in range 12: xv[i] = F64(i % 5) * 0.3 - 0.6
+        tv :~ g.Value(target).Flat()!
+        for i in range 6: tv[i] = F64(i) * 0.2
+        g.Forward(3)
+        g.Backward(loss)
+        grads.Push(g.Grad(x).Flat()!.Copy())
+        grads.Push(g.Grad(w1).Flat()!.Copy())
+        # a step of plain descent over the parameters leaves the frozen weight as it was
+        before := g.Value(w2).Flat()!.Copy()
+        p :~ g.Params().Flat()!
+        pg :~ g.ParamGrads().Flat()!
+        for i in range g.ParamCount: p[i] = p[i] - 0.1 * pg[i]
+        if frozen: assert g.Value(w2).Flat()! == before
+    }
+    assert grads[0] == grads[2] and grads[1] == grads[3]
 }
 
 test Graph "the kernels compute what they say: ReLU, a product, a linear layer, softmax cross-entropy" {
