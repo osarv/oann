@@ -7,6 +7,7 @@ Last re-checked against olang f73ca3c4f (2026-11-21). A repro is removed once ol
 | file | status | why |
 |---|---|---|
 | `fieldname.olang` | reproduces | D3a: a constructor field may not share a function's name in its module. A deliberate rule, kept as a record of the friction |
+| `spawnwrap.olang` | reproduces (olang 8e7038d, 2026-11-27) | a struct value built in a function, holding a struct with a reference, passed by value to tasks under a join: the caller releases its region after the join although it was already let go of - SIGSEGV in `__olang_region_drop`; fine with `-free late` or without spawn. Crashes kernels/gemm.olang's GemmLeft test at 4 threads |
 | `unknowntype.olang` | fixed (olang 5525e1d95: error[M9] "module std/time declares no 'Instant'") | a parameter typed by a module member that does not exist (`time.Instant`) passes the checker and stops the build in lowering ("does not lower an unknown type") instead of a check error naming it |
 | `mapiterref.olang` | fixed (olang d0951cebd: `for e in m` walks a writable map by IterMut, a read-only one by IterRef; an explicit `Iter()` on a read-only map of such values still fails - use `IterRef()`) | iterating a `Map` whose values hold a writable reference (a struct with a `mut Array<F32>&` field, as `tensor.Tensor` has) fails in the prelude's `MapIter` with T25c ("'MapEntry' writes through or keeps its parameter 'value'"); `Keys()` and `Ref(key)` work |
 
