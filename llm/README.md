@@ -9,12 +9,13 @@ completions of a file of prompts as one long, resumable job. Nothing here trains
 |---|---|
 | `model.olang` | `Config` (config.json), `Model.Load` (safetensors, one file or the shards of an index; BF16, F16 or F32 stored), `Step` (any rows of any sequences through every layer), `Cache` (the paged key-value cache), `State` (a step's rows and buffers) |
 | `gguf.olang` | GGUF files (llama.cpp's): the header and metadata, rows of a tensor widened to F32 (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K), the metadata as the config.json and tokenizer.json the rest reads; `Model.Load` and `oann-gen` take a `.gguf` path in place of a directory (llama, qwen2, qwen3, qwen3moe, granite, granitemoe, olmoe, smollm3; not Gemma) |
+| `vision.olang` | `Vision`, Gemma 3's SigLIP encoder and projector (`Load` from the checkpoint's `vision_tower` and `multi_modal_projector`, `Embed`: an image's 256 embeddings for the language model), `Pixels` (the processor's resize, PIL's bilinear bit for bit, and scaling), `ReadRgb` (a PNG or JPEG file by std/imgdecode), `ImageText` (a prompt's image tokens) |
 | `bpe.olang` | `Bpe`, Hugging Face's BPE (tokenizer.json), byte-level or SentencePiece's (Gemma: "▁" for spaces, byte fallback): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
 | `chat.olang` | `Chat`: the model's own chat template run by `jinja.olang` (`Render`: messages, tool schemas, tool calls; `Prompt`: one user turn), with hard-coded ChatML, DeepSeek-R1, Llama 3, Granite and Gemma prompts where a directory has no template; stop tokens and sampling defaults; `Fetch` from Hugging Face |
 | `jinja.olang` | `Template`: the Jinja2 subset Hugging Face chat templates are written in, parsed once and rendered with a context of `Val`s, as transformers' environment renders them |
 | `gen.olang` | `oann-gen` |
-| `tools/reference.py`, `tools/tokref.py`, `tools/chatref.py`, `tools/ggufref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
+| `tools/reference.py`, `tools/tokref.py`, `tools/chatref.py`, `tools/ggufref.py`, `tools/visionref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
 ## Using it
 
@@ -36,6 +37,16 @@ the model's chat template, with `"system"` or `--system` before it) or `"text"` 
 `finish` is `stop` (a stop token: generation_config's `eos_token_id` and the end of a turn) or `length`. Thinking
 models write their reasoning first, between `<think>` and `</think>`; DeepSeek-R1's template opens the `<think>` itself,
 so it is put at the front of `text` and both families read alike. `--no-think` turns Qwen3's thinking off.
+
+Gemma 3's checkpoints (4B, 12B, 27B; not 270M or 1B, which have no eyes) also read images: a line's `"image"` (a path)
+or `"images"` (a list) names PNG or JPEG files. A `"prompt"` gets its images before its text, as the chat template puts
+an image part first; a `"text"` writes `<start_of_image>` where each goes. The vision encoder loads at the first image,
+each image becomes 256 embeddings that the language model reads in place of its image tokens, and those tokens see the
+whole image (attention within an image goes both ways), as transformers' Gemma3ForConditionalGeneration does.
+
+```
+{"id": "fig3", "prompt": "What does this chart show?", "image": "figures/fig3.png"}
+```
 
 The job resumes: run again with the same arguments, it skips the (id, sample) pairs already in `out.jsonl` and makes
 the rest. Each completion draws from its own generator, seeded by `--seed`, its id and its sample number, and a row of
@@ -175,6 +186,12 @@ each type; the tests hold the rows to 1e-5 and the model, on both paths, to a me
 largest and the same five greedy tokens (Qwen3-0.6B in Q8_0, Q4_0 with Q4_1 and Q6_K, Q4_K_M, Q5_K_M; Llama-3.2-1B in
 Q4_K_M).
 
+`llm/tools/visionref.py` draws a test image and writes what Hugging Face's Gemma 3 processor and model make of it: the
+processor's pixels, the vision tower's embeddings (F32) and the language model's logits after the image (BF16). The
+tests hold `Pixels` to the processor's bit for bit, the embeddings within 2%, the prompt's logits within 5% on the
+mean, and ten teacher-forced steps to at least eight of the same tokens (any other within one logit of the reference's:
+BF16 near ties) for Gemma-3-4B.
+
 The tests (`make test`) build small random Qwen2 and Qwen3 checkpoints and hold the AMX path to the exact one within
 BF16's rounding, decoding through the cache a token a step to reading the prompt at once (over pages), a row's logits
 to be the same, bit for bit, alone or beside other sequences, a batch with prompts in chunks and with preemption to
@@ -250,6 +267,10 @@ exact path. It is mostly room - more or longer sequences - and a little speed.
 
 A prompt is read in the same steps, each of its positions a row with attention of its own; that suits prompts of
 hundreds of tokens, not of many thousands.
+
+Gemma 3's vision encoder takes about 15 s an image on the same machine (`make visionbench`): 27 layers over 4096
+patches, the products about 2.6 s, attention about 12 s (flash attention, BF16 on AMX tiles, 16 heads of 72 over the
+4096 patches, no scores kept); the language model then reads the 256 image tokens as any prompt's.
 
 ## Models and licences
 

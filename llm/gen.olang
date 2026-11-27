@@ -10,7 +10,10 @@
 # given) or "text" (read as it is), and an "id" (the line's number where it has none). K completions of each are
 # written to out.jsonl as they finish, a line each:
 #     {"id": ..., "sample": k, "text": "<think>...</think>...", "prompt_tokens": n, "tokens": m, "finish": "stop"}
-# finish is "stop" (a stop token) or "length" (--max-tokens, or the context). The job resumes: completions already in
+# finish is "stop" (a stop token) or "length" (--max-tokens, or the context). A vision-language model's line (Gemma 3)
+# may name image files (PNG or JPEG): "image" (a path) or "images" (a list of paths), seen by llm/vision. A "prompt"
+# gets the images before its text, as the chat template puts an image part before a text part; a "text" places each
+# where it writes <start_of_image>. The job resumes: completions already in
 # out.jsonl are not made again, and each completion draws from a generator seeded by --seed, its id and its sample,
 # so a resumed job writes what an uninterrupted one would. Sampling defaults are the model's generation_config.json.
 # Progress goes to standard error.
@@ -25,11 +28,13 @@ import "chat"
 import "engine"
 import "gguf"
 import "model"
+import "vision"
 
-type job struct(id String&, sample I64, prompt Array<I32>&) {
+type job struct(id String&, sample I64, prompt Array<I32>&, images Array<F32>&) {
     id                  # the id as JSON text
     sample
     prompt
+    images              # the embeddings of the prompt's image tokens (empty without images)
 }
 
 # FNV-1a of text
@@ -93,6 +98,31 @@ fn tokenizer(dir String&) bpe.Bpe ? bpe.BpeError, json.Error, os.Error, gguf.Ggu
     return try bpe.Bpe.Parse(try (try gguf.File.Open(dir)).TokenizerJson())
 }
 
+# the image paths of a prompts.jsonl line: "image" or "images"
+fn imagePaths(j json.Json&, where String&) Vec<String> {
+    out := Vec<String>()
+    if j.Has("image") {
+        out.Push(try (try j["image"] catch { fail(where + ": image") }).AsStr() catch { fail(where + ": image is not a string") })
+    }
+    if not j.Has("images"): return out
+    list :~ try (try j["images"] catch { fail(where + ": images") }).AsArr() catch { fail(where + ": images is not a list") }
+    for x in list: out.Push(try x.AsStr() catch { fail(where + ": an image is not a string") })
+    return out
+}
+
+# the embeddings of the images at paths, one after another
+fn embedImages(v vision.Vision&, e mut vision.Seeing&, c model.Config&, paths Vec<String>&, where String&) Array<F32> {
+    per := c.ImageTokens * c.Dim
+    out := Array<F32>(paths.Len() * per)
+    for i, path in paths {
+        rgb, w, h := try vision.ReadRgb(path) catch { fail(where + ": cannot read the image " + path) }
+        one := Array<F32>(per)
+        v.Embed(e, v.Pixels(rgb, w, h), one)
+        for x in range per: out[i * per + x] = one[x]
+    }
+    return out
+}
+
 fn main() {
     p := flags.Flags("oann-gen", "completions of prompts.jsonl by MODEL, written to out.jsonl as they finish")
     n := p.Int("n", 'n', 1, "completions of each prompt")
@@ -138,6 +168,11 @@ fn main() {
             finished.Put(json.Encode(id) + "#" + $k, true)
         }
     }
+    # the eyes, loaded at the first image
+    sees := m.C.ImageToken >= 0 and not dir.EndsWith(".gguf")
+    eyes := Vec<vision.Vision>()
+    seeing := Vec<vision.Seeing>()
+    images I64 = 0
     # the jobs
     text :~ try os.ReadFile(args[1]) catch { fail("cannot read " + args[1]) }
     jobs := Vec<job>()
@@ -147,6 +182,11 @@ fn main() {
         if line.Trim().Len() == 0: continue
         j :~ try json.Json.Parse(line) catch { fail(args[1] + ":" + $(li + 1) + ": not JSON") }
         id :~ json.Encode(try j["id"] catch default json.Json.Num(F64(li)))
+        where := args[1] + ":" + $(li + 1)
+        paths := imagePaths(j, where)
+        if paths.Len() > 0 and not sees: fail(where + ": images, but " + dir + " is not a vision-language model oann reads (Gemma 3)")
+        lead := ""
+        for _ in paths: lead += "<start_of_image>"
         prompt String& = ""
         if j.Has("text") {
             prompt ~ try (try j["text"] catch { fail("text") }).AsStr() catch { fail(args[1] + ":" + $(li + 1) + ": text is not a string") }
@@ -154,7 +194,19 @@ fn main() {
             user :~ try (try j["prompt"] catch { fail(args[1] + ":" + $(li + 1) + ": no prompt or text") }).AsStr() catch { fail(args[1] + ":" + $(li + 1) + ": prompt is not a string") }
             sys :~ system.Get()
             if j.Has("system"): sys ~ try (try j["system"] catch { fail("system") }).AsStr() catch { fail("system is not a string") }
-            prompt ~ ch.Prompt(user, sys, not noThink.Get())
+            prompt ~ ch.Prompt(lead + user.Trim(), sys, not noThink.Get())
+        }
+        embeds := Array<F32>(0)
+        if paths.Len() > 0 {
+            if eyes.Len() == 0 {
+                t1 := time.Now()
+                eyes.Push(try vision.Vision.Load(dir, exact.Get()) catch { fail("cannot load the vision encoder in " + dir) })
+                seeing.Push(vision.Seeing(eyes[0]))
+                say("loaded the vision encoder, " + (F64(time.Since(t1)) / 1e9).Fixed(1) + " s")
+            }
+            embeds = embedImages(eyes[0], seeing.RefMut(0), m.C, paths, where)
+            images += paths.Len()
+            prompt ~ vision.ImageText(prompt, m.C.ImageTokens)
         }
         ids := tok.Encode(prompt)
         for k in range n.Get() {
@@ -162,11 +214,12 @@ fn main() {
                 skipped++
                 continue
             }
-            jobs.Push(job(id, k, ids))
+            jobs.Push(job(id, k, ids, embeds))
             longest = longest.Max(ids.Len())
         }
     }
     if skipped > 0: say($skipped + " completions already in " + outPath)
+    if images > 0: say($images + " images seen")
     if jobs.Len() == 0 {
         say("nothing to do")
         return
@@ -187,7 +240,7 @@ fn main() {
         ", top-k " + $e.Sampling.TopK)
     for i, jb in jobs.View() {
         s := mix(U64(seed.Get()) ^ mix(hash(jb.id)) ^ mix(U64(jb.sample) + 0x51ED))
-        e.Submit(engine.Request(i, jb.prompt, maxNew.Get(), s))
+        e.Submit(engine.Request(i, jb.prompt, maxNew.Get(), s, Images = jb.images))
     }
     out := try os.File.Append(outPath) catch { fail("cannot write " + outPath) }
     opening := ch.Opening()

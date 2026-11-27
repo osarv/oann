@@ -496,11 +496,17 @@ fn halved<S>(z S) Bool {
 }
 
 # rows x cols of the scratch from at (ld flashCols) rounded into h from ho, a block view of the same shape
-fn rounded<A>(h mut Array<BF16>&, ho I64, sc Array<A>&, at I64, rows I64, cols I64) mat.Mat<BF16> {
+fn rounded<A>(m mut mat.Mat<BF16>&, sc Array<A>&, at I64, rows I64, cols I64) {
     for r in range rows {
-        for c in range cols: h[ho + r * flashCols + c] = BF16(sc[at + r * flashCols + c])
+        for c in range cols: m.Data[m.Off + r * flashCols + c] = BF16(sc[at + r * flashCols + c])
     }
-    return mat.Mat<BF16>(h, ho, rows, cols, flashCols)
+    m.Rows, m.Cols = rows, cols
+}
+
+# m moved to rows x cols at (r0, c0) of the matrix it views from (Off0 its offset there). The views of the flash
+# loops are built once and moved: a view built from a borrowed array finds that array's scope as it is built
+fn moved<S>(m mut mat.Mat<S>&, off0 I64, r0 I64, c0 I64, rows I64, cols I64) {
+    m.Off, m.Rows, m.Cols = off0 + r0 * m.Ld + c0, rows, cols
 }
 
 # the job over the seqs heads matrices, in runs on up to f.Threads tasks
@@ -534,6 +540,8 @@ fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
     scale A = 1.0 / A(dh).Sqrt()
     r0, c0 := e / at.Count * ctx, e % at.Count * dh
     so, oo, mo, lo := 0, 2 * flashRows * flashCols, 2 * flashRows * flashCols + flashRows * dh, 2 * flashRows * flashCols + flashRows * dh + flashRows
+    qi, kj, vj := block(j.q, 0, 0, 0, dh), block(j.k, 0, 0, 0, dh), block(j.v, 0, 0, 0, dh)
+    om, sm, hm := mat.Mat<A>(sc, oo, 0, dh, dh), mat.Mat<A>(sc, so, 0, 0, flashCols), mat.Mat<BF16>(hs, 0, 0, 0, flashCols)
     for i0 in range 0, ctx, flashRows {
         br := flashRows.Min(ctx - i0)
         for r in range br {
@@ -542,16 +550,17 @@ fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
             for d in range dh: sc[oo + r * dh + d] = 0.0
         }
         reach := i0 + br if at.Causal else ctx
-        qi := block(j.q, r0 + i0, c0, br, dh)
-        om := mat.Mat<A>(sc, oo, br, dh, dh)
+        moved(qi, j.q.Off, r0 + i0, c0, br, dh)
+        om.Rows = br
         for j0 in range low(at, j.starts, r0 + i0, i0), reach, flashCols {
             bc := flashCols.Min(reach - j0)
-            kj, vj := block(j.k, r0 + j0, c0, bc, dh), block(j.v, r0 + j0, c0, bc, dh)
-            sm := mat.Mat<A>(sc, so, br, bc, flashCols)
+            moved(kj, j.k.Off, r0 + j0, c0, bc, dh)
+            moved(vj, j.v.Off, r0 + j0, c0, bc, dh)
+            sm.Rows, sm.Cols = br, bc
             gemm.Gemm(ws, sm, qi, false, kj, true, scale, 0.0)
             for r in range br: flashFold(sc, so + r * flashCols, bc, (low(at, j.starts, r0 + i0 + r, i0 + r) - j0).Max(0), flashReach(at.Causal, i0 + r, j0, bc), mo + r, lo + r, oo + r * dh, dh)
             if halved(S(0.0)) {
-                hm := rounded(hs, 0, sc, so, br, bc)
+                rounded(hm, sc, so, br, bc)
                 gemm.Gemm(ws, om, hm, false, vj, false, 1.0, 1.0)
             } else { gemm.Gemm(ws, om, sm, false, vj, false, 1.0, 1.0) }
         }
@@ -605,6 +614,10 @@ fn flashBack<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
     ko := 2 * flashRows * flashCols + flashRows * dh + 2 * flashRows
     vo, qo := ko + flashCols * dh, ko + 2 * flashCols * dh
     dd := qo + ctx * dh
+    qi, kj, vj, doi := block(j.q, 0, 0, 0, dh), block(j.k, 0, 0, 0, dh), block(j.v, 0, 0, 0, dh), block(j.dout, 0, 0, 0, dh)
+    dkm, dvm, dqi := mat.Mat<A>(sc, ko, 0, dh, dh), mat.Mat<A>(sc, vo, 0, dh, dh), mat.Mat<A>(sc, qo, 0, dh, dh)
+    pm, gm := mat.Mat<A>(sc, po, 0, 0, flashCols), mat.Mat<A>(sc, go, 0, 0, flashCols)
+    ph, gh := mat.Mat<BF16>(hs, 0, 0, 0, flashCols), mat.Mat<BF16>(hs, flashRows * flashCols, 0, 0, flashCols)
     for i in range ctx {
         row := (r0 + i) * j.dout.Ld + j.dout.Off + c0
         orow := (r0 + i) * j.out.Ld + j.out.Off + c0
@@ -619,14 +632,16 @@ fn flashBack<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
             sc[ko + x] = 0.0
             sc[vo + x] = 0.0
         }
-        kj, vj := block(j.k, r0 + j0, c0, bc, dh), block(j.v, r0 + j0, c0, bc, dh)
-        dkm, dvm := mat.Mat<A>(sc, ko, bc, dh, dh), mat.Mat<A>(sc, vo, bc, dh, dh)
+        moved(kj, j.k.Off, r0 + j0, c0, bc, dh)
+        moved(vj, j.v.Off, r0 + j0, c0, bc, dh)
+        dkm.Rows, dvm.Rows = bc, bc
         first := j0 / flashRows * flashRows if at.Causal else 0
         for i0 in range first, ctx, flashRows {
             if low(at, j.starts, r0 + i0, i0) >= j0 + bc: break             # the window (or the document) has left this key block
             br := flashRows.Min(ctx - i0)
-            qi, doi := block(j.q, r0 + i0, c0, br, dh), block(j.dout, r0 + i0, c0, br, dh)
-            pm, gm := mat.Mat<A>(sc, po, br, bc, flashCols), mat.Mat<A>(sc, go, br, bc, flashCols)
+            moved(qi, j.q.Off, r0 + i0, c0, br, dh)
+            moved(doi, j.dout.Off, r0 + i0, c0, br, dh)
+            pm.Rows, pm.Cols, gm.Rows, gm.Cols = br, bc, br, bc
             gemm.Gemm(ws, pm, qi, false, kj, true, scale, 0.0)
             gemm.Gemm(ws, gm, doi, false, vj, true, 1.0, 0.0)
             for r in range br {
@@ -648,9 +663,10 @@ fn flashBack<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
                     sc[go + r * flashCols + c] = 0.0
                 }
             }
-            dqi := mat.Mat<A>(sc, qo + i0 * dh, br, dh, dh)
+            dqi.Off, dqi.Rows = qo + i0 * dh, br
             if halved(S(0.0)) {
-                ph, gh := rounded(hs, 0, sc, po, br, bc), rounded(hs, flashRows * flashCols, sc, go, br, bc)
+                rounded(ph, sc, po, br, bc)
+                rounded(gh, sc, go, br, bc)
                 gemm.Gemm(ws, dvm, ph, true, doi, false, 1.0, 1.0)
                 gemm.Gemm(ws, dqi, gh, false, kj, false, 1.0, 1.0)
                 gemm.Gemm(ws, dkm, gh, true, qi, false, 1.0, 1.0)

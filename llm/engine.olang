@@ -19,11 +19,12 @@ import "std/rand"
 import "model"
 
 # what to generate for a prompt
-type Request struct(Id I64, Prompt Array<I32>&, MaxNew I64, Seed U64) {
+type Request struct(Id I64, Prompt Array<I32>&, MaxNew I64, Seed U64, Images Array<F32>& = Array<F32>(0)) {
     Id                      # the caller's
     Prompt
     MaxNew
     Seed
+    Images                  # a vision-language model's: the embeddings of the prompt's image tokens, in order (llm/vision)
 }
 
 # a finished request: its tokens (the stop token left out) and why it ended
@@ -186,7 +187,7 @@ fn (e mut Engine&) Step() Array<Done> {
                 i++
                 continue
             }
-            n := left if decoding else left.Min(budget)
+            n := left if decoding else e.unsplit(s.toks, s.cached, left.Min(budget))
             if n <= 0 {
                 i++
                 continue
@@ -208,7 +209,13 @@ fn (e mut Engine&) Step() Array<Done> {
             for q in range n {
                 pos := s2.cached + q
                 e.rowSeq[st.N] = i
-                st.Add(s2.toks[pos], pos, s2.slot, pos == s2.toks.Len() - 1)
+                want := pos == s2.toks.Len() - 1
+                if I64(s2.toks[pos]) != e.m.C.ImageToken or s2.req.Images.Len() == 0 {
+                    st.Add(s2.toks[pos], pos, s2.slot, want)
+                    continue
+                }
+                at, last := imageRow(s2.toks, pos, e.m.C.ImageToken)
+                st.AddGiven(s2.req.Images, at, e.m.C.Dim, pos, last, s2.slot, want)
             }
             e.ran[i] = n
             if not decoding: budget -= n
@@ -253,6 +260,30 @@ fn (e mut Engine&) Step() Array<Done> {
         i++
     }
     return finished.ToArray()
+}
+
+# n prompt rows from position at, cut so that no image's run of tokens is split over two steps (its rows attend to
+# each other): stopped before a run that does not fit, or taken whole where the rows begin with one
+fn (e Engine&) unsplit(toks Vec<I32>&, at I64, n I64) I64 {
+    img := e.m.C.ImageToken
+    end := at + n
+    if img < 0 or end >= toks.Len() or I64(toks[end]) != img or I64(toks[end - 1]) != img: return n
+    start := end - 1
+    for start > at and I64(toks[start - 1]) == img: start--
+    if start > at: return start - at
+    for end < toks.Len() and I64(toks[end]) == img: end++
+    return end - at
+}
+
+# the image token at pos: which image embedding it takes (the image tokens before it), and its run's last position
+fn imageRow(toks Vec<I32>&, pos I64, img I64) I64, I64 {
+    at I64 = 0
+    for q in range pos {
+        if I64(toks[q]) == img: at++
+    }
+    last := pos
+    for last + 1 < toks.Len() and I64(toks[last + 1]) == img: last++
+    return at, last
 }
 
 # a step begun again after a preemption changed the batch

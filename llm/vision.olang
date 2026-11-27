@@ -13,11 +13,16 @@
 # Products as llm/model's are: BF16 weights, and on AMX the activations rounded to BF16 with F32 sums (kernels/gemm's
 # tiles), the outputs split over the cores; elsewhere F32 activations times the weights widened.
 
+import "std/image"
+import "std/imgdecode"
+import "std/io"
 import "std/json"
 import "std/os"
+import "std/time"
 import "../kernels/gemm"
 import "../kernels/mat"
 import "../kernels/elem"
+import "../kernels/attention"
 import "model"
 
 type VisionConfig struct() {
@@ -162,12 +167,14 @@ type Seeing struct(v Vision&) {
     f mut Array<F32>& = Array<F32>(n * v.C.Ffn.Max(3 * v.C.Patch * v.C.Patch))
     xb mut Array<BF16>& = Array<BF16>(n * v.C.Ffn.Max(3 * v.C.Patch * v.C.Patch) if v.Tile else 0)
     yb mut Array<BF16>& = Array<BF16>(n * 3 * v.C.Dim if v.Tile else 0)
-    tasks I64 = v.Threads.Min(v.C.Heads)
-    s mut Array<F32>& = Array<F32>(tasks * n * n)
-    pb mut Array<BF16>& = Array<BF16>(tasks * n * n if v.Tile else 0)
+    ob mut Array<BF16>& = Array<BF16>(n * v.C.Dim if v.Tile else 0)
+    lse mut Array<F32>& = Array<F32>(v.C.Heads * n)
+    fl mut attention.Flash<F32>& = attention.Flash<F32>.For(v.Threads, n, v.C.Dim / v.C.Heads)
     made := Vec<gemm.Workspace<F32>>()
     for _ in range v.Threads: made.Push(gemm.Workspace<F32>(1, n.Max(v.C.Ffn)))
     ws mut Array<gemm.Workspace<F32>>& = made.ToArray()
+    Products I64 = 0        # nanoseconds in the linear maps and in attention, summed over the images seen
+    Attention I64 = 0
 }
 
 # the embeddings of the image pixels ([3 x Size x Size], channel-major, scaled to [-1, 1]) for the language model:
@@ -223,14 +230,22 @@ fn (v Vision&) block(e mut Seeing&, b VBlock&) {
     n := e.n
     v.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, b.Ln1, c.Eps) })
     v.lin(e, e.qkv, e.h, n, b.Qkv)
+    t0 := time.Now()
     v.attend(e)
+    e.Attention += time.Since(t0)
     v.lin(e, e.h, e.att, n, b.O)
-    for i in range n * d: e.x[i] += e.h[i]
-    v.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, b.Ln2, c.Eps) })
+    v.rows(n, fn(r0 I64, r1 I64) {
+        add(e.x, e.h, r0 * d, r1 * d)
+        layerNorm(e.h, e.x, d, r0, r1, b.Ln2, c.Eps)
+    })
     v.lin(e, e.f, e.h, n, b.Fc1)
     v.rows(n, fn(r0 I64, r1 I64) { geluTanh(e.f, r0 * c.Ffn, r1 * c.Ffn) })
     v.lin(e, e.h, e.f, n, b.Fc2)
-    for i in range n * d: e.x[i] += e.h[i]
+    v.rows(n, fn(r0 I64, r1 I64) { add(e.x, e.h, r0 * d, r1 * d) })
+}
+
+fn add(x mut Array<F32>&, y Array<F32>&, from I64, to I64) {
+    for i in range from, to: x[i] += y[i]
 }
 
 # f(rows r0 .. r1) over the cores
@@ -243,6 +258,8 @@ fn (v Vision&) rows(n I64, f fn&(r0 I64, r1 I64)) {
 
 # dst[: rows, : Out] = src[: rows, : In] W^T + b, the outputs split over the cores in multiples of 16
 fn (v Vision&) lin(e mut Seeing&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w VLin&) {
+    t0 := time.Now()
+    defer: e.Products += time.Since(t0)
     if v.Tile: v.rows(rows, fn(r0 I64, r1 I64) { round(e.xb, src, r0 * w.In, r1 * w.In) })
     t := v.Threads.Min(w.Out / 16).Max(1)
     join {
@@ -261,43 +278,25 @@ fn part(ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, x
     gemm.Gemm(ws, c, mat.Mat<F32>(src, 0, rows, w.In, w.In), false, b, true, epi = epi)
 }
 
-# every patch's attention to every patch, a run of heads a task: the queries scaled by head^-1/2, the scores, their
-# softmax, the weighted values
+# every patch's attention to every patch, by flash attention (no n x n scores kept): softmax(q k^T / head^1/2) v a head
 fn (v Vision&) attend(e mut Seeing&) {
     c := v.C
     d := c.Dim
     n := e.n
-    hd := d / c.Heads
-    scale := F32(1.0 / F64(hd).Sqrt())
-    v.rows(n, fn(r0 I64, r1 I64) { scaleQueries(e.qkv, d, scale, r0, r1) })
-    if v.Tile: v.rows(n, fn(r0 I64, r1 I64) { round(e.yb, e.qkv, r0 * 3 * d, r1 * 3 * d) })
-    t := e.tasks
-    join {
-        for i in range t: spawn heads(e.ws[i], e.att, e.qkv, e.yb, e.s[i * n * n:(i + 1) * n * n], e.pb[i * n * n:(i + 1) * n * n] if v.Tile else e.pb, n, d, hd, i * c.Heads / t, (i + 1) * c.Heads / t, v.Tile)
+    at := attention.Heads(c.Heads, n, Causal = false)
+    if not v.Tile {
+        out := mat.Mat<F32>(e.att, 0, n, d, d)
+        attention.FlashAttention<F32, F32>(e.fl, out, mat.Mat<F32>(e.qkv, 0, n, d, 3 * d), mat.Mat<F32>(e.qkv, d, n, d, 3 * d), mat.Mat<F32>(e.qkv, 2 * d, n, d, 3 * d), e.lse, at)
+        return
     }
+    v.rows(n, fn(r0 I64, r1 I64) { round(e.yb, e.qkv, r0 * 3 * d, r1 * 3 * d) })
+    out := mat.Mat<BF16>(e.ob, 0, n, d, d)
+    attention.FlashAttention<BF16, F32>(e.fl, out, mat.Mat<BF16>(e.yb, 0, n, d, 3 * d), mat.Mat<BF16>(e.yb, d, n, d, 3 * d), mat.Mat<BF16>(e.yb, 2 * d, n, d, 3 * d), e.lse, at)
+    v.rows(n, fn(r0 I64, r1 I64) { widen(e.att, e.ob, r0 * d, r1 * d) })
 }
 
-fn heads(ws mut gemm.Workspace<F32>&, att mut Array<F32>&, qkv mut Array<F32>&, yb mut Array<BF16>&, s mut Array<F32>&, pb mut Array<BF16>&, n I64, d I64, hd I64, h0 I64, h1 I64, tile Bool) {
-    sm := mat.Mat<F32>(s, 0, n, n, n)
-    for h in range h0, h1 {
-        o := mat.Mat<F32>(att, h * hd, n, hd, d)
-        if tile {
-            gemm.Gemm(ws, sm, mat.Mat<BF16>(yb, h * hd, n, hd, 3 * d), false, mat.Mat<BF16>(yb, d + h * hd, n, hd, 3 * d), true)
-            softmax(s, n, 0, n)
-            round(pb, s, 0, n * n)
-            gemm.Gemm(ws, o, mat.Mat<BF16>(pb, 0, n, n, n), false, mat.Mat<BF16>(yb, 2 * d + h * hd, n, hd, 3 * d), false)
-            continue
-        }
-        gemm.Gemm(ws, sm, mat.Mat<F32>(qkv, h * hd, n, hd, 3 * d), false, mat.Mat<F32>(qkv, d + h * hd, n, hd, 3 * d), true)
-        softmax(s, n, 0, n)
-        gemm.Gemm(ws, o, mat.Mat<F32>(s, 0, n, n, n), false, mat.Mat<F32>(qkv, 2 * d + h * hd, n, hd, 3 * d), false)
-    }
-}
-
-fn scaleQueries(qkv mut Array<F32>&, d I64, scale F32, r0 I64, r1 I64) {
-    for r in range r0, r1 {
-        for i in range d: qkv[r * 3 * d + i] *= scale
-    }
+fn widen(dst mut Array<F32>&, src Array<BF16>&, from I64, to I64) {
+    for i in range from, to: dst[i] = F32(src[i])
 }
 
 fn round(dst mut Array<BF16>&, src Array<F32>&, from I64, to I64) {
@@ -320,10 +319,7 @@ fn layerNorm(y mut Array<F32>&, x Array<F32>&, n I64, r0 I64, r1 I64, g LayerNor
 
 # GELU's tanh form (gelu_pytorch_tanh) of x[from .. to]
 fn geluTanh(x mut Array<F32>&, from I64, to I64) {
-    for i in range from, to {
-        u := x[i]
-        x[i] = 0.5 * u * (1.0 + (F32(0.7978845608028654) * (u + 0.044715 * u * u * u)).Tanh())
-    }
+    for i in range from, to: x[i] = elem.FastGeluTanh(x[i])
 }
 
 # each of rows r0 .. r1 of s (n wide) the softmax of itself
@@ -430,6 +426,45 @@ fn Prompt(s mut model.State&, c model.Config&, toks Array<I32>&, embeds Array<F3
 }
 
 # ---- tests ----
+
+# the bytes of a file
+fn readBytes(path String&) Array<U8> ? os.Error, io.Error {
+    f := try os.File.Open(path)
+    n := (try os.FileInfo.Stat(path)).Size
+    b := Array<U8>(n)
+    got I64 = 0
+    for got < n {
+        piece :~ try f.Read(b[got:])
+        if piece.Len() == 0: break
+        got += piece.Len()
+    }
+    return b
+}
+
+# an image file (PNG or JPEG) as 8-bit RGB, row-major, with its width and height: grey repeated, alpha dropped
+fn ReadRgb(path String&) Array<U8>, I64, I64 ? os.Error, io.Error, imgdecode.Error {
+    img := try imgdecode.Decode(try readBytes(path))
+    return Rgb(img), img.Width, img.Height
+}
+
+fn Rgb(img image.Image&) Array<U8> {
+    n, ch := img.Width * img.Height, img.Channels
+    if ch == 3: return img.Pixels
+    out := Array<U8>(3 * n)
+    for i in range n {
+        for c in range 3: out[3 * i + c] = img.Pixels[i * ch + (c if ch >= 3 else 0)]
+    }
+    return out
+}
+
+# a prompt's text with each <start_of_image> opened into its image's tokens, as Gemma 3's processor does: a blank line,
+# <start_of_image>, tokens <image_soft_token>, <end_of_image>, a blank line
+fn ImageText(prompt String&, tokens I64) String {
+    run := "\n\n<start_of_image>"
+    for _ in range tokens: run += "<image_soft_token>"
+    run += "<end_of_image>\n\n"
+    return prompt.Replace("<start_of_image>", run)
+}
 
 fn readF32(path String&) Array<F32> {
     f := os.File.Open(path)!

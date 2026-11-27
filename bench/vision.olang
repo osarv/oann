@@ -1,0 +1,29 @@
+# the time Gemma 3's vision tower and projector (llm/vision) take to embed one image on this machine, a few rounds.
+# Arguments: the model's directory, the rounds (3)
+
+import "std/os"
+import "std/time"
+import "../llm/vision"
+
+fn main() {
+    args :~ os.Args()
+    if args.Len() < 2 {
+        Println("bench/vision MODEL [rounds]")
+        return
+    }
+    rounds I64 = args[2].ParseInt()! if args.Len() > 2 else 3
+    v := vision.Vision.Load(args[1])!
+    e := vision.Seeing(v)
+    sz := v.C.Size
+    pixels := Array<F32>[F32((i * 7919) % 255) / 127.5 - 1.0 for i in range 3 * sz * sz]
+    out := Array<F32>(v.C.Pooled * v.C.Pooled * v.C.Out)
+    for r in range rounds {
+        t0 := time.Now()
+        e.Products = 0
+        e.Attention = 0
+        t0 = time.Now()
+        v.Embed(e, pixels, out)
+        Println("round " + $r + ": " + (F64(time.Since(t0)) / 1e9).Fixed(2) + " s an image (products " + (F64(e.Products) / 1e9).Fixed(2) + " s, attention " +
+            (F64(e.Attention) / 1e9).Fixed(2) + " s; " + ("AMX" if v.Tile else "F32") + ", " + $v.Threads + " threads)")
+    }
+}
