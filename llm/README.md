@@ -1,16 +1,16 @@
 # llm
 
 Inference for openly licensed decoder-only language models on the CPU: Hugging Face checkpoints of the Qwen2, Qwen3,
-Llama (Llama 3, SmolLM2), Mistral, Granite and SmolLM3 architectures and the mixtures of experts of Qwen3-MoE,
+Llama (Llama 3, SmolLM2), Mistral, Granite, SmolLM3 and Gemma 3 architectures and the mixtures of experts of Qwen3-MoE,
 Granite-MoE and OLMoE loaded as they are published, run in batches on AMX tiles, and `oann-gen`, a command that writes
 completions of a file of prompts as one long, resumable job. Nothing here trains; the weights are never committed.
 
 | file | what |
 |---|---|
 | `model.olang` | `Config` (config.json), `Model.Load` (safetensors, one file or the shards of an index; BF16, F16 or F32 stored), `Step` (any rows of any sequences through every layer), `Cache` (the paged key-value cache), `State` (a step's rows and buffers) |
-| `bpe.olang` | `Bpe`, Hugging Face's byte-level BPE (tokenizer.json): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
+| `bpe.olang` | `Bpe`, Hugging Face's BPE (tokenizer.json), byte-level or SentencePiece's (Gemma: "▁" for spaces, byte fallback): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
-| `chat.olang` | `Chat`: the chat template (ChatML, DeepSeek-R1's, Llama 3's, Granite's), stop tokens and sampling defaults of a model directory; `Fetch` from Hugging Face |
+| `chat.olang` | `Chat`: the chat template (ChatML, DeepSeek-R1's, Llama 3's, Granite's, Gemma's), stop tokens and sampling defaults of a model directory; `Fetch` from Hugging Face |
 | `gen.olang` | `oann-gen` |
 | `tools/reference.py`, `tools/tokref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
@@ -80,7 +80,11 @@ sin times the attention factor); grouped-query attention, over a sliding window 
 biases on the query, key and value projections; Qwen3's RMSNorm of each query and key head before the rotation;
 Granite's multipliers (the embedding, each residual branch, the scores in place of 1/sqrt(d), the logits divided);
 SmolLM3's layers without rotation (`no_rope_layers`); the head tied to the embedding or its own, its rows padded to a
-multiple of 16 (Granite's vocabulary of 49159). Gemma and Phi are not run yet.
+multiple of 16 (Granite's vocabulary of 49159); Gemma 3's text models (`gemma3_text`: 270M, 1B): the embedding times
+sqrt(Dim), norm weights read as 1 + w, each branch's output normed before it is added, a GELU (tanh form) gate,
+`query_pre_attn_scalar`, its sliding-window layers rotated by `rope_local_base_freq` and unscaled (`sliding_window_pattern`
+or `layer_types`). Gemma 3's larger, multimodal checkpoints (4B and up: `language_model.` names, a `text_config`) and
+Phi are not run yet.
 
 **Mixtures of experts** (Qwen3-MoE, Granite-MoE, OLMoE). Each row's router logits (F32) go through a softmax; the top
 k experts are kept, their weights renormalized where the config's `norm_topk_prob` says (Granite-MoE's softmax over the
@@ -102,7 +106,9 @@ first, the stretches between them split by the pre-tokenizer's pattern over the 
 Qwen2's (one digit a chunk), Llama 3's (up to three) or GPT-2's (ByteLevel's own regex: Granite, SmolLM), after
 SmolLM's Digits pre-tokenizer where there is one - and each chunk's bytes merged lowest rank first; where the model sets
 `ignore_merges` (Llama 3), a chunk the vocabulary holds whole is that token. A byte a vocabulary lacks (SmolLM's and
-Granite's lack some control bytes and bytes UTF-8 never has) is dropped, as the library drops it. It encodes as the tokenizers library does
+Granite's lack some control bytes and bytes UTF-8 never has) is dropped, as the library drops it. SentencePiece's BPE
+(Gemma's tokenizer.json; a Metaspace pre-tokenizer reads the same way) writes spaces as "▁", does not split the text,
+starts from its characters - one the vocabulary lacks as its UTF-8 bytes' `<0xXX>` tokens - and merges them by rank. It encodes as the tokenizers library does
 (checked on text in English, German, Chinese, Japanese, Korean, Russian, code, emoji and odd whitespace); the NFC
 normalizer is not applied, which matters only for text not already in NFC.
 
@@ -116,9 +122,9 @@ logits and ten greedy tokens. `llm/tools/tokref.py DIR ...` writes the tokenizer
 languages and scripts, code, numbers, emoji, whitespace) and the chat template's prompt. The tests read them where
 `$OANN_MODELS` has them: every position of every small model within 1e-4 on the exact path (on AMX's, BF16 activations,
 where a router may take another expert at a near tie: the mean difference within 1% and the same greedy token at 90% of
-positions); SmolLM2-135M, Llama-3.2-1B, Granite-3.3-2B and Granite-3.1-1B-A400M within 1e-3 of the largest logit over
+positions); SmolLM2-135M, Llama-3.2-1B, Granite-3.3-2B, Granite-3.1-1B-A400M and Gemma-3 270M and 1B (read after `<bos>`) within 1e-3 of the largest logit over
 the whole vocabulary and the same ten greedy tokens on the exact path, five on AMX's (Granite-3.3's sixth is a near tie
-that transformers in BF16 also takes the other way); the ids of Qwen3, Llama 3.2, SmolLM2 and Granite 3.3's tokenizers exactly the library's; the chat
+that transformers in BF16 also takes the other way); the ids of Qwen3, Llama 3.2, SmolLM2, Granite 3.3 and Gemma 3's tokenizers exactly the library's; the chat
 prompts exactly the templates'.
 
 The tests (`make test`) build small random Qwen2 and Qwen3 checkpoints and hold the AMX path to the exact one within
@@ -193,6 +199,7 @@ architectures known to run, and their licences (each model's own LICENSE file is
 | HuggingFaceTB/SmolLM3-3B | smollm3 | Apache 2.0 |
 | ibm-granite/granite-3.3-2b-instruct, granite-3.3-8b-instruct | granite | Apache 2.0 |
 | ibm-granite/granite-3.1-1b-a400m-instruct, granite-3.1-3b-a800m-instruct | granitemoe | Apache 2.0 |
+| google/gemma-3-270m-it, gemma-3-1b-it (ungated copies: unsloth/...) | gemma3_text | Gemma Terms of Use (use restrictions; not an open-source licence) |
 | allenai/OLMoE-1B-7B-0125-Instruct | olmoe | Apache 2.0 (14 GB in BF16: INT8 on 16 GB) |
 | Qwen/Qwen3-30B-A3B | qwen3_moe | Apache 2.0 (61 GB in BF16: does not fit a 16 GB machine yet) |
 | mistralai/Mistral-7B-Instruct-v0.3 | mistral | Apache 2.0 (its tokenizer is SentencePiece's: not read yet) |
