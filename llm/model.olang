@@ -90,6 +90,10 @@ type Config struct() {
     NormPlus F32 = 0.0      # added to every norm weight as it is read (Gemma's 1 + w)
     ThetaLocal F64 = 0.0    # the sliding-window layers' rope theta, unscaled (Gemma's rope_local_base_freq); 0: Theta
     FreqDiv mut Array<F64>& = Array<F64>(0)     # each rotary frequency divided by its factor (a GGUF's rope_freqs); empty: none
+    ImageToken I64 = -1     # a vision-language model's (llm/vision): the token standing for an image's embedded patches,
+    ImageTokens I64 = 0     # how many of them an image is,
+    ImageStart I64 = -1     # and the tokens around them
+    ImageEnd I64 = -1
 }
 
 # whether layer li rotates by the local frequencies (a window's, where ThetaLocal is set)
@@ -174,6 +178,18 @@ fn boolOr(j json.Json&, key String&, d Bool) Bool {
 fn Config.Parse(text String&) Config ? ModelError {
     j :~ try json.Json.Parse(text) catch { error ModelError.Malformed("config.json is not JSON") }
     c := Config()
+    # Gemma 3's vision-language models: the language model is text_config's, the image's tokens the top level's
+    if j.Has("text_config") and j.Has("vision_config") {
+        top :~ j
+        if (try (try top["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch default "") != "gemma3": error ModelError.Unsupported("a vision-language model other than Gemma 3's")
+        c.ImageToken = intOr(top, "image_token_index", -1)
+        c.ImageTokens = intOr(top, "mm_tokens_per_image", 256)
+        c.ImageStart = intOr(top, "boi_token_index", -1)
+        c.ImageEnd = intOr(top, "eoi_token_index", -1)
+        j ~ try top["text_config"] catch { error ModelError.Malformed("text_config") }
+        if not j.Has("model_type"): error ModelError.Malformed("text_config has no model_type")
+        c.Tied = true
+    }
     c.Arch = try (try j["model_type"] catch { error ModelError.Malformed("no model_type") }).AsStr() catch { error ModelError.Malformed("model_type") }
     known := false
     for a in Archs {
@@ -194,7 +210,7 @@ fn Config.Parse(text String&) Config ? ModelError {
     if intOr(j, "clip_qkv", 0) != 0: error ModelError.Unsupported("clip_qkv")
     if boolOr(j, "mlp_bias", false): error ModelError.Unsupported("mlp_bias")
     c.Bias = boolOr(j, "attention_bias", c.Arch == "qwen2")
-    c.Tied = boolOr(j, "tie_word_embeddings", false)
+    c.Tied = boolOr(j, "tie_word_embeddings", c.Tied)
     c.MaxPos = intOr(j, "max_position_embeddings", 32768)
     # rope_scaling, or transformers 5's rope_parameters (rope_theta in it)
     key :~ "rope_scaling" if j.Has("rope_scaling") else "rope_parameters"
@@ -424,6 +440,7 @@ type Weights struct(files Array<checkpoint.File>&, where Map<String, I64>, paths
     buf mut Array<U8>& = Array<U8>(0)
     row mut Array<F32>& = Array<F32>(0)
     gg mut Vec<gguf.File>& = Vec<gguf.File>()     # a GGUF file in place of the safetensors (its one element)
+    prefix String = ""      # what "model." is in the files (a vision-language model's language_model.model.)
     headDim I64 = 0
 }
 
@@ -512,12 +529,20 @@ fn Weights.Open(dir String&) Weights ? ModelError, os.Error {
     return Weights(files.ToArray(), where, paths.ToArray(), base.ToArray())
 }
 
+# a tensor's name as the files have it
+fn (w Weights&) named(name String&) String {
+    if w.prefix.Len() == 0: return name
+    if name.StartsWith("model."): return w.prefix + name["model.".Len():]
+    if name == "lm_head.weight": return w.prefix[:w.prefix.Len() - "model.".Len()] + "lm_head.weight"
+    return name
+}
+
 fn (w Weights&) Has(name String&) Bool {
     if w.gg.Len() > 0 {
         g, _ := ggufName(name)
         return w.gg[0].Has(g)
     }
-    return w.where.Has(name)
+    return w.where.Has(w.named(name))
 }
 
 # rows at..at + n of tensor "name" (each cols long; a tensor of 3 dimensions read as its rows one after another) as
@@ -534,10 +559,19 @@ fn (w mut Weights&) rowsOf(name String&, at I64, n I64, cols I64, dst mut Array<
         try w.gg.RefMut(0).Rows(g, first, n, dst, w.headDim) catch gguf.GgufError { error ModelError.Malformed("a read of " + g) }
         return
     }
-    e, k := try w.entry(name)
+    e, k := try w.entry(w.named(name))
     last := e.Shape[e.Shape.Len() - 1]
     total I64 = 1
     for d in range e.Shape.Len() - 1: total *= e.Shape[d]
+    if last != cols and e.Shape.Len() > 2 {
+        # a convolution's [out, channels, height, width]: rows of everything after the first
+        inner I64 = 1
+        for d in range 1, e.Shape.Len(): inner *= e.Shape[d]
+        if inner == cols {
+            last = cols
+            total = e.Shape[0]
+        }
+    }
     ok := e.Type == checkpoint.Dtype.BF16 or e.Type == checkpoint.Dtype.F16 or e.Type == checkpoint.Dtype.F32
     if not ok or last != cols or at + n > total.Max(1): error ModelError.Malformed(e.Key + " is " + $e.Shape + " " + e.Type.Name() + ", not rows of " + $cols)
     width := e.Type.Width()
@@ -618,6 +652,11 @@ fn (w mut Weights&) matrix(dst mut Array<F32>&, name String&, rows I64, cols I64
     try w.rowsOf(name, 0, rows, cols, dst)
 }
 
+# for other modules reading the same files (llm/vision): a matrix of rows x cols, a vector of n, F32
+fn (w mut Weights&) Matrix(dst mut Array<F32>&, name String&, rows I64, cols I64) ? ModelError { try w.matrix(dst, name, rows, cols) }
+
+fn (w mut Weights&) Vector(dst mut Array<F32>&, name String&, n I64) ? ModelError { try w.vector(dst, name, 0, n) }
+
 # a vector "name" of n elements into dst from "from"
 fn (w mut Weights&) vector(dst mut Array<F32>&, name String&, from I64, n I64) ? ModelError {
     v := Array<F32>(n)
@@ -652,6 +691,9 @@ fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = fa
     }
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
     w := try Weights.Open(dir)
+    for p in ["language_model.model.", "model.language_model."] {
+        if w.where.Has(p + "embed_tokens.weight"): w.prefix = p
+    }
     return try Model.From(c, w, exact, int8, int4)
 }
 
@@ -825,6 +867,9 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     Pos mut Array<I64>& = Array<I64>(Rows)          # its position,
     Slot mut Array<I64>& = Array<I64>(Rows)         # its sequence's slot in the cache,
     Out mut Array<I64>& = Array<I64>(Rows, -1)      # and where its logits go (-1: none)
+    Last mut Array<I64>& = Array<I64>(Rows)         # the last position it attends to (its own; an image's last for an image's rows)
+    Given mut Array<I64>& = Array<I64>(Rows, -1)    # where its embedding is in Embeds (-1: its token's)
+    Embeds mut Array<F32>& = Array<F32>(0)          # embeddings given in place of tokens' (an image's), Dim each
     NOut I64 = 0
     Times mut Array<I64>& = Array<I64>(4)           # ns in products, attention, the rest, steps
     SplitK Bool = true                              # a few rows' attention split by pages over the tasks
@@ -885,6 +930,19 @@ type Attend struct(c Config&, maxCtx I64, tile Bool) {
     vb mut Array<BF16>& = Array<BF16>(c.HeadDim * PageSize)
 }
 
+# adds a row whose embedding is e's row at (Dim wide, as the model's input: not scaled), at position pos of the
+# sequence in slot, attending to its sequence's positions to last (an image's rows see the whole image). Embeds grows
+# to hold it where it must (at most once a size)
+fn (s mut State&) AddGiven(e Array<F32>&, at I64, d I64, pos I64, last I64, slot I64, logits Bool) I64 {
+    j := s.Add(0, pos, slot, logits)
+    r := s.N - 1
+    if s.Embeds.Len() < s.Rows * d: s.Embeds ~ Array<F32>(s.Rows * d)
+    for i in range d: s.Embeds[r * d + i] = e[at * d + i]
+    s.Given[r] = r
+    s.Last[r] = last
+    return j
+}
+
 # clears the step's rows
 fn (s mut State&) Reset() {
     s.N = 0
@@ -896,6 +954,8 @@ fn (s mut State&) Add(tok I32, pos I64, slot I64, logits Bool) I64 {
     r := s.N
     s.Tok[r] = tok
     s.Pos[r] = pos
+    s.Last[r] = pos
+    s.Given[r] = -1
     s.Slot[r] = slot
     s.Out[r] = -1
     if logits {
@@ -1191,6 +1251,10 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
     # the embedding of each row's token
     for r in range n {
         t := I64(s.Tok[r])
+        if s.Given[r] >= 0 {
+            for i in range d: s.x[r * d + i] = s.Embeds[s.Given[r] * d + i]
+            continue
+        }
         if c.Tied {
             for i in range d: s.x[r * d + i] = m.Head.Get(t, i)
         } else {
@@ -1519,16 +1583,16 @@ fn (m Model&) attention(s mut State&, k Cache&, li I64) {
     items := s.N * m.C.KvHeads
     for it in range items {
         p := s.Pos[it / m.C.KvHeads]
-        np := p / PageSize + 1 - firstPos(m.C, li, p) / PageSize
+        np := s.Last[it / m.C.KvHeads] / PageSize + 1 - firstPos(m.C, li, p) / PageSize
         s.uoff[it + 1] = s.uoff[it] + ((np + ChunkPages - 1) / ChunkPages if s.SplitK else 1)
     }
     units := s.uoff[items]
     tasks := m.Threads.Min(units)
     if tasks <= 1 {
-        attendUnits(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Slot, k, li, 0, units, s.uoff, items, s.work[0], s.part)
+        attendUnits(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Last, s.Slot, k, li, 0, units, s.uoff, items, s.work[0], s.part)
     } else {
         join {
-            for t in range tasks: spawn attendUnits(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Slot, k, li, t * units / tasks, (t + 1) * units / tasks, s.uoff, items, s.work[t], s.part)
+            for t in range tasks: spawn attendUnits(m.C, m.Tile, s.qkv, s.att, s.Pos, s.Last, s.Slot, k, li, t * units / tasks, (t + 1) * units / tasks, s.uoff, items, s.work[t], s.part)
         }
     }
     if units > items: joinParts(m.C, s.att, s.part, s.uoff, items)
@@ -1590,7 +1654,7 @@ fn widen(dst mut Array<BF16>&, x Array<I8>&, o I64, n I64) {
 # units u0 .. u1: item it (row it / KvHeads, head group it % KvHeads) has units uoff[it] .. uoff[it + 1] - 1, a run of
 # ChunkPages of its pages each; an item of one unit writes its attention, the runs of a longer one their partial
 # softmaxes into part
-fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos Array<I64>&, slot Array<I64>&, k Cache&, li I64, u0 I64, u1 I64, uoff Array<I64>&, items I64, a mut Attend&, part mut Array<F32>&) {
+fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos Array<I64>&, last Array<I64>&, slot Array<I64>&, k Cache&, li I64, u0 I64, u1 I64, uoff Array<I64>&, items I64, a mut Attend&, part mut Array<F32>&) {
     hd := c.HeadDim
     g := c.Heads / c.KvHeads
     w3 := (c.Heads + 2 * c.KvHeads) * hd
@@ -1613,14 +1677,15 @@ fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
         r := it / c.KvHeads
         h := it % c.KvHeads
         p := pos[r]
-        np := p / PageSize + 1
+        e := last[r]
+        np := e / PageSize + 1
         first := firstPos(c, li, p)
         fp := first / PageSize                      # the window's first page
         pa := fp + (u - uoff[it]) * ChunkPages if chunks > 1 else fp
         pb := (pa + ChunkPages).Min(np) if chunks > 1 else np
         row := slot[r] * k.MaxPages
         n := (pb - pa) * PageSize                   # the positions of the run's pages
-        valid := (p + 1).Min(pb * PageSize) - pa * PageSize
+        valid := (e + 1).Min(pb * PageSize) - pa * PageSize
         skip := (first - pa * PageSize).Max(0)      # the run's positions before the window: weight 0
         if tile {
             for j in range g {

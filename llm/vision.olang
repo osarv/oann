@@ -1,0 +1,516 @@
+# llm/vision - Gemma 3's eyes: the SigLIP vision encoder and the projector that turn an image into the embeddings
+# llm/model reads in place of an image's tokens, as Hugging Face's Gemma3ForConditionalGeneration has them
+# (vision_tower.vision_model.*, multi_modal_projector.*; config.json's vision_config).
+#
+# An image, resized to Size x Size (896) and scaled to [-1, 1], is cut into patches of Patch x Patch pixels (14: 64 x 64
+# of them), each a linear map of its 3 Patch^2 values (the patch embedding, a convolution of stride Patch) plus its
+# position's embedding; then Layers pre-norm transformer blocks (LayerNorm with a bias, attention of every patch to
+# every patch, a GELU perceptron, biases everywhere) and a final LayerNorm. The projector averages each 4 x 4 square of
+# patches (64 x 64 -> 16 x 16: 256 embeddings), RMS-norms them (Gemma's 1 + w) and maps them into the language model's
+# width. The language model reads them unscaled between its <start_of_image> and <end_of_image> tokens, every one of
+# them attending to the whole image (llm/model's State.AddGiven).
+#
+# Products as llm/model's are: BF16 weights, and on AMX the activations rounded to BF16 with F32 sums (kernels/gemm's
+# tiles), the outputs split over the cores; elsewhere F32 activations times the weights widened.
+
+import "std/json"
+import "std/os"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../kernels/elem"
+import "model"
+
+type VisionConfig struct() {
+    Dim I64                 # hidden_size (1152)
+    Layers I64
+    Heads I64
+    Ffn I64                 # intermediate_size
+    Patch I64               # patch_size (14)
+    Size I64                # image_size (896)
+    Eps F64                 # layer_norm_eps
+    Side I64 = 0            # patches a side (64)
+    Pooled I64 = 0          # embeddings a side after pooling (16)
+    Out I64 = 0             # the language model's width
+}
+
+fn VisionConfig.Parse(text String&) VisionConfig ? model.ModelError {
+    top :~ try json.Json.Parse(text) catch { error model.ModelError.Malformed("config.json is not JSON") }
+    if not top.Has("vision_config"): error model.ModelError.Unsupported("no vision_config: not a vision-language model")
+    j :~ try top["vision_config"] catch { error model.ModelError.Malformed("vision_config") }
+    t :~ try top["text_config"] catch { error model.ModelError.Malformed("text_config") }
+    c := VisionConfig()
+    c.Dim = num(j, "hidden_size", 1152)
+    c.Layers = num(j, "num_hidden_layers", 27)
+    c.Heads = num(j, "num_attention_heads", 16)
+    c.Ffn = num(j, "intermediate_size", 4304)
+    c.Patch = num(j, "patch_size", 14)
+    c.Size = num(j, "image_size", 896)
+    c.Eps = try (try j["layer_norm_eps"] catch { return c.finish(top, t) }).AsNum() catch default 1e-6
+    return c.finish(top, t)
+}
+
+fn (c VisionConfig) finish(top json.Json&, t json.Json&) VisionConfig {
+    d := c
+    if d.Eps == 0.0: d.Eps = 1e-6
+    d.Side = d.Size / d.Patch
+    tokens := num(top, "mm_tokens_per_image", 256)
+    per := 1
+    for per * per < tokens: per++
+    d.Pooled = per
+    d.Out = num(t, "hidden_size", 0)
+    return d
+}
+
+fn num(j json.Json&, key String&, dflt I64) I64 { return try (try j[key] catch { return dflt }).AsInt() catch default dflt }
+
+# y = x W^T + b: W [Out x In] BF16, row-major
+type VLin struct(In I64, Out I64) {
+    In
+    Out
+    W mut Array<BF16>& = Array<BF16>(In * Out)
+    Bias mut Array<F32>& = Array<F32>(Out)
+}
+
+type LayerNorm struct(n I64) {
+    G mut Array<F32>& = Array<F32>(n)
+    B mut Array<F32>& = Array<F32>(n)
+}
+
+type VBlock struct(c VisionConfig&) {
+    Ln1 LayerNorm = LayerNorm(c.Dim)
+    Qkv VLin = VLin(c.Dim, 3 * c.Dim)
+    O VLin = VLin(c.Dim, c.Dim)
+    Ln2 LayerNorm = LayerNorm(c.Dim)
+    Fc1 VLin = VLin(c.Dim, c.Ffn)
+    Fc2 VLin = VLin(c.Ffn, c.Dim)
+}
+
+type Vision struct(C VisionConfig, Tile Bool) {
+    C
+    Tile                    # BF16 activations on AMX tiles; else F32
+    PatchEmbed VLin = VLin(3 * C.Patch * C.Patch, C.Dim)
+    Pos mut Array<F32>& = Array<F32>(C.Side * C.Side * C.Dim)
+    made := Vec<VBlock>()
+    for _ in range C.Layers: made.Push(VBlock(C))
+    Blocks mut Array<VBlock>& = made.ToArray()
+    Post LayerNorm = LayerNorm(C.Dim)
+    SoftNorm mut Array<F32>& = Array<F32>(C.Dim)
+    Proj VLin = VLin(C.Dim, C.Out)
+    Threads I64 = gemm.Cores()
+}
+
+# ---- loading ----
+
+# the vision tower and projector of the Gemma 3 checkpoint in dir
+fn Vision.Load(dir String&, exact Bool = false) Vision ? model.ModelError, os.Error {
+    c := try VisionConfig.Parse(try os.ReadFile(dir + "/config.json"))
+    v := Vision(c, TargetHasTileDot and not exact)
+    w := try model.Weights.Open(dir)
+    p := "vision_tower.vision_model."
+    pe := Array<F32>(c.Dim * 3 * c.Patch * c.Patch)
+    try w.Matrix(pe, p + "embeddings.patch_embedding.weight", c.Dim, 3 * c.Patch * c.Patch)
+    for i in range pe.Len(): v.PatchEmbed.W[i] = BF16(pe[i])
+    try w.Vector(v.PatchEmbed.Bias, p + "embeddings.patch_embedding.bias", c.Dim)
+    try w.Matrix(v.Pos, p + "embeddings.position_embedding.weight", c.Side * c.Side, c.Dim)
+    for i in range c.Layers {
+        q := p + "encoder.layers." + $i + "."
+        b := v.Blocks[i]
+        try norm(w, b.Ln1, q + "layer_norm1")
+        try norm(w, b.Ln2, q + "layer_norm2")
+        try lin(w, b.Qkv, q + "self_attn.q_proj", 0, c.Dim)
+        try lin(w, b.Qkv, q + "self_attn.k_proj", c.Dim, c.Dim)
+        try lin(w, b.Qkv, q + "self_attn.v_proj", 2 * c.Dim, c.Dim)
+        try lin(w, b.O, q + "self_attn.out_proj", 0, c.Dim)
+        try lin(w, b.Fc1, q + "mlp.fc1", 0, c.Ffn)
+        try lin(w, b.Fc2, q + "mlp.fc2", 0, c.Dim)
+    }
+    try norm(w, v.Post, p + "post_layernorm")
+    try w.Vector(v.SoftNorm, "multi_modal_projector.mm_soft_emb_norm.weight", c.Dim)
+    # the projection is stored [vision width x text width]: y = x P, so W = P^T
+    pr := Array<F32>(c.Dim * c.Out)
+    try w.Matrix(pr, "multi_modal_projector.mm_input_projection_weight", c.Dim, c.Out)
+    for i in range c.Dim {
+        for o in range c.Out: v.Proj.W[o * c.Dim + i] = BF16(pr[i * c.Out + o])
+    }
+    return v
+}
+
+# rows from .. from + rows of l from "name.weight" ([rows, In]) and its bias
+fn lin(w mut model.Weights&, l mut VLin&, name String&, from I64, rows I64) ? model.ModelError {
+    m := Array<F32>(rows * l.In)
+    try w.Matrix(m, name + ".weight", rows, l.In)
+    for i in range rows * l.In: l.W[from * l.In + i] = BF16(m[i])
+    b := Array<F32>(rows)
+    try w.Vector(b, name + ".bias", rows)
+    for i in range rows: l.Bias[from + i] = b[i]
+}
+
+fn norm(w mut model.Weights&, n mut LayerNorm&, name String&) ? model.ModelError {
+    try w.Vector(n.G, name + ".weight", n.G.Len())
+    try w.Vector(n.B, name + ".bias", n.B.Len())
+}
+
+# ---- running ----
+
+# an image's buffers: its n patches through the blocks
+type Seeing struct(v Vision&) {
+    n I64 = v.C.Side * v.C.Side
+    x mut Array<F32>& = Array<F32>(n * v.C.Dim)
+    h mut Array<F32>& = Array<F32>(n * v.C.Dim)
+    qkv mut Array<F32>& = Array<F32>(n * 3 * v.C.Dim)
+    att mut Array<F32>& = Array<F32>(n * v.C.Dim)
+    f mut Array<F32>& = Array<F32>(n * v.C.Ffn.Max(3 * v.C.Patch * v.C.Patch))
+    xb mut Array<BF16>& = Array<BF16>(n * v.C.Ffn.Max(3 * v.C.Patch * v.C.Patch) if v.Tile else 0)
+    yb mut Array<BF16>& = Array<BF16>(n * 3 * v.C.Dim if v.Tile else 0)
+    tasks I64 = v.Threads.Min(v.C.Heads)
+    s mut Array<F32>& = Array<F32>(tasks * n * n)
+    pb mut Array<BF16>& = Array<BF16>(tasks * n * n if v.Tile else 0)
+    made := Vec<gemm.Workspace<F32>>()
+    for _ in range v.Threads: made.Push(gemm.Workspace<F32>(1, n.Max(v.C.Ffn)))
+    ws mut Array<gemm.Workspace<F32>>& = made.ToArray()
+}
+
+# the embeddings of the image pixels ([3 x Size x Size], channel-major, scaled to [-1, 1]) for the language model:
+# Pooled^2 rows of Out, row-major, into out
+fn (v Vision&) Embed(e mut Seeing&, pixels Array<F32>&, out mut Array<F32>&) {
+    c := v.C
+    d := c.Dim
+    n := e.n
+    pp := c.Patch * c.Patch
+    # patch (py, px)'s values in the convolution's order: channel, row, column
+    for py in range c.Side {
+        for px in range c.Side {
+            o := (py * c.Side + px) * 3 * pp
+            for ch in range 3 {
+                for ky in range c.Patch {
+                    src := ch * c.Size * c.Size + (py * c.Patch + ky) * c.Size + px * c.Patch
+                    for kx in range c.Patch: e.f[o + ch * pp + ky * c.Patch + kx] = pixels[src + kx]
+                }
+            }
+        }
+    }
+    v.lin(e, e.x, e.f, n, v.PatchEmbed)
+    for i in range n * d: e.x[i] += v.Pos[i]
+    for b in v.Blocks: v.block(e, b)
+    v.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, v.Post, c.Eps) })
+    # 4 x 4 squares of patches averaged, RMS-normed (1 + w), projected
+    k := c.Side / c.Pooled
+    np := c.Pooled * c.Pooled
+    for qy in range c.Pooled {
+        for qx in range c.Pooled {
+            o := (qy * c.Pooled + qx) * d
+            for i in range d: e.att[o + i] = 0.0
+            for dy in range k {
+                for dx in range k {
+                    src := ((qy * k + dy) * c.Side + qx * k + dx) * d
+                    for i in range d: e.att[o + i] += e.h[src + i]
+                }
+            }
+            inv := 1.0 / F32(k * k)
+            for i in range d: e.att[o + i] *= inv
+            ss F64 = 0.0
+            for i in range d: ss += F64(e.att[o + i]) * F64(e.att[o + i])
+            r := F32(1.0 / (ss / F64(d) + c.Eps).Sqrt())
+            for i in range d: e.att[o + i] = e.att[o + i] * r * (1.0 + v.SoftNorm[i])
+        }
+    }
+    v.lin(e, out, e.att, np, v.Proj)
+}
+
+fn (v Vision&) block(e mut Seeing&, b VBlock&) {
+    c := v.C
+    d := c.Dim
+    n := e.n
+    v.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, b.Ln1, c.Eps) })
+    v.lin(e, e.qkv, e.h, n, b.Qkv)
+    v.attend(e)
+    v.lin(e, e.h, e.att, n, b.O)
+    for i in range n * d: e.x[i] += e.h[i]
+    v.rows(n, fn(r0 I64, r1 I64) { layerNorm(e.h, e.x, d, r0, r1, b.Ln2, c.Eps) })
+    v.lin(e, e.f, e.h, n, b.Fc1)
+    v.rows(n, fn(r0 I64, r1 I64) { geluTanh(e.f, r0 * c.Ffn, r1 * c.Ffn) })
+    v.lin(e, e.h, e.f, n, b.Fc2)
+    for i in range n * d: e.x[i] += e.h[i]
+}
+
+# f(rows r0 .. r1) over the cores
+fn (v Vision&) rows(n I64, f fn&(r0 I64, r1 I64)) {
+    t := v.Threads.Min(n).Max(1)
+    join {
+        for i in range t: spawn f(i * n / t, (i + 1) * n / t)
+    }
+}
+
+# dst[: rows, : Out] = src[: rows, : In] W^T + b, the outputs split over the cores in multiples of 16
+fn (v Vision&) lin(e mut Seeing&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w VLin&) {
+    if v.Tile: v.rows(rows, fn(r0 I64, r1 I64) { round(e.xb, src, r0 * w.In, r1 * w.In) })
+    t := v.Threads.Min(w.Out / 16).Max(1)
+    join {
+        for i in range t: spawn part(e.ws[i], dst, src, e.xb, rows, w, (i * w.Out / t) / 16 * 16, ((i + 1) * w.Out / t) / 16 * 16 if i + 1 < t else w.Out, v.Tile)
+    }
+}
+
+fn part(ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, xb mut Array<BF16>&, rows I64, w VLin&, o0 I64, o1 I64, tile Bool) {
+    c := mat.Mat<F32>(dst, o0, rows, o1 - o0, w.Out)
+    epi := gemm.Epilogue.Bias(w.Bias[o0:o1])
+    b := mat.Mat<BF16>(w.W, o0 * w.In, o1 - o0, w.In, w.In)
+    if tile {
+        gemm.Gemm(ws, c, mat.Mat<BF16>(xb, 0, rows, w.In, w.In), false, b, true, epi = epi)
+        return
+    }
+    gemm.Gemm(ws, c, mat.Mat<F32>(src, 0, rows, w.In, w.In), false, b, true, epi = epi)
+}
+
+# every patch's attention to every patch, a run of heads a task: the queries scaled by head^-1/2, the scores, their
+# softmax, the weighted values
+fn (v Vision&) attend(e mut Seeing&) {
+    c := v.C
+    d := c.Dim
+    n := e.n
+    hd := d / c.Heads
+    scale := F32(1.0 / F64(hd).Sqrt())
+    v.rows(n, fn(r0 I64, r1 I64) { scaleQueries(e.qkv, d, scale, r0, r1) })
+    if v.Tile: v.rows(n, fn(r0 I64, r1 I64) { round(e.yb, e.qkv, r0 * 3 * d, r1 * 3 * d) })
+    t := e.tasks
+    join {
+        for i in range t: spawn heads(e.ws[i], e.att, e.qkv, e.yb, e.s[i * n * n:(i + 1) * n * n], e.pb[i * n * n:(i + 1) * n * n] if v.Tile else e.pb, n, d, hd, i * c.Heads / t, (i + 1) * c.Heads / t, v.Tile)
+    }
+}
+
+fn heads(ws mut gemm.Workspace<F32>&, att mut Array<F32>&, qkv mut Array<F32>&, yb mut Array<BF16>&, s mut Array<F32>&, pb mut Array<BF16>&, n I64, d I64, hd I64, h0 I64, h1 I64, tile Bool) {
+    sm := mat.Mat<F32>(s, 0, n, n, n)
+    for h in range h0, h1 {
+        o := mat.Mat<F32>(att, h * hd, n, hd, d)
+        if tile {
+            gemm.Gemm(ws, sm, mat.Mat<BF16>(yb, h * hd, n, hd, 3 * d), false, mat.Mat<BF16>(yb, d + h * hd, n, hd, 3 * d), true)
+            softmax(s, n, 0, n)
+            round(pb, s, 0, n * n)
+            gemm.Gemm(ws, o, mat.Mat<BF16>(pb, 0, n, n, n), false, mat.Mat<BF16>(yb, 2 * d + h * hd, n, hd, 3 * d), false)
+            continue
+        }
+        gemm.Gemm(ws, sm, mat.Mat<F32>(qkv, h * hd, n, hd, 3 * d), false, mat.Mat<F32>(qkv, d + h * hd, n, hd, 3 * d), true)
+        softmax(s, n, 0, n)
+        gemm.Gemm(ws, o, mat.Mat<F32>(s, 0, n, n, n), false, mat.Mat<F32>(qkv, 2 * d + h * hd, n, hd, 3 * d), false)
+    }
+}
+
+fn scaleQueries(qkv mut Array<F32>&, d I64, scale F32, r0 I64, r1 I64) {
+    for r in range r0, r1 {
+        for i in range d: qkv[r * 3 * d + i] *= scale
+    }
+}
+
+fn round(dst mut Array<BF16>&, src Array<F32>&, from I64, to I64) {
+    for i in range from, to: dst[i] = BF16(src[i])
+}
+
+# LayerNorm of rows r0 .. r1 of x (n wide) into y, statistics in F64
+fn layerNorm(y mut Array<F32>&, x Array<F32>&, n I64, r0 I64, r1 I64, g LayerNorm&, eps F64) {
+    for r in range r0, r1 {
+        o := r * n
+        s F64 = 0.0
+        for i in range n: s += F64(x[o + i])
+        mean := s / F64(n)
+        q F64 = 0.0
+        for i in range n: q += (F64(x[o + i]) - mean) * (F64(x[o + i]) - mean)
+        inv := 1.0 / (q / F64(n) + eps).Sqrt()
+        for i in range n: y[o + i] = F32((F64(x[o + i]) - mean) * inv) * g.G[i] + g.B[i]
+    }
+}
+
+# GELU's tanh form (gelu_pytorch_tanh) of x[from .. to]
+fn geluTanh(x mut Array<F32>&, from I64, to I64) {
+    for i in range from, to {
+        u := x[i]
+        x[i] = 0.5 * u * (1.0 + (F32(0.7978845608028654) * (u + 0.044715 * u * u * u)).Tanh())
+    }
+}
+
+# each of rows r0 .. r1 of s (n wide) the softmax of itself
+fn softmax(s mut Array<F32>&, n I64, r0 I64, r1 I64) {
+    for r in range r0, r1 {
+        o := r * n
+        top := elem.MaxIn<F32, F32>(s, o, n)
+        for i in range n: s[o + i] = elem.FastExp(s[o + i] - top)
+        inv := F32(1.0 / elem.SumIn<F32, F64>(s, o, n))
+        for i in range n: s[o + i] *= inv
+    }
+}
+
+# ---- an image's pixels ----
+
+# the RGB bytes of an image (w x h, row-major, 3 a pixel) as the vision tower reads them: resized to Size x Size
+# (PIL's bilinear, as the Gemma 3 processor resizes), scaled to [0, 1] and normalized to [-1, 1], channel-major
+fn (v Vision&) Pixels(rgb Array<U8>&, w I64, h I64) Array<F32> {
+    sz := v.C.Size
+    r := Resize(rgb, w, h, sz, sz)
+    out := Array<F32>(3 * sz * sz)
+    for i in range sz * sz {
+        for ch in range 3: out[ch * sz * sz + i] = (F32(r[3 * i + ch]) * F32(0.00392156862745098) - 0.5) / 0.5
+    }
+    return out
+}
+
+# PIL's 8-bit resampling: weights of a bilinear (triangle) filter, widened by the scale when shrinking (antialiased),
+# normalized and made 22-bit fixed point; a horizontal pass then a vertical one, each rounded back to bytes
+fn Resize(rgb Array<U8>&, w I64, h I64, ow I64, oh I64) Array<U8> {
+    mid := Array<U8>(ow * h * 3)
+    kx, bx, nx := coeffs(w, ow)
+    for y in range h {
+        for x in range ow {
+            for ch in range 3 {
+                ss I64 = 1 << 21
+                for t in range nx[x]: ss += I64(rgb[(y * w + bx[x] + t) * 3 + ch]) * kx[x * kx.Len() / ow + t]
+                mid[(y * ow + x) * 3 + ch] = U8((ss >> 22).Max(0).Min(255))
+            }
+        }
+    }
+    out := Array<U8>(ow * oh * 3)
+    ky, by, ny := coeffs(h, oh)
+    for y in range oh {
+        for x in range ow {
+            for ch in range 3 {
+                ss I64 = 1 << 21
+                for t in range ny[y]: ss += I64(mid[((by[y] + t) * ow + x) * 3 + ch]) * ky[y * ky.Len() / oh + t]
+                out[(y * ow + x) * 3 + ch] = U8((ss >> 22).Max(0).Min(255))
+            }
+        }
+    }
+    return out
+}
+
+# each output's fixed-point weights (ksize of them an output), its first input and its count of inputs
+fn coeffs(inSize I64, outSize I64) Array<I64>, Array<I64>, Array<I64> {
+    scale := F64(inSize) / F64(outSize)
+    fs := scale.Max(1.0)
+    support := fs
+    ksize := I64(support.Ceil()) * 2 + 1
+    k := Array<I64>(outSize * ksize)
+    first := Array<I64>(outSize)
+    count := Array<I64>(outSize)
+    pre := Array<F64>(ksize)
+    for xx in range outSize {
+        center := (F64(xx) + 0.5) * scale
+        lo := I64(center - support + 0.5).Max(0)
+        hi := I64(center + support + 0.5).Min(inSize) - lo
+        total F64 = 0.0
+        for x in range hi {
+            u := ((F64(x + lo) - center + 0.5) / fs).Abs()
+            pre[x] = 1.0 - u if u < 1.0 else 0.0
+            total += pre[x]
+        }
+        for x in range hi {
+            q := pre[x] / total if total != 0.0 else pre[x]
+            k[xx * ksize + x] = I64((q * 4194304.0 - 0.5).Trunc()) if q < 0.0 else I64((q * 4194304.0 + 0.5).Trunc())
+        }
+        first[xx] = lo
+        count[xx] = hi
+    }
+    return k, first, count
+}
+
+# ---- reading an image in a prompt ----
+
+# the rows of tokens toks (one sequence, in slot, from position 0) into s, an image's tokens (c.ImageToken) given the
+# rows of embeds (Pooled^2 of them an image, in order) and each seeing its whole image; logits for the last row
+fn Prompt(s mut model.State&, c model.Config&, toks Array<I32>&, embeds Array<F32>&, slot I64) {
+    img I64 = 0
+    for i, t in toks {
+        want := i == toks.Len() - 1
+        if I64(t) != c.ImageToken {
+            s.Add(t, I64(i), slot, want)
+            continue
+        }
+        # the image's last position: its run of image tokens ends there
+        last := i
+        for last + 1 < toks.Len() and I64(toks[last + 1]) == c.ImageToken: last++
+        s.AddGiven(embeds, img, c.Dim, I64(i), I64(last), slot, want)
+        img++
+    }
+}
+
+# ---- tests ----
+
+fn readF32(path String&) Array<F32> {
+    f := os.File.Open(path)!
+    n := os.FileInfo.Stat(path)!.Size
+    b := Array<U8>(n)
+    got I64 = 0
+    for got < n {
+        piece :~ f.Read(b[got:])!
+        if piece.Len() == 0: break
+        got += piece.Len()
+    }
+    return Array<F32>[F32.FromBits(U32(b[4 * i]) | (U32(b[4 * i + 1]) << 8) | (U32(b[4 * i + 2]) << 16) | (U32(b[4 * i + 3]) << 24)) for i in range n / 4]
+}
+
+test Vision "makes the processor's pixels from an image's bytes: PIL's bilinear resize, bit for bit, where $OANN_MODELS has Gemma 3 4B" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    dir := root + "/unsloth--gemma-3-4b-it"
+    if root.Len() == 0 or not os.Exists(dir + "/vision_test.rgb"): return
+    c := VisionConfig.Parse(os.ReadFile(dir + "/config.json")!)!
+    v := Vision(c, false)
+    f := os.File.Open(dir + "/vision_test.rgb")!
+    rgb := Array<U8>(640 * 480 * 3)
+    got I64 = 0
+    for got < rgb.Len() {
+        piece :~ f.Read(rgb[got:])!
+        got += piece.Len()
+    }
+    px := v.Pixels(rgb, 640, 480)
+    want := readF32(dir + "/vision_pixels.f32")
+    worst F32 = 0.0
+    for i in range want.Len(): worst = worst.Max((px[i] - want[i]).Abs())
+    assert worst < 1e-5, "pixels differ by " + $worst
+}
+
+# llm/tools/visionref.py's references for unsloth--gemma-3-4b-it under $OANN_MODELS
+test Vision "embeds the reference image as transformers does, and the model describes it with the same words, where $OANN_MODELS has Gemma 3 4B" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    dir := root + "/unsloth--gemma-3-4b-it"
+    if root.Len() == 0 or not os.Exists(dir + "/vision_ref.json"): return
+    v := Vision.Load(dir)!
+    e := Seeing(v)
+    pixels := readF32(dir + "/vision_pixels.f32")
+    want := readF32(dir + "/vision_embeds.f32")
+    got := Array<F32>(want.Len())
+    v.Embed(e, pixels, got)
+    diff F64 = 0.0
+    size F64 = 0.0
+    for i in range want.Len() {
+        diff += F64((got[i] - want[i]).Abs())
+        size += F64(want[i].Abs())
+    }
+    assert diff / size < 0.02, "the image's embeddings: mean difference " + $(diff / size) + " of the mean magnitude"
+    m := model.Model.Load(dir)!
+    j :~ json.Json.Parse(os.ReadFile(dir + "/vision_ref.json")!)!
+    toks := Array<I32>[I32(t.AsInt()!) for t in j["tokens"]!.AsArr()!]
+    cont := Array<I32>[I32(t.AsInt()!) for t in j["greedy"]!.AsArr()!]
+    k := model.Cache(m.C, 16, 1, 16)
+    for i in range 16: k.Table[i] = k.Take()
+    s := model.State(m, toks.Len(), toks.Len(), 1024)
+    Prompt(s, m.C, toks, got, 0)
+    m.Step(s, k)
+    # the reference's tokens fed back (its language model is BF16, so a near tie may turn either way): at each step
+    # ours is the same, or the reference's is within 1 of ours
+    last := Array<F32>[F32(x.AsNum()!) for x in j["last"]!.AsArr()!]
+    lg0 :~ s.LogitsOf(s.NOut - 1, m.C.Vocab)
+    gap F64 = 0.0
+    for x in range last.Len(): gap += F64((lg0[x] - last[x]).Abs())
+    assert gap / F64(last.Len()) < 0.05 * F64(elem.MaxIn<F32, F32>(last, 0, last.Len())), "the prompt's logits: mean difference " + $(gap / F64(last.Len()))
+    same I64 = 0
+    for step in range 10 {
+        lg :~ s.LogitsOf(s.NOut - 1, m.C.Vocab)
+        best I64 = 0
+        for x in range m.C.Vocab {
+            if lg[x] > lg[best]: best = x
+        }
+        ref := I64(cont[step])
+        if best == ref: same++
+        assert best == ref or lg[ref] > lg[best] - 1.0, "step " + $step + ": " + $best + " (" + $lg[best] + "), the reference's " + $ref + " at " + $lg[ref]
+        s.Reset()
+        s.Add(cont[step], I64(toks.Len() + step), 0, true)
+        m.Step(s, k)
+    }
+    assert same >= 8, "the same token at " + $same + " of 10 steps"
+}
