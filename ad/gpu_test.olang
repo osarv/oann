@@ -15,6 +15,9 @@ import "../kernels/device"
 import gdev "../kernels/gpu/device"
 import "../kernels/gpu/kern"
 import "../models/gpt"
+import "../models/qwen"
+import "../llm/model"
+import "std/os"
 import "../nn/optim"
 import "../nn/train"
 import "../tensor"
@@ -738,6 +741,69 @@ fn frozenCase() {
 }
 
 test frozenCase "a frozen weight on the GPU goes up once, not at every Forward, and again only when the host set it; forward and backward within rounding of the CPU's" { frozenCase() }
+
+# Qwen3 as a graph of frozen weights (models/qwen) on both backends, in T: the logits of a batch of 2 x 24 tokens and the
+# largest difference against the largest logit; the frozen weights went up once over two Forwards
+fn qwenOn<T>(m model.Model&) F64, F64 {
+    cpu mut graph.Graph<T>& = graph.Graph<T>(2)
+    gpu mut graph.Graph<T>& = graph.Graph<T>(2)
+    qc := qwen.Qwen.New(cpu, m.C, 24)!
+    qg := qwen.Qwen.New(gpu, m.C, 24)!
+    lc := qc.Lm(cpu)
+    lg := qg.Lm(gpu)
+    try cpu.Plan(rand.Rand(1), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    qc.Fill(cpu, m)
+    qg.Fill(gpu, m)
+    feedQwen(cpu, lc, m.C.Vocab)
+    feedQwen(gpu, lg, m.C.Vocab)
+    assert gpu.FrozenUploads() == qwenFrozen(m.C), "frozen weights went up " + $gpu.FrozenUploads() + " times"
+    a := cpu.Value(lc.Logits).Flat()!
+    b := gpu.Value(lg.Logits).Flat()!
+    w, big := F64(0.0), F64(0.0)
+    for i in range a.Len() {
+        w = w.Max((F64(a[i]) - F64(b[i])).Abs())
+        big = big.Max(F64(a[i]).Abs())
+    }
+    return w, big
+}
+
+# the same tokens and targets from one seed, then two Forwards
+fn feedQwen<T>(g mut graph.Graph<T>&, lm train.LanguageModel&, vocab I64) {
+    r := rand.Rand(7)
+    tc :~ g.Ints(lm.Tokens).Flat()!
+    yc :~ g.Ints(lm.Targets).Flat()!
+    for i in range tc.Len() {
+        tc[i] = I32(r.Below(vocab))
+        yc[i] = I32(r.Below(vocab))
+    }
+    g.Forward(2)
+    g.Forward(2)
+}
+
+# the frozen weights of a Qwen graph of config c
+fn qwenFrozen(c model.Config&) I64 {
+    block := 9 + (3 if c.Bias else 0) + (2 if c.QkNorm else 0)
+    return 2 + c.Layers * block + (0 if c.Tied else 1)
+}
+
+fn qwenCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("Qwen3 as a graph")
+        return
+    }
+    for tied in [true, false] {
+        dir := model.TinyTied(true, 3, tied)
+        m := model.Model.Load(dir, true)!
+        w, big := qwenOn<F32>(m)
+        assert w <= 2.0e-4 * big, "Qwen3 F32 (tied " + $tied + "): the logits differ by " + $w + " of " + $big
+        wb, bigb := qwenOn<BF16>(m)
+        assert wb <= 0.02 * bigb, "Qwen3 BF16 (tied " + $tied + "): the logits differ by " + $wb + " of " + $bigb
+        os.RemoveAll(dir)!
+    }
+}
+
+test qwenCase "Qwen3 of frozen weights on the GPU, F32 and BF16, grouped heads by Expand: the CPU's logits within rounding, each weight uploaded once" { qwenCase() }
 
 # GP8: views on the GPU - Permute (rank 3 and 4, of a parameter, of a view), Slice (a middle axis and the last, of a
 # view), Expand (of a slice, of a parameter, then permuted) - each read through a Contiguous copy, and their gradients

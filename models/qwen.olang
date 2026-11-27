@@ -1,0 +1,232 @@
+# models/qwen - Qwen3 (and Qwen2) as a graph: the open-weight decoder llm/model runs for inference, recorded on ad/graph
+# so it can be fine-tuned. Its weights are frozen (graph.Frozen: no gradient, no optimizer state, resident on the GPU),
+# filled from a checkpoint llm/model loaded; gradients flow through them to whatever is trained beside them.
+#
+# A block, as the Hugging Face model has it: x + attention(RMSNorm(x)), then + SwiGLU(RMSNorm(.)). Attention projects
+# to Heads query heads and KvHeads key and value heads of HeadDim (Qwen3: each head RMS-normed by its own gain first),
+# rotates queries and keys (rotary positions, the config's theta), repeats each key and value head Heads / KvHeads
+# times by an Expand view, and runs causal attention. The head is the embedding (tied) or a matrix of its own.
+#
+# Use: `q := Qwen.New(g, cfg, ctx)?` records the layers before Plan, `q.Lm(g)` the tokens, logits and loss, then after
+# Plan `q.Fill(g, m)` copies the weights of `model.Model.Load(dir, true)` (exact: row-major) into the graph.
+
+import "../ad/graph"
+import "../nn/train"
+import "../llm/model"
+import "../kernels/mat"
+
+# one block's weights: [out, in] matrices, vectors of their width; a bias None where the config has none
+type QwenBlock struct() {
+    Norm1 graph.Var = graph.None
+    Q graph.Var = graph.None
+    K graph.Var = graph.None
+    V graph.Var = graph.None
+    QBias graph.Var = graph.None
+    KBias graph.Var = graph.None
+    VBias graph.Var = graph.None
+    QNorm graph.Var = graph.None
+    KNorm graph.Var = graph.None
+    O graph.Var = graph.None
+    Norm2 graph.Var = graph.None
+    Gate graph.Var = graph.None
+    Up graph.Var = graph.None
+    Down graph.Var = graph.None
+}
+
+type Qwen struct(Config model.Config, Ctx I64, Embed graph.Var, Blocks Array<QwenBlock>, Final graph.Var, Head graph.Var) {
+    Config
+    Ctx         # the positions a sequence has
+    Embed
+    Blocks
+    Final
+    Head        # Embed where tied
+}
+
+# the model of config c as frozen weights on g, for sequences of ctx positions
+fn Qwen.New<T>(g mut graph.Graph<T>&, c model.Config, ctx I64) Qwen ? model.ModelError {
+    if c.PosScale != 1.0: error model.ModelError.Unsupported("scaled rotary positions in a graph")
+    q, kv, d := c.Heads * c.HeadDim, c.KvHeads * c.HeadDim, c.Dim
+    table := g.Frozen(c.Vocab, d)
+    blocks := Vec<QwenBlock>()
+    for _ in range c.Layers {
+        b := QwenBlock()
+        b.Norm1 = g.Frozen(d)
+        b.Q = g.Frozen(q, d)
+        b.K = g.Frozen(kv, d)
+        b.V = g.Frozen(kv, d)
+        if c.Bias {
+            b.QBias = g.Frozen(q)
+            b.KBias = g.Frozen(kv)
+            b.VBias = g.Frozen(kv)
+        }
+        if c.QkNorm {
+            b.QNorm = g.Frozen(c.HeadDim)
+            b.KNorm = g.Frozen(c.HeadDim)
+        }
+        b.O = g.Frozen(d, q)
+        b.Norm2 = g.Frozen(d)
+        b.Gate = g.Frozen(c.Ffn, d)
+        b.Up = g.Frozen(c.Ffn, d)
+        b.Down = g.Frozen(d, c.Ffn)
+        blocks.Push(b)
+    }
+    final := g.Frozen(d)
+    head := table if c.Tied else g.Frozen(c.Vocab, d)
+    return Qwen(c, ctx, table, blocks.ToArray(), final, head)
+}
+
+# x [b, t, heads hd]: each head RMS-normed with gain (Qwen3's QK-norm)
+fn (m Qwen&) headNorm<T>(g mut graph.Graph<T>&, x graph.Var, heads I64, gain graph.Var) graph.Var {
+    hd := m.Config.HeadDim
+    n := g.Norm(g.Reshape(x, m.Ctx, heads, hd), gain, graph.None, true, m.Config.Eps)
+    return g.Reshape(n, m.Ctx, heads * hd)
+}
+
+# x [b, t, KvHeads hd] with each head repeated Heads / KvHeads times in place: [b, t, Heads hd]
+fn (m Qwen&) repeat<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
+    c := m.Config
+    if c.KvHeads == c.Heads: return x
+    rep := c.Heads / c.KvHeads
+    e := g.Expand(g.Reshape(x, m.Ctx, c.KvHeads, 1, c.HeadDim), m.Ctx, c.KvHeads, rep, c.HeadDim)
+    return g.Reshape(e, m.Ctx, c.Heads * c.HeadDim)
+}
+
+# one block on the stream h
+fn (m Qwen&) block<T>(g mut graph.Graph<T>&, b QwenBlock&, h graph.Var) graph.Var {
+    c := m.Config
+    x := g.Norm(h, b.Norm1, graph.None, true, c.Eps)
+    q := g.Linear(x, b.Q, b.QBias)
+    k := g.Linear(x, b.K, b.KBias)
+    v := g.Linear(x, b.V, b.VBias)
+    if c.QkNorm {
+        q = m.headNorm(g, q, c.Heads, b.QNorm)
+        k = m.headNorm(g, k, c.KvHeads, b.KNorm)
+    }
+    q = g.Rope(q, c.Heads, c.Theta)
+    k = g.Rope(k, c.KvHeads, c.Theta)
+    a := g.Attention(q, m.repeat(g, k), m.repeat(g, v), c.Heads, true)
+    h2 := g.Add(h, g.Linear(a, b.O))
+    y := g.Norm(h2, b.Norm2, graph.None, true, c.Eps)
+    f := g.Mul(g.Act(g.Linear(y, b.Gate), mat.Act.Silu), g.Linear(y, b.Up))
+    return g.Add(h2, g.Linear(f, b.Down))
+}
+
+# the logits of each position's next token, from a Tokens(Ctx) node: [batch, Ctx, Vocab]
+fn (m Qwen&) Logits<T>(g mut graph.Graph<T>&, tokens graph.Var) graph.Var {
+    h := g.Embedding(tokens, m.Embed)
+    for b in m.Blocks: h = m.block(g, b, h)
+    return g.MatMul(g.Norm(h, m.Final, graph.None, true, m.Config.Eps), m.Head, false, true)
+}
+
+# the loops' handles: tokens, targets, logits and loss over sequences of Ctx tokens; "loss" false for logits alone
+fn (m Qwen&) Lm<T>(g mut graph.Graph<T>&, loss Bool = true) train.LanguageModel {
+    tok := g.Tokens(m.Ctx)
+    logits := m.Logits(g, tok)
+    if not loss: return train.LanguageModel(tok, graph.None, logits, graph.None, m.Ctx)
+    y := g.Classes(m.Ctx)
+    return train.LanguageModel(tok, y, logits, g.CrossEntropy(logits, y), m.Ctx)
+}
+
+# rows from .. from + n of w into frozen weight v
+fn rows<T>(g mut graph.Graph<T>&, v graph.Var, w model.Linear&, from I64, n I64) {
+    dst :~ g.Value(v).Flat()!
+    for o in range n {
+        for i in range w.In: dst[o * w.In + i] = T(w.Get(from + o, i))
+    }
+}
+
+# n elements of src from "from" into frozen vector v
+fn vector<T>(g mut graph.Graph<T>&, v graph.Var, src Array<F32>&, from I64, n I64) {
+    dst :~ g.Value(v).Flat()!
+    for i in range n: dst[i] = T(src[from + i])
+}
+
+# the weights of m (llm/model's, loaded for this config) into the graph's frozen weights, after Plan
+fn (q Qwen&) Fill<T>(g mut graph.Graph<T>&, m model.Model&) {
+    c := q.Config
+    qd, kv := c.Heads * c.HeadDim, c.KvHeads * c.HeadDim
+    for li, b in q.Blocks {
+        l := m.Layers[li]
+        vector(g, b.Norm1, l.Norm1, 0, c.Dim)
+        rows(g, b.Q, l.Qkv, 0, qd)
+        rows(g, b.K, l.Qkv, qd, kv)
+        rows(g, b.V, l.Qkv, qd + kv, kv)
+        if c.Bias {
+            vector(g, b.QBias, l.Qkv.Bias, 0, qd)
+            vector(g, b.KBias, l.Qkv.Bias, qd, kv)
+            vector(g, b.VBias, l.Qkv.Bias, qd + kv, kv)
+        }
+        if c.QkNorm {
+            vector(g, b.QNorm, l.QNorm, 0, c.HeadDim)
+            vector(g, b.KNorm, l.KNorm, 0, c.HeadDim)
+        }
+        rows(g, b.O, l.O, 0, c.Dim)
+        vector(g, b.Norm2, l.Norm2, 0, c.Dim)
+        rows(g, b.Gate, l.GateUp, 0, c.Ffn)
+        rows(g, b.Up, l.GateUp, c.Ffn, c.Ffn)
+        rows(g, b.Down, l.Down, 0, c.Dim)
+    }
+    vector(g, q.Final, m.Final, 0, c.Dim)
+    if c.Tied {
+        rows(g, q.Embed, m.Head, 0, c.Vocab)
+        return
+    }
+    rows(g, q.Embed, m.Embed, 0, c.Vocab)
+    rows(g, q.Head, m.Head, 0, c.Vocab)
+}
+
+# ---- tests ----
+
+import "std/os"
+import "std/rand"
+
+# the exact path's logits of a prompt (every position), in a cache of its own
+fn oracle(m model.Model&, toks Array<I32>&) Array<F32> {
+    k := model.Cache(m.C, 8, 1, 8, true)
+    for i in range 8: k.Table[i] = k.Take()
+    s := model.State(m, toks.Len(), toks.Len(), 256)
+    for i, t in toks: s.Add(t, I64(i), 0, true)
+    m.Step(s, k)
+    return s.Logits[:toks.Len() * m.C.Vocab].Copy()
+}
+
+# the graph's logits of "batch" prompts of ctx tokens drawn from seed, against the oracle's: the largest difference
+# and the largest logit
+fn compare<T>(m model.Model&, ctx I64, batch I64, seed U64) F64, F64 {
+    g mut graph.Graph<T>& = graph.Graph<T>(batch, 2)
+    g.NoGrad = true
+    q := Qwen.New(g, m.C, ctx)!
+    lm := q.Lm(g, false)
+    g.Plan(rand.Rand(1))!
+    assert g.ParamCount == 0
+    q.Fill(g, m)
+    r := rand.Rand(seed)
+    toks :~ g.Ints(lm.Tokens).Flat()!
+    for i in range toks.Len(): toks[i] = I32(r.Below(m.C.Vocab))
+    g.Training = false
+    g.Forward(batch)
+    got :~ g.Value(lm.Logits).Flat()!
+    v := m.C.Vocab
+    worst, big := F64(0.0), F64(0.0)
+    for b in range batch {
+        want := oracle(m, toks[b * ctx:(b + 1) * ctx])
+        for i in range ctx * v {
+            worst = worst.Max((F64(got[b * ctx * v + i]) - F64(want[i])).Abs())
+            big = big.Max(F64(want[i]).Abs())
+        }
+    }
+    return worst, big
+}
+
+test Qwen "the graph's logits are llm/model's: Qwen3 tied and untied, Qwen2's biases, grouped heads, F32 to 1e-5 of the largest, BF16 to 2%" {
+    for which in range 3 {
+        dir := model.TinyTied(which < 2, U64(3 + which), which == 0)
+        m := model.Model.Load(dir, true)!
+        assert m.C.KvHeads < m.C.Heads and m.C.Tied == (which == 0) and m.C.QkNorm == (which < 2)
+        worst, big := compare<F32>(m, 24, 2, 7)
+        assert big > 1.0 and worst < 1e-5 * big, "case " + $which + ": F32 logits differ by " + $worst + " of " + $big
+        worstB, bigB := compare<BF16>(m, 24, 2, 7)
+        assert worstB < 0.02 * bigB, "case " + $which + ": BF16 logits differ by " + $worstB + " of " + $bigB
+        os.RemoveAll(dir)!
+    }
+}
