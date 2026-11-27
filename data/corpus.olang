@@ -1,0 +1,465 @@
+# corpus - a pre-training corpus built from Hugging Face datasets: each source's files listed and fetched one at a time
+# (curl, into a cache, removed once read unless kept), its documents filtered (the source's quality score at least 3,
+# its language), duplicates dropped (an exact hash of the text, over everything this source has kept so far), each
+# document put in train, validation or test by its hash (so the split never changes and a document is never in two),
+# tokenized, followed by the end-of-text id, and appended to that split's token files - data/tokens' format, U16 ids
+# under 65536 tokens, U32 above, the train split cut into shards of a fixed number of tokens. Every source writes its
+# own directory, so a training run picks its mix (and leaves a source out) by which files it reads, and so sources
+# build in parallel, one process each.
+#
+# A source's state - the files read, the counts, each token file's length, the licences seen - is OUT/SOURCE/state.json,
+# written after every file with the hashes kept (dedup.bin); a run stopped anywhere starts again after the last file it
+# finished, the token files cut back to the lengths that state records.
+#
+# The sources and their terms (Sources): FineWeb-Edu (sample/100BT, ODC-By 1.0, Common Crawl's terms), FineMath (its
+# finemath-3plus part, ODC-By 1.0, Common Crawl's terms) and the Common Pile's copy of Stack-Edu (stackv2_edu_filtered:
+# code from openly licensed repositories only, the licence of each file in its metadata - counted per licence here).
+# Stack-Edu itself holds only Software Heritage blob ids, fetched from a bucket that needs an account, so its Common Pile
+# copy is the openly reachable one.
+
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/rand"
+import "std/set"
+import unistd "unistd.h"
+import "parquet"
+
+type CorpusError error {
+    Download  # curl could not list or fetch a file
+    Unpack    # gunzip failed
+    Malformed # a state file or a JSON line this module cannot read
+}
+
+# a dataset on the Hugging Face hub and how to read it
+type Source struct(Name String&, Repo String&, Dir String&, Format String&, Licence String&, Use String&, Language String& = ""
+    First I64 = 0, Last I64 = -1) {
+    Name       # the directory it writes, and how the command line names it
+    Repo
+    Dir        # the part of the repository read
+    Format     # "parquet" or "json.gz"
+    Licence    # its licence and terms
+    Use        # commercial, non-commercial, unclear or restricted - what a model trained on it may be used for
+    Language   # the language field a document must have, "" for any
+    First      # the files read: the First ... Last of the listing in name order (Last -1: to the end)
+    Last
+}
+
+# the sources this module knows
+fn Sources() Array<Source>& {
+    return Array<Source>[
+        Source("fwe", "HuggingFaceFW/fineweb-edu", "sample/100BT", "parquet"
+            "ODC-By 1.0; Common Crawl terms of use", "commercial (attribution)")
+        Source("math", "HuggingFaceTB/finemath", "finemath-3plus", "parquet"
+            "ODC-By 1.0; Common Crawl terms of use", "commercial (attribution)")
+        Source("code", "common-pile/stackv2_edu_filtered", "", "json.gz"
+            "openly licensed repositories only (Blue Oak Council certified); each file's licence in its metadata, counted in state.json"
+            "commercial (licence notices)", Language = "Python", First = 73, Last = 85)]
+}
+
+# the source named
+fn Source.Named(name String&) Source ? CorpusError {
+    for s in Sources() {
+        if s.Name == name: return s
+    }
+    error CorpusError.Malformed
+}
+
+fn say(msg String&) { try io.PutErrLn("corpus: " + msg) catch { } }
+
+# ---- listing and fetching ----
+
+# the source's files, as paths in its repository: listed by the hub's API, sorted, First ... Last kept, then (parquet
+# sources, whose files are each a sample of the whole) shuffled by a fixed seed so any prefix is a fair sample
+fn Files(s Source&) Array<String&>& ? CorpusError, os.Error {
+    url := "https://huggingface.co/api/datasets/" + s.Repo + "/tree/main" + ("/" + s.Dir if s.Dir.Len() > 0 else "")
+    out := try os.Output.Exec("curl", "-fsSL", "--retry", "5", url)
+    if out.Status != 0: error CorpusError.Download
+    doc :~ try json.Json.Parse(out.Stdout) catch { error CorpusError.Malformed }
+    items :~ try doc.AsArr() catch { error CorpusError.Malformed }
+    names := Vec<String&>()
+    for item in items {
+        path :~ try item["path"].AsStr() catch { error CorpusError.Malformed }
+        if path.EndsWith("." + s.Format): names.Push(path)
+    }
+    sorted := names.ToArray()
+    sorted.Sort(fn(a, b): return a.Less(b))
+    last := sorted.Len() - 1 if s.Last < 0 else s.Last.Min(sorted.Len() - 1)
+    kept := sorted[s.First.Min(last + 1):last + 1]
+    if s.Format != "parquet": return kept
+    r := rand.Rand(1)
+    order := Array<String&>(kept.Len())
+    for i, x in kept: order[i] ~ x
+    for k in range order.Len() - 1 {
+        i := order.Len() - 1 - k
+        j := r.Below(i + 1)
+        a :~ order[i]
+        order[i] ~ order[j]
+        order[j] ~ a
+    }
+    return order
+}
+
+# the repository's file at path, fetched into cache once (a partial download resumed); the local path
+fn Fetch(s Source&, path String&, cache String&) String ? CorpusError, os.Error {
+    local := cache + "/" + s.Name + "-" + path[(try path.FindLast("/") catch default -1) + 1:]
+    if os.Exists(local): return local
+    try os.MkDirAll(cache)
+    url := "https://huggingface.co/datasets/" + s.Repo + "/resolve/main/" + path
+    part := local + ".part"
+    for attempt in range 5 {
+        if os.Run("curl -fsSL --retry 5 -C - -o " + os.Quote(part) + " " + os.Quote(url)) == 0 {
+            try os.Rename(part, local)
+            return local
+        }
+        say("fetch of " + path + " failed (attempt " + $(attempt + 1) + "), retrying")
+    }
+    error CorpusError.Download
+}
+
+# ---- splits and hashes ----
+
+Train I64 = 0
+Val I64 = 1
+Test I64 = 2
+SplitNames Array<String&>& = Array<String&>["train", "val", "test"]
+
+# the split of a document whose text hashes to h: the hash's top 24 bits, mixed, as a fraction below heldout is
+# validation, the next heldout test, the rest train
+fn SplitOf(h I64, heldout F64) I64 {
+    u := F64((U64(h) * 0x9E3779B97F4A7C15) >> 40) / 16777216.0
+    if u < heldout: return Val
+    if u < 2.0 * heldout: return Test
+    return Train
+}
+
+# ---- token files ----
+
+# one split's token files: name.bin (or name_0000.bin, name_0001.bin, ... when cut every rotate tokens) and the ids not
+# yet written
+type Shards struct(Name String&, Rotate I64, Width I64) {
+    Name
+    Rotate
+    Width
+    Names mut Vec<String&>& = Vec<String&>()
+    Counts mut Vec<I64>& = Vec<I64>()
+    buf mut Vec<U8>& = Vec<U8>()
+}
+
+# one id, held until the next Flush
+fn (s mut Shards&) Push(id I32) {
+    for k in range s.Width: s.buf.Push(U8((id >> I32(8 * k)) & 255))
+}
+
+# the ids pushed since the last flush and those written
+fn (s Shards&) Tokens() I64 {
+    n := s.buf.Len() / s.Width
+    for c in s.Counts.Iter(): n += c
+    return n
+}
+
+# the held ids appended to the files in dir, a new file begun where one holds Rotate
+fn (s mut Shards&) Flush(dir String&) ? io.Error, os.Error {
+    bytes := s.buf.ToArray()
+    at I64 = 0
+    for at < bytes.Len() {
+        full := s.Counts.Len() > 0 and s.Rotate > 0 and s.Counts.Last()! >= s.Rotate
+        if s.Counts.Len() == 0 or full {
+            s.Names.Push(s.Name + ("_" + (s.Names.Len()).PadStart(4, '0') if s.Rotate > 0 else "") + ".bin")
+            s.Counts.Push(0)
+        }
+        last := s.Counts.Len() - 1
+        room := (bytes.Len() - at) / s.Width
+        if s.Rotate > 0: room = room.Min(s.Rotate - s.Counts.At(last))
+        f := try os.File.Append(dir + "/" + s.Names.At(last))
+        try f.Write(bytes[at:at + room * s.Width])
+        s.Counts.SetAt(last, s.Counts.At(last) + room)
+        at += room * s.Width
+    }
+    s.buf.Clear()
+}
+
+# the files in dir cut back to the counts recorded (what a run stopped mid-file wrote after its last state)
+fn (s Shards&) Trim(dir String&) ? os.Error {
+    for i in range s.Names.Len() {
+        path := dir + "/" + s.Names.At(i)
+        if not os.Exists(path): error os.Error.NotFound(path)
+        if unistd.truncate(path.ToC(), s.Counts.At(i) * s.Width) != 0: error os.Error.NotFound(path)
+    }
+}
+
+# ---- a source's build ----
+
+# the documents of one source read so far: what was seen, dropped and kept, per split
+type Build struct(Src Source, Dir String&, Width I64, Eos I32, Heldout F64, Rotate I64) {
+    Src
+    Dir
+    Width
+    Eos
+    Heldout
+    Done mut Vec<String&>& = Vec<String&>()      # the repository files read to their end (or to the budget)
+    Seen I64 = 0
+    Filtered I64 = 0
+    Dups I64 = 0
+    Docs mut Array<I64>& = Array<I64>(3)
+    Bytes mut Array<I64>& = Array<I64>(3)
+    Out mut Array<Shards>& = Array<Shards>[Shards("train", Rotate, Width), Shards("val", 0, Width), Shards("test", 0, Width)]
+    hashes mut set.Set<I64>& = set.Set<I64>()
+    fresh mut Vec<I64>& = Vec<I64>()             # hashes kept since the last save
+    licences mut Map<String, I64>& = Map<String, I64>()
+    Sample I64 = 0                                 # sampling: the bytes of train text wanted, kept as text, not tokenized
+    Sampled mut StringBuilder& = StringBuilder()
+}
+
+# whether the build holds what it wants: Sample bytes of text when sampling, else budget train tokens
+fn (b Build&) Full(budget I64) Bool {
+    if b.Sample > 0: return b.Sampled.Len() >= b.Sample
+    return b.TrainTokens() >= budget
+}
+
+# the shortest document kept, in bytes
+MinBytes I64 = 64
+
+# one document: dropped (a score under 3, too short, another language, seen before) or tokenized into its split
+fn (b mut Build&) Take(text String&, score F64, language String&, licence String&, encode fn&(text String&) Array<I32>) {
+    b.Seen += 1
+    if score < 3.0 or text.Len() < MinBytes or b.Src.Language.Len() > 0 and language != b.Src.Language {
+        b.Filtered += 1
+        return
+    }
+    h := text.Hash()
+    if not b.hashes.Add(h) {
+        b.Dups += 1
+        return
+    }
+    b.fresh.Push(h)
+    split := SplitOf(h, b.Heldout)
+    if b.Sample > 0 {
+        if split != Train or b.Sampled.Len() >= b.Sample: return
+        b.Sampled.Push(text)
+        b.Sampled.Push("\n\n")
+        b.Docs[Train] += 1
+        return
+    }
+    ids := encode(text)
+    for id in ids: b.Out[split].Push(id)
+    b.Out[split].Push(b.Eos)
+    b.Docs[split] += 1
+    b.Bytes[split] += text.Len()
+    if licence.Len() > 0: b.licences.Update("" + licence, 0, fn(n): return n + 1)
+}
+
+# the train tokens so far
+fn (b Build&) TrainTokens() I64 { return b.Out[Train].Tokens() }
+
+# the documents of a Parquet file, until the train split holds budget tokens; whether it was read to its end
+fn (b mut Build&) Parquet(path String&, budget I64, encode fn&(text String&) Array<I32>) Bool ? parquet.ParquetError, os.Error {
+    p := try parquet.Parquet.Open(path)
+    tc := try p.Column("text")
+    sc := try p.Column("int_score")
+    for g in range p.Groups() {
+        if b.Full(budget): return false
+        texts := try p.Texts(g, tc)
+        scores := try p.Numbers(g, sc)
+        for i, t in texts: b.Take(t, scores[i], "", "", encode)
+    }
+    return true
+}
+
+# a JSON line's member a (or metadata's member a) as text: "" when missing or not text
+fn textAt(doc json.Json&, a String&) String& {
+    return try doc[a].AsStr() catch { return "" }
+}
+
+fn metaAt(doc json.Json&, a String&) String& {
+    return try doc["metadata"][a].AsStr() catch { return "" }
+}
+
+# the documents of a gzipped JSON-lines file (Dolma's form: text, int_score, metadata.language, metadata.license), until
+# the train split holds budget tokens; whether it was read to its end. It is unpacked beside itself, a block at a time
+# read from that
+fn (b mut Build&) JsonLines(path String&, budget I64, encode fn&(text String&) Array<I32>) Bool ? CorpusError, os.Error {
+    plain := path + ".jsonl"
+    if os.Run("gunzip -c " + os.Quote(path) + " > " + os.Quote(plain)) != 0: error CorpusError.Unpack
+    defer { try os.Remove(plain) catch { } }
+    f := try os.File.Open(plain)
+    size := (try os.FileInfo.Stat(plain)).Size
+    block I64 = 16 << 20
+    at I64 = 0
+    for at < size {
+        if b.Full(budget): return false
+        n := block.Min(size - at)
+        buf := Array<U8>(n)
+        got I64 = 0
+        for got < n {
+            r := unistd.pread(f.Fd(), buf[got:], U64(n - got), at + got)
+            if r <= 0: error CorpusError.Malformed
+            got += r
+        }
+        text := String(buf)
+        end := n if at + n == size else (try text.FindLast("\n") catch default -1) + 1
+        if end <= 0 {
+            block *= 2  # a line longer than the block: read it again, whole
+            continue
+        }
+        start I64 = 0
+        for start < end {
+            stop := start + (try text[start:end].FindByte('\n') catch default end - start - 1) + 1
+            line := text[start:stop].TrimEnd()
+            start = stop
+            if line.Len() == 0: continue
+            doc :~ try json.Json.Parse(line) catch { error CorpusError.Malformed }
+            score := try doc["int_score"].AsNum() catch default 0.0
+            b.Take(textAt(doc, "text"), score, metaAt(doc, "language"), metaAt(doc, "license"), encode)
+        }
+        at += end
+    }
+    return true
+}
+
+# ---- state ----
+
+# the build's state as JSON
+fn (b Build&) StateJson() String {
+    sb := StringBuilder()
+    sb.Push("{\"source\": " + json.Encode(b.Src.Name) + ", \"repo\": " + json.Encode(b.Src.Repo) + ", \"dir\": " + json.Encode(b.Src.Dir))
+    sb.Push(",\n \"licence\": " + json.Encode(b.Src.Licence) + ", \"use\": " + json.Encode(b.Src.Use))
+    sb.Push(",\n \"filter\": " + json.Encode("int_score >= 3, at least " + $MinBytes + " bytes" + (", language " + b.Src.Language if b.Src.Language.Len() > 0 else "") + ", exact duplicates dropped"))
+    sb.Push(",\n \"width\": " + $b.Width + ", \"eos\": " + $b.Eos + ", \"heldout\": " + $b.Heldout)
+    sb.Push(",\n \"seen\": " + $b.Seen + ", \"filtered\": " + $b.Filtered + ", \"dups\": " + $b.Dups)
+    sb.Push(",\n \"done\": [")
+    for i in range b.Done.Len() {
+        if i > 0: sb.Push(", ")
+        sb.Push(json.Encode(b.Done.At(i)))
+    }
+    sb.Push("],\n \"splits\": [")
+    for k in range 3 {
+        s := b.Out[k]
+        if k > 0: sb.Push(",")
+        sb.Push("\n  {\"name\": \"" + s.Name + "\", \"docs\": " + $b.Docs[k] + ", \"bytes\": " + $b.Bytes[k] + ", \"tokens\": " + $s.Tokens() + ", \"files\": [")
+        for i in range s.Names.Len() {
+            if i > 0: sb.Push(", ")
+            sb.Push("[" + json.Encode(s.Names.At(i)) + ", " + $s.Counts.At(i) + "]")
+        }
+        sb.Push("]}")
+    }
+    sb.Push("],\n \"licences\": [")
+    first := true
+    for name in b.licences.Keys() {
+        if not first: sb.Push(", ")
+        first = false
+        sb.Push("[" + json.Encode(name) + ", " + $(try b.licences.Get(name) catch default 0) + "]")
+    }
+    sb.Push("]}\n")
+    return sb.ToString()
+}
+
+# the state written (state.json, through a temporary file) and the hashes kept since the last save appended to dedup.bin;
+# the token files are flushed first, so a state never counts tokens a file does not hold
+fn (b mut Build&) Save() ? io.Error, os.Error {
+    for k in range 3: try b.Out[k].Flush(b.Dir)
+    hashes := Array<U8>(b.fresh.Len() * 8)
+    for i in range b.fresh.Len() {
+        h := b.fresh.At(i)
+        for k in range 8: hashes[i * 8 + k] = U8((h >> (8 * k)) & 255)
+    }
+    f := try os.File.Append(b.Dir + "/dedup.bin")
+    try f.Write(hashes)
+    b.fresh.Clear()
+    try os.WriteFile(b.Dir + "/state.json.tmp", b.StateJson())
+    try os.Rename(b.Dir + "/state.json.tmp", b.Dir + "/state.json")
+}
+
+# a build resumed from dir's state.json, or begun there; the token files cut back to what the state counts
+fn Build.Open(src Source&, dir String&, width I64, eos I32, heldout F64, rotate I64) Build ? CorpusError, os.Error {
+    try os.MkDirAll(dir)
+    b := Build(src, dir, width, eos, heldout, rotate)
+    if not os.Exists(dir + "/state.json") {
+        try os.Remove(dir + "/dedup.bin") catch { }
+        return b
+    }
+    doc :~ try json.Json.Parse(try os.ReadFile(dir + "/state.json")) catch { error CorpusError.Malformed }
+    try b.restore(doc) catch { error CorpusError.Malformed }
+    for k in range 3: try b.Out[k].Trim(dir)
+    saved := try os.ReadFile(dir + "/dedup.bin") catch default ""
+    for i in range saved.Len() / 8 {
+        h I64 = 0
+        for k in range 8: h |= I64(U8(saved[i * 8 + k])) << (8 * k)
+        b.hashes.Add(h)
+    }
+    say(src.Name + ": resumed after " + $b.Done.Len() + " files, " + $b.TrainTokens() + " train tokens")
+    return b
+}
+
+fn (b mut Build&) restore(doc json.Json&) ? json.Error, CorpusError {
+    if (try doc["width"].AsInt()) != b.Width or I32(try doc["eos"].AsInt()) != b.Eos: error CorpusError.Malformed
+    b.Seen = try doc["seen"].AsInt()
+    b.Filtered = try doc["filtered"].AsInt()
+    b.Dups = try doc["dups"].AsInt()
+    done :~ try doc["done"].AsArr()
+    for d in done: b.Done.Push("" + try d.AsStr())
+    splits :~ try doc["splits"].AsArr()
+    for k in range 3 {
+        s :~ splits[k]
+        b.Docs[k] = try s["docs"].AsInt()
+        b.Bytes[k] = try s["bytes"].AsInt()
+        files :~ try s["files"].AsArr()
+        for f in files {
+            b.Out[k].Names.Push("" + try f[0].AsStr())
+            b.Out[k].Counts.Push(try f[1].AsInt())
+        }
+    }
+    licences :~ try doc["licences"].AsArr()
+    for l in licences: b.licences.Put("" + try l[0].AsStr(), try l[1].AsInt())
+}
+
+# ---- tests ----
+
+test SplitOf "about heldout of the documents go to each held-out split, the same every time" {
+    counts := Array<I64>(3)
+    for i in range 100000: counts[SplitOf(($i).Hash(), 0.01)] += 1
+    assert counts[Val] > 800 and counts[Val] < 1200 and counts[Test] > 800 and counts[Test] < 1200
+    assert SplitOf(("a").Hash(), 0.01) == SplitOf(("a").Hash(), 0.01)
+}
+
+test Shards.Flush "cuts the train split into files of Rotate tokens and trims back to a saved count" {
+    dir := "build/corpus_test"
+    try os.RemoveAll(dir) catch { }
+    try os.MkDirAll(dir)
+    s := Shards("train", 4, 2)
+    for i in range 10: s.Push(I32(i))
+    try s.Flush(dir)
+    assert s.Names.Len() == 3 and s.Counts.At(0) == 4 and s.Counts.At(2) == 2 and s.Tokens() == 10
+    s.Push(70)
+    try s.Flush(dir)
+    assert s.Counts.At(2) == 3 and (try os.FileInfo.Stat(dir + "/train_0002.bin")).Size == 6
+    s.Counts.SetAt(2, 1)
+    try s.Trim(dir)
+    assert (try os.FileInfo.Stat(dir + "/train_0002.bin")).Size == 2
+}
+
+test Build "filters, drops duplicates, splits and resumes from its state" {
+    dir := "build/corpus_build"
+    try os.RemoveAll(dir) catch { }
+    src := Source("t", "r", "", "json.gz", "L", "U", Language = "Python")
+    enc := fn(t String&) Array<I32>: return Array<I32>[I32(t.Len()), 1]
+    b := try Build.Open(src, dir, 2, 9, 0.0, 0)
+    long := "x".PadEnd(100, 'y')
+    b.Take(long, 3.0, "Python", "MIT", enc)
+    b.Take(long, 4.0, "Python", "MIT", enc)        # a duplicate
+    b.Take("short", 3.0, "Python", "MIT", enc)     # too short
+    b.Take(long + "z", 2.0, "Python", "MIT", enc)  # low score
+    b.Take(long + "w", 3.0, "Go", "MIT", enc)      # another language
+    b.Take(long + "v", 3.0, "Python", "Apache-2.0", enc)
+    b.Done.Push("f1")
+    try b.Save()
+    assert b.Seen == 6 and b.Filtered == 3 and b.Dups == 1 and b.Docs[Train] == 2 and b.TrainTokens() == 6
+    b.Take(long + "u", 3.0, "Python", "MIT", enc)
+    try b.Out[Train].Flush(dir)                    # written but never saved: cut back on resume
+    again := try Build.Open(src, dir, 2, 9, 0.0, 0)
+    assert again.TrainTokens() == 6 and again.Done.Len() == 1 and again.Seen == 6
+    assert (try os.FileInfo.Stat(dir + "/train.bin")).Size == 12
+    again.Take(long, 3.0, "Python", "MIT", enc)
+    assert again.Dups == 2
+    assert try again.StateJson().Find("\"Apache-2.0\", 1") >= 0
+}

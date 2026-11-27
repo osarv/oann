@@ -1,0 +1,186 @@
+# The pre-training corpus of the ~300M reasoning model (data/corpus.olang says how a source is read, filtered, split and
+# written). Three steps, from the repository's root:
+#
+#   olang build -output build/examples_corpus examples/corpus.olang
+#   build/examples_corpus tokenizer OUT [--vocab 32000] [--sample-mb 300] [--mix fwe=0.7,math=0.15,code=0.15]
+#                                       [--no-digits] [--teacher TOKENIZER.JSON] [--cache DIR]
+#   build/examples_corpus build OUT SOURCE TOKENS [--shard 100000000] [--heldout 0.005] [--keep] [--cache DIR]
+#   build/examples_corpus summary OUT
+#
+# tokenizer: learns a byte-level BPE vocabulary of --vocab tokens (the last is the end-of-text id) from --sample-mb of
+# training text, drawn from the sources in the --mix shares (held-out documents never read), every digit a chunk of its
+# own unless --no-digits; writes OUT/tokenizer.json. With --teacher, a Hugging Face tokenizer.json (Qwen3's, for logit
+# distillation from a teacher) is copied in instead, its <|endoftext|> the end-of-text id and ids written as U32.
+#
+# build: reads SOURCE (fwe, math or code) until its train split holds TOKENS tokens (a number, or with k, M or B), writing
+# OUT/SOURCE/train_NNNN.bin (--shard tokens each), val.bin and test.bin (--heldout of the documents each, by hash) and
+# OUT/SOURCE/state.json; the source's files are fetched into --cache (OUT/cache) one at a time and removed once read
+# unless --keep. Run again, it resumes; run once per source, the sources build side by side. Each build ends by
+# writing OUT/corpus.json: the tokenizer and every source's state (licence, terms, filter, counts, files).
+#
+# The files are data/tokens' format: Tokens.Open(path, ctx, width) with width 2 (U16) for the vocabulary of 32000.
+
+import "std/flags"
+import "std/io"
+import "std/os"
+import "std/time"
+import "../data/corpus"
+import "../llm/bpe"
+import "../tokenizer"
+
+fn say(msg String&) { try io.PutErrLn("corpus: " + msg) catch { } }
+
+# a count written as 123, 50k, 100M or 5B
+fn count(t String&) I64 ? ParseError {
+    if t.Len() == 0: error ParseError.Empty
+    last := t[t.Len() - 1]
+    scale I64 = match last {
+        case 'k', 'K': 1000
+        case 'M': 1000000
+        case 'B', 'G': 1000000000
+        case _: 1
+    }
+    digits := t[:t.Len() - 1] if scale > 1 else t
+    return I64((try digits.ParseFloat()) * F64(scale))
+}
+
+# the shares of --mix: name=share pairs, comma separated
+fn shareOf(mix String&, name String&) F64 ? ParseError {
+    for part in mix.Split(",") {
+        kv := part.Trim().Split("=")
+        if kv.Len() == 2 and kv[0] == name: return try kv[1].ParseFloat()
+    }
+    return 0.0
+}
+
+fn tokenizerCommand(out String&, vocab I64, sampleMb I64, mix String&, digits Bool, teacher String&, cache String&) ? {
+    try os.MkDirAll(out)
+    if teacher.Len() > 0 {
+        text := try os.ReadFile(teacher)
+        t := try bpe.Bpe.Parse(text)
+        if t.Find("<|endoftext|>") < 0: say("warning: the teacher has no <|endoftext|> token")
+        try os.WriteFile(out + "/tokenizer.json", text)
+        say("teacher tokenizer copied: " + $t.Size + " tokens, end of text " + $t.Find("<|endoftext|>"))
+        return
+    }
+    sample := StringBuilder()
+    for src in corpus.Sources() {
+        share := try shareOf(mix, src.Name)
+        if share <= 0.0: continue
+        b := corpus.Build(src, out + "/" + src.Name, 2, 0, 0.005, 0)
+        b.Sample = I64(share * F64(sampleMb) * 1000000.0)
+        for path in try corpus.Files(src) {
+            if b.Full(0): break
+            local := try corpus.Fetch(src, path, cache)
+            none := fn(t String&) Array<I32>: return Array<I32>(0)
+            if src.Format == "parquet" {
+                try b.Parquet(local, 0, none)
+            } else {
+                try b.JsonLines(local, 0, none)
+            }
+        }
+        say(src.Name + ": " + $(b.Sampled.Len() / 1000000) + " MB of text sampled from " + $b.Docs[corpus.Train] + " documents")
+        sample.Push(b.Sampled.ToString())
+    }
+    text := sample.ToString()
+    start := time.Now()
+    tok := tokenizer.Tokenizer.Train(text, vocab - 1, digits)
+    try tok.Save(out + "/tokenizer.json")
+    say("tokenizer: " + $(tok.Size() + 1) + " tokens (end of text " + $tok.Size() + ") from " + $(text.Len() / 1000000) + " MB in " + $(time.Since(start) / 1000000000) + " s")
+}
+
+fn buildCommand(out String&, name String&, budget I64, shard I64, heldout F64, keep Bool, cache String&) ? {
+    src := try corpus.Source.Named(name)
+    text := try os.ReadFile(out + "/tokenizer.json")
+    if (try text.Find("\"oann-bpe\"") catch default -1) >= 0 {
+        tok := try tokenizer.Tokenizer.Parse(text)
+        width := 2 if tok.Size() + 1 <= 65536 else 4
+        b := try corpus.Build.Open(src, out + "/" + name, width, I32(tok.Size()), heldout, shard)
+        try run(b, budget, keep, cache, fn(t String&) Array<I32>: return tok.Encode(t))
+    } else {
+        tok := try bpe.Bpe.Parse(text)
+        b := try corpus.Build.Open(src, out + "/" + name, 4, tok.Find("<|endoftext|>"), heldout, shard)
+        try run(b, budget, keep, cache, fn(t String&) Array<I32>: return tok.Encode(t))
+    }
+    try summary(out)
+}
+
+fn run(b mut corpus.Build&, budget I64, keep Bool, cache String&, encode fn&(text String&) Array<I32>) ? {
+    for path in try corpus.Files(b.Src) {
+        if b.Full(budget): break
+        if b.Done.Has(path): continue
+        local := try corpus.Fetch(b.Src, path, cache)
+        start := time.Now()
+        before := b.TrainTokens()
+        if b.Src.Format == "parquet" {
+            try b.Parquet(local, budget, encode)
+        } else {
+            try b.JsonLines(local, budget, encode)
+        }
+        b.Done.Push(path)
+        try b.Save()
+        if not keep: try os.Remove(local)
+        secs := F64(time.Since(start)) / 1e9
+        say(b.Src.Name + ": " + path + " read: +" + $((b.TrainTokens() - before) / 1000000) + "M train tokens in " + $I64(secs) + " s, " +
+            $(b.TrainTokens() / 1000000) + "M of " + $(budget / 1000000) + "M; seen " + $b.Seen + ", filtered " + $b.Filtered + ", duplicates " + $b.Dups)
+    }
+}
+
+# OUT/corpus.json: the tokenizer and each source's state
+fn summary(out String&) ? {
+    sb := StringBuilder()
+    sb.Push("{\"tokenizer\": \"tokenizer.json\", \"sources\": [\n")
+    first := true
+    for src in corpus.Sources() {
+        path := out + "/" + src.Name + "/state.json"
+        if not os.Exists(path): continue
+        if not first: sb.Push(",\n")
+        first = false
+        sb.Push((try os.ReadFile(path)).TrimEnd())
+    }
+    sb.Push("\n]}\n")
+    try os.WriteFile(out + "/corpus.json.tmp", sb.ToString())
+    try os.Rename(out + "/corpus.json.tmp", out + "/corpus.json")
+}
+
+fn main() ? {
+    p := flags.Flags("corpus", "build the pre-training corpus: tokenizer OUT | build OUT SOURCE TOKENS | summary OUT")
+    vocab := p.Int("vocab", 0, 32000, "tokens in the vocabulary, the end-of-text id included")
+    sampleMb := p.Int("sample-mb", 0, 300, "megabytes of training text the tokenizer learns from")
+    mix := p.Text("mix", 0, "fwe=0.7,math=0.15,code=0.15", "each source's share of the tokenizer's sample")
+    noDigits := p.Bool("no-digits", 0, "keep runs of digits together (GPT-2's rule) instead of one digit a chunk")
+    teacher := p.Text("teacher", 0, "", "a Hugging Face tokenizer.json to use instead of learning one")
+    shard := p.Int("shard", 0, 100000000, "tokens in each train file")
+    heldout := p.Float("heldout", 0, 0.005, "the share of documents in each of validation and test")
+    keep := p.Bool("keep", 0, "keep the fetched files")
+    cacheFlag := p.Text("cache", 0, "", "where fetched files go (OUT/cache)")
+    try p.Parse(os.Args()) catch flags.Error.Help {
+        try io.Put(p.Help())
+        return
+    } catch flags.Error {
+        say(p.Message())
+        os.Exit(2)
+    }
+    args := p.Args()
+    if args.Len() < 2 {
+        try io.Put(p.Help())
+        os.Exit(2)
+    }
+    out := args[1]
+    cache := cacheFlag.Get() if cacheFlag.IsSet() else out + "/cache"
+    match args[0] {
+        case "tokenizer": try tokenizerCommand(out, vocab.Get(), sampleMb.Get(), mix.Get(), not noDigits.Get(), teacher.Get(), cache)
+        case "build" {
+            if args.Len() < 4 {
+                say("build OUT SOURCE TOKENS")
+                os.Exit(2)
+            }
+            try buildCommand(out, args[2], try count(args[3]), shard.Get(), heldout.Get(), keep.Get(), cache)
+        }
+        case "summary": try summary(out)
+        case _ {
+            say("unknown command " + args[0])
+            os.Exit(2)
+        }
+    }
+}
