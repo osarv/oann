@@ -644,8 +644,8 @@ fn (g mut Graph<T>&) PackConstants(backward Bool = true) {
     if not bf or not (g.ws32.Tile or g.ws32.Pairs): return
     packs := Vec<gemm.TilePacked>()
     packs.Push(gemm.TilePacked(0, 0))
-    g.packFwd = Array<I64>(g.nodes.Len())
-    g.packBwd = Array<I64>(g.nodes.Len())
+    g.packFwd ~ Array<I64>(g.nodes.Len())
+    g.packBwd ~ Array<I64>(g.nodes.Len())
     for i in range g.nodes.Len() {
         match g.nodes[i].Kind {
             case Op.Linear(_, w, _) {
@@ -662,7 +662,7 @@ fn (g mut Graph<T>&) PackConstants(backward Bool = true) {
             case _ { }
         }
     }
-    g.tilePacks = packs.ToArray()
+    g.tilePacks ~ packs.ToArray()
 }
 
 # x w^T + b over the last axis: x [..., in], w [out, in], b [out] or None
@@ -2455,10 +2455,10 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
             if g.Int8 { g.linearInt8(i, x, b) } else { ops.Linear<T, A>(ws, y, g.Value(x), g.Value(w), g.opt(b), g.tilePacks[g.packFwd[i] if g.packFwd.Len() > i else 0]) }
         }
         case Op.MatMul(a, b, ta, tb): ops.MatMul<T, A>(ws, y, g.Value(a), ta, g.Value(b), tb)
-        case Op.Add(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(1.0))
-        case Op.Sub(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(-1.0))
-        case Op.Mul(a, b): ops.Mul<T, A>(y, g.Value(a), g.Value(b))
-        case Op.Scale(x, k): ops.Scale<T, A>(y, g.Value(x), A(k))
+        case Op.Add(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(1.0), g.Threads)
+        case Op.Sub(a, b): ops.Combine<T, A>(y, g.Value(a), g.Value(b), A(-1.0), g.Threads)
+        case Op.Mul(a, b): ops.Mul<T, A>(y, g.Value(a), g.Value(b), g.Threads)
+        case Op.Scale(x, k): ops.Scale<T, A>(y, g.Value(x), A(k), g.Threads)
         case Op.Shift(x, k): ops.Shift<T, A>(y, g.Value(x), A(k))
         case Op.Sqrt(x): ops.Sqrt<T, A>(y, g.Value(x))
         case Op.Log(x): ops.Log<T, A>(y, g.Value(x))
@@ -2470,10 +2470,10 @@ fn (g mut Graph<T>&) forwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan.
         case Op.LeakyRelu(x, slope): ops.LeakyRelu<T, A>(y, g.Value(x), A(slope))
         case Op.Softmax(x): ops.Softmax(y, g.Value(x))
         case Op.LogSoftmax(x): ops.LogSoftmax<T, A>(y, g.Value(x))
-        case Op.Norm(x, gain, b, rms, eps): ops.Norm(y, g.Value(x), g.Value(gain), g.opt(b), rms, eps, g.saved(i))
+        case Op.Norm(x, gain, b, rms, eps): ops.Norm(y, g.Value(x), g.Value(gain), g.opt(b), rms, eps, g.saved(i), g.Threads)
         case Op.Embedding(t, w): ops.Embedding(y, g.intsOf(t), g.Value(w))
         case Op.Positions(x, w): ops.Positions<T, A>(y, g.Value(x), g.Value(w), nd.Dims[1], g.Pos)
-        case Op.Rope(x, heads, base): ops.Rope(y, g.Value(x), heads, nd.Dims[1], g.Pos, base)
+        case Op.Rope(x, heads, base): ops.Rope(y, g.Value(x), heads, nd.Dims[1], g.Pos, base, g.Threads)
         case Op.Attention(q, k, v, heads, causal, window, docs) {
             if g.Decode {
                 ops.AttentionStep<T, A>(y, g.Value(q), g.Value(k), g.Value(v), g.saved(i), nd.Dims[1], g.accOf<A>(i), g.Pos, heads, window)
@@ -2710,17 +2710,17 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             aa := g.acc(a)
             db := g.gradOf(b)
             ab := g.acc(b)
-            ops.MulBackward<T, A>(dy, g.Value(a), g.Value(b), da, aa, db, ab)
+            ops.MulBackward<T, A>(dy, g.Value(a), g.Value(b), da, aa, db, ab, g.Threads)
         }
         case Op.Scale(x, k) {
             dx := g.gradOf(x)
             ax := g.acc(x)
-            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(k), ax)
+            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(k), ax, g.Threads)
         }
         case Op.Shift(x, _) {
             dx := g.gradOf(x)
             ax := g.acc(x)
-            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax)
+            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax, g.Threads)
         }
         case Op.Sqrt(x) {
             dx := g.gradOf(x)
@@ -2775,7 +2775,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             ag := g.acc(gain)
             db := g.gradOf(b)
             ab := g.acc(b)
-            ops.NormBackward(dy, g.Value(x), g.Value(gain), rms, g.saved(i), dx, ax, dg, ag, db, ab)
+            ops.NormBackward(dy, g.Value(x), g.Value(gain), rms, g.saved(i), dx, ax, dg, ag, db, ab, g.Threads)
         }
         case Op.Embedding(t, w) {
             dw := g.gradOf(w)
@@ -2795,7 +2795,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
             dx := g.gradOf(x)
             ax := g.acc(x)
             tmp := g.scratchTensor(i, 0, dy.Dims)
-            if ops.Wanted(dx): ops.RopeBackward<T, A>(dy, heads, nd.Dims[1], g.Pos, base, dx, ax, tmp)
+            if ops.Wanted(dx): ops.RopeBackward<T, A>(dy, heads, nd.Dims[1], g.Pos, base, dx, ax, tmp, g.Threads)
         }
         case Op.Attention(q, k, v, heads, causal, window, docs) {
             dq := g.gradOf(q)
@@ -2853,7 +2853,7 @@ fn (g mut Graph<T>&) backwardIn<A>(i I64, ws mut gemm.Workspace<A>&, sw mut scan
         case Op.Reshape(x), Op.Contiguous(x) {
             dx := g.gradOf(x)
             ax := g.acc(x)
-            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax)
+            if ops.Wanted(dx): ops.Put<T, A>(dx.Flat()!, dy.Flat()!, A(1.0), ax, g.Threads)
         }
         case Op.Permute(x), Op.Slice(x, _, _), Op.Expand(x): g.viewBack<A>(i, dy, x)
         case Op.Sum(x, mean) {
@@ -3447,7 +3447,7 @@ fn (g mut Graph<T>&) combineBack<A>(dy tensor.Tensor<T>&, a Var, b Var, k A) {
     aa := g.acc(a)
     db := g.gradOf(b)
     ab := g.acc(b)
-    ops.CombineBackward<T, A>(dy, k, da, aa, db, ab)
+    ops.CombineBackward<T, A>(dy, k, da, aa, db, ab, g.Threads)
 }
 
 # a view's backward: dy added into x's gradient through the view's strides (relative to x's own layout, dense) - zeroed
@@ -3467,7 +3467,7 @@ fn (g mut Graph<T>&) viewBack<A>(i I64, dy tensor.Tensor<T>&, x Var) {
         case _: expanded(dx, nd, xn, dy.Dims, st)
     }
     if not ax: dx.Fill(T(0.0))
-    ops.AddInto<T, A>(dx.Flat()!, target, dy, true)
+    ops.AddInto<T, A>(dx.Flat()!, target, dy, true, g.Threads)
 }
 
 # x's gradient seen through a permutation: the view's axis k reads x's axis axes[k], found by matching strides

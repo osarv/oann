@@ -128,6 +128,7 @@ type AdamW<A, G> struct(params tensor.Tensor<A>, grads tensor.Tensor<G>, rate F6
     Beta2 F64 = beta2
     Eps F64 = eps
     Decay F64 = decay
+    TableRate F64 = 1.0                             # the sparse tables' rate as a multiple of Rate
     Steps I64 = 0                                   # the steps taken
     p mut Array<A>& = params.Flat()!
     gr Array<G>& = grads.Flat()!
@@ -151,7 +152,7 @@ type RowTable struct(lo I64, rows I64, decay Bool, set graph.RowSet) {
 # g's sparse tables (Graph.Sparse) stepped from now on by the rows each Backward touched, and taken out of the dense
 # runs: a step costs those rows, not the table. Lazy Adam: a row's moments are decayed by beta^k for the k steps it was
 # not touched (as the dense update would have decayed them under zero gradients), its decoupled weight decay is applied
-# as (1 - rate decay)^k at the current rate, and the moves its moments alone would have made in those k steps are not
+# as (1 - rate decay)^k at the current rate (Rate x TableRate: a table may learn at a rate of its own), and the moves its moments alone would have made in those k steps are not
 # made. A row touched at every step is stepped exactly - bit for bit - as dense AdamW steps it
 fn (o mut AdamW<A, G>&) Sparse<T>(g graph.Graph<T>&) {
     for i in range g.Size() {
@@ -193,9 +194,11 @@ fn (o mut AdamW<A, G>&) Step() {
         keep A = A(1.0 - o.Rate * o.Decay) if r.Decay else A(1.0)
         adamRun(o.p, o.gr, o.M, o.V, r.Lo, r.Hi, b1, b2, c1, c2, keep, step, root, eps)
     }
+    trate := o.Rate * o.TableRate
+    tstep A = A(trate / corr1)
     for t in range o.tables.Len() {
         tb := o.tables[t]
-        keep F64 = 1.0 - o.Rate * o.Decay if tb.Decay else 1.0
+        keep F64 = 1.0 - trate * o.Decay if tb.Decay else 1.0
         cols := tb.Set.Cols
         for k in range tb.Set.Count[0] {
             row := I64(tb.Set.Rows[k])
@@ -203,7 +206,7 @@ fn (o mut AdamW<A, G>&) Step() {
             gap := o.Steps - tb.Last[row] - 1
             tb.Last[row] = o.Steps
             if gap > 0: lazyDecay(o.M, o.V, o.p, lo, lo + cols, A(o.Beta1.Pow(F64(gap))), A(o.Beta2.Pow(F64(gap))), A(keep.Pow(F64(gap))))
-            adamRun(o.p, o.gr, o.M, o.V, lo, lo + cols, b1, b2, c1, c2, A(keep), step, root, eps)
+            adamRun(o.p, o.gr, o.M, o.V, lo, lo + cols, b1, b2, c1, c2, A(keep), tstep, root, eps)
         }
     }
 }

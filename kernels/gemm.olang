@@ -278,13 +278,7 @@ fn GemmBatch<SC, SA, SB, A>(ws mut Workspace<A>&, c mut Batch<SC>&, a Batch<SA>&
         return
     }
     if ws.blocksBF16(m, n, k) and bf16Operands(a.Data, b.Data, alpha) {
-        for e in range count {
-            g, mb := e / c.Members, e % c.Members
-            oa := operand<SA>(a.Data[a.Off + a.GroupStride * g + a.MemberStride * mb:], a.Ld)
-            ob := operand<SB>(b.Data[b.Off + b.GroupStride * g + b.MemberStride * mb:], b.Ld)
-            cd :~ c.Data[c.Off + c.GroupStride * g + c.MemberStride * mb:]
-            tileBlocks(ws, m, n, k, oa, ta, ob, tb, alpha, beta, cd, c.Ld, false, lower, result, diag)
-        }
+        tileBatch(ws, c, a, ta, b, tb, alpha, beta, lower, result, diag)
         return
     }
     z A
@@ -1079,33 +1073,142 @@ fn tileProduct<SA, SB, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, a operan
     # a transposed left operand is gathered as it is packed; where the result is narrow, C^T = op(b)^T a gathers the
     # narrow op(b) instead and stores the result transposed
     if ta and not tb and n < m {
-        tileBlocks(ws, n, m, k, b, true, a, false, alpha, beta, c, ldc, true, false, false, 0)
+        tileColumns(ws, n, m, k, b, true, a, false, alpha, beta, c, ldc, true)
         return
     }
-    tileBlocks(ws, m, n, k, a, ta, b, tb, alpha, beta, c, ldc, false, false, false, 0)
+    tileColumns(ws, m, n, k, a, ta, b, tb, alpha, beta, c, ldc, false)
+}
+
+# tileBlocks (unconfined) with op(r)'s columns in runs of whole 16s over up to ws.Threads tasks, each with its own
+# blocks of the workspace: every element's sum is the one a single run makes (its depth is never split), so the values
+# are the same whatever the count - a narrow product (a weight's gradient, depth the batch's rows) uses every thread
+fn tileColumns<SL, SR, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, l operand<SL>&, lt Bool, r operand<SR>&, rt Bool, alpha A, beta A, c mut Array<S>&, ldc I64, trans Bool) {
+    kp := roundUp(k, 32)
+    sa, sb, sc := amxRows * kp, amxCols * kp, amxRows * amxCols
+    tasks I64 = lesser(lesser(ws.Threads, (n + 15) / 16), m * n * k / madds).Max(1)
+    tasks = lesser(tasks, ws.ta.Len() / sa)
+    tasks = lesser(tasks, ws.tb.Len() / sb)
+    tasks = lesser(tasks, ws.tc.Len() / sc).Max(1)
+    if tasks == 1 {
+        tileBlocks(ws, m, n, k, l, lt, r, rt, alpha, beta, c, ldc, trans, false, false, 0)
+        return
+    }
+    share := roundUp((n + tasks - 1) / tasks, 16)
+    run := tileColumnRun<SL, SR, S, A>(l, lt, r, rt, m, n, k, alpha, beta, c, ldc, trans, ws.Tile)
+    join {
+        for t in range tasks {
+            j0 := t * share
+            if j0 < n: spawn run.go(j0, lesser(share, n - j0), ws.ta[t * sa:(t + 1) * sa], ws.tb[t * sb:(t + 1) * sb], ws.tc[t * sc:(t + 1) * sc])
+        }
+    }
+}
+
+type tileColumnRun<SL, SR, S, A> struct(l operand<SL>, lt Bool, r operand<SR>, rt Bool, m I64, n I64, k I64, al A, be A, c mut Array<S>&, ldc I64, trans Bool, amx Bool) {
+    l
+    lt
+    r
+    rt
+    m
+    n
+    k
+    al
+    be
+    c
+    ldc
+    trans
+    amx
+}
+
+# op(r)'s columns j0 .. j0 + w - 1 into c, with these blocks of the workspace
+fn (q tileColumnRun<SL, SR, S, A>&) go(j0 I64, w I64, ta mut Array<BF16>&, tb mut Array<BF16>&, tc mut Array<F32>&) {
+    rj := operand<SR>(q.r.d[j0 * q.r.ld if q.rt else j0:], q.r.ld)
+    cj :~ q.c[j0 * q.ldc if q.trans else j0:]
+    tileBlocksIn(q.amx, ta, tb, tc, q.m, w, q.k, q.l, q.lt, rj, q.rt, q.al, q.be, cj, q.ldc, q.trans, false, false, 0)
 }
 
 # the blocked tile product of op(l) (m x k) by op(r) (k x n) into c, or into c transposed (trans: c is n x m);
 # confined as GemmBatch's triangles: lower - op(l) lower-triangular (l's elements past the diagonal + diag read as
 # zero), result - only C[i, j] for j <= i + diag stored
 fn tileBlocks<SL, SR, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, l operand<SL>&, lt Bool, r operand<SR>&, rt Bool, alpha A, beta A, c mut Array<S>&, ldc I64, trans Bool, lower Bool, result Bool, diag I64) {
+    tileBlocksIn(ws.Tile, ws.ta, ws.tb, ws.tc, m, n, k, l, lt, r, rt, alpha, beta, c, ldc, trans, lower, result, diag)
+}
+
+# tileBlocks with these blocks of a workspace (a task's own, where several run): amx says AMX tiles or the pair dot
+fn tileBlocksIn<SL, SR, S, A>(amx Bool, ta mut Array<BF16>&, tb mut Array<BF16>&, tc mut Array<F32>&, m I64, n I64, k I64, l operand<SL>&, lt Bool, r operand<SR>&, rt Bool, alpha A, beta A, c mut Array<S>&, ldc I64, trans Bool, lower Bool, result Bool, diag I64) {
     kp := roundUp(k, 32)
     for j0 in range 0, n, amxCols {
         w := lesser(amxCols, n - j0)
         wp := roundUp(w, 16)
-        if ws.Tile: packPairs(ws.tb, r, rt, k, kp, j0, w, wp)
-        else: packStrips(ws.tb, r, rt, k, kp, j0, w, wp)
+        if amx: packPairs(tb, r, rt, k, kp, j0, w, wp)
+        else: packStrips(tb, r, rt, k, kp, j0, w, wp)
         for i0 in range 0, m, amxRows {
             h := lesser(amxRows, m - i0)
             hp := roundUp(h, 16)
-            packRows(ws.ta, l, lt, k, kp, i0, h, hp)
-            if lower: maskLower(ws.ta, lt, k, kp, i0, h, diag)
-            if ws.Tile: addTiles(ws.tc, hp, wp, ws.ta, kp, ws.tb)
-            else: pairBlock(ws.tc, hp, wp, ws.ta, kp, ws.tb)
-            if trans: tileStoreT(ws.tc, wp, h, w, alpha, beta, c, j0 * ldc + i0, ldc)
-            else if result: tileStoreLower(ws.tc, wp, h, w, alpha, beta, c, i0, j0, ldc, diag)
-            else: tileStore(ws.tc, wp, h, w, alpha, beta, c, i0 * ldc + j0, ldc)
+            packRows(ta, l, lt, k, kp, i0, h, hp)
+            if lower: maskLower(ta, lt, k, kp, i0, h, diag)
+            if amx: addTiles(tc, hp, wp, ta, kp, tb)
+            else: pairBlock(tc, hp, wp, ta, kp, tb)
+            if trans: tileStoreT(tc, wp, h, w, alpha, beta, c, j0 * ldc + i0, ldc)
+            else if result: tileStoreLower(tc, wp, h, w, alpha, beta, c, i0, j0, ldc, diag)
+            else: tileStore(tc, wp, h, w, alpha, beta, c, i0 * ldc + j0, ldc)
         }
+    }
+}
+
+# GemmBatch's tile path: runs of the matrices over up to ws.Threads tasks, each with its own blocks of the workspace
+# (as tileTasks), every matrix the product one task would make - the same sums whatever the count
+fn tileBatch<SC, SA, SB, A>(ws mut Workspace<A>&, c mut Batch<SC>&, a Batch<SA>&, ta Bool, b Batch<SB>&, tb Bool, alpha A, beta A, lower Bool, result Bool, diag I64) {
+    m, n := c.Rows, c.Cols
+    k I64 = a.Rows if ta else a.Cols
+    count I64 = c.Groups * c.Members
+    kp := roundUp(k, 32)
+    sa, sb, sc := amxRows * kp, amxCols * kp, amxRows * amxCols
+    tasks I64 = lesser(lesser(ws.Threads, count), count * m * n * k / madds).Max(1)
+    tasks = lesser(tasks, ws.ta.Len() / sa)
+    tasks = lesser(tasks, ws.tb.Len() / sb)
+    tasks = lesser(tasks, ws.tc.Len() / sc).Max(1)
+    run := tileBatchRun<SC, SA, SB, A>(c.Data[c.Off:], strides.of(c), a.Data[a.Off:], strides.of(a), ta, b.Data[b.Off:], strides.of(b), tb, m, n, k, alpha, beta, lower, result, diag, ws.Tile)
+    if tasks == 1 {
+        run.go(0, count, ws.ta, ws.tb, ws.tc)
+        return
+    }
+    share := (count + tasks - 1) / tasks
+    join {
+        for t in range tasks {
+            lo I64 = t * share
+            hi I64 = lesser(count, lo + share)
+            if lo < hi: spawn run.go(lo, hi, ws.ta[t * sa:(t + 1) * sa], ws.tb[t * sb:(t + 1) * sb], ws.tc[t * sc:(t + 1) * sc])
+        }
+    }
+}
+
+type tileBatchRun<S, SA, SB, A> struct(cd mut Array<S>&, cst strides, ad Array<SA>&, ast strides, ta Bool, bd Array<SB>&, bst strides, tb Bool, m I64, n I64, k I64, al A, be A, lower Bool, result Bool, diag I64, amx Bool) {
+    cd
+    cst
+    ad
+    ast
+    ta
+    bd
+    bst
+    tb
+    m
+    n
+    k
+    al
+    be
+    lower
+    result
+    diag
+    amx
+}
+
+# matrices lo .. hi - 1 by the tile path, with these blocks of the workspace
+fn (r tileBatchRun<S, SA, SB, A>&) go(lo I64, hi I64, ta mut Array<BF16>&, tb mut Array<BF16>&, tc mut Array<F32>&) {
+    for e in range lo, hi {
+        sa := operand<SA>(r.ad[r.ast.at(e):], r.ast.ld)
+        sb := operand<SB>(r.bd[r.bst.at(e):], r.bst.ld)
+        cd :~ r.cd[r.cst.at(e):]
+        tileBlocksIn(r.amx, ta, tb, tc, r.m, r.n, r.k, sa, r.ta, sb, r.tb, r.al, r.be, cd, r.cst.ld, false, r.lower, r.result, r.diag)
     }
 }
 
