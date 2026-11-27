@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -143,6 +143,11 @@ tinystories:
 bpelm:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_bpelm examples/bpelm.olang
 	$(GPUENV) ./build/examples_bpelm $(ARGS)
+
+# LoRA on Qwen3 on the CPU (examples/qwen_lora.olang) - ARGS: the model's directory, steps, adapter and merged directories
+qwenlora:
+	$(OLANG) build $(GPUDEFINE) -output build/examples_qwen_lora examples/qwen_lora.olang
+	$(GPUENV) ./build/examples_qwen_lora $(ARGS)
 
 # oann-listen: speech to text by a Whisper model (speech/listen.olang, speech/README.md), built to build/oann-listen -
 # ARGS: MODEL CLIP.wav and its flags (none: only builds it)
