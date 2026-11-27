@@ -16,6 +16,7 @@ import gdev "../kernels/gpu/device"
 import "../kernels/gpu/kern"
 import "../models/gpt"
 import "../models/qwen"
+import "../nn/lora"
 import "../llm/model"
 import "std/os"
 import "../nn/optim"
@@ -804,6 +805,58 @@ fn qwenCase() {
 }
 
 test qwenCase "Qwen3 of frozen weights on the GPU, F32 and BF16, grouped heads by Expand: the CPU's logits within rounding, each weight uploaded once" { qwenCase() }
+
+# LoRA on every projection of a tiny Qwen3 (models/qwen AddLora), F32, trained 10 AdamW steps on one batch on each
+# backend from the same start: the losses step by step within 1e-3 of the CPU's, the adapters after within 1e-3, the
+# loss lowered, and the frozen weights still uploaded once each
+fn loraCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("LoRA on Qwen3")
+        return
+    }
+    dir := model.TinyTied(true, 3, true)
+    m := model.Model.Load(dir, true)!
+    c := lora.Config(4, 8.0, Array<String>["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    cpu mut graph.Graph<F32>& = graph.Graph<F32>(2)
+    gpu mut graph.Graph<F32>& = graph.Graph<F32>(2)
+    qc := qwen.Qwen.New(cpu, m.C, 24)!
+    qg := qwen.Qwen.New(gpu, m.C, 24)!
+    qc.AddLora(cpu, c)!
+    qg.AddLora(gpu, c)!
+    lc := qc.Lm(cpu)
+    lg := qg.Lm(gpu)
+    try cpu.Plan(rand.Rand(1), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(1), device.Backend.Gpu) catch tensor.ShapeError e { unreachable $e }
+    qc.Fill(cpu, m)
+    qg.Fill(gpu, m)
+    feedQwen(cpu, lc, m.C.Vocab)
+    feedQwen(gpu, lg, m.C.Vocab)
+    oc := optim.AdamW(cpu.Params(), cpu.ParamGrads(), rate = 0.01, spans = optim.Spans(cpu))
+    og := try optim.GpuAdamW<F32>.For(gpu, rate = 0.01) catch { unreachable }
+    first, last := F64(0.0), F64(0.0)
+    for step in range 10 {
+        cpu.Forward(2)
+        cpu.Backward(lc.Loss)
+        oc.Step()
+        gpu.Forward(2)
+        gpu.Backward(lg.Loss)
+        og.Step()
+        a, b := cpu.Scalar(lc.Loss), gpu.Scalar(lg.Loss)
+        assert (a - b).Abs() <= 1e-3 * (1.0 + a), "LoRA step " + $step + ": the loss " + $b + " against the CPU's " + $a
+        if step == 0: first = b
+        last = b
+    }
+    assert last < 0.7 * first, "LoRA on the GPU: the loss went from " + $first + " to " + $last
+    pc :~ cpu.Params().Flat()!
+    pg :~ gpu.Params().Flat()!
+    w F64 = 0.0
+    for i in range pc.Len(): w = w.Max((F64(pc[i]) - F64(pg[i])).Abs())
+    assert w <= 1e-3, "LoRA on the GPU: the adapters differ by " + $w
+    assert gpu.FrozenUploads() == qwenFrozen(m.C), "frozen weights went up " + $gpu.FrozenUploads() + " times"
+    os.RemoveAll(dir)!
+}
+
+test loraCase "LoRA on a tiny Qwen3 trained on the GPU as on the CPU: the losses step by step, the adapters after, the frozen weights uploaded once" { loraCase() }
 
 # GP8: views on the GPU - Permute (rank 3 and 4, of a parameter, of a view), Slice (a middle axis and the last, of a
 # view), Expand (of a slice, of a parameter, then permuted) - each read through a Contiguous copy, and their gradients
