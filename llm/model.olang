@@ -945,6 +945,9 @@ fn attendUnits(c Config&, tile Bool, qkv Array<F32>&, att mut Array<F32>&, pos A
                         vo := base + (t / 2) * hd * 2 + t % 2
                         if k.VF.Len() > 0 {
                             for i in range hd: a.o[j * hd + i] += x * k.VF[vo + 2 * i]
+                        } else if k.Kv8 {
+                            xs := x * k.VS[base / hd + t]
+                            for i in range hd: a.o[j * hd + i] += xs * F32(k.V8[vo + 2 * i])
                         } else {
                             for i in range hd: a.o[j * hd + i] += x * F32(k.V[vo + 2 * i])
                         }
@@ -1147,12 +1150,15 @@ test Model "attention split into runs of pages over the tasks gives the logits o
 
 test Model "8-bit values, a scale per position and head: the logits within a few percent of BF16's" {
     dir := Tiny(false, 19)
-    m := Model.Load(dir)!
     toks := tokens(200, 6)
-    a := decode(m, toks, false)
-    b := decode(m, toks, true)
-    assert worst(a, b) < 0.05 * biggest(a), $worst(a, b) + " of " + $biggest(a)
-    assert PageBytes(m.C, true) * 10 < PageBytes(m.C) * 8
+    # the AMX path where the target has it, and the F32 one (a target without AMX)
+    for exact in [false, true] {
+        m := Model.Load(dir, exact)!
+        a := decode(m, toks, false)
+        b := decode(m, toks, true)
+        assert worst(a, b) < 0.05 * biggest(a), "exact " + $exact + ": " + $worst(a, b) + " of " + $biggest(a)
+        assert PageBytes(m.C, true) * 10 < PageBytes(m.C) * 8
+    }
     os.RemoveAll(dir)!
 }
 

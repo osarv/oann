@@ -14,6 +14,13 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   `SelfAttention.Apply(g, x, docs)` - the graph's `Attention(..., docs)`, attention within a document - and `keep` (an
   `Input(t, 1)`, zero where a document starts) for `DeltaBlock.Apply(g, x, keep)`, whose gate it multiplies so the state
   starts from nothing at each document.
+- `moe.olang` - a mixture-of-experts perceptron: `Moe.New(g, D, H, E)` registers a router [E, D] and per expert SwiGLU
+  matrices (Gate, Up [H, D], Down [D, H]); `Apply(g, op, x)` runs it through an `Experts<S>(tokens, D, H, E, K, threads)` (S the product operands' storage, F32 or BF16)
+  operation (a `graph.Custom`, one per layer, kept as long as the graph): each token to the K experts with the highest
+  logit plus a selection bias, gates from the router's softmax (renormalized over the chosen ones for K > 1), only the
+  chosen experts' products run (kernels/gemm over the tokens gathered by expert). Balancing without a loss
+  (DeepSeek-V3's): `op.Balance(rate)` after each step moves the bias toward an even load; `Aux` > 0 adds Switch's balance
+  loss as a gradient. `Imbalance()` is the busiest expert's load over the mean. CPU; F32 in and out of the graph.
 - `ngram.olang` - input tables added to the embedding, lookups only: `Ngram` of order 1 (the previous token's code, a
   table indexed by x_{t-1}, its last row for the first position), 2 or 3 (a table of `Buckets` rows indexed by a hash of
   x_{t-1}, x_t or x_{t-2}, x_{t-1}, x_t). `New` registers the table and a `Tokens()` input of row indices, `Fill` computes
