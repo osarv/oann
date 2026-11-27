@@ -11,9 +11,10 @@ completions of a file of prompts as one long, resumable job. Nothing here trains
 | `gguf.olang` | GGUF files (llama.cpp's): the header and metadata, rows of a tensor widened to F32 (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K), the metadata as the config.json and tokenizer.json the rest reads; `Model.Load` and `oann-gen` take a `.gguf` path in place of a directory (llama, qwen2, qwen3, qwen3moe, granite, granitemoe, olmoe, smollm3; not Gemma) |
 | `bpe.olang` | `Bpe`, Hugging Face's BPE (tokenizer.json), byte-level or SentencePiece's (Gemma: "▁" for spaces, byte fallback): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
-| `chat.olang` | `Chat`: the chat template (ChatML, DeepSeek-R1's, Llama 3's, Granite's, Gemma's), stop tokens and sampling defaults of a model directory; `Fetch` from Hugging Face |
+| `chat.olang` | `Chat`: the model's own chat template run by `jinja.olang` (`Render`: messages, tool schemas, tool calls; `Prompt`: one user turn), with hard-coded ChatML, DeepSeek-R1, Llama 3, Granite and Gemma prompts where a directory has no template; stop tokens and sampling defaults; `Fetch` from Hugging Face |
+| `jinja.olang` | `Template`: the Jinja2 subset Hugging Face chat templates are written in, parsed once and rendered with a context of `Val`s, as transformers' environment renders them |
 | `gen.olang` | `oann-gen` |
-| `tools/reference.py`, `tools/tokref.py`, `tools/ggufref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
+| `tools/reference.py`, `tools/tokref.py`, `tools/chatref.py`, `tools/ggufref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
 ## Using it
 
@@ -113,6 +114,32 @@ starts from its characters - one the vocabulary lacks as its UTF-8 bytes' `<0xXX
 (checked on text in English, German, Chinese, Japanese, Korean, Russian, code, emoji and odd whitespace); the NFC
 normalizer is not applied, which matters only for text not already in NFC.
 
+**Chat templates.** `Chat.Load` reads the template from `chat_template.jinja`, else tokenizer_config.json's
+`chat_template` (a string, or the `"default"` of a list of named ones), and parses it once with `jinja.Template.Parse`.
+`Render(messages, tools, addGenerationPrompt, extra)` runs it as `apply_chat_template(..., tokenize=False)` does: the
+variables `messages`, `tools` (or none), `documents` (none), `add_generation_prompt`, tokenizer_config's special tokens
+(`bos_token`, `eos_token`, ...) and the members of `extra` (`enable_thinking`, ...). Messages are `jinja.Val` dicts -
+`role`, `content`, an assistant's `tool_calls` (`{"type": "function", "function": {"name", "arguments"}}`), a `tool`
+reply - built with `Val.NewDict` and `Put`, or read from JSON with `Val.FromJson`. A template's `raise_exception`
+(Gemma's on a tool turn, say) is `jinja.Error.Raised`. `Prompt(user, system, think)` renders one user turn after an
+optional system prompt (thinking off is `enable_thinking=False`), falling back to the hard-coded prompts above where
+there is no template.
+
+```
+t := try jinja.Template.Parse(text)
+ctx := jinja.Val.NewDict()
+ctx.Put("messages", jinja.Val.FromJson(try json.Json.Parse(messagesJson)))
+prompt := try t.Render(ctx)
+```
+
+The engine's environment is transformers': trim_blocks and lstrip_blocks, `-` whitespace control, an undefined value
+empty until something is asked of it, `tojson` as Python's `json.dumps(ensure_ascii=False)` (with `indent` too), and
+the globals `raise_exception`, `namespace`, `strftime_now` (local time), `range` and `dict`. What it supports - the
+statements, operators, filters, tests and string and dict methods - is listed at the top of `jinja.olang`. A lexer
+applies the whitespace control to the text between tags, a recursive-descent parser with Jinja's precedence builds
+expressions, statements and blocks into arrays that refer to each other by index, and the render walks them with a
+stack of scopes (a for loop's body and a macro's are scopes of their own, as in Jinja).
+
 ## Checks
 
 `llm/tools/reference.py` builds a small model of random weights for each architecture and option (Llama 3's and YaRN's
@@ -126,7 +153,12 @@ where a router may take another expert at a near tie: the mean difference within
 positions); SmolLM2-135M, Llama-3.2-1B, Granite-3.3-2B, Granite-3.1-1B-A400M and Gemma-3 270M and 1B (read after `<bos>`) within 1e-3 of the largest logit over
 the whole vocabulary and the same ten greedy tokens on the exact path, five on AMX's (Granite-3.3's sixth is a near tie
 that transformers in BF16 also takes the other way); the ids of Qwen3, Llama 3.2, SmolLM2, Granite 3.3 and Gemma 3's tokenizers exactly the library's; the chat
-prompts exactly the templates'.
+prompts exactly the templates'. `llm/tools/chatref.py DIR ...` renders six conversations with each model's template
+through transformers (one user turn; a system prompt; several turns; no generation prompt; `enable_thinking=False`;
+a tool schema, an assistant's tool call and the tool's reply) into `DIR/jinjaref.json`, and a test of `chat.olang`
+renders them through `jinja.olang` and holds them equal byte for byte - or both failing, as Gemma's template does on the
+tool turn - for Qwen3, Llama 3.2, Granite 3.3, Granite 3.1 MoE, Gemma 3 and SmolLM2. The templates write today's date,
+so the reference is written the day the test runs.
 
 A GGUF file's weights load widened to F32 and then rounded to BF16 (or requantized to INT8 with `--int8`): the file's
 4 or 8 bits save disk and download, not memory or time. The query and key rows of the Llama family come out of

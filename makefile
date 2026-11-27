@@ -15,7 +15,7 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	evo/schema.olang evo/neat.olang evo/pareto.olang evo/search.olang evo/inherit.olang \
 	archnet/encode.olang archnet/offline.olang archnet/toy.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
 	surgery/model.olang surgery/ops.olang \
-	llm/bpe.olang llm/model.olang llm/engine.olang llm/chat.olang llm/gguf.olang \
+	llm/bpe.olang llm/jinja.olang llm/model.olang llm/engine.olang llm/chat.olang llm/gguf.olang \
 	speech/mel.olang speech/whisper.olang speech/transcribe.olang speech/kws.olang speech/speak.olang speech/vits.olang speech/g2p.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
