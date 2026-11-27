@@ -1,16 +1,17 @@
 # llm
 
-Inference for openly licensed decoder-only language models on the CPU: Hugging Face checkpoints of the Qwen2 and Qwen3
-architectures loaded as they are published, run in batches on AMX tiles, and `oann-gen`, a command that writes
+Inference for openly licensed decoder-only language models on the CPU: Hugging Face checkpoints of the Qwen2, Qwen3,
+Llama (Llama 3, SmolLM2), Mistral, Granite and SmolLM3 architectures loaded as they are published, run in batches on AMX tiles, and `oann-gen`, a command that writes
 completions of a file of prompts as one long, resumable job. Nothing here trains; the weights are never committed.
 
 | file | what |
 |---|---|
 | `model.olang` | `Config` (config.json), `Model.Load` (safetensors, one file or the shards of an index; BF16, F16 or F32 stored), `Step` (any rows of any sequences through every layer), `Cache` (the paged key-value cache), `State` (a step's rows and buffers) |
-| `bpe.olang` | `Bpe`, Hugging Face's byte-level BPE (tokenizer.json): the added tokens, the Qwen2 pre-tokenizer pattern over Unicode classes (`unicode.olang`), the merges by rank |
+| `bpe.olang` | `Bpe`, Hugging Face's byte-level BPE (tokenizer.json): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
-| `chat.olang` | `Chat`: the chat template (ChatML, DeepSeek-R1's), stop tokens and sampling defaults of a model directory; `Fetch` from Hugging Face |
+| `chat.olang` | `Chat`: the chat template (ChatML, DeepSeek-R1's, Llama 3's, Granite's), stop tokens and sampling defaults of a model directory; `Fetch` from Hugging Face |
 | `gen.olang` | `oann-gen` |
+| `tools/reference.py`, `tools/tokref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
 ## Using it
 
@@ -70,18 +71,36 @@ page's keys) and the page's share of the output (the weights in BF16 times the v
 between them in F32. When the pool runs dry, the youngest sequence is preempted - its pages freed, its request queued
 again from its prompt, to draw the same tokens.
 
-**The architectures.** RMSNorm; rotary positions with the model's theta (and linear rope scaling); grouped-query
-attention; a SwiGLU perceptron; Qwen2's biases on the query, key and value projections; Qwen3's RMSNorm of each query
-and key head before the rotation; the head tied to the embedding or its own. YaRN and the mixture-of-experts models are
-not run.
+**The architectures.** RMSNorm; rotary positions with the model's theta, scaled as `rope_scaling` (or transformers 5's
+`rope_parameters`) says - linear, Llama 3.1's (long wavelengths divided by the factor, short ones kept, a blend between)
+or YaRN's (frequencies interpolated by a ramp between beta_slow and beta_fast turns over the original context, cos and
+sin times the attention factor); grouped-query attention, over a sliding window where the config sets one (Mistral's
+`sliding_window`, Qwen2's with `use_sliding_window`, `layer_types`' "sliding_attention"); a SwiGLU perceptron; Qwen2's
+biases on the query, key and value projections; Qwen3's RMSNorm of each query and key head before the rotation;
+Granite's multipliers (the embedding, each residual branch, the scores in place of 1/sqrt(d), the logits divided);
+SmolLM3's layers without rotation (`no_rope_layers`); the head tied to the embedding or its own, its rows padded to a
+multiple of 16 (Granite's vocabulary of 49159). Gemma, Phi and the mixture-of-experts models are not run yet.
 
 **Tokens.** tokenizer.json's byte-level BPE: added tokens (`<|im_start|>`, `<think>`, ...) are matched in the text
-first, the stretches between them split by the pre-tokenizer's pattern (Qwen2's, one digit a chunk) over the Unicode
-letter and number classes, and each chunk's bytes merged lowest rank first. It encodes as the tokenizers library does
+first, the stretches between them split by the pre-tokenizer's pattern over the Unicode letter and number classes -
+Qwen2's (one digit a chunk), Llama 3's (up to three) or GPT-2's (ByteLevel's own regex: Granite, SmolLM), after
+SmolLM's Digits pre-tokenizer where there is one - and each chunk's bytes merged lowest rank first; where the model sets
+`ignore_merges` (Llama 3), a chunk the vocabulary holds whole is that token. A byte a vocabulary lacks (SmolLM's and
+Granite's lack some control bytes and bytes UTF-8 never has) is dropped, as the library drops it. It encodes as the tokenizers library does
 (checked on text in English, German, Chinese, Japanese, Korean, Russian, code, emoji and odd whitespace); the NFC
 normalizer is not applied, which matters only for text not already in NFC.
 
 ## Checks
+
+`llm/tools/reference.py` builds a small model of random weights for each architecture and option (Llama 3's and YaRN's
+rope scaling, Granite's multipliers, SmolLM3's layers without rotation, Mistral's window of 50 over 150 positions) and
+writes the logits transformers gives at every position; with `--real DIR ...` it writes a real checkpoint's last-position
+logits and ten greedy tokens. `llm/tools/tokref.py DIR ...` writes the tokenizers library's ids of fixed texts (nine
+languages and scripts, code, numbers, emoji, whitespace) and the chat template's prompt. The tests read them where
+`$OANN_MODELS` has them: every position of every small model within 1e-4 on the exact path (0.03 on AMX's); SmolLM2-135M,
+Llama-3.2-1B and Granite-3.3-2B within 1e-3 of the largest logit over the whole vocabulary and the same ten greedy
+tokens on both paths; the ids of Qwen3, Llama 3.2, SmolLM2 and Granite 3.3's tokenizers exactly the library's; the chat
+prompts exactly the templates'.
 
 The tests (`make test`) build small random Qwen2 and Qwen3 checkpoints and hold the AMX path to the exact one within
 BF16's rounding, decoding through the cache a token a step to reading the prompt at once (over pages), a row's logits
@@ -150,6 +169,11 @@ architectures known to run, and their licences (each model's own LICENSE file is
 
 | model | architecture | licence |
 |---|---|---|
+| meta-llama/Llama-3.2-1B-Instruct, 3B-Instruct (ungated copies: unsloth/...) | llama | Llama 3.2 Community License (use policy; "Built with Llama") |
+| HuggingFaceTB/SmolLM2-135M-Instruct, 360M-Instruct, 1.7B-Instruct | llama | Apache 2.0 |
+| HuggingFaceTB/SmolLM3-3B | smollm3 | Apache 2.0 |
+| ibm-granite/granite-3.3-2b-instruct, granite-3.3-8b-instruct | granite | Apache 2.0 |
+| mistralai/Mistral-7B-Instruct-v0.3 | mistral | Apache 2.0 (its tokenizer is SentencePiece's: not read yet) |
 | Qwen/Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B, Qwen3-8B | qwen3 | Apache 2.0 |
 | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B, DeepSeek-R1-Distill-Qwen-7B | qwen2 | MIT (built from Qwen2.5, Apache 2.0) |
 | Qwen/Qwen2.5-0.5B-Instruct ... 7B-Instruct | qwen2 | Apache 2.0 |

@@ -1,13 +1,17 @@
-# llm/bpe - Hugging Face's byte-level BPE tokenizers (tokenizer.json, "model": {"type": "BPE"}), as the Qwen2 and Qwen3
-# families and the models distilled into them have them: a vocabulary of byte strings in GPT-2's printable form ("Ġthe"
-# for " the"), the merges in rank order, and the added tokens (<|im_start|>, <think>, ...) matched in the text before
-# anything else, as the tokenizers library does.
+# llm/bpe - Hugging Face's byte-level BPE tokenizers (tokenizer.json, "model": {"type": "BPE"}), as the Qwen2, Qwen3,
+# Llama 3, SmolLM and Granite families and the models distilled into them have them: a vocabulary of byte strings in
+# GPT-2's printable form ("Ġthe" for " the"), the merges in rank order, and the added tokens (<|im_start|>, <think>,
+# ...) matched in the text before anything else, as the tokenizers library does.
 #
-# Encoding: the text is cut at every added token; each stretch between them is split by the pre-tokenizer's pattern
-#     (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
-# (Qwen2's; one digit a chunk), read by a hand-written scanner over code points with the Unicode classes of
-# llm/unicode; each chunk's bytes are merged lowest rank first, leftmost first (a heap over its positions, as the
-# tokenizer module's encoder does). The normalizer's NFC is not applied: text already in NFC (nearly all text) encodes
+# Encoding: the text is cut at every added token; each stretch between them is split by the pre-tokenizer's pattern,
+# one of three read from tokenizer.json:
+#     Qwen2:  (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+#     Llama3: the same with \p{N}{1,3} (up to three digits a chunk)
+#     Gpt2:   's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+ (ByteLevel's own; Granite, SmolLM)
+# and, where a Digits pre-tokenizer comes first (SmolLM's individual_digits), every digit a chunk of its own. A
+# hand-written scanner reads them over code points with the Unicode classes of llm/unicode; each chunk's bytes are
+# merged lowest rank first, leftmost first (a heap over its positions, as the tokenizer module's encoder does) - or,
+# where the model sets ignore_merges (Llama 3), a chunk the vocabulary holds whole is that token. The normalizer's NFC is not applied: text already in NFC (nearly all text) encodes
 # as the library encodes it. Decoding writes each token's bytes.
 
 import "std/json"
@@ -26,6 +30,13 @@ type AddedToken struct(Text String&, Id I32) {
     Id
 }
 
+# the pre-tokenizer's pattern
+type Pre enum {
+    Qwen2
+    Llama3
+    Gpt2
+}
+
 type Bpe struct(Size I64, starts Array<I64>&, bytes Array<Char>&, byteId Array<I32>&, table Array<I64>&, mergeTo Array<I32>&
     Added Array<AddedToken>&) {
     Size                    # the number of ids (the largest id + 1)
@@ -36,6 +47,9 @@ type Bpe struct(Size I64, starts Array<I64>&, bytes Array<Char>&, byteId Array<I
     mergeTo                 # the token a merge of rank r makes
     Added                   # longest first
     firsts Array<Bool>& = firstBytes(Added)
+    Split Pre = Pre.Qwen2   # the pre-tokenizer's pattern
+    Digits Bool = false     # every digit a chunk of its own, before the pattern
+    whole mut Map<String, I32>& = Map<String, I32>()    # ignore_merges: the vocabulary's tokens by their bytes
 }
 
 fn firstBytes(added Array<AddedToken>&) Array<Bool> {
@@ -144,7 +158,7 @@ fn Bpe.Parse(text String&) Bpe ? BpeError, json.Error {
             sb.PushChar(Char(U8(192 | (cp >> 6))))
             sb.PushChar(Char(U8(128 | (cp & 63))))
         }
-        byteId[b] = I32(try ids.Get(sb.ToString()) catch { error BpeError.Malformed })
+        byteId[b] = I32(try ids.Get(sb.ToString()) catch default -1)    # some vocabularies lack bytes UTF-8 never has
     }
     # the merges, in rank order: "a b" or ["a", "b"]
     merges :~ try (try model["merges"]).AsArr()
@@ -182,7 +196,41 @@ fn Bpe.Parse(text String&) Bpe ? BpeError, json.Error {
     }
     sorted :~ added.ToArray()
     sorted.Sort(fn(x AddedToken, y AddedToken) Bool { return x.Text.Len() > y.Text.Len() })
-    return Bpe(size, starts, all.ToArray(), byteId, table, mergeTo, sorted)
+    t := Bpe(size, starts, all.ToArray(), byteId, table, mergeTo, sorted)
+    readPre(t, doc)
+    if model.Has("ignore_merges") and (try (try model["ignore_merges"]).AsBool() catch default false) {
+        for id in range size {
+            if not isAdded[id]: t.whole.Put(String(t.bytes[t.starts[id]:t.starts[id + 1]]), I32(id))
+        }
+    }
+    return t
+}
+
+# the pre-tokenizer of tokenizer.json: a Split by Llama 3's or Qwen2's pattern, or ByteLevel's own; a Digits before it
+fn readPre(t mut Bpe&, doc json.Json&) {
+    if not doc.Has("pre_tokenizer"): return
+    pre :~ try doc["pre_tokenizer"] catch { return }
+    if pre.IsNull(): return
+    parts := Vec<json.Json&>()
+    if pre.Has("pretokenizers") {
+        seq :~ try (try pre["pretokenizers"] catch { return }).AsArr() catch { return }
+        for x in seq: parts.Push(x)
+    } else {
+        parts.Push(pre)
+    }
+    split := false
+    for x in parts.View() {
+        kind :~ try (try x["type"] catch { continue }).AsStr() catch { continue }
+        if kind == "Digits" {
+            t.Digits = try (try x["individual_digits"] catch { continue }).AsBool() catch default false
+        } else if kind == "Split" {
+            pat :~ try (try (try x["pattern"] catch { continue })["Regex"] catch { continue }).AsStr() catch { continue }
+            split = true
+            t.Split = Pre.Llama3 if (try pat.Find("\\p{N}{1,3}") catch default -1) >= 0 else Pre.Qwen2
+        } else if kind == "ByteLevel" and not split {
+            if try (try x["use_regex"] catch { continue }).AsBool() catch default true: t.Split = Pre.Gpt2
+        }
+    }
 }
 
 # the rank of merging (a, b), -1 when no merge makes it
@@ -296,8 +344,51 @@ fn runEnd(t String&, i I64, k I64) I64 {
     return j
 }
 
-# where the chunk starting at t[i] ends: the pattern's alternatives tried in its order
-fn ChunkEnd(t String&, i I64) I64 {
+# where the chunk starting at t[i] ends by pattern p
+fn ChunkEndOf(t String&, i I64, p Pre) I64 {
+    return match p {
+        case Pre.Qwen2: ChunkEnd(t, i)
+        case Pre.Llama3: ChunkEnd(t, i, 3)
+        case Pre.Gpt2: gpt2End(t, i)
+    }
+}
+
+# where the chunk starting at t[i] ends by GPT-2's pattern: the alternatives tried in its order
+fn gpt2End(t String&, i I64) I64 {
+    n := t.Len()
+    c := t[i]
+    # 's|'t|'re|'ve|'m|'ll|'d
+    if c == '\'' and i + 1 < n {
+        d := t[i + 1]
+        if d == 's' or d == 't' or d == 'm' or d == 'd': return i + 2
+        if i + 2 < n {
+            e := t[i + 2]
+            if (d == 'r' and e == 'e') or (d == 'v' and e == 'e') or (d == 'l' and e == 'l'): return i + 3
+        }
+    }
+    k, _ := kindAt(t, i)
+    #  ?\p{L}+,  ?\p{N}+,  ?[^\s\p{L}\p{N}]+
+    if k != kindSpace: return runEnd(t, i, k)
+    if c == ' ' {
+        k2, _ := kindAt(t, i + 1)
+        if k2 >= 0 and k2 != kindSpace: return runEnd(t, i + 1, k2)
+    }
+    # \s+(?!\S), \s+: the run, backed off by its last code point where a non-space follows and that leaves one
+    e := runEnd(t, i, kindSpace)
+    if e >= n: return e
+    q I64 = i
+    prev I64 = i
+    for q < e {
+        _, wq := kindAt(t, q)
+        prev = q
+        q += wq
+    }
+    return prev if prev > i else e
+}
+
+# where the chunk starting at t[i] ends by Qwen2's pattern (digits 1 a chunk) or Llama 3's (digits up to 3): the
+# alternatives tried in its order
+fn ChunkEnd(t String&, i I64, digits I64 = 1) I64 {
     n := t.Len()
     c := t[i]
     # (?i:'s|'t|'re|'ve|'m|'ll|'d)
@@ -316,8 +407,16 @@ fn ChunkEnd(t String&, i I64) I64 {
         k2, _ := kindAt(t, i + w)
         if k2 == kindLetter: return runEnd(t, i + w, kindLetter)
     }
-    # \p{N}
-    if k == kindNumber: return i + w
+    # \p{N}, \p{N}{1,3}
+    if k == kindNumber {
+        e := i + w
+        for _ in range digits - 1 {
+            ke, we := kindAt(t, e)
+            if ke != kindNumber: break
+            e += we
+        }
+        return e
+    }
     #  ?[^\s\p{L}\p{N}]+[\r\n]*
     j I64 = -1
     if k == kindOther {
@@ -350,16 +449,30 @@ fn ChunkEnd(t String&, i I64) I64 {
     return prev if prev > i else e
 }
 
-# the chunks of t, as pieces of it (added tokens not looked for)
-fn Chunks(t String&) list.List<String&>& {
+# the chunks of t, as pieces of it (added tokens not looked for), by pattern p, digits split first or not
+fn Chunks(t String&, p Pre = Pre.Qwen2, digits Bool = false) list.List<String&>& {
     out mut list.List<String&>& = list.List<String&>()
     i I64 = 0
     for i < t.Len() {
-        e := ChunkEnd(t, i)
+        e := chunkEnd(t, i, p, digits)
         out.Push(t[i:e])
         i = e
     }
     return out
+}
+
+# where the chunk starting at t[i] ends: by pattern p, within the stretch to the next digit where digits are split
+fn chunkEnd(t String&, i I64, p Pre, digits Bool) I64 {
+    if not digits: return ChunkEndOf(t, i, p)
+    k, w := kindAt(t, i)
+    if k == kindNumber: return i + w
+    q := i + w
+    for q < t.Len() {
+        kq, wq := kindAt(t, q)
+        if kq == kindNumber: break
+        q += wq
+    }
+    return ChunkEndOf(t[:q], i, p)
 }
 
 # ---- encoding ----
@@ -409,6 +522,10 @@ fn heapPop(h mut list.List<I64>&) I64 {
 # piece's tokens appended to out: its bytes merged lowest rank first, leftmost first
 fn (t Bpe&) encodeChunk(piece String&, e mut encoder&, out mut Vec<I32>&) {
     n := piece.Len()
+    if t.whole.Len() > 0 and t.whole.Has(piece) {
+        out.Push(try t.whole.Get(piece) catch { unreachable })
+        return
+    }
     syms :~ e.syms
     next :~ e.next
     prev :~ e.prev
@@ -449,7 +566,7 @@ fn (t Bpe&) encodeChunk(piece String&, e mut encoder&, out mut Vec<I32>&) {
     }
     j I64 = 0
     for j < n {
-        out.Push(I32(syms[j]))
+        if syms[j] >= 0: out.Push(I32(syms[j]))        # a byte the vocabulary lacks is dropped, as the library drops it
         j = next[j]
     }
 }
@@ -478,7 +595,7 @@ fn (t Bpe&) Encode(text String&) Array<I32> {
         # the stretch before it, pre-tokenized
         p I64 = start
         for p < i {
-            end := ChunkEnd(text[:i], p)
+            end := chunkEnd(text[:i], p, t.Split, t.Digits)
             t.encodeChunk(text[p:end], e, out)
             p = end
         }
@@ -514,4 +631,38 @@ test ChunkEnd "the pre-tokenizer's alternatives in their order" {
     assert cut("über café") == "über| café"
     assert cut("“quoted”") == "“quoted|”"
     assert cut("中文 text") == "中文| text"
+}
+
+fn cutBy(t String&, p Pre, digits Bool = false) String { return Chunks(t, p, digits).Join("|") }
+
+test ChunkEndOf "Llama 3's digits up to three a chunk; GPT-2's pattern; digits split first" {
+    assert cutBy("I'm 12345 ok", Pre.Llama3) == "I|'m| |123|45| ok"
+    assert cutBy("Hello world", Pre.Gpt2) == "Hello| world"
+    assert cutBy("I'M 123 ok", Pre.Gpt2) == "I|'|M| 123| ok"
+    assert cutBy("a  b", Pre.Gpt2) == "a| | b"
+    assert cutBy("x\n\ny", Pre.Gpt2) == "x|\n|\n|y"
+    assert cutBy("(x)!!\n", Pre.Gpt2) == "(|x|)!!|\n"
+    assert cutBy("end   ", Pre.Gpt2) == "end|   "
+    assert cutBy("über café", Pre.Gpt2) == "über| café"
+    assert cutBy("I'm 123 ok", Pre.Gpt2, true) == "I|'m| |1|2|3| ok"
+    assert cutBy("a  12b", Pre.Gpt2, true) == "a|  |1|2|b"
+}
+
+# the models under $OANN_MODELS with a tokref.json (llm/tools/tokref.py: the tokenizers library's ids of fixed texts)
+test Bpe "encodes as the tokenizers library does, for every model under $OANN_MODELS with a tokref.json" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: return
+    for name in os.ReadDir(root)! {
+        dir := root + "/" + name
+        if not os.Exists(dir + "/tokref.json"): continue
+        t := Bpe.Load(dir + "/tokenizer.json")!
+        cases :~ json.Json.Parse(os.ReadFile(dir + "/tokref.json")!)!.AsArr()!
+        for c in cases {
+            text :~ c["text"]!.AsStr()!
+            want := Array<I32>[I32(x.AsInt()!) for x in c["ids"]!.AsArr()!]
+            got := t.Encode(text)
+            assert got == want, name + ": " + text + "\n got  " + $got + "\n want " + $want
+            assert t.Decode(got)! == text, name + ": decoding " + text
+        }
+    }
 }
