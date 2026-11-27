@@ -8,12 +8,15 @@
 # times by an Expand view, and runs causal attention. The head is the embedding (tied) or a matrix of its own.
 #
 # Use: `q := Qwen.New(g, cfg, ctx)?` records the layers before Plan, `q.Lm(g)` the tokens, logits and loss, then after
-# Plan `q.Fill(g, m)` copies the weights of `model.Model.Load(dir, true)` (exact: row-major) into the graph.
+# Plan `q.Fill(g, m)` copies the weights of `model.Model.Load(dir, true)` (exact: row-major) into the graph. To
+# fine-tune, `s := q.AddLora(g, lora.Config(8, 16.0, ["q_proj", "v_proj"]))?` before Lm puts LoRA adapters (nn/lora) on
+# the projections named: they are the graph's only parameters; `s.Save(g, dir)` writes them as PEFT does.
 
 import "../ad/graph"
 import "../nn/train"
 import "../llm/model"
 import "../kernels/mat"
+import "../nn/lora"
 
 # one block's weights: [out, in] matrices, vectors of their width; a bias None where the config has none
 type QwenBlock struct() {
@@ -31,6 +34,13 @@ type QwenBlock struct() {
     Gate graph.Var = graph.None
     Up graph.Var = graph.None
     Down graph.Var = graph.None
+    LQ lora.Adapter = lora.Adapter()        # the projections' adapters (AddLora): none by default
+    LK lora.Adapter = lora.Adapter()
+    LV lora.Adapter = lora.Adapter()
+    LO lora.Adapter = lora.Adapter()
+    LGate lora.Adapter = lora.Adapter()
+    LUp lora.Adapter = lora.Adapter()
+    LDown lora.Adapter = lora.Adapter()
 }
 
 type Qwen struct(Config model.Config, Ctx I64, Embed graph.Var, Blocks Array<QwenBlock>, Final graph.Var, Head graph.Var) {
@@ -95,9 +105,9 @@ fn (m Qwen&) repeat<T>(g mut graph.Graph<T>&, x graph.Var) graph.Var {
 fn (m Qwen&) block<T>(g mut graph.Graph<T>&, b QwenBlock&, h graph.Var) graph.Var {
     c := m.Config
     x := g.Norm(h, b.Norm1, graph.None, true, c.Eps)
-    q := g.Linear(x, b.Q, b.QBias)
-    k := g.Linear(x, b.K, b.KBias)
-    v := g.Linear(x, b.V, b.VBias)
+    q := b.LQ.Linear(g, x, b.Q, b.QBias)
+    k := b.LK.Linear(g, x, b.K, b.KBias)
+    v := b.LV.Linear(g, x, b.V, b.VBias)
     if c.QkNorm {
         q = m.headNorm(g, q, c.Heads, b.QNorm)
         k = m.headNorm(g, k, c.KvHeads, b.KNorm)
@@ -105,10 +115,35 @@ fn (m Qwen&) block<T>(g mut graph.Graph<T>&, b QwenBlock&, h graph.Var) graph.Va
     q = g.Rope(q, c.Heads, c.Theta)
     k = g.Rope(k, c.KvHeads, c.Theta)
     a := g.Attention(q, m.repeat(g, k), m.repeat(g, v), c.Heads, true)
-    h2 := g.Add(h, g.Linear(a, b.O))
+    h2 := g.Add(h, b.LO.Linear(g, a, b.O))
     y := g.Norm(h2, b.Norm2, graph.None, true, c.Eps)
-    f := g.Mul(g.Act(g.Linear(y, b.Gate), mat.Act.Silu), g.Linear(y, b.Up))
-    return g.Add(h2, g.Linear(f, b.Down))
+    f := g.Mul(g.Act(b.LGate.Linear(g, y, b.Gate), mat.Act.Silu), b.LUp.Linear(g, y, b.Up))
+    return g.Add(h2, b.LDown.Linear(g, f, b.Down))
+}
+
+# LoRA adapters on the projections c names (q_proj k_proj v_proj o_proj gate_proj up_proj down_proj), made on g
+# before Plan, under the module paths of the Hugging Face checkpoint - the set Save, Load and lora.Merge take
+fn (m mut Qwen&) AddLora<T>(g mut graph.Graph<T>&, c lora.Config) lora.Set ? lora.LoraError {
+    known := ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    for t in c.Targets {
+        if not (t in known): error lora.LoraError.Config("target " + t + " (Qwen has " + $known + ")")
+    }
+    s := lora.Set(c)
+    cf := m.Config
+    qd, kv, d, f := cf.Heads * cf.HeadDim, cf.KvHeads * cf.HeadDim, cf.Dim, cf.Ffn
+    for i in range m.Blocks.Len() {
+        b := m.Blocks[i]
+        p := "model.layers." + $i + "."
+        b.LQ = s.Add(g, p + "self_attn.q_proj", d, qd)
+        b.LK = s.Add(g, p + "self_attn.k_proj", d, kv)
+        b.LV = s.Add(g, p + "self_attn.v_proj", d, kv)
+        b.LO = s.Add(g, p + "self_attn.o_proj", qd, d)
+        b.LGate = s.Add(g, p + "mlp.gate_proj", d, f)
+        b.LUp = s.Add(g, p + "mlp.up_proj", d, f)
+        b.LDown = s.Add(g, p + "mlp.down_proj", f, d)
+        m.Blocks[i] = b
+    }
+    return s
 }
 
 # the logits of each position's next token, from a Tokens(Ctx) node: [batch, Ctx, Vocab]
@@ -229,4 +264,144 @@ test Qwen "the graph's logits are llm/model's: Qwen3 tied and untied, Qwen2's bi
         assert worstB < 0.02 * bigB, "case " + $which + ": BF16 logits differ by " + $worstB + " of " + $bigB
         os.RemoveAll(dir)!
     }
+}
+
+import "../nn/optim"
+import "../tools/gradcheck"
+import "../tensor"
+import "../io/checkpoint"
+
+# every projection Qwen has, at rank 4
+fn allTargets() lora.Config {
+    return lora.Config(4, 8.0, Array<String>["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+}
+
+# the tiny Qwen3 of m with adapters c (rank 0: none) as a graph of "batch" sequences of ctx tokens, filled, its tokens
+# and targets drawn from seed 5
+fn adapted<T>(m model.Model&, c lora.Config, ctx I64, batch I64) graph.Graph<T>, Qwen, lora.Set, train.LanguageModel {
+    g mut graph.Graph<T>& = graph.Graph<T>(batch, 2)
+    q := Qwen.New(g, m.C, ctx)!
+    s := q.AddLora(g, c)! if c.Rank > 0 else lora.Set(c)
+    lm := q.Lm(g)
+    g.Plan(rand.Rand(1))!
+    q.Fill(g, m)
+    r := rand.Rand(5)
+    toks :~ g.Ints(lm.Tokens).Flat()!
+    ys :~ g.Ints(lm.Targets).Flat()!
+    for i in range toks.Len() {
+        toks[i] = I32(r.Below(m.C.Vocab))
+        ys[i] = I32(r.Below(m.C.Vocab))
+    }
+    return g, q, s, lm
+}
+
+# "steps" AdamW steps on the graph's fixed batch: the loss before and after
+fn steps<T>(g mut graph.Graph<T>&, lm train.LanguageModel&, n I64) F64, F64 {
+    g.Training = true
+    g.Forward(g.Batch)
+    before := g.Scalar(lm.Loss)
+    match T {
+        case BF16 {
+            o := optim.AdamW(g.Masters(), g.ParamGrads(), rate = 1e-2, spans = optim.Spans(g))
+            for _ in range n: step(g, lm, o)
+        }
+        case _ {
+            o := optim.AdamW(g.Params(), g.ParamGrads(), rate = 1e-2, spans = optim.Spans(g))
+            for _ in range n: step(g, lm, o)
+        }
+    }
+    g.Forward(g.Batch)
+    return before, g.Scalar(lm.Loss)
+}
+
+fn step<T, O>(g mut graph.Graph<T>&, lm train.LanguageModel&, o mut O&) {
+    g.Forward(g.Batch)
+    g.Backward(lm.Loss)
+    o.Step()
+    g.SyncParams()
+}
+
+# the largest difference of a and b, and the largest of b
+fn diff(a Array<F64>&, b Array<F64>&) F64, F64 {
+    worst, big := F64(0.0), F64(0.0)
+    for i in range a.Len() {
+        worst = worst.Max((a[i] - b[i]).Abs())
+        big = big.Max(b[i].Abs())
+    }
+    return worst, big
+}
+
+fn flat<T>(t tensor.Tensor<T>&) Array<F64> {
+    x :~ t.Flat()!
+    return Array<F64>[F64(v) for v in x]
+}
+
+test Qwen "LoRA: logits the base's exactly at the start, only A and B are parameters, their gradients the central differences', the frozen weights unchanged by a step and the loss lowered" {
+    dir := model.TinyTied(true, 3, true)
+    m := model.Model.Load(dir, true)!
+    base, _, _, bl := adapted<F32>(m, lora.Config(0, 1.0, Array<String>(0)), 16, 2)
+    g, q, s, lm := adapted<F32>(m, allTargets(), 16, 2)
+    base.Training = false
+    g.Training = false
+    base.Forward(2)
+    g.Forward(2)
+    assert base.Value(bl.Logits).Flat()! == g.Value(lm.Logits).Flat()!
+    assert s.Items.Len() == 7 * m.C.Layers and g.ParamCount == s.Count(g)
+    # gradients, in F64, with B away from zero so A's are not zero
+    h, _, hs, hl := adapted<F64>(m, allTargets(), 8, 2)
+    r := rand.Rand(9)
+    for a in hs.Items.View() {
+        b := h.Value(a.B)
+        b.FillNormal(r, 0.0, 0.1)
+    }
+    err := gradcheck.GradientError(h, hl.Loss, 2)
+    assert err < 5e-5, "LoRA gradients differ from the central differences by " + $err
+    # a few steps: the frozen weights stay, the loss falls
+    w0 := flat(g.Value(q.Blocks[0].Q))
+    before, after := steps(g, lm, 20)
+    assert flat(g.Value(q.Blocks[0].Q)) == w0
+    assert after < 0.7 * before, "the loss went from " + $before + " to " + $after
+    os.RemoveAll(dir)!
+}
+
+test Qwen "LoRA adapters: saved as PEFT names them and loaded back bit for bit; merged into the base, llm/model gives the adapted graph's logits" {
+    dir := model.TinyTied(true, 4, false)
+    m := model.Model.Load(dir, true)!
+    c := lora.Config(4, 8.0, Array<String>["q_proj", "v_proj", "o_proj", "down_proj"])
+    g, _, s, lm := adapted<F32>(m, c, 16, 1)
+    steps(g, lm, 10)
+    out := os.MkTemp("", "lora")!
+    s.Save(g, out + "/adapter")!
+    f := checkpoint.File.Load(out + "/adapter/adapter_model.safetensors")!
+    assert f.Has("base_model.model.model.layers.1.mlp.down_proj.lora_B.weight") and f.Entries.Len() == 2 * 4 * m.C.Layers
+    back := lora.Config.Read(out + "/adapter")!
+    assert back.Rank == 4 and back.Alpha == 8.0 and back.Targets == c.Targets
+    h, _, hs, _ := adapted<F32>(m, back, 16, 1)
+    hs.Load(h, out + "/adapter")!
+    assert h.Params().Flat()! == g.Params().Flat()!
+    # merged in F32: the base graph with the merged weights gives the adapted graph's logits to 1e-5 of the largest;
+    # llm/model (which holds weights in BF16) to 1% of it
+    lora.Merge(dir, out + "/adapter", out + "/merged", true)!
+    g.Training = false
+    g.Forward(1)
+    got := flat(g.Value(lm.Logits))
+    toks :~ g.Ints(lm.Tokens).Flat()!
+    plain, pq, _, pl := adapted<F32>(m, lora.Config(0, 1.0, Array<String>(0)), 16, 1)
+    mf := checkpoint.File.Load(out + "/merged/model.safetensors")!
+    for i, b in pq.Blocks {
+        p := "model.layers." + $i + "."
+        for k, v in [b.Q, b.V, b.O, b.Down] {
+            w := plain.Value(v)
+            mf.Read(p + ["self_attn.q_proj", "self_attn.v_proj", "self_attn.o_proj", "mlp.down_proj"][k] + ".weight", w)!
+        }
+    }
+    plain.Training = false
+    plain.Forward(1)
+    worst, big := diff(got, flat(plain.Value(pl.Logits)))
+    assert big > 1.0 and worst < 1e-5 * big, "merged F32 weights: the logits differ by " + $worst + " of " + $big
+    merged := model.Model.Load(out + "/merged", true)!
+    worstB, bigB := diff(got, Array<F64>[F64(x) for x in oracle(merged, toks)])
+    assert worstB < 0.01 * bigB, "llm/model on the merged model: the logits differ by " + $worstB + " of " + $bigB
+    os.RemoveAll(out)!
+    os.RemoveAll(dir)!
 }
