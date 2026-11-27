@@ -1,0 +1,92 @@
+# G-M6: what language model fits and how fast it trains on the GPU - a GPT of the yardstick's kind (RoPE, RMS norms, a
+# gated feed-forward, tied embeddings) at the size asked, F32 or BF16 (mixed precision: the arena in BF16, F32 masters
+# and moments), trained by whole steps captured as CUDA graphs (GpuAdamW.Train: Forward, Backward, the clip, AdamW) on
+# random tokens. Prints the parameters, the device bytes the plan and the optimizer take, the median step and the tokens
+# and model FLOPs a second (6 x parameters x tokens, the usual count; attention's own products not in it).
+# From the repository's root: make gpulm ARGS="dim layers heads ctx batch steps f32|bf16 [vocab]", e.g. ARGS="768 12 12
+# 512 8 20 bf16" (about 124M parameters with a 32000 vocabulary).
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../kernels/device"
+import "../models/gpt"
+import "../nn/optim"
+import "../nn/train"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(x Array<F64>&) F64 {
+    s := Array<F64>[v for v in x]
+    for i in range s.Len() {
+        j := i
+        for j > 0 and s[j - 1] > s[j] {
+            s[j - 1], s[j] = s[j], s[j - 1]
+            j--
+        }
+    }
+    return s[s.Len() / 2]
+}
+
+fn feed<T>(g mut graph.Graph<T>&, lm train.LanguageModel&, r mut rand.Rand&, vocab I64) {
+    t :~ g.Ints(lm.Tokens).Flat()!
+    c :~ g.Ints(lm.Targets).Flat()!
+    for i in range t.Len(): t[i] = I32(r.Below(vocab))
+    for i in range c.Len(): c[i] = I32(r.Below(vocab))
+}
+
+fn run<T>(c gpt.GptConfig, batch I64, steps I64, what String&) ? io.Error {
+    g mut graph.Graph<T>& = graph.Graph<T>(batch)
+    lm := gpt.Gpt.New(g, c).Lm(g)
+    try g.Plan(rand.Rand(1), device.Backend.Gpu) catch e {
+        try io.Put("not planned on the GPU: " + $e + "\n")
+        return
+    }
+    o := try optim.GpuAdamW<T>.For(g, rate = 3e-4, decay = 0.1) catch e {
+        try io.Put("no optimizer on the GPU: " + $e + "\n")
+        return
+    }
+    params := c.Params()
+    moments := 2 * params * 4
+    mb := F64(g.ArenaBytes() + moments) / 1048576.0
+    try io.Put(what + ": " + $params + " parameters, " + $mb + " MB on the device (arena " + $(F64(g.ArenaBytes()) / 1048576.0) + " MB, moments " + $(F64(moments) / 1048576.0) + " MB)\n")
+    r := rand.Rand(2)
+    times := Array<F64>(steps)
+    for s in range steps + 2 {
+        feed(g, lm, r, c.Vocab)
+        t0 := time.Now()
+        o.Train(lm.Loss, batch, 1.0)
+        loss := g.Scalar(lm.Loss)
+        if s >= 2: times[s - 2] = F64(time.Since(t0)) * 1e-9
+        if s == steps + 1: try io.Put("  last loss " + $loss + "\n")
+    }
+    step := median(times)
+    tokens := F64(batch * c.Ctx)
+    try io.Put("  step " + $(step * 1000.0) + " ms, " + $(tokens / step) + " tokens/s, " + $(6.0 * F64(params) * tokens / step / 1.0e12) + " model TFLOPS\n")
+}
+
+fn main() ? io.Error, ParseError {
+    args :~ os.Args()
+    dim := try number(args, 1, 768)
+    layers := try number(args, 2, 12)
+    heads := try number(args, 3, 12)
+    ctx := try number(args, 4, 512)
+    batch := try number(args, 5, 8)
+    steps := try number(args, 6, 20)
+    kind :~ args[7] if args.Len() > 7 else "bf16"
+    vocab := try number(args, 8, 32000)
+    if not device.GpuAvailable() {
+        try io.Put("no CUDA device\n")
+        return
+    }
+    device.SetDefault(device.Backend.Gpu)
+    c := gpt.GptConfig(vocab, dim, layers, heads, ctx, Rope = true, Rms = true, Gated = true)
+    what := $dim + " x " + $layers + " layers, " + $heads + " heads, ctx " + $ctx + ", batch " + $batch + ", " + kind
+    if kind == "f32": try run<F32>(c, batch, steps, what)
+    else: try run<BF16>(c, batch, steps, what)
+}

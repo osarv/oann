@@ -5,7 +5,8 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 - `layers.olang` - layers as plain data (handles and sizes) with a `New` on a graph that registers the parameters and an
   `Apply` that records the operations: `Dense`, `Embedding` (also a tied output head), `Norm` (layer or RMS), `Mlp`,
   `Conv`, `SelfAttention` (rotary positions optional; `window` W > 0 for sliding-window attention, the graph's `Attention(..., window)`; `gate` for a per-head output gate, head h's output times sigmoid(W x)_h with W [heads, D] - `HeadGate` applies one to any [b, t, D]), `AttentionBlock` (pre-normalized, a GELU or gated SwiGLU `Feed`,
-  dropout), `Transformer` (GPT-2's decoder), and the scan-based residual blocks `SsmBlock` (Mamba's selective scan over
+  dropout), `Transformer` (GPT-2's decoder; `Loss` its loss by the graph's `ChunkedCE`, never holding the logits, each block
+  recomputed in the backward with `checkpoint` - the graph's `Recompute`), and the scan-based residual blocks `SsmBlock` (Mamba's selective scan over
   the graph's `SelectiveScan`) and `DeltaBlock` (the gated delta rule: the graph's `DeltaRule`, chunked in the WY form for training, the recurrent form a position at a time while decoding, its state carried between Forward calls). Starting values are PyTorch's for `Dense` and
   `Conv`, GPT-2's for the transformer.
 - Packed documents (several documents to a sequence): `DocStarts(g, tokens, sep, docs, keep)` fills, from the batch's
@@ -36,7 +37,20 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 - `train.olang` - the loops: `Epoch`/`Evaluate` for a classifier over a `loader.Loader`; `LmStep`/`LmEvaluate` for a Data parallel: `AverageGrads` and `BroadcastParams` over replicas - one single-thread graph a thread at its share of the batch, run at once (a join), the gradients averaged into the first, the optimizer stepping it, its parameters copied back; for small models whose products split poorly across threads.
   language model over any batch source with `Random` and `At` (data/text's `Windows`, data/tokens' `Tokens`); `Fit`, a
   whole run with reports, a record through io/runlog and checkpoints; `Save`/`Resume`, safetensors files holding the
-  parameters, the optimizer's state and the step, which resume a run bit for bit.
+  parameters, the optimizer's state and the step, which resume a run bit for bit (`Write` puts the same into a writer
+  for a loop that saves more).
+- `tune.olang` - the fine-tuning loop over any graph and anything its optimizer steps (`Params()`, so a LoRA graph's
+  adapters as well): `Step` accumulates `Accum` batches' gradients (their mean) before clipping and the optimizer's
+  step; `Fit` runs, reports, measures validation and checkpoints - the parameters, the optimizer's moments, where the
+  batch source stands (data/chat's `ChatRows.Save`) and the dropout generator - and resumes from its checkpoint when it
+  exists, so running the same command again after an interruption carries on exactly.
+- `qlora.olang` - QLoRA on a Qwen3 or Qwen2 checkpoint: `qlora.Options(model, data, out, ...).Run(on)` builds
+  models/qwen with its projections in NF4, LoRA adapters (rank, alpha, targets), the loss by ChunkedCE and blocks
+  recomputed, fills it straight from the checkpoint (`FillFrom`), lays it out first and prints what it takes (refusing
+  a GPU run over `Budget` MB), reads chat JSONL through the model's tokenizer.json (data/chat, a validation share
+  carved off), trains by `tune.Fit` with a linear warmup and decay (resumable from OUT/run.ckpt; `Stop` ends early with
+  the checkpoint written), saves the adapter as PEFT does and merges it where asked. GPU where there is one (a BF16
+  graph, `optim.GpuAdamW`, whose moments a checkpoint holds), else the CPU in F32. `examples/qlora.olang`, `make qlora`.
 - `dist.olang` - one model trained by workers that share no network, only a store of named blobs: DiLoCo. Each worker
   trains its own copy for H steps with its own optimizer, `Sync` hands in its delta (global - local) and takes back the
   outer step the coordinator (worker 0) took on the average - Nesterov momentum, DiLoCo's 0.7 and 0.9. `Store` is the
@@ -61,6 +75,7 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
 - `potts.olang` - a pairwise (Potts) energy over a sparse graph of K-valued cells (`Potts`: a shared K x K table W, unary terms linear in each cell's features, `Factors` - k-ary factor tables - and `Hidden` - binary hidden units, block-sampled; `Colouring`; `ClueFeatures`, a constraint problem's cell features: clue one-hot and degree), fitted by pseudolikelihood (`PseudoGrad`, `Symmetric`; `Fitter` - Add a batch's examples, Step by Adam; local rules on the same tables: `Stats` - the energy's derivative at an assignment - `AddContrast`, `CD` (from the data, from noise, or persistent) and `EP` (free, then nudged by +-beta through the sampler's `Bias`)) and searched by many chains at once (`Sampler`: `Colour` the graph's colour classes, `Start`, `Anneal` - annealed chromatic Gibbs to a zero-temperature finish, each chain stopping on its own, `Schedule` - `Focus`, a focused heat bath over violated factors and edges with optional growing and decaying constraint weights (`FocusSchedule`), and `Langevin`, the relaxed search on softmax logits; `Best`), over message.Edges `Pairs` - a table of its own for each listed pair of cells and a bias per cell (`All`, or `Screen`: the pairs of highest mutual information over solved examples), fitted by `PairFitter` (pseudolikelihood, Adam, L1 soft thresholds), thinned by `Pruned` (couplings with row and column means taken out), and solved exactly by `ForestMin` (min-sum dynamic programming when the free cells' pair graph is a forest, else `NotForest.Cycle`).
 - `seqsettle.olang` - a settle as a sequence layer (`SettleSeq`, a graph operation): each token's state K sweeps of s = tanh(W s + b_t), W block-diagonal in heads, the drive b_t = u_t plus the previous state rotated pair by pair by phi_t and scaled by gam_t; cold or warm, with or without the carry; forward and exact backward through every sweep, the batch's sequences as vector lanes; `bench/seqsettle.olang` times it
 
+- `lora.olang` - LoRA adapters on frozen projections: `Config` (rank, alpha, target modules; read from PEFT's adapter_config.json), `Set.Add` (A uniform in +-1/sqrt(in), B zero, before Plan), `Adapter.Linear` (in place of `g.Linear`), `Set.Save`/`Load` (adapter_model.safetensors under PEFT's names) and `Merge` (W += alpha/r B A into a copy of a base checkpoint). Used by `models/qwen`'s `AddLora`.
 - `quant.olang` - INT8 post-training quantization for inference over kernels/gemm's `GemmI8`, on tensors and arrays alone: `Weights` (symmetric per output channel), `Range` (dynamic or calibrated activation ranges, U8 with a zero point), `Model` (dense layers, convolutions (their windows read from the quantized images by `GemmI8Left`, no patch matrix) and max pooling from weight tensors and biases - `DenseOf`, `ConvOf`, `Pool` - run on plain arrays by `Forward`; `Calibrate` and `Static`; `Bytes`).
 - `quantgraph.olang` - `quant` read from the autodiff graph: `Dense(q, g, d, relu)`, `Conv(q, g, c, relu)` and `Mlp(batch, g, net)` from a trained graph's values, and `Quantize(g)` / `Dequantize(g)` / `LinearBytes(g)` for the graph's own hook (every `Linear` node in INT8 - a transformer's projections and perceptrons, its key-value decoding unchanged). Apart from `quant` so that a program quantizing without the graph does not compile the graph (whose size makes the build link by ThinLTO, which costs the kernels their inlining: repro/crossinline, fixed in olang and removed 2026-11-21).
 

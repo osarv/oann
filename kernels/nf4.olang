@@ -1,0 +1,170 @@
+# kernels/nf4 - 4-bit NormalFloat weights (NF4, Dettmers et al. 2023, "QLoRA"): each weight one of sixteen levels - the
+# quantiles of a standard normal, scaled to [-1, 1] with an exact zero - times the absolute maximum of its block of 64.
+# Two weights a byte, the first of a pair in the high nibble (bitsandbytes' layout, so its packed weights read as they
+# are), one F32 scale a block: 4.5 bits a weight, an eighth of F32's bytes and two ninths of BF16's. A frozen base under
+# LoRA adapters; ad/graph's NF4 node holds these and dequantizes into the graph's element type just before each product.
+#
+#     q := nf4.NF4.Quantize(w, rows, cols)    # w rows x cols, row-major, F32, BF16 or F64
+#     q.Dequantize(out, 0)                    # out[0 ... rows * cols - 1] = level * its block's absmax, in out's type
+
+# a quantization block: the weights one scale covers, row-major over the whole matrix
+Block := 64
+
+# the sixteen NF4 levels: bitsandbytes' table (functional.py, create_normal_map(0.9677083) normalised), the QLoRA paper's
+# Appendix E
+Levels := Array<F32>[
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634, 0.33791524171829224
+    0.44070982933044434, 0.5626170039176941, 0.7229568362236023, 1.0
+]
+
+# the midpoints between neighbouring levels: a normalised weight above Mids[k] rounds to a level above k
+Mids Array<F64> = midpoints()
+
+fn midpoints() Array<F64> {
+    m := Array<F64>(15)
+    for k in range 15: m[k] = (F64(Levels[k]) + F64(Levels[k + 1])) / 2.0
+    return m
+}
+
+# rows x cols weights in NF4: Codes two a byte (weight 2j in the high nibble of byte j), Absmax one a block of 64
+type NF4 struct(rows I64, cols I64) {
+    Rows I64 = rows
+    Cols I64 = cols
+    Count I64 = rows * cols
+    Codes mut Array<U8>& = Array<U8>((rows * cols + 1) / 2)
+    Absmax mut Array<F32>& = Array<F32>((rows * cols + Block - 1) / Block)
+}
+
+# the level nearest x, a weight divided by its block's absmax (in [-1, 1]); a tie rounds down, as bitsandbytes' does
+fn Code(x F64) I64 {
+    lo I64 = 0
+    hi I64 = 15
+    for lo < hi {
+        mid := (lo + hi) / 2
+        if x > Mids[mid] { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+# w's NF4 form: w rows x cols, row-major from w[0], in any float type. A block's scale is its largest |w| (an all-zero
+# block's codes are the zero level, its scale 0)
+fn NF4.Quantize<E>(w Array<E>&, rows I64, cols I64) NF4 {
+    q := NF4(rows, cols)
+    for b in range q.Absmax.Len() {
+        lo := b * Block
+        hi := (lo + Block).Min(q.Count)
+        top F32 = 0.0
+        for i in range lo, hi: top = top.Max(F32(w[i]).Abs())
+        q.Absmax[b] = top
+        inv := 1.0 / F64(top) if top > 0.0 else 0.0
+        for i in range lo, hi: q.Set(i, Code(F64(F32(w[i])) * inv))
+    }
+    return q
+}
+
+# weight i's code (row-major), 0 to 15
+fn (q NF4&) Get(i I64) I64 {
+    b := q.Codes[i / 2]
+    return I64(b & 15) if i % 2 == 1 else I64(b >> 4)
+}
+
+# weight i's code set to c, 0 to 15 (its scale untouched)
+fn (q mut NF4&) Set(i I64, c I64) {
+    b := q.Codes[i / 2]
+    q.Codes[i / 2] = (b & 240) | U8(c) if i % 2 == 1 else (b & 15) | U8(c << 4)
+}
+
+# weight i's value: its level times its block's absmax, in F32 (the product the GPU's kernel forms too)
+fn (q NF4&) At(i I64) F32 { return Levels[q.Get(i)] * q.Absmax[i / Block] }
+
+# every weight's value into out from out[at], in out's type: rounded once from At's F32
+fn (q NF4&) Dequantize<E>(out mut Array<E>&, at I64) { DequantizeRun(out, at, q.Count, q.Codes, 0, q.Absmax, 0) }
+
+# count weights stored as NF4 elsewhere - their codes from codes[c0] (byte c0's high nibble the first), their scales from
+# absmax[s0] (one a block of 64 from the first) - into out from out[at], each level times its scale in F32 rounded once
+# to E: where ad/graph keeps a graph's NF4 weights in one store
+fn DequantizeRun<E>(out mut Array<E>&, at I64, count I64, codes Array<U8>&, c0 I64, absmax Array<F32>&, s0 I64) {
+    for j in range count / 2 {
+        b := codes[c0 + j]
+        s := absmax[s0 + 2 * j / Block]
+        out[at + 2 * j] = E(Levels[I64(b >> 4)] * s)
+        out[at + 2 * j + 1] = E(Levels[I64(b & 15)] * s)
+    }
+    if count % 2 == 1: out[at + count - 1] = E(Levels[I64(codes[c0 + count / 2] >> 4)] * absmax[s0 + (count - 1) / Block])
+}
+
+# the bytes the weights take: codes and scales
+fn (q NF4&) Bytes() I64 { return q.Codes.Len() + 4 * q.Absmax.Len() }
+
+# ---- tests ----
+
+# the inverse of the standard normal's distribution function, by bisection on Erf (for the table's test)
+fn normalQuantile(p F64) F64 {
+    lo F64 = -10.0
+    hi F64 = 10.0
+    for _ in range 200 {
+        mid := (lo + hi) / 2.0
+        if 0.5 * (1.0 + (mid / 2.0.Sqrt()).Erf()) < p { lo = mid } else { hi = mid }
+    }
+    return (lo + hi) / 2.0
+}
+
+test Code "NF4's levels are QLoRA's: the normal's quantiles at 8 steps from 0.9677083 to 0.5 (positive) and 7 (negative), a zero, scaled to a maximum of 1" {
+    offset := 0.9677083
+    v := Vec<F64>()
+    for i in range 8: v.Push(normalQuantile(offset + F64(i) * (0.5 - offset) / 8.0))
+    for i in range 7: v.Push(-normalQuantile(offset + F64(i) * (0.5 - offset) / 7.0))
+    v.Push(0.0)
+    top := v[0]
+    sorted := Array<F64>(16)
+    for i in range 16 {
+        rank I64 = 0
+        for j in range 16 {
+            if v[j] < v[i]: rank++
+        }
+        sorted[rank] = v[i] / top
+    }
+    for k in range 16: assert (sorted[k] - F64(Levels[k])).Abs() < 2e-6, "level " + $k + ": " + $sorted[k] + " against " + $Levels[k]
+    # bitsandbytes' decision thresholds (dQuantizeNF4) are these midpoints
+    assert (Mids[7] - 0.03979014977812767).Abs() < 1e-9 and (Mids[0] - -0.8480964004993439).Abs() < 1e-9
+    assert (Mids[14] - 0.8614784181118011).Abs() < 1e-9
+}
+
+test NF4 "codes round to the nearest level, two a byte high nibble first, a block's scale its absmax" {
+    for k in range 16: assert Code(F64(Levels[k])) == k
+    assert Code(0.03) == 7 and Code(0.05) == 8 and Code(-2.0) == 0 and Code(2.0) == 15
+    w := Array<F32>(130)
+    for i in range 130: w[i] = F32(((i * 37) % 101) - 50) * 0.01
+    w[3] = 0.9
+    q := NF4.Quantize(w, 10, 13)
+    assert q.Codes.Len() == 65 and q.Absmax.Len() == 3
+    assert q.Absmax[0] == 0.9 and q.Absmax[2] == w[128].Abs().Max(w[129].Abs())
+    assert q.Get(3) == 15
+    assert q.Codes[1] == U8(q.Get(2) * 16 + q.Get(3))
+    out := Array<F32>(131)
+    q.Dequantize(out, 1)
+    for i in range 130 {
+        assert out[i + 1] == q.At(i)
+        # every weight within half the widest gap between levels (0.304) of its block's scale
+        assert (F64(out[i + 1]) - F64(w[i])).Abs() <= 0.16 * F64(q.Absmax[i / Block]) + 1e-6
+    }
+    assert out[3 + 1] == 0.9
+    # a zero block stays zero; a BF16 source and target round once
+    z := NF4.Quantize(Array<BF16>(64), 8, 8)
+    assert z.Absmax[0] == 0.0 and z.Get(17) == 7 and z.At(17) == 0.0
+    b := Array<BF16>(130)
+    q.Dequantize(b, 0)
+    for i in range 130: assert b[i] == BF16(q.At(i))
+}
+
+test NF4.Quantize "quantizing what NF4 gives back gives the same codes and scales" {
+    w := Array<F64>(256)
+    for i in range 256: w[i] = ((F64(i) * 0.7311).Sin() * 3.0)
+    q := NF4.Quantize(w, 16, 16)
+    back := Array<F32>(256)
+    q.Dequantize(back, 0)
+    r := NF4.Quantize(back, 16, 16)
+    assert r.Codes == q.Codes and r.Absmax == q.Absmax
+}

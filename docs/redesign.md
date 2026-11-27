@@ -1203,6 +1203,17 @@ launches one by one; the column sums behind the bias and norm gradients are tile
 5.63 -> 3.71 ms with the graph). Not kept, measured: capturing the settle's prepare, a fused attention kernel row by row (slower
 than the batched products). Already in GP4: the folded constants and zeroed word. Numbers and reproduction: PROGRESS.md, "GP7".
 
+**As built (GP9, 2026-11-26): what language models need.** Attention in a band plans on the GPU: the softmax kernels
+take kernels/attention's low and high per row (a sliding window; packed documents, causal or both ways, their starts
+the docs Tokens input on the device). Rope (`oann_ad_rope`: the angle, cosine and sine in F64 as the CPU's, the rotation
+in real; its gradient the rotation back), AddScalar, Sqrt, Log and stablemax cross entropy (`oann_ad_sm_rows` and
+`oann_ad_sm_grad`, the total CE's kernel) mirror ad/ops. **BF16 graphs** plan on the GPU: ad.cu's arena element is
+`store` (the graph's type, or `oann_bf16`: 16 bits read widened to F32 and written rounded to nearest even, as the CPU's
+BF16 graph rounds), every kernel computing in `real` (F32); the products are cuBLAS's BF16 with F32 sums (GP3); the
+mirror keeps the F32 masters (`Mirror.Masters`), up and down with the parameters, and `GpuAdamW` steps them with F32
+moments and rounds each into the arena in the same kernel (`oann_ad_adamw`: the weights stepped and the copy out, the
+step's scalars in F64 on the device). F16 stays refused. Measures (G-M6, `make gpulm`): PROGRESS.md, "GP9".
+
 The packages are section 4.4.
 
 ## 2. Module map

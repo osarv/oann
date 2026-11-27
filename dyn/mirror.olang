@@ -265,7 +265,7 @@ fn Mirror<T>.build(dev mut gdev.Device&, e mut settle.Engine<T>&) Mirror<T> ? gd
     at I64 = 0
     offsets := Array<I64>(3 * e.Pops.Len())
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         offsets[3 * i] = at
         at += span(batch * p.Size, T.Size)
         offsets[3 * i + 1] = at
@@ -373,7 +373,7 @@ fn (m mut Mirror<T>&) push(e mut settle.Engine<T>&) {
     }
     for i in range e.Pops.Len() {
         if m.sDev[i]: continue
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         n := e.Rows * p.Size
         m.State.Upload(p.R0.U, 0, m.Pot0 + p.Unit * e.Rows, n)
         m.State.Upload(p.R0.S, 0, m.Act0 + p.Unit * e.Rows, n)
@@ -384,7 +384,7 @@ fn (m mut Mirror<T>&) push(e mut settle.Engine<T>&) {
 # population i's committed state (buffer 0, every row) on the host, brought down where the device's is newer
 fn (m mut Mirror<T>&) HostState(e mut settle.Engine<T>&, i I64) {
     if m.sHost[i]: return
-    p := e.Pops[i]
+    p :~ e.Pops[i]
     n := e.Rows * p.Size
     m.State.Download(p.R0.U, m.Pot0 + p.Unit * e.Rows, 0, n)
     m.State.Download(p.R0.S, m.Act0 + p.Unit * e.Rows, 0, n)
@@ -450,7 +450,7 @@ fn (m mut Mirror<T>&) WroteState(e mut settle.Engine<T>&, i I64) {
 fn (m mut Mirror<T>&) inputs(e mut settle.Engine<T>&, damping F64) {
     s := m.stage.Addr
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         cu.oann_stage(s, U64(m.drive[i]), p.Drive, 0, U64(e.Batch * p.Size * T.Size))
         if p.Labels.Len() > 0: cu.oann_stage(s, U64(m.labels[i]), p.Labels, 0, U64(p.Labels.Len() * 4))
         if p.Target.Len() > 0: cu.oann_stage(s, U64(m.target[i]), p.Target, 0, U64(p.Target.Len() * T.Size))
@@ -531,7 +531,7 @@ fn (m mut Mirror<T>&) Settle(e mut settle.Engine<T>&, lo I64, hi I64, b settle.B
     last := b.Sweeps
     enq, covered I64 = 0, 0
     slot I64 = 0
-    pend := m.pend
+    pend :~ m.pend
     for i in range 4: pend[i] = 0
     found I64 = -1
     for found < 0 {
@@ -573,7 +573,7 @@ fn (m mut Mirror<T>&) sweeps(e mut settle.Engine<T>&, from I64, upto I64, lo I64
         for k in range from, upto: m.sweep(e, k, lo, hi, euclid, tol, inf, stop)
         return
     }
-    key := m.gkey
+    key :~ m.gkey
     key[0], key[1], key[2], key[3] = m.signature(e), U64(from), U64(upto), U64(lo)
     key[4], key[5], key[6], key[7] = U64(hi) + (U64(1) << 40 if euclid else 0), tol, inf, U64(e.Batch)
     d := m.dev
@@ -594,7 +594,7 @@ fn (m mut Mirror<T>&) sweeps(e mut settle.Engine<T>&, from I64, upto I64, lo I64
 fn (m Mirror<T>&) signature(e settle.Engine<T>&) U64 {
     sig U64 = 14695981039346656037
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         sig = (sig ^ U64(p.Size + 31 * ((1 if p.Retired > 0 else 0) + 2 * (1 if p.Labels.Len() > 0 else 0) + 4 * (1 if p.Target.Len() > 0 else 0)))) * 1099511628211
     }
     return sig
@@ -619,7 +619,7 @@ fn (m mut Mirror<T>&) prepare(e mut settle.Engine<T>&, lo I64, hi I64, fold Bool
     rows, batch := e.Rows, e.Batch
     d := m.dev
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role != neuron.Role.Input: continue
         per := batch * p.Size
         n := (hi - lo) * per
@@ -628,14 +628,14 @@ fn (m mut Mirror<T>&) prepare(e mut settle.Engine<T>&, lo I64, hi I64, fold Bool
     }
     if not fold: return
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role == neuron.Role.Input: continue
         n := batch * p.Size
         cst := m.Cst + p.Unit * batch
         kern.Launch(d, m.Common[0], kern.Blocks(n), kern.Block, m.at(cst), m.In.Addr(m.drive[i]), m.at(m.P + p.Bias), kern.Arg(U32(p.Size)), kern.Arg(U32(n)))
         for li in p.Folds {
-            l := e.Links[li]
-            pre := e.Pops[l.Pre]
+            l :~ e.Links[li]
+            pre :~ e.Pops[l.Pre]
             m.carry(l, li, cst, m.Act0 + pre.Unit * rows, batch, false, T(1))
         }
     }
@@ -655,19 +655,19 @@ fn (m mut Mirror<T>&) sweep(e mut settle.Engine<T>&, k I64, lo I64, hi I64, eucl
     prev U64 = 0 if k == 0 else m.Words.Addr(k - 1)
     out := m.Words.Addr(MaxSweeps + k) if euclid else m.Words.Addr(k)
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role == neuron.Role.Input: continue
         base := p.Unit * rows + r0 * p.Size
         carried := false
         for li in p.In {
-            l := e.Links[li]
-            pre := e.Pops[l.Pre]
+            l :~ e.Links[li]
+            pre :~ e.Pops[l.Pre]
             m.carry(l, li, m.Tot + base, s + pre.Unit * rows + r0 * pre.Size, n, false, T(1) if carried else T(0))
             carried = true
         }
         for li in p.Back {
-            l := e.Links[li]
-            post := e.Pops[l.Post]
+            l :~ e.Links[li]
+            post :~ e.Pops[l.Post]
             m.carry(l, li, m.Tot + base, s + post.Unit * rows + r0 * post.Size, n, true, T(1) if carried else T(0))
             carried = true
         }
@@ -706,7 +706,7 @@ fn (m mut Mirror<T>&) Reset(e mut settle.Engine<T>&, ph I64) {
     m.push(e)
     d := m.dev
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role == neuron.Role.Input: continue
         base := p.Unit * e.Rows + ph * e.Batch * p.Size
         bytes := e.Batch * p.Size * T.Size
@@ -722,7 +722,7 @@ fn (m mut Mirror<T>&) Warm(e mut settle.Engine<T>&, to I64, from I64) {
     m.push(e)
     d := m.dev
     for i in range e.Pops.Len() {
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         if p.Role == neuron.Role.Input: continue
         n := e.Batch * p.Size
         base := p.Unit * e.Rows
@@ -750,16 +750,17 @@ fn (m mut Mirror<T>&) Contrast(e mut settle.Engine<T>&, links Array<Bool>&, pops
     }
     for i in range e.Links.Len() {
         if not links[i]: continue
-        l := e.Links[i]
+        l :~ e.Links[i]
         kern.Zero(d, m.at(m.G + l.Off), l.Count * T.Size)
         if l.Frozen: continue
-        post, pre := e.Pops[l.Post], e.Pops[l.Pre]
+        post :~ e.Pops[l.Post]
+        pre :~ e.Pops[l.Pre]
         m.pair(l, i, m.Diff + post.Unit * n, m.Act0 + pre.Unit * rows + plus * n * pre.Size, k)
         if pre.Role != neuron.Role.Input: m.pair(l, i, m.Act0 + post.Unit * rows + minus * n * post.Size, m.Diff + pre.Unit * n, k)
     }
     for i in range e.Pops.Len() {
         if not pops[i]: continue
-        p := e.Pops[i]
+        p :~ e.Pops[i]
         kk := k if p.Role != neuron.Role.Input else T(0)
         kern.Launch(d, m.Common[2], kern.Blocks(p.Size), kern.Block, m.at(m.G + p.Bias), m.at(m.Diff + p.Unit * n), kern.Arg(U32(n)), kern.Arg(U32(p.Size)), kern.Arg(kk))
     }

@@ -485,6 +485,133 @@ fn CrossEntropyBackward<S, A>(dloss A, classes Array<I32>&, probs tensor.Tensor<
     }
 }
 
+# ---- cross-entropy over a large vocabulary, a chunk of it at a time ----
+#
+# The loss of CrossEntropy(x w^T, classes) without the logits: x [rows, D], w [V, D], the columns of x w^T - the
+# vocabulary - taken chunk at a time into z (rows x chunk elements of scratch). Each row keeps a running maximum, the
+# sum of exp below it, and its class's logit (state: 3 rows of A); after the last chunk state[0 .. rows] holds each
+# row's log-sum-exp, what the backward reads. Rows whose class is negative are not counted
+
+# the mean over the counted rows of lse - z[class]
+fn ChunkedCE<S, A>(ws mut gemm.Workspace<A>&, x tensor.Tensor<S>, w tensor.Tensor<S>, classes Array<I32>&, chunk I64, z mut Array<S>&, state mut Array<A>&, threads I64 = 1) F64 {
+    xm, wm := rows(x), rows(w)
+    n := xm.Rows
+    for q in range (wm.Rows + chunk - 1) / chunk {
+        v0 := q * chunk
+        c := lesserOf(chunk, wm.Rows - v0)
+        zm := mat.Mat<S>(z, 0, n, c, c)
+        wc := mat.Mat<S>(wm.Data, wm.Off + v0 * wm.Ld, c, wm.Cols, wm.Ld)
+        gemm.Gemm(ws, zm, xm, false, wc, true)
+        cceFold<S, A>(z, state, classes, n, c, v0, v0 + c >= wm.Rows, threads)
+    }
+    total F64 = 0.0
+    counted I64 = 0
+    for r in range n {
+        cl := I64(classes[r])
+        if cl < 0: continue
+        total += F64(state[r] - state[2 * n + r])
+        counted++
+    }
+    return total / F64(counted) if counted > 0 else 0.0
+}
+
+# rows lo ... hi of a chunk of c logits (columns v0 ...) folded into each row's running maximum and sum; the last chunk
+# leaves the log-sum-exp in state[r]
+fn cceRows<S, A>(z Array<S>&, state mut Array<A>&, classes Array<I32>&, lo I64, hi I64, n I64, c I64, v0 I64, last Bool) {
+    for r in range lo, hi {
+        o := r * c
+        top A = A(z[o])
+        for j in range 1, c {
+            v A = A(z[o + j])
+            top = v if v > top else top
+        }
+        if v0 > 0 and state[r] > top: top = state[r]
+        s A = 0.0
+        for j in range c: s += (A(z[o + j]) - top).Exp()
+        if v0 > 0: s += state[n + r] * (state[r] - top).Exp()
+        state[r] = top
+        state[n + r] = s
+        cl := I64(classes[r]) - v0
+        if cl >= 0 and cl < c: state[2 * n + r] = A(z[o + cl])
+        if last: state[r] = top + s.Log()
+    }
+}
+
+# dx (+)= dloss sum over the chunks of dz_c w_c and dw_c (+)= dz_c^T x, dz_c = (softmax - onehot(class)) / counted for
+# the chunk's columns, recomputed from x, w and the forward's log-sum-exps (state); z the forward's scratch
+fn ChunkedCEBackward<S, A>(ws mut gemm.Workspace<A>&, dloss A, x tensor.Tensor<S>, w tensor.Tensor<S>, classes Array<I32>&, chunk I64, z mut Array<S>&, state Array<A>&, dx mut tensor.Tensor<S>&, addX Bool, dw mut tensor.Tensor<S>&, addW Bool, threads I64 = 1) {
+    xm, wm := rows(x), rows(w)
+    n := xm.Rows
+    counted I64 = 0
+    for r in range n {
+        if classes[r] >= 0: counted++
+    }
+    k := dloss / A(counted if counted > 0 else 1)
+    for q in range (wm.Rows + chunk - 1) / chunk {
+        v0 := q * chunk
+        c := lesserOf(chunk, wm.Rows - v0)
+        zm := mat.Mat<S>(z, 0, n, c, c)
+        wc := mat.Mat<S>(wm.Data, wm.Off + v0 * wm.Ld, c, wm.Cols, wm.Ld)
+        gemm.Gemm(ws, zm, xm, false, wc, true)
+        cceGrads<S, A>(z, state, classes, n, c, v0, k, threads)
+        if Wanted(dx) {
+            d := rows(dx)
+            gemm.Gemm(ws, d, zm, false, wc, false, A(1.0), betaOf<A>(addX or v0 > 0))
+        }
+        if Wanted(dw) {
+            d := rows(dw)
+            dc := mat.Mat<S>(d.Data, d.Off + v0 * d.Ld, c, d.Cols, d.Ld)
+            gemm.Gemm(ws, dc, zm, true, xm, false, A(1.0), betaOf<A>(addW))
+        }
+    }
+}
+
+# rows lo ... hi of a chunk's logits made their gradient in place: k (exp(z - lse) - onehot), zero for an ignored row
+fn cceGrad<S, A>(z mut Array<S>&, state Array<A>&, classes Array<I32>&, lo I64, hi I64, c I64, v0 I64, k A) {
+    for r in range lo, hi {
+        o := r * c
+        cl := I64(classes[r])
+        if cl < 0 {
+            for j in range c: z[o + j] = S(0.0)
+            continue
+        }
+        lse := state[r]
+        for j in range c: z[o + j] = S(k * ((A(z[o + j]) - lse).Exp() - (A(1.0) if v0 + j == cl else A(0.0))))
+    }
+}
+
+# a chunk's rows folded into the running state (cceRows), split over tasks where large enough
+fn cceFold<S, A>(z Array<S>&, state mut Array<A>&, classes Array<I32>&, n I64, c I64, v0 I64, last Bool, threads I64) {
+    k := parts(threads, n * c).Min(n).Max(1)
+    share := (n + k - 1) / k
+    if k == 1 {
+        cceRows<S, A>(z, state, classes, 0, n, n, c, v0, last)
+        return
+    }
+    join {
+        for t in range k {
+            lo, hi := t * share, lesserOf(n, (t + 1) * share)
+            if lo < hi: spawn cceRows<S, A>(z, state, classes, lo, hi, n, c, v0, last)
+        }
+    }
+}
+
+# a chunk's logits made their gradient (cceGrad), split over tasks where large enough
+fn cceGrads<S, A>(z mut Array<S>&, state Array<A>&, classes Array<I32>&, n I64, c I64, v0 I64, k A, threads I64) {
+    tasks := parts(threads, n * c).Min(n).Max(1)
+    share := (n + tasks - 1) / tasks
+    if tasks == 1 {
+        cceGrad<S, A>(z, state, classes, 0, n, c, v0, k)
+        return
+    }
+    join {
+        for t in range tasks {
+            lo, hi := t * share, lesserOf(n, (t + 1) * share)
+            if lo < hi: spawn cceGrad<S, A>(z, state, classes, lo, hi, c, v0, k)
+        }
+    }
+}
+
 # the mean of (a - b)^2, in F64
 fn Mse<S, A>(a tensor.Tensor<S>, b tensor.Tensor<S>) F64 {
     ad :~ flat(a)

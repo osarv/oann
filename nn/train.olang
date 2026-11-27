@@ -339,6 +339,14 @@ fn record(log mut runlog.Log&, p Progress&) ? runlog.RunLogError, io.Error {
 # Written whole to a file of its own and renamed into place, so a run stopped inside a save leaves the last one
 fn Save<E, O>(path String&, g graph.Graph<E>&, o O&, step I64) ? os.Error, checkpoint.SafetensorsError {
     w := checkpoint.Writer()
+    try Write(w, g, o, step)
+    part := $path + ".part"
+    try w.Save(part)
+    try os.Rename(part, path)
+}
+
+# what Save writes, into w: a loop that keeps more in its checkpoints (nn/tune) adds it before saving
+fn Write<E, O>(w mut checkpoint.Writer&, g graph.Graph<E>&, o O&, step I64) ? checkpoint.SafetensorsError {
     k I64 = 0
     for i in range g.Size() {
         if g.Info(graph.Var(i)).Kind != graph.Op.Param: continue
@@ -347,9 +355,6 @@ fn Save<E, O>(path String&, g graph.Graph<E>&, o O&, step I64) ? os.Error, check
     }
     try o.Save(w)
     w.Meta("step", $step)
-    part := $path + ".part"
-    try w.Save(part)
-    try os.Rename(part, path)
 }
 
 # the run a checkpoint holds loaded into g and o, which are built as the saved ones were (the same graph, an optimizer

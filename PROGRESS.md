@@ -2367,3 +2367,77 @@ bench/whisperlin (`make whisperlinbench`), us, old -> new, 1 row: INT8 1 x 512 x
 Left: F32 few-row products take 4x for 4 rows (each row read the weights apart); the decoder's cross-attention still
 splits over heads unconditionally (unmeasured without a model here); the phone's thresholds are this VM's, untested
 on aarch64 hardware.
+
+## The GPU route, GP9: what language models need on the GPU (gpu-lm, 2026-11-26)
+
+docs/redesign.md 1.10's GP9 note. For a bigger language model trained on the RTX 4060 (8 GB), the parts the yardstick
+GPT and the looped-depth and reasoning experiments use, which GP6 refused on the GPU, now plan there:
+- **Attention in a band**: a sliding window and packed documents (causal, and both ways) - the softmax and its gradient
+  read each row's band as kernels/attention's `low`/`high` (the window, the document's start and, not causal, its end).
+- **Rope**, **AddScalar**, **Sqrt**, **Log**, **stablemax cross entropy** (ignored rows too).
+- **BF16 graphs** (mixed precision): the arena in BF16, kernels in F32, F32 masters and moments stepped on the device,
+  each parameter rounded from its master in AdamW's kernel. Halves the activations and the arena; the products run on
+  the tensor cores in BF16. A model's device bytes: the arena (BF16 values, gradients, saved activations) plus 4 bytes a
+  parameter of masters and 8 of moments - so about 300M parameters fit beside a short context's activations in 8 GB,
+  1B does not (16 GB of masters and moments alone).
+- **Fixed on the way**: the GPU-only code (built only with `-define Gpu=true`) had not been compiled since olang's
+  links-and-contents change (E10, 2026-11-26), so every GPU build failed: `=` into a null reference field (a mirror, an
+  optimizer, the device) is now `~`, and locals meant as references to a mirror, its steps, a key, a population are
+  `:~` (as copies they allocated, failing the `Allocates` asserts, and the CUDA graphs' keys were written into copies).
+  ad/gpu_test's `feed` wrote the graphs' inputs into copies the same way.
+
+**Tests** (`make gputest`): compiled in the cloud against CUDA 12.0's headers with no device, so every GPU test there
+reports itself skipped; `ad/gpu_test.olang` adds `bandsCase` (a window of 3; documents causal; documents both ways),
+`elemsCase` (Rope at bases 10000 and 500, AddScalar, Sqrt, Log, stablemax with ignored classes) and `bf16Case` (a BF16
+GPT's forward and backward against the CPU's BF16 graph, then 15 steps of GpuAdamW on masters against the CPU's mixed
+AdamW, the arena the masters rounded, then `Train`); the kernels compile under nvcc for F32, F64 and BF16. **Not yet
+run on a GPU** - the first run is on the RTX 4060: `make gputest`, then `make gpulm` (G-M6) at 124M and 300M sizes.
+
+
+## NF4 weights: QLoRA's 4-bit base (wt-nf4, 2026-11-27)
+
+`kernels/nf4.olang`: 4-bit NormalFloat (Dettmers et al. 2023) - sixteen levels (bitsandbytes' table; a test derives
+them from the normal's quantiles at offset 0.9677083 and checks bitsandbytes' decision thresholds), one F32 absmax per
+block of 64, two codes a byte with the first in the high nibble (bitsandbytes' layout): 4.5 bits a weight. `Quantize`
+from F32, BF16 or F64; `Dequantize` into any float type, the level times the scale formed in F32 and rounded once.
+
+`ad/graph`: `g.NF4(rows, cols)` is a frozen Linear weight held as NF4 (set after Plan by `SetNF4`); a Linear reading it
+dequantizes it into the graph's element type just before its forward product and its input-gradient product, into one
+buffer all NF4 weights share (the largest one's size), so the arena holds one dequantized matrix, not every one. On the
+GPU the codes and scales stay resident (uploaded once a setting) and `oann_ad_nf4` (ad.cu) dequantizes before cuBLAS.
+Read by a Linear alone (anything else, a Watch, or an eager graph is refused by Plan). Double quantization of the
+scales and a fused dequant-GEMM are not built.
+
+**Tests**: kernels/nf4 (the table, rounding and packing, re-quantizing what NF4 gives back gives the same codes); ad/graph
+`Graph.NF4` (two NF4 layers around a trained one: output and gradients bit for bit those of plain frozen weights holding
+the dequantized values, F32 and BF16; the refusals); ad/gpu_test `nf4Case` (against the CPU within 2e-4, the input's
+gradient too, codes uploaded once a setting) - compiled in the cloud with no device, so skipped there; the kernel
+compiles under nvcc (sm_89, F32 and F64). Not yet run on a GPU.
+
+## Large vocabularies: chunked cross entropy and activation checkpointing (wt-bigvocab, 2026-11-27)
+
+For fine-tuning Qwen3 (a 151936-token head) on the RTX 4060, the two largest activation costs are gone:
+- **ChunkedCE** (ad/graph `g.ChunkedCE(x, w, classes, chunk)`, ad/ops, ad.cu `oann_ad_cce_rows`/`_grad`): the loss of
+  x w^T against classes with the vocabulary taken a chunk at a time - forward a running maximum and sum per row, the
+  backward each chunk's logits again (two products more than the full head), never the [rows, V] logits, their softmax
+  or their gradient. Its scratch is alive at its forward and its backward only (a buffer of two spans in the plan).
+- **Recompute** (`g.Recompute(from, out)`, per block): the block's values and kept tensors are free in the plan from
+  their last forward reader until half a step before the first backward reading them, when the segment's forward runs
+  again (CPU, GPU, CUDA graphs). Costs one more forward of each block a step.
+- nn/layers `Transformer.Loss(g, tokens, classes, chunk, checkpoint)` and `Hidden` record both.
+
+**Measured** (`make bigvocab`, the arena as Plan lays it, BF16, Qwen3-0.6B's sizes: width 1024, 28 layers, 16 heads, a
+batch of 1; MB on the GPU / the CPU):
+
+| context | full CrossEntropy | ChunkedCE | ChunkedCE + Recompute |
+|---|---|---|---|
+| 1024 | 2664 / 1724 | 2063 / 1122 | 147 / 109 |
+| 4096 | 21929 / 6896 | 19895 / 4488 | 1393 / 437 |
+
+On the GPU attention keeps its weights (heads x t x t a layer), which checkpointing frees for all but one block.
+**Tests**: ad/graph (ChunkedCE equals CrossEntropy(Linear) - F64 within 1e-12, F32, BF16, uneven chunks, ignored rows,
+a short batch, rows split over tasks; checkpointed blocks give the loss and every gradient bit for bit over steps and a
+short batch, at 1 and 2 threads, the arena under 3/4 and growing under a third as fast with depth; refusals), nn/layers
+(Transformer.Loss against CrossEntropy(Apply), checkpointed equal), ad/gpu_test `bigVocabCase` (CPU against GPU in
+F32 and BF16, checkpointed against plain bit for bit on the device, Train as a CUDA graph) - compiled, skipped without a
+device; the kernels compile under nvcc for F32, F64 and BF16. **Not yet run on a GPU.**

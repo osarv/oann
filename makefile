@@ -5,10 +5,10 @@
 OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
-TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/spike.olang \
-	ad/graph.olang ad/descent.olang ad/score.olang tools/gradcheck.olang nn/layers.olang nn/moe.olang nn/ngram.olang nn/optim.olang nn/train.olang nn/dist.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang nn/ternary.olang nn/potts.olang nn/seqsettle.olang nn/diffusion.olang nn/chain.olang nn/lines.olang \
-	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang tokenizer.olang \
-	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang io/checkpoint.olang io/onnx.olang io/runlog.olang \
+TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/nf4.olang kernels/spike.olang \
+	ad/graph.olang ad/descent.olang ad/score.olang tools/gradcheck.olang nn/layers.olang nn/moe.olang nn/ngram.olang nn/optim.olang nn/train.olang nn/tune.olang nn/qlora.olang nn/dist.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang nn/ternary.olang nn/potts.olang nn/seqsettle.olang nn/diffusion.olang nn/chain.olang nn/lines.olang \
+	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang models/qwen.olang tokenizer.olang \
+	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang data/chat.olang io/checkpoint.olang io/onnx.olang io/runlog.olang \
 	dyn/neuron.olang dyn/conn.olang dyn/system.olang dyn/energy.olang dyn/learn.olang dyn/holo.olang dyn/store.olang dyn/recur.olang dyn/sleep.olang dyn/halt.olang dyn/bridge.olang models/hybrid.olang board/engine.olang \
 	bayes/dense.olang bayes/gauss.olang bayes/quadrature.olang bayes/laplace.olang bayes/state.olang bayes/target.olang bayes/vi.olang \
 	bayes/mcmc.olang bayes/empirical.olang bayes/check.olang \
@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -101,6 +101,16 @@ arenaad:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_arena_ad bench/arena_ad.olang
 	$(GPUENV) ./build/bench_arena_ad $(ARGS)
 
+# G-M6: what language model fits on the GPU and how fast it trains - ARGS: dim layers heads ctx batch steps f32|bf16 [vocab]
+gpulm:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_gpulm bench/gpulm.olang
+	$(GPUENV) ./build/bench_gpulm $(ARGS)
+
+# the activation arena of a BF16 model at Qwen3's sizes: full cross entropy, ChunkedCE, ChunkedCE with Recompute
+bigvocab:
+	$(OLANG) build -output build/bench_bigvocab bench/bigvocab.olang
+	./build/bench_bigvocab $(ARGS)
+
 # fetches MNIST into data/mnist (once), checks the pipeline against what is known about the dataset, and times it
 data bench:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_data bench/data.olang
@@ -143,6 +153,18 @@ tinystories:
 bpelm:
 	$(OLANG) build $(GPUDEFINE) -output build/examples_bpelm examples/bpelm.olang
 	$(GPUENV) ./build/examples_bpelm $(ARGS)
+
+# LoRA on Qwen3 on the CPU (examples/qwen_lora.olang) - ARGS: the model's directory, steps, adapter and merged directories
+qwenlora:
+	$(OLANG) build $(GPUDEFINE) -output build/examples_qwen_lora examples/qwen_lora.olang
+	$(GPUENV) ./build/examples_qwen_lora $(ARGS)
+
+# QLoRA fine-tuning of Qwen3 on chat conversations (examples/qlora.olang, nn/qlora; GPU where there is one) - ARGS: the
+# model's directory, the training JSONL, the output directory, then "-name value" options (-steps, -ctx, -rank, ...), or
+# -plan for what a run would take
+qlora:
+	$(OLANG) build $(GPUDEFINE) -output build/examples_qlora examples/qlora.olang
+	$(GPUENV) ./build/examples_qlora $(ARGS)
 
 # oann-listen: speech to text by a Whisper model (speech/listen.olang, speech/README.md), built to build/oann-listen -
 # ARGS: MODEL CLIP.wav and its flags (none: only builds it)

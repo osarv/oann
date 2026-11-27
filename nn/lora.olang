@@ -1,0 +1,226 @@
+# nn/lora - low-rank adapters (LoRA): a frozen projection W ([out, in]) learns through a product of two small
+# matrices beside it, y = x W^T + bias + (Alpha / Rank) (x A^T) B^T, with A [Rank, in] and B [out, Rank] the only
+# parameters. A starts uniform in +-1/sqrt(in) (PEFT's: Kaiming's uniform rule with the slope sqrt(5)), B at zero, so
+# an adapted model starts as its base exactly. Both take weight decay, as a Hugging Face trainer gives them.
+#
+# A Set holds a model's adapters, each under the module path its base weight has in the checkpoint
+# ("model.layers.0.self_attn.q_proj" for "model.layers.0.self_attn.q_proj.weight"). Save writes them as PEFT does -
+# adapter_model.safetensors with "base_model.model.<path>.lora_A.weight" and ".lora_B.weight" (F32), and
+# adapter_config.json - so an adapter goes to and comes from Hugging Face's PEFT; Load reads one back into a graph built
+# with the same config. Merge folds an adapter into a copy of the base checkpoint (W += Alpha / Rank B A), so an
+# inference engine that knows nothing of adapters (llm/model) runs the result. Dropout on the adapter's input is not
+# offered (lora_dropout is written 0).
+#
+# Use: `s := lora.Set(lora.Config(8, 16.0, ["q_proj", "v_proj"]))`, then for each projection the model has
+# `ad := s.Add(g, path, in, out)` before Plan (an adapter of nothing where the config does not name the projection's
+# last part) and `ad.Linear(g, x, w, bias)` in place of `g.Linear(x, w, bias)`.
+
+import "../ad/graph"
+import "../io/checkpoint"
+import "../tensor"
+import "std/json"
+import "std/os"
+
+type LoraError error {
+    Config(why String)      # an adapter_config.json this module cannot read, or a config naming nothing it knows
+    Missing(name String)    # a tensor the adapter or the base lacks
+}
+
+# the rank, the scale's numerator and the projections adapted - their names' last parts, PEFT's target_modules
+type Config struct(Rank I64, Alpha F64, Targets Array<String>) {
+    Rank
+    Alpha
+    Targets
+}
+
+# the factor the adapter's product is scaled by
+fn (c Config&) Scale() F64 { return c.Alpha / F64(c.Rank) }
+
+# whether the module at path (its last part) is adapted
+fn (c Config&) Wants(path String&) Bool {
+    last := path.Split(".")
+    for t in c.Targets {
+        if t == last[last.Len() - 1]: return true
+    }
+    return false
+}
+
+# the config in an adapter directory's adapter_config.json (r, lora_alpha, target_modules)
+fn Config.Read(dir String&) Config ? LoraError {
+    path := dir + "/adapter_config.json"
+    text := try os.ReadFile(path) catch { error LoraError.Config("no " + path) }
+    j :~ try json.Json.Parse(text) catch { error LoraError.Config(path + " is not JSON") }
+    r := try (try j["r"] catch { error LoraError.Config("no r") }).AsInt() catch { error LoraError.Config("r") }
+    alpha := try (try j["lora_alpha"] catch { error LoraError.Config("no lora_alpha") }).AsNum() catch { error LoraError.Config("lora_alpha") }
+    ts :~ try (try j["target_modules"] catch { error LoraError.Config("no target_modules") }).AsArr() catch { error LoraError.Config("target_modules must be a list") }
+    targets := Vec<String>()
+    for t in ts: targets.Push($(try t.AsStr() catch { error LoraError.Config("target_modules") }))
+    if r <= 0: error LoraError.Config("r " + $r)
+    return Config(r, alpha, targets.ToArray())
+}
+
+# the config as PEFT's adapter_config.json
+fn (c Config&) Json() String {
+    sb := StringBuilder()
+    sb.Push("{\n  \"peft_type\": \"LORA\",\n  \"task_type\": \"CAUSAL_LM\",\n  \"r\": " + $c.Rank)
+    sb.Push(",\n  \"lora_alpha\": " + $c.Alpha + ",\n  \"lora_dropout\": 0.0,\n  \"bias\": \"none\",\n  \"fan_in_fan_out\": false")
+    sb.Push(",\n  \"init_lora_weights\": true,\n  \"base_model_name_or_path\": null,\n  \"target_modules\": [")
+    for i, t in c.Targets: sb.Push(("" if i == 0 else ", ") + "\"" + t + "\"")
+    sb.Push("]\n}\n")
+    return sb.ToString()
+}
+
+# one projection's adapter: A and B, or None for a projection not adapted
+type Adapter struct() {
+    A graph.Var = graph.None
+    B graph.Var = graph.None
+    Scale F64 = 0.0
+}
+
+# x W^T + bias, plus the adapter's Scale (x A^T) B^T where it has one
+fn (a Adapter&) Linear<T>(g mut graph.Graph<T>&, x graph.Var, w graph.Var, bias graph.Var = graph.None) graph.Var {
+    y := g.Linear(x, w, bias)
+    if a.A == graph.None: return y
+    return g.Add(y, g.Scale(g.Linear(g.Linear(x, a.A), a.B), a.Scale))
+}
+
+# a model's adapters, each named by its module's path
+type Set struct(Settings Config) {
+    Settings
+    Paths Vec<String> = Vec<String>()
+    Items Vec<Adapter> = Vec<Adapter>()
+}
+
+# the adapter of the projection at path ([out, in]): A and B made on g (before Plan) where the config names it
+fn (s mut Set&) Add<T>(g mut graph.Graph<T>&, path String&, inputs I64, outputs I64) Adapter {
+    if not s.Settings.Wants(path): return Adapter()
+    bound := 1.0 / F64(inputs).Sqrt()
+    a := Adapter()
+    a.A = g.Param(graph.Init.Uniform(-bound, bound), true, s.Settings.Rank, inputs)
+    a.B = g.Param(graph.Init.Zeros, true, outputs, s.Settings.Rank)
+    a.Scale = s.Settings.Scale()
+    s.Paths.Push($path)
+    s.Items.Push(a)
+    return a
+}
+
+# the adapter's parameters' count
+fn (s Set&) Count<T>(g graph.Graph<T>&) I64 {
+    n I64 = 0
+    for a in s.Items.View(): n += g.Info(a.A).Dims.Count() + g.Info(a.B).Dims.Count()
+    return n
+}
+
+fn nameA(path String&) String { return "base_model.model." + path + ".lora_A.weight" }
+
+fn nameB(path String&) String { return "base_model.model." + path + ".lora_B.weight" }
+
+# v's values in F32: a BF16 graph's masters, else the arena's
+fn valueOf<T>(g graph.Graph<T>&, v graph.Var) tensor.Tensor<F32> {
+    if g.HasMasters(): return g.Master(v)
+    x := g.Value(v)
+    return x.To<F32>()
+}
+
+# the adapters as PEFT writes them into dir (made if missing): adapter_model.safetensors (F32) and adapter_config.json
+fn (s Set&) Save<T>(g graph.Graph<T>&, dir String&) ? os.Error, checkpoint.SafetensorsError {
+    if not os.Exists(dir): try os.MkDirAll(dir)
+    w := checkpoint.Writer()
+    for i, a in s.Items.View() {
+        try w.Add(nameA(s.Paths[i]), valueOf(g, a.A))
+        try w.Add(nameB(s.Paths[i]), valueOf(g, a.B))
+    }
+    try w.Save(dir + "/adapter_model.safetensors")
+    try os.WriteFile(dir + "/adapter_config.json", s.Settings.Json())
+}
+
+# the adapters of dir read into the graph's (after Plan; a graph built with the adapter's config)
+fn (s Set&) Load<T>(g mut graph.Graph<T>&, dir String&) ? os.Error, checkpoint.SafetensorsError, tensor.ShapeError {
+    f := try checkpoint.File.Load(dir + "/adapter_model.safetensors")
+    for i, a in s.Items.View() {
+        for k, v in [a.A, a.B] {
+            name := nameA(s.Paths[i]) if k == 0 else nameB(s.Paths[i])
+            if g.HasMasters() {
+                m := g.Master(v)
+                try f.Read(name, m)
+            } else {
+                p := g.Value(v)
+                try f.Read(name, p)
+            }
+        }
+    }
+    g.FullSync()
+}
+
+# ---- merging ----
+
+# w ([out, n]) += scale b a, with a [r, n] and b [out, r]
+fn fold(w mut tensor.Tensor<F32>&, a tensor.Tensor<F32>&, b tensor.Tensor<F32>&, scale F64) ? LoraError {
+    r, n, out := a.Dims[0], a.Dims[1], b.Dims[0]
+    if b.Dims[1] != r or w.Dims[0] != out or w.Dims[1] != n: error LoraError.Config("an adapter's shapes do not fit its weight")
+    wf :~ w.Flat()!
+    af :~ a.Flat()!
+    bf :~ b.Flat()!
+    row := Array<F64>(n)
+    for o in range out {
+        for i in range n: row[i] = 0.0
+        for k in range r {
+            c := F64(bf[o * r + k])
+            for i in range n: row[i] += c * F64(af[k * n + i])
+        }
+        for i in range n: wf[o * n + i] = F32(F64(wf[o * n + i]) + scale * row[i])
+    }
+}
+
+# the checkpoint files of a model directory: model.safetensors, or the shards its index names
+fn shards(dir String&) Array<String> ? os.Error, LoraError {
+    if os.Exists(dir + "/model.safetensors"): return Array<String>["model.safetensors"]
+    index := dir + "/model.safetensors.index.json"
+    j :~ try json.Json.Parse(try os.ReadFile(index)) catch json.Error { error LoraError.Config(index + " is not JSON") }
+    m :~ try (try j["weight_map"] catch { error LoraError.Config("no weight_map") }).AsObj() catch { error LoraError.Config("weight_map") }
+    seen := Map<String, Bool>()
+    out := Vec<String>()
+    for k in range m.Len() {
+        name := $(try m.Values[k].AsStr() catch { error LoraError.Config("weight_map") })
+        if seen.Has(name): continue
+        seen.Put(name, true)
+        out.Push(name)
+    }
+    return out.ToArray()
+}
+
+# the base model in "base" with the adapter in "adapter" folded into its weights, as a model directory "out": every
+# other file copied as it is, every tensor stored in its own dtype (a BF16 weight rounded once after the fold), or in
+# F32 where "wide"
+fn Merge(base String&, adapter String&, out String&, wide Bool = false) ? os.Error, checkpoint.SafetensorsError, LoraError {
+    c := try Config.Read(adapter)
+    f := try checkpoint.File.Load(adapter + "/adapter_model.safetensors")
+    pending := Map<String, String>()        # a base weight's name: its module's path
+    for name in f.Names() {
+        if not name.EndsWith(".lora_A.weight") or not name.StartsWith("base_model.model."): continue
+        path := name[17:name.Len() - 14]
+        pending.Put(path + ".weight", $path)
+    }
+    if not os.Exists(out): try os.MkDirAll(out)
+    files := try shards(base)
+    for file in try os.ReadDir(base) {
+        if file.EndsWith(".safetensors"): continue
+        try os.WriteFile(out + "/" + file, try os.ReadFile(base + "/" + file))
+    }
+    done I64 = 0
+    for file in files {
+        src := try checkpoint.File.Load(base + "/" + file)
+        w := checkpoint.Writer()
+        for e in src.Entries {
+            t := try src.Get<F32>(e.Key)
+            if pending.Has(e.Key) {
+                path := try pending.Get(e.Key) catch { unreachable }
+                try fold(t, try f.Get<F32>(nameA(path)), try f.Get<F32>(nameB(path)), c.Scale())
+                done++
+            }
+            try w.AddAs(e.Key, t, checkpoint.Dtype.F32 if wide else e.Type)
+        }
+        try w.Save(out + "/" + file)
+    }
+    if done != pending.Len(): error LoraError.Missing("a base weight for one of the adapter's " + $pending.Len() + " projections")
+}
