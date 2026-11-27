@@ -34,8 +34,9 @@ type TokenizerError error {
 }
 
 # a byte-level BPE vocabulary: the 256 bytes, then token 256 + k = the merge of Merges[k]'s pair, (a << 32) | b
-type Tokenizer struct(Merges Array<I64>&) {
+type Tokenizer struct(Merges Array<I64>&, Digits Bool = false) {
     Merges
+    Digits # a digit is a chunk of its own (with a space before it), as Llama's and Qwen's patterns cut numbers
     table Array<I64>& = rankTable(Merges)    # open addressing: slot s, a pair at 2s (-1: empty), its rank at 2s + 1
     starts Array<I64>& = tokenStarts(Merges) # token t's bytes are bytes[starts[t] ... starts[t + 1] - 1]
     bytes Array<Char>& = tokenBytes(Merges, starts)
@@ -133,8 +134,9 @@ fn classOf(c Char) I64 {
     return classOther
 }
 
-# where the chunk starting at i of t ends: GPT-2's pattern, alternatives tried in its order
-fn ChunkEnd(t String&, i I64) I64 {
+# where the chunk starting at i of t ends: GPT-2's pattern, alternatives tried in its order; with digits, ' ?\p{N}'
+# in place of ' ?\p{N}+' - every digit a chunk, so numbers are spelled digit by digit
+fn ChunkEnd(t String&, i I64, digits Bool = false) I64 {
     n := t.Len()
     c := t[i]
     if c == '\'' and i + 1 < n {
@@ -150,6 +152,7 @@ fn ChunkEnd(t String&, i I64) I64 {
     k := classOf(t[j])
     e I64 = j + 1
     if k != classSpace {
+        if digits and k == classDigit: return e
         for e < n and classOf(t[e]) == k: e++
         return e
     }
@@ -281,14 +284,14 @@ type ChunkSet struct(counts Array<I64>&, starts Array<I64>&, lens mut Array<I64>
     Syms mut Array<I64>& = syms
 }
 
-fn ChunkSet.Of(text String&) ChunkSet {
+fn ChunkSet.Of(text String&, digits Bool = false) ChunkSet {
     index := Map<String&, I64>()
     counts := list.List<I64>()
     first := list.List<I64>() # where its first occurrence starts in text
     lens := list.List<I64>()
     i I64 = 0
     for i < text.Len() {
-        e := ChunkEnd(text, i)
+        e := ChunkEnd(text, i, digits)
         piece :~ text[i:e]
         w := try index.Get(piece) catch default -1
         if w < 0 {
@@ -368,8 +371,8 @@ fn (r mut trainer&) merge(c mut ChunkSet&, stamp mut Array<I64>&, pair I64, made
 
 # a vocabulary of "vocab" tokens (256 bytes and vocab - 256 merges, fewer when the text runs out of pairs) learned
 # from text
-fn Tokenizer.Train(text String&, vocab I64) Tokenizer {
-    c mut ChunkSet& = ChunkSet.Of(text)
+fn Tokenizer.Train(text String&, vocab I64, digits Bool = false) Tokenizer {
+    c mut ChunkSet& = ChunkSet.Of(text, digits)
     r := trainer()
     for w in range c.Counts.Len() {
         s := c.Starts[w]
@@ -386,7 +389,7 @@ fn Tokenizer.Train(text String&, vocab I64) Tokenizer {
         r.settle()
     }
     learned Array<I64>& = merges.ToArray()
-    return Tokenizer(learned)
+    return Tokenizer(learned, digits)
 }
 
 # ---- encoding and decoding ----
@@ -490,7 +493,7 @@ fn (t Tokenizer&) Encode(text String&) Array<I32> {
     n I64 = 0
     i I64 = 0
     for i < text.Len() {
-        end := ChunkEnd(text, i)
+        end := ChunkEnd(text, i, t.Digits)
         piece :~ text[i:end]
         c := try seen.Get(piece) catch default -1
         if c < 0 {
@@ -564,11 +567,12 @@ fn (t Tokenizer&) printed(id I64, sb mut StringBuilder&) {
     sb.PushChar('"')
 }
 
-# the tokenizer as JSON text: {"format": "oann-bpe", "version": 1, "pretokenize": "gpt2-ascii", "merges": [[a, b], ...],
+# the tokenizer as JSON text: {"format": "oann-bpe", "version": 1, "pretokenize": "gpt2-ascii" (or "gpt2-ascii-digits"
+# with Digits), "merges": [[a, b], ...],
 # "vocab": [every token in GPT-2's printable form]} - the merges are what Load reads, the vocabulary is for reading
 fn (t Tokenizer&) ToJson() String {
     sb := StringBuilder()
-    sb.Push("{\"format\": \"oann-bpe\", \"version\": 1, \"pretokenize\": \"gpt2-ascii\",\n\"merges\": [")
+    sb.Push("{\"format\": \"oann-bpe\", \"version\": 1, \"pretokenize\": \"" + ("gpt2-ascii-digits" if t.Digits else "gpt2-ascii") + "\",\n\"merges\": [")
     for k, pair in t.Merges {
         if k > 0: sb.Push(", ")
         if k % 8 == 0: sb.Push("\n")
@@ -603,7 +607,8 @@ fn Tokenizer.Parse(text String&) Tokenizer ? TokenizerError, json.Error {
         if a < 0 or b < 0 or a >= 256 + k or b >= 256 + k: error TokenizerError.Malformed
         merges[k] = pairOf(a, b)
     }
-    return Tokenizer(merges)
+    digits := doc.Has("pretokenize") and (try doc["pretokenize"].AsStr()) == "gpt2-ascii-digits"
+    return Tokenizer(merges, digits)
 }
 
 # the tokenizer saved at "path"
@@ -617,6 +622,21 @@ fn Tokenizer.Load(path String&) Tokenizer ? TokenizerError, json.Error, os.Error
 # the chunks of t joined by "|"
 fn cut(t String&) String {
     return Chunks(t).Join("|")
+}
+
+test ChunkEnd "with digits, every digit is a chunk of its own, a space before it kept with it" {
+    t := "x 123+45"
+    pieces := Vec<String&>()
+    i I64 = 0
+    for i < t.Len() {
+        e := ChunkEnd(t, i, true)
+        pieces.Push(t[i:e])
+        i = e
+    }
+    assert pieces.ToArray().Join("|") == "x| 1|2|3|+|4|5"
+    tok := Tokenizer.Train("12 12 12 ab ab", 300, true)
+    back := try Tokenizer.Parse(tok.ToJson())
+    assert back.Digits and back.Encode("1212").Len() == 4
 }
 
 test "chunks follow GPT-2's pattern: contractions, a space before a run, the last of several spaces kept apart" {
