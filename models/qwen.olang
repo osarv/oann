@@ -8,8 +8,12 @@
 # times by an Expand view, and runs causal attention. The head is the embedding (tied) or a matrix of its own.
 #
 # Use: `q := Qwen.New(g, cfg, ctx)?` records the layers before Plan, `q.Lm(g)` the tokens, logits and loss, then after
-# Plan `q.Fill(g, m)` copies the weights of `model.Model.Load(dir, true)` (exact: row-major) into the graph. To
-# fine-tune, `s := q.AddLora(g, lora.Config(8, 16.0, ["q_proj", "v_proj"]))?` before Lm puts LoRA adapters (nn/lora) on
+# Plan `q.Fill(g, m)` copies the weights of `model.Model.Load(dir, true)` (exact: row-major) into the graph, or
+# `q.FillFrom(g, dir)` reads them straight from the checkpoint's files a tensor at a time (no llm/model copy). New's
+# options for training: the seven projections in 4-bit NF4 (nf4: QLoRA's base, quantized as filled), each block
+# recomputed in the backward (recompute); `Lm(g, true, chunk)` takes the loss over the vocabulary chunk at a time
+# (graph.ChunkedCE, the head tied or not) with no logits. `Footprint.Of` lays such a graph out (nothing allocated) and
+# gives what it would take, so a size that will not fit says so first. To fine-tune, `s := q.AddLora(g, lora.Config(8, 16.0, ["q_proj", "v_proj"]))?` before Lm puts LoRA adapters (nn/lora) on
 # the projections named: they are the graph's only parameters; `s.Save(g, dir)` writes them as PEFT does.
 
 import "../ad/graph"
@@ -17,6 +21,12 @@ import "../nn/train"
 import "../llm/model"
 import "../kernels/mat"
 import "../nn/lora"
+import "../kernels/nf4"
+import "../kernels/device"
+import "../io/checkpoint"
+import "../tensor"
+import "std/json"
+import "std/os"
 
 # one block's weights: [out, in] matrices, vectors of their width; a bias None where the config has none
 type QwenBlock struct() {
@@ -43,17 +53,26 @@ type QwenBlock struct() {
     LDown lora.Adapter = lora.Adapter()
 }
 
-type Qwen struct(Config model.Config, Ctx I64, Embed graph.Var, Blocks Array<QwenBlock>, Final graph.Var, Head graph.Var) {
+type Qwen struct(Config model.Config, Ctx I64, Embed graph.Var, Blocks Array<QwenBlock>, Final graph.Var, Head graph.Var
+        Nf4 Bool = false, Recompute Bool = false) {
     Config
     Ctx         # the positions a sequence has
     Embed
     Blocks
     Final
     Head        # Embed where tied
+    Nf4         # the seven projections' weights in 4-bit NF4 (g.NF4), quantized as they are filled
+    Recompute   # each block's activations computed again in the backward (g.Recompute) rather than kept
 }
 
-# the model of config c as frozen weights on g, for sequences of ctx positions
-fn Qwen.New<T>(g mut graph.Graph<T>&, c model.Config, ctx I64) Qwen ? model.ModelError {
+# a projection's frozen weights, outs x ins: 4-bit NF4 where quantized
+fn projection<T>(g mut graph.Graph<T>&, quantized Bool, outs I64, ins I64) graph.Var {
+    return g.NF4(outs, ins) if quantized else g.Frozen(outs, ins)
+}
+
+# the model of config c as frozen weights on g, for sequences of ctx positions; the projections in NF4 where quantized, each
+# block recomputed in the backward where recompute
+fn Qwen.New<T>(g mut graph.Graph<T>&, c model.Config, ctx I64, quantized Bool = false, recompute Bool = false) Qwen ? model.ModelError {
     if c.PosScale != 1.0: error model.ModelError.Unsupported("scaled rotary positions in a graph")
     q, kv, d := c.Heads * c.HeadDim, c.KvHeads * c.HeadDim, c.Dim
     table := g.Frozen(c.Vocab, d)
@@ -61,9 +80,9 @@ fn Qwen.New<T>(g mut graph.Graph<T>&, c model.Config, ctx I64) Qwen ? model.Mode
     for _ in range c.Layers {
         b := QwenBlock()
         b.Norm1 = g.Frozen(d)
-        b.Q = g.Frozen(q, d)
-        b.K = g.Frozen(kv, d)
-        b.V = g.Frozen(kv, d)
+        b.Q = projection(g, quantized, q, d)
+        b.K = projection(g, quantized, kv, d)
+        b.V = projection(g, quantized, kv, d)
         if c.Bias {
             b.QBias = g.Frozen(q)
             b.KBias = g.Frozen(kv)
@@ -73,16 +92,16 @@ fn Qwen.New<T>(g mut graph.Graph<T>&, c model.Config, ctx I64) Qwen ? model.Mode
             b.QNorm = g.Frozen(c.HeadDim)
             b.KNorm = g.Frozen(c.HeadDim)
         }
-        b.O = g.Frozen(d, q)
+        b.O = projection(g, quantized, d, q)
         b.Norm2 = g.Frozen(d)
-        b.Gate = g.Frozen(c.Ffn, d)
-        b.Up = g.Frozen(c.Ffn, d)
-        b.Down = g.Frozen(d, c.Ffn)
+        b.Gate = projection(g, quantized, c.Ffn, d)
+        b.Up = projection(g, quantized, c.Ffn, d)
+        b.Down = projection(g, quantized, d, c.Ffn)
         blocks.Push(b)
     }
     final := g.Frozen(d)
     head := table if c.Tied else g.Frozen(c.Vocab, d)
-    return Qwen(c, ctx, table, blocks.ToArray(), final, head)
+    return Qwen(c, ctx, table, blocks.ToArray(), final, head, quantized, recompute)
 }
 
 # x [b, t, heads hd]: each head RMS-normed with gain (Qwen3's QK-norm)
@@ -146,24 +165,47 @@ fn (m mut Qwen&) AddLora<T>(g mut graph.Graph<T>&, c lora.Config) lora.Set ? lor
     return s
 }
 
-# the logits of each position's next token, from a Tokens(Ctx) node: [batch, Ctx, Vocab]
-fn (m Qwen&) Logits<T>(g mut graph.Graph<T>&, tokens graph.Var) graph.Var {
+# the final norm's output from a Tokens(Ctx) node, [batch, Ctx, Dim]: what the head reads
+fn (m Qwen&) Hidden<T>(g mut graph.Graph<T>&, tokens graph.Var) graph.Var {
     h := g.Embedding(tokens, m.Embed)
-    for b in m.Blocks: h = m.block(g, b, h)
-    return g.MatMul(g.Norm(h, m.Final, graph.None, true, m.Config.Eps), m.Head, false, true)
+    for b in m.Blocks {
+        from := g.Size()
+        h = m.block(g, b, h)
+        if m.Recompute: g.Recompute(from, h)
+    }
+    return g.Norm(h, m.Final, graph.None, true, m.Config.Eps)
 }
 
-# the loops' handles: tokens, targets, logits and loss over sequences of Ctx tokens; "loss" false for logits alone
-fn (m Qwen&) Lm<T>(g mut graph.Graph<T>&, loss Bool = true) train.LanguageModel {
+# the logits of each position's next token, from a Tokens(Ctx) node: [batch, Ctx, Vocab]
+fn (m Qwen&) Logits<T>(g mut graph.Graph<T>&, tokens graph.Var) graph.Var {
+    return g.MatMul(m.Hidden(g, tokens), m.Head, false, true)
+}
+
+# the loops' handles: tokens, targets, logits and loss over sequences of Ctx tokens; "loss" false for logits alone;
+# chunk above 0 for the loss alone, the vocabulary taken chunk columns at a time (graph.ChunkedCE: no logits)
+fn (m Qwen&) Lm<T>(g mut graph.Graph<T>&, loss Bool = true, chunk I64 = 0) train.LanguageModel {
     tok := g.Tokens(m.Ctx)
+    if loss and chunk > 0 {
+        h := m.Hidden(g, tok)
+        y := g.Classes(m.Ctx)
+        return train.LanguageModel(tok, y, graph.None, g.ChunkedCE(h, m.Head, y, chunk), m.Ctx)
+    }
     logits := m.Logits(g, tok)
     if not loss: return train.LanguageModel(tok, graph.None, logits, graph.None, m.Ctx)
     y := g.Classes(m.Ctx)
     return train.LanguageModel(tok, y, logits, g.CrossEntropy(logits, y), m.Ctx)
 }
 
-# rows from .. from + n of w into frozen weight v
+# rows from .. from + n of w into frozen weight v: quantized from F32 where v is NF4
 fn rows<T>(g mut graph.Graph<T>&, v graph.Var, w model.Linear&, from I64, n I64) {
+    if g.Info(v).Quant >= 0 {
+        vals := Array<F32>(n * w.In)
+        for o in range n {
+            for i in range w.In: vals[o * w.In + i] = w.Get(from + o, i)
+        }
+        g.SetNF4(v, nf4.NF4.Quantize(vals, n, w.In))
+        return
+    }
     dst :~ g.Value(v).Flat()!
     for o in range n {
         for i in range w.In: dst[o * w.In + i] = T(w.Get(from + o, i))
@@ -210,9 +252,125 @@ fn (q Qwen&) Fill<T>(g mut graph.Graph<T>&, m model.Model&) {
     rows(g, q.Head, m.Head, 0, c.Vocab)
 }
 
+# ---- reading a checkpoint straight into the graph ----
+
+# a model directory's checkpoint: model.safetensors, or the shards model.safetensors.index.json names - each file's
+# header read, its data left on disk - and which file holds each tensor
+type Shards struct(Files Array<checkpoint.File>&, where Map<String, I64>) {
+    Files
+    where
+}
+
+fn Shards.Open(dir String&) Shards ? os.Error, checkpoint.SafetensorsError, model.ModelError {
+    files := Vec<checkpoint.File>()
+    where := Map<String, I64>()
+    single := dir + "/model.safetensors"
+    if os.Exists(single) {
+        f := try checkpoint.File.Load(single)
+        for e in f.Entries: where.Put(e.Key, 0)
+        files.Push(f)
+        return Shards(files.ToArray(), where)
+    }
+    index := dir + "/model.safetensors.index.json"
+    j :~ try json.Json.Parse(try os.ReadFile(index)) catch json.Error { error model.ModelError.Malformed(index) }
+    m :~ try (try j["weight_map"] catch { error model.ModelError.Malformed(index) }).AsObj() catch { error model.ModelError.Malformed(index) }
+    shard := Map<String, I64>()
+    for k in range m.Len() {
+        name :~ try m.Values[k].AsStr() catch { error model.ModelError.Malformed(index) }
+        if not shard.Has(name) {
+            shard.Put(name, files.Len())
+            files.Push(try checkpoint.File.Load(dir + "/" + name))
+        }
+        where.Put(m.Keys[k], try shard.Get(name) catch { unreachable })
+    }
+    return Shards(files.ToArray(), where)
+}
+
+# the tensor "name" read into frozen weight v: converted to the graph's type as it is read (a rounding at most, as
+# T(x)), or read in F32 and quantized where v is NF4 - the one tensor's F32 copy the only memory it takes
+fn (s Shards&) Into<T>(g mut graph.Graph<T>&, v graph.Var, name String&) ? checkpoint.SafetensorsError, tensor.ShapeError {
+    k := try s.where.Get(name) catch { error checkpoint.SafetensorsError.Missing($name) }
+    nd := g.Info(v)
+    if nd.Quant < 0 {
+        dst := g.Value(v)
+        try s.Files[k].Read(name, dst)
+        return
+    }
+    outs, ins := nd.Dims[0], nd.Dims[1]
+    t := tensor.Tensor<F32>.Zeros(outs, ins)
+    try s.Files[k].Read(name, t)
+    g.SetNF4(v, nf4.NF4.Quantize(t.Flat()!, outs, ins))
+}
+
+# the weights of the checkpoint in dir read straight into the graph's frozen weights, after Plan, a tensor at a time:
+# Fill's numbers (bit for bit in frozen weights; the same NF4 codes) without llm/model's copy of the whole model, so a
+# model fills within its largest tensor in F32 beyond the graph
+fn (q Qwen&) FillFrom<T>(g mut graph.Graph<T>&, dir String&) ? os.Error, checkpoint.SafetensorsError, tensor.ShapeError, model.ModelError {
+    s := try Shards.Open(dir)
+    c := q.Config
+    for i, b in q.Blocks {
+        p := "model.layers." + $i + "."
+        try s.Into(g, b.Norm1, p + "input_layernorm.weight")
+        try s.Into(g, b.Q, p + "self_attn.q_proj.weight")
+        try s.Into(g, b.K, p + "self_attn.k_proj.weight")
+        try s.Into(g, b.V, p + "self_attn.v_proj.weight")
+        if c.Bias {
+            try s.Into(g, b.QBias, p + "self_attn.q_proj.bias")
+            try s.Into(g, b.KBias, p + "self_attn.k_proj.bias")
+            try s.Into(g, b.VBias, p + "self_attn.v_proj.bias")
+        }
+        if c.QkNorm {
+            try s.Into(g, b.QNorm, p + "self_attn.q_norm.weight")
+            try s.Into(g, b.KNorm, p + "self_attn.k_norm.weight")
+        }
+        try s.Into(g, b.O, p + "self_attn.o_proj.weight")
+        try s.Into(g, b.Norm2, p + "post_attention_layernorm.weight")
+        try s.Into(g, b.Gate, p + "mlp.gate_proj.weight")
+        try s.Into(g, b.Up, p + "mlp.up_proj.weight")
+        try s.Into(g, b.Down, p + "mlp.down_proj.weight")
+    }
+    try s.Into(g, q.Final, "model.norm.weight")
+    try s.Into(g, q.Embed, "model.embed_tokens.weight")
+    if not c.Tied: try s.Into(g, q.Head, "lm_head.weight")
+}
+
+# ---- what training takes ----
+
+# the memory a QLoRA run takes, in bytes, as the graph would be laid out (graph.Lay: nothing allocated): the arena (the
+# frozen weights in the graph's type, activations, gradients, tokens, accumulators, a BF16 graph's F32 masters), the NF4
+# weights (codes and scales) and AdamW's two moments. On the GPU all of it is on the device; the host holds the arena and
+# the NF4 weights too
+type Footprint struct(Arena I64, Quant I64, Moments I64, Params I64) {
+    Arena
+    Quant
+    Moments
+    Params
+    Total I64 = Arena + Quant + Moments
+}
+
+# the NF4 bytes of an outs x ins weight: two codes a byte, an F32 scale a block
+fn quantBytes(outs I64, ins I64) I64 { return (outs * ins + 1) / 2 + 4 * ((outs * ins + nf4.Block - 1) / nf4.Block) }
+
+# what training config c at ctx positions, "batch" sequences, takes on a backend, LoRA lc on it, the options as New's
+# and Lm's: the graph recorded and laid out, never planned
+fn Footprint.Of<T>(c model.Config, ctx I64, batch I64, quantized Bool, recompute Bool, chunk I64, lc lora.Config
+        on device.Backend) Footprint ? tensor.ShapeError, model.ModelError, lora.LoraError {
+    g mut graph.Graph<T>& = graph.Graph<T>(batch)
+    q := try Qwen.New(g, c, ctx, quantized, recompute)
+    try q.AddLora(g, lc)
+    q.Lm(g, true, chunk)
+    l := try g.Lay(on)
+    real I64 = 8 if T.Size == 8 else 4
+    masters I64 = 4 * l.ParamCount if T.Size == 2 else 0
+    arena := T.Size * l.Size + 4 * l.Ints + real * l.Accs + masters
+    qd, kv, d := c.Heads * c.HeadDim, c.KvHeads * c.HeadDim, c.Dim
+    quant I64 = 0
+    if quantized: quant = c.Layers * (quantBytes(qd, d) + 2 * quantBytes(kv, d) + quantBytes(d, qd) + 2 * quantBytes(c.Ffn, d) + quantBytes(d, c.Ffn))
+    return Footprint(arena, quant, 2 * real * l.ParamCount, l.ParamCount)
+}
+
 # ---- tests ----
 
-import "std/os"
 import "std/rand"
 
 # the exact path's logits of a prompt (every position), in a cache of its own
@@ -268,8 +426,6 @@ test Qwen "the graph's logits are llm/model's: Qwen3 tied and untied, Qwen2's bi
 
 import "../nn/optim"
 import "../tools/gradcheck"
-import "../tensor"
-import "../io/checkpoint"
 
 # every projection Qwen has, at rank 4
 fn allTargets() lora.Config {
@@ -403,5 +559,134 @@ test Qwen "LoRA adapters: saved as PEFT names them and loaded back bit for bit; 
     worstB, bigB := diff(got, Array<F64>[F64(x) for x in oracle(merged, toks)])
     assert worstB < 0.01 * bigB, "llm/model on the merged model: the logits differ by " + $worstB + " of " + $bigB
     os.RemoveAll(out)!
+    os.RemoveAll(dir)!
+}
+
+# ---- QLoRA's pieces ----
+
+# the tiny Qwen of m (or of the checkpoint in dir, read by FillFrom, where dir is not "") with adapters c, its options,
+# "batch" sequences of ctx tokens drawn from seed 5, each B drawn from seed 9 so that the adapters count
+fn qlora<T>(m model.Model&, dir String&, c lora.Config, ctx I64, batch I64, quantized Bool, recompute Bool, chunk I64) graph.Graph<T>, Qwen, train.LanguageModel {
+    g mut graph.Graph<T>& = graph.Graph<T>(batch, 2)
+    q := Qwen.New(g, m.C, ctx, quantized, recompute)!
+    s := q.AddLora(g, c)! if c.Rank > 0 else lora.Set(c)
+    lm := q.Lm(g, true, chunk)
+    g.Plan(rand.Rand(1))!
+    if dir == "" { q.Fill(g, m) } else { q.FillFrom(g, dir)! }
+    r := rand.Rand(5)
+    toks :~ g.Ints(lm.Tokens).Flat()!
+    ys :~ g.Ints(lm.Targets).Flat()!
+    for i in range toks.Len() {
+        toks[i] = I32(r.Below(m.C.Vocab))
+        ys[i] = I32(r.Below(m.C.Vocab))
+    }
+    rb := rand.Rand(9)
+    for a in s.Items.View() {
+        b := g.Value(a.B)
+        b.FillNormal(rb, 0.0, 0.1)
+    }
+    g.Training = true
+    return g, q, lm
+}
+
+# every projection's frozen weights replaced by their NF4 rounding (what an NF4 graph's products read)
+fn roundToNf4<T>(g mut graph.Graph<T>&, q Qwen&) {
+    for b in q.Blocks {
+        for v in [b.Q, b.K, b.V, b.O, b.Gate, b.Up, b.Down] {
+            t := g.Value(v)
+            w :~ t.Flat()!
+            nf4.NF4.Quantize(w, t.Dim(0), t.Dim(1)).Dequantize(w, 0)
+        }
+    }
+}
+
+test Qwen "QLoRA: NF4 + LoRA + ChunkedCE + Recompute gives the loss of frozen weights rounded to NF4 with the full cross entropy, within rounding; A and B's gradients bit for bit with and without Recompute" {
+    dir := model.TinyTied(true, 6, true)
+    m := model.Model.Load(dir, true)!
+    c := allTargets()
+    want, wq, wl := qlora<F32>(m, "", c, 16, 2, false, false, 0)
+    roundToNf4(want, wq)
+    want.Forward(2)
+    full := want.Scalar(wl.Loss)
+    g, _, lm := qlora<F32>(m, "", c, 16, 2, true, true, 40)
+    g.Forward(2)
+    got := g.Scalar(lm.Loss)
+    assert (got - full).Abs() < 1e-5 * full, "QLoRA's loss " + $got + ", the reference's " + $full
+    g.Backward(lm.Loss)
+    h, _, hl := qlora<F32>(m, "", c, 16, 2, true, false, 40)
+    h.Forward(2)
+    h.Backward(hl.Loss)
+    assert h.Scalar(hl.Loss) == got and g.ParamGrads().Flat()! == h.ParamGrads().Flat()!
+    want.Backward(wl.Loss)
+    worst, big := diff(flat(g.ParamGrads()), flat(want.ParamGrads()))
+    assert worst < 1e-4 * big, "gradients differ from the reference's by " + $worst + " of " + $big
+    os.RemoveAll(dir)!
+}
+
+# dir's checkpoint split into two shards and an index, as a large model is stored
+fn sharded(dir String&) String {
+    out :~ os.MkTemp("", "shards")!
+    os.WriteFile(out + "/config.json", os.ReadFile(dir + "/config.json")!)!
+    f := checkpoint.File.Load(dir + "/model.safetensors")!
+    a := checkpoint.Writer()
+    b := checkpoint.Writer()
+    names := ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    index := StringBuilder()
+    index.Push("{\"metadata\": {}, \"weight_map\": {")
+    for k, e in f.Entries {
+        t := f.Get<F32>(e.Key)!
+        if k % 2 == 0 { a.AddAs(e.Key, t, e.Type)! } else { b.AddAs(e.Key, t, e.Type)! }
+        if k > 0: index.Push(", ")
+        index.Push("\"" + e.Key + "\": \"" + names[k % 2] + "\"")
+    }
+    index.Push("}}")
+    a.Save(out + "/" + names[0])!
+    b.Save(out + "/" + names[1])!
+    os.WriteFile(out + "/model.safetensors.index.json", index.ToString())!
+    return out
+}
+
+# the logits of a graph of m's model filled by Fill or by FillFrom(dir)
+fn filledLogits<T>(m model.Model&, dir String&, quantized Bool) Array<F64> {
+    g mut graph.Graph<T>& = graph.Graph<T>(1, 2)
+    g.NoGrad = true
+    q := Qwen.New(g, m.C, 12, quantized)!
+    lm := q.Lm(g, false)
+    g.Plan(rand.Rand(1))!
+    if dir == "" { q.Fill(g, m) } else { q.FillFrom(g, dir)! }
+    toks :~ g.Ints(lm.Tokens).Flat()!
+    for i in range toks.Len(): toks[i] = I32((7 * i + 3) % m.C.Vocab)
+    g.Training = false
+    g.Forward(1)
+    return flat(g.Value(lm.Logits))
+}
+
+test Qwen "FillFrom reads the checkpoint (one file or sharded) into the graph as Fill copies llm/model's: the same logits bit for bit, F32, BF16 and NF4, Qwen3 tied and untied, Qwen2's biases" {
+    for which in range 3 {
+        dir := model.TinyTied(which < 2, U64(3 + which), which == 0)
+        shards := sharded(dir)
+        m := model.Model.Load(dir, true)!
+        for quantized in [false, true] {
+            want := filledLogits<F32>(m, "", quantized)
+            assert filledLogits<F32>(m, dir, quantized) == want and filledLogits<F32>(m, shards, quantized) == want, "case " + $which + " F32, NF4 " + $quantized
+            assert filledLogits<BF16>(m, shards, quantized) == filledLogits<BF16>(m, "", quantized), "case " + $which + " BF16, NF4 " + $quantized
+        }
+        os.RemoveAll(shards)!
+        os.RemoveAll(dir)!
+    }
+}
+
+test Footprint "the planner's arena is what Plan allocates; NF4 and Recompute shrink it" {
+    dir := model.TinyTied(true, 3, true)
+    m := model.Model.Load(dir, true)!
+    c := allTargets()
+    for quantized in [false, true] {
+        fp := Footprint.Of<F32>(m.C, 16, 2, quantized, true, 40, c, device.Backend.Cpu)!
+        g, _, _ := qlora<F32>(m, "", c, 16, 2, quantized, true, 40)
+        assert fp.Arena == g.ArenaBytes() and fp.Params == g.ParamCount, "planned " + $fp.Arena + ", allocated " + $g.ArenaBytes()
+    }
+    plain := Footprint.Of<F32>(m.C, 64, 2, false, false, 0, c, device.Backend.Cpu)!
+    small := Footprint.Of<F32>(m.C, 64, 2, true, true, 40, c, device.Backend.Cpu)!
+    assert small.Arena + small.Quant < plain.Arena and small.Quant > 0
     os.RemoveAll(dir)!
 }
