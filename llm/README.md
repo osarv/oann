@@ -50,6 +50,7 @@ a step never reads another row, so a completion does not depend on the batch it 
 | `--ctx C` | positions a sequence may have, prompt and completion (default: the longest prompt and M) |
 | `--kv-gb G` | memory for the key-value cache (default 90% of what is free after loading, less 1 GB) |
 | `--int8` | 8-bit weights, a scale per 32 inputs (the head stays BF16): 0.56 of the memory, needs AMX (BF16 without it); the 8B models need it on 16 GB |
+| `--int4` | 4-bit weights, a scale and an offset per 32 inputs (the head stays BF16): about a third of the memory, and decoding a few sequences about twice as fast; needs AMX |
 | `--kv8` | values in the cache in 8 bits, a scale per position and head: 0.76 of the cache's memory, needs AMX |
 | `--exact` | F32 activations and cache: slow, for checking against a reference |
 
@@ -64,7 +65,12 @@ decoded, so a new sequence starts the moment another finishes (continuous batchi
 **Products.** On a CPU with AMX (`TargetHasTileDot`), the weights stay BF16 and are packed once, as they are loaded,
 into the pair layout of std/tile's `AddDot`, in blocks of 32 outputs: a step rounds its activations to BF16 and each
 task adds `X W^T` into its blocks of the result, summing in F32. With `--int8` the layers' weights are 8 bits with a
-scale per 32 inputs (symmetric), widened to BF16 512 inputs of a block at a time into the L1 cache as they are used. Without AMX, or with `--exact`, the activations stay
+scale per 32 inputs (symmetric), widened to BF16 512 inputs of a block at a time into the L1 cache as they are used. With `--int4` they are 4 bits,
+`W = d (q - 8) + m` with a scale `d` and an offset `m` (F16) per 32 inputs of an output (GGUF's Q4_1, 5.5 bits a weight
+with the scales), laid out for VNNI's byte dots over 16 outputs at once: a step of at most 16 rows puts each row's
+activations in 8 bits (a scale per 32, shifted by 128 into bytes) and multiplies them with `vpdpbusd` straight from the
+packed weights, so decoding reads a quarter of BF16's bytes; a bigger step widens the weights to BF16 for AddDot as
+`--int8` does. Without AMX, or with `--exact`, the activations stay
 F32 and kernels/gemm multiplies them by the weights widened.
 
 **Attention** reads a paged key-value cache: pages of 64 positions, BF16, taken from a pool as a sequence grows and
@@ -101,6 +107,7 @@ faster than a dense model of its size:
 |---|---|---|---|---|---|
 | granite-3.1-3b-a800m-instruct (3.3B, 0.8B active) | BF16, 6.3 GB | 9.0 | 70 | 141 | 8.8 GB |
 | granite-3.1-3b-a800m-instruct | INT8 | 7.1 | 50 | 110 | 6.1 GB |
+| granite-3.1-3b-a800m-instruct | INT4, 2.3 GB | 18.0 | | 118 | 3.8 GB |
 | granite-3.3-2b-instruct (dense 2.5B), for comparison | BF16, 4.8 GB | 4.0 | | | |
 
 **Tokens.** tokenizer.json's byte-level BPE: added tokens (`<|im_start|>`, `<think>`, ...) are matched in the text
@@ -160,8 +167,8 @@ renders them through `jinja.olang` and holds them equal byte for byte - or both 
 tool turn - for Qwen3, Llama 3.2, Granite 3.3, Granite 3.1 MoE, Gemma 3 and SmolLM2. The templates write today's date,
 so the reference is written the day the test runs.
 
-A GGUF file's weights load widened to F32 and then rounded to BF16 (or requantized to INT8 with `--int8`): the file's
-4 or 8 bits save disk and download, not memory or time. The query and key rows of the Llama family come out of
+A GGUF file's weights load widened to F32 and then rounded to BF16, or requantized to 8 bits (`--int8`) or 4
+(`--int4`, which keeps the memory a 4-bit file promises). The query and key rows of the Llama family come out of
 llama.cpp's interleaved order, and Llama 3's `rope_freqs` divides the frequencies. `llm/tools/ggufref.py FILE.gguf ...`
 writes transformers' own reading of each file (dequantized, F32) and gguf-py's dequantization of two rows of a tensor of
 each type; the tests hold the rows to 1e-5 and the model, on both paths, to a mean logit difference under 1% of the
@@ -199,6 +206,22 @@ batch 64 it is as long as the products for the 1.5B model, sooner for models wit
 saves memory, not time here: widening the weights costs what reading half the bytes saves. Qwen3-8B in BF16 (16 GB)
 does not fit in 15 GB. `oann-gen` on 64 prompts with the 1.5B model, batch 64, at most 1024 tokens: 60194 tokens in
 301 s, 200 tokens a second, peak 5.2 GB. Measurements on a shared VM vary by 10-20% from run to run.
+
+**4-bit weights** (`--int4`, context 256): decoding one sequence reads a quarter of the bytes and runs about twice as
+fast; past 16 rows a step widens the weights, and a batch of 64 runs at about 0.65 of BF16's speed:
+
+| model | weights | batch 1 | batch 16 | batch 64 | peak |
+|---|---|---|---|---|---|
+| Llama-3.2-1B-Instruct | BF16, 2.4 GB | 8.0 | | | 2.7 GB (batch 1) |
+| Llama-3.2-1B-Instruct | INT4, 1.1 GB | 14.5 | | | 1.5 GB (batch 1) |
+| granite-3.3-2b-instruct | BF16, 4.8 GB | 3.7 | 58 | 132 | 6.6 GB |
+| granite-3.3-2b-instruct | INT8, 2.8 GB | 2.8 | 40 | 108 | 4.6 GB |
+| granite-3.3-2b-instruct | INT4, 1.8 GB | 8.3 | 35 | 85 | 3.6 GB |
+
+The 4 bits cost accuracy: against transformers in F32 the mean logit difference is about 2.5% of the largest logit for
+Llama 3.2 1B and Granite 3.3 2B (8% for SmolLM2-135M), and greedy answers stay the same, but near ties can turn
+(Gemma 3 1B's first answer token does, as PyTorch quantizing it the same way also gives). A GGUF file's own 4-bit
+weights are requantized into this layout, not kept as they are.
 
 **Long contexts.** Tokens a second at 2048, 4096 and 8192 positions (BF16 weights; "-" where weights and cache do not
 fit in 15 GB):

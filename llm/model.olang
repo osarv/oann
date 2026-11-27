@@ -312,22 +312,28 @@ fn (c Config&) Params() I64 {
 
 # a linear map of In inputs to Out outputs, y = x W^T + b: W BF16, either packed in AddDot's pair layout in blocks of
 # Nb outputs (element (o, i) at (o / Nb) In Nb + ((i / 2) Nb + o % Nb) 2 + i % 2) or as stored, row o at o In
-type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8 Bool = false) {
+type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8 Bool = false, Int4 Bool = false) {
     In
     Out
     Nb
     Packed
     Int8                                                        # Q and Scale hold W: W[o, i] = Scale[o, i / Group] Q[o, i]
+    Int4                                                        # Q4, D4 and C4 hold W (below, "4-bit weights")
     Group I64 = 32                      # inputs to a scale
-    W mut Array<BF16>& = Array<BF16>(0 if Int8 else In * Out)
+    W mut Array<BF16>& = Array<BF16>(0 if Int8 or Int4 else In * Out)
     Q mut Array<I8>& = Array<I8>(In * Out if Int8 else 0)
     Scale mut Array<F32>& = Array<F32>(Out * In / Group if Int8 else 0)   # row o's at o In / Group
+    Q4 mut Array<U8>& = Array<U8>(In * Out / 2 if Int4 else 0)
+    D4 mut Array<F16>& = Array<F16>(Out * In / 32 if Int4 else 0)
+    M4 mut Array<F16>& = Array<F16>(Out * In / 32 if Int4 else 0)
+    C4 mut Array<I16>& = Array<I16>(Out * In / 32 if Int4 else 0)
     Bias mut Array<F32>& = Array<F32>(Out if bias else 0)
 }
 
 # element (o, i) of W
 fn (w Linear&) Get(o I64, i I64) F32 {
     if w.Int8: return F32(w.Q[w.at(o, i)]) * w.Scale[(o * w.In + i) / w.Group]
+    if w.Int4: return F32(w.D4[w.at4(o, i / 32)]) * F32(I64((w.Q4[w.byte4(o, i)] >> (4 if i % 8 >= 4 else 0)) & 15) - 8) + F32(w.M4[w.at4(o, i / 32)])
     return F32(w.W[w.at(o, i)])
 }
 
@@ -335,6 +341,44 @@ fn (w Linear&) Get(o I64, i I64) F32 {
 fn (w Linear&) at(o I64, i I64) I64 {
     if not w.Packed: return o * w.In + i
     return (o / w.Nb) * w.In * w.Nb + ((i / 2) * w.Nb + o % w.Nb) * 2 + i % 2
+}
+
+# 4-bit weights. A scale and an offset a group of 32 inputs of an output: W[o, i] = D4 (q - 8) + M4, q in 0 .. 15 (the
+# group's least value M4 - 8 D4, its largest M4 + 7 D4, as GGUF's Q4_1 has it with q's 8 moved into the offset). Laid out for VNNI's byte dots over 16 outputs at once: group g of
+# a block of 16 outputs is four chunks of 64 bytes, chunk c holding inputs 32 g + 8 c + t (low nibbles) and
+# 32 g + 8 c + 4 + t (high) of output n at byte 4 n + t. D4 and C4 (128 times the group's sum of q - 8, which a dot
+# against activations shifted by 128 into bytes takes back) a group's 16 outputs together, as M4: 5.5 bits a weight.
+
+# where group g of output o's scale and correction are
+fn (w Linear&) at4(o I64, g I64) I64 { return ((o / 16) * (w.In / 32) + g) * 16 + o % 16 }
+
+# the byte holding input i of output o
+fn (w Linear&) byte4(o I64, i I64) I64 {
+    return (((o / 16) * (w.In / 32) + i / 32) * 4 + (i % 32) / 8) * 64 + 4 * (o % 16) + i % 4
+}
+
+# a group of 32 weights of output o from input i0 quantized into 4 bits
+fn (w mut Linear&) put4(o I64, i0 I64, v Array<F32>&, at I64) {
+    lo := v[at]
+    hi := v[at]
+    for t in range 32 {
+        lo = lo.Min(v[at + t])
+        hi = hi.Max(v[at + t])
+    }
+    d := F32(F16((hi - lo) / 15.0))
+    m := F32(F16(lo + 8.0 * d))
+    inv := 1.0 / d if d != 0.0 else F32(0.0)
+    sum I64 = 0
+    for t in range 32 {
+        q := I64(((v[at + t] - m) * inv).Round()).Max(-8).Min(7)
+        sum += q
+        b := w.byte4(o, i0 + t)
+        sh := U8(4) if t % 8 >= 4 else U8(0)
+        w.Q4[b] = (w.Q4[b] & ~(U8(15) << sh)) | (U8(q + 8) << sh)
+    }
+    w.D4[w.at4(o, i0 / 32)] = F16(d)
+    w.M4[w.at4(o, i0 / 32)] = F16(m)
+    w.C4[w.at4(o, i0 / 32)] = I16(128 * sum)
 }
 
 # the widest block of 64, 32 or 16 outputs every part divides into
@@ -349,11 +393,11 @@ fn blockOf(parts Array<I64>&) I64 {
     return 16
 }
 
-type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false) {
-    Qkv Linear = Linear(c.Dim, (c.Heads + 2 * c.KvHeads) * c.HeadDim, blockOf([c.Heads * c.HeadDim, c.KvHeads * c.HeadDim]), pack, c.Bias, int8)
-    O Linear = Linear(c.Heads * c.HeadDim, c.Dim, blockOf([c.Dim]), pack, Int8 = int8)
-    GateUp Linear = Linear(c.Dim, 0 if moe else 2 * c.Ffn, blockOf([c.Ffn]), pack, Int8 = int8)
-    Down Linear = Linear(c.Ffn, 0 if moe else c.Dim, blockOf([c.Dim]), pack, Int8 = int8)
+type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false, int4 Bool = false) {
+    Qkv Linear = Linear(c.Dim, (c.Heads + 2 * c.KvHeads) * c.HeadDim, blockOf([c.Heads * c.HeadDim, c.KvHeads * c.HeadDim]), pack, c.Bias, int8, int4)
+    O Linear = Linear(c.Heads * c.HeadDim, c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4)
+    GateUp Linear = Linear(c.Dim, 0 if moe else 2 * c.Ffn, blockOf([c.Ffn]), pack, Int8 = int8, Int4 = int4)
+    Down Linear = Linear(c.Ffn, 0 if moe else c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4)
     Norm1 mut Array<F32>& = Array<F32>(c.Dim)
     Norm2 mut Array<F32>& = Array<F32>(c.Dim)
     PostAttn mut Array<F32>& = Array<F32>(c.Dim if c.PostNorms else 0)
@@ -364,8 +408,8 @@ type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false) {
     ups := Vec<Linear>()
     downs := Vec<Linear>()
     for _ in range c.Experts if moe else 0 {
-        ups.Push(Linear(c.Dim, 2 * c.MoeFfn, blockOf([c.MoeFfn]), pack, Int8 = int8))
-        downs.Push(Linear(c.MoeFfn, c.Dim, blockOf([c.Dim]), pack, Int8 = int8))
+        ups.Push(Linear(c.Dim, 2 * c.MoeFfn, blockOf([c.MoeFfn]), pack, Int8 = int8, Int4 = int4))
+        downs.Push(Linear(c.MoeFfn, c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4))
     }
     Ups mut Array<Linear>& = ups.ToArray()          # each expert's gate and up halves
     Downs mut Array<Linear>& = downs.ToArray()
@@ -557,6 +601,8 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
                         l.Q[l.at(o, i)] = I8(v if v < 127.0 and v > -127.0 else (F32(127.0) if v > 0.0 else F32(-127.0)))
                     }
                 }
+            } else if l.Int4 {
+                for g0 in range 0, l.In, 32: l.put4(o, g0, b, r * l.In + g0)
             } else if l.Packed {
                 base := (o / l.Nb) * l.In * l.Nb + (o % l.Nb) * 2
                 for i in range l.In: l.W[base + (i / 2) * l.Nb * 2 + i % 2] = BF16(b[r * l.In + i])
@@ -581,12 +627,13 @@ fn (w mut Weights&) vector(dst mut Array<F32>&, name String&, from I64, n I64) ?
 
 # ---- the model ----
 
-type Model struct(C Config, Tile Bool, Int8 Bool = false) {
+type Model struct(C Config, Tile Bool, Int8 Bool = false, Int4 Bool = false) {
     C                                       # the configuration
     Tile                                    # AddDot's products (BF16 activations); else F32 activations and gemm
     Int8                                    # the layers' weights in 8 bits, a scale per 32 inputs (the head and embedding BF16)
+    Int4                                    # the layers' weights in 4 bits, a scale per 32 inputs (the head and embedding BF16)
     made := Vec<Layer>()
-    for li in range C.Layers: made.Push(Layer(C, Tile, Int8, C.MoeAt(li)))
+    for li in range C.Layers: made.Push(Layer(C, Tile, Int8, C.MoeAt(li), Int4))
     Layers mut Array<Layer>& = made.ToArray()
     Embed Linear = Linear(C.Dim, C.Vocab if not C.Tied else 0, 16, false)   # row-major; empty when tied
     Head Linear = Linear(C.Dim, roundUp(C.Vocab, 16), blockOf([roundUp(C.Vocab, 16)]), Tile)   # rows past Vocab 0
@@ -596,22 +643,23 @@ type Model struct(C Config, Tile Bool, Int8 Bool = false) {
 
 # the model in directory dir (config.json, model.safetensors or its shards): exact (F32 activations, gemm's products)
 # where AMX is missing or exact is set
-fn Model.Load(dir String&, exact Bool = false, int8 Bool = false) Model ? ModelError, os.Error {
+fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = false) Model ? ModelError, os.Error {
     if dir.EndsWith(".gguf") {
         g := try gguf.File.Open(dir) catch gguf.GgufError { error ModelError.Malformed(dir + " (GGUF)") }
         c := try Config.Parse(try g.ConfigJson() catch gguf.GgufError { error ModelError.Unsupported(dir + ": " + g.Arch) })
         w := Weights.Gguf(g, c.HeadDim)
-        return try Model.From(c, w, exact, int8)
+        return try Model.From(c, w, exact, int8, int4)
     }
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
     w := try Weights.Open(dir)
-    return try Model.From(c, w, exact, int8)
+    return try Model.From(c, w, exact, int8, int4)
 }
 
 # the model of config c with weights w
-fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool) Model ? ModelError {
-    if exact and int8: error ModelError.Unsupported("exact products of 8-bit weights")
-    m := Model(c, TargetHasTileDot and not exact, int8 and TargetHasTileDot)
+fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false) Model ? ModelError {
+    if exact and (int8 or int4): error ModelError.Unsupported("exact products of 8- or 4-bit weights")
+    if int8 and int4: error ModelError.Unsupported("both 8- and 4-bit weights")
+    m := Model(c, TargetHasTileDot and not exact, int8 and TargetHasTileDot, int4 and TargetHasTileDot)
     if w.Has("rope_freqs.weight") {
         m.C.FreqDiv ~ Array<F64>(c.HeadDim / 2)
         v := Array<F32>(c.HeadDim / 2)
@@ -693,7 +741,7 @@ fn loadExperts(w mut Weights&, l mut Layer&, c Config&, p String&) ? ModelError 
 }
 
 # the bytes its weights take
-fn (w Linear&) Bytes() I64 { return 2 * w.W.Len() + w.Q.Len() + 4 * (w.Scale.Len() + w.Bias.Len()) }
+fn (w Linear&) Bytes() I64 { return 2 * w.W.Len() + w.Q.Len() + w.Q4.Len() + 2 * (w.D4.Len() + w.M4.Len() + w.C4.Len()) + 4 * (w.Scale.Len() + w.Bias.Len()) }
 
 # the bytes the weights take
 fn (m Model&) Bytes() I64 {
@@ -789,8 +837,9 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     att mut Array<F32>& = Array<F32>(roundUp(Rows, 16) * m.C.Heads * m.C.HeadDim)
     y mut Array<F32>& = Array<F32>(roundUp(Rows, 16) * (2 * m.C.Ffn).Max(m.C.Dim))     # a perceptron's gate and up, or a projection's output
     xb mut Array<BF16>& = Array<BF16>(roundUp(Rows, 16) * widest(m.C) if m.Tile else 0)
-    deq mut Array<BF16>& = Array<BF16>(m.Threads * widest(m.C) * 64 if m.Tile and m.Int8 else 0)   # each task's widened block
-    scs mut Array<F32>& = Array<F32>(m.Threads * 128)                                             # and its scales
+    deq mut Array<BF16>& = Array<BF16>(m.Threads * widest(m.C) * 64 if m.Tile and (m.Int8 or m.Int4) else 0)   # each task's widened block
+    scs mut Array<F32>& = Array<F32>(m.Threads * (256 + 2 * Gemv4 * widest(m.C) / 32))                  # and its scales (4 bits: its rows' too)
+    qxs mut Array<U8>& = Array<U8>(m.Threads * Gemv4 * widest(m.C) if m.Int4 else 0)              # 4 bits: each task's rows in 8
     # a mixture of experts: each row's experts and weights, the rows grouped by expert, an expert's rows gathered
     pick mut Array<I32>& = Array<I32>(Rows * m.C.TopK)
     pickW mut Array<F32>& = Array<F32>(Rows * m.C.TopK)
@@ -872,7 +921,7 @@ fn rmsNorm(y mut Array<F32>&, yo I64, x Array<F32>&, xo I64, n I64, d I64, ld I6
 }
 
 # dst[: rows, : w.Out] = src[: rows, : w.In] W^T + b, rows of src w.In apart and of dst w.Out apart
-fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F32>&, ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Linear&) {
+fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F32>&, qxs mut Array<U8>&, ws mut gemm.Workspace<F32>&, dst mut Array<F32>&, src mut Array<F32>&, rows I64, w Linear&) {
     if rows == 0: return
     if m.Tile {
         rp := roundUp(rows, 16)
@@ -881,8 +930,10 @@ fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F3
         blocks := w.Out / w.Nb
         tasks := m.Threads.Min(blocks)
         per := deq.Len() / m.Threads
+        sp := scs.Len() / m.Threads
+        qp := qxs.Len() / m.Threads
         join {
-            for t in range tasks: spawn mmBlocks(dst, xb, w, rp, t * blocks / tasks, (t + 1) * blocks / tasks, deq[t * per:(t + 1) * per], scs[t * 128:(t + 1) * 128])
+            for t in range tasks: spawn mmBlocks(dst, xb, w, rp, t * blocks / tasks, (t + 1) * blocks / tasks, deq[t * per:(t + 1) * per], scs[t * sp:(t + 1) * sp], qxs[t * qp:(t + 1) * qp], rows)
         }
     } else {
         c := mat.Mat<F32>(dst, 0, rows, w.Out, w.Out)
@@ -899,7 +950,12 @@ fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F3
 
 # blocks b0 .. b1 of dst = x W^T (rp rows) by AddDot; 8-bit weights widened a part of a block at a time into deq, each
 # times its group's scale and rounded to BF16 (to nearest, even), the scales of a pair row of the block in deq's tail
-fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I64, deq mut Array<BF16>&, sc mut Array<F32>&) {
+fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I64, deq mut Array<BF16>&, sc mut Array<F32>&, qx mut Array<U8>&, real I64) {
+    if w.Int4 and real <= Gemv4 {
+        quant8(x, w.In, real, qx, sc[256:])
+        gemv4(dst, w, real, b0, b1, qx, sc[256:], sc[:256])
+        return
+    }
     span := w.In * w.Nb
     for b in range b0, b1 {
         c0 := b * w.Nb
@@ -934,10 +990,163 @@ fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I
                 }
                 stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:depth * w.Nb])!
             }
+        } else if w.Int4 {
+            # widened 512 deep at a time, as 8-bit weights are
+            for k0 in range 0, w.In, 512 {
+                depth := (w.In - k0).Min(512)
+                widen4(w, c0, k0, depth, deq, sc)
+                stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:depth * w.Nb])!
+            }
         } else {
             stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x, w.In, w.In, w.W[b * span:(b + 1) * span])!
         }
     }
+}
+
+# the rows a product of 4-bit weights takes by byte dots (decoding); more are widened to BF16 for AddDot
+Gemv4 I64 = 16
+
+# rows 0 .. real of x (BF16, In apart) in 8 bits: a scale a group of 32 (its largest magnitude 127) into xs, the values
+# rounded and shifted by 128 into bytes, and each group's sum (of the values as the bytes give them back) after the
+# scales, at real In / 32
+fn quant8(x Array<BF16>&, width I64, real I64, qx mut Array<U8>&, xs mut Array<F32>&) {
+    ng := width / 32
+    for r in range real {
+        for g in range ng {
+            o := r * width + g * 32
+            big F32 = 0.0
+            for t in range 32: big = big.Max(F32(x[o + t]).Abs())
+            d := big / 127.0
+            inv := 1.0 / d if d > 0.0 else F32(0.0)
+            xs[r * ng + g] = d
+            sum I64 = 0
+            for t in range 32 {
+                q := I64((F32(x[o + t]) * inv).Round())
+                sum += q
+                qx[o + t] = U8(q + 128)
+            }
+            xs[real * ng + r * ng + g] = d * F32(sum)
+        }
+    }
+}
+
+# blocks b0 .. b1 of dst = x W^T for rows 0 .. real, W in 4 bits, x in 8 (quant8): a group's 32 inputs of 16 outputs
+# by eight VNNI steps (four inputs of a row shared by the 16) into I32, then scaled into F32 sums (acc, 16 a row)
+fn gemv4(dst mut Array<F32>&, w Linear&, real I64, b0 I64, b1 I64, qx Array<U8>&, xs Array<F32>&, acc mut Array<F32>&) {
+    ng := w.In / 32
+    lanes := tile4()
+    if real == 1 {
+        gemv4one(dst, w, b0, b1, qx, xs, lanes)
+        return
+    }
+    for cb in range b0 * w.Nb / 16, b1 * w.Nb / 16 {
+        for i in range real * 16: acc[i] = 0.0
+        for g in range ng {
+            for i in range real * 16: lanes.ai[i] = 0
+            for c in range 4 {
+                o := ((cb * ng + g) * 4 + c) * 64
+                for j in range 64 {
+                    b := w.Q4[o + j]
+                    lanes.lo[j] = I8(b & 15) - 8
+                    lanes.hi[j] = I8(b >> 4) - 8
+                }
+                for r in range real {
+                    x := r * w.In + 32 * g + 8 * c
+                    lanes.ai[r * 16:r * 16 + 16] += (qx[x:x + 4] * lanes.lo[:64]).Sum<I32>(4)
+                    lanes.ai[r * 16:r * 16 + 16] += (qx[x + 4:x + 8] * lanes.hi[:64]).Sum<I32>(4)
+                }
+            }
+            a4 := (cb * ng + g) * 16
+            for r in range real {
+                sx := xs[r * ng + g]
+                sum := xs[real * ng + r * ng + g]
+                for n in range 16: acc[r * 16 + n] += sx * F32(w.D4[a4 + n]) * F32(lanes.ai[r * 16 + n] - I32(w.C4[a4 + n])) + sum * F32(w.M4[a4 + n])
+            }
+        }
+        for r in range real {
+            for n in range 16: dst[r * w.Out + cb * 16 + n] = acc[r * 16 + n]
+        }
+    }
+}
+
+# gemv4 for one row (decoding one sequence): the group's sums kept in one vector
+fn gemv4one(dst mut Array<F32>&, w Linear&, b0 I64, b1 I64, qx Array<U8>&, xs Array<F32>&, lanes mut tile4&) {
+    ng := w.In / 32
+    for cb in range b0 * w.Nb / 16, b1 * w.Nb / 16 {
+        for n in range 16: lanes.acc[n] = 0.0
+        for g in range ng {
+            xg :~ qx[32 * g:32 * g + 32]
+            o := (cb * ng + g) * 256
+            q :~ w.Q4[o:o + 256]
+            for j in range 256 {
+                lanes.lo[j] = I8(q[j] & 15) - 8
+                lanes.hi[j] = I8(q[j] >> 4) - 8
+            }
+            ai :~ lanes.ai[:16]
+            for n in range 16: ai[n] = 0
+            comptime for c in range 4 {
+                ai += (xg[8 * c:8 * c + 4] * lanes.lo[64 * c:64 * c + 64]).Sum<I32>(4)
+                ai += (xg[8 * c + 4:8 * c + 8] * lanes.hi[64 * c:64 * c + 64]).Sum<I32>(4)
+            }
+            a4 := (cb * ng + g) * 16
+            sx := xs[g]
+            sum := xs[ng + g]
+            for n in range 16: lanes.acc[n] += sx * F32(w.D4[a4 + n]) * F32(ai[n] - I32(w.C4[a4 + n])) + sum * F32(w.M4[a4 + n])
+        }
+        for n in range 16: dst[cb * 16 + n] = lanes.acc[n]
+    }
+}
+
+# inputs k0 .. k0 + depth of outputs c0 .. c0 + Nb of 4-bit W widened to BF16 into deq in AddDot's pair layout (input
+# 2 p + s of output n at p 2 Nb + 2 n + s); sc holds a group's 16 scales
+fn widen4(w Linear&, c0 I64, k0 I64, depth I64, deq mut Array<BF16>&, sc mut Array<F32>&) {
+    ng := w.In / 32
+    row := 2 * w.Nb
+    sc4 :~ sc[:64]
+    f :~ sc[64:128]
+    mc4 :~ sc[128:192]
+    tb := tile4()
+    for sb in range w.Nb / 16 {
+        cb := c0 / 16 + sb
+        for g in range k0 / 32, (k0 + depth) / 32 {
+            o := (cb * ng + g) * 256
+            a4 := (cb * ng + g) * 16
+            for j in range 64 {
+                sc4[j] = F32(w.D4[a4 + j / 4])
+                mc4[j] = F32(w.M4[a4 + j / 4])
+            }
+            for half in range 8 {
+                c := half / 2
+                q :~ w.Q4[o + 64 * c:o + 64 * c + 64]
+                if half % 2 == 0 {
+                    for j in range 64: f[j] = sc4[j] * F32(I32(q[j] & 15) - 8) + mc4[j]
+                } else {
+                    for j in range 64: f[j] = sc4[j] * F32(I32(q[j] >> 4) - 8) + mc4[j]
+                }
+                for j in range 64 {
+                    bits := f[j].Bits()
+                    tb.b[j] = BF16.FromBits(U16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16))
+                }
+                p0 := (32 * g + 4 * half - k0) / 2      # this quad's first pair: outputs' inputs 0, 1 there, 2, 3 next
+                at := p0 * row + 32 * sb
+                for n in range 16 {
+                    deq[at + 2 * n] = tb.b[4 * n]
+                    deq[at + 2 * n + 1] = tb.b[4 * n + 1]
+                    deq[at + row + 2 * n] = tb.b[4 * n + 2]
+                    deq[at + row + 2 * n + 1] = tb.b[4 * n + 3]
+                }
+            }
+        }
+    }
+}
+
+# gemv4's registers: a chunk's weights unpacked, the rows' I32 sums
+type tile4 struct() {
+    lo := Array<I8>(256)
+    hi := Array<I8>(256)
+    acc := Array<F32>(16)
+    b := Array<BF16>(64)
+    ai := Array<I32>(256)
 }
 
 # the rotation of each row's position: cos and sin of position x freq[i]
@@ -998,7 +1207,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         l :~ m.Layers[li]
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm1, c.Eps)
         t1 = time.Now()
-        m.linear(s.xb, s.deq, s.scs, s.ws, s.qkv, s.h, n, l.Qkv)
+        m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.qkv, s.h, n, l.Qkv)
         tm += time.Since(t1)
         # QK-norm, rotation, and the keys and values into the cache
         tasks := m.Threads.Min(n / 8)
@@ -1016,7 +1225,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         m.attention(s, k, li)
         ta += time.Since(t2)
         t1 = time.Now()
-        m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.att, n, l.O)
+        m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.y, s.att, n, l.O)
         tm += time.Since(t1)
         if c.PostNorms: rmsNorm(s.y, 0, s.y, 0, n, d, d, l.PostAttn, c.Eps)
         for i in range n * d: s.x[i] += s.y[i] * rs
@@ -1035,7 +1244,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         rmsNorm(s.h, j * d, s.x, r * d, 1, d, d, m.Final, c.Eps)
     }
     t1 = time.Now()
-    m.linear(s.xb, s.deq, s.scs, s.ws, s.Logits, s.h, s.NOut, m.Head)
+    m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.Logits, s.h, s.NOut, m.Head)
     if m.Head.Out != c.Vocab {
         # a vocabulary not a multiple of 16: the head's padded rows dropped, each row's logits moved down to Vocab apart
         for j in range s.NOut {
@@ -1057,7 +1266,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
 # the dense perceptron over the step's rows, s.h (normed) into s.y
 fn (m Model&) dense(s mut State&, l Layer&, tasks I64) {
     n := s.N
-    m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.h, n, l.GateUp)
+    m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.y, s.h, n, l.GateUp)
     if tasks <= 1 {
         swiglu(s.h, s.y, m.C.Ffn, 0, n, m.C.Gelu)
     } else {
@@ -1065,7 +1274,7 @@ fn (m Model&) dense(s mut State&, l Layer&, tasks I64) {
             for t in range tasks: spawn swiglu(s.h, s.y, m.C.Ffn, t * n / tasks, (t + 1) * n / tasks, m.C.Gelu)
         }
     }
-    m.linear(s.xb, s.deq, s.scs, s.ws, s.y, s.h, n, l.Down)
+    m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.y, s.h, n, l.Down)
 }
 
 # a mixture of experts over the step's rows, s.h (normed) into s.y: each row's top k experts by the router's softmax
@@ -1100,9 +1309,9 @@ fn (m Model&) experts(s mut State&, l Layer&) {
             r := I64(s.byExp[a + j]) / k
             for i in range d: s.gx[j * d + i] = s.h[r * d + i]
         }
-        m.linear(s.xb, s.deq, s.scs, s.ws, s.gy, s.gx, cnt, l.Ups[e])
+        m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.gy, s.gx, cnt, l.Ups[e])
         swiglu(s.gh, s.gy, f, 0, cnt, c.Gelu)
-        m.linear(s.xb, s.deq, s.scs, s.ws, s.go, s.gh, cnt, l.Downs[e])
+        m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.go, s.gh, cnt, l.Downs[e])
         for j in range cnt {
             i := I64(s.byExp[a + j])
             r := i / k
@@ -1134,12 +1343,14 @@ fn (m Model&) expertsTiled(s mut State&, l Layer&) {
     }
     tasks := m.Threads.Min(na)
     per := s.deq.Len() / m.Threads
+    sp := s.scs.Len() / m.Threads
+    qp := s.qxs.Len() / m.Threads
     if tasks <= 1 {
-        expertRun(c, l, s.h, s.byExp, s.expAt, s.act, 0, 1, na, s.tx[:s.moeIn], s.tg[:s.tg.Len() / m.Threads], s.deq[:per], s.scs[:128], s.pairOut)
+        expertRun(c, l, s.h, s.byExp, s.expAt, s.act, 0, 1, na, s.tx[:s.moeIn], s.tg[:s.tg.Len() / m.Threads], s.deq[:per], s.scs[:sp], s.qxs[:qp], s.pairOut)
     } else {
         tw := s.tg.Len() / m.Threads
         join {
-            for t in range tasks: spawn expertRun(c, l, s.h, s.byExp, s.expAt, s.act, t, tasks, na, s.tx[t * s.moeIn:(t + 1) * s.moeIn], s.tg[t * tw:(t + 1) * tw], s.deq[t * per:(t + 1) * per], s.scs[t * 128:(t + 1) * 128], s.pairOut)
+            for t in range tasks: spawn expertRun(c, l, s.h, s.byExp, s.expAt, s.act, t, tasks, na, s.tx[t * s.moeIn:(t + 1) * s.moeIn], s.tg[t * tw:(t + 1) * tw], s.deq[t * per:(t + 1) * per], s.scs[t * sp:(t + 1) * sp], s.qxs[t * qp:(t + 1) * qp], s.pairOut)
         }
     }
     for r in range s.N {
@@ -1153,7 +1364,7 @@ fn (m Model&) expertsTiled(s mut State&, l Layer&) {
 
 # experts act[t], act[t + tasks], ...: each one's rows gathered, its perceptron run by AddDot on this core, the outputs
 # into pairOut at their (row, choice)
-fn expertRun(c Config&, l Layer&, h Array<F32>&, byExp Array<I32>&, expAt Array<I64>&, act Array<I64>&, t I64, tasks I64, na I64, xb mut Array<BF16>&, g mut Array<F32>&, deq mut Array<BF16>&, sc mut Array<F32>&, pairOut mut Array<F32>&) {
+fn expertRun(c Config&, l Layer&, h Array<F32>&, byExp Array<I32>&, expAt Array<I64>&, act Array<I64>&, t I64, tasks I64, na I64, xb mut Array<BF16>&, g mut Array<F32>&, deq mut Array<BF16>&, sc mut Array<F32>&, qx mut Array<U8>&, pairOut mut Array<F32>&) {
     d := c.Dim
     f := c.MoeFfn
     k := c.TopK
@@ -1172,7 +1383,7 @@ fn expertRun(c Config&, l Layer&, h Array<F32>&, byExp Array<I32>&, expAt Array<
         }
         for i in range cnt * d, rp * d: xb[i] = BF16(0.0)
         up Linear& = l.Ups[e]
-        mmBlocks(g[gy:gh], xb, up, rp, 0, up.Out / up.Nb, deq, sc)
+        mmBlocks(g[gy:gh], xb, up, rp, 0, up.Out / up.Nb, deq, sc, qx, cnt)
         for j in range cnt {
             for i in range f {
                 gv := g[gy + j * 2 * f + i]
@@ -1181,7 +1392,7 @@ fn expertRun(c Config&, l Layer&, h Array<F32>&, byExp Array<I32>&, expAt Array<
         }
         for i in range cnt * f, rp * f: xb[i] = BF16(0.0)
         down Linear& = l.Downs[e]
-        mmBlocks(g[gout:], xb, down, rp, 0, down.Out / down.Nb, deq, sc)
+        mmBlocks(g[gout:], xb, down, rp, 0, down.Out / down.Nb, deq, sc, qx, cnt)
         for j in range cnt {
             i := I64(byExp[a + j])
             for q in range d: pairOut[i * d + q] = g[gout + j * d + q]
@@ -1946,6 +2157,86 @@ test Model "loads GGUF files (Q8_0, Q4_0, Q4_1, the k-quants): the logits and gr
             mean := diff / F64(last.Len())
             assert mean < 0.01 * biggest(last), name + " exact " + $exact + ": mean " + $mean + " of " + $biggest(last) + ", worst " + $worst(last, lg)
             assert toks == cont[:5], name + " exact " + $exact + ": " + $toks + ", not " + $cont
+        }
+    }
+}
+
+# 4-bit weights against transformers' F32 logits on the real checkpoints and GGUF files under $OANN_MODELS: the mean
+# difference within 10% of the largest logit (SmolLM2-135M: 8%, as PyTorch quantizing it the same way gives) and the
+# first greedy token the same, or the reference's within 1 of it (4 bits a weight move near ties)
+test Model "4-bit weights: the logits near transformers' and the first greedy token the same, where $OANN_MODELS has the checkpoints" {
+    if not TargetHasTileDot: return
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    if root.Len() == 0: return
+    paths := Vec<String>()
+    for name in ["HuggingFaceTB--SmolLM2-135M-Instruct", "unsloth--Llama-3.2-1B-Instruct", "ibm-granite--granite-3.3-2b-instruct", "ibm-granite--granite-3.1-1b-a400m-instruct", "unsloth--gemma-3-1b-it"] {
+        if os.Exists(root + "/" + name + "/ref.json"): paths.Push(root + "/" + name)
+    }
+    for name in ["Qwen3-0.6B-Q4_K_M.gguf", "Llama-3.2-1B-Instruct-Q4_K_M.gguf"] {
+        if os.Exists(root + "/gguf/" + name + ".ref.json"): paths.Push(root + "/gguf/" + name)
+    }
+    for path in paths.View() {
+        refPath := path + (".ref.json" if path.EndsWith(".gguf") else "/ref.json")
+        j :~ json.Json.Parse(os.ReadFile(refPath)!)!
+        prompt := Array<I32>[I32(t.AsInt()!) for t in j["tokens"]!.AsArr()!]
+        last := Array<F32>[F32(x.AsNum()!) for x in j["last"]!.AsArr()!]
+        cont := Array<I32>[I32(t.AsInt()!) for t in j["greedy"]!.AsArr()!]
+        m := Model.Load(path, false, false, true)!
+        assert m.Int4
+        k := Cache(m.C, 8, 1, 8)
+        for i in range 8: k.Table[i] = k.Take()
+        s := State(m, prompt.Len(), prompt.Len(), 256)
+        for i, t in prompt: s.Add(t, I64(i), 0, true)
+        m.Step(s, k)
+        lg :~ s.LogitsOf(prompt.Len() - 1, m.C.Vocab)
+        diff F64 = 0.0
+        for i in range last.Len(): diff += F64((lg[i] - last[i]).Abs())
+        mean := diff / F64(last.Len())
+        toks, _ := greedy(m, prompt, 3)
+        # Gemma 3 1B's answer is a near tie in 4 bits: PyTorch with the same weights and 8-bit activations has it at
+        # 18.67 against 18.16 for another (13.46 in F32); the reference's token is held to within 1 of the top
+        assert mean < 0.1 * biggest(last) and (toks[0] == cont[0] or lg[I64(cont[0])] > lg[I64(toks[0])] - 1.0), path + ": mean " + $mean + " of " + $biggest(last) + ", " + $toks + ", not " + $cont
+    }
+}
+
+# 4-bit weights' products: byte dots (one row, a few) and the widened AddDot against the weights read one by one (Get),
+# activations with outliers
+test Linear "4-bit products by byte dots and by widening agree with the weights read one by one" {
+    if not TargetHasTileDot: return
+    r := rand.Rand(7)
+    for shape in [[1152, 64], [6912, 32], [256, 48]] {
+        w := Linear(shape[0], shape[1], 16, true, Int4 = true)
+        row := Array<F32>(w.In)
+        for o in range w.Out {
+            for i in range w.In: row[i] = F32(r.Normal() * 0.05 + (0.02 if o % 3 == 0 else 0.0))
+            for g0 in range 0, w.In, 32: w.put4(o, g0, row, g0)
+        }
+        for rows in [1, 5, 20] {
+            rp := roundUp(rows, 16)
+            x := Array<BF16>(rp * w.In)
+            xf := Array<F32>(rows * w.In)
+            for i in range rows * w.In {
+                v := r.Normal() * (40.0 if i % 97 == 0 else 1.0)
+                x[i] = BF16(v)
+                xf[i] = F32(x[i])
+            }
+            dst := Array<F32>(rp * w.Out)
+            deq := Array<BF16>(w.In * 64)
+            sc := Array<F32>(256 + 2 * Gemv4 * w.In / 32)
+            qx := Array<U8>(Gemv4 * w.In)
+            mmBlocks(dst, x, w, rp, 0, w.Out / w.Nb, deq, sc, qx, rows)
+            for k in range rows {
+                for o in range w.Out {
+                    want F64 = 0.0
+                    size F64 = 0.0
+                    for i in range w.In {
+                        want += F64(xf[k * w.In + i]) * F64(w.Get(o, i))
+                        size += (F64(xf[k * w.In + i]) * F64(w.Get(o, i))).Abs()
+                    }
+                    got := F64(dst[k * w.Out + o])
+                    assert (got - want).Abs() < 0.02 * size + 1e-3, $shape + " rows " + $rows + " (" + $k + ", " + $o + "): " + $got + ", not " + $want
+                }
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 # llm/gen - oann-gen, completions of many prompts by an open-weight model, as one long job:
 #
 #     oann-gen MODEL prompts.jsonl out.jsonl [--n K] [--temp T] [--top-p P] [--top-k K] [--max-tokens M] [--batch B]
-#              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--kv8] [--exact]
+#              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--int4] [--kv8] [--exact]
 #
 # MODEL is a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors or its shards),
 # a GGUF file (llm/gguf: its weights widened to BF16, or requantized to INT8, as they load),
@@ -109,6 +109,7 @@ fn main() {
     exact := p.Bool("exact", 0, "F32 activations and cache (slow; to check against a reference)")
     kv8 := p.Bool("kv8", 0, "keys and values in 8 bits, a scale per position and head: about half the cache (AMX)")
     int8 := p.Bool("int8", 0, "8-bit weights, a scale per 32 inputs (the head stays BF16): about 0.56 of the memory; needs AMX")
+    int4 := p.Bool("int4", 0, "4-bit weights, a scale per 32 inputs (the head stays BF16): about a third of the memory, faster decoding; needs AMX")
     try p.Parse(os.Args()) catch flags.Error.Help {
         try io.Put(p.Help()) catch { }
         return
@@ -122,8 +123,8 @@ fn main() {
     t0 := time.Now()
     tok := try tokenizer(dir) catch { fail("cannot read the tokenizer of " + dir) }
     ch := chat.Chat.Load(dir, tok)
-    m := try model.Model.Load(dir, exact.Get(), int8.Get()) catch { fail("cannot load the model in " + dir) }
-    say("loaded " + dir + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(m.Bytes() / 1048576) + " MB" + (" (INT8)" if m.Int8 else "") + ", " +
+    m := try model.Model.Load(dir, exact.Get(), int8.Get(), int4.Get()) catch { fail("cannot load the model in " + dir) }
+    say("loaded " + dir + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(m.Bytes() / 1048576) + " MB" + (" (INT8)" if m.Int8 else (" (INT4)" if m.Int4 else "")) + ", " +
         ("AMX tiles" if m.Tile else "F32 products") + ", " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
     # what is done already
     finished := Map<String, Bool>()

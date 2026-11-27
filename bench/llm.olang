@@ -1,7 +1,7 @@
 # decoding speed of an open-weight model (llm/model) on this machine: tokens a second at each batch size, every
 # sequence of the batch given a context of ctx positions first (random tokens, read 256 rows a step), then "steps"
 # steps of one token each timed - and where a step's time goes (the products, attention, the rest) and the process's
-# peak resident memory. Arguments: the model's directory, the context (512), the steps (16), "int8" for 8-bit weights,
+# peak resident memory. Arguments: the model's directory, the context (512), the steps (16), "int8" or "int4" for 8- or 4-bit weights,
 # then the batch sizes (1 16 64); OANN_KV8 set: 8-bit keys and values
 
 import "std/os"
@@ -21,21 +21,22 @@ fn peak() I64 {
 fn main() {
     args :~ os.Args()
     if args.Len() < 2 {
-        Println("bench/llm MODEL [ctx] [steps] [int8|bf16] [batch ...]")
+        Println("bench/llm MODEL [ctx] [steps] [int8|int4|bf16] [batch ...]")
         return
     }
     ctx I64 = args[2].ParseInt()! if args.Len() > 2 else 512
     steps I64 = args[3].ParseInt()! if args.Len() > 3 else 16
     int8 := args.Len() > 4 and args[4] == "int8"
+    int4 := args.Len() > 4 and args[4] == "int4"
     batches := Vec<I64>()
     for i in range 5, args.Len(): batches.Push(args[i].ParseInt()!)
     if batches.Len() == 0 {
         for b in [1, 16, 64]: batches.Push(b)
     }
     t0 := time.Now()
-    m := model.Model.Load(args[1], false, int8)!
+    m := model.Model.Load(args[1], false, int8, int4)!
     Println(args[1] + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(m.Bytes() / 1048576) + " MB of weights (" +
-        ("INT8" if int8 else "BF16") + ", cache " + ("INT8" if (try os.Env("OANN_KV8") catch default "").Len() > 0 else "BF16") + "), " + ("AMX" if m.Tile else "F32") + ", loaded in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+        ("INT8" if int8 else ("INT4" if int4 else "BF16")) + ", cache " + ("INT8" if (try os.Env("OANN_KV8") catch default "").Len() > 0 else "BF16") + "), " + ("AMX" if m.Tile else "F32") + ", loaded in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
     top := batches.View().Max()!
     per := (ctx + steps) / model.PageSize + 1
     kv8 := (try os.Env("OANN_KV8") catch default "").Len() > 0
