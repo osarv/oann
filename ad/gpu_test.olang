@@ -5,7 +5,8 @@
 # softmax (plain and causal), log-sum-exp, layer and RMS norms forward and backward, AdamW (bit for bit). Then whole
 # graphs planned on both backends from one seed and fed the same batch: the perceptron and the character transformer
 # (and its variants), forward and backward within rounding of the CPU's, two GPU runs identical, a short batch, a few
-# AdamW steps with the optimizer on the device against the host's, and what has no GPU form refused by name.
+# AdamW steps with the optimizer on the device against the host's, and what has no GPU form refused by name. Last, nn/moe's
+# mixture of experts on the device (Work.Moe) against nn/moe's Experts on the CPU.
 
 import "graph"
 import "mirror"
@@ -18,6 +19,7 @@ import "../kernels/gpu/kern"
 import "../models/gpt"
 import "../models/qwen"
 import "../nn/lora"
+import "../nn/moe"
 import "../llm/model"
 import "std/os"
 import "../nn/optim"
@@ -1123,3 +1125,199 @@ fn bigVocabCase() {
 }
 
 test bigVocabCase "ChunkedCE and checkpointed blocks on the GPU: within rounding of the CPU's (F32 and BF16), checkpointed equal to plain bit for bit, a short batch, and Train as a CUDA graph learns" { bigVocabCase() }
+
+# ---- a mixture of experts (nn/moe's Experts as ad/mirror's Work.Moe) ----
+
+# a mixture of experts after a linear map (so x's gradient flows through it): x, the target, the layer's output, the
+# loss, the layer's parameters
+fn moeNet<T, S>(g mut graph.Graph<T>&, op mut moe.Experts<S>&, d I64, h I64, e I64) graph.Var, graph.Var, graph.Var, graph.Var, moe.Moe {
+    x := g.Input(d)
+    t := g.Input(d)
+    w0 := g.Param(graph.Init.Normal(0.0, 0.3), true, d, d)
+    m := moe.Moe.New(g, d, h, e)
+    y := m.Apply(g, op, g.Linear(x, w0))
+    g.Keep(y)
+    return x, t, y, g.Mse(y, t), m
+}
+
+# a tensor's elements as F64
+fn f64s<T>(v tensor.Tensor<T>) Array<F64> {
+    f :~ v.Flat()!
+    return Array<F64>[F64(x) for x in f]
+}
+
+fn worst64(a Array<F64>&, b Array<F64>&) F64, F64 {
+    w, big := F64(0.0), F64(0.0)
+    for i in range b.Len() {
+        w = w.Max((a[i] - b[i]).Abs())
+        big = big.Max(b[i].Abs())
+    }
+    return w, big
+}
+
+# the router's values set alike on both graphs (from the seed: decisive routing, so a rounding never flips a choice)
+fn routerAlike<T>(cpu mut graph.Graph<T>&, gpu mut graph.Graph<T>&, router graph.Var, seed U64) {
+    r := rand.Rand(seed)
+    a :~ cpu.Value(router).Flat()!
+    b :~ gpu.Value(router).Flat()!
+    for i in range a.Len() {
+        v := T(r.Normal() * 0.6)
+        a[i], b[i] = v, v
+    }
+}
+
+fn feedMoe<T>(g mut graph.Graph<T>&, x graph.Var, t graph.Var, seed U64) {
+    r := rand.Rand(seed)
+    for v in Array<graph.Var>[x, t] {
+        f :~ g.Data(v).Flat()!
+        for i in range f.Len(): f[i] = T(r.Normal())
+    }
+}
+
+fn setMoe<S>(op mut moe.Experts<S>&, renorm Bool, aux F64) {
+    op.Renorm = renorm
+    op.Aux = aux
+    for j in range op.E: op.Bias[j] = F32(0.05 * F64(j % 3))
+}
+
+# one setting of the layer on both backends: a full batch, a short one and the full again, forward and backward within
+# tol of the CPU's, the rows each expert took (Load) the CPU's, two GPU runs alike
+fn moeCompare<T, S>(k I64, renorm Bool, aux F64, tol F64, what String&) {
+    d, h, e, batch := I64(16), I64(12), I64(4), I64(24)
+    oc := moe.Experts<S>(batch, d, h, e, k)
+    og := moe.Experts<S>(batch, d, h, e, k)
+    setMoe(oc, renorm, aux)
+    setMoe(og, renorm, aux)
+    cpu := graph.Graph<T>(batch)
+    x, t, y, loss, m := moeNet(cpu, oc, d, h, e)
+    gpu := graph.Graph<T>(batch)
+    moeNet(gpu, og, d, h, e)
+    try cpu.Plan(rand.Rand(4), device.Backend.Cpu) catch { unreachable }
+    try gpu.Plan(rand.Rand(4), device.Backend.Gpu) catch tensor.ShapeError err { unreachable $err }
+    routerAlike(cpu, gpu, m.Router, 9)
+    for n in Array<I64>[24, 13, 24] {
+        feedMoe(cpu, x, t, U64(n))
+        feedMoe(gpu, x, t, U64(n))
+        cpu.Forward(n)
+        cpu.Backward(loss)
+        gpu.Forward(n)
+        gpu.Backward(loss)
+        at := what + " at " + $n
+        lc, lg := cpu.Scalar(loss), gpu.Scalar(loss)
+        assert (lc - lg).Abs() <= tol * (1.0 + lc.Abs()), at + ": the loss " + $lg + " against the CPU's " + $lc
+        wy, by := worst64(f64s(gpu.Value(y)), f64s(cpu.Value(y)))
+        assert wy <= tol * (1.0 + by), at + ": the outputs differ by " + $wy + " of " + $by
+        gc := f64s(cpu.ParamGrads())
+        gg := f64s(gpu.ParamGrads())
+        wg, bg := worst64(gg, gc)
+        assert wg <= tol * (1.0 + bg), at + ": the gradients differ by " + $wg + " of " + $bg
+        for j in range e: assert oc.Load[j] == og.Load[j], at + ": expert " + $j + " took " + $og.Load[j] + " rows, the CPU's " + $oc.Load[j]
+        gpu.Forward(n)
+        gpu.Backward(loss)
+        assert gg == f64s(gpu.ParamGrads()), at + ": a second run differs"
+        oc.ResetLoad()
+        og.ResetLoad()
+    }
+}
+
+fn moeCase() {
+    if not device.GpuAvailable() {
+        gdev.Skip("mixture of experts")
+        return
+    }
+    for k in Array<I64>[1, 2] {
+        for renorm in Array<Bool>[false, true] {
+            moeCompare<F32, F32>(k, renorm, 0.0, 2.0e-4, "F32 k " + $k + " renorm " + $renorm)
+        }
+    }
+    moeCompare<F32, F32>(2, true, 0.3, 2.0e-4, "F32 with the balance loss")
+    moeCompare<BF16, BF16>(2, true, 0.0, 3.0e-2, "BF16 k 2")
+    moeCompare<BF16, BF16>(1, false, 0.3, 3.0e-2, "BF16 k 1 with the balance loss")
+}
+
+test moeCase "a mixture of experts on the GPU (F32 and BF16 graphs; K 1 and 2, renormalized or not, the balance loss): forward and backward within rounding of nn/moe's on the CPU, each expert's rows the CPU's, a short batch, twice alike" { moeCase() }
+
+# Balance on the GPU: a router that favours one expert, the bias moved by the rows the device counted, until even
+fn moeBalance() {
+    if not device.GpuAvailable() {
+        gdev.Skip("mixture of experts balancing")
+        return
+    }
+    n, d, h, e := I64(256), I64(8), I64(4), I64(8)
+    op := moe.Experts<F32>(n, d, h, e, 2)
+    g := graph.Graph<F32>(n)
+    x := g.Input(d)
+    m := moe.Moe.New(g, d, h, e)
+    y := m.Apply(g, op, x)
+    g.Mse(y, g.Input(d))
+    try g.Plan(rand.Rand(2), device.Backend.Gpu) catch tensor.ShapeError err { unreachable $err }
+    r := rand.Rand(11)
+    wr :~ g.Value(m.Router).Flat()!
+    for i in range wr.Len(): wr[i] = F32(r.Normal() * 0.5) + (2.0 if i < d else 0.0)
+    xs :~ g.Data(x).Flat()!
+    for i in range xs.Len(): xs[i] = F32(r.Normal())
+    g.Forward(n)
+    before := op.Imbalance()
+    op.ResetLoad()
+    for _ in range 400 {
+        g.Forward(n)
+        op.Balance(0.02)
+    }
+    g.Forward(n)
+    after := op.Imbalance()
+    assert before > 1.5 and after < 1.25, $before + " -> " + $after
+}
+
+test moeBalance "Balance on the GPU spreads a router that favours one expert: the device's rows per expert fill Load, the bias goes up before each Forward" { moeBalance() }
+
+# a small mixture-of-experts classifier trained on the GPU by Train (launch by launch: a Moe step is not captured),
+# balanced each step: it learns, and Train equals Forward, Backward and Step one by one
+fn moeTrained() {
+    if not device.GpuAvailable() {
+        gdev.Skip("mixture of experts training")
+        return
+    }
+    n, d, h, e, classes := I64(64), I64(16), I64(16), I64(4), I64(4)
+    losses := Array<F64>(2)
+    params := Vec<Array<F32>>()
+    for way in range 2 {
+        op := moe.Experts<F32>(n, d, h, e, 2)
+        g := graph.Graph<F32>(n)
+        x := g.Input(d)
+        c := g.Classes()
+        m := moe.Moe.New(g, d, h, e)
+        logits := g.Linear(m.Apply(g, op, x), g.Param(graph.Init.Normal(0.0, 0.3), true, classes, d))
+        loss := g.CrossEntropy(logits, c)
+        try g.Plan(rand.Rand(6), device.Backend.Gpu) catch tensor.ShapeError err { unreachable $err }
+        o := try optim.GpuAdamW<F32>.For(g, rate = 0.01) catch { unreachable }
+        r := rand.Rand(3)
+        xs :~ g.Data(x).Flat()!
+        cs :~ g.Ints(c).Flat()!
+        for i in range xs.Len(): xs[i] = F32(r.Normal())
+        for t in range n {
+            best I64 = 0
+            for j in range 1, classes {
+                if xs[t * d + j] > xs[t * d + best]: best = j
+            }
+            cs[t] = I32(best)       # the largest of the first four features: learnable
+        }
+        first F64 = 0.0
+        for step in range 60 {
+            if way == 0 {
+                g.Forward(n)
+                g.Backward(loss)
+                o.Step()
+            } else {
+                o.Train(loss, n)
+            }
+            op.Balance(1e-2)
+            if step == 0: first = g.Scalar(loss)
+        }
+        losses[way] = g.Scalar(loss)
+        assert losses[way] < 0.6 * first, "no learning: " + $first + " to " + $losses[way]
+        params.Push(Array<F32>[v for v in g.Params().Flat()!])
+    }
+    assert losses[0] == losses[1] and params[0] == params[1], "Train differs from the launches one by one: " + $losses[0] + " against " + $losses[1]
+}
+
+test moeTrained "a mixture-of-experts classifier trained on the GPU by Train and balanced learns, Train equal to the launches one by one" { moeTrained() }

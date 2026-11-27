@@ -1,0 +1,125 @@
+# What a mixture-of-experts feed-forward layer costs on the GPU against the dense one it replaces: nn/moe's Experts
+# (E experts, K a token, hidden H each, ad/mirror's Work.Moe) against layers.Feed's gated (SwiGLU) perceptron of the same
+# active size (hidden K H), one layer of each on `tokens` rows of width D, trained by GpuAdamW (Forward, Backward, the
+# step) on random rows. Prints the median step of each: the dense one launch by launch and as one CUDA graph (Train), the
+# mixture launch by launch (a Moe step brings its rows per expert down once a Forward, so it is not captured), and the
+# mixture's cost over the dense layer's - reasoning-300m.md's P2 bar: well under 33 %.
+# From the repository's root: make gpumoe ARGS="tokens steps f32|bf16 experts k D..." (the defaults: 8192 20 bf16 16 2
+# 384 640 896, the P4 ladder's widths); the dense hidden width is 8 D / 3 rounded up to 64, each expert's a K-th of it.
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../ad/graph"
+import "../kernels/device"
+import "../nn/layers"
+import "../nn/moe"
+import "../nn/optim"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(x Array<F64>&) F64 {
+    s := Array<F64>[v for v in x]
+    for i in range s.Len() {
+        j := i
+        for j > 0 and s[j - 1] > s[j] {
+            s[j - 1], s[j] = s[j], s[j - 1]
+            j--
+        }
+    }
+    return s[s.Len() / 2]
+}
+
+fn fill<T>(g mut graph.Graph<T>&, v graph.Var, r mut rand.Rand&) {
+    f :~ g.Data(v).Flat()!
+    for i in range f.Len(): f[i] = T(r.Normal())
+}
+
+# the median step in ms of `steps` (after two warm ones): whole (Train) or launch by launch; ops balanced after each
+fn timed<T, S>(g mut graph.Graph<T>&, loss graph.Var, x graph.Var, t graph.Var, steps I64, whole Bool, op mut moe.Experts<S>?&) F64 ? io.Error {
+    o := try optim.GpuAdamW<T>.For(g, rate = 1e-3) catch e {
+        try io.Put("no optimizer on the GPU: " + $e + "\n")
+        return 0.0
+    }
+    r := rand.Rand(2)
+    fill(g, x, r)
+    fill(g, t, r)
+    n := g.Batch
+    times := Array<F64>(steps)
+    for s in range steps + 2 {
+        t0 := time.Now()
+        if whole { o.Train(loss, n) } else {
+            g.Forward(n)
+            g.Backward(loss)
+            o.Step()
+        }
+        g.Scalar(loss)
+        if op is not null: op!.Balance(1e-2)
+        if s >= 2: times[s - 2] = F64(time.Since(t0)) * 1e-6
+    }
+    return median(times)
+}
+
+fn dense<T>(tokens I64, d I64, hidden I64, steps I64, whole Bool) F64 ? io.Error {
+    g mut graph.Graph<T>& = graph.Graph<T>(tokens)
+    x := g.Input(d)
+    t := g.Input(d)
+    f := layers.Feed.New(g, d, hidden, graph.Init.Normal(0.0, 0.02), true)
+    loss := g.Mse(f.Apply(g, x), t)
+    try g.Plan(rand.Rand(1), device.Backend.Gpu) catch e {
+        try io.Put("not planned on the GPU: " + $e + "\n")
+        return 0.0
+    }
+    none mut moe.Experts<T>?& = null
+    return try timed(g, loss, x, t, steps, whole, none)
+}
+
+fn mixture<T>(tokens I64, d I64, h I64, e I64, k I64, steps I64) F64 ? io.Error {
+    op := moe.Experts<T>(tokens, d, h, e, k)
+    g mut graph.Graph<T>& = graph.Graph<T>(tokens)
+    x := g.Input(d)
+    t := g.Input(d)
+    m := moe.Moe.New(g, d, h, e)
+    loss := g.Mse(m.Apply(g, op, x), t)
+    try g.Plan(rand.Rand(1), device.Backend.Gpu) catch err {
+        try io.Put("not planned on the GPU: " + $err + "\n")
+        return 0.0
+    }
+    return try timed(g, loss, x, t, steps, false, op)
+}
+
+fn row<T>(tokens I64, d I64, e I64, k I64, steps I64) ? io.Error {
+    hidden := (8 * d / 3 + 63) / 64 * 64
+    h := hidden / k
+    one := try dense<T>(tokens, d, hidden, steps, false)
+    graphed := try dense<T>(tokens, d, hidden, steps, true)
+    mix := try mixture<T>(tokens, d, h, e, k, steps)
+    try io.Put("D " + $d + ": dense hidden " + $hidden + " " + $one + " ms (" + $graphed + " as a CUDA graph); " + $e + " experts x top-" + $k + " hidden " + $h + " " + $mix + " ms: +" + $(100.0 * (mix / one - 1.0)) + " % launch by launch, +" + $(100.0 * (mix / graphed - 1.0)) + " % against the graph\n")
+}
+
+fn main() ? io.Error, ParseError {
+    args :~ os.Args()
+    tokens := try number(args, 1, 8192)
+    steps := try number(args, 2, 20)
+    kind :~ args[3] if args.Len() > 3 else "bf16"
+    e := try number(args, 4, 16)
+    k := try number(args, 5, 2)
+    dims := Vec<I64>()
+    for i in range 6, args.Len(): dims.Push(try args[i].ParseInt())
+    if dims.Len() == 0 {
+        for d in Array<I64>[384, 640, 896]: dims.Push(d)
+    }
+    if not device.GpuAvailable() {
+        try io.Put("no CUDA device\n")
+        return
+    }
+    try io.Put($tokens + " tokens, " + kind + "\n")
+    for d in dims {
+        if kind == "f32": try row<F32>(tokens, d, e, k, steps)
+        else: try row<BF16>(tokens, d, e, k, steps)
+    }
+}
