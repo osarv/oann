@@ -43,8 +43,27 @@ fn betaOf<A>(add Bool) A { return A(1.0) if add else A(0.0) }
 
 # ---- lane loops: y = a op b, dx (+)= k dy ----
 
+# Each loop is split into up to `threads` runs of the elements under one join (parts below says when a split pays);
+# every element is computed as one run would compute it, so the values are the same whatever the count.
+
 # dx = k dy, or dx += k dy where add (dx a gradient, of dy's length)
-fn Put<S, A>(dx mut Array<S>&, dy Array<S>&, k A, add Bool) {
+fn Put<S, A>(dx mut Array<S>&, dy Array<S>&, k A, add Bool, threads I64 = 1) {
+    n := dx.Len()
+    t := parts(threads, n)
+    if t == 1 {
+        putRun<S, A>(dx, dy, k, add)
+        return
+    }
+    share := (n + t - 1) / t
+    join {
+        for j in range t {
+            lo, hi := j * share, lesserOf(n, (j + 1) * share)
+            if lo < hi: spawn putRun<S, A>(dx[lo:hi], dy[lo:hi], k, add)
+        }
+    }
+}
+
+fn putRun<S, A>(dx mut Array<S>&, dy Array<S>&, k A, add Bool) {
     n := dx.Len()
     if add {
         for i in range n: dx[i] = S(A(dx[i]) + k * A(dy[i]))
@@ -54,7 +73,23 @@ fn Put<S, A>(dx mut Array<S>&, dy Array<S>&, k A, add Bool) {
 }
 
 # dx = k dy b, or dx += that where add
-fn putTimes<S, A>(dx mut Array<S>&, dy Array<S>&, b Array<S>&, k A, add Bool) {
+fn putTimes<S, A>(dx mut Array<S>&, dy Array<S>&, b Array<S>&, k A, add Bool, threads I64 = 1) {
+    n := dx.Len()
+    t := parts(threads, n)
+    if t == 1 {
+        putTimesRun<S, A>(dx, dy, b, k, add)
+        return
+    }
+    share := (n + t - 1) / t
+    join {
+        for j in range t {
+            lo, hi := j * share, lesserOf(n, (j + 1) * share)
+            if lo < hi: spawn putTimesRun<S, A>(dx[lo:hi], dy[lo:hi], b[lo:hi], k, add)
+        }
+    }
+}
+
+fn putTimesRun<S, A>(dx mut Array<S>&, dy Array<S>&, b Array<S>&, k A, add Bool) {
     n := dx.Len()
     if add {
         for i in range n: dx[i] = S(A(dx[i]) + k * A(dy[i]) * A(b[i]))
@@ -64,38 +99,64 @@ fn putTimes<S, A>(dx mut Array<S>&, dy Array<S>&, b Array<S>&, k A, add Bool) {
 }
 
 # y = a + k b: Add (k 1) and Sub (k -1)
-fn Combine<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>, k A) {
-    yd :~ flat(y)
-    ad :~ flat(a)
-    bd :~ flat(b)
+fn Combine<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>, k A, threads I64 = 1) {
+    yd, ad, bd := flat(y), flat(a), flat(b)
+    n := yd.Len()
+    t := parts(threads, n)
+    if t == 1 {
+        combineRun<S, A>(yd, ad, bd, k)
+        return
+    }
+    share := (n + t - 1) / t
+    join {
+        for j in range t {
+            lo, hi := j * share, lesserOf(n, (j + 1) * share)
+            if lo < hi: spawn combineRun<S, A>(yd[lo:hi], ad[lo:hi], bd[lo:hi], k)
+        }
+    }
+}
+
+fn combineRun<S, A>(yd mut Array<S>&, ad Array<S>&, bd Array<S>&, k A) {
     for i in range yd.Len(): yd[i] = S(A(ad[i]) + k * A(bd[i]))
 }
 
-fn CombineBackward<S, A>(dy tensor.Tensor<S>, k A, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn CombineBackward<S, A>(dy tensor.Tensor<S>, k A, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool, threads I64 = 1) {
     g :~ flat(dy)
-    if Wanted(da): Put<S, A>(flat(da), g, A(1.0), addA)
-    if Wanted(db): Put<S, A>(flat(db), g, k, addB)
+    if Wanted(da): Put<S, A>(flat(da), g, A(1.0), addA, threads)
+    if Wanted(db): Put<S, A>(flat(db), g, k, addB, threads)
 }
 
 # y = a b, element by element
-fn Mul<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>) {
-    yd :~ flat(y)
-    ad :~ flat(a)
-    bd :~ flat(b)
+fn Mul<S, A>(y mut tensor.Tensor<S>&, a tensor.Tensor<S>, b tensor.Tensor<S>, threads I64 = 1) {
+    yd, ad, bd := flat(y), flat(a), flat(b)
+    n := yd.Len()
+    t := parts(threads, n)
+    if t == 1 {
+        mulRun<S, A>(yd, ad, bd)
+        return
+    }
+    share := (n + t - 1) / t
+    join {
+        for j in range t {
+            lo, hi := j * share, lesserOf(n, (j + 1) * share)
+            if lo < hi: spawn mulRun<S, A>(yd[lo:hi], ad[lo:hi], bd[lo:hi])
+        }
+    }
+}
+
+fn mulRun<S, A>(yd mut Array<S>&, ad Array<S>&, bd Array<S>&) {
     for i in range yd.Len(): yd[i] = S(A(ad[i]) * A(bd[i]))
 }
 
-fn MulBackward<S, A>(dy tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool) {
+fn MulBackward<S, A>(dy tensor.Tensor<S>, a tensor.Tensor<S>, b tensor.Tensor<S>, da mut tensor.Tensor<S>&, addA Bool, db mut tensor.Tensor<S>&, addB Bool, threads I64 = 1) {
     g :~ flat(dy)
-    if Wanted(da): putTimes<S, A>(flat(da), g, flat(b), A(1.0), addA)
-    if Wanted(db): putTimes<S, A>(flat(db), g, flat(a), A(1.0), addB)
+    if Wanted(da): putTimes<S, A>(flat(da), g, flat(b), A(1.0), addA, threads)
+    if Wanted(db): putTimes<S, A>(flat(db), g, flat(a), A(1.0), addB, threads)
 }
 
 # y = k x
-fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A) {
-    yd :~ flat(y)
-    xd :~ flat(x)
-    for i in range yd.Len(): yd[i] = S(k * A(xd[i]))
+fn Scale<S, A>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, k A, threads I64 = 1) {
+    Put<S, A>(flat(y), flat(x), k, false, threads)
 }
 
 # ---- products ----
@@ -556,19 +617,45 @@ fn StablemaxCEBackward<S, A>(dloss A, classes Array<I32>&, logits tensor.Tensor<
 # ---- normalization ----
 
 # y = (x - mean) inv gain + bias over the last axis (rms: no mean taken out, no bias); stats keeps mean and inv, two
-# rows of the rows' count
-fn Norm<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, gain tensor.Tensor<S>, bias tensor.Tensor<S>, rms Bool, eps F64, stats mut Array<S>&) {
+# rows of the rows' count. Runs of rows over up to `threads` tasks, each row as one task would make it
+fn Norm<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, gain tensor.Tensor<S>, bias tensor.Tensor<S>, rms Bool, eps F64, stats mut Array<S>&, threads I64 = 1) {
     xm := rows(x)
     n := xm.Rows
     mean :~ stats[0:n]
     inv :~ stats[n:2 * n]
-    elem.RowNormStats(mean, inv, xm, S(eps), rms)
     ym := rows(y)
-    elem.RowNormApply(ym, xm, mean, inv, flat(gain), flat(bias) if bias.Count() > 0 else stats[0:0])
+    bs :~ flat(bias) if bias.Count() > 0 else stats[0:0]
+    t := rowParts(threads, n, xm.Cols)
+    if t == 1 {
+        elem.RowNormStats(mean, inv, xm, S(eps), rms)
+        elem.RowNormApply(ym, xm, mean, inv, flat(gain), bs)
+        return
+    }
+    share := (n + t - 1) / t
+    join {
+        for j in range t {
+            lo, hi := j * share, lesserOf(n, (j + 1) * share)
+            if lo < hi: spawn normRows<S>(band(ym.Data, ym.Off, ym.Ld, lo, hi, ym.Cols), ym.Ld, band(xm.Data, xm.Off, xm.Ld, lo, hi, xm.Cols), xm.Ld, hi - lo, xm.Cols, mean[lo:hi], inv[lo:hi], flat(gain), bs, eps, rms)
+        }
+    }
 }
 
-# dx, dgain, dbias, each written or added to
-fn NormBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, gain tensor.Tensor<S>, rms Bool, stats Array<S>&, dx mut tensor.Tensor<S>&, addX Bool, dgain mut tensor.Tensor<S>&, addG Bool, dbias mut tensor.Tensor<S>&, addB Bool) {
+# rows lo .. hi - 1 of a matrix (from off, ld apart, cols wide) as the run of its storage they lie in
+fn band<S>(d mut Array<S>&, off I64, ld I64, lo I64, hi I64, cols I64) mut Array<S>& { return d[off + lo * ld:off + (hi - 1) * ld + cols] }
+
+# a pass over the rows of a rows x cols matrix split into this many tasks
+fn rowParts(threads I64, n I64, cols I64) I64 { return parts(threads, n * cols).Min(n).Max(1) }
+
+# a task's rows of Norm: their statistics, then their values
+fn normRows<S>(yd mut Array<S>&, yld I64, xd mut Array<S>&, xld I64, n I64, cols I64, mean mut Array<S>&, inv mut Array<S>&, gain Array<S>&, bias Array<S>&, eps F64, rms Bool) {
+    xm := mat.Mat<S>(xd, 0, n, cols, xld)
+    ym := mat.Mat<S>(yd, 0, n, cols, yld)
+    elem.RowNormStats(mean, inv, xm, S(eps), rms)
+    elem.RowNormApply(ym, xm, mean, inv, gain, bias)
+}
+
+# dx, dgain, dbias, each written or added to; dx's rows over up to `threads` tasks
+fn NormBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, gain tensor.Tensor<S>, rms Bool, stats Array<S>&, dx mut tensor.Tensor<S>&, addX Bool, dgain mut tensor.Tensor<S>&, addG Bool, dbias mut tensor.Tensor<S>&, addB Bool, threads I64 = 1) {
     g := rows(dy)
     xm := rows(x)
     n := xm.Rows
@@ -576,10 +663,29 @@ fn NormBackward<S>(dy tensor.Tensor<S>, x tensor.Tensor<S>, gain tensor.Tensor<S
     inv :~ stats[n:2 * n]
     if Wanted(dx) {
         d := rows(dx)
-        elem.RowNormGrad(d, g, xm, mean, inv, flat(gain), rms, addX)
+        t := rowParts(threads, n, xm.Cols)
+        if t == 1 {
+            elem.RowNormGrad(d, g, xm, mean, inv, flat(gain), rms, addX)
+        } else {
+            share := (n + t - 1) / t
+            join {
+                for j in range t {
+                    lo, hi := j * share, lesserOf(n, (j + 1) * share)
+                    if lo < hi: spawn normGradRows<S>(band(d.Data, d.Off, d.Ld, lo, hi, d.Cols), d.Ld, band(g.Data, g.Off, g.Ld, lo, hi, g.Cols), g.Ld, band(xm.Data, xm.Off, xm.Ld, lo, hi, xm.Cols), xm.Ld, hi - lo, xm.Cols, mean[lo:hi], inv[lo:hi], flat(gain), rms, addX)
+                }
+            }
+        }
     }
     if Wanted(dgain): elem.RowNormParamGrad(flat(dgain), flat(dgain)[0:0], g, xm, mean, inv, addG)
     if Wanted(dbias): elem.RowNormParamGrad(flat(dbias)[0:0], flat(dbias), g, xm, mean, inv, addB)
+}
+
+# a task's rows of dx
+fn normGradRows<S>(dd mut Array<S>&, dld I64, gd mut Array<S>&, gld I64, xd mut Array<S>&, xld I64, n I64, cols I64, mean Array<S>&, inv Array<S>&, gain Array<S>&, rms Bool, add Bool) {
+    d := mat.Mat<S>(dd, 0, n, cols, dld)
+    g := mat.Mat<S>(gd, 0, n, cols, gld)
+    xm := mat.Mat<S>(xd, 0, n, cols, xld)
+    elem.RowNormGrad(d, g, xm, mean, inv, gain, rms, add)
 }
 
 # ---- lookups and positions ----
@@ -663,25 +769,28 @@ fn PositionsBackward<S, A>(dy tensor.Tensor<S>, ctx I64, first I64, dx mut tenso
 }
 
 # y = x rotated (Su et al.) at positions first + t of sequences of ctx
-fn Rope<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64) {
+fn Rope<S>(y mut tensor.Tensor<S>&, x tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64, threads I64 = 1) {
     try y.Convert(x) catch { unreachable }
     ym := rows(y)
-    attention.Rope(ym, first, attention.Heads(heads, y.Dim(1)), base)
+    attention.RopeOver(ym, first, attention.Heads(heads, y.Dim(1)), base, 1.0, ropeTasks(threads, ym))
 }
 
+# Rope's tasks over m: one where too small to pay a spawn
+fn ropeTasks<S>(threads I64, m mat.Mat<S>&) I64 { return rowParts(threads, m.Rows, m.Cols) }
+
 # dx (+)= dy rotated back; tmp holds dy's elements while they are rotated, where dx is added to
-fn RopeBackward<S, A>(dy tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64, dx mut tensor.Tensor<S>&, add Bool, tmp mut tensor.Tensor<S>&) {
+fn RopeBackward<S, A>(dy tensor.Tensor<S>, heads I64, ctx I64, first I64, base F64, dx mut tensor.Tensor<S>&, add Bool, tmp mut tensor.Tensor<S>&, threads I64 = 1) {
     at := attention.Heads(heads, ctx)
     if not add {
         try dx.Convert(dy) catch { unreachable }
         dm := rows(dx)
-        attention.RopeBack(dm, first, at, base)
+        attention.RopeOver(dm, first, at, base, -1.0, ropeTasks(threads, dm))
         return
     }
     try tmp.Convert(dy) catch { unreachable }
     tm := rows(tmp)
-    attention.RopeBack(tm, first, at, base)
-    Put<S, A>(flat(dx), flat(tmp), A(1.0), true)
+    attention.RopeOver(tm, first, at, base, -1.0, ropeTasks(threads, tm))
+    Put<S, A>(flat(dx), flat(tmp), A(1.0), true, threads)
 }
 
 # ---- attention ----
@@ -940,12 +1049,54 @@ fn SumLastBackward<S, A>(dy tensor.Tensor<S>, mean Bool, dx mut tensor.Tensor<S>
 
 # dst += src, element by element, both of one shape and any strides, dd being dst's storage (written where not add):
 # the backward of a view, through the view's strides over its base's gradient
-fn AddInto<S, A>(dd mut Array<S>&, dst mut tensor.Tensor<S>&, src tensor.Tensor<S>, add Bool) {
+fn AddInto<S, A>(dd mut Array<S>&, dst mut tensor.Tensor<S>&, src tensor.Tensor<S>, add Bool, threads I64 = 1) {
     if not add {
         try dst.Convert(src) catch { unreachable }
         return
     }
-    walkAdd<S, A>(dd, dst, src, 0, dst.Offset, src.Offset)
+    lead := leadingRuns(dst)
+    if lead == 0 or threads <= 1 or src.Count() < actSplitFrom {
+        walkAdd<S, A>(dd, dst, src, 0, dst.Offset, src.Offset)
+        return
+    }
+    # the leading axes' positions (one or two axes, merged) in runs: a position's elements of dst lie within one stride
+    # of the last leading axis and no other position's do, so each element is added to by one task in walkAdd's order
+    d1 := dst.Dim(1) if lead == 2 else 1
+    count := dst.Dim(0) * d1
+    step := dst.Strides[lead - 1]
+    t := threads.Min(count)
+    share := (count + t - 1) / t
+    join {
+        for j in range t {
+            lo, hi := j * share, lesserOf(count, (j + 1) * share)
+            if lo < hi: spawn addRuns<S, A>(dd[dst.Offset + lo * step:dst.Offset + hi * step], dst, src, lead, d1, lo, hi)
+        }
+    }
+}
+
+# how many leading axes of dst (0, 1 or 2) AddInto may split its work by: each has a stride other than 0, the second's
+# positions run on from the first's (stride0 = dim1 stride1), and one position's elements lie within one stride of the
+# last (the inner axes' reach is less than it)
+fn leadingRuns<S>(dst tensor.Tensor<S>&) I64 {
+    r := dst.Rank()
+    if r < 2 or dst.Strides[0] <= 0: return 0
+    lead := 2 if r >= 3 and dst.Strides[1] > 0 and dst.Strides[0] == dst.Dim(1) * dst.Strides[1] else 1
+    reach I64 = 1
+    for a in range lead, r: reach += (dst.Dim(a) - 1) * dst.Strides[a].Max(0)
+    for a in range lead, r {
+        if dst.Strides[a] < 0: return 0
+    }
+    return lead if reach <= dst.Strides[lead - 1] else 0
+}
+
+# a task's leading positions lo .. hi - 1 of AddInto, dd the run of dst's storage they reach (from position lo)
+fn addRuns<S, A>(dd mut Array<S>&, dst tensor.Tensor<S>&, src tensor.Tensor<S>&, lead I64, d1 I64, lo I64, hi I64) {
+    step := dst.Strides[lead - 1]
+    for p in range lo, hi {
+        i0, i1 := p / d1, p % d1
+        s := src.Offset + i0 * src.Strides[0] + (i1 * src.Strides[1] if lead == 2 else 0)
+        walkAdd<S, A>(dd, dst, src, lead, (p - lo) * step, s)
+    }
 }
 
 # dst's elements from axis `axis` on, plus src's - a recursion over the axes, for strides of any kind, an Expand's 0

@@ -345,12 +345,16 @@ fn rotate<T>(x mut mat.Mat<T>&, pos I64, at Heads, base F64, direction F64) {
 # the cosines and sines of a position's angles, 128 pairs at a time, computed once for every row at that position (the
 # rows are sequences of at.Ctx positions, one after another)
 fn rotateIn<S, A>(x mut mat.Mat<S>&, pos I64, at Heads, base F64, direction F64) {
+    rotateSpan<S, A>(x, pos, at, base, direction, 0, at.Ctx.Min(x.Rows))
+}
+
+# rotateIn's positions t0 .. t1 - 1: the rows t, t + Ctx, ... of each
+fn rotateSpan<S, A>(x mut mat.Mat<S>&, pos I64, at Heads, base F64, direction F64, t0 I64, t1 I64) {
     dh := x.Cols / at.Count
     half := dh / 2
     cs := Array<A>(128)
     sn := Array<A>(128)
-    ctx := at.Ctx.Min(x.Rows)
-    for t in range ctx {
+    for t in range t0, t1 {
         p := F64(pos + t)
         for c0 in range 0, half, 128 {
             w := 128 if c0 + 128 <= half else half - c0
@@ -375,6 +379,38 @@ fn rotatePairs<S, A>(x mut mat.Mat<S>&, r I64, c0 I64, half I64, w I64, cs Array
         x.Data[o + c] = S(a * cs[c] - b * sn[c])
         x.Data[o + half + c] = S(a * sn[c] + b * cs[c])
     }
+}
+
+# Rope (direction 1) or RopeBack (-1) with x's positions in runs over up to `threads` tasks, a task rotating the rows
+# of its positions (t, t + Ctx, ...) as rotateIn does - the same values whatever the count
+fn RopeOver<T>(x mut mat.Mat<T>&, pos I64, at Heads, base F64, direction F64, threads I64) {
+    match T {
+        case F64 { rotateOver<T, F64>(x, pos, at, base, direction, threads) }
+        case _ { rotateOver<T, F32>(x, pos, at, base, direction, threads) }
+    }
+}
+
+fn rotateOver<S, A>(x mut mat.Mat<S>&, pos I64, at Heads, base F64, direction F64, threads I64) {
+    ctx := at.Ctx.Min(x.Rows)
+    tasks := threads.Min(ctx).Max(1)
+    if tasks == 1 {
+        rotateIn<S, A>(x, pos, at, base, direction)
+        return
+    }
+    share := (ctx + tasks - 1) / tasks
+    join {
+        for j in range tasks {
+            lo, hi := j * share, ctx.Min((j + 1) * share)
+            if lo < hi: spawn rotateTask<S, A>(x.Data, x.Off, x.Rows, x.Cols, x.Ld, pos, at, base, direction, lo, hi)
+        }
+    }
+}
+
+# a task's positions t0 .. t1 - 1 of x (Data from off, rows x cols, ld apart); tasks share x's storage, each writing
+# only the rows of its own positions
+fn rotateTask<S, A>(xd mut Array<S>&, off I64, nrows I64, cols I64, ld I64, pos I64, at Heads, base F64, direction F64, t0 I64, t1 I64) {
+    x := mat.Mat<S>(xd, off, nrows, cols, ld)
+    rotateSpan<S, A>(x, pos, at, base, direction, t0, t1)
 }
 
 # ---- flash attention ----
