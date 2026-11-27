@@ -6,62 +6,27 @@
 # / 4. The spectrum of a frame is one matrix product: the windowed frames times the 402 rows of cos and sin of the
 # discrete Fourier transform (kernels/gemm), then the filters as another.
 #
-# Wav reads a RIFF WAVE file of 16-bit PCM (mono, or the channels averaged) at any rate, resampled to 16 kHz by linear
-# interpolation where it is not.
+# Wav reads a RIFF WAVE file (std/wav; the channels averaged) at any rate, resampled to 16 kHz by linear interpolation
+# where it is not.
 
 import "std/os"
+import "std/wav"
 import "../kernels/gemm"
 import "../kernels/mat"
-
-type AudioError error {
-    Malformed(what String)    # a file that is not the WAVE this reads
-}
 
 Rate I64 = 16000            # samples a second
 Window I64 = 400            # samples a frame (n_fft)
 Hop I64 = 160               # samples between frames
 Bins I64 = 201              # frequencies of a frame (n_fft / 2 + 1)
 
-fn u16At(b String&, i I64) I64 { return I64(U8(b[i])) | (I64(U8(b[i + 1])) << 8) }
-fn u32At(b String&, i I64) I64 { return u16At(b, i) | (u16At(b, i + 2) << 16) }
-
-# the samples of a WAVE file of 16-bit PCM, in -1 .. 1 at 16 kHz
-fn Wav(path String&) Array<F32> ? AudioError, os.Error {
-    b :~ try os.ReadFile(path)
-    if b.Len() < 12 or b[0:4] != "RIFF" or b[8:12] != "WAVE": error AudioError.Malformed(path + " is not a RIFF WAVE file")
-    channels I64 = 0
-    rate I64 = 0
-    at I64 = 12
-    for at + 8 <= b.Len() {
-        id :~ b[at:at + 4]
-        n := u32At(b, at + 4)
-        body := at + 8
-        if id == "fmt " {
-            if u16At(b, body) != 1 or u16At(b, body + 14) != 16: error AudioError.Malformed(path + " is not 16-bit PCM")
-            channels = u16At(b, body + 2)
-            rate = u32At(b, body + 4)
-        } else if id == "data" {
-            if channels == 0: error AudioError.Malformed(path + ": data before fmt")
-            n = n.Min(b.Len() - body)
-            return Resample(pcm(b, body, n / (2 * channels), channels), rate)
-        }
-        at = body + n + n % 2
-    }
-    error AudioError.Malformed(path + " has no data")
+fn u32At(b String&, i I64) I64 {
+    return I64(U8(b[i])) | (I64(U8(b[i + 1])) << 8) | (I64(U8(b[i + 2])) << 16) | (I64(U8(b[i + 3])) << 24)
 }
 
-# frames of 16-bit samples from byte at, the channels averaged
-fn pcm(b String&, at I64, frames I64, channels I64) Array<F32> {
-    out := Array<F32>(frames)
-    for i in range frames {
-        s I64 = 0
-        for c in range channels {
-            v := u16At(b, at + 2 * (i * channels + c))
-            s += v - 65536 if v >= 32768 else v
-        }
-        out[i] = F32(F64(s) / F64(channels) / 32768.0)
-    }
-    return out
+# the samples of a WAVE file, mono in -1 .. 1 at 16 kHz
+fn Wav(path String&) Array<F32> ? wav.Error, os.Error {
+    sound := try wav.Sound.Read(path)
+    return Resample(sound.Mono(), sound.Rate)
 }
 
 # x at rate, linearly interpolated to 16 kHz

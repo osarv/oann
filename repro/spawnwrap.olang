@@ -1,0 +1,48 @@
+# spawnwrap: a struct value built in a function (wrap<L>(a), its field a struct holding a reference) and passed by
+# value to tasks under a join is given back twice - the caller's __olang_region_release after the join drops a region
+# already let go of, a segmentation fault (SEGV READ in __olang_region_drop under -race). Expected: prints
+# "499500 499500". Passes with -free late, and when work is called without spawn; found by kernels/gemm.olang's
+# GemmLeft test (foreign<L>(a) passed to packedProduct's tasks) at 4 threads.
+# Status: reproduces (olang 8e7038d, 2026-11-27): `olang spawnwrap.olang` ends by SIGSEGV
+type mat struct(n I64) {
+    Data mut Array<F64>& = Array<F64>(n)
+}
+
+type inner struct(m mat&) {
+    m
+}
+
+fn (x inner&) Sum() F64 {
+    s F64 = 0
+    for i in range x.m.Data.Len(): s = s + x.m.Data[i]
+    return s
+}
+
+type wrap<L> struct(x L) {
+    x
+}
+
+fn (w wrap<L>&) sum() F64 { return w.x.Sum() }
+
+fn work<S>(s S, t I64, out mut Array<F64>&) {
+    out[t] = s.sum()
+}
+
+fn run<S>(s S, out mut Array<F64>&) {
+    join {
+        for t in range 4: spawn work(s, t, out)
+    }
+}
+
+fn outer<L>(a L, out mut Array<F64>&) {
+    w := wrap<L>(a)
+    run(w, out)
+}
+
+fn main() {
+    a := mat(1000)
+    for i in range 1000: a.Data[i] = F64(i)
+    out := Array<F64>(4)
+    outer(inner(a), out)
+    Print($out[0] + " " + $out[3] + "\n")
+}
