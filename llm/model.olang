@@ -89,7 +89,9 @@ type Config struct() {
     PostNorms Bool = false  # each branch's output normed before it is added (Gemma's post_attention and post_feedforward)
     NormPlus F32 = 0.0      # added to every norm weight as it is read (Gemma's 1 + w)
     ThetaLocal F64 = 0.0    # the sliding-window layers' rope theta, unscaled (Gemma's rope_local_base_freq); 0: Theta
-    FreqDiv mut Array<F64>& = Array<F64>(0)     # each rotary frequency divided by its factor (a GGUF's rope_freqs); empty: none
+    FreqDiv mut Array<F64>& = Array<F64>(0)     # each rotary frequency divided by its factor (a GGUF's rope_freqs, longrope's short_factor); empty: none
+    FreqLong mut Array<F64>& = Array<F64>(0)    # longrope's long_factor: the divisors at positions from RopeOld on; empty: FreqDiv's
+    Rot I64 = 0             # the dimensions of a head rotated, its first (partial_rotary_factor: Phi's 96 of 128); 0: all
     ImageToken I64 = -1     # a vision-language model's (llm/vision): the token standing for an image's embedded patches,
     ImageTokens I64 = 0     # how many of them an image is,
     ImageStart I64 = -1     # and the tokens around them
@@ -108,7 +110,10 @@ fn (c Config&) LocalFreqs() Array<F64> {
 fn (c Config&) MoeAt(li I64) Bool { return c.Moe.Len() > 0 and c.Moe[li] }
 
 # the architectures run
-Archs Array<String>& = ["qwen2", "qwen3", "llama", "mistral", "granite", "smollm3", "qwen3_moe", "granitemoe", "olmoe", "gemma3_text"]
+Archs Array<String>& = ["qwen2", "qwen3", "llama", "mistral", "granite", "smollm3", "qwen3_moe", "granitemoe", "olmoe", "gemma3_text", "phi3"]
+
+# half the dimensions of a head rotated: the pairs i and i + RotHalf
+fn (c Config&) RotHalf() I64 { return (c.Rot if c.Rot > 0 else c.HeadDim) / 2 }
 
 # layer li's rows attend to the positions after pos - window (0 every position)
 fn (c Config&) WindowOf(li I64) I64 { return c.Window[li] if c.Window.Len() > 0 else 0 }
@@ -124,9 +129,9 @@ fn (c Config&) turnDim(turns F64) F64 { return F64(c.HeadDim) * (F64(c.RopeOld) 
 
 # the rotary frequencies of the pairs of a head's dimensions (i and i + HeadDim / 2), scaled as rope_scaling says
 # (linear scaling is PosScale's, applied to the positions)
-fn (c Config&) Freqs() Array<F64> {
-    half := c.HeadDim / 2
-    f := Array<F64>[c.Theta.Pow(-2.0 * F64(i) / F64(c.HeadDim)) for i in range half]
+fn (c Config&) Freqs(long Bool = false) Array<F64> {
+    half := c.RotHalf()
+    f := Array<F64>[c.Theta.Pow(-2.0 * F64(i) / F64(2 * half)) for i in range half]
     if c.Rope == "llama3" {
         # Llama 3.1's: long wavelengths divided by the factor, short ones kept, those between blended
         lowWave := F64(c.RopeOld) / c.RopeLow
@@ -153,10 +158,17 @@ fn (c Config&) Freqs() Array<F64> {
             f[i] = f[i] / c.RopeFactor * ramp + f[i] * (1.0 - ramp)
         }
     }
-    if c.FreqDiv.Len() == half {
-        for i in range half: f[i] = f[i] / c.FreqDiv[i]
+    div :~ c.FreqLong if long and c.FreqLong.Len() == half else c.FreqDiv
+    if div.Len() == half {
+        for i in range half: f[i] = f[i] / div[i]
     }
     return f
+}
+
+# a list of numbers in j at key
+fn factors(j json.Json&, key String&) Array<F64> ? ModelError {
+    xs :~ try (try j[key] catch { error ModelError.Malformed(key) }).AsArr() catch { error ModelError.Malformed(key) }
+    return Array<F64>[try x.AsNum() catch { error ModelError.Malformed(key) } for x in xs]
 }
 
 fn intOr(j json.Json&, key String&, d I64) I64 {
@@ -240,11 +252,21 @@ fn Config.Parse(text String&) Config ? ModelError {
                 c.RopeLow = numOr(rs, "beta_slow", 1.0)
                 c.RopeHigh = numOr(rs, "beta_fast", 32.0)
                 c.RopeAttn = numOr(rs, "attention_factor", 0.1 * c.RopeFactor.Log() + 1.0 if c.RopeFactor > 1.0 else 1.0)
+            } else if kind == "longrope" {
+                # Phi's: each frequency divided by short_factor's divisor, by long_factor's at positions from the
+                # original context on (as vLLM switches per position), cos and sin scaled by sqrt(1 + ln f / ln old)
+                c.Rope = kind
+                c.FreqDiv ~ try factors(rs, "short_factor")
+                c.FreqLong ~ try factors(rs, "long_factor")
+                f := F64(c.MaxPos) / F64(c.RopeOld)
+                c.RopeAttn = numOr(rs, "attention_factor", (1.0 + f.Log() / F64(c.RopeOld).Log()).Sqrt() if f > 1.0 else 1.0)
             } else if kind != "default" {
                 error ModelError.Unsupported("rope_scaling " + kind)
             }
         }
     }
+    partial := numOr(j, "partial_rotary_factor", 1.0)
+    if partial < 1.0: c.Rot = I64(F64(c.HeadDim) * partial)
     if c.Arch == "gemma3_text" {
         c.Gelu = true
         c.PostNorms = true
@@ -713,9 +735,14 @@ fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false
     for i in range c.Layers {
         p := "model.layers." + $i + "."
         l := m.Layers[i]
-        try w.fill(l.Qkv, p + "self_attn.q_proj.weight", 0, q)
-        try w.fill(l.Qkv, p + "self_attn.k_proj.weight", q, kv)
-        try w.fill(l.Qkv, p + "self_attn.v_proj.weight", q + kv, kv)
+        # Phi's projections stored fused: qkv_proj (queries, keys, values) and gate_up_proj (gate, up), as oann holds them
+        if w.Has(p + "self_attn.qkv_proj.weight") {
+            try w.fill(l.Qkv, p + "self_attn.qkv_proj.weight", 0, q + 2 * kv)
+        } else {
+            try w.fill(l.Qkv, p + "self_attn.q_proj.weight", 0, q)
+            try w.fill(l.Qkv, p + "self_attn.k_proj.weight", q, kv)
+            try w.fill(l.Qkv, p + "self_attn.v_proj.weight", q + kv, kv)
+        }
         if c.Bias {
             try w.vector(l.Qkv.Bias, p + "self_attn.q_proj.bias", 0, q)
             try w.vector(l.Qkv.Bias, p + "self_attn.k_proj.bias", q, kv)
@@ -724,6 +751,9 @@ fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false
         try w.fill(l.O, p + "self_attn.o_proj.weight", 0, c.Dim)
         if c.MoeAt(i) {
             try loadExperts(w, l, c, p)
+        } else if w.Has(p + "mlp.gate_up_proj.weight") {
+            try w.fill(l.GateUp, p + "mlp.gate_up_proj.weight", 0, 2 * c.Ffn)
+            try w.fill(l.Down, p + "mlp.down_proj.weight", 0, c.Dim)
         } else {
             try w.fill(l.GateUp, p + "mlp.gate_proj.weight", 0, c.Ffn)
             try w.fill(l.GateUp, p + "mlp.up_proj.weight", c.Ffn, c.Ffn)
@@ -904,6 +934,7 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     cos mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2)
     sin mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2)
     freq Array<F64>& = m.C.Freqs()
+    longFreq Array<F64>& = m.C.Freqs(true)
     lcos mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2 if m.C.ThetaLocal > 0.0 else 0)   # the local layers' rotation
     lsin mut Array<F32>& = Array<F32>(Rows * m.C.HeadDim / 2 if m.C.ThetaLocal > 0.0 else 0)
     lfreq Array<F64>& = m.C.LocalFreqs()
@@ -1211,11 +1242,12 @@ type tile4 struct() {
 
 # the rotation of each row's position: cos and sin of position x freq[i]
 fn (m Model&) angles(s mut State&) {
-    half := m.C.HeadDim / 2
+    half := m.C.RotHalf()
     for r in range s.N {
         p := F64(s.Pos[r]) / m.C.PosScale
+        long := m.C.FreqLong.Len() > 0 and s.Pos[r] >= m.C.RopeOld
         for i in range half {
-            a := p * s.freq[i]
+            a := p * (s.longFreq[i] if long else s.freq[i])
             s.cos[r * half + i] = F32(a.Cos() * m.C.RopeAttn)
             s.sin[r * half + i] = F32(a.Sin() * m.C.RopeAttn)
         }
@@ -1518,7 +1550,7 @@ fn headsOf(c Config&, l Layer&, qkv mut Array<F32>&, cos Array<F32>&, sin Array<
         for hh in range c.Heads + c.KvHeads {
             ho := o + hh * hd
             if c.QkNorm and not c.QkWide: rmsNorm(qkv, ho, qkv, ho, 1, hd, hd, l.QNorm if hh < c.Heads else l.KNorm, c.Eps)
-            if c.Rotates(li): rotate(qkv, ho, cos, sin, r, hd / 2)
+            if c.Rotates(li): rotate(qkv, ho, cos, sin, r, c.RotHalf())
         }
         store(c, qkv, pos, slot, k, li, r)
     }
@@ -2131,7 +2163,7 @@ test Model "matches the reference implementation on Qwen3-0.6B and DeepSeek-R1-D
 
 # llm/tools/reference.py's small models (Hugging Face transformers, F32): the logits of every position of 150 tokens
 test Model "matches transformers on small models of each architecture and option, where $OANN_MODELS has them (llm/tools/reference.py)" {
-    for name in ["llama3", "yarn", "granite", "smollm3", "mistral", "qwen3moe", "granitemoe", "olmoe", "gemma3"] {
+    for name in ["llama3", "yarn", "granite", "smollm3", "mistral", "qwen3moe", "granitemoe", "olmoe", "gemma3", "phi3"] {
         dir := reference("oann-tiny-" + name)
         if dir.Len() == 0 or not os.Exists(dir + "/ref.json"): continue
         j :~ json.Json.Parse(os.ReadFile(dir + "/ref.json")!)!

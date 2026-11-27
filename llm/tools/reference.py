@@ -1,5 +1,5 @@
 # The reference llm/model's architectures are held to: small models of random weights of each architecture and option
-# (Llama 3's and YaRN's rope scaling, Granite's multipliers, SmolLM3's layers without rotation, Mistral's sliding
+# (Llama 3's, YaRN's and Phi's longrope rope scaling, Phi's partial rotation, Granite's multipliers, SmolLM3's layers without rotation, Mistral's sliding
 # window, Gemma 3's sliding and full layers, the mixtures of experts of Qwen3-MoE (a dense layer among them), Granite-MoE and OLMoE), built and run by Hugging Face transformers in F32 on the CPU. Each is saved as a checkpoint under
 # $OANN_MODELS/oann-tiny-NAME with ref.json: the token ids read and the logits of every position.
 #     python3 llm/tools/reference.py        (pip install torch transformers safetensors)
@@ -26,6 +26,12 @@ cases = {
     "gemma3": ("gemma3_text", dict(sliding_window=50, layer_types=["sliding_attention", "sliding_attention",
                                    "full_attention", "sliding_attention"], rope_local_base_freq=1000.0,
                                    query_pre_attn_scalar=24, rope_theta=100000.0)),
+    # Phi-4's: a quarter of each head unrotated, longrope's short factors (150 positions, within the original 256),
+    # queries, keys and values and the gate and up stored fused
+    "phi3": ("phi3", dict(hidden_size=128, partial_rotary_factor=0.75, original_max_position_embeddings=256,
+                          rope_scaling=dict(type="longrope", short_factor=[1.0 + 0.25 * i for i in range(12)],
+                                            long_factor=[2.0 + 0.5 * i for i in range(12)]),
+                          pad_token_id=0, bos_token_id=1, eos_token_id=2, tie_word_embeddings=True)),
     "olmoe": ("olmoe", dict(hidden_size=128, num_experts=8, num_experts_per_tok=2, norm_topk_prob=False, pad_token_id=0, eos_token_id=1,
                             bos_token_id=None)),
 }

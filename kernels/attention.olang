@@ -439,6 +439,11 @@ type Flash<A> struct(threads I64) {
     buf mut Array<A>& = Array<A>(0)
     half mut Array<BF16>& = Array<BF16>(0)        # a task's weights and their gradient rounded to BF16 (BF16 storage)
     ws mut Vec<mut gemm.Workspace<A>&>& = Vec<mut gemm.Workspace<A>&>()
+    # a task's key blocks (K^T, Dh x flashCols) and value blocks (flashCols x Dh) packed once a head for the tile path
+    # (BF16 storage), blocks of them a task: each query block then reuses them instead of packing them again
+    blocks I64 = 0
+    keys mut Vec<gemm.TilePacked>& = Vec<gemm.TilePacked>()
+    vals mut Vec<gemm.TilePacked>& = Vec<gemm.TilePacked>()
 }
 
 # room for sequences of up to ctx positions in heads of up to dh columns; never shrinks
@@ -450,6 +455,13 @@ fn (f mut Flash<A>&) Reserve(ctx I64, dh I64) {
     f.half ~ Array<BF16>(f.Threads * 2 * flashRows * flashCols)
     for f.ws.Len() < f.Threads: f.ws.Push(gemm.Workspace<A>(1))
     for w in f.ws: w.Reserve(flashRows.Max(flashCols).Max(f.Dh))
+    f.blocks = f.Ctx / flashCols
+    f.keys ~ Vec<gemm.TilePacked>()
+    f.vals ~ Vec<gemm.TilePacked>()
+    for _ in range f.Threads * f.blocks {
+        f.keys.Push(gemm.TilePacked(f.Dh, flashCols))
+        f.vals.Push(gemm.TilePacked(flashCols, f.Dh))
+    }
 }
 
 fn Flash<A>.For(threads I64, ctx I64, dh I64) Flash<A> {
@@ -482,7 +494,7 @@ fn (j flashJob<S, A>&) run(e0 I64, e1 I64, t I64) {
     hs :~ j.f.half[t * 2 * flashRows * flashCols:(t + 1) * 2 * flashRows * flashCols]
     ws :~ j.f.ws[t]
     for e in range e0, e1 {
-        if j.backward { flashBack<S, A>(j, ws, sc, hs, e) } else { flashFore<S, A>(j, ws, sc, hs, e) }
+        if j.backward { flashBack<S, A>(j, ws, sc, hs, e) } else { flashFore<S, A>(j, ws, sc, hs, e, t) }
     }
 }
 
@@ -533,7 +545,7 @@ fn flashReach(causal Bool, i I64, j0 I64, bc I64) I64 {
 }
 
 # matrix e's attention, block by block: out's rows of its head, and lse[e Ctx + i] for each of its rows
-fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>&, hs mut Array<BF16>&, e I64) {
+fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>&, hs mut Array<BF16>&, e I64, t I64) {
     at := j.at
     ctx := at.Ctx
     dh := j.q.Cols / at.Count
@@ -542,6 +554,15 @@ fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
     so, oo, mo, lo := 0, 2 * flashRows * flashCols, 2 * flashRows * flashCols + flashRows * dh, 2 * flashRows * flashCols + flashRows * dh + flashRows
     qi, kj, vj := block(j.q, 0, 0, 0, dh), block(j.k, 0, 0, 0, dh), block(j.v, 0, 0, 0, dh)
     om, sm, hm := mat.Mat<A>(sc, oo, 0, dh, dh), mat.Mat<A>(sc, so, 0, 0, flashCols), mat.Mat<BF16>(hs, 0, 0, 0, flashCols)
+    # the head's whole key and value blocks packed once (BF16 storage, heads of the width the packs were made for)
+    base, whole := t * j.f.blocks, ctx / flashCols
+    packs := halved(S(0.0)) and whole <= j.f.blocks and dh == j.f.Dh
+    for b in range whole if packs else 0 {
+        moved(kj, j.k.Off, r0 + b * flashCols, c0, flashCols, dh)
+        moved(vj, j.v.Off, r0 + b * flashCols, c0, flashCols, dh)
+        ws.RepackTiles(j.f.keys.RefMut(base + b), kj, true)
+        ws.RepackTiles(j.f.vals.RefMut(base + b), vj, false)
+    }
     for i0 in range 0, ctx, flashRows {
         br := flashRows.Min(ctx - i0)
         for r in range br {
@@ -557,11 +578,14 @@ fn flashFore<S, A>(j flashJob<S, A>&, ws mut gemm.Workspace<A>&, sc mut Array<A>
             moved(kj, j.k.Off, r0 + j0, c0, bc, dh)
             moved(vj, j.v.Off, r0 + j0, c0, bc, dh)
             sm.Rows, sm.Cols = br, bc
-            gemm.Gemm(ws, sm, qi, false, kj, true, scale, 0.0)
+            reuse := packs and bc == flashCols and j0 % flashCols == 0
+            if reuse: gemm.GemmTilePacked(ws, sm, qi, kj, true, j.f.keys[base + j0 / flashCols], scale, 0.0)
+            else: gemm.Gemm(ws, sm, qi, false, kj, true, scale, 0.0)
             for r in range br: flashFold(sc, so + r * flashCols, bc, (low(at, j.starts, r0 + i0 + r, i0 + r) - j0).Max(0), flashReach(at.Causal, i0 + r, j0, bc), mo + r, lo + r, oo + r * dh, dh)
             if halved(S(0.0)) {
                 rounded(hm, sc, so, br, bc)
-                gemm.Gemm(ws, om, hm, false, vj, false, 1.0, 1.0)
+                if reuse: gemm.GemmTilePacked(ws, om, hm, vj, false, j.f.vals[base + j0 / flashCols], 1.0, 1.0)
+                else: gemm.Gemm(ws, om, hm, false, vj, false, 1.0, 1.0)
             } else { gemm.Gemm(ws, om, sm, false, vj, false, 1.0, 1.0) }
         }
         for r in range br {
@@ -1086,6 +1110,37 @@ test FlashAttention "equals Attention, causal and not, a context not a multiple 
     want, _ := reference(q64, k64, v64, seqs, ctx, heads, dim, true)
     for i in range n * dim: assert (F64(o32[i]) - want[i]).Abs() < 1e-5, "F32 at " + $i
 }
+test FlashAttention "BF16 storage: the reference's within BF16's rounding, causal and not; the key and value blocks packed once a head give what packing them per product gives, bit for bit" {
+    r := rand.Rand(23)
+    seqs, ctx, heads, dim := 2, 300, 2, 64
+    n := seqs * ctx
+    dh := dim / heads
+    q, k, v := Array<BF16>(n * dim), Array<BF16>(n * dim), Array<BF16>(n * dim)
+    fill(q, r, 1.0)
+    fill(k, r, 1.0)
+    fill(v, r, 1.0)
+    q64 := Array<F64>[F64(x) for x in q]
+    k64 := Array<F64>[F64(x) for x in k]
+    v64 := Array<F64>[F64(x) for x in v]
+    for causal in Array<Bool>[true, false] {
+        at := Heads(heads, ctx, causal)
+        want, _ := reference(q64, k64, v64, seqs, ctx, heads, dim, causal)
+        outs := Vec<Array<BF16>>()
+        for wide in Array<I64>[0, 16] {
+            # a Flash made for wider heads packs nothing: every product packs its own blocks
+            f := Flash<F32>.For(3, ctx, dh + wide)
+            o := Array<BF16>(n * dim)
+            lse := Array<F32>(n * heads)
+            FlashAttention<BF16, F32>(f, mat.Mat<BF16>(o, 0, n, dim, dim), mat.Mat<BF16>(q, 0, n, dim, dim), mat.Mat<BF16>(k, 0, n, dim, dim), mat.Mat<BF16>(v, 0, n, dim, dim), lse, at)
+            outs.Push(o)
+        }
+        for i in range n * dim {
+            assert (F64(outs[0][i]) - want[i]).Abs() < 3e-2 * (1.0 + want[i].Abs()), "BF16 at " + $i
+            assert F32(outs[0][i]) == F32(outs[1][i]), "packed once against per product at " + $i
+        }
+    }
+}
+
 test FlashAttention "a sliding window (1, 50, 128, 200 over 300 positions): the band's reference, equal to Attention's; gradients equal AttentionGrad's; decoding steps agree" {
     r := rand.Rand(23)
     seqs, ctx, heads, dim := 2, 300, 2, 32

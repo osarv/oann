@@ -1,7 +1,7 @@
 # llm
 
 Inference for openly licensed decoder-only language models on the CPU: Hugging Face checkpoints of the Qwen2, Qwen3,
-Llama (Llama 3, SmolLM2), Mistral, Granite, SmolLM3 and Gemma 3 architectures and the mixtures of experts of Qwen3-MoE,
+Llama (Llama 3, SmolLM2), Mistral, Granite, SmolLM3, Phi-3/Phi-4 and Gemma 3 architectures and the mixtures of experts of Qwen3-MoE,
 Granite-MoE and OLMoE loaded as they are published, run in batches on AMX tiles, and `oann-gen`, a command that writes
 completions of a file of prompts as one long, resumable job. Nothing here trains; the weights are never committed.
 
@@ -10,7 +10,7 @@ completions of a file of prompts as one long, resumable job. Nothing here trains
 | `model.olang` | `Config` (config.json), `Model.Load` (safetensors, one file or the shards of an index; BF16, F16 or F32 stored), `Step` (any rows of any sequences through every layer), `Cache` (the paged key-value cache), `State` (a step's rows and buffers) |
 | `gguf.olang` | GGUF files (llama.cpp's): the header and metadata, rows of a tensor widened to F32 (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K), the metadata as the config.json and tokenizer.json the rest reads; `Model.Load` and `oann-gen` take a `.gguf` path in place of a directory (llama, qwen2, qwen3, qwen3moe, granite, granitemoe, olmoe, smollm3; not Gemma) |
 | `vision.olang` | `Vision`, Gemma 3's SigLIP encoder and projector (`Load` from the checkpoint's `vision_tower` and `multi_modal_projector`, `Embed`: an image's 256 embeddings for the language model), `Pixels` (the processor's resize, PIL's bilinear bit for bit, and scaling), `ReadRgb` (a PNG or JPEG file by std/imgdecode), `ImageText` (a prompt's image tokens) |
-| `bpe.olang` | `Bpe`, Hugging Face's BPE (tokenizer.json), byte-level or SentencePiece's (Gemma: "▁" for spaces, byte fallback): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's or GPT-2's, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
+| `bpe.olang` | `Bpe`, Hugging Face's BPE (tokenizer.json), byte-level or SentencePiece's (Gemma: "▁" for spaces, byte fallback): the added tokens, the pre-tokenizer's pattern (Qwen2's, Llama 3's, GPT-2's or GPT-4o's o200k, digits split first or not) over Unicode classes (`unicode.olang`), the merges by rank, `ignore_merges` |
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
 | `chat.olang` | `Chat`: the model's own chat template run by `jinja.olang` (`Render`: messages, tool schemas, tool calls; `Prompt`: one user turn), with hard-coded ChatML, DeepSeek-R1, Llama 3, Granite and Gemma prompts where a directory has no template; stop tokens and sampling defaults; `Fetch` from Hugging Face |
 | `jinja.olang` | `Template`: the Jinja2 subset Hugging Face chat templates are written in, parsed once and rendered with a context of `Val`s, as transformers' environment renders them |
@@ -186,6 +186,14 @@ each type; the tests hold the rows to 1e-5 and the model, on both paths, to a me
 largest and the same five greedy tokens (Qwen3-0.6B in Q8_0, Q4_0 with Q4_1 and Q6_K, Q4_K_M, Q5_K_M; Llama-3.2-1B in
 Q4_K_M).
 
+Phi-4-mini (phi3: queries, keys and values and the gate and up stored fused, a quarter of each head unrotated, its
+o200k tokenizer, longrope) against transformers in F32 on "The capital of France is": the AMX path's last logits within
+0.1 of transformers' (mean 0.011, largest 38.9) and the same ten greedy tokens; with `--int4` a mean difference of 1.5
+and the first two tokens the same. The tokenizer is held to the library's ids like the others, and a small random phi3
+model (`reference.py`) to every position's logits. Longrope divides each frequency by short_factor below the original
+context (4096) and by long_factor from there on, per position as vLLM does; transformers instead switches every
+position once a sequence passes 4096, so past that point the two differ and only vLLM's form is a fixed rule.
+
 `llm/tools/visionref.py` draws a test image and writes what Hugging Face's Gemma 3 processor and model make of it: the
 processor's pixels, the vision tower's embeddings (F32) and the language model's logits after the image (BF16). The
 tests hold `Pixels` to the processor's bit for bit, the embeddings within 2%, the prompt's logits within 5% on the
@@ -234,6 +242,8 @@ fast; past 16 rows a step widens the weights, and a batch of 64 runs at about 0.
 | granite-3.3-2b-instruct | BF16, 4.8 GB | 3.7 | 58 | 132 | 6.6 GB |
 | granite-3.3-2b-instruct | INT8, 2.8 GB | 2.8 | 40 | 108 | 4.6 GB |
 | granite-3.3-2b-instruct | INT4, 1.8 GB | 8.3 | 35 | 85 | 3.6 GB |
+| Phi-4-mini-instruct (3.8B, context 512) | BF16, 7.3 GB | 3.3 | 45 | 95 | 12.5 GB (batch 64) |
+| Phi-4-mini-instruct (3.8B, context 512) | INT4 | 5.8 | 26 | | 4.9 GB (batch 16) |
 
 The 4 bits cost accuracy: against transformers in F32 the mean logit difference is about 2.5% of the largest logit for
 Llama 3.2 1B and Granite 3.3 2B (8% for SmolLM2-135M), and greedy answers stay the same, but near ties can turn
@@ -269,7 +279,7 @@ A prompt is read in the same steps, each of its positions a row with attention o
 hundreds of tokens, not of many thousands.
 
 Gemma 3's vision encoder takes about 15 s an image on the same machine (`make visionbench`): 27 layers over 4096
-patches, the products about 2.6 s, attention about 12 s (flash attention, BF16 on AMX tiles, 16 heads of 72 over the
+patches, the products about 2.6 s, attention about 11.8 s (flash attention, BF16 on AMX tiles, 16 heads of 72 over the
 4096 patches, no scores kept); the language model then reads the 256 image tokens as any prompt's.
 
 ## Models and licences
@@ -289,6 +299,8 @@ architectures known to run, and their licences (each model's own LICENSE file is
 | Qwen/Qwen3-30B-A3B | qwen3_moe | Apache 2.0 (61 GB in BF16: does not fit a 16 GB machine yet) |
 | mistralai/Mistral-7B-Instruct-v0.3 | mistral | Apache 2.0 (its tokenizer is SentencePiece's: not read yet) |
 | Qwen/Qwen3-0.6B, Qwen3-1.7B, Qwen3-4B, Qwen3-8B | qwen3 | Apache 2.0 |
+| microsoft/Phi-4-mini-instruct | phi3 | MIT |
+| google/gemma-3-4b-it, 12b-it, 27b-it (ungated copies: unsloth/...), with images | gemma3 (llm/vision) | Gemma Terms of Use |
 | deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B, DeepSeek-R1-Distill-Qwen-7B | qwen2 | MIT (built from Qwen2.5, Apache 2.0) |
 | Qwen/Qwen2.5-0.5B-Instruct ... 7B-Instruct | qwen2 | Apache 2.0 |
 

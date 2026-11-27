@@ -40,6 +40,7 @@ type Pre enum {
     Qwen2
     Llama3
     Gpt2
+    O200k       # GPT-4o's (Phi-4): words by letter case, a contraction only after a word, digits up to 3
 }
 
 type Bpe struct(Size I64, starts Array<I64>&, bytes Array<Char>&, byteId Array<I32>&, table Array<I64>&, mergeTo Array<I32>&
@@ -322,6 +323,7 @@ fn readPre(t mut Bpe&, doc json.Json&) {
             pat :~ try (try (try x["pattern"] catch { continue })["Regex"] catch { continue }).AsStr() catch { continue }
             split = true
             t.Split = Pre.Llama3 if (try pat.Find("\\p{N}{1,3}") catch default -1) >= 0 else Pre.Qwen2
+            if (try pat.Find("\\p{Lu}") catch default -1) >= 0: t.Split = Pre.O200k
         } else if kind == "ByteLevel" and not split {
             if try (try x["use_regex"] catch { continue }).AsBool() catch default true: t.Split = Pre.Gpt2
         }
@@ -445,7 +447,121 @@ fn ChunkEndOf(t String&, i I64, p Pre) I64 {
         case Pre.Qwen2: ChunkEnd(t, i)
         case Pre.Llama3: ChunkEnd(t, i, 3)
         case Pre.Gpt2: gpt2End(t, i)
+        case Pre.O200k: o200kEnd(t, i)
     }
+}
+
+# the code point at t[i]'s case for o200k's pattern, and its length: 1 capital-like ([\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]),
+# 2 small-like ([\p{Ll}\p{Lm}\p{Lo}\p{M}]), 3 both, 0 neither
+fn caseAt(t String&, i I64) I64, I64 {
+    if i >= t.Len(): return 0, 0
+    c, w := pointAt(t, i)
+    if c < 0x80 {
+        if c >= 0x61 and c <= 0x7A: return 2, w
+        return (1 if c >= 0x41 and c <= 0x5A else 0), w
+    }
+    if c == 0xFFFFFFFF: return 0, w
+    if inRanges(unicode.Marks, c): return 3, w
+    if not inRanges(unicode.Letters, c): return 0, w
+    if inRanges(unicode.Lower, c): return 2, w
+    return (1 if inRanges(unicode.Upper, c) else 3), w
+}
+
+# the end of the run from i of code points whose case has bit b
+fn caseEnd(t String&, i I64, b I64) I64 {
+    j I64 = i
+    for j < t.Len() {
+        k, w := caseAt(t, j)
+        if k & b == 0: break
+        j += w
+    }
+    return j
+}
+
+# o200k's word from s, -1 where none: capital-likes then small-likes (U*L+, the capitals backed off until the smalls
+# match), else capitals alone (U+L*, where U*L+ found no small); then a contraction
+fn o200kWord(t String&, s I64) I64 {
+    starts := Vec<I64>()
+    a I64 = s
+    for a < t.Len() {
+        k, w := caseAt(t, a)
+        if k & 1 == 0: break
+        starts.Push(a)
+        a += w
+    }
+    starts.Push(a)
+    for y in range starts.Len() {
+        at := starts[starts.Len() - 1 - y]
+        k, _ := caseAt(t, at)
+        if k & 2 != 0: return contraction(t, caseEnd(t, at, 2))
+    }
+    if a == s: return -1
+    return contraction(t, caseEnd(t, a, 2))
+}
+
+# e past (?i:'s|'t|'re|'ve|'m|'ll|'d) where one follows
+fn contraction(t String&, e I64) I64 {
+    if e + 1 >= t.Len() or t[e] != '\'': return e
+    d := lower(t[e + 1])
+    if d == 's' or d == 't' or d == 'm' or d == 'd': return e + 2
+    if e + 2 >= t.Len(): return e
+    f := lower(t[e + 2])
+    if (d == 'r' and f == 'e') or (d == 'v' and f == 'e') or (d == 'l' and f == 'l'): return e + 3
+    return e
+}
+
+# where the chunk starting at t[i] ends by o200k's pattern: the alternatives tried in its order
+fn o200kEnd(t String&, i I64) I64 {
+    n := t.Len()
+    c := t[i]
+    k, w := kindAt(t, i)
+    # [^\r\n\p{L}\p{N}]? before either word form, tried with it first
+    prefix := k != kindLetter and k != kindNumber and not newline(c)
+    if prefix {
+        e := o200kWord(t, i + w)
+        if e > i + w: return e
+    }
+    e0 := o200kWord(t, i)
+    if e0 > i: return e0
+    # \p{N}{1,3}
+    if k == kindNumber {
+        e := i + w
+        for _ in range 2 {
+            ke, we := kindAt(t, e)
+            if ke != kindNumber: break
+            e += we
+        }
+        return e
+    }
+    #  ?[^\s\p{L}\p{N}]+[\r\n/]*
+    j I64 = -1
+    if k == kindOther {
+        j = i
+    } else if c == ' ' {
+        k2, _ := kindAt(t, i + 1)
+        if k2 == kindOther: j = i + 1
+    }
+    if j >= 0 {
+        e := runEnd(t, j, kindOther)
+        for e < n and (newline(t[e]) or t[e] == '/'): e++
+        return e
+    }
+    # whitespace: \s*[\r\n]+ (to the run's last line break), \s+(?!\S), \s+
+    e := runEnd(t, i, kindSpace)
+    last I64 = -1
+    for q in range i, e {
+        if newline(t[q]): last = q
+    }
+    if last >= 0: return last + 1
+    if e >= n: return e
+    q I64 = i
+    prev I64 = i
+    for q < e {
+        _, wq := kindAt(t, q)
+        prev = q
+        q += wq
+    }
+    return prev if prev > i else e
 }
 
 # where the chunk starting at t[i] ends by GPT-2's pattern: the alternatives tried in its order
@@ -775,6 +891,10 @@ test ChunkEndOf "Llama 3's digits up to three a chunk; GPT-2's pattern; digits s
     assert cutBy("a  b", Pre.Gpt2) == "a| | b"
     assert cutBy("x\n\ny", Pre.Gpt2) == "x|\n|\n|y"
     assert cutBy("(x)!!\n", Pre.Gpt2) == "(|x|)!!|\n"
+    assert cutBy("HelloWorld", Pre.O200k) == "Hello|World"
+    assert cutBy("I'M ok", Pre.O200k) == "I'M| ok"
+    assert cutBy("x\n\ny", Pre.O200k) == "x|\n\n|y"
+    assert cutBy("(x)!!\n12345", Pre.O200k) == "(x|)!!\n|123|45"
     assert cutBy("end   ", Pre.Gpt2) == "end|   "
     assert cutBy("über café", Pre.Gpt2) == "über| café"
     assert cutBy("I'm 123 ok", Pre.Gpt2, true) == "I|'m| |1|2|3| ok"
