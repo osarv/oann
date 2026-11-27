@@ -1073,10 +1073,57 @@ fn tileProduct<SA, SB, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, a operan
     # a transposed left operand is gathered as it is packed; where the result is narrow, C^T = op(b)^T a gathers the
     # narrow op(b) instead and stores the result transposed
     if ta and not tb and n < m {
-        tileBlocks(ws, n, m, k, b, true, a, false, alpha, beta, c, ldc, true, false, false, 0)
+        tileColumns(ws, n, m, k, b, true, a, false, alpha, beta, c, ldc, true)
         return
     }
-    tileBlocks(ws, m, n, k, a, ta, b, tb, alpha, beta, c, ldc, false, false, false, 0)
+    tileColumns(ws, m, n, k, a, ta, b, tb, alpha, beta, c, ldc, false)
+}
+
+# tileBlocks (unconfined) with op(r)'s columns in runs of whole 16s over up to ws.Threads tasks, each with its own
+# blocks of the workspace: every element's sum is the one a single run makes (its depth is never split), so the values
+# are the same whatever the count - a narrow product (a weight's gradient, depth the batch's rows) uses every thread
+fn tileColumns<SL, SR, S, A>(ws mut Workspace<A>&, m I64, n I64, k I64, l operand<SL>&, lt Bool, r operand<SR>&, rt Bool, alpha A, beta A, c mut Array<S>&, ldc I64, trans Bool) {
+    kp := roundUp(k, 32)
+    sa, sb, sc := amxRows * kp, amxCols * kp, amxRows * amxCols
+    tasks I64 = lesser(lesser(ws.Threads, (n + 15) / 16), m * n * k / madds).Max(1)
+    tasks = lesser(tasks, ws.ta.Len() / sa)
+    tasks = lesser(tasks, ws.tb.Len() / sb)
+    tasks = lesser(tasks, ws.tc.Len() / sc).Max(1)
+    if tasks == 1 {
+        tileBlocks(ws, m, n, k, l, lt, r, rt, alpha, beta, c, ldc, trans, false, false, 0)
+        return
+    }
+    share := roundUp((n + tasks - 1) / tasks, 16)
+    run := tileColumnRun<SL, SR, S, A>(l, lt, r, rt, m, n, k, alpha, beta, c, ldc, trans, ws.Tile)
+    join {
+        for t in range tasks {
+            j0 := t * share
+            if j0 < n: spawn run.go(j0, lesser(share, n - j0), ws.ta[t * sa:(t + 1) * sa], ws.tb[t * sb:(t + 1) * sb], ws.tc[t * sc:(t + 1) * sc])
+        }
+    }
+}
+
+type tileColumnRun<SL, SR, S, A> struct(l operand<SL>, lt Bool, r operand<SR>, rt Bool, m I64, n I64, k I64, al A, be A, c mut Array<S>&, ldc I64, trans Bool, amx Bool) {
+    l
+    lt
+    r
+    rt
+    m
+    n
+    k
+    al
+    be
+    c
+    ldc
+    trans
+    amx
+}
+
+# op(r)'s columns j0 .. j0 + w - 1 into c, with these blocks of the workspace
+fn (q tileColumnRun<SL, SR, S, A>&) go(j0 I64, w I64, ta mut Array<BF16>&, tb mut Array<BF16>&, tc mut Array<F32>&) {
+    rj := operand<SR>(q.r.d[j0 * q.r.ld if q.rt else j0:], q.r.ld)
+    cj :~ q.c[j0 * q.ldc if q.trans else j0:]
+    tileBlocksIn(q.amx, ta, tb, tc, q.m, w, q.k, q.l, q.lt, rj, q.rt, q.al, q.be, cj, q.ldc, q.trans, false, false, 0)
 }
 
 # the blocked tile product of op(l) (m x k) by op(r) (k x n) into c, or into c transposed (trans: c is n x m);
