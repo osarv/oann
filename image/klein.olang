@@ -13,6 +13,7 @@
 # Transformer and Steps, Decoder and Pixels are the parts with the model loaded by the caller, to keep it for many
 # pictures (oann-image --serve).
 
+import "std/io"
 import "std/rand"
 import "../llm/bpe"
 import "../llm/chat"
@@ -40,21 +41,32 @@ fn Tokens(dir String&, prompt String&) Array<I32>, I64 ? Error {
 }
 
 # the prompt's embeddings for the transformer: TextTokens rows of 3 x the encoder's width
-fn Embed(dir String&, prompt String&, exact Bool = false, int8 Bool = false) Array<F32> ? Error {
+fn Embed(dir String&, prompt String&, exact Bool = false, int8 Bool = false, device String& = "cpu") Array<F32> ? Error {
     ids, real := try Tokens(dir, prompt)
     last I64 = 0
     for k in KeepLayers: last = last.Max(k)
-    m := try model.Model.Load(dir + "/text_encoder", exact, int8, layers = last) catch { error Error.Failed(dir + "/text_encoder") }
+    onDevice := device == "vulkan"
+    m := try model.Model.Load(dir + "/text_encoder", exact or onDevice, int8 and not onDevice, layers = last) catch { error Error.Failed(dir + "/text_encoder") }
     pages := (TextTokens + model.PageSize - 1) / model.PageSize
-    k := model.Cache(m.C, pages, 1, pages, exact)
-    for i in range pages: k.Table[i] = k.Take()
     s := model.State(m, TextTokens, 0, TextTokens)
     s.Keep(m, KeepLayers)
     for i in range TextTokens {
         s.Add(ids[i], i, 0, false)
         if i >= real: s.Last[i] = real - 1
     }
-    m.Step(s, k)
+    # on the device where it has the room, else here
+    here := not onDevice
+    if onDevice {
+        try vkEmbed(m, s, pages) catch e {
+            try io.PutErrLn("oann-image: the text encoder runs on the CPU: " + $e) catch { }
+            here = true
+        }
+    }
+    if here {
+        k := model.Cache(m.C, pages, 1, pages, exact or onDevice)
+        for i in range pages: k.Table[i] = k.Take()
+        m.Step(s, k)
+    }
     d := m.C.Dim
     n := KeepLayers.Len()
     out := Array<F32>(TextTokens * n * d)
@@ -123,6 +135,7 @@ Vulkan Bool = false
 if Vulkan {
     import "vk"
     import vdev "../kernels/vk/device"
+    import lvk "../llm/vk"
 
     # the steps of sig on the Vulkan device (image/vk), lat in place
     fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
@@ -137,25 +150,56 @@ if Vulkan {
             for k in range lat.Len(): lat[k] += dt * g.Out[k]
         }
     }
+
+    # Embed's step on the Vulkan device (llm/vk): Error.Failed where the device has not the room
+    fn vkEmbed(m model.Model&, s mut model.State&, pages I64) ? Error {
+        k := model.Cache(m.C, pages, 1, pages, device = true)
+        for i in range pages: k.Table[i] = k.Take()
+        dev := try vdev.Device.Open() catch e { error Error.Failed($e) }
+        dec := try lvk.Decoder.Make(dev, m, TextTokens, 1, k, TextTokens) catch e { error Error.Failed($e) }
+        try dec.Step(m, s, k) catch e { error Error.Failed($e) }
+    }
+
+    # the decoder on the Vulkan device (image/vk)
+    fn vkDecode(v vae.Vae&, z Array<F32>&, h I64, w I64) Array<F32> ? Error {
+        dev := try vdev.Device.Open() catch e { error Error.Failed("the Vulkan device: " + $e) }
+        g := try vk.VaeGpu.Make(dev, v, h, w) catch e { error Error.Failed("the decoder on " + dev.Name + ": " + $e) }
+        return try g.Decode(z) catch e { error Error.Failed($e) }
+    }
 } else {
     fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
+        error Error.Failed("the device vulkan: this program was built without Vulkan (-define Vulkan=true, where Vulkan's headers are: libvulkan-dev)")
+    }
+
+    fn vkEmbed(m model.Model&, s mut model.State&, pages I64) ? Error { error Error.Failed("built without Vulkan") }
+
+    fn vkDecode(v vae.Vae&, z Array<F32>&, h I64, w I64) Array<F32> ? Error {
         error Error.Failed("the device vulkan: this program was built without Vulkan (-define Vulkan=true, where Vulkan's headers are: libvulkan-dev)")
     }
 }
 
 # the latent tokens' picture: 16 rows x 16 cols x 3 bytes, row-major, red, green, blue
-fn Decode(dir String&, tokens Array<F32>&, rows I64, cols I64) Array<U8> ? Error {
+fn Decode(dir String&, tokens Array<F32>&, rows I64, cols I64, device String& = "cpu") Array<U8> ? Error {
     v := try Decoder(dir)
-    return Pixels(v, tokens, rows, cols)
+    return Pixels(v, tokens, rows, cols, device)
 }
 
 # the autoencoder's decoder
 fn Decoder(dir String&) vae.Vae ? Error { return try vae.Vae.Load(dir + "/vae") catch { error Error.Failed(dir + "/vae") } }
 
+# the latents' picture on device where it has the room, else here
+fn decodeOn(v vae.Vae&, z mut Array<F32>&, h I64, w I64, device String&) Array<F32> {
+    if device != "vulkan": return v.Decode(z, h, w)
+    return try vkDecode(v, z, h, w) catch e {
+        try io.PutErrLn("oann-image: the decoder runs on the CPU: " + $e) catch { }
+        return v.Decode(z, h, w)
+    }
+}
+
 # Decode with the decoder v loaded (Decoder)
-fn Pixels(v vae.Vae&, tokens Array<F32>&, rows I64, cols I64) Array<U8> {
+fn Pixels(v vae.Vae&, tokens Array<F32>&, rows I64, cols I64, device String& = "cpu") Array<U8> {
     z := v.Unpatch(tokens, rows, cols)
-    img := v.Decode(z, 2 * rows, 2 * cols)
+    img := decodeOn(v, z, 2 * rows, 2 * cols, device)
     return Array<U8>[U8(((x / 2.0 + 0.5).Clamp(0.0, 1.0) * 255.0).RoundEven()) for x in img]
 }
 
@@ -164,9 +208,9 @@ fn Pixels(v vae.Vae&, tokens Array<F32>&, rows I64, cols I64) Array<U8> {
 fn Generate(dir String&, prompt String&, width I64, height I64, steps I64 = 4, seed U64 = 0, exact Bool = false, progress fn&(step I64) = fn(step I64) { }, device String& = "cpu") Array<U8>, I64, I64 ? Error {
     rows, cols := height / 16, width / 16
     if rows < 1 or cols < 1: error Error.Failed("an image smaller than 16 x 16")
-    embeds := try Embed(dir, prompt, exact)
+    embeds := try Embed(dir, prompt, exact, device = device)
     tokens := try Flow(dir, embeds, rows, cols, steps, seed, exact, progress, device = device)
-    return try Decode(dir, tokens, rows, cols), 16 * cols, 16 * rows
+    return try Decode(dir, tokens, rows, cols, device), 16 * cols, 16 * rows
 }
 
 if TestBuild {
