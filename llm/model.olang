@@ -585,6 +585,7 @@ type Weights struct(files Array<checkpoint.File>&, where Map<String, I64>, paths
     row mut Array<F32>& = Array<F32>(0)
     gg mut Vec<gguf.File>& = Vec<gguf.File>()     # a GGUF file in place of the safetensors (its one element)
     prefix String = ""      # what "model." is in the files (a vision-language model's language_model.model.)
+    bare Bool = false       # the files name the tensors without "model." (an embedding model's: the base model alone)
     headDim I64 = 0
 }
 
@@ -682,6 +683,7 @@ fn Weights.Open(dir String&) Weights ? ModelError, os.Error {
 
 # a tensor's name as the files have it
 fn (w Weights&) named(name String&) String {
+    if w.bare and name.StartsWith("model."): return name["model.".Len():]
     if w.prefix.Len() == 0: return name
     if name.StartsWith("model."): return w.prefix + name["model.".Len():]
     if name == "lm_head.weight": return w.prefix[:w.prefix.Len() - "model.".Len()] + "lm_head.weight"
@@ -850,6 +852,7 @@ fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = fa
     for p in ["language_model.model.", "model.language_model."] {
         if w.where.Has(p + "embed_tokens.weight"): w.prefix = p
     }
+    if w.where.Has("embed_tokens.weight"): w.bare = true
     m := try Model.From(c, w, exact, int8, int4, ImportancePath(dir) if int4 and os.Exists(ImportancePath(dir)) else "")
     return m
 }
@@ -1180,6 +1183,10 @@ fn (s mut State&) Add(tok I32, pos I64, slot I64, logits Bool) I64 {
     s.N++
     return s.Out[r]
 }
+
+# the final-normed stream of output row j of the last step, Dim long: what the head read, and an embedding model's
+# output (llm/embedding)
+fn (s State&) Hidden(j I64, d I64) Array<F32>& { return s.h[j * d:(j + 1) * d] }
 
 # the logits of output row j
 # each row's rotation as Angles left it: cos and sin of position x frequency, RotHalf() a row
