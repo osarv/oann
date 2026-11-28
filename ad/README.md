@@ -33,12 +33,14 @@ the graph is then refused there): kind 1 is nn/moe's mixture of experts, lowered
 router's product and choices, each expert's rows found in token order by one block and put in the expert's own block
 of a fixed size (the mean rows an expert and a slack of sixteenths more; rows no token takes are zero rows), so each of
 the step's products is one `cublasGemmBatchedEx` over the experts with its addresses read on the device, and nothing
-waits for the rows per expert: `GpuAdamW.Train` captures a graph with a mixture as a CUDA graph like any other, and
-waits once at the step's end for the counts (added to the op's load, `GpuLoad`; the selection bias goes up before each
-step, `GpuBias`). An expert given more rows than its block overflows: launch by launch the host sees the counts and
-widens the blocks before the products; in a captured step the device marks it, AdamW steps nothing and Train runs the
-step again. The next step's slack is the one that held this step's rows, or one more. Past blocks half again the mean the
-rows are packed and each expert's products sized by the counts the host read (not captured, `GpuWhole` false).
+waits for the rows per expert inside a captured step: `GpuAdamW.Train` captures a graph with a mixture as a CUDA
+graph like any other, and waits once at the step's end for the counts (added to the op's load, `GpuLoad`; the selection
+bias goes up before each step, `GpuBias`). Launch by launch the host reads the counts each Forward and the blocks are
+the narrowest that hold them; a captured step's are a sixteenth wider than the last counted step needed, and an expert
+given more rows than its block overflows: the device marks it, AdamW steps nothing and Train runs the step again launch
+by launch. So Train equals the launches one by one within rounding, not bit for bit (cuBLAS rounds a product by its
+size). Past blocks half again the mean the rows are packed and each expert's products sized by the counts (not
+captured, `GpuWhole` false).
 
 One parameter set in two graphs (a model and a copy of it on other inputs, a target network): record both the same
 way, `b.CopyParamsFrom(a)` before each of b's Forward (after a's optimizer step), run both Backwards, then

@@ -260,13 +260,15 @@ type MatPlan<T> unique struct(dev gdev.Device&, node I64) {
 }
 
 # A Moe step's rows on the device (v2, grouped): every expert has a block of Cap rows of the kept arrays, Cap the mean
-# rows an expert (slots / E) and Slack sixteenths of it more, so each of the step's products is one cublasGemmBatchedEx of
-# E products of one fixed size, the addresses read from a device array - nothing waits for the rows per expert, and a
-# training step with a mixture is captured as a CUDA graph like any other. Rows no token takes are zero rows. An expert
-# given more than Cap rows overflows: launch by launch the host sees it at once (it reads the counts there) and widens
-# the blocks before the products; in a captured step the device marks it, AdamW steps nothing, and the host runs the
-# step again launch by launch (GpuAdamW.Train). Past MaxSlack (blocks half again the mean) the step runs v1's way: the
-# experts' rows packed, a cuBLAS product an expert sized by the counts the host read (never captured).
+# rows an expert (slots / E) and Slack sixteenths of it more, so each of the step's products is one cublasGemmBatchedEx
+# of E products of one fixed size, the addresses read from a device array. Rows no token takes are zero rows.
+# Launch by launch the host reads the rows per expert (one wait a Forward) and the blocks are the narrowest that hold
+# them: the step is a function of its inputs alone, run twice the same bit for bit. A captured step (GpuAdamW.Train)
+# cannot wait: its blocks are one sixteenth wider than the last counted step needed, nothing waits until the step's
+# end, and an expert given more than its block overflows - the device marks it, AdamW steps nothing, and the host runs
+# the step again launch by launch. (cuBLAS rounds a product by its size, so a captured step equals the launches one by
+# one within rounding, not bit for bit, where its blocks are wider.) Past MaxSlack (blocks half again the mean) the
+# step runs v1's way: the experts' rows packed, a cuBLAS product an expert sized by the counts (never captured).
 MaxSlack := 8
 
 # the rows of an expert's block for `slots` rows over e experts at a slack (sixteenths of the mean more)
@@ -307,7 +309,7 @@ PCount := 16
 # slot's expert, gate, gate's gradient and row, each row's token, the rows per expert and the counting block's runs
 # (F32 and I32, whatever the arena holds), the selection bias, the products' addresses (ptr); on the host the rows per
 # expert of the last Forward (Counts, downloaded), their starts where packed, the backward's adds by input (Adds, the
-# graph's), the slack in use (Slack; MaxSlack + 1: packed), the blocks the last Forward ran with (Cap; 0: packed) and
+# graph's), the slack the last counted step needed (Slack; MaxSlack + 1: packed), the blocks the last Forward ran with (Cap; 0: packed) and
 # what the addresses on the device were made for (ptrCap)
 type MoePlan unique struct(node I64, e I64, logits gdev.Buf<F32>, probs gdev.Buf<F32>, gate gdev.Buf<F32>, dgate gdev.Buf<F32>, bias gdev.Buf<F32>, sel gdev.Buf<I32>, pos gdev.Buf<I32>, tok gdev.Buf<I32>, count gdev.Buf<I32>, part gdev.Buf<I32>, ptr gdev.Buf<U64>) {
     node
@@ -1044,11 +1046,11 @@ fn (m Mirror<T>&) MoeKey() U64 {
     return key
 }
 
-# plan i's blocks for `rows` tokens at its slack (0: packed) and, where they changed, its products' addresses up
-fn (m mut Mirror<T>&) moeBlocks(s Step&, i I64, rows I64) I64 {
+# plan i's blocks for `rows` tokens at a slack (0: packed) and, where they changed, its products' addresses up
+fn (m mut Mirror<T>&) moeBlocks(s Step&, i I64, rows I64, slack I64) I64 {
     d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
     slots := rows * k
-    cap := MoeCap(slots, e, m.moes[i].Slack) if m.moes[i].Slack <= MaxSlack else 0
+    cap := MoeCap(slots, e, slack) if slack <= MaxSlack else 0
     m.moes[i].Cap = cap
     m.moes[i].Slots = slots
     if cap == 0 or cap == m.moes[i].ptrCap: return cap
@@ -1082,7 +1084,7 @@ fn (m mut Mirror<T>&) moeBlocks(s Step&, i I64, rows I64) I64 {
 fn (m mut Mirror<T>&) MoePrepare(n I64) {
     for i in range m.moes.Len() {
         s := m.steps[m.moes[i].node]
-        m.moeBlocks(s, i, s.RowsAt(n, m.batch))
+        m.moeBlocks(s, i, s.RowsAt(n, m.batch), (m.moes[i].Slack + 1).Min(MaxSlack) if m.moes[i].Slack <= MaxSlack else m.moes[i].Slack)
     }
 }
 
@@ -1108,18 +1110,8 @@ fn (m mut Mirror<T>&) moeCounted(i I64) I64 {
         at += c
         most = most.Max(c)
     }
-    need := slackFor(m.moes[i].Slots, m.moes[i].e, most)
-    if need > m.moes[i].Slack: m.moes[i].Slack = need
+    m.moes[i].Slack = slackFor(m.moes[i].Slots, m.moes[i].e, most)
     return most
-}
-
-# after a step whose rows were counted (plan i's Counts are its own): the next step's slack is the one that held this
-# step's rows and at most one more - blocks follow the load down at once, and up when an expert overflows
-fn (m mut Mirror<T>&) MoeObserve(i I64) {
-    most I64 = 0
-    for j in range m.moes[i].e: most = most.Max(m.moes[i].Counts[j])
-    need := slackFor(m.moes[i].Slots, m.moes[i].e, most)
-    m.moes[i].Slack = need.Max(m.moes[i].Slack.Min(need + 1))
 }
 
 # E products of one size, C[j] = op(A[j]) op(B[j]) (added to where add), their addresses plan i's arrays pc, pa and pb
@@ -1145,13 +1137,15 @@ fn (m mut Mirror<T>&) moeForward(s Step&, rows I64) {
     t := storeType(z)
     m.gemmAt(m.moes[i].logits.Addr(0), cu.CUDA_R_32F, e, m.at(x), false, d, m.at(wr), true, d, rows, e, d, t, false)
     m.elems(KMoeRoute, rows, m.moes[i].probs.Addr(0), m.moes[i].sel.Addr(0), m.moes[i].gate.Addr(0), m.moes[i].logits.Addr(0), m.moes[i].bias.Addr(0), n64(rows), n64(e), n64(k), flag(s.Flag))
-    cap := m.moes[i].Cap if m.Capturing else m.moeBlocks(s, i, rows)
+    guess := m.moes[i].Slack
+    cap := m.moes[i].Cap if m.Capturing else m.moeBlocks(s, i, rows, guess)
     m.moeRows(i, rows * k, e, k, cap)
     if not m.Capturing {
         m.moes[i].count.Download(m.moes[i].hostCount, 0, 0, e)
         m.sync()
-        if m.moeCounted(i) > cap and cap > 0 {
-            cap = m.moeBlocks(s, i, rows)
+        m.moeCounted(i)
+        if m.moes[i].Slack != guess {
+            cap = m.moeBlocks(s, i, rows, m.moes[i].Slack)
             m.MoeBegin()
             m.moeRows(i, rows * k, e, k, cap)
         }
