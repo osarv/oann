@@ -41,8 +41,8 @@ is the faster product.
 
 `Gemm` and `GemmBatch` (every transpose, alpha and beta, heads and stacked matrices), the element maps (ReLU, GELU,
 GELU's tanh form, SiLU, sigmoid, tanh, softplus, exp, affine), `Add` and `Mul` (with a row's bias repeated), `Softmax`
-with the causal mask, `RmsNorm`, `LayerNorm`, `Gather` (an embedding's rows) and `ArgMax`: every kernel a transformer
-decoder's inference needs, F32. `make vktest` checks each against the CPU's kernels and runs a small decoder's forward
+with the causal mask, `RmsNorm`, `LayerNorm`, `Gather` (an embedding's rows), `ArgMax` and `Patches` (a convolution's patch matrix, for a product to finish): every
+kernel a transformer decoder's inference and Whisper's encoder and decoder need, F32. `make vktest` checks each against the CPU's kernels and runs a small decoder's forward
 pass on the device against the CPU (logits within 1e-6 on lavapipe).
 
 Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
@@ -52,10 +52,12 @@ Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
 1. **A faster product.** An invocation computes a 4 x 4 block of the result, reading four elements of each operand a
    step of the depth for sixteen products (5x the one-element form on llvmpipe; `make vkgemm`). Next, measured on real
    GPUs first: tiles of the operands staged in workgroup memory, and the block's size by device.
-2. **`device.Backend.Vulkan`**: `kernels/device` chooses it where the build has it and CUDA is absent, so a script's
-   `SetDefault` line is unchanged.
-3. **Inference on it**: `llm/gpu`'s decoder (the paged cache, rotary positions, QK-norm) and Whisper's forward pass on
-   `kernels/vk`, for Viska and the agent on machines without NVIDIA.
+2. **Whisper on it** (first: transcription on an office laptop's integrated GPU): speech/whisper's `Encode` and `Step`
+   with their arrays on the device - `Patches` and `Gemm` for the two convolutions, `Map` GELU, `LayerNorm`, `GemmBatch`
+   and `Softmax` for the attention, the decoder's key and value cache as device buffers - behind a device choice in
+   speech/transcribe, checked against the CPU's logits.
+3. **LLM decoding on it**: `llm/gpu`'s decoder (the paged cache, rotary positions, QK-norm) on `kernels/vk`, and
+   `device.Backend.Vulkan` in `kernels/device` once plans run there.
 4. **Half precision** where the device has `shaderFloat16` and 16-bit storage (BF16 has no Vulkan form: F16).
 5. **Training**: ad/mirror's backward kernels and AdamW, kernel by kernel.
 6. **Windows and Android builds** of the shim (the loader's name is already chosen per target), and a Metal backend

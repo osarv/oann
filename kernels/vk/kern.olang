@@ -1,7 +1,7 @@
 # kern - oann's kernels on any Vulkan GPU (docs/vulkan.md): each written with spirv.Kernel, made into a pipeline when a
 # Set is made, and recorded on the device's queue when called - the products, the element-wise maps, and what a model's
 # forward pass needs beside them (softmax with its causal mask, the two norms, an embedding's rows, the largest of a
-# row). F32 throughout.
+# row, a convolution's patches). F32 throughout.
 #
 # A Set is every kernel of one device, made once (Set.Make: the drivers compile them, tens of milliseconds each). Its
 # methods record: they return at once, the work runs by the device's next Sync at the latest, and a failure is that
@@ -374,10 +374,43 @@ fn argmaxKernel() spirv.Kernel {
     return k
 }
 
+# a convolution's patches along one axis, for a product to finish (the patch matrix times the filters): row i of col
+# is, for each channel ch and tap k, the source's frame i stride + k - pad of that channel, 0 where the frame is outside
+# the source. Invocation (x, y) is column x = ch width + k of row y
+fn patchesKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    src := k.Buffer(spirv.Ty.F32)
+    col := k.Buffer(spirv.Ty.F32)
+    rows := k.Param(spirv.Ty.U32)
+    chans := k.Param(spirv.Ty.U32)
+    width := k.Param(spirv.Ty.U32)
+    frames := k.Param(spirv.Ty.U32)
+    stride := k.Param(spirv.Ty.U32)
+    pad := k.Param(spirv.Ty.U32)
+    sOff := k.Param(spirv.Ty.U32)
+    frameStep := k.Param(spirv.Ty.U32)
+    chanStep := k.Param(spirv.Ty.U32)
+    cOff := k.Param(spirv.Ty.U32)
+    x := k.GlobalId(0)
+    i := k.GlobalId(1)
+    k.If(k.And(k.Lt(i, rows), k.Lt(x, k.Mul(chans, width))))
+    ch := k.Div(x, width)
+    tap := k.Mod(x, width)
+    at := k.Add(k.Mul(i, stride), tap)       # the frame, pad too far right
+    out := k.Add(cOff, k.Add(k.Mul(i, k.Mul(chans, width)), x))
+    k.If(k.And(k.Ge(at, pad), k.Lt(k.Sub(at, pad), frames)))
+    k.Write(col, out, k.Read(src, k.Add(sOff, k.Add(k.Mul(k.Sub(at, pad), frameStep), k.Mul(ch, chanStep)))))
+    k.Else()
+    k.Write(col, out, k.F(0))
+    k.EndIf()
+    k.EndIf()
+    return k
+}
+
 # ---- a device's kernels ----
 
 # every kernel of one device, made by Set.Make
-type Set unique struct(product Kernel, affine Kernel, relu Kernel, gelu Kernel, geluTanh Kernel, silu Kernel, sigmoid Kernel, tanh Kernel, softplus Kernel, exp Kernel, add Kernel, mul Kernel, softmax Kernel, rms Kernel, layer Kernel, gather Kernel, argmax Kernel) {
+type Set unique struct(product Kernel, affine Kernel, relu Kernel, gelu Kernel, geluTanh Kernel, silu Kernel, sigmoid Kernel, tanh Kernel, softplus Kernel, exp Kernel, add Kernel, mul Kernel, softmax Kernel, rms Kernel, layer Kernel, gather Kernel, argmax Kernel, patches Kernel) {
     product
     affine
     relu
@@ -395,6 +428,7 @@ type Set unique struct(product Kernel, affine Kernel, relu Kernel, gelu Kernel, 
     layer
     gather
     argmax
+    patches
 }
 
 fn Kernel.of(d mut device.Device&, name String, k spirv.Kernel) Kernel ? device.VkError {
@@ -411,7 +445,7 @@ fn Set.Make(d mut device.Device&) Set ? device.VkError {
         try Kernel.of(d, "tanh", mapKernel(Op.Tanh)), try Kernel.of(d, "softplus", mapKernel(Op.Softplus))
         try Kernel.of(d, "exp", mapKernel(Op.Exp)), try Kernel.of(d, "add", zipKernel(false)), try Kernel.of(d, "mul", zipKernel(true))
         try Kernel.of(d, "softmax", softmaxKernel()), try Kernel.of(d, "rmsnorm", normKernel(false))
-        try Kernel.of(d, "layernorm", normKernel(true)), try Kernel.of(d, "gather", gatherKernel()), try Kernel.of(d, "argmax", argmaxKernel()))
+        try Kernel.of(d, "layernorm", normKernel(true)), try Kernel.of(d, "gather", gatherKernel()), try Kernel.of(d, "argmax", argmaxKernel()), try Kernel.of(d, "patches", patchesKernel()))
 }
 
 # c = alpha op(a) op(b) + beta c for every matrix of the batches (a, b and c of one Groups and Members; op the
@@ -495,6 +529,15 @@ fn (s Set&) Gather(d mut device.Device&, out device.DMat<F32>&, table device.DMa
 fn (s Set&) ArgMax(d mut device.Device&, out device.Buf<U32>&, oOff I64, x device.DMat<F32>&) {
     p := Array<U32>[u(x.Rows), u(x.Cols), u(x.Off), u(x.Ld), u(oOff)]
     s.argmax.Run(d, groups(x.Rows, Line), 1, 1, Array<U64>[x.Data.Handle(), out.Handle()], p)
+}
+
+# col's rows are a convolution's patches of src along one axis: row i holds, for each of chans channels and width taps,
+# column ch width + k, the source's element at sOff + (i stride + k - pad) frameStep + ch chanStep, or 0 where that
+# frame is not one of the source's frames. col (rows x chans width, from cOff) times the filters is the convolution
+# (speech/whisper's two). Unchecked: the source holds what is named
+fn (s Set&) Patches(d mut device.Device&, col device.Buf<F32>&, cOff I64, rows I64, src device.Buf<F32>&, sOff I64, frames I64, frameStep I64, chans I64, chanStep I64, width I64, stride I64 = 1, pad I64 = 0) {
+    p := Array<U32>[u(rows), u(chans), u(width), u(frames), u(stride), u(pad), u(sOff), u(frameStep), u(chanStep), u(cOff)]
+    s.patches.Run(d, groups(chans * width, Tile), groups(rows, Tile), 1, Array<U64>[src.Handle(), col.Handle()], p)
 }
 
 # ---- tests: the CPU is the oracle ----
@@ -762,5 +805,44 @@ test Set.RmsNorm "RMS norm and layer norm against the CPU in F64; an embedding's
     }
     for i in range 4 {
         for j in range cols: assert picked[i * cols + j] == hx[I64(hi[i]) * cols + j], "gathered (" + $i + ", " + $j + ")"
+    }
+}
+
+test Set.Patches "a convolution's patches as speech/whisper makes them: width 3 over channel-major frames, and stride 2 over frame-major rows" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Patches")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(12)
+    mels, t, dim := 5, 22, 7
+    spec := randoms(mels * t, r)
+    xs := randoms(t * dim, r)
+    bspec := try onDevice(d, spec)
+    bx := try onDevice(d, xs)
+    b1 := try device.Buf<F32>.Make(d, t * 3 * mels)
+    b2 := try device.Buf<F32>.Make(d, t / 2 * 3 * dim)
+    s.Patches(d, b1, 0, t, bspec, 0, t, 1, mels, t, 3, 1, 1)
+    s.Patches(d, b2, 0, t / 2, bx, 0, t, dim, dim, 1, 3, 2, 1)
+    c1 := Array<F32>(t * 3 * mels)
+    c2 := Array<F32>(t / 2 * 3 * dim)
+    b1.DownloadAll(c1)
+    b2.DownloadAll(c2)
+    try d.Sync()
+    for i in range t {
+        for ch in range mels {
+            for k in range 3 {
+                j := i + k - 1
+                assert c1[i * 3 * mels + ch * 3 + k] == (spec[ch * t + j] if j >= 0 and j < t else F32(0.0)), "the first's (" + $i + ", " + $ch + ", " + $k + ")"
+            }
+        }
+    }
+    for i in range t / 2 {
+        for ch in range dim {
+            for k in range 3 {
+                j := 2 * i + k - 1
+                assert c2[i * 3 * dim + ch * 3 + k] == (xs[j * dim + ch] if j >= 0 and j < t else F32(0.0)), "the second's (" + $i + ", " + $ch + ", " + $k + ")"
+            }
+        }
     }
 }
