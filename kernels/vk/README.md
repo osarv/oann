@@ -3,8 +3,8 @@
 oann's kernels on any GPU with a Vulkan driver: AMD, Intel, NVIDIA, integrated GPUs, phones', and a CPU's software
 Vulkan (Mesa's lavapipe). The design is `docs/vulkan.md`. `kernels/gpu` is the CUDA backend, for NVIDIA alone.
 
-Lightly tested: every test passes on software Vulkan; real hardware has seen little of it. Expect bugs on a driver it
-has not met.
+Lightly tested: the tests pass on software Vulkan, an NVIDIA RTX 4060 and an AMD Radeon integrated GPU (Windows).
+Intel's and phones' GPUs have not seen it. Expect bugs on a driver it has not met.
 
 | file | what |
 |---|---|

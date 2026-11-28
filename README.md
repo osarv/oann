@@ -35,8 +35,9 @@ device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backen
 That GPU is NVIDIA's (CUDA, cuBLAS). Other cards - AMD, Intel, integrated GPUs, anything with a Vulkan driver - are
 reached through the Vulkan backend, `kernels/vk` (docs/vulkan.md, `-define Vulkan=true`): the products and the kernels a
 transformer's inference needs, called directly, not yet through `device.SetDefault`, and open-weight language models
-decoding on it (`oann-gen --device vulkan`, llm/README.md). It is there but lightly tested -
-checked on software Vulkan, hardly on real hardware - so expect bugs.
+decoding on it (`oann-gen --device vulkan`, llm/README.md). It is there but lightly tested: its tests
+run on software Vulkan, an NVIDIA RTX 4060 and an AMD Radeon integrated GPU (Windows); Intel's and phones' have not
+seen it - so expect bugs.
 
 Other modules the same way: `github.com/osarv/oann/nn/optim`, `.../ad/graph`, `.../models/gpt`, `.../dyn/system`.
 Run a file by naming it - olang builds it fully optimized into its cache and runs it. The examples work as they are:

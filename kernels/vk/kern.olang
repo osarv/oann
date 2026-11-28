@@ -477,10 +477,14 @@ fn (s Set&) mapOf(op Op) Kernel& {
     }
 }
 
+# the most elements one dispatch along a line is given, whatever the device takes: a kernel's indices are 32 bits wide
+# (a test lowers it, to split small arrays)
+LineMost mut I64 = 1 << 28
+
 # the elements one dispatch of a kernel along a line takes on d (its workgroups an axis are bounded): a longer array
 # goes in runs of this many, a multiple of `period`
 fn most(d device.Device&, period I64 = 1) I64 {
-    top := d.MaxGroups * Line
+    top := (d.MaxGroups * Line).Min(LineMost)
     return top if period >= top else top / period * period
 }
 
@@ -503,7 +507,7 @@ fn (s Set&) Affine(d mut device.Device&, y device.Buf<F32>&, yOff I64, x device.
 # the zip kernel k over n elements: z = x (+ or *) y, y repeating every period (0: no repeat), in runs a dispatch takes
 fn (s Set&) zip(d mut device.Device&, k Kernel&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, a F32, period I64) {
     repeat := period > 0 and period < n
-    assert not repeat or period <= d.MaxGroups * Line, "a period longer than one dispatch takes: " + $period
+    assert not repeat or period <= most(d), "a period longer than one dispatch takes: " + $period
     step := most(d, period if repeat else 1)
     for at in range 0, n, step {
         m := step.Min(n - at)
@@ -878,7 +882,10 @@ test Set.Add "arrays longer than one dispatch's workgroups take: a map in place,
     }
     s := try Set.Make(d)
     period I64 = 7
-    n := (d.MaxGroups * Line / period + 3) * period + 5
+    # runs of at most 2^16 elements, on every device (a GPU's own limit is billions)
+    LineMost = 1 << 16
+    defer: LineMost = 1 << 28
+    n := (most(d) / period * 3 + 3) * period + 5
     x := Array<F32>[F32((i * 7919) % 1001 - 500) for i in range n]
     y := Array<F32>[F32((i * 104729) % 601 - 300) for i in range n]
     bx device.Buf<F32> = try onDevice(d, x)

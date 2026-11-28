@@ -55,7 +55,10 @@ BF16's own rounding. A matrix larger than the device binds as one buffer (`maxSt
 Vulkan and some phones) is held in runs of its rows, a dispatch each. `make vktest` checks it on tiny models;
 `make vkllm ARGS=MODEL_DIR` checks and times a real one.
 
-Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
+Tested on software Vulkan (Mesa's llvmpipe) and, as Windows programs, on an NVIDIA RTX 4060 and an AMD Radeon
+integrated GPU (2026-11-28: the decoder's logits within 4.8e-7 of the CPU's on both). The product there, `vkgemm`,
+GFLOPS F32 at 1024^3 and 2048^3: the RTX 4060 1024 and 1510 (another job on it), the Radeon integrated 47 and 47, the
+same machine's CPU at 4 threads 32 (a Windows build). Intel's and phones' GPUs have not seen it.
 
 ## Whisper on it
 
