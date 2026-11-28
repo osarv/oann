@@ -61,7 +61,7 @@ a step never reads another row, so a completion does not depend on the batch it 
 | `--ctx C` | positions a sequence may have, prompt and completion (default: the longest prompt and M) |
 | `--kv-gb G` | memory for the key-value cache (default 90% of what is free after loading, less 1 GB) |
 | `--int8` | 8-bit weights, a scale per 32 inputs (the head stays BF16): 0.56 of the memory, needs AMX (BF16 without it); the 8B models need it on 16 GB |
-| `--int4` | 4-bit weights, a scale and an offset per 32 inputs (the head stays BF16): about a third of the memory, and decoding a few sequences about twice as fast; needs AMX |
+| `--int4` | 4-bit weights, a scale and an offset per 32 inputs (the down projections 8-bit, the head BF16): about 40% of the memory, and decoding a few sequences 1.5-2x as fast; needs AMX |
 | `--kv8` | values in the cache in 8 bits, a scale per position and head: 0.76 of the cache's memory, needs AMX |
 | `--exact` | F32 activations and cache: slow, for checking against a reference |
 
@@ -76,7 +76,7 @@ decoded, so a new sequence starts the moment another finishes (continuous batchi
 **Products.** On a CPU with AMX (`TargetHasTileDot`), the weights stay BF16 and are packed once, as they are loaded,
 into the pair layout of std/tile's `AddDot`, in blocks of 32 outputs: a step rounds its activations to BF16 and each
 task adds `X W^T` into its blocks of the result, summing in F32. With `--int8` the layers' weights are 8 bits with a
-scale per 32 inputs (symmetric), widened to BF16 512 inputs of a block at a time into the L1 cache as they are used. With `--int4` they are 4 bits,
+scale per 32 inputs (symmetric), widened to BF16 512 inputs of a block at a time into the L1 cache as they are used (a step of at most 4 rows multiplies them by byte dots, as below). With `--int4` they are 4 bits,
 `W = d (q - 8) + m` with a scale `d` and an offset `m` (F16) per 32 inputs of an output (GGUF's Q4_1, 5.5 bits a weight
 with the scales), laid out for VNNI's byte dots over 16 outputs at once: a step of at most 16 rows puts each row's
 activations in 8 bits (a scale per 32, shifted by 128 into bytes) and multiplies them with `vpdpbusd` straight from the
@@ -188,8 +188,9 @@ Q4_K_M).
 
 Phi-4-mini (phi3: queries, keys and values and the gate and up stored fused, a quarter of each head unrotated, its
 o200k tokenizer, longrope) against transformers in F32 on "The capital of France is": the AMX path's last logits within
-0.1 of transformers' (mean 0.011, largest 38.9) and the same ten greedy tokens; with `--int4` a mean difference of 1.5
-and the first two tokens the same. The tokenizer is held to the library's ids like the others, and a small random phi3
+0.1 of transformers' (mean 0.011, largest 38.9) and the same ten greedy tokens; with `--int4` a mean difference of 0.56
+(1.5 with the down projections in 4 bits too: their 8192 inputs carry outlier channels, and keeping them in BF16 or 8
+bits removes most of the error, while keeping the other products or the first and last layers does not). The tokenizer is held to the library's ids like the others, and a small random phi3
 model (`reference.py`) to every position's logits. Longrope divides each frequency by short_factor below the original
 context (4096) and by long_factor from there on, per position as vLLM does; transformers instead switches every
 position once a sequence passes 4096, so past that point the two differ and only vLLM's form is a fixed rule.
@@ -238,14 +239,16 @@ fast; past 16 rows a step widens the weights, and a batch of 64 runs at about 0.
 | model | weights | batch 1 | batch 16 | batch 64 | peak |
 |---|---|---|---|---|---|
 | Llama-3.2-1B-Instruct | BF16, 2.4 GB | 8.0 | | | 2.7 GB (batch 1) |
-| Llama-3.2-1B-Instruct | INT4, 1.1 GB | 14.5 | | | 1.5 GB (batch 1) |
+| Llama-3.2-1B-Instruct | INT4, 1.25 GB | 12.1 | | | 1.6 GB (batch 1) |
 | granite-3.3-2b-instruct | BF16, 4.8 GB | 3.7 | 58 | 132 | 6.6 GB |
-| granite-3.3-2b-instruct | INT8, 2.8 GB | 2.8 | 40 | 108 | 4.6 GB |
-| granite-3.3-2b-instruct | INT4, 1.8 GB | 8.3 | 35 | 85 | 3.6 GB |
+| granite-3.3-2b-instruct | INT8, 2.8 GB | 3.9 | 40 | 101 | 4.7 GB |
+| granite-3.3-2b-instruct | INT4, 2.1 GB | 6.2 | 39 | 90 | 3.9 GB |
 | Phi-4-mini-instruct (3.8B, context 512) | BF16, 7.3 GB | 3.3 | 45 | 95 | 12.5 GB (batch 64) |
-| Phi-4-mini-instruct (3.8B, context 512) | INT4 | 5.8 | 26 | | 4.9 GB (batch 16) |
+| Phi-4-mini-instruct (3.8B, context 512) | INT4, 3.6 GB | 4.7 | 25 | | 5.3 GB (batch 16) |
 
-The 4 bits cost accuracy: against transformers in F32 the mean logit difference is about 2.5% of the largest logit for
+The down projections stay in 8 bits under `--int4` (their 4-bit error turned Phi-4-mini's answers; it costs about 15%
+of the memory and 20% of batch 1's speed). Up to 4 rows, 8-bit weights are multiplied by byte dots as 4-bit ones are
+(Granite's batch 1 in INT8 2.8 -> 3.9 tokens a second); beyond, widened. The 4 bits cost accuracy: against transformers in F32 the mean logit difference is about 2.5% of the largest logit for
 Llama 3.2 1B and Granite 3.3 2B (8% for SmolLM2-135M), and greedy answers stay the same, but near ties can turn
 (Gemma 3 1B's first answer token does, as PyTorch quantizing it the same way also gives). A GGUF file's own 4-bit
 weights are requantized into this layout, not kept as they are.

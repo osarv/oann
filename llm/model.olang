@@ -361,11 +361,29 @@ type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8
     W mut Array<BF16>& = Array<BF16>(0 if Int8 or Int4 else In * Out)
     Q mut Array<I8>& = Array<I8>(In * Out if Int8 else 0)
     Scale mut Array<F32>& = Array<F32>(Out * In / Group if Int8 else 0)   # row o's at o In / Group
+    C8 mut Array<I16>& = Array<I16>(Out * In / Group if Int8 else 0)      # each group's sum of Q, as Scale
     Q4 mut Array<U8>& = Array<U8>(In * Out / 2 if Int4 else 0)
     D4 mut Array<F16>& = Array<F16>(Out * In / 32 if Int4 else 0)
     M4 mut Array<F16>& = Array<F16>(Out * In / 32 if Int4 else 0)
     C4 mut Array<I16>& = Array<I16>(Out * In / 32 if Int4 else 0)
     Bias mut Array<F32>& = Array<F32>(Out if bias else 0)
+}
+
+# inputs g0 .. g0 + Group of output o in 8 bits from row[at:], symmetric: the group's largest magnitude is 127
+fn (l mut Linear&) put8(o I64, g0 I64, row Array<F32>&, at I64) {
+    top F32 = 0.0
+    for i in range l.Group: top = top.Max(row[at + i].Abs())
+    sc := top / 127.0 if top > 0.0 else F32(1.0)
+    l.Scale[(o * l.In + g0) / l.Group] = sc
+    inv := 1.0 / sc
+    sum I64 = 0
+    for i in range l.Group {
+        v := (row[at + i] * inv).Round()
+        q := I8(v if v < 127.0 and v > -127.0 else (F32(127.0) if v > 0.0 else F32(-127.0)))
+        l.Q[l.at(o, g0 + i)] = q
+        sum += I64(q)
+    }
+    l.C8[(o * l.In + g0) / l.Group] = I16(sum)
 }
 
 # element (o, i) of W
@@ -435,7 +453,7 @@ type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false, int4 Bool =
     Qkv Linear = Linear(c.Dim, (c.Heads + 2 * c.KvHeads) * c.HeadDim, blockOf([c.Heads * c.HeadDim, c.KvHeads * c.HeadDim]), pack, c.Bias, int8, int4)
     O Linear = Linear(c.Heads * c.HeadDim, c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4)
     GateUp Linear = Linear(c.Dim, 0 if moe else 2 * c.Ffn, blockOf([c.Ffn]), pack, Int8 = int8, Int4 = int4)
-    Down Linear = Linear(c.Ffn, 0 if moe else c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4)
+    Down Linear = Linear(c.Ffn, 0 if moe else c.Dim, blockOf([c.Dim]), pack, Int8 = int8 or int4)
     Norm1 mut Array<F32>& = Array<F32>(c.Dim)
     Norm2 mut Array<F32>& = Array<F32>(c.Dim)
     PostAttn mut Array<F32>& = Array<F32>(c.Dim if c.PostNorms else 0)
@@ -447,7 +465,7 @@ type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false, int4 Bool =
     downs := Vec<Linear>()
     for _ in range c.Experts if moe else 0 {
         ups.Push(Linear(c.Dim, 2 * c.MoeFfn, blockOf([c.MoeFfn]), pack, Int8 = int8, Int4 = int4))
-        downs.Push(Linear(c.MoeFfn, c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4))
+        downs.Push(Linear(c.MoeFfn, c.Dim, blockOf([c.Dim]), pack, Int8 = int8 or int4))
     }
     Ups mut Array<Linear>& = ups.ToArray()          # each expert's gate and up halves
     Downs mut Array<Linear>& = downs.ToArray()
@@ -643,20 +661,7 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
             o := from + r0 + r
             if l.Int8 {
                 # symmetric, a scale per Group inputs of an output: the group's largest magnitude is 127
-                for g0 in range 0, l.In, l.Group {
-                    top F32 = 0.0
-                    for i in range g0, g0 + l.Group {
-                        v := b[r * l.In + i]
-                        top = v if v > top else (-v if -v > top else top)
-                    }
-                    sc := top / 127.0 if top > 0.0 else F32(1.0)
-                    l.Scale[(o * l.In + g0) / l.Group] = sc
-                    inv := 1.0 / sc
-                    for i in range g0, g0 + l.Group {
-                        v := (b[r * l.In + i] * inv).Round()
-                        l.Q[l.at(o, i)] = I8(v if v < 127.0 and v > -127.0 else (F32(127.0) if v > 0.0 else F32(-127.0)))
-                    }
-                }
+                for g0 in range 0, l.In, l.Group: l.put8(o, g0, b, r * l.In + g0)
             } else if l.Int4 {
                 for g0 in range 0, l.In, 32: l.put4(o, g0, b, r * l.In + g0)
             } else if l.Packed {
@@ -914,7 +919,7 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     xb mut Array<BF16>& = Array<BF16>(roundUp(Rows, 16) * widest(m.C) if m.Tile else 0)
     deq mut Array<BF16>& = Array<BF16>(m.Threads * widest(m.C) * 64 if m.Tile and (m.Int8 or m.Int4) else 0)   # each task's widened block
     scs mut Array<F32>& = Array<F32>(m.Threads * (256 + 2 * Gemv4 * widest(m.C) / 32))                  # and its scales (4 bits: its rows' too)
-    qxs mut Array<U8>& = Array<U8>(m.Threads * Gemv4 * widest(m.C) if m.Int4 else 0)              # 4 bits: each task's rows in 8
+    qxs mut Array<U8>& = Array<U8>(m.Threads * Gemv4 * widest(m.C) if m.Int4 or m.Int8 else 0)     # 4 or 8 bits: each task's rows in 8
     # a mixture of experts: each row's experts and weights, the rows grouped by expert, an expert's rows gathered
     pick mut Array<I32>& = Array<I32>(Rows * m.C.TopK)
     pickW mut Array<F32>& = Array<F32>(Rows * m.C.TopK)
@@ -1047,6 +1052,11 @@ fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I
         gemv4(dst, w, real, b0, b1, qx, sc[256:], sc[:256])
         return
     }
+    if w.Int8 and w.Packed and w.Group == 32 and real <= Gemv8 {
+        quant8(x, w.In, real, qx, sc[256:])
+        gemv8(dst, w, real, b0, b1, qx, sc[256:], sc[:256])
+        return
+    }
     span := w.In * w.Nb
     for b in range b0, b1 {
         c0 := b * w.Nb
@@ -1096,6 +1106,9 @@ fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I
 
 # the rows a product of 4-bit weights takes by byte dots (decoding); more are widened to BF16 for AddDot
 Gemv4 I64 = 16
+
+# the rows a product of 8-bit weights takes by byte dots; more are widened (the reordering costs more than widening)
+Gemv8 I64 = 4
 
 # rows 0 .. real of x (BF16, In apart) in 8 bits: a scale a group of 32 (its largest magnitude 127) into xs, the values
 # rounded and shifted by 128 into bytes, and each group's sum (of the values as the bytes give them back) after the
@@ -1156,6 +1169,45 @@ fn gemv4(dst mut Array<F32>&, w Linear&, real I64, b0 I64, b1 I64, qx Array<U8>&
         }
         for r in range real {
             for n in range 16: dst[r * w.Out + cb * 16 + n] = acc[r * 16 + n]
+        }
+    }
+}
+
+# blocks b0 .. b1 of dst = x W^T for rows 0 .. real, W in 8 bits (packed, a scale per 32), x in 8 (quant8): a group's
+# 32 inputs of 16 outputs reordered from AddDot's pairs into fours (w8), then eight VNNI steps a row as gemv4's
+fn gemv8(dst mut Array<F32>&, w Linear&, real I64, b0 I64, b1 I64, qx Array<U8>&, xs Array<F32>&, acc mut Array<F32>&) {
+    ng := w.In / 32
+    row := 2 * w.Nb
+    lanes := tile4()
+    for cb in range b0 * w.Nb / 16, b1 * w.Nb / 16 {
+        o0, n0 := cb * 16, cb * 16 % w.Nb
+        base := (o0 / w.Nb) * w.In * w.Nb + 2 * n0
+        for i in range real * 16: acc[i] = 0.0
+        for g in range ng {
+            for c in range 8 {
+                q :~ w.Q[base + (16 * g + 2 * c) * row:]
+                d :~ lanes.w8[64 * c:64 * c + 64]
+                for n in range 16 {
+                    d[4 * n] = q[2 * n]
+                    d[4 * n + 1] = q[2 * n + 1]
+                    d[4 * n + 2] = q[row + 2 * n]
+                    d[4 * n + 3] = q[row + 2 * n + 1]
+                }
+            }
+            for r in range real {
+                ai :~ lanes.ai[r * 16:r * 16 + 16]
+                for n in range 16: ai[n] = 0
+                xg :~ qx[r * w.In + 32 * g:]
+                comptime for c in range 8: ai += (xg[4 * c:4 * c + 4] * lanes.w8[64 * c:64 * c + 64]).Sum<I32>(4)
+                sx := xs[r * ng + g]
+                for n in range 16 {
+                    a := (o0 + n) * ng + g
+                    acc[r * 16 + n] += sx * w.Scale[a] * F32(ai[n] - 128 * I32(w.C8[a]))
+                }
+            }
+        }
+        for r in range real {
+            for n in range 16: dst[r * w.Out + o0 + n] = acc[r * 16 + n]
         }
     }
 }
@@ -1238,6 +1290,7 @@ type tile4 struct() {
     acc := Array<F32>(16)
     b := Array<BF16>(64)
     ai := Array<I32>(256)
+    w8 := Array<I8>(512)
 }
 
 # the rotation of each row's position: cos and sin of position x freq[i]
@@ -2296,17 +2349,21 @@ test Model "4-bit weights: the logits near transformers' and the first greedy to
     }
 }
 
-# 4-bit weights' products: byte dots (one row, a few) and the widened AddDot against the weights read one by one (Get),
+# 4- and 8-bit weights' products: byte dots (one row, a few) and the widened AddDot against the weights read one by one (Get),
 # activations with outliers
-test Linear "4-bit products by byte dots and by widening agree with the weights read one by one" {
+test Linear "4- and 8-bit products by byte dots and by widening agree with the weights read one by one" {
     if not TargetHasTileDot: return
     r := rand.Rand(7)
-    for shape in [[1152, 64], [6912, 32], [256, 48]] {
-        w := Linear(shape[0], shape[1], 16, true, Int4 = true)
+    for shape in [[1152, 64, 16, 4], [6912, 32, 16, 4], [256, 48, 16, 4], [1152, 64, 32, 8], [256, 96, 48, 8]] {
+        bits := shape[3]
+        w := Linear(shape[0], shape[1], shape[2], true, Int8 = bits == 8, Int4 = bits == 4)
         row := Array<F32>(w.In)
         for o in range w.Out {
             for i in range w.In: row[i] = F32(r.Normal() * 0.05 + (0.02 if o % 3 == 0 else 0.0))
-            for g0 in range 0, w.In, 32: w.put4(o, g0, row, g0)
+            for g0 in range 0, w.In, 32 {
+                if bits == 4: w.put4(o, g0, row, g0)
+                else: w.put8(o, g0, row, g0)
+            }
         }
         for rows in [1, 5, 20] {
             rp := roundUp(rows, 16)
