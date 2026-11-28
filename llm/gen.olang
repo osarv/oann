@@ -2,6 +2,7 @@
 #
 #     oann-gen MODEL prompts.jsonl out.jsonl [--n K] [--temp T] [--top-p P] [--top-k K] [--max-tokens M] [--batch B]
 #              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--int4] [--kv8] [--exact]
+#              [--device gpu]
 #
 # MODEL is a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors or its shards),
 # a GGUF file (llm/gguf: its weights widened to BF16, or requantized to INT8, as they load),
@@ -17,6 +18,11 @@
 # out.jsonl are not made again, and each completion draws from a generator seeded by --seed, its id and its sample,
 # so a resumed job writes what an uninterrupted one would. Sampling defaults are the model's generation_config.json.
 # Progress goes to standard error.
+#
+# --device gpu runs the model on the CUDA device (llm/gpu: the weights in BF16 and the cache on the device, sampling
+# here), where oann-gen was built with -define Gpu=true (make oanngen does where the CUDA toolkit is installed). The
+# cache takes the device's memory left after the weights, less 1.5 GB for the display and the step's buffers; --kv-gb
+# says otherwise.
 
 import "std/flags"
 import "std/io"
@@ -29,6 +35,40 @@ import "engine"
 import "gguf"
 import "model"
 import "vision"
+
+Gpu Bool = false
+
+if Gpu {
+    import "gpu"
+    import gdev "../kernels/gpu/device"
+
+    theDev mut gdev.Device?& = null
+    theDec mut gpu.Decoder?& = null
+
+    # the device opened, for m: the bytes of its memory left for the cache
+    fn gpuOpen(m model.Model&) I64 {
+        why := gpu.Refusal(m)
+        if why != "": fail("--device gpu does not run this model: " + why)
+        theDev ~ try gdev.Device.Open() catch e { fail("--device gpu: " + $e) }
+        say("device: " + theDev!.Str() + ", weights " + $(gpu.WeightBytes(m) / 1048576) + " MB")
+        return theDev!.MiB * 1048576 - gpu.WeightBytes(m) - 1536 * 1048576
+    }
+
+    # m on the device, for e's steps
+    fn gpuLoad(m model.Model&, e engine.Engine&, maxCtx I64) {
+        t0 := time.Now()
+        theDec ~ try gpu.Decoder.Make(theDev!, m, e.State.Rows, e.Batch, e.Cache, maxCtx) catch err { fail("--device gpu: " + $err + " (a smaller --kv-gb, --batch or --ctx may fit)") }
+        say("on the device: " + $(theDec!.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+    }
+
+    fn gpuStep(m model.Model&, e mut engine.Engine&) {
+        try theDec!.Step(m, e.State, e.Cache) catch err { fail("--device gpu: " + $err) }
+    }
+} else {
+    fn gpuOpen(m model.Model&) I64 { fail("--device gpu: this oann-gen was built without the GPU (build it with -define Gpu=true: make oanngen where the CUDA toolkit is installed)") }
+    fn gpuLoad(m model.Model&, e engine.Engine&, maxCtx I64) { }
+    fn gpuStep(m model.Model&, e mut engine.Engine&) { }
+}
 
 type job struct(id String&, sample I64, prompt Array<I32>&, images Array<F32>&) {
     id                  # the id as JSON text
@@ -140,6 +180,7 @@ fn main() {
     kv8 := p.Bool("kv8", 0, "keys and values in 8 bits, a scale per position and head: about half the cache (AMX)")
     int8 := p.Bool("int8", 0, "8-bit weights, a scale per 32 inputs (the head stays BF16): about 0.56 of the memory; needs AMX")
     int4 := p.Bool("int4", 0, "4-bit weights, a scale per 32 inputs (the head stays BF16): about a third of the memory, faster decoding; needs AMX")
+    deviceName := p.Text("device", 0, "cpu", "cpu, or gpu: the model on the CUDA device (BF16; a build with -define Gpu=true)")
     try p.Parse(os.Args()) catch flags.Error.Help {
         try io.Put(p.Help()) catch { }
         return
@@ -153,7 +194,11 @@ fn main() {
     t0 := time.Now()
     tok := try tokenizer(dir) catch { fail("cannot read the tokenizer of " + dir) }
     ch := chat.Chat.Load(dir, tok)
-    m := try model.Model.Load(dir, exact.Get(), int8.Get(), int4.Get()) catch { fail("cannot load the model in " + dir) }
+    onGpu := deviceName.Get() == "gpu"
+    if not onGpu and deviceName.Get() != "cpu": fail("--device is cpu or gpu")
+    if onGpu and (int8.Get() or int4.Get() or kv8.Get() or exact.Get()): fail("--device gpu runs BF16 alone: not with --int8, --int4, --kv8 or --exact")
+    # (the device reads the weights row-major: loaded as --exact loads them, without AMX's packing)
+    m := try model.Model.Load(dir, exact.Get() or onGpu, int8.Get(), int4.Get()) catch { fail("cannot load the model in " + dir) }
     say("loaded " + dir + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(m.Bytes() / 1048576) + " MB" + (" (INT8)" if m.Int8 else (" (INT4)" if m.Int4 else "")) + ", " +
         ("AMX tiles" if m.Tile else "F32 products") + ", " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
     # what is done already
@@ -226,10 +271,13 @@ fn main() {
     }
     maxCtx := ctx.Get() if ctx.Get() > 0 else longest + maxNew.Get()
     maxCtx = maxCtx.Min(m.C.MaxPos)
-    budget := I64(kvGb.Get() * 1073741824.0) if kvGb.Get() > 0.0 else (available() - 1073741824) * 9 / 10
+    budget := (available() - 1073741824) * 9 / 10
+    if onGpu: budget = gpuOpen(m)
+    if kvGb.Get() > 0.0: budget = I64(kvGb.Get() * 1073741824.0)
     pages := engine.PagesFor(m.C, budget, kv8.Get() and m.Tile).Min(batch.Get() * (maxCtx / model.PageSize + 1))
     if pages < maxCtx / model.PageSize + 1: fail("no room for one sequence of " + $maxCtx + " positions in " + $(budget / 1048576) + " MB")
-    e := engine.Engine(m, batch.Get(), maxCtx, pages, Exact = exact.Get(), Kv8 = kv8.Get())
+    e := engine.Engine(m, batch.Get(), maxCtx, pages, Exact = exact.Get(), Kv8 = kv8.Get(), Device = onGpu)
+    if onGpu: gpuLoad(m, e, maxCtx)
     tt := ch.Temp if temp.Get() < 0.0 else temp.Get()
     tp := ch.TopP if topP.Get() < 0.0 else topP.Get()
     tk := ch.TopK if topK.Get() < 0 else topK.Get()
@@ -248,7 +296,11 @@ fn main() {
     last := start
     done I64 = 0
     for not e.Idle() {
-        for d in e.Step() {
+        if e.Begin() {
+            if onGpu: gpuStep(m, e)
+            else: m.Step(e.State, e.Cache)
+        }
+        for d in e.End() {
             jb := jobs[d.Id]
             body := try tok.Decode(d.Tokens) catch default ""
             line := "{\"id\": " + jb.id + ", \"sample\": " + $jb.sample + ", \"text\": " + json.Encode(opening + body) +

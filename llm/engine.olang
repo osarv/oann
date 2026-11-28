@@ -53,14 +53,15 @@ type seq struct(req Request, slot I64) {
     for t in req.Prompt: toks.Push(t)
 }
 
-type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 = 256, Exact Bool = false, Kv8 Bool = false) {
+type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 = 256, Exact Bool = false, Kv8 Bool = false, Device Bool = false) {
     m
     Batch                   # sequences at once
     MaxCtx                  # positions a sequence may have, prompt and completion
     Chunk                   # prompt rows a step
+    Device                  # the model runs on a device (llm/gpu): the cache here is its page table alone
     Sampling Sampler = Sampler()
     Stops mut Vec<I32>& = Vec<I32>()
-    Cache mut model.Cache& = model.Cache(m.C, Pages, Batch, MaxCtx / model.PageSize + 1, Exact, Kv8 and m.Tile)
+    Cache mut model.Cache& = model.Cache(m.C, Pages, Batch, MaxCtx / model.PageSize + 1, Exact, Kv8 and m.Tile, Device)
     State mut model.State& = model.State(m, Batch + Chunk, Batch, MaxCtx + model.PageSize)
     queue mut Vec<Request>& = Vec<Request>()        # waiting, in order, from head
     head I64 = 0
@@ -74,6 +75,8 @@ type Engine struct(m model.Model&, Batch I64, MaxCtx I64, Pages I64, Chunk I64 =
     ran mut Array<I64>& = Array<I64>(Batch)                 # each sequence's rows this step
     keys mut Array<I64>& = Array<I64>(m.C.Vocab)
     rngs mut Array<rand.Rand>& = Array<rand.Rand>[rand.Rand(U64(i)) for i in range Batch]  # each slot's generator
+    done mut Vec<Done>& = Vec<Done>()               # finished since the last End
+    stepped Bool = false                            # Begin set rows: End samples them
     Tokens I64 = 0          # tokens generated
     Preempted I64 = 0
     Steps I64 = 0
@@ -169,7 +172,15 @@ fn (e mut Engine&) grow(i I64, n I64) Bool {
 # one step: admits what fits, runs a row for every sequence being decoded and prompt rows up to Chunk, samples, and
 # gives the requests that finished
 fn (e mut Engine&) Step() Array<Done> {
-    finished := Vec<Done>()
+    if e.Begin(): e.m.Step(e.State, e.Cache)
+    return e.End()
+}
+
+# a step's first half, for a model run elsewhere (the GPU's, llm/gpu): admits what fits and sets the step's rows in
+# State (and their pages in Cache's table). True where there are rows: the model then runs on State and Cache, and End
+# samples; End is called either way
+fn (e mut Engine&) Begin() Bool {
+    finished :~ e.done
     e.admit()
     for d in e.refused.View(): finished.Push(d)
     e.refused.Clear()
@@ -203,7 +214,7 @@ fn (e mut Engine&) Step() Array<Done> {
             }
             if e.running.Len() < before {
                 # a preemption moved the sequences: start the step's rows over
-                return e.restart(finished)
+                return e.Begin()
             }
             s2 := e.running[i]
             for q in range n {
@@ -222,8 +233,20 @@ fn (e mut Engine&) Step() Array<Done> {
             i++
         }
     }
-    if st.N == 0: return finished.ToArray()
-    e.m.Step(st, e.Cache)
+    e.stepped = st.N > 0
+    return e.stepped
+}
+
+# a step's second half: the rows' logits (State.Logits) sampled, and the requests that finished since Begin
+fn (e mut Engine&) End() Array<Done> {
+    finished :~ e.done
+    st :~ e.State
+    if not e.stepped {
+        none := finished.ToArray()
+        finished.Clear()
+        return none
+    }
+    e.stepped = false
     e.Steps++
     # the rows' sequences move on: their positions are cached, and a row at a sequence's last token samples the next
     for i in range e.running.Len() {
@@ -259,7 +282,9 @@ fn (e mut Engine&) Step() Array<Done> {
         }
         i++
     }
-    return finished.ToArray()
+    all := finished.ToArray()
+    finished.Clear()
+    return all
 }
 
 # n prompt rows from position at, cut so that no image's run of tokens is split over two steps (its rows attend to
@@ -284,13 +309,6 @@ fn imageRow(toks Vec<I32>&, pos I64, img I64) I64, I64 {
     last := pos
     for last + 1 < toks.Len() and I64(toks[last + 1]) == img: last++
     return at, last
-}
-
-# a step begun again after a preemption changed the batch
-fn (e mut Engine&) restart(finished mut Vec<Done>&) Array<Done> {
-    more := e.Step()
-    for d in more: finished.Push(d)
-    return finished.ToArray()
 }
 
 # a token from logits by the sampling settings sp, drawn from r; keys is scratch of the vocabulary's size

@@ -14,6 +14,7 @@ completions of a file of prompts as one long, resumable job. Nothing here trains
 | `engine.olang` | `Engine`, continuous batching: requests admitted as slots and pages allow, prompts read in chunks beside the sequences being decoded, preemption when the pages run out; `Sample` (temperature, top-k, top-p) |
 | `chat.olang` | `Chat`: the model's own chat template run by `jinja.olang` (`Render`: messages, tool schemas, tool calls; `Prompt`: one user turn), with hard-coded ChatML, DeepSeek-R1, Llama 3, Granite and Gemma prompts where a directory has no template; stop tokens and sampling defaults; `Fetch` from Hugging Face |
 | `jinja.olang` | `Template`: the Jinja2 subset Hugging Face chat templates are written in, parsed once and rendered with a context of `Val`s, as transformers' environment renders them |
+| `gpu.olang` | `Decoder`: `Step`'s work on a CUDA device, for the engine's batches (below, "On the GPU"); built only with `-define Gpu=true` |
 | `gen.olang` | `oann-gen` |
 | `tools/reference.py`, `tools/tokref.py`, `tools/chatref.py`, `tools/ggufref.py`, `tools/visionref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
@@ -64,6 +65,7 @@ a step never reads another row, so a completion does not depend on the batch it 
 | `--int4` | 4-bit weights, a scale and an offset per 32 inputs (the down projections 8-bit, the head BF16): about 40% of the memory, and decoding a few sequences 1.5-2x as fast; needs AMX |
 | `--kv8` | values in the cache in 8 bits, a scale per position and head: 0.76 of the cache's memory, needs AMX |
 | `--exact` | F32 activations and cache: slow, for checking against a reference |
+| `--device gpu` | the model on the CUDA device, BF16 (below, "On the GPU"); `make oanngen` builds it in where the CUDA toolkit is installed |
 
 ## How it works
 
@@ -157,6 +159,28 @@ statements, operators, filters, tests and string and dict methods - is listed at
 applies the whitespace control to the text between tags, a recursive-descent parser with Jinja's precedence builds
 expressions, statements and blocks into arrays that refer to each other by index, and the render walks them with a
 stack of scopes (a for loop's body and a macro's are scopes of their own, as in Jinja).
+
+### On the GPU
+
+`oann-gen --device gpu` runs the engine's steps on a CUDA device (`gpu.olang`). The weights go up once, in BF16 and
+row-major; the keys and values of every page live on the device alone, in BF16 (the engine's `Cache` keeps the page
+table and the free pages); each step sends up its rows - tokens, positions, slots, the page table, the rotations'
+angles - and brings down the logits of the rows that want them, which the host samples as before. A layer is four
+cuBLASLt products (BF16 by BF16 summed in F32, planned once for each row count, a multiple of 8, and used by every
+layer) and seven kernels of `kernels/gpu/src/llm.cu`, one short launch each: the norm into BF16; the heads' QK-norm
+and rotation with the keys and values written into their pages; the attention, a block for each row's head over its
+sequence's pages (scores, softmax and the weighted values); the residual add; the gated perceptron's activation.
+
+It runs the dense decoders whose rows attend to every earlier position (Qwen3, Qwen2, Llama, Mistral, Granite,
+SmolLM3, Phi) in BF16, and refuses the rest by name: INT8 and INT4 weights, the mixtures of experts, sliding windows,
+Gemma's post-norms and GELU, OLMoE's wide QK-norm, images. The cache takes the device's memory left after the weights,
+less 1.5 GB for the display and a step's buffers (`--kv-gb` says otherwise): a page is `PageBytes`, as on the CPU -
+Qwen3-1.7B's 115 KB a token after 3.4 GB of weights, so about 2.5 GB, 22 thousand cached tokens, on an 8 GB device.
+When the pages run out the engine preempts as it does on the CPU.
+
+`make gputest` holds the device's logits to the CPU's on tiny models (QK-norm and a tied head; biases and a head of
+its own; a padded vocabulary) over 70 steps of two sequences crossing a page; `make gpullm ARGS=MODEL_DIR` does the
+same for a real model and then times batches.
 
 ## Checks
 

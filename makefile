@@ -24,7 +24,7 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 GPUDEFINE = $(if $(filter 0,$(GPU)),,$(if $(wildcard /usr/include/cuda_runtime_api.h),-define Gpu=true,))
 
 # the GPU backend's tests: the CPU's tests run green either way (they plan on the CPU); these need the define
-GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang ad/gpu_test.olang
+GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang ad/gpu_test.olang llm/gpu.olang
 
 # where WSL keeps its libcuda.so.1, put first on the loader's path for the GPU targets: a native Linux driver package
 # installed beside the toolkit (libnvidia-compute) can shadow WSL's in the loader's cache, and CUDA then finds no
@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -105,6 +105,12 @@ arenaad:
 gpulm:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_gpulm bench/gpulm.olang
 	$(GPUENV) ./build/bench_gpulm $(ARGS)
+
+# a language model's decoding on the GPU (llm/gpu) checked against the CPU's step, then tokens a second by batch
+# (bench/gpullm.olang) - ARGS: MODEL_DIR [steps] [batch ...]
+gpullm:
+	$(OLANG) build -define Gpu=true -output build/bench_gpullm bench/gpullm.olang
+	$(GPUENV) ./build/bench_gpullm $(ARGS)
 
 # a mixture-of-experts layer (nn/moe on the device) against the dense gated perceptron of its active size: median steps
 # and the mixture's cost over the dense layer's (bench/gpumoe.olang) - ARGS: tokens steps f32|bf16 experts k D...
@@ -181,7 +187,7 @@ oannlisten:
 # oann-gen: completions of a JSON-lines file of prompts by an open-weight model (llm/gen.olang, llm/README.md), built
 # to build/oann-gen - ARGS: MODEL prompts.jsonl out.jsonl and its flags (none: only builds it)
 oanngen:
-	$(OLANG) build -output build/oann-gen llm/gen.olang
+	$(OLANG) build $(GPUDEFINE) -output build/oann-gen llm/gen.olang
 	$(if $(ARGS),./build/oann-gen $(ARGS),)
 
 # Whisper's real-time factor (bench/speech.olang) - ARGS: MODEL_DIR CLIP.wav [rounds] [threads ...]
