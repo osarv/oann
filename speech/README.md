@@ -9,6 +9,7 @@ committed, as in `llm/`.
 |---|---|
 | `mel.olang` | `Wav` (16-bit PCM WAVE, any rate, resampled to 16 kHz), `Mel` (log-mel: Hann window 400, hop 160, Slaney's filters, the DFT as a matrix product), `Mel.Clip` (Whisper's input, as Hugging Face's feature extractor makes it) |
 | `whisper.olang` | `Model.Load` (config.json, model.safetensors), `Encode` (the convolutions and blocks over 1500 positions, or fewer), `Decoder` (cross-attention keys and values, a cache of the decoder's own, beams in slots), `Step` |
+| `whispervk.olang` | `Runner`: `Encode`, `Cross` and `Step` on a Vulkan device (kernels/vk, docs/vulkan.md; a build with `-define Vulkan=true`), checked against the CPU |
 | `transcribe.olang` | `Whisper`: the prompt and language detection, the logit rules (suppressed tokens, timestamp rules), greedy and beam decoding, `Cut` (segments), `Transcribe` (clips of any length), `Stream` (sound as it comes) |
 | `kws.olang` | the wake word: features, the network (`Spotter`), `Train`, `Detector` (a threshold over smoothed scores, a refractory second) |
 | `speak.olang` | `Voice.Load("en" or "sv")`, `Speak(text)`: our G2P (`g2p.olang`), then a Piper voice (`vits.olang`), samples at `Rate` (22050); `To16k` |
@@ -35,7 +36,9 @@ MODEL is a directory or a Hugging Face repository, fetched once into `$OANN_MODE
 half the memory, AMX products where the CPU has them), `--threads T`, `--positions N` (a shorter encoder window: faster
 on short commands, not the reference; `Text` keeps at least 3 s of silence after the sound, without which the model
 never ends and repeats itself; `Options.NoRepeat` also stops greedy decoding at a phrase come three times running),
-`--max-tokens`; with `--wake`: `--threshold`, `--pause`, `--longest`, `--quiet`.
+`--max-tokens`, `--device cpu|vulkan|vulkan-encoder` (the products on any GPU with a Vulkan driver, or the encoder alone
+there; a build with `-define Vulkan=true`; lightly tested and not yet timed on a real GPU: docs/vulkan.md), `--time`;
+with `--wake`: `--threshold`, `--pause`, `--longest`, `--quiet`.
 
 For the Pi: `olang build -target aarch64-linux-gnu -output build/oann-listen speech/listen.olang` (clang 19 or newer and
 the arm64 C library, olang's docs/install.md), then copy the binary over.

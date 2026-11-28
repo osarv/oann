@@ -15,6 +15,7 @@
 
 import "../kernels/vk/device"
 import "../kernels/vk/kern"
+import "mel"
 import "whisper"
 
 # a block's arrays on the device, in this order: piece(b, i)
@@ -480,4 +481,44 @@ test Runner "a random Whisper on the device against the CPU: the encoded positio
     }
     Println("decoder on " + d.Name + ": logits within " + $worst + " of the CPU's")
     assert worst < 1e-4, "logits off by " + $worst
+}
+
+test Runner "whisper-tiny's weights on the device (where the model is fetched): the encoded 1500 positions and a prompt's and three steps' logits within 1e-3 of the CPU's" {
+    dir := mel.Cache() + "/models/openai--whisper-tiny"
+    m := try whisper.Model.Load(dir) catch {
+        Println("skipped: no " + dir)
+        return
+    }
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("whisper-tiny on the device")
+        return
+    }
+    c := m.C
+    n := c.Positions
+    r := try Runner.Make(d, m, 1, 8, 1)
+    e := whisper.Encoder(m, n)
+    k := whisper.Decoder(m, 1, 8, 1)
+    kd := whisper.Decoder(m, 1, 8, 1, false)
+    spec := Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.0005 for i in range c.Mels * 2 * n]
+    m.Encode(e, spec, n)
+    r.Encode(spec, n)
+    got := Array<F32>(n * c.Dim)
+    try r.Encoded(got)
+    eg := gap(e.Out, got, n * c.Dim)
+    m.Cross(k, e.Out, n)
+    r.Cross()
+    worst F64 = 0
+    for step in range 4 {
+        k.Reset()
+        kd.Reset()
+        for i in range (4 if step == 0 else 1) {
+            p := i if step == 0 else 3 + step
+            tok := I32(50258 + i) if step == 0 else I32(400 + 91 * step)
+            k.Add(tok, p, 0)
+            kd.Add(tok, p, 0)
+        }
+        worst = worst.Max(try both(m, r, k, kd, 1))
+    }
+    Println("whisper-tiny on " + d.Name + ": encoder within " + $eg + ", logits within " + $worst)
+    assert eg < 1e-3 and worst < 1e-3, "encoder " + $eg + ", logits " + $worst
 }

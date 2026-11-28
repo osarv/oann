@@ -47,18 +47,29 @@ pass on the device against the CPU (logits within 1e-6 on lavapipe).
 
 Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
 
+## Whisper on it
+
+`speech/whispervk` runs speech/whisper's `Encode`, `Cross` and `Step` on a device: the weights (F32), every array of
+the encoder and of a decoder's step, the decoder's cache of keys and values and the cross-attention's keys and values
+are device buffers; a step sends its rows' tokens and positions up and brings its logits back, one `Sync` a step.
+`speech/transcribe` chooses with `Whisper.LoadOn(dir, Backend.Vulkan)` (or `Backend.VulkanEncoder`: the encoder on the
+device, the decoder on the CPU), `oann-listen --device vulkan`. Against the CPU on software Vulkan: a random model's
+logits within 3e-6, whisper-tiny's within 2e-4, and the same transcript.
+
+Speed is not known on a real GPU. On software Vulkan (llvmpipe, 4 cores) it is slower than the CPU's kernels, as it
+must be: the small shape's encoder over 30 s takes 15.0 s against 1.6 s, a greedy step 122 ms against 44 ms
+(`make whispervk ARGS="small 3"`). Whether an integrated GPU beats the CPU is for that bench to say on one; the
+product (item 1 below) is the encoder's whole cost, and a step is about 25 small dispatches a layer, so a device's
+cost a dispatch decides the decoder.
+
 ## What comes next
 
 1. **A faster product.** An invocation computes a 4 x 4 block of the result, reading four elements of each operand a
    step of the depth for sixteen products (5x the one-element form on llvmpipe; `make vkgemm`). Next, measured on real
    GPUs first: tiles of the operands staged in workgroup memory, and the block's size by device.
-2. **Whisper on it** (first: transcription on an office laptop's integrated GPU): speech/whisper's `Encode` and `Step`
-   with their arrays on the device - `Patches` and `Gemm` for the two convolutions, `Map` GELU, `LayerNorm`, `GemmBatch`
-   and `Softmax` for the attention, the decoder's key and value cache as device buffers - behind a device choice in
-   speech/transcribe, checked against the CPU's logits.
-3. **LLM decoding on it**: `llm/gpu`'s decoder (the paged cache, rotary positions, QK-norm) on `kernels/vk`, and
+2. **LLM decoding on it**: `llm/gpu`'s decoder (the paged cache, rotary positions, QK-norm) on `kernels/vk`, and
    `device.Backend.Vulkan` in `kernels/device` once plans run there.
-4. **Half precision** where the device has `shaderFloat16` and 16-bit storage (BF16 has no Vulkan form: F16).
-5. **Training**: ad/mirror's backward kernels and AdamW, kernel by kernel.
-6. **Windows and Android builds** of the shim (the loader's name is already chosen per target), and a Metal backend
+3. **Half precision** where the device has `shaderFloat16` and 16-bit storage (BF16 has no Vulkan form: F16).
+4. **Training**: ad/mirror's backward kernels and AdamW, kernel by kernel.
+5. **Windows and Android builds** of the shim (the loader's name is already chosen per target), and a Metal backend
    for Apple.
