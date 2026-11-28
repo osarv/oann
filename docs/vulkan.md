@@ -49,8 +49,9 @@ Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
 
 ## What comes next
 
-1. **A fast product.** The product computes one element an invocation, reading its operands straight from the buffers
-   (measured by `make vkgemm`). Next: tiles of the operands staged in workgroup memory, several elements an invocation.
+1. **A faster product.** An invocation computes a 4 x 4 block of the result, reading four elements of each operand a
+   step of the depth for sixteen products (5x the one-element form on llvmpipe; `make vkgemm`). Next, measured on real
+   GPUs first: tiles of the operands staged in workgroup memory, and the block's size by device.
 2. **`device.Backend.Vulkan`**: `kernels/device` chooses it where the build has it and CUDA is absent, so a script's
    `SetDefault` line is unchanged.
 3. **Inference on it**: `llm/gpu`'s decoder (the paged cache, rotary positions, QK-norm) and Whisper's forward pass on

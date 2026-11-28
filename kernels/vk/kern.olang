@@ -8,7 +8,7 @@
 # Sync's error. Operands are views (device.DMat, device.DBatch) or a buffer with an offset; nothing is checked but what
 # the device itself limits (asserted).
 #
-# Against the CPU. Sums are taken one element after another in each kernel, where kernels/gemm sums in lanes, so a
+# Against the CPU. Sums are taken one term after another in each kernel, where kernels/gemm sums in lanes, so a
 # product agrees with the CPU's to rounding (tests: within depth x eps), not bit for bit; +, -, * and / are IEEE's and
 # never fused; exp and tanh are the driver's, a few units in the last place from kernels/elem's.
 #
@@ -73,6 +73,9 @@ fn (k Kernel&) Run(d mut device.Device&, x I64, y I64, z I64, bufs Array<U64>&, 
 Line I64 = 64
 Tile I64 = 8
 
+# the rows and the columns of a product one invocation computes
+Block I64 = 4
+
 fn groups(n I64, per I64) I64 { return (n + per - 1) / per }
 
 fn u(x I64) U32 { return U32(x) }
@@ -80,7 +83,9 @@ fn f(x F32) U32 { return x.Bits() }
 
 # ---- the kernels, written ----
 
-# C = alpha op(A) op(B) + beta C over a batch: invocation (x, y, z) is column x and row y of matrix z
+# C = alpha op(A) op(B) + beta C over a batch: invocation (x, y, z) is the Block x Block elements of matrix z from
+# row Block y and column Block x - each step of the depth reads Block elements of each operand for Block^2 products,
+# every element's sum still taken in the depth's order
 fn gemmKernel() spirv.Kernel {
     k := spirv.Kernel.Begin(Tile, Tile)
     a := k.Buffer(spirv.Ty.F32)
@@ -106,10 +111,10 @@ fn gemmKernel() spirv.Kernel {
     tb := k.Param(spirv.Ty.U32)
     alpha := k.Param(spirv.Ty.F32)
     beta := k.Param(spirv.Ty.F32)
-    j := k.GlobalId(0)
-    i := k.GlobalId(1)
+    j0 := k.Mul(k.GlobalId(0), k.U(Block))
+    i0 := k.Mul(k.GlobalId(1), k.U(Block))
     z := k.GlobalId(2)
-    k.If(k.And(k.Lt(i, m), k.Lt(j, n)))
+    k.If(k.And(k.Lt(i0, m), k.Lt(j0, n)))
     g := k.Div(z, members)
     mm := k.Mod(z, members)
     a0 := k.Add(aOff, k.Add(k.Mul(g, aGs), k.Mul(mm, aMs)))
@@ -118,24 +123,46 @@ fn gemmKernel() spirv.Kernel {
     # op(A)'s (i, p) is a0 + i lda + p, or transposed a0 + p lda + i; op(B)'s (p, j) is b0 + p ldb + j, or b0 + j ldb + p
     at := k.Ne(ta, k.U(0))
     bt := k.Ne(tb, k.U(0))
-    aBase := k.Add(a0, k.Select(at, i, k.Mul(i, lda)))
     aStep := k.Select(at, lda, k.U(1))
-    bBase := k.Add(b0, k.Select(bt, k.Mul(j, ldb), j))
     bStep := k.Select(bt, k.U(1), ldb)
-    acc := k.Let(k.F(0))
+    # the block's rows and columns, those past the matrix's edge read as its last (and are not written)
+    lastRow := k.Sub(m, k.U(1))
+    lastCol := k.Sub(n, k.U(1))
+    aBase := Vec<spirv.Val>()
+    bBase := Vec<spirv.Val>()
+    for q in range Block {
+        i := k.Least(k.Add(i0, k.U(q)), lastRow)
+        j := k.Least(k.Add(j0, k.U(q)), lastCol)
+        aBase.Push(k.Add(a0, k.Select(at, i, k.Mul(i, lda))))
+        bBase.Push(k.Add(b0, k.Select(bt, k.Mul(j, ldb), j)))
+    }
+    acc := Vec<spirv.Var>()
+    for _ in range Block * Block: acc.Push(k.Let(k.F(0)))
     p := k.Var(spirv.Ty.U32)
     k.For(p, k.U(0), depth)
-    pv := k.Get(p)
-    av := k.Read(a, k.Add(aBase, k.Mul(pv, aStep)))
-    bv := k.Read(b, k.Add(bBase, k.Mul(pv, bStep)))
-    k.Set(acc, k.Add(k.Get(acc), k.Mul(av, bv)))
+    pa := k.Mul(k.Get(p), aStep)
+    pb := k.Mul(k.Get(p), bStep)
+    av := Vec<spirv.Val>()
+    bv := Vec<spirv.Val>()
+    for q in range Block {
+        av.Push(k.Read(a, k.Add(aBase[q], pa)))
+        bv.Push(k.Read(b, k.Add(bBase[q], pb)))
+    }
+    for q in range Block * Block: k.Set(acc[q], k.Add(k.Get(acc[q]), k.Mul(av[q / Block], bv[q % Block])))
     k.Next(p)
-    ci := k.Add(c0, k.Add(k.Mul(i, ldc), j))
-    k.If(k.Eq(beta, k.F(0)))
-    k.Write(c, ci, k.Mul(alpha, k.Get(acc)))
-    k.Else()
-    k.Write(c, ci, k.Add(k.Mul(alpha, k.Get(acc)), k.Mul(beta, k.Read(c, ci))))
-    k.EndIf()
+    keep := k.Eq(beta, k.F(0))
+    for q in range Block * Block {
+        i := k.Add(i0, k.U(q / Block))
+        j := k.Add(j0, k.U(q % Block))
+        k.If(k.And(k.Lt(i, m), k.Lt(j, n)))
+        ci := k.Add(c0, k.Add(k.Mul(i, ldc), j))
+        k.If(keep)
+        k.Write(c, ci, k.Mul(alpha, k.Get(acc[q])))
+        k.Else()
+        k.Write(c, ci, k.Add(k.Mul(alpha, k.Get(acc[q])), k.Mul(beta, k.Read(c, ci))))
+        k.EndIf()
+        k.EndIf()
+    }
     k.EndIf()
     return k
 }
@@ -394,7 +421,7 @@ fn (s Set&) GemmBatch(d mut device.Device&, c device.DBatch<F32>&, a device.DBat
     p := Array<U32>[u(c.Rows), u(c.Cols), u(depth), u(c.Members), u(a.Off), u(a.Ld), u(a.GroupStride), u(a.MemberStride)
         u(b.Off), u(b.Ld), u(b.GroupStride), u(b.MemberStride), u(c.Off), u(c.Ld), u(c.GroupStride), u(c.MemberStride)
         u(1 if ta else 0), u(1 if tb else 0), f(alpha), f(beta)]
-    s.product.Run(d, groups(c.Cols, Tile), groups(c.Rows, Tile), c.Groups * c.Members, Array<U64>[a.Data.Handle(), b.Data.Handle(), c.Data.Handle()], p)
+    s.product.Run(d, groups(c.Cols, Tile * Block), groups(c.Rows, Tile * Block), c.Groups * c.Members, Array<U64>[a.Data.Handle(), b.Data.Handle(), c.Data.Handle()], p)
 }
 
 # c = alpha op(a) op(b) + beta c, kernels/gemm's Gemm
