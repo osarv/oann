@@ -2412,6 +2412,23 @@ fn (g Graph<T>&) positions() I64 {
 }
 
 # runs every node in the order recorded, on the first n entries of the batch (decoding: positions Pos ... Pos + n - 1)
+# while decoding a batch of sequences on the CPU: sequence `from`'s cached keys and values of positions 0 .. n - 1
+# copied over sequence `to`'s, in every attention - a beam search's reordering of its hypotheses between steps
+fn (g mut Graph<T>&) CopyCache(from I64, to I64, n I64) {
+    if not g.Decode or not g.onCpu or from == to: return
+    for i in range g.nodes.Len() {
+        nd := g.nodes[i]
+        if nd.Kind != Op.Attention: continue
+        ctx, d := nd.Dims[1], nd.Dims[2]
+        base := nd.SavedOffset
+        for half in range 2 {
+            src := base + from * 2 * ctx * d + half * ctx * d
+            dst := base + to * 2 * ctx * d + half * ctx * d
+            for j in range n.Min(ctx) * d: g.vals[i].mem[dst + j] = g.vals[i].mem[src + j]
+        }
+    }
+}
+
 fn (g mut Graph<T>&) Forward(n I64) {
     if not g.planned or g.problem != "": unreachable "oann: Forward of a graph not planned, or with a shape that did not fit: " + $g.problem
     limit := g.positions() if g.Decode else g.Batch
@@ -4280,6 +4297,29 @@ test Graph "decoding with a cache of keys and values equals the full forward, a 
             }
         }
     }
+}
+
+test Graph "CopyCache: a decoding batch's sequence continues as the one whose cache it was given" {
+    ctx I64 = 8
+    d := Graph<F64>(2, 1, Mode.Captured, true)
+    dt, dl := tinyLm(d, ctx)
+    try d.Plan(rand.Rand(5))
+    a := Array<I32>[3, 1, 4, 1, 5, 9]
+    b := Array<I32>[2, 7, 1, 8, 2, 8]
+    td :~ d.Ints(dt).Flat()!
+    for pos in range 5 {
+        d.Pos = pos
+        td[0] = a[pos]
+        td[1] = b[pos]
+        d.Forward(1)
+    }
+    d.CopyCache(0, 1, 5)
+    d.Pos = 5
+    td[0] = a[5]
+    td[1] = a[5]
+    d.Forward(1)
+    got := d.Value(dl)
+    for c in range 11: assert (got.Get(0, 0, c) - got.Get(1, 0, c)).Abs() < 1e-12, "class " + $c
 }
 
 test Graph "a decoding graph's positions are its Tokens', wherever they were recorded: a parameter made first does not set them" {
