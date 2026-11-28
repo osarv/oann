@@ -170,9 +170,9 @@ table and the free pages); each step sends up its rows - tokens, positions, slot
 angles - and brings down the logits of the rows that want them, which the host samples as before. A layer is four
 cuBLASLt products (BF16 by BF16 summed in F32, planned once for each row count, a multiple of 8, and used by every
 layer) and seven kernels of `kernels/gpu/src/llm.cu`, one short launch each: the norm into BF16; the heads' QK-norm
-and rotation with the keys and values written into their pages; the attention, a block for each row's key-value head over its
-sequence's pages, its keys and values read once for the head's queries (`OANN_GPU_ATTN=split`: split by pages, flash
-decoding, the pages' partial softmaxes joined after); the residual add; the gated perceptron's activation.
+and rotation with the keys and values written into their pages; the attention split by pages (flash decoding: a block for each
+row's key-value head and page, its keys and values read once for the head's queries, then a block for each row's head
+joining the pages' partial softmaxes; `OANN_GPU_ATTN=seq` for a block a key-value head over all its pages); the residual add; the gated perceptron's activation.
 
 It runs the dense decoders whose rows attend to every earlier position (Qwen3, Qwen2, Llama, Mistral, Granite,
 SmolLM3, Phi) in BF16, and refuses the rest by name: INT8 and INT4 weights, the mixtures of experts, sliding windows,
@@ -181,6 +181,19 @@ the weights and 768 MB for a step's buffers (`--kv-gb` says otherwise); a cache 
 memory reads at the PCIe bus's speed, and oann-gen says so: a page is `PageBytes`, as on the CPU -
 Qwen3-1.7B's 115 KB a token after 3.4 GB of weights, so about 2.5 GB, 22 thousand cached tokens, on an 8 GB device.
 When the pages run out the engine preempts as it does on the CPU.
+
+Speed on an RTX 4060 (8 GB, the desktop on it too), Qwen3-1.7B in BF16, a token a sequence a step, `make gpullm`:
+
+| batch | 512 positions | 1,536 positions |
+|---|---|---|
+| 8 | 351 tokens/s | 228 |
+| 16 | 670 | 413 |
+| 32 | 966 | - (no room) |
+
+(over the whole run from position 0; measured with the unsplit attention, which the split one beats 1.7-3x at the
+longest positions.) A step's products cost 18-20 ms at any batch - the weights read once, at 246 GB/s - and are the
+floor. A cache that spills into Windows' shared system memory reads at PCIe speed and is 20x slower: the cache is
+sized from the free memory the driver reports.
 
 `make gputest` holds the device's logits to the CPU's on tiny models (QK-norm and a tied head; biases and a head of
 its own; a padded vocabulary) over 70 steps of two sequences crossing a page; `make gpullm ARGS=MODEL_DIR` does the
