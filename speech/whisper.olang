@@ -14,6 +14,7 @@
 
 import "std/json"
 import "std/os"
+import "std/rand"
 import "../io/checkpoint"
 import "../kernels/elem"
 import "../kernels/gemm"
@@ -248,6 +249,54 @@ fn (m mut Model&) QuantizeEncoder() {
         m.Enc[i].Fc1.Quantize()
         m.Enc[i].Fc2.Quantize()
     }
+}
+
+# a model of shape c with random weights (uniform, small enough that activations stay of order 1): for tests and
+# timings that need a shape and no files
+fn Model.Random(c Config, seed I64 = 1) Model {
+    r := rand.Rand(U64(seed))
+    m := Model(c, false)
+    randomLin(m.Conv1, r)
+    randomLin(m.Conv2, r)
+    randomFill(m.EncPos, 0.5, r)
+    for i in range m.Enc.Len(): randomBlock(m.Enc[i], r)
+    randomNorm(m.EncLn, r)
+    randomFill(m.Embed, 0.5, r)
+    m.Head.W ~ m.Embed
+    randomFill(m.DecPos, 0.5, r)
+    for i in range m.Dec.Len(): randomBlock(m.Dec[i], r)
+    randomNorm(m.DecLn, r)
+    return m
+}
+
+fn randomFill(a mut Array<F32>&, scale F64, r mut rand.Rand&) {
+    for i in range a.Len(): a[i] = F32(r.Uniform(-scale, scale))
+}
+
+fn randomLin(l mut Lin&, r mut rand.Rand&) {
+    if l.Out == 0: return
+    l.W ~ Array<F32>(l.In * l.Out)
+    randomFill(l.W, 1.5 / F64(l.In).Sqrt(), r)
+    randomFill(l.Bias, 0.1, r)
+}
+
+fn randomNorm(n mut Norm&, r mut rand.Rand&) {
+    for i in range n.G.Len(): n.G[i] = F32(r.Uniform(0.7, 1.3))
+    randomFill(n.B, 0.1, r)
+}
+
+fn randomBlock(b mut Block&, r mut rand.Rand&) {
+    randomNorm(b.Ln1, r)
+    randomLin(b.Qkv, r)
+    for i in range b.Qkv.In: b.Qkv.Bias[b.Qkv.In + i] = 0.0       # the keys have no bias
+    randomLin(b.O, r)
+    randomNorm(b.Ln2, r)
+    randomLin(b.CQ, r)
+    randomLin(b.CKv, r)
+    randomLin(b.CO, r)
+    randomNorm(b.Ln3, r)
+    randomLin(b.Fc1, r)
+    randomLin(b.Fc2, r)
 }
 
 # the parameters
@@ -563,27 +612,34 @@ fn tileHeads(ws mut gemm.Workspace<F32>&, att mut Array<F32>&, yb mut Array<BF16
 
 # the decoder's state: Slots sequences (a beam each) of up to C.Text positions in a cache of their keys and values,
 # the cross-attention's keys and values of the encoded positions, the buffers of a step of up to Rows rows
-type Decoder struct(m Model&, Slots I64, Rows I64, Outs I64) {
+type Decoder struct(m Model&, Slots I64, Rows I64, Outs I64, Host Bool = true) {
     Slots
     Rows
     Outs
-    a mut Arith& = Arith(m.Threads, m.C.Vocab.Max(m.C.Positions).Max(m.C.Ffn), (Rows * m.C.Ffn.Max(3 * m.C.Dim)).Max(m.C.Positions * m.C.Dim))
-    K mut Array<F32>& = Array<F32>(m.C.DecLayers * Slots * m.C.Text * m.C.Dim)
-    V mut Array<F32>& = Array<F32>(m.C.DecLayers * Slots * m.C.Text * m.C.Dim)
+    Host                                                     # false: the rows and logits alone, the step run elsewhere (speech/whispervk: a device)
+    a mut Arith& = Arith(m.Threads, m.C.Vocab.Max(m.C.Positions).Max(m.C.Ffn), (Rows * m.C.Ffn.Max(3 * m.C.Dim)).Max(m.C.Positions * m.C.Dim) if Host else 0)
+    K mut Array<F32>& = Array<F32>(m.C.DecLayers * Slots * m.C.Text * m.C.Dim if Host else 0)
+    V mut Array<F32>& = Array<F32>(m.C.DecLayers * Slots * m.C.Text * m.C.Dim if Host else 0)
     N I64 = 0                                                # encoded positions crossed to
-    ckv mut Array<F32>& = Array<F32>(m.C.DecLayers * m.C.Positions * 2 * m.C.Dim)
-    x mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
-    h mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
-    qkv mut Array<F32>& = Array<F32>(Rows * 3 * m.C.Dim)
-    att mut Array<F32>& = Array<F32>(Rows * m.C.Dim)
-    f mut Array<F32>& = Array<F32>(Rows * m.C.Ffn)
-    s mut Array<F32>& = Array<F32>(Rows * m.C.Positions.Max(m.C.Text) * m.Threads.Min(m.C.DecHeads).Max(1))
+    ckv mut Array<F32>& = Array<F32>(m.C.DecLayers * m.C.Positions * 2 * m.C.Dim if Host else 0)
+    x mut Array<F32>& = Array<F32>(Rows * m.C.Dim if Host else 0)
+    h mut Array<F32>& = Array<F32>(Rows * m.C.Dim if Host else 0)
+    qkv mut Array<F32>& = Array<F32>(Rows * 3 * m.C.Dim if Host else 0)
+    att mut Array<F32>& = Array<F32>(Rows * m.C.Dim if Host else 0)
+    f mut Array<F32>& = Array<F32>(Rows * m.C.Ffn if Host else 0)
+    s mut Array<F32>& = Array<F32>(Rows * m.C.Positions.Max(m.C.Text) * m.Threads.Min(m.C.DecHeads).Max(1) if Host else 0)
     Logits mut Array<F32>& = Array<F32>(Outs * m.C.Vocab)   # the logits of a step's last Outs rows at most, in order
     tok mut Array<I32>& = Array<I32>(Rows)
     pos mut Array<I64>& = Array<I64>(Rows)
     slot mut Array<I64>& = Array<I64>(Rows)
     n I64 = 0                                                # rows of the step being made
 }
+
+# the step being made, for whoever runs it: its rows, and row r's token, position and sequence
+fn (k Decoder&) Count() I64 { return k.n }
+fn (k Decoder&) Tok(r I64) I32 { return k.tok[r] }
+fn (k Decoder&) Pos(r I64) I64 { return k.pos[r] }
+fn (k Decoder&) Slot(r I64) I64 { return k.slot[r] }
 
 # the cross-attention's keys and values of every layer over enc's n positions ([n x Dim])
 fn (m Model&) Cross(k mut Decoder&, enc mut Array<F32>&, n I64) {
