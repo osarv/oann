@@ -373,6 +373,7 @@ type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8
     # copied as it is loaded, so the scales are written into these arrays, not given new ones)
     Awq mut Array<F32>& = Array<F32>(In if Int8 or Int4 else 0)
     Unawq mut Array<F32>& = Array<F32>(In if Int8 or Int4 else 0)
+    Imp mut Array<F32>& = Array<F32>(In if Int4 else 0)       # each input's importance (mean square), 0 where not given
 }
 
 # whether it has activation-aware scales
@@ -452,6 +453,82 @@ fn (w mut Linear&) put4(o I64, i0 I64, v Array<F32>&, at I64) {
     w.D4[w.at4(o, i0 / 32)] = F16(d)
     w.M4[w.at4(o, i0 / 32)] = F16(m)
     w.C4[w.at4(o, i0 / 32)] = I16(128 * sum)
+}
+
+# put4 with the group's scale and offset fitted to the inputs' importance (Imp): the steps tried a little finer and
+# coarser than the range's, the rounded values' scale and offset by weighted least squares each time, and the one
+# whose stored (F16) form leaves the least weighted error kept - min and max as put4 among them (q and best: scratch
+# for 32 steps)
+fn (w mut Linear&) put4w(o I64, i0 I64, v Array<F32>&, at I64, q mut Array<I64>&, best mut Array<I64>&) {
+    lo := v[at]
+    hi := v[at]
+    for t in range 32 {
+        lo = lo.Min(v[at + t])
+        hi = hi.Max(v[at + t])
+    }
+    if hi == lo {
+        w.put4(o, i0, v, at)
+        return
+    }
+    imp :~ w.Imp[i0:i0 + 32]
+    bd := F32(F16((hi - lo) / 15.0))
+    bm := F32(F16(lo + 8.0 * bd))
+    least F64 = errOf4(v, at, imp, bd, bm, best)
+    for step in range 13 {
+        iscale := (15.0 + 0.15 * F32(step - 6)) / (hi - lo)
+        sw F64 = 0.0
+        sl F64 = 0.0
+        sll F64 = 0.0
+        sx F64 = 0.0
+        slx F64 = 0.0
+        for t in range 32 {
+            l := I64((iscale * (v[at + t] - lo)).Round()).Max(0).Min(15)
+            q[t] = l
+            iw := F64(imp[t])
+            x := F64(v[at + t])
+            sw += iw
+            sl += iw * F64(l)
+            sll += iw * F64(l * l)
+            sx += iw * x
+            slx += iw * F64(l) * x
+        }
+        det := sw * sll - sl * sl
+        if det <= 0.0: continue
+        d := F32(F16(F32((sw * slx - sx * sl) / det)))
+        if d <= 0.0: continue
+        m := F32(F16(F32((sll * sx - sl * slx) / det) + 8.0 * d))
+        e := errOf4(v, at, imp, d, m, q)
+        if e < least {
+            least = e
+            bd = d
+            bm = m
+            for t in range 32: best[t] = q[t]
+        }
+    }
+    sum I64 = 0
+    for t in range 32 {
+        sum += best[t] - 8
+        b := w.byte4(o, i0 + t)
+        sh := U8(4) if t % 8 >= 4 else U8(0)
+        w.Q4[b] = (w.Q4[b] & ~(U8(15) << sh)) | (U8(best[t]) << sh)
+    }
+    w.D4[w.at4(o, i0 / 32)] = F16(bd)
+    w.M4[w.at4(o, i0 / 32)] = F16(bm)
+    w.C4[w.at4(o, i0 / 32)] = I16(128 * sum)
+}
+
+# the weighted error of a group of 32 stored with scale d and offset m (W = d (q - 8) + m), each value's q rounded
+# to the nearest step into q (0 .. 15)
+fn errOf4(v Array<F32>&, at I64, imp Array<F32>&, d F32, m F32, q mut Array<I64>&) F64 {
+    inv := 1.0 / d
+    e F64 = 0.0
+    for t in range 32 {
+        l := I64(((v[at + t] - m) * inv).Round()).Max(-8).Min(7) + 8
+        q[t] = l
+        x := F64(v[at + t] - (d * F32(l - 8) + m))
+        e += F64(imp[t]) * x * x
+    }
+    return e
 }
 
 # the widest block of 64, 32 or 16 outputs every part divides into
@@ -708,19 +785,37 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
                 for i in range l.In: b[r * l.In + i] *= l.Awq[i]
             }
         }
-        for r in range n {
-            o := from + r0 + r
-            if l.Int8 {
-                # symmetric, a scale per Group inputs of an output: the group's largest magnitude is 127
-                for g0 in range 0, l.In, l.Group: l.put8(o, g0, b, r * l.In + g0)
-            } else if l.Int4 {
-                for g0 in range 0, l.In, 32: l.put4(o, g0, b, r * l.In + g0)
-            } else if l.Packed {
-                base := (o / l.Nb) * l.In * l.Nb + (o % l.Nb) * 2
-                for i in range l.In: l.W[base + (i / 2) * l.Nb * 2 + i % 2] = BF16(b[r * l.In + i])
-            } else {
-                for i in range l.In: l.W[o * l.In + i] = BF16(b[r * l.In + i])
+        # rows rounded to 4 bits by importance on every core (each output's bytes and scales its own)
+        if l.Int4 and l.Imp.Len() > 0 and l.Imp[0] > 0.0 and n >= 16 {
+            tasks := gemm.Cores().Min(n / 8)
+            join {
+                for t in range tasks: spawn putRows(l, b, from + r0, t * n / tasks, (t + 1) * n / tasks)
             }
+            continue
+        }
+        putRows(l, b, from + r0, 0, n)
+    }
+}
+
+# rows ra .. rb of b (In apart) into l as its outputs from + ra ..
+fn putRows(l mut Linear&, b Array<F32>&, from I64, ra I64, rb I64) {
+    q := Array<I64>(32)
+    best := Array<I64>(32)
+    weighed := l.Int4 and l.Imp.Len() > 0 and l.Imp[0] > 0.0
+    for r in range ra, rb {
+        o := from + r
+        if l.Int8 {
+            # symmetric, a scale per Group inputs of an output: the group's largest magnitude is 127
+            for g0 in range 0, l.In, l.Group: l.put8(o, g0, b, r * l.In + g0)
+        } else if weighed {
+            for g0 in range 0, l.In, 32: l.put4w(o, g0, b, r * l.In + g0, q, best)
+        } else if l.Int4 {
+            for g0 in range 0, l.In, 32: l.put4(o, g0, b, r * l.In + g0)
+        } else if l.Packed {
+            base := (o / l.Nb) * l.In * l.Nb + (o % l.Nb) * 2
+            for i in range l.In: l.W[base + (i / 2) * l.Nb * 2 + i % 2] = BF16(b[r * l.In + i])
+        } else {
+            for i in range l.In: l.W[o * l.In + i] = BF16(b[r * l.In + i])
         }
     }
 }
@@ -807,6 +902,8 @@ fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false
                 v := Array<F32>(lin.In)
                 try sw.Vector(v, name, lin.In)
                 lin.SetAwq(v)
+                imp := p + "awq_imp." + part.Name()
+                if lin.Imp.Len() > 0 and sw.Has(imp): try sw.Vector(lin.Imp, imp, lin.In)
             }
         }
         # Phi's projections stored fused: qkv_proj (queries, keys, values) and gate_up_proj (gate, up), as oann holds them

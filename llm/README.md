@@ -258,9 +258,12 @@ calibration text (a built-in mix of prose, code, mathematics and dialogue by def
 product's inputs, and for each product picks `s_i = a_i^alpha` (`a_i` input i's mean magnitude, alpha in 0, 0.1 ... 1)
 whose 4-bit product is nearest BF16's on those rows; the scales go to `DIR/oann-awq.safetensors`, which `--int4`
 then reads: the weights are multiplied by `s` before rounding and the activations divided by it, so the inputs that
-carry large activations get finer steps. Llama 3.2 1B (53 s to calibrate): the mean KL divergence from BF16 over 512
-held-out tokens 0.061 -> 0.055 (with the down projections in 4 bits too, 0.151 -> 0.124 - still well behind 8-bit
-ones, which is why they stay 8-bit).
+carry large activations get finer steps. The file also holds each input's importance (its mean square after the
+scales), and each group's 4-bit scale and offset are then fitted to it (steps a little finer and coarser than the
+range's tried, the scale and offset by weighted least squares, as llama.cpp's importance matrix does), on every core
+as the model loads (Llama 3.2 1B in 22 s instead of 8). Llama 3.2 1B (53 s to calibrate), the mean KL divergence from
+BF16 over 512 held-out tokens: 0.061 plain, 0.055 with the scales, 0.045 with the fitted rounding too; with the down
+projections in 4 bits as well 0.151 -> 0.107, still well behind 8-bit ones, which is why they stay 8-bit.
 
 Reading a prompt with 4- or 8-bit weights widens them to BF16 once a step: a step of 64 rows or more widens each block
 of 32 outputs whole and multiplies once. Llama 3.2 1B reads 2048 tokens at about 400 a second in INT4, as in BF16
