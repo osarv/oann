@@ -1,14 +1,14 @@
 # image
 
 Text to image with FLUX.2 klein (Black Forest Labs' distilled rectified-flow models; the 4B model's weights are
-Apache 2.0), run from the model's Hugging Face repository as it is published. The transformer runs on the CPU or on any GPU with a
-Vulkan driver; the text encoder and the decoder on the CPU. The weights are never committed.
+Apache 2.0), run from the model's Hugging Face repository as it is published. Every part runs on the CPU or on any GPU with a Vulkan
+driver. The weights are never committed.
 
 | file | what |
 |---|---|
 | `klein.olang` | the pipeline: `Embed` (the prompt through the model's Qwen3 text encoder, llm/), `Flow` (noise to latents in a few Euler steps), `Decode` (latents to pixels), `Generate` (all three), `Sigmas` (the steps' noise levels); `Transformer` and `Steps`, `Decoder` and `Pixels`, the same with the model loaded once by the caller |
 | `flux2.olang` | `Model`, the flow transformer (diffusers' Flux2Transformer2DModel): `Load`, `Run` (the buffers of one image size), `SetText`, `Forward` (one pass: every latent token's velocity) |
-| `vk.olang` | `Gpu`, the transformer on a Vulkan device (kernels/vk): `Make` (the buffers, the blocks that fit kept on the device), `SetText`, `Forward`; built with `-define Vulkan=true` |
+| `vk.olang` | on a Vulkan device (kernels/vk), built with `-define Vulkan=true`: `Gpu`, the transformer (`Make`: the buffers, the blocks that fit kept on the device; `SetText`, `Forward`), and `VaeGpu`, the decoder (`Make` for one size, `Decode`) |
 | `vae.olang` | `Vae`, the autoencoder's decoder (AutoencoderKLFlux2): `Load`, `Unpatch` (tokens to latents), `Decode` |
 | `png.olang` | `Encode`: pixels as a PNG file |
 | `gen.olang` | `oann-image`, the command, and its server mode |
@@ -27,8 +27,10 @@ build/oann-image klein4b "A cat holding a sign that says hello world" cat.png --
 (4, what the distilled models are made for), `--seed S` (the noise; a seed gives the same picture again), `--exact`
 (F32 activations). The noise is std/rand's, so a seed's picture is not the picture diffusers draws for that seed.
 
-`--device vulkan` runs the transformer on a GPU (a build with `-define Vulkan=true`, which `make oannimage` adds where
-Vulkan's headers are; `OANN_VK_DEVICE=N` picks one of several), with F32 activations as `--exact`.
+`--device vulkan` runs the three parts on a GPU (a build with `-define Vulkan=true`, which `make oannimage` adds where
+Vulkan's headers are; `OANN_VK_DEVICE=N` picks one of several): the text encoder through llm/vk, the transformer and
+the decoder through vk.olang, F32 activations. Where the card has not the room for the text encoder or the decoder,
+that part runs on the CPU and a line on stderr says so.
 
 From a program: `klein.Generate(dir, prompt, width, height)` gives the picture's bytes (row-major, red, green, blue).
 
@@ -77,6 +79,13 @@ stay on the device and the rest are sent up again on each pass, in order with th
 `OANN_IMAGE_VK_MIB` (MiB of device memory for everything), else half the device's memory. Attention is the device's
 general product: a group of heads' scores in one buffer of at most 512 MiB, their softmax, the values' mean.
 
+The decoder on a GPU (`VaeGpu`) holds its weights (F32) and three buffers of its widest activation, which the layers
+pass between them: about 1 GiB each at 1024 x 1024. A 3 x 3 convolution is its patches, a run of output rows at a time
+(at most 256 MiB of them), times the weights by the general product; a group norm sums each group by chunks of pixels,
+then the chunks' sums, in two passes (the mean, then the squares about it); the mid block's attention takes a run of
+queries at a time. The text encoder on a GPU is llm/vk's decoder over the 512 rows, the streams after layers 9, 18
+and 27 brought back (`State.Keep`).
+
 ## Checks
 
 `tools/ref.py` runs diffusers' Flux2KleinPipeline stage by stage on the CPU in F32 and writes what each stage read and
@@ -103,6 +112,9 @@ Measured 2026-11-28 on a 4-core Xeon VM with AMX (15 GB), klein 4B, "A cat holdi
 | decoder (the reference's latents) | worst 1.9e-6 of values up to 1.17 |
 | the picture, prompt to pixels, exact | mean 0.014 of 255 a channel, worst 20 |
 | the picture, BF16 activations | mean 4.2 of 255: the same picture to the eye, details differ (rounding grows over the steps, as it does for the reference run in BF16) |
+| on software Vulkan (lavapipe): transformer, steps 1-4 | worst 1.3e-4, 6.1e-4, 8.6e-4, 7.9e-4 of values up to 8 |
+| on software Vulkan: decoder | worst 5.4e-6 of values up to 1.17 |
+| on software Vulkan: prompt embeddings | mean 0.026, worst 35 (llm/vk holds keys and values in BF16; the CPU's BF16 mode: mean 0.043, worst 60) |
 
 Times there, 256 x 256 (768 rows a pass): exact - text 34 s, flow 104 s (42 s of it loading; 14.5 s a step), decoder
 3.7 s; BF16 - text 17 s, flow 71 s (30 s loading; 9.5 s a step), decoder 3.6 s. Larger sizes and a GPU are not

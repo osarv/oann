@@ -188,8 +188,9 @@ type Entry struct(Key String, Type Dtype, Shape Array<I64>, Begin I64, End I64) 
     End
 }
 
-# the bytes a save or a load moves at a time
+# the bytes a save or a load moves at a time, and a read from disk
 Chunk I64 = 1 << 16
+ReadChunk I64 = 1 << 20
 
 # tensors added by name, each encoded as it comes into a scratch file of the data (Chunk bytes at a time), which Save
 # then copies after the header - so neither holds more than the header and a buffer, whatever the tensors' size. The
@@ -370,7 +371,7 @@ type File struct(bytes Array<U8>&, Entries Array<Entry>&, Meta Map<String, Strin
     disk
     index Map<String, I64> = Map<String, I64>()
     for i, e in Entries: index.Put(e.Key, i)
-    chunk mut Array<U8>& = Array<U8>(Chunk if disk.Len() > 0 else 0)
+    chunk mut Array<U8>& = Array<U8>(ReadChunk if disk.Len() > 0 else 0)
 }
 
 # the file held in "bytes"
@@ -492,7 +493,7 @@ fn (f File&) Read<T>(name String&, dst mut tensor.Tensor<T>&) ? SafetensorsError
     out :~ try dst.Flat()
     width := e.Type.Width()
     if f.disk.Len() == 0 {
-        for i in range out.Len(): out[i] = elementAt(f.bytes, f.base + e.Begin + i * width, e.Type, like)
+        fill(out, 0, f.bytes, f.base + e.Begin, out.Len(), e.Type, like)
         return
     }
     per := f.chunk.Len() / width
@@ -500,8 +501,32 @@ fn (f File&) Read<T>(name String&, dst mut tensor.Tensor<T>&) ? SafetensorsError
         n := per.Min(out.Len() - i0)
         buf :~ f.chunk[:n * width]
         try readAt(f.disk[0], f.base + e.Begin + i0 * width, buf) catch io.Error { error SafetensorsError.Malformed }
-        for i in range n: out[i0 + i] = elementAt(buf, i * width, e.Type, like)
+        fill(out, i0, buf, 0, n, e.Type, like)
     }
+}
+
+# out[at ..] = the n elements of dtype d from raw[from], each converted as D(x) does: a BF16 or F32 tensor read into
+# its own type is copied by bits, without asking each element's dtype
+fn fill<T>(out mut Array<T>&, at I64, raw Array<U8>&, from I64, n I64, d Dtype, like T) {
+    match T {
+        case BF16 {
+            if d == Dtype.BF16 {
+                for i in range n: out[at + i] = BF16.FromBits(U16(raw[from + 2 * i]) | (U16(raw[from + 2 * i + 1]) << 8))
+                return
+            }
+        }
+        case F32 {
+            if d == Dtype.F32 {
+                for i in range n {
+                    o := from + 4 * i
+                    out[at + i] = F32.FromBits(U32(raw[o]) | (U32(raw[o + 1]) << 8) | (U32(raw[o + 2]) << 16) | (U32(raw[o + 3]) << 24))
+                }
+                return
+            }
+        }
+        case _ { }
+    }
+    for i in range n: out[at + i] = elementAt(raw, from + i * d.Width(), d, like)
 }
 
 # the tensor "name" as a new tensor of element type T, of the stored shape
