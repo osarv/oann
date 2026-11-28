@@ -253,6 +253,15 @@ Llama 3.2 1B and Granite 3.3 2B (8% for SmolLM2-135M), and greedy answers stay t
 (Gemma 3 1B's first answer token does, as PyTorch quantizing it the same way also gives). A GGUF file's own 4-bit
 weights are requantized into this layout, not kept as they are.
 
+**Activation-aware scales** (AWQ-style): `olang llm/awq.olang DIR [TEXTFILE]` reads the model in BF16 over a
+calibration text (a built-in mix of prose, code, mathematics and dialogue by default), keeps 128 rows of every dense
+product's inputs, and for each product picks `s_i = a_i^alpha` (`a_i` input i's mean magnitude, alpha in 0, 0.1 ... 1)
+whose 4-bit product is nearest BF16's on those rows; the scales go to `DIR/oann-awq.safetensors`, which `--int4`
+then reads: the weights are multiplied by `s` before rounding and the activations divided by it, so the inputs that
+carry large activations get finer steps. Llama 3.2 1B (53 s to calibrate): the mean KL divergence from BF16 over 512
+held-out tokens 0.061 -> 0.055 (with the down projections in 4 bits too, 0.151 -> 0.124 - still well behind 8-bit
+ones, which is why they stay 8-bit).
+
 Reading a prompt with 4- or 8-bit weights widens them to BF16 once a step: a step of 64 rows or more widens each block
 of 32 outputs whole and multiplies once. Llama 3.2 1B reads 2048 tokens at about 400 a second in INT4, as in BF16
 (it was 348); Phi-4-mini 1024 at 161 in INT4 against 177 in BF16. `bench/llm.olang` prints the reading speed;

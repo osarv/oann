@@ -1,0 +1,189 @@
+# oann-awq: activation-aware scales for a model's 4-bit weights (`--int4`), written beside its weights
+# (model.AwqPath: DIR/oann-awq.safetensors, or FILE.gguf.awq.safetensors).
+#
+#     olang llm/awq.olang DIR [TEXTFILE]
+#
+# The model is read in BF16 over a calibration text (TEXTFILE, else a built-in mix of prose, code, mathematics and
+# dialogue) and the inputs of every dense layer's products kept (State.Tap). For each product, input i's weights are
+# multiplied by s_i = a_i^alpha before they are rounded to 4 bits and its activations divided by s_i as they are
+# multiplied, a_i the mean magnitude of input i over the kept rows: the inputs that carry large activations get finer
+# steps. alpha (0, 0.1, ... 1) is the one whose 4-bit product is nearest the BF16 product on the kept rows; alpha 0
+# is no scaling. The scales go into the file as "model.layers.L.awq.{qkv,o,gate_up,down}" (F32, In long), which
+# Model.Load reads for `--int4`. Experts' products are not scaled.
+import "std/json"
+import "std/os"
+import "std/time"
+import "bpe"
+import "gguf"
+import "model"
+import "../io/checkpoint"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../tensor"
+
+Rows I64 = 128      # rows kept of each product's inputs
+
+Builtin String = "The history of the bridge begins in 1867, when the town council voted to replace the ferry. " +
+    "Engineers argued for two years about stone against iron; the iron design won because it could be built in winter. " +
+    "Question: if a train leaves at 9:40 and the trip takes 2 hours and 35 minutes, when does it arrive? " +
+    "Answer: 9:40 plus 2:35 is 12:15, so it arrives at a quarter past twelve.\n\n" +
+    "def merge(a, b):\n    out = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n" +
+    "        if a[i] <= b[j]:\n            out.append(a[i]); i += 1\n        else:\n            out.append(b[j]); j += 1\n" +
+    "    return out + a[i:] + b[j:]\n\n" +
+    "Let f(x) = 3x^2 - 12x + 7. Its derivative is f'(x) = 6x - 12, which is zero at x = 2, so the minimum is f(2) = -5. " +
+    "The sum of the first n odd numbers is n^2: 1 + 3 = 4, 1 + 3 + 5 = 9, and by induction (n+1)^2 = n^2 + 2n + 1.\n\n" +
+    "User: Can you explain why the sky is blue?\nAssistant: Sunlight is scattered by the molecules of the air, and " +
+    "shorter wavelengths scatter much more strongly (Rayleigh scattering goes as the inverse fourth power of the " +
+    "wavelength), so blue light reaches your eyes from every part of the sky.\n\n" +
+    "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Gothenburg\", \"unit\": \"celsius\"}}\n" +
+    "SELECT name, COUNT(*) AS orders FROM customers JOIN orders ON orders.customer_id = customers.id " +
+    "GROUP BY name HAVING COUNT(*) > 3 ORDER BY orders DESC;\n\n" +
+    "Das Wetter in Stockholm ist heute kalt, aber sonnig. Le chat dort sur le canapé depuis ce matin. " +
+    "Hon läste boken på en kväll och skrev sedan ett långt brev till sin bror.\n\n" +
+    "In a well-designed experiment the treatment and control groups differ only in the variable being tested, and the " +
+    "sample size is chosen before the data are seen so that the result cannot be steered by when one stops counting. " +
+    "A p-value is not the probability that the hypothesis is true; it is the probability of data at least this extreme " +
+    "if the null hypothesis held. Proof that sqrt(2) is irrational: suppose sqrt(2) = p/q in lowest terms; then " +
+    "p^2 = 2q^2, so p is even, p = 2k, and 4k^2 = 2q^2 gives q^2 = 2k^2, so q is even too - a contradiction.\n"
+
+fn tokenizer(dir String&) bpe.Bpe ? bpe.BpeError, json.Error, os.Error, gguf.GgufError {
+    if not dir.EndsWith(".gguf"): return try bpe.Bpe.Load(dir + "/tokenizer.json")
+    return try bpe.Bpe.Parse(try (try gguf.File.Open(dir)).TokenizerJson())
+}
+
+# w (rows x cols, row-major) after scaling by s, rounding to 4 bits as --int4 does (model.Linear.put4: a scale and an
+# offset per 32 inputs, F16) and dividing by s again, into dst
+fn rounded(w Array<F32>&, s Array<F32>&, rows I64, cols I64, dst mut Array<F32>&) {
+    v := Array<F32>(32)
+    for r in range rows {
+        for g0 in range 0, cols, 32 {
+            o := r * cols + g0
+            for t in range 32: v[t] = w[o + t] * s[g0 + t]
+            lo := v[0]
+            hi := v[0]
+            for t in range 32 {
+                lo = lo.Min(v[t])
+                hi = hi.Max(v[t])
+            }
+            d := F32(F16((hi - lo) / 15.0))
+            m := F32(F16(lo + 8.0 * d))
+            inv := 1.0 / d if d != 0.0 else F32(0.0)
+            for t in range 32 {
+                q := ((v[t] - m) * inv).Round().Max(-8.0).Min(7.0)
+                dst[o + t] = (d * q + m) / s[g0 + t]
+            }
+        }
+    }
+}
+
+# the squared distance of x w'^T from want, w' = w rounded with scales s (rows of x: n, w: out x in)
+fn errorOf(ws mut gemm.Workspace<F32>&, x mut Array<F32>&, n I64, w Array<F32>&, outs I64, width I64, s Array<F32>&, want Array<F32>&, wq mut Array<F32>&, got mut Array<F32>&) F64 {
+    rounded(w, s, outs, width, wq)
+    c := mat.Mat<F32>(got, 0, n, outs, outs)
+    gemm.Gemm(ws, c, mat.Mat<F32>(x, 0, n, width, width), false, mat.Mat<F32>(wq, 0, outs, width, width), true)
+    e F64 = 0.0
+    for i in range n * outs: e += F64(got[i] - want[i]) * F64(got[i] - want[i])
+    return e
+}
+
+# the scales of one product (w outs x width) for its kept inputs x (n rows), and the error without them and with them
+fn search(ws mut gemm.Workspace<F32>&, x mut Array<F32>&, n I64, w mut Array<F32>&, outs I64, width I64) Array<F32>, F64, F64 {
+    mean := Array<F32>(width)
+    for r in range n {
+        for i in range width: mean[i] += x[r * width + i].Abs()
+    }
+    for i in range width: mean[i] = (mean[i] / F32(n)).Max(1e-6)
+    want := Array<F32>(n * outs)
+    gemm.Gemm(ws, mat.Mat<F32>(want, 0, n, outs, outs), mat.Mat<F32>(x, 0, n, width, width), false, mat.Mat<F32>(w, 0, outs, width, width), true)
+    wq := Array<F32>(outs * width)
+    got := Array<F32>(n * outs)
+    best := Array<F32>(width)
+    s := Array<F32>(width)
+    for i in range width: best[i] = 1.0
+    plain := errorOf(ws, x, n, w, outs, width, best, want, wq, got)
+    least := plain
+    for step in range 1, 11 {
+        alpha := F64(step) / 10.0
+        lo F64 = 1e30
+        hi F64 = 0.0
+        for i in range width {
+            v := F64(mean[i]).Pow(alpha)
+            s[i] = F32(v)
+            lo = lo.Min(v)
+            hi = hi.Max(v)
+        }
+        mid := (lo * hi).Sqrt()
+        for i in range width: s[i] = F32(F64(s[i]) / mid)
+        e := errorOf(ws, x, n, w, outs, width, s, want, wq, got)
+        if e < least {
+            least = e
+            for i in range width: best[i] = s[i]
+        }
+    }
+    return best, plain, least
+}
+
+# product k of layer l, in model.AwqPart's order
+fn part(l model.Layer&, k I64) model.Linear& {
+    if k == 0: return l.Qkv
+    if k == 1: return l.O
+    if k == 2: return l.GateUp
+    return l.Down
+}
+
+fn fail(msg String&) noreturn {
+    Println(msg)
+    os.Exit(1)
+}
+
+fn main() {
+    args :~ os.Args()
+    if args.Len() < 2 {
+        Println("usage: olang llm/awq.olang DIR [TEXTFILE]")
+        os.Exit(2)
+    }
+    dir := args[1]
+    text := (try os.ReadFile(args[2]) catch { fail("cannot read " + args[2]) }) if args.Len() > 2 else Builtin
+    t0 := time.Now()
+    m := try model.Model.Load(dir) catch { fail("cannot load " + dir) }
+    tok := try tokenizer(dir) catch { fail("cannot read the tokenizer of " + dir) }
+    ids := tok.Encode(text)
+    n := ids.Len()
+    k := model.Cache(m.C, n / model.PageSize + 2, 1, n / model.PageSize + 2)
+    for i in range n / model.PageSize + 2: k.Table[i] = k.Take()
+    s := model.State(m, n, 1, n + model.PageSize)
+    s.Tap(m, Rows)
+    for i, t in ids: s.Add(t, I64(i), 0, i == n - 1)
+    m.Step(s, k)
+    Println(dir + ": " + $n + " calibration tokens read in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+    ws := gemm.Workspace<F32>(m.Threads)
+    ws.Reserve(m.C.Ffn.Max(m.C.Heads * m.C.HeadDim + 2 * m.C.KvHeads * m.C.HeadDim).Max(2 * m.C.Ffn).Max(Rows))
+    out := checkpoint.Writer()
+    names := ["qkv", "o", "gate_up", "down"]
+    for li in range m.C.Layers {
+        if m.C.MoeAt(li): continue
+        l model.Layer& = m.Layers[li]
+        line := "layer " + $li + ":"
+        for kind in range 4 {
+            lin model.Linear& = part(l, kind)
+            rows := s.TapN[4 * li + kind]
+            if rows == 0: continue
+            x := Array<F32>(rows * lin.In)
+            at := s.TapAt[4 * li + kind]
+            for i in range rows * lin.In: x[i] = s.Taps[at + i]
+            w := Array<F32>(lin.Out * lin.In)
+            for o in range lin.Out {
+                for i in range lin.In: w[o * lin.In + i] = lin.Get(o, i)
+            }
+            sc, plain, least := search(ws, x, rows, w, lin.Out, lin.In)
+            t := tensor.Tensor<F32>.Zeros(lin.In)
+            for i in range lin.In: t.Set(sc[i], i)
+            try out.Add("model.layers." + $li + ".awq." + names[kind], t) catch { unreachable }
+            line += " " + names[kind] + " " + (least / plain.Max(1e-30)).Fixed(2)
+        }
+        Println(line)
+    }
+    path := model.AwqPath(dir)
+    try out.Save(path) catch { fail("cannot write " + path) }
+    Println("wrote " + path + " in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s (each product's 4-bit error with the scales, as a share of without)")
+}

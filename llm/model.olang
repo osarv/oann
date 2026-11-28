@@ -367,6 +367,23 @@ type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8
     M4 mut Array<F16>& = Array<F16>(Out * In / 32 if Int4 else 0)
     C4 mut Array<I16>& = Array<I16>(Out * In / 32 if Int4 else 0)
     Bias mut Array<F32>& = Array<F32>(Out if bias else 0)
+    # activation-aware scales (llm/awq.olang), where given: input i's weights times Awq[i] before they are quantized,
+    # and the activations times Unawq[i] = 1 / Awq[i] as they are multiplied - the product the same, the rounding
+    # of the weights that matter most smaller; held by 8- and 4-bit weights, all 0 where not given (a Layer is
+    # copied as it is loaded, so the scales are written into these arrays, not given new ones)
+    Awq mut Array<F32>& = Array<F32>(In if Int8 or Int4 else 0)
+    Unawq mut Array<F32>& = Array<F32>(In if Int8 or Int4 else 0)
+}
+
+# whether it has activation-aware scales
+fn (l Linear&) Scaled() Bool { return l.Unawq.Len() > 0 and l.Unawq[0] != 0.0 }
+
+# the scales s for its inputs (In of them; 8- or 4-bit weights)
+fn (l mut Linear&) SetAwq(s Array<F32>&) {
+    for i in range l.In {
+        l.Awq[i] = s[i]
+        l.Unawq[i] = 1.0 / s[i]
+    }
 }
 
 # inputs g0 .. g0 + Group of output o in 8 bits from row[at:], symmetric: the group's largest magnitude is 127
@@ -449,6 +466,18 @@ fn blockOf(parts Array<I64>&) I64 {
     return 16
 }
 
+# the products of a layer that take activation-aware scales, by their names in the scales file
+type AwqPart enum { Qkv, O, GateUp, Down }
+
+fn (a AwqPart) Name() String& {
+    match a {
+        case AwqPart.Qkv: return "qkv"
+        case AwqPart.O: return "o"
+        case AwqPart.GateUp: return "gate_up"
+        case AwqPart.Down: return "down"
+    }
+}
+
 type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false, int4 Bool = false) {
     Qkv Linear = Linear(c.Dim, (c.Heads + 2 * c.KvHeads) * c.HeadDim, blockOf([c.Heads * c.HeadDim, c.KvHeads * c.HeadDim]), pack, c.Bias, int8, int4)
     O Linear = Linear(c.Heads * c.HeadDim, c.Dim, blockOf([c.Dim]), pack, Int8 = int8, Int4 = int4)
@@ -469,6 +498,16 @@ type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false, int4 Bool =
     }
     Ups mut Array<Linear>& = ups.ToArray()          # each expert's gate and up halves
     Downs mut Array<Linear>& = downs.ToArray()
+}
+
+# its product a
+fn (l mut Layer&) Part(a AwqPart) mut Linear& {
+    match a {
+        case AwqPart.Qkv: return l.Qkv
+        case AwqPart.O: return l.O
+        case AwqPart.GateUp: return l.GateUp
+        case AwqPart.Down: return l.Down
+    }
 }
 
 # the safetensors of a model directory: one file, or the shards of an index
@@ -538,19 +577,26 @@ fn opened(path String&, paths mut Vec<String>&, base mut Vec<I64>&) ? ModelError
     base.Push(8 + n)
 }
 
-fn Weights.Open(dir String&) Weights ? ModelError, os.Error {
+# the weights of one safetensors file
+fn Weights.File(single String&) Weights ? ModelError, os.Error {
     files := Vec<checkpoint.File>()
     where := Map<String, I64>()
     paths := Vec<String>()
     base := Vec<I64>()
+    f := try checkpoint.File.Load(single) catch checkpoint.SafetensorsError { error ModelError.Malformed(single) }
+    for e in f.Entries: where.Put(e.Key, 0)
+    files.Push(f)
+    try opened(single, paths, base)
+    return Weights(files.ToArray(), where, paths.ToArray(), base.ToArray())
+}
+
+fn Weights.Open(dir String&) Weights ? ModelError, os.Error {
     single := dir + "/model.safetensors"
-    if os.Exists(single) {
-        f := try checkpoint.File.Load(single) catch checkpoint.SafetensorsError { error ModelError.Malformed(single) }
-        for e in f.Entries: where.Put(e.Key, 0)
-        files.Push(f)
-        try opened(single, paths, base)
-        return Weights(files.ToArray(), where, paths.ToArray(), base.ToArray())
-    }
+    if os.Exists(single): return try Weights.File(single)
+    files := Vec<checkpoint.File>()
+    where := Map<String, I64>()
+    paths := Vec<String>()
+    base := Vec<I64>()
     index := dir + "/model.safetensors.index.json"
     j :~ try json.Json.Parse(try os.ReadFile(index)) catch json.Error { error ModelError.Malformed(index) }
     m :~ try (try j["weight_map"] catch { error ModelError.Malformed(index) }).AsObj() catch { error ModelError.Malformed(index) }
@@ -657,6 +703,11 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
         n := per.Min(rows - r0)
         try w.rowsOf(name, at + r0, n, l.In, w.row)
         b :~ w.row
+        if l.Scaled() {
+            for r in range n {
+                for i in range l.In: b[r * l.In + i] *= l.Awq[i]
+            }
+        }
         for r in range n {
             o := from + r0 + r
             if l.Int8 {
@@ -714,18 +765,22 @@ fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = fa
         g := try gguf.File.Open(dir) catch gguf.GgufError { error ModelError.Malformed(dir + " (GGUF)") }
         c := try Config.Parse(try g.ConfigJson() catch gguf.GgufError { error ModelError.Unsupported(dir + ": " + g.Arch) })
         w := Weights.Gguf(g, c.HeadDim)
-        return try Model.From(c, w, exact, int8, int4)
+        return try Model.From(c, w, exact, int8, int4, AwqPath(dir) if int4 and os.Exists(AwqPath(dir)) else "")
     }
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
     w := try Weights.Open(dir)
     for p in ["language_model.model.", "model.language_model."] {
         if w.where.Has(p + "embed_tokens.weight"): w.prefix = p
     }
-    return try Model.From(c, w, exact, int8, int4)
+    m := try Model.From(c, w, exact, int8, int4, AwqPath(dir) if int4 and os.Exists(AwqPath(dir)) else "")
+    return m
 }
 
-# the model of config c with weights w
-fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false) Model ? ModelError {
+# where llm/awq.olang keeps a model's activation-aware scales: beside its weights
+fn AwqPath(dir String&) String { return dir + (".awq.safetensors" if dir.EndsWith(".gguf") else "/oann-awq.safetensors") }
+
+# the model of config c with weights w (4 bits: the activation-aware scales of the file awq, where named)
+fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false, awq String& = "") Model ? ModelError {
     if exact and (int8 or int4): error ModelError.Unsupported("exact products of 8- or 4-bit weights")
     if int8 and int4: error ModelError.Unsupported("both 8- and 4-bit weights")
     m := Model(c, TargetHasTileDot and not exact, int8 and TargetHasTileDot, int4 and TargetHasTileDot)
@@ -737,9 +792,23 @@ fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false
     }
     q := c.Heads * c.HeadDim
     kv := c.KvHeads * c.HeadDim
+    scales := Vec<Weights>()
+    if awq.Len() > 0 and m.Int4: scales.Push(try Weights.File(awq) catch os.Error { error ModelError.Malformed(awq) })
     for i in range c.Layers {
         p := "model.layers." + $i + "."
         l := m.Layers[i]
+        if scales.Len() > 0 and not c.MoeAt(i) {
+            for part in [AwqPart.Qkv, AwqPart.O, AwqPart.GateUp, AwqPart.Down] {
+                name := p + "awq." + part.Name()
+                sw :~ scales.RefMut(0)
+                if not sw.Has(name): continue
+                lin :~ l.Part(part)
+                if lin.Awq.Len() == 0: continue
+                v := Array<F32>(lin.In)
+                try sw.Vector(v, name, lin.In)
+                lin.SetAwq(v)
+            }
+        }
         # Phi's projections stored fused: qkv_proj (queries, keys, values) and gate_up_proj (gate, up), as oann holds them
         if w.Has(p + "self_attn.qkv_proj.weight") {
             try w.fill(l.Qkv, p + "self_attn.qkv_proj.weight", 0, q + 2 * kv)
@@ -948,6 +1017,41 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     work mut Array<Attend>& = tasks.ToArray()
     ws gemm.Workspace<F32> = gemm.Workspace<F32>(m.Threads)
     ws.Reserve(m.Head.Out.Max(2 * m.C.Ffn).Max(2 * m.C.MoeFfn).Max(Rows))
+    # taps (Tap): rows of each dense layer's product inputs kept, as calibration reads them (llm/awq.olang)
+    TapRows I64 = 0
+    Taps mut Array<F32>& = Array<F32>(0)
+    TapAt mut Array<I64>& = Array<I64>(0)           # product k of layer l's rows at TapAt[4 l + k], In apart
+    TapN mut Array<I64>& = Array<I64>(0)            # and how many it holds
+}
+
+# up to rows rows of every dense product's inputs kept by the steps to come (AwqPart order: Qkv, O, GateUp, Down)
+fn (s mut State&) Tap(m Model&, rows I64) {
+    s.TapRows = rows
+    s.TapAt ~ Array<I64>(4 * m.C.Layers + 1)
+    s.TapN ~ Array<I64>(4 * m.C.Layers)
+    at I64 = 0
+    for li in range m.C.Layers {
+        l Layer& = m.Layers[li]
+        for k, w in [l.Qkv.In, l.O.In, l.GateUp.In, l.Down.In] {
+            s.TapAt[4 * li + k] = at
+            at += rows * w
+        }
+    }
+    s.TapAt[4 * m.C.Layers] = at
+    s.Taps ~ Array<F32>(at)
+}
+
+# rows of src (width apart) kept for product k of layer li: evenly over the step, its first four aside (a sequence's
+# first positions carry outliers of their own)
+fn (s mut State&) tap(li I64, k I64, src Array<F32>&, n I64, width I64) {
+    slot := 4 * li + k
+    stride := ((n - 4) / s.TapRows).Max(1)
+    for r in range 4, n, stride {
+        if s.TapN[slot] >= s.TapRows: return
+        o := s.TapAt[slot] + s.TapN[slot] * width
+        for i in range width: s.Taps[o + i] = src[r * width + i]
+        s.TapN[slot] += 1
+    }
 }
 
 fn roundUp(n I64, m I64) I64 { return (n + m - 1) / m * m }
@@ -1021,7 +1125,13 @@ fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F3
     if rows == 0: return
     if m.Tile {
         rp := roundUp(rows, 16)
-        for i in range rows * w.In: xb[i] = BF16(src[i])
+        if w.Scaled() {
+            for r in range rows {
+                for i in range w.In: xb[r * w.In + i] = BF16(src[r * w.In + i] * w.Unawq[i])
+            }
+        } else {
+            for i in range rows * w.In: xb[i] = BF16(src[i])
+        }
         for i in range rows * w.In, rp * w.In: xb[i] = BF16(0.0)
         blocks := w.Out / w.Nb
         tasks := m.Threads.Min(blocks)
@@ -1367,6 +1477,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         l :~ m.Layers[li]
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm1, c.Eps)
         t1 = time.Now()
+        if s.TapRows > 0: s.tap(li, 0, s.h, n, l.Qkv.In)
         m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.qkv, s.h, n, l.Qkv)
         tm += time.Since(t1)
         # QK-norm, rotation, and the keys and values into the cache
@@ -1385,6 +1496,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         m.attention(s, k, li)
         ta += time.Since(t2)
         t1 = time.Now()
+        if s.TapRows > 0: s.tap(li, 1, s.att, n, l.O.In)
         m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.y, s.att, n, l.O)
         tm += time.Since(t1)
         if c.PostNorms: rmsNorm(s.y, 0, s.y, 0, n, d, d, l.PostAttn, c.Eps)
@@ -1392,7 +1504,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm2, c.Eps)
         t1 = time.Now()
         if c.MoeAt(li): m.experts(s, l)
-        else: m.dense(s, l, tasks)
+        else: m.dense(s, l, tasks, li)
         tm += time.Since(t1)
         if c.PostNorms: rmsNorm(s.y, 0, s.y, 0, n, d, d, l.PostFfn, c.Eps)
         for i in range n * d: s.x[i] += s.y[i] * rs
@@ -1424,8 +1536,9 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
 }
 
 # the dense perceptron over the step's rows, s.h (normed) into s.y
-fn (m Model&) dense(s mut State&, l Layer&, tasks I64) {
+fn (m Model&) dense(s mut State&, l Layer&, tasks I64, li I64) {
     n := s.N
+    if s.TapRows > 0: s.tap(li, 2, s.h, n, l.GateUp.In)
     m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.y, s.h, n, l.GateUp)
     if tasks <= 1 {
         swiglu(s.h, s.y, m.C.Ffn, 0, n, m.C.Gelu)
@@ -1434,6 +1547,7 @@ fn (m Model&) dense(s mut State&, l Layer&, tasks I64) {
             for t in range tasks: spawn swiglu(s.h, s.y, m.C.Ffn, t * n / tasks, (t + 1) * n / tasks, m.C.Gelu)
         }
     }
+    if s.TapRows > 0: s.tap(li, 3, s.h, n, l.Down.In)
     m.linear(s.xb, s.deq, s.scs, s.qxs, s.ws, s.y, s.h, n, l.Down)
 }
 
@@ -2406,3 +2520,44 @@ test Linear "4- and 8-bit products by byte dots and by widening agree with the w
     }
 }
 
+
+# scales that are powers of two, the same over each group of 32 inputs, change no rounding: the weights' 4-bit steps
+# and the activations' 8-bit ones scale exactly, so the logits are those of no scales, bit for bit
+test Model "activation-aware scales: powers of two per group give the logits of none, where $OANN_MODELS has SmolLM2" {
+    if not TargetHasTileDot: return
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    dir := root + "/HuggingFaceTB--SmolLM2-135M-Instruct"
+    if root.Len() == 0 or not os.Exists(dir + "/config.json"): return
+    c := Config.Parse(os.ReadFile(dir + "/config.json")!)!
+    plain := Model.From(c, Weights.Open(dir)!, false, false, true, "")!
+    out := checkpoint.Writer()
+    for li in range c.Layers {
+        l Layer& = plain.Layers[li]
+        for k, name in ["qkv", "o", "gate_up", "down"] {
+            width := [l.Qkv.In, l.O.In, l.GateUp.In, l.Down.In][k]
+            t := tensor.Tensor<F32>.Zeros(width)
+            for i in range width: t.Set(F32([0.5, 1.0, 2.0, 4.0][(i / 32 + li + k) % 4]), i)
+            out.Add("model.layers." + $li + ".awq." + name, t)!
+        }
+    }
+    path := (try os.Env("TMPDIR") catch default "/tmp") + "/oann-awq-test.safetensors"
+    out.Save(path)!
+    scaled := Model.From(c, Weights.Open(dir)!, false, false, true, path)!
+    os.Remove(path)!
+    assert scaled.Layers[0].Down.Scaled() and scaled.Layers[0].Qkv.Scaled()
+    for n in [3, 20] {
+        want := lastLogits(plain, n)
+        got := lastLogits(scaled, n)
+        for i in range c.Vocab: assert want[i].Bits() == got[i].Bits(), $n + " rows, logit " + $i + ": " + $got[i] + ", not " + $want[i]
+    }
+}
+
+# the logits of the last of n rows of made-up tokens
+fn lastLogits(m Model&, n I64) Array<F32> {
+    k := Cache(m.C, 4, 1, 4)
+    for i in range 4: k.Table[i] = k.Take()
+    s := State(m, n, n, 256)
+    for i in range n: s.Add(I32(100 + 37 * i), I64(i), 0, i == n - 1)
+    m.Step(s, k)
+    return s.LogitsOf(0, m.C.Vocab).Copy()
+}
