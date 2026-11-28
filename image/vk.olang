@@ -13,8 +13,8 @@
 # a matrix is more than the device binds as one buffer). The model's 7.4 GB is more than many cards hold beside a
 # desktop, so only the first blocks that fit the budget stay on the device (resident); every later block's matrices
 # are sent up again each pass into one set of buffers the blocks of its shape share (streamed), in program order
-# with the kernels that read them. Budget: $OANN_IMAGE_VK_MIB (MiB of device memory for everything here), else what the
-# driver says is still free less KeepFree (1 GiB, for the desktop), else half the device's memory.
+# with the kernels that read them. Budget: $OANN_IMAGE_VK_MIB (MiB of device memory for everything here), else half the
+# device's memory, and never more than the driver says is free less KeepFree (1.5 GiB, for the desktop).
 #
 # Attention is the device's general product: a group of heads' scores (rows x rows each) in one buffer of at most
 # 512 MiB, their softmax, then the values' mean - as many heads at once as fit.
@@ -204,19 +204,22 @@ fn working(c flux2.Config&, s I64, n I64, t I64, most I64) I64, I64 {
 }
 
 # the MiB of device memory the budget leaves unused when none is asked: the desktop and other programs' room
-KeepFree I64 = 1024
+KeepFree I64 = 1536
 
-# the bytes the resident blocks may take when no budget is asked: what the driver says this process may still take,
-# less KeepFree; where it cannot say, half the device's memory less the held bytes
+# the bytes the resident blocks may take when no budget is asked: half the device's memory less the held bytes, and no
+# more than the driver says this process may still take less KeepFree. Not all of the free memory: on Windows a budget
+# near the driver's figure moved buffers out to shared memory (a 4060 with 6155 MiB held stepped 2-4x slower than with
+# 2177 MiB), while half the card was the fastest measured
 fn spare(dev vdev.Device&, held I64) I64 {
+    half := dev.MiB / 2 * 1048576 - held
     free := try dev.FreeMiB() catch default -1
-    if free < 0: return dev.MiB / 2 * 1048576 - held
-    return (free - KeepFree).Max(0) * 1048576
+    if free < 0: return half
+    return half.Min((free - KeepFree).Max(0) * 1048576)
 }
 
 # m on dev for passes over t prompt rows and rows x cols latent tokens: the kernels compiled, the buffers made, the
-# resident blocks' weights sent up. budget: the MiB of device memory for all of it (0: $OANN_IMAGE_VK_MIB, else the free
-# memory less KeepFree, else half the device's; under 0: no block resident). VkError.Vulkan where the device has not the room for a buffer
+# resident blocks' weights sent up. budget: the MiB of device memory for all of it (0: $OANN_IMAGE_VK_MIB, else half the
+# device's, at most the free memory less KeepFree; under 0: no block resident). VkError.Vulkan where the device has not the room for a buffer
 fn Gpu.Make(dev mut vdev.Device&, m flux2.Model&, t I64, rows I64, cols I64, budget I64 = 0) Gpu ? vdev.VkError {
     c flux2.Config& = m.C
     d, ffn := c.Dim, c.Ffn
