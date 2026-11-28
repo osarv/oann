@@ -13,10 +13,14 @@ committed, as in `llm/`.
 | `transcribe.olang` | `Whisper`: the prompt and language detection, the logit rules (suppressed tokens, timestamp rules), greedy and beam decoding, `Cut` (segments), `Transcribe` (clips of any length), `Stream` (sound as it comes) |
 | `kws.olang` | the wake word: features, the network (`Spotter`), `Train`, `Detector` (a threshold over smoothed scores, a refractory second) |
 | `speak.olang` | `Voice.Load("en" or "sv")`, `Speak(text)`: our G2P (`g2p.olang`), then a Piper voice (`vits.olang`), samples at `Rate` (22050); `To16k` |
+| `speaker.olang` | a voice as 192 numbers: `Fbank` (Kaldi's 80 mel bins, 25 ms frames), `Model.Load` (WeSpeaker's ECAPA-TDNN from its .onnx), `Embedder`, `EmbedAll`, `Cosine` |
+| `diarize.olang` | who speaks when: `Diarizer` (`Add` the speech stretches, `Labels`, `Turns`), `Options`, `Most` (the speaker of most of a stretch) |
+| `who.olang` | `oann-who`, the command: the turns of a clip, or the error against a reference |
 | `listen.olang` | `oann-listen`, the command |
 | `g2p.olang` | `G2p.Load`, `Phonemes(text, "en" or "sv")`: text to the IPA espeak-ng gives the VITS voices (below) |
 | `vits.olang` | text to speech: `Model.Load` (a transformers VitsModel), `Model.Piper` (a Piper voice's .onnx), `Symbols` (IPA to ids), `Speak` (ids to samples and every id's frames) |
 | `tools/reference.py` | the reference the tests are held to: transformers, F32, on CPU |
+| `tools/speaker_reference.py` | the speaker model's reference: kaldi-native-fbank and onnxruntime on a clip's first 6 s |
 | `tools/vits_reference.py` | VITS's references: transformers' VitsModel (vits-ljs) and onnxruntime (Piper's voices), with no noise |
 | `tools/g2p_reference.py` | espeak-ng's phonemes (through phonemizer) for word lists and sentences, what `g2p.olang` is measured against |
 
@@ -289,6 +293,52 @@ times 8 - a Cortex-A72 (NEON, no BF16) is roughly 8 times slower on compute-boun
 Piper's medium voices speak faster than real time there on one core and about twice real time on four; vits-ljs (its
 HiFi-GAN is 512 channels wide, about 13 times Piper's medium arithmetic) does not, which is why the voices are Piper's.
 
+## Who speaks when
+
+```
+make oannwho                                                     # builds build/oann-who
+build/oann-who voxceleb_ECAPA512.onnx meeting.wav --turns        # a line a turn: start end speaker
+build/oann-who voxceleb_ECAPA512.onnx a.wav b.wav                # a.ref, b.ref beside them ("start end speaker" a line): the error
+```
+
+The speech itself is given (a transcript's segments, or the reference's turns): `Diarizer.Add` takes the stretches,
+and nothing here decides what is speech.
+
+**The voice vector.** Every 0.75 s of a stretch, a 1.5 s window: Kaldi's filter bank (80 mel bins, 25 ms frames every
+10 ms, pre-emphasis 0.97, the Povey window, a 512-point DFT as a matrix product), each bin's mean over the window
+taken off, then WeSpeaker's ECAPA-TDNN (Wespeaker/wespeaker-voxceleb-ecapa-tdnn512: 6 M weights, 25 MB, 512 channels,
+three squeeze-and-excitation Res2 blocks one after the other, attentive statistics pooling) gives 192 numbers.
+Batch normalization is folded into the convolutions at load; windows are embedded on `Threads` tasks.
+
+**Grouping** is WeSpeaker's spectral clustering. The windows' cosines make a matrix; each row keeps its largest
+max(6, 2 %) entries, the matrix is made symmetric, and the eigenvectors of its Laplacian (`kernels/eigen`) with the
+smallest eigenvalues are read: the largest gap among the first 20 eigenvalues says how many speakers there are
+(`Options.Speakers` where it is known), k-means on those eigenvectors says who. A recording of more than 1000 windows
+(12 minutes of speech) is first merged to 1000 groups by average linkage and the groups' means are clustered, so the
+cost stops growing with the length. Last, a group that is under 5 % of the windows and comes in runs of two windows
+or fewer is no speaker (noise, laughter, two people at once): its windows go to the nearest real group. A window
+speaks for the part of its stretch nearer its middle than any other window's.
+
+**Checks** (`make test`, where `~/.cache/oann` has the model and `ref/ecapa512`, written by `python3 -I
+speech/tools/speaker_reference.py CLIP.wav ~/.cache/oann/ref/ecapa512 MODEL.onnx`): the filter bank held to
+kaldi-native-fbank's, the vectors' cosine with onnxruntime's above 0.99999; synthetic voices grouped and counted.
+
+**Error** (the share of speaker time given to the wrong speaker; the reference's speech given, no collar, overlapped
+speech counted for every speaker in it; settings chosen on the development halves only, the test halves read once):
+
+| recordings | development | test | test, where one person talks |
+|---|---|---|---|
+| Swedish parliament debates (RixVox-v2 rebuilt into debates: 28 + 28, 12.5 h each, 2-25 speakers, long turns) | 0.6 % | 1.3 % | 1.3 % |
+| AMI meetings, headset mix (18 + 16 meetings, 9 h each, 3-5 speakers) | 16.1 % | 18.0 % | 3.2 % |
+| AMI meetings, one distant microphone | 20.2 % | 22.9 % | 9.8 % |
+
+AMI's speakers talk over each other for much of the time, and one label a moment cannot be right for two people:
+that is most of its total. No Swedish meeting recordings with open reference turns were found; the debates are the
+Swedish measure and AMI (English) the meeting one.
+
+**Speed** (4 threads, per hour of recording, the grouping included): 26 s with AVX-512 (Xeon, 4 cores), 43 s built for
+`x86-64-v3` (AVX2) on the same machine; peak memory 150-250 MB.
+
 ## Models, data and licences
 
 Weights and clips are fetched by whoever runs the code; none are in this repository.
@@ -296,6 +346,9 @@ Weights and clips are fetched by whoever runs the code; none are in this reposit
 | what | used for | licence |
 |---|---|---|
 | openai/whisper-tiny, -base, -small (Hugging Face) | speech to text | Apache 2.0 on the Hub; OpenAI's release (github.com/openai/whisper, code and weights) MIT |
+| Wespeaker/wespeaker-voxceleb-ecapa-tdnn512 (Hugging Face; trained on VoxCeleb2) | speaker vectors | Apache 2.0 |
+| KBLab/rixvox-v2 (Swedish parliament speeches), one shard rebuilt into debates | speaker error | ODC-BY |
+| AMI meeting corpus (diarizers-community/ami) | speaker error | CC BY 4.0 |
 | jfk.wav (JFK's inaugural address, 1961, as whisper.cpp's sample) | test clip | public domain (a work of the US government) |
 | LibriVox, Aesop's Fables vol. 1, sections 1-2 (archive.org `aesop_fables_volume_one_librivox`), cut to 24, 20 and 67 s | test clips | public domain (LibriVox) |
 | the synthetic word of the kws test | wake-word test | made by the test |
