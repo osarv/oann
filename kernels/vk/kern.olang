@@ -584,8 +584,11 @@ fn Kernel.of(d mut device.Device&, name String, k spirv.Kernel) Kernel ? device.
 }
 
 # the kernels, each made a pipeline of d now: the first the driver refuses is the error, named
-fn Set.Make(d mut device.Device&) Set ? device.VkError {
-    return Set(try Product.Make(d, Plan.For(d))
+fn Set.Make(d mut device.Device&) Set ? device.VkError { return try Set.MakeWith(d, Plan.For(d)) }
+
+# the same with the product by plan (one d runs: Plan.Fits)
+fn Set.MakeWith(d mut device.Device&, plan Plan) Set ? device.VkError {
+    return Set(try Product.Make(d, plan)
         try Kernel.of(d, "affine", mapKernel(Op.Affine)), try Kernel.of(d, "relu", mapKernel(Op.Relu))
         try Kernel.of(d, "gelu", mapKernel(Op.Gelu)), try Kernel.of(d, "gelutanh", mapKernel(Op.GeluTanh))
         try Kernel.of(d, "silu", mapKernel(Op.Silu)), try Kernel.of(d, "sigmoid", mapKernel(Op.Sigmoid))
@@ -787,6 +790,42 @@ test Set.Gemm "against kernels/gemm: every transpose, alpha and beta, offset vie
             try compare(d, s, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, 1, 0)
             try compare(d, s, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, -0.75, 0.5)
         }
+    }
+}
+
+# the product of a (m x k) and b (k x n) by plan, brought back
+fn planned(d mut device.Device&, plan Plan, a Array<F32>&, b Array<F32>&, m I64, k I64, n I64) Array<F32> ? device.VkError {
+    p := try Product.Make(d, plan)
+    ba := try onDevice(d, a)
+    bb := try onDevice(d, b)
+    bc := try device.Buf<F32>.Make(d, m * n)
+    p.Run(d, device.DBatch<F32>.One(device.DMat<F32>(bc, 0, m, n, n)), device.DBatch<F32>.One(device.DMat<F32>(ba, 0, m, k, k)), false, device.DBatch<F32>.One(device.DMat<F32>(bb, 0, k, n, n)), false)
+    out := Array<F32>(m * n)
+    bc.DownloadAll(out)
+    try d.Sync()
+    return out
+}
+
+test Product.Make "the product's plans - blocks, workgroups, staged operands, fused steps - against kernels/gemm, and every plan not fused the same bits" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Product")
+        return
+    }
+    r := rand.Rand(11)
+    ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
+    plans := Array<Plan>[Plan(1, 8, 0, false), Plan(8, 4, 0, false), Plan(4, 8, 16, false), Plan(8, 8, 32, false), Plan(2, 16, 16, false), Plan(1, 8, 8, false), Plan(4, 8, 0, true), Plan(4, 8, 16, true)]
+    sizes := Array<I64>[1, 1, 1, 7, 5, 3, 33, 17, 65, 129, 65, 257, 100, 300, 70]
+    a, b := randoms(131 * 77, r), randoms(77 * 67, r)
+    want := try planned(d, Plan(4, 8, 0, false), a, b, 131, 77, 67)
+    for plan in plans {
+        if not plan.Fits(d): continue
+        s := try Set.MakeWith(d, plan)
+        for i in range 0, sizes.Len(), 3 {
+            for t in range 4: try compare(d, s, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], t % 2 == 1, t / 2 == 1, -0.75, 0.5)
+        }
+        if plan.Fused: continue
+        got := try planned(d, plan, a, b, 131, 77, 67)
+        for i in range got.Len(): assert got[i] == want[i], "element " + $i + " by " + plan.Str() + " is not the first plan's"
     }
 }
 
