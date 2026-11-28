@@ -348,10 +348,10 @@ fn Linear.Make(dev mut vdev.Device&, name String, plan LinPlan) Linear ? vdev.Vk
     return Linear(try made(dev, name, linearKernel(plan)), plan)
 }
 
-# y[: n, : outs] (rows ldy apart from yOff) = src[: n, : depth] (rows the depth apart) W^T, W outs rows of depth BF16
-# (even) from w's start, + bias's outs from bOff where biased
-fn (l Linear&) Run(dev mut vdev.Device&, y vdev.Buf<F32>&, yOff I64, ldy I64, src vdev.Buf<F32>&, n I64, w vdev.Buf<BF16>&, outs I64, depth I64, bias vdev.Buf<F32>&, bOff I64, biased Bool) {
-    p := Array<U32>[u(n), u(outs), u(depth), u(0), u(depth), u(yOff), u(ldy), u(bOff), u(1 if biased else 0)]
+# y[: n, : outs] (rows ldy apart from yOff) = src[: n, : depth] (rows lda apart from aOff; lda 0: the depth apart) W^T,
+# W outs rows of depth BF16 (even) from w's start, + bias's outs from bOff where biased
+fn (l Linear&) Run(dev mut vdev.Device&, y vdev.Buf<F32>&, yOff I64, ldy I64, src vdev.Buf<F32>&, n I64, w vdev.Buf<BF16>&, outs I64, depth I64, bias vdev.Buf<F32>&, bOff I64, biased Bool, aOff I64 = 0, lda I64 = 0) {
+    p := Array<U32>[u(n), u(outs), u(depth), u(aOff), u(lda if lda > 0 else depth), u(yOff), u(ldy), u(bOff), u(1 if biased else 0)]
     dev.Spend(2.0 * F64(n) * F64(outs) * F64(depth))
     l.k.Run(dev, groups(outs, l.By.Sx * l.By.Cols), groups(n, l.By.Sy * l.By.Rows), 1, Array<U64>[src.Handle(), w.Handle(), y.Handle(), bias.Handle()], p)
 }
@@ -796,14 +796,22 @@ fn (dec mut Decoder&) norm(n I64, gi I64, picked Bool, eps F64) {
     dec.ks.norm.Run(d, groups(n, Line), 1, 1, Array<U64>[dec.x.Handle(), dec.h.Handle(), dec.g.Handle(), dec.ints.Handle()], p)
 }
 
+# the stream after `after` layers into s.Kept where s keeps it (State.Keep), read after the step's Sync
+fn (dec Decoder&) kept(s mut model.State&, after I64, n I64) {
+    d := dec.x.N / dec.Rows
+    for i, k in s.KeepAfter {
+        if k == after: dec.x.Download(s.Kept, 0, i * s.Rows * d, n * d)
+    }
+}
+
 # x[: n] += y[: n] * rs
 fn (dec mut Decoder&) add(n I64, rs F32) {
     d := dec.dev
     dec.ks.mix.Run(d, groups(n, Line), 1, 1, Array<U64>[dec.x.Handle(), dec.y.Handle()], Array<U32>[u(n), f(1), f(rs), u(1)])
 }
 
-# the logits of the rows of s that want them, into s.Logits, as Model.Step gives them: one pass through every layer on
-# the device. k is the cache's page table (made with device = true); the keys and values are here
+# the logits of the rows of s that want them, into s.Logits, as Model.Step gives them, and the streams s keeps (State.Keep)
+# into s.Kept: one pass through every layer on the device. k is the cache's page table (made with device = true); the keys and values are here
 fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ? vdev.VkError {
     t0 := time.Now()
     c model.Config& = m.C
@@ -840,6 +848,7 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
         first := (b - dec.wFirst[ti]) * per
         dec.ks.embeds.Run(dev, groups(d, Tile), groups(n, Tile), 1, Array<U64>[ints, dec.w[b].Handle(), dec.x.Handle()], Array<U32>[u(n), u(d), u(0), u(first), u(per), f(F32(c.EmbedScale))])
     }
+    dec.kept(s, 0, n)
     rs := F32(c.ResScale)
     items := n * heads
     at := Array<U32>[u(3 * rows), u(2 * rows), u(tableAt)]      # the last positions, the slots, the page table
@@ -865,6 +874,7 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
         dec.ks.swiglu.Run(dev, groups(ffn, Tile), groups(n, Tile), 1, Array<U64>[dec.y.Handle(), dec.h.Handle()], Array<U32>[u(n), u(ffn)])
         dec.product(4 * li + 3, l.Down, dec.y, dec.h, n, gi + 7)
         dec.add(n * d, rs)
+        dec.kept(s, li + 1, n)
     }
     # the final norm of the rows that want logits, gathered in order, and the head
     no := s.NOut

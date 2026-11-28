@@ -1,0 +1,360 @@
+# image/vae - the decoder of FLUX.2's autoencoder (diffusers' AutoencoderKLFlux2: vae/config.json and
+# diffusion_pytorch_model.safetensors): latents of Latent channels, one position per 8 x 8 pixels, to an RGB image.
+# The latents the flow model writes are these in 2 x 2 patches (four positions' channels one token), normalized by the
+# batch norm's running statistics; Unpatch undoes both.
+#
+# The decoder: a 1 x 1 convolution (post_quant_conv), a 3 x 3 one to the widest channels, a middle of two residual
+# blocks around one head of attention over all positions, then a stage per entry of block_out_channels from the last
+# to the first - Layers + 1 residual blocks, then (all but the last stage) the image doubled, each pixel repeated, and
+# convolved - and a GroupNorm, SiLU and a 3 x 3 convolution to RGB. A residual block is GroupNorm, SiLU, convolution,
+# twice, added to its input (through a 1 x 1 convolution where the channels change).
+#
+# Images are channels last (H x W x C), as kernels/conv reads them; everything is F32, the reference's arithmetic.
+
+import "std/json"
+import "std/os"
+import "../io/checkpoint"
+import "../kernels/attention"
+import "../kernels/conv"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../tensor"
+
+type VaeError error {
+    Unsupported(what String)
+    Malformed(what String)
+}
+
+type Conv struct(C I64, OutC I64, K I64) {
+    C
+    OutC
+    K
+    W mut Array<F32>& = Array<F32>(OutC * C * K * K)       # [OutC x C K K], PyTorch's
+    B mut Array<F32>& = Array<F32>(OutC)
+}
+
+type Norm struct(n I64) {
+    G mut Array<F32>& = Array<F32>(n)
+    B mut Array<F32>& = Array<F32>(n)
+}
+
+type Resnet struct(cin I64, cout I64) {
+    Norm1 Norm = Norm(cin)
+    Conv1 Conv = Conv(cin, cout, 3)
+    Norm2 Norm = Norm(cout)
+    Conv2 Conv = Conv(cout, cout, 3)
+    Short Conv = Conv(cin, cout if cin != cout else 0, 1)
+}
+
+# a stage: its residual blocks, and the convolution after doubling (OutC 0: the last stage, not doubled)
+type Stage struct(cin I64, cout I64, layers I64, up Bool) {
+    made := Vec<Resnet>()
+    for i in range layers: made.Push(Resnet(cin if i == 0 else cout, cout))
+    Blocks mut Array<Resnet>& = made.ToArray()
+    Up Conv = Conv(cout, cout if up else 0, 3)
+}
+
+type Vae struct(Latent I64, Widths Array<I64>, Layers I64, Groups I64, BnEps F64) {
+    Latent                                  # latent_channels
+    Widths                                  # block_out_channels
+    Layers                                  # layers_per_block
+    Groups                                  # norm_num_groups
+    BnEps
+    top I64 = Widths[Widths.Len() - 1]
+    Post Conv = Conv(Latent, Latent, 1)
+    In Conv = Conv(Latent, top, 3)
+    Mid1 Resnet = Resnet(top, top)
+    AttnNorm Norm = Norm(top)
+    Qkv Conv = Conv(top, 3 * top, 1)        # the attention's query, key and value maps, rows one after another
+    AttnOut Conv = Conv(top, top, 1)
+    Mid2 Resnet = Resnet(top, top)
+    made := Vec<Stage>()
+    for i in range Widths.Len() {
+        w := Widths[Widths.Len() - 1 - i]
+        made.Push(Stage(top if i == 0 else Widths[Widths.Len() - i], w, Layers + 1, i + 1 < Widths.Len()))
+    }
+    Stages mut Array<Stage>& = made.ToArray()
+    OutNorm Norm = Norm(Widths[0])
+    Out Conv = Conv(Widths[0], 3, 3)
+    Mean mut Array<F32>& = Array<F32>(4 * Latent)       # the batch norm over a token's 4 Latent numbers
+    Var mut Array<F32>& = Array<F32>(4 * Latent)
+    Threads I64 = gemm.Cores()
+}
+
+type reader struct(f checkpoint.File&) {
+    f
+}
+
+fn (r reader&) vec(dst mut Array<F32>&, name String&) ? VaeError {
+    e := try r.f.Find(name) catch { error VaeError.Malformed("no tensor " + name) }
+    count I64 = 1
+    for d in e.Shape: count *= d
+    if count != dst.Len(): error VaeError.Malformed(name + " is " + $e.Shape + ", not " + $dst.Len() + " elements")
+    t := try tensor.Tensor<F32>.Over(dst, 0, ...e.Shape) catch { error VaeError.Malformed(name) }
+    try r.f.Read(name, t) catch { error VaeError.Malformed(name) }
+}
+
+fn (r reader&) conv(c mut Conv&, name String&) ? VaeError {
+    if c.OutC == 0: return
+    try r.vec(c.W, name + ".weight")
+    try r.vec(c.B, name + ".bias")
+}
+
+fn (r reader&) norm(n mut Norm&, name String&) ? VaeError {
+    try r.vec(n.G, name + ".weight")
+    try r.vec(n.B, name + ".bias")
+}
+
+fn (r reader&) resnet(b mut Resnet&, p String&) ? VaeError {
+    try r.norm(b.Norm1, p + "norm1")
+    try r.conv(b.Conv1, p + "conv1")
+    try r.norm(b.Norm2, p + "norm2")
+    try r.conv(b.Conv2, p + "conv2")
+    try r.conv(b.Short, p + "conv_shortcut")
+}
+
+fn intOf(j json.Json&, key String&) I64 ? VaeError {
+    v :~ try j[key] catch { error VaeError.Malformed("config.json has no " + key) }
+    return try v.AsInt() catch { error VaeError.Malformed("config.json's " + key) }
+}
+
+# the autoencoder's decoder in directory dir (config.json, diffusion_pytorch_model.safetensors)
+fn Vae.Load(dir String&) Vae ? VaeError, os.Error {
+    j :~ try json.Json.Parse(try os.ReadFile(dir + "/config.json")) catch { error VaeError.Malformed("config.json is not JSON") }
+    kind :~ try (try j["_class_name"] catch { error VaeError.Malformed("no _class_name") }).AsStr() catch { error VaeError.Malformed("_class_name") }
+    if kind != "AutoencoderKLFlux2": error VaeError.Unsupported(kind + " (AutoencoderKLFlux2 runs)")
+    widths := Vec<I64>()
+    ws :~ try j["block_out_channels"] catch { error VaeError.Malformed("config.json has no block_out_channels") }
+    match ws {
+        case json.Json.Arr(items) {
+            for a in items: widths.Push(try a.AsInt() catch { error VaeError.Malformed("block_out_channels") })
+        }
+        case _: error VaeError.Malformed("block_out_channels")
+    }
+    eps := try (try j["batch_norm_eps"] catch { error VaeError.Malformed("no batch_norm_eps") }).AsNum() catch { error VaeError.Malformed("batch_norm_eps") }
+    v := Vae(try intOf(j, "latent_channels"), widths.ToArray(), try intOf(j, "layers_per_block"), try intOf(j, "norm_num_groups"), eps)
+    f := try checkpoint.File.Load(dir + "/diffusion_pytorch_model.safetensors") catch checkpoint.SafetensorsError { error VaeError.Malformed(dir + "/diffusion_pytorch_model.safetensors") }
+    r := reader(f)
+    try r.conv(v.Post, "post_quant_conv")
+    try r.conv(v.In, "decoder.conv_in")
+    try r.resnet(v.Mid1, "decoder.mid_block.resnets.0.")
+    try r.norm(v.AttnNorm, "decoder.mid_block.attentions.0.group_norm")
+    top := v.top
+    for k, part in ["to_q", "to_k", "to_v"] {
+        w := Array<F32>(top * top)
+        b := Array<F32>(top)
+        try r.vec(w, "decoder.mid_block.attentions.0." + part + ".weight")
+        try r.vec(b, "decoder.mid_block.attentions.0." + part + ".bias")
+        for i in range top * top: v.Qkv.W[k * top * top + i] = w[i]
+        for i in range top: v.Qkv.B[k * top + i] = b[i]
+    }
+    try r.conv(v.AttnOut, "decoder.mid_block.attentions.0.to_out.0")
+    try r.resnet(v.Mid2, "decoder.mid_block.resnets.1.")
+    for i in range v.Stages.Len() {
+        for k in range v.Stages[i].Blocks.Len(): try r.resnet(v.Stages[i].Blocks[k], "decoder.up_blocks." + $i + ".resnets." + $k + ".")
+        try r.conv(v.Stages[i].Up, "decoder.up_blocks." + $i + ".upsamplers.0.conv")
+    }
+    try r.norm(v.OutNorm, "decoder.conv_norm_out")
+    try r.conv(v.Out, "decoder.conv_out")
+    try r.vec(v.Mean, "bn.running_mean")
+    try r.vec(v.Var, "bn.running_var")
+    return v
+}
+
+# the flow model's tokens ([rows x cols] of 4 Latent numbers, row y cols + x the token at (y, x)) as the decoder's
+# latents, channels last ([2 rows x 2 cols x Latent]): each token times the batch norm's deviation plus its mean, its
+# channel 4 c + 2 dy + dx the latent channel c at (2 y + dy, 2 x + dx)
+fn (v Vae&) Unpatch(tokens Array<F32>&, rows I64, cols I64) Array<F32> {
+    l := v.Latent
+    z := Array<F32>(4 * rows * cols * l)
+    for y in range rows {
+        for x in range cols {
+            for k in range 4 * l {
+                val := tokens[(y * cols + x) * 4 * l + k] * F32((F64(v.Var[k]) + v.BnEps).Sqrt()) + v.Mean[k]
+                c, dy, dx := k / 4, k % 4 / 2, k % 2
+                z[((2 * y + dy) * 2 * cols + 2 * x + dx) * l + c] = val
+            }
+        }
+    }
+    return z
+}
+
+fn silu(x F32) F32 { return x / (1.0 + (-x).Exp()) }
+
+# groups g0 .. g1 of x (n positions of c channels, groups of them) normed in place: each group's values over all
+# positions to mean 0 and variance 1 (statistics in F64), times the channel's gain plus its bias, then SiLU where act
+fn groupNorm(x mut Array<F32>&, n I64, c I64, groups I64, g0 I64, g1 I64, w Norm&, act Bool) {
+    per := c / groups
+    for g in range g0, g1 {
+        s F64 = 0.0
+        ss F64 = 0.0
+        for i in range n {
+            o := i * c + g * per
+            for k in range per {
+                val := F64(x[o + k])
+                s += val
+                ss += val * val
+            }
+        }
+        count := F64(n * per)
+        mean := s / count
+        inv := 1.0 / (ss / count - mean * mean + 1e-6).Sqrt()
+        for i in range n {
+            o := i * c + g * per
+            for k in range per {
+                y := F32((F64(x[o + k]) - mean) * inv) * w.G[g * per + k] + w.B[g * per + k]
+                x[o + k] = silu(y) if act else y
+            }
+        }
+    }
+}
+
+# a decoding's products: one workspace, grown to each convolution
+type Decoding struct(v Vae&) {
+    ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(v.Threads)
+}
+
+fn (v Vae&) norm(x mut Array<F32>&, n I64, c I64, w Norm&, act Bool) {
+    t := v.Threads.Min(v.Groups)
+    join {
+        for i in range t: spawn groupNorm(x, n, c, v.Groups, i * v.Groups / t, (i + 1) * v.Groups / t, w, act)
+    }
+}
+
+# the convolution of x (h x w x cv.C) by cv, padded to keep its size
+fn (v Vae&) conv(e mut Decoding&, x mut Array<F32>&, h I64, w I64, cv Conv&) Array<F32> {
+    s := try conv.Shape(cv.C, h, w, cv.OutC, cv.K, 1, cv.K / 2) catch { unreachable }
+    y := Array<F32>(h * w * cv.OutC)
+    conv.ReserveConv(e.ws, 1, s, F32(0.0))
+    ym := mat.Mat<F32>(y, 0, 1, y.Len(), y.Len())
+    conv.Conv2d(e.ws, ym, mat.Mat<F32>(x, 0, 1, x.Len(), x.Len()), mat.Mat<F32>(cv.W, 0, cv.OutC, s.Patch(), s.Patch()), s, gemm.Epilogue.Bias(cv.B))
+    return y
+}
+
+fn (v Vae&) resnet(e mut Decoding&, x mut Array<F32>&, h I64, w I64, b Resnet&) Array<F32> {
+    cin, cout := b.Conv1.C, b.Conv1.OutC
+    a := Array<F32>[val for val in x]
+    v.norm(a, h * w, cin, b.Norm1, true)
+    y := v.conv(e, a, h, w, b.Conv1)
+    v.norm(y, h * w, cout, b.Norm2, true)
+    out := v.conv(e, y, h, w, b.Conv2)
+    if b.Short.OutC == 0 {
+        for i in range out.Len(): out[i] += x[i]
+        return out
+    }
+    short := v.conv(e, x, h, w, b.Short)
+    for i in range out.Len(): out[i] += short[i]
+    return out
+}
+
+# one head of attention over the n positions of x (c channels), added to x
+fn (v Vae&) attend(e mut Decoding&, x mut Array<F32>&, h I64, w I64) Array<F32> {
+    c := v.top
+    n := h * w
+    a := Array<F32>[val for val in x]
+    v.norm(a, n, c, v.AttnNorm, false)
+    qkv := v.conv(e, a, h, w, v.Qkv)
+    out := Array<F32>(n * c)
+    lse := Array<F32>(n)
+    fl := attention.Flash<F32>.For(v.Threads, n, c)
+    at := attention.Heads(1, n, Causal = false)
+    om := mat.Mat<F32>(out, 0, n, c, c)
+    attention.FlashAttention<F32, F32>(fl, om, mat.Mat<F32>(qkv, 0, n, c, 3 * c), mat.Mat<F32>(qkv, c, n, c, 3 * c), mat.Mat<F32>(qkv, 2 * c, n, c, 3 * c), lse, at)
+    y := v.conv(e, out, h, w, v.AttnOut)
+    for i in range y.Len(): y[i] += x[i]
+    return y
+}
+
+# x (h x w x c) doubled: each pixel repeated 2 x 2
+fn double(x Array<F32>&, h I64, w I64, c I64) Array<F32> {
+    y := Array<F32>(4 * h * w * c)
+    for i in range 2 * h {
+        for j in range 2 * w {
+            src := ((i / 2) * w + j / 2) * c
+            dst := (i * 2 * w + j) * c
+            for k in range c: y[dst + k] = x[src + k]
+        }
+    }
+    return y
+}
+
+# the image of latents z (h x w x Latent, channels last), doubled by every stage but the last (8 h x 8 w x 3 with four
+# stages), channels last, values about -1 .. 1
+fn (v Vae&) Decode(z mut Array<F32>&, h0 I64, w0 I64) Array<F32> {
+    e := Decoding(v)
+    h, w := h0, w0
+    x mut Array<F32>& = v.conv(e, z, h, w, v.Post)
+    x ~ v.conv(e, x, h, w, v.In)
+    x ~ v.resnet(e, x, h, w, v.Mid1)
+    x ~ v.attend(e, x, h, w)
+    x ~ v.resnet(e, x, h, w, v.Mid2)
+    for st in v.Stages {
+        for b in st.Blocks: x ~ v.resnet(e, x, h, w, b)
+        if st.Up.OutC == 0: continue
+        x ~ double(x, h, w, st.Up.C)
+        h, w = 2 * h, 2 * w
+        x ~ v.conv(e, x, h, w, st.Up)
+    }
+    v.norm(x, h * w, v.Widths[0], v.OutNorm, true)
+    return v.conv(e, x, h, w, v.Out)
+}
+
+if TestBuild {
+
+import "std/rand"
+
+fn fillRandom(a mut Array<F32>&, scale F64, r mut rand.Rand&) {
+    for i in range a.Len(): a[i] = F32(r.Uniform(-scale, scale))
+}
+
+test Unpatch "a token's channel 4 c + 2 dy + dx is latent channel c at (2 y + dy, 2 x + dx), scaled by the batch norm" {
+    v := Vae(2, [32, 32], 1, 32, 0.0)
+    for k in range 8 {
+        v.Mean[k] = F32(k)
+        v.Var[k] = 4.0
+    }
+    rows, cols := 2, 3
+    tokens := Array<F32>[F32(i) for i in range rows * cols * 8]
+    z := v.Unpatch(tokens, rows, cols)
+    for y in range rows {
+        for x in range cols {
+            for k in range 8 {
+                c, dy, dx := k / 4, k % 4 / 2, k % 2
+                assert z[((2 * y + dy) * 2 * cols + 2 * x + dx) * 2 + c] == tokens[(y * cols + x) * 8 + k] * 2.0 + F32(k)
+            }
+        }
+    }
+}
+
+test Decode "a decoder of two stages and random weights turns h x w latents into 2 h x 2 w x 3 numbers, the same for any thread count" {
+    v := Vae(4, [32, 64], 1, 32, 1e-4)
+    r := rand.Rand(7)
+    for c in [v.Post, v.In, v.Qkv, v.AttnOut, v.Out, v.Mid1.Conv1, v.Mid1.Conv2, v.Mid2.Conv1, v.Mid2.Conv2]: fillRandom(c.W, 0.05, r)
+    for i in range v.Stages.Len() {
+        for k in range v.Stages[i].Blocks.Len() {
+            fillRandom(v.Stages[i].Blocks[k].Conv1.W, 0.05, r)
+            fillRandom(v.Stages[i].Blocks[k].Conv2.W, 0.05, r)
+            fillRandom(v.Stages[i].Blocks[k].Short.W, 0.05, r)
+            for j in range v.Stages[i].Blocks[k].Norm1.G.Len(): v.Stages[i].Blocks[k].Norm1.G[j] = 1.0
+            for j in range v.Stages[i].Blocks[k].Norm2.G.Len(): v.Stages[i].Blocks[k].Norm2.G[j] = 1.0
+        }
+        fillRandom(v.Stages[i].Up.W, 0.05, r)
+    }
+    for n in [v.Mid1.Norm1, v.Mid1.Norm2, v.Mid2.Norm1, v.Mid2.Norm2, v.AttnNorm, v.OutNorm] {
+        for j in range n.G.Len(): n.G[j] = 1.0
+    }
+    z := Array<F32>(3 * 5 * 4)
+    fillRandom(z, 1.0, r)
+    a := v.Decode(z, 3, 5)
+    assert a.Len() == 6 * 10 * 3
+    energy F64 = 0.0
+    for x in a: energy += F64(x) * F64(x)
+    assert energy > 0.0 and energy < 1e12
+    v.Threads = 1
+    b := v.Decode(z, 3, 5)
+    worst F32 = 0.0
+    for i in range a.Len(): worst = worst.Max((a[i] - b[i]).Abs())
+    assert worst < 1e-4
+}
+
+}

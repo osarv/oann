@@ -1,0 +1,968 @@
+# image/vk - FLUX.2's transformer (image/flux2) on any GPU with a Vulkan driver (kernels/vk): AMD, Intel, NVIDIA,
+# integrated ones, a CPU's software Vulkan. The numbers are the CPU's exact mode's: F32 activations, BF16 weights.
+#
+#     dev := try vdev.Device.Open()
+#     g := try Gpu.Make(dev, m, t, rows, cols)
+#     try g.SetText(embeds)
+#     try g.Forward(latents, sigma)        # g.Out: each latent token's velocity
+#
+# What is where. The stream and every product, norm, rotation and attention are on the device; the host computes the
+# noise level's modulations (one row through a few maps: flux2.Signal) and sends them up each pass, with the latents.
+#
+# The weights. A block's matrices are BF16 as the host holds them, a buffer a matrix (several, runs of its rows, where
+# a matrix is more than the device binds as one buffer). The model's 7.4 GB is more than many cards hold beside a
+# desktop, so only the first blocks that fit the budget stay on the device (resident); every later block's matrices
+# are sent up again each pass into one set of buffers the blocks of its shape share (streamed), in program order
+# with the kernels that read them. Budget: $OANN_IMAGE_VK_MIB (MiB of device memory for everything here), else what the
+# driver says is still free less KeepFree (1 GiB, for the desktop), else half the device's memory.
+#
+# Attention is the device's general product: a group of heads' scores (rows x rows each) in one buffer of at most
+# 512 MiB, their softmax, then the values' mean - as many heads at once as fit.
+#
+# VaeGpu is the autoencoder's decoder (image/vae) on the device: every convolution, norm, upsampling and the attention
+# there, the weights F32 as the host holds them. A 3 x 3 convolution is its patches (a run of output rows at a time,
+# at most 256 MiB of them) times the weights by the general product; a group norm sums a group's numbers by chunks of
+# pixels, then the chunks' sums, in two passes (the mean, then the squares about it). The attention's scores are a run
+# of queries at a time. At 1024 x 1024 its largest buffers are about 1 GiB, about 3.5 GiB at once.
+#
+# Built only with -define Vulkan=true; image/klein imports it under `if Vulkan`.
+
+import vdev "../kernels/vk/device"
+import "../kernels/vk/kern"
+import "../kernels/vk/spirv"
+import lvk "../llm/vk"
+import "flux2"
+import "vae"
+import "std/os"
+
+Vulkan Bool = false
+
+assert Vulkan, "image/vk is a Vulkan device's and is built only with -define Vulkan=true: import it under if Vulkan { ... }"
+
+Tile I64 = 8
+
+# the most bytes of one buffer of weights (0: what the device binds, at most 4 GiB): a test's, to split small matrices
+BufLimit mut I64 = 0
+
+fn groups(n I64, per I64) I64 { return (n + per - 1) / per }
+fn u(x I64) U32 { return U32(x) }
+fn f(x F32) U32 { return x.Bits() }
+
+# rows r0 .. r0 + n of p (ld apart): the heads of the queries (the first heads x hd columns) and of the keys (the next)
+# scaled to unit root mean square and by the gains (the queries' hd at gOff, then the keys'), then each pair of
+# dimensions turned by the row's angle (ang: cos, rows x hd / 2, then sin from sinOff). An invocation a head of a row
+fn headsKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    p := k.Buffer(spirv.Ty.F32)
+    gain := k.Buffer(spirv.Ty.F32)
+    ang := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    r0 := k.Param(spirv.Ty.U32)
+    ld := k.Param(spirv.Ty.U32)
+    heads := k.Param(spirv.Ty.U32)
+    hd := k.Param(spirv.Ty.U32)
+    gOff := k.Param(spirv.Ty.U32)
+    sinOff := k.Param(spirv.Ty.U32)
+    eps := k.Param(spirv.Ty.F32)
+    hh := k.GlobalId(0)
+    r := k.GlobalId(1)
+    k.If(k.And(k.Lt(r, n), k.Lt(hh, k.Shl(heads, k.U(1)))))
+    row := k.Add(r0, r)
+    o := k.Add(k.Mul(row, ld), k.Mul(hh, hd))
+    g0 := k.Add(gOff, k.Select(k.Lt(hh, heads), k.U(0), hd))
+    half := k.Shr(hd, k.U(1))
+    c0 := k.Mul(row, half)
+    s0 := k.Add(sinOff, c0)
+    sq := k.Let(k.F(0))
+    i := k.Var(spirv.Ty.U32)
+    k.For(i, k.U(0), hd)
+    v := k.Read(p, k.Add(o, k.Get(i)))
+    k.Set(sq, k.Add(k.Get(sq), k.Mul(v, v)))
+    k.Next(i)
+    inv := k.Div(k.F(1), k.Sqrt(k.Add(k.Div(k.Get(sq), k.ToF(hd)), eps)))
+    k.For(i, k.U(0), half)
+    i2 := k.Shl(k.Get(i), k.U(1))
+    i3 := k.Add(i2, k.U(1))
+    a := k.Mul(k.Mul(k.Read(p, k.Add(o, i2)), inv), k.Read(gain, k.Add(g0, i2)))
+    b := k.Mul(k.Mul(k.Read(p, k.Add(o, i3)), inv), k.Read(gain, k.Add(g0, i3)))
+    cs := k.Read(ang, k.Add(c0, k.Get(i)))
+    sn := k.Read(ang, k.Add(s0, k.Get(i)))
+    k.Write(p, k.Add(o, i2), k.Sub(k.Mul(a, cs), k.Mul(b, sn)))
+    k.Write(p, k.Add(o, i3), k.Add(k.Mul(b, cs), k.Mul(a, sn)))
+    k.Next(i)
+    k.EndIf()
+    return k
+}
+
+# dst[dOff + r dLd + i] = silu(src[sOff + r sLd + i]) src[sOff + r sLd + width + i] for r < n, i < width: the gated
+# perceptron's hidden layer of its gate and up halves
+fn swigluKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    src := k.Buffer(spirv.Ty.F32)
+    dst := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    width := k.Param(spirv.Ty.U32)
+    sOff := k.Param(spirv.Ty.U32)
+    sLd := k.Param(spirv.Ty.U32)
+    dOff := k.Param(spirv.Ty.U32)
+    dLd := k.Param(spirv.Ty.U32)
+    i := k.GlobalId(0)
+    r := k.GlobalId(1)
+    k.If(k.And(k.Lt(r, n), k.Lt(i, width)))
+    s0 := k.Add(k.Add(sOff, k.Mul(r, sLd)), i)
+    gt := k.Read(src, s0)
+    act := k.Div(gt, k.Add(k.F(1), k.Exp(k.Neg(gt))))
+    k.Write(dst, k.Add(k.Add(dOff, k.Mul(r, dLd)), i), k.Mul(act, k.Read(src, k.Add(s0, width))))
+    k.EndIf()
+    return k
+}
+
+fn made(d mut vdev.Device&, name String, k spirv.Kernel) kern.Kernel ? vdev.VkError {
+    w := k
+    return try kern.Kernel.Make(d, name, w)
+}
+
+# a double block's eight matrices, and a single block's two, in the order their buffers are held
+fn doubleLin(b flux2.DoubleBlock&, i I64) flux2.Lin& {
+    match i {
+        case 0: return b.TxtQkv
+        case 1: return b.ImgQkv
+        case 2: return b.TxtO
+        case 3: return b.ImgO
+        case 4: return b.TxtUp
+        case 5: return b.ImgUp
+        case 6: return b.TxtDown
+        case _: return b.ImgDown
+    }
+}
+
+fn singleLin(b flux2.SingleBlock&, i I64) flux2.Lin& { return b.Wide if i == 0 else b.Out }
+
+fn bytesOf(l flux2.Lin&) I64 { return 2 * l.In * l.Out }
+
+# the model on a device, for passes over t prompt rows and rows x cols latent tokens
+type Gpu unique struct(dev mut vdev.Device&, m flux2.Model&, ks kern.Set, linear lvk.Linear, heads kern.Kernel, swiglu kern.Kernel, t I64, rows I64, cols I64, per I64, x vdev.Buf<F32>, h vdev.Buf<F32>, p vdev.Buf<F32>, mid vdev.Buf<F32>, scores vdev.Buf<F32>, mods vdev.Buf<F32>, gains vdev.Buf<F32>, ang vdev.Buf<F32>, ctx vdev.Buf<F32>, lat vdev.Buf<F32>) {
+    dev
+    m
+    ks
+    linear
+    heads
+    swiglu
+    T I64 = t
+    N I64 = rows * cols
+    S I64 = t + rows * cols
+    per                 # heads whose scores are one buffer
+    x                   # the stream: the prompt's rows, then the image's, Dim a row
+    h                   # what a product reads and what goes into the stream
+    p                   # a row's queries, keys, values, then its perceptron's gate and up
+    mid                 # the attention's output, the perceptron's hidden layer; the last map's result
+    scores
+    mods                # the pass's modulations: image 6 Dim, text 6 Dim, single 3 Dim, the last norm's 2 Dim; scales + 1
+    gains               # each double block's text queries', text keys', image queries', image keys' gains, then each single block's two
+    ang                 # cos, then sin: S x HeadDim / 2 each
+    ctx                 # the prompt embedded
+    lat                 # the latents
+    w mut Vec<vdev.Buf<BF16>>& = Vec<vdev.Buf<BF16>>()      # matrix i's buffers are w[first[i] .. first[i + 1]], each
+    first mut Vec<I64>& = Vec<I64>()                        # wRows[i] of its rows (the last what is left)
+    wRows mut Vec<I64>& = Vec<I64>()
+    Resident I64 = 0    # blocks (double, then single) whose matrices stay on the device
+    G flux2.Signals = flux2.Signals(m, t, rows, cols)
+    hostMods mut Array<F32>& = Array<F32>(17 * m.C.Dim)
+    Out mut Array<F32>& = Array<F32>(rows * cols * m.C.In)  # a pass's result: each latent token's velocity
+    Bytes I64 = 0       # device memory held
+}
+
+# matrices 0 .. 2 are the model's own (ImgIn, TxtIn, Out), 3 .. 10 the streamed double block's, 11 .. 12 the streamed
+# single block's, then every resident block's
+globals I64 = 3
+streamDouble I64 = 3
+streamSingle I64 = 11
+firstResident I64 = 13
+
+# room for a matrix of outs rows of depth, the next index
+fn (g mut Gpu&) room(outs I64, depth I64) ? vdev.VkError {
+    d := g.dev
+    limit := BufLimit if BufLimit > 0 else (d.MaxBufMiB * 1048576).Min(4294967296)
+    per := (limit / (2 * depth)).Max(1).Min(outs)
+    g.first.Push(g.w.Len())
+    g.wRows.Push(per)
+    for o in range 0, outs, per: g.w.Push(try vdev.Buf<BF16>.Make(d, per.Min(outs - o) * depth))
+    g.Bytes += 2 * outs * depth
+}
+
+# l's weights into matrix i's buffers
+fn (g mut Gpu&) put(i I64, l flux2.Lin&) {
+    per := g.wRows[i]
+    for o in range 0, l.Out, per: g.w.RefMut(g.first[i] + o / per).Upload(l.W, o * l.In, 0, per.Min(l.Out - o) * l.In)
+}
+
+# the device memory a run over t + n rows holds beside the weights, and the heads a buffer of scores takes
+fn working(c flux2.Config&, s I64, n I64, t I64, most I64) I64, I64 {
+    per := (most / (4 * s * s)).Max(1).Min(c.Heads)
+    wide := 3 * c.Dim + 2 * c.Ffn
+    return 4 * (2 * s * c.Dim + s * wide + s * (c.Dim + c.Ffn) + per * s * s + 17 * c.Dim + s * c.HeadDim + t * c.Dim + n * c.In), per
+}
+
+# the MiB of device memory the budget leaves unused when none is asked: the desktop and other programs' room
+KeepFree I64 = 1024
+
+# the bytes the resident blocks may take when no budget is asked: what the driver says this process may still take,
+# less KeepFree; where it cannot say, half the device's memory less the held bytes
+fn spare(dev vdev.Device&, held I64) I64 {
+    free := try dev.FreeMiB() catch default -1
+    if free < 0: return dev.MiB / 2 * 1048576 - held
+    return (free - KeepFree).Max(0) * 1048576
+}
+
+# m on dev for passes over t prompt rows and rows x cols latent tokens: the kernels compiled, the buffers made, the
+# resident blocks' weights sent up. budget: the MiB of device memory for all of it (0: $OANN_IMAGE_VK_MIB, else the free
+# memory less KeepFree, else half the device's; under 0: no block resident). VkError.Vulkan where the device has not the room for a buffer
+fn Gpu.Make(dev mut vdev.Device&, m flux2.Model&, t I64, rows I64, cols I64, budget I64 = 0) Gpu ? vdev.VkError {
+    c flux2.Config& = m.C
+    d, ffn := c.Dim, c.Ffn
+    n := rows * cols
+    s := t + n
+    wide := 3 * d + 2 * ffn
+    maxBuf := (dev.MaxBufMiB * 1048576).Min(4294967296)
+    if 4 * s * s > maxBuf or 4 * s * wide > maxBuf {
+        error vdev.VkError.Vulkan(0, "an image of " + $n + " tokens needs a buffer of more than " + dev.Name + " holds (" + $dev.MaxBufMiB + " MiB): a smaller image may fit")
+    }
+    work, per := working(c, s, n, t, maxBuf.Min(512 * 1048576))
+    half := c.HeadDim / 2
+    g := Gpu(dev, m, try kern.Set.Make(dev), try lvk.Linear.Make(dev, "image_linear", lvk.LinPlan.ForMany(dev)), try made(dev, "image_heads", headsKernel()), try made(dev, "image_swiglu", swigluKernel())
+        t, rows, cols, per, try vdev.Buf<F32>.Make(dev, s * d), try vdev.Buf<F32>.Make(dev, s * d), try vdev.Buf<F32>.Make(dev, s * wide), try vdev.Buf<F32>.Make(dev, s * (d + ffn))
+        try vdev.Buf<F32>.Make(dev, per * s * s), try vdev.Buf<F32>.Make(dev, 17 * d), try vdev.Buf<F32>.Make(dev, (4 * c.Double + 2 * c.Single) * c.HeadDim)
+        try vdev.Buf<F32>.Make(dev, 2 * s * half), try vdev.Buf<F32>.Make(dev, t * d), try vdev.Buf<F32>.Make(dev, n * c.In))
+    g.Bytes = work
+    # the model's own matrices, then the streamed blocks' buffers
+    try g.room(m.ImgIn.Out, m.ImgIn.In)
+    try g.room(m.TxtIn.Out, m.TxtIn.In)
+    try g.room(m.Out.Out, m.Out.In)
+    g.put(0, m.ImgIn)
+    g.put(1, m.TxtIn)
+    g.put(2, m.Out)
+    if c.Double > 0 {
+        for i in range 8: try g.room(doubleLin(m.Doubles[0], i).Out, doubleLin(m.Doubles[0], i).In)
+    } else {
+        for _ in range 8: try g.room(1, 2)
+    }
+    if c.Single > 0 {
+        for i in range 2: try g.room(singleLin(m.Singles[0], i).Out, singleLin(m.Singles[0], i).In)
+    } else {
+        for _ in range 2: try g.room(1, 2)
+    }
+    # the blocks that fit the budget stay
+    env := try os.Env("OANN_IMAGE_VK_MIB") catch default ""
+    asked := budget if budget > 0 else try env.ParseInt() catch default 0
+    left := 0 if budget < 0 else asked * 1048576 - g.Bytes if asked > 0 else spare(dev, g.Bytes)
+    for b in range c.Double + c.Single {
+        need I64 = 0
+        if b < c.Double {
+            for i in range 8: need += bytesOf(doubleLin(m.Doubles[b], i))
+        } else {
+            for i in range 2: need += bytesOf(singleLin(m.Singles[b - c.Double], i))
+        }
+        if need > left: break
+        left -= need
+        if b < c.Double {
+            for i in range 8 {
+                l :~ doubleLin(m.Doubles[b], i)
+                try g.room(l.Out, l.In)
+                g.put(g.wRows.Len() - 1, l)
+            }
+        } else {
+            for i in range 2 {
+                l :~ singleLin(m.Singles[b - c.Double], i)
+                try g.room(l.Out, l.In)
+                g.put(g.wRows.Len() - 1, l)
+            }
+        }
+        g.Resident += 1
+    }
+    g.first.Push(g.w.Len())
+    # the rotations and the heads' gains, once
+    host := Array<F32>(2 * s * half)
+    for i in range s * half {
+        host[i] = g.G.Cos[i]
+        host[s * half + i] = g.G.Sin[i]
+    }
+    g.ang.UploadAll(host)
+    hd := c.HeadDim
+    gh := Array<F32>((4 * c.Double + 2 * c.Single) * hd)
+    for b in range c.Double {
+        bl :~ m.Doubles[b]
+        for i in range hd {
+            gh[(4 * b) * hd + i] = bl.TxtQ[i]
+            gh[(4 * b + 1) * hd + i] = bl.TxtK[i]
+            gh[(4 * b + 2) * hd + i] = bl.ImgQ[i]
+            gh[(4 * b + 3) * hd + i] = bl.ImgK[i]
+        }
+    }
+    for b in range c.Single {
+        bl :~ m.Singles[b]
+        for i in range hd {
+            gh[(4 * c.Double + 2 * b) * hd + i] = bl.Q[i]
+            gh[(4 * c.Double + 2 * b + 1) * hd + i] = bl.K[i]
+        }
+    }
+    g.gains.UploadAll(gh)
+    try dev.Sync()
+    return g
+}
+
+# y[: n, : l.Out] (rows ldy apart from yOff) = src[: n, : l.In] (rows lda apart from aOff) W^T, W matrix i
+fn (g mut Gpu&) lin(i I64, l flux2.Lin&, y vdev.Buf<F32>&, yOff I64, ldy I64, src vdev.Buf<F32>&, aOff I64, lda I64, n I64) {
+    d := g.dev
+    per := g.wRows[i]
+    for o in range 0, l.Out, per {
+        g.linear.Run(d, y, yOff + o, ldy, src, n, g.w[g.first[i] + o / per], per.Min(l.Out - o), l.In, g.mods, 0, false, aOff, lda)
+    }
+}
+
+# rows r0 .. r0 + n of h: x's centred and scaled to unit variance, times the modulation at scale, plus that at shift
+fn (g mut Gpu&) norm(r0 I64, n I64, shift I64, scale I64) {
+    d := g.dev
+    dim := g.m.C.Dim
+    g.ks.LayerNorm(d, vdev.DMat<F32>(g.h, r0 * dim, n, dim, dim), vdev.DMat<F32>(g.x, r0 * dim, n, dim, dim), g.mods, scale, g.mods, shift, F32(g.m.C.Eps))
+}
+
+# rows r0 .. r0 + n of x plus the modulation at gate times h's
+fn (g mut Gpu&) gated(r0 I64, n I64, gate I64) {
+    d := g.dev
+    dim := g.m.C.Dim
+    g.ks.Mul(d, g.h, r0 * dim, g.h, r0 * dim, g.mods, gate, n * dim, dim)
+    g.ks.Add(d, g.x, r0 * dim, g.x, r0 * dim, g.h, r0 * dim, n * dim)
+}
+
+# rows r0 .. r0 + n of p: the queries' and keys' heads normed by the gains at gOff and turned
+fn (g mut Gpu&) turn(r0 I64, n I64, gOff I64) {
+    d := g.dev
+    c flux2.Config& = g.m.C
+    wide := 3 * c.Dim + 2 * c.Ffn
+    params := Array<U32>[u(n), u(r0), u(wide), u(c.Heads), u(c.HeadDim), u(gOff), u(g.S * c.HeadDim / 2), f(F32(c.Eps))]
+    g.heads.Run(d, groups(2 * c.Heads, Tile), groups(n, Tile), 1, Array<U64>[g.p.Handle(), g.gains.Handle(), g.ang.Handle()], params)
+}
+
+# mid's rows (ld apart, n of them from its start, width wide) = silu(gate) up of p's perceptron halves
+fn (g mut Gpu&) gate(n I64, ld I64, at I64) {
+    d := g.dev
+    c flux2.Config& = g.m.C
+    wide := 3 * c.Dim + 2 * c.Ffn
+    params := Array<U32>[u(n), u(c.Ffn), u(3 * c.Dim), u(wide), u(at), u(ld)]
+    g.swiglu.Run(d, groups(c.Ffn, Tile), groups(n, Tile), 1, Array<U64>[g.p.Handle(), g.mid.Handle()], params)
+}
+
+# every row's attention to every row (queries, keys and values the first 3 Dim columns of p's rows) into mid's first
+# Dim columns, its rows ld apart
+fn (g mut Gpu&) attend(ld I64) {
+    d := g.dev
+    c flux2.Config& = g.m.C
+    s, hd, dim := g.S, c.HeadDim, c.Dim
+    wide := 3 * dim + 2 * c.Ffn
+    for h0 in range 0, c.Heads, g.per {
+        n := g.per.Min(c.Heads - h0)
+        flat := vdev.DMat<F32>(g.scores, 0, n * s, s, s)
+        sc := vdev.DBatch<F32>.Stacked(flat, s, n)
+        q := vdev.DBatch<F32>.Heads(vdev.DMat<F32>(g.p, h0 * hd, s, n * hd, wide), s, n)
+        k := vdev.DBatch<F32>.Heads(vdev.DMat<F32>(g.p, dim + h0 * hd, s, n * hd, wide), s, n)
+        v := vdev.DBatch<F32>.Heads(vdev.DMat<F32>(g.p, 2 * dim + h0 * hd, s, n * hd, wide), s, n)
+        out := vdev.DBatch<F32>.Heads(vdev.DMat<F32>(g.mid, h0 * hd, s, n * hd, ld), s, n)
+        g.ks.GemmBatch(d, sc, q, false, k, true)
+        g.ks.Softmax(d, flat, flat, F32(1.0 / F64(hd).Sqrt()))
+        g.ks.GemmBatch(d, out, sc, false, v, false)
+    }
+}
+
+# the prompt's embeddings ([T x Text]) embedded for the passes to come
+fn (g mut Gpu&) SetText(embeds Array<F32>&) ? vdev.VkError {
+    d := g.dev
+    m :~ g.m
+    g.p.Upload(embeds, 0, 0, g.T * m.C.Text)
+    g.lin(1, m.TxtIn, g.ctx, 0, m.C.Dim, g.p, 0, m.C.Text, g.T)
+    try d.Sync()
+}
+
+# double block b's first matrix: its own where it is resident, else the streamed set's after its weights went up
+fn (g mut Gpu&) double(b I64) I64 {
+    if b < g.Resident: return firstResident + 8 * b
+    for i in range 8: g.put(streamDouble + i, doubleLin(g.m.Doubles[b], i))
+    return streamDouble
+}
+
+fn (g mut Gpu&) single(b I64) I64 {
+    nd := g.m.C.Double
+    if nd + b < g.Resident: return firstResident + 8 * nd.Min(g.Resident) + 2 * b
+    for i in range 2: g.put(streamSingle + i, singleLin(g.m.Singles[b], i))
+    return streamSingle
+}
+
+# one pass: the velocity of the latents ([N x In]) at noise level sigma, into g.Out (flux2's Forward)
+fn (g mut Gpu&) Forward(latents Array<F32>&, sigma F64) ? vdev.VkError {
+    dev := g.dev
+    m :~ g.m
+    c flux2.Config& = m.C
+    d, ffn, hd := c.Dim, c.Ffn, c.HeadDim
+    t, n, s := g.T, g.N, g.S
+    wide := 3 * d + 2 * ffn
+    # the modulations, the scales as 1 + scale: image at 0, text at 6 d, single at 12 d, the last norm's at 15 d
+    m.Signal(g.G, sigma)
+    for i in range 6 * d {
+        g.hostMods[i] = g.G.ModImg[i]
+        g.hostMods[6 * d + i] = g.G.ModTxt[i]
+    }
+    for i in range 3 * d: g.hostMods[12 * d + i] = g.G.ModOne[i]
+    for i in range 2 * d: g.hostMods[15 * d + i] = g.G.ModOut[i]
+    for i in range d {
+        for at in [d, 4 * d, 7 * d, 10 * d, 13 * d, 15 * d]: g.hostMods[at + i] += 1.0
+    }
+    g.mods.UploadAll(g.hostMods)
+    g.lat.Upload(latents, 0, 0, n * c.In)
+    g.x.CopyFrom(0, g.ctx, 0, t * d)
+    g.lin(0, m.ImgIn, g.x, t * d, d, g.lat, 0, c.In, n)
+    img, txt, one := 0, 6 * d, 12 * d
+    for b in range c.Double {
+        bl :~ m.Doubles[b]
+        w := g.double(b)
+        go := 4 * b * hd
+        # the attention: each stream normed and projected by its own weights, the rows attending as one sequence
+        g.norm(0, t, txt, txt + d)
+        g.norm(t, n, img, img + d)
+        g.lin(w, bl.TxtQkv, g.p, 0, wide, g.h, 0, d, t)
+        g.lin(w + 1, bl.ImgQkv, g.p, t * wide, wide, g.h, t * d, d, n)
+        g.turn(0, t, go)
+        g.turn(t, n, go + 2 * hd)
+        g.attend(d)
+        g.lin(w + 2, bl.TxtO, g.h, 0, d, g.mid, 0, d, t)
+        g.lin(w + 3, bl.ImgO, g.h, t * d, d, g.mid, t * d, d, n)
+        g.gated(0, t, txt + 2 * d)
+        g.gated(t, n, img + 2 * d)
+        # the perceptrons
+        g.norm(0, t, txt + 3 * d, txt + 4 * d)
+        g.norm(t, n, img + 3 * d, img + 4 * d)
+        g.lin(w + 4, bl.TxtUp, g.p, 3 * d, wide, g.h, 0, d, t)
+        g.lin(w + 5, bl.ImgUp, g.p, t * wide + 3 * d, wide, g.h, t * d, d, n)
+        g.gate(s, ffn, 0)
+        g.lin(w + 6, bl.TxtDown, g.h, 0, d, g.mid, 0, ffn, t)
+        g.lin(w + 7, bl.ImgDown, g.h, t * d, d, g.mid, t * ffn, ffn, n)
+        g.gated(0, t, txt + 5 * d)
+        g.gated(t, n, img + 5 * d)
+    }
+    for b in range c.Single {
+        bl :~ m.Singles[b]
+        w := g.single(b)
+        g.norm(0, s, one, one + d)
+        g.lin(w, bl.Wide, g.p, 0, wide, g.h, 0, d, s)
+        g.turn(0, s, (4 * c.Double + 2 * b) * hd)
+        # the second product's input: the attention's output, then the perceptron's hidden layer
+        g.attend(d + ffn)
+        g.gate(s, d + ffn, d)
+        g.lin(w + 1, bl.Out, g.h, 0, d, g.mid, 0, d + ffn, s)
+        g.gated(0, s, one + 2 * d)
+    }
+    g.norm(t, n, 16 * d, 15 * d)
+    g.lin(2, m.Out, g.mid, 0, c.In, g.h, t * d, d, n)
+    g.mid.Download(g.Out, 0, 0, n * c.In)
+    try dev.Sync()
+}
+
+# ---- the decoder ----
+
+# the most elements one dispatch of an element kernel covers
+fn reach(d vdev.Device&) I64 { return (d.MaxGroups * 64).Min(1 << 24) }
+
+# an element kernel's start: i = at + the invocation's index, and whether it is one of the m
+fn elemBegin(k mut spirv.Kernel&) spirv.Val, spirv.Val {
+    at := k.Param(spirv.Ty.U32)
+    m := k.Param(spirv.Ty.U32)
+    j := k.GlobalId(0)
+    return k.Add(at, j), k.Lt(j, m)
+}
+
+# col[e] for e < count, e = q (C 9) + c 9 + ky 3 + kx, q a pixel from p0: x's channel c at (y + ky - 1, x + kx - 1) of
+# the h x w picture (NHWC), 0 outside it - a 3 x 3 convolution's patches in PyTorch's order
+fn patchKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(64)
+    x := k.Buffer(spirv.Ty.F32)
+    col := k.Buffer(spirv.Ty.F32)
+    e, live := elemBegin(k)
+    p0 := k.Param(spirv.Ty.U32)
+    h := k.Param(spirv.Ty.U32)
+    w := k.Param(spirv.Ty.U32)
+    c := k.Param(spirv.Ty.U32)
+    k.If(live)
+    c9 := k.Mul(c, k.U(9))
+    q := k.Div(e, c9)
+    r := k.Mod(e, c9)
+    ch := k.Div(r, k.U(9))
+    t := k.Mod(r, k.U(9))
+    p := k.Add(p0, q)
+    py := k.ToI(k.Div(p, w))
+    px := k.ToI(k.Mod(p, w))
+    yy := k.Add(py, k.Sub(k.ToI(k.Div(t, k.U(3))), k.I(1)))
+    xx := k.Add(px, k.Sub(k.ToI(k.Mod(t, k.U(3))), k.I(1)))
+    inside := k.And(k.And(k.Ge(yy, k.I(0)), k.Lt(yy, k.ToI(h))), k.And(k.Ge(xx, k.I(0)), k.Lt(xx, k.ToI(w))))
+    src := k.Add(k.Mul(k.Add(k.Mul(k.ToU(k.Most(yy, k.I(0))), w), k.ToU(k.Most(xx, k.I(0)))), c), ch)
+    k.Write(col, e, k.Select(inside, k.Read(x, k.Select(inside, src, k.U(0))), k.F(0)))
+    k.EndIf()
+    return k
+}
+
+# y[e] = x[e's source] for e < count over a 2h x 2w x c picture: nearest-neighbour doubling of the h x w one
+fn doubleKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(64)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    e, live := elemBegin(k)
+    w := k.Param(spirv.Ty.U32)
+    c := k.Param(spirv.Ty.U32)
+    k.If(live)
+    ch := k.Mod(e, c)
+    p := k.Div(e, c)
+    w2 := k.Shl(w, k.U(1))
+    i := k.Shr(k.Div(p, w2), k.U(1))
+    j := k.Shr(k.Mod(p, w2), k.U(1))
+    k.Write(y, e, k.Read(x, k.Add(k.Mul(k.Add(k.Mul(i, w), j), c), ch)))
+    k.EndIf()
+    return k
+}
+
+# part[g chunks + j] = the sum over pixels j P .. (j + 1) P (below n) of group g's channels (per of them, c a pixel)
+# of x, less mean[g] and squared where squares
+fn statsKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    x := k.Buffer(spirv.Ty.F32)
+    part := k.Buffer(spirv.Ty.F32)
+    mean := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    c := k.Param(spirv.Ty.U32)
+    per := k.Param(spirv.Ty.U32)
+    groupsN := k.Param(spirv.Ty.U32)
+    chunk := k.Param(spirv.Ty.U32)
+    chunks := k.Param(spirv.Ty.U32)
+    squares := k.Param(spirv.Ty.U32)
+    j := k.GlobalId(0)
+    g := k.GlobalId(1)
+    k.If(k.And(k.Lt(j, chunks), k.Lt(g, groupsN)))
+    mu := k.Select(k.Ne(squares, k.U(0)), k.Read(mean, g), k.F(0))
+    sq := k.Ne(squares, k.U(0))
+    acc := k.Let(k.F(0))
+    lo := k.Mul(j, chunk)
+    hi := k.Least(k.Add(lo, chunk), n)
+    i := k.Var(spirv.Ty.U32)
+    q := k.Var(spirv.Ty.U32)
+    k.For(i, lo, hi)
+    o := k.Add(k.Mul(k.Get(i), c), k.Mul(g, per))
+    k.For(q, k.U(0), per)
+    v := k.Sub(k.Read(x, k.Add(o, k.Get(q))), mu)
+    k.Set(acc, k.Add(k.Get(acc), k.Select(sq, k.Mul(v, v), v)))
+    k.Next(q)
+    k.Next(i)
+    k.Write(part, k.Add(k.Mul(g, chunks), j), k.Get(acc))
+    k.EndIf()
+    return k
+}
+
+# out[outOff + g] = the sum of part[g chunks ..] divided by count: the mean (or, last, 1 / sqrt(that + eps))
+fn reduceKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(64)
+    part := k.Buffer(spirv.Ty.F32)
+    out := k.Buffer(spirv.Ty.F32)
+    groupsN := k.Param(spirv.Ty.U32)
+    chunks := k.Param(spirv.Ty.U32)
+    count := k.Param(spirv.Ty.F32)
+    root := k.Param(spirv.Ty.U32)
+    eps := k.Param(spirv.Ty.F32)
+    outOff := k.Param(spirv.Ty.U32)
+    g := k.GlobalId(0)
+    k.If(k.Lt(g, groupsN))
+    acc := k.Let(k.F(0))
+    j := k.Var(spirv.Ty.U32)
+    k.For(j, k.U(0), chunks)
+    k.Set(acc, k.Add(k.Get(acc), k.Read(part, k.Add(k.Mul(g, chunks), k.Get(j)))))
+    k.Next(j)
+    v := k.Div(k.Get(acc), count)
+    k.Write(out, k.Add(outOff, g), k.Select(k.Ne(root, k.U(0)), k.Div(k.F(1), k.Sqrt(k.Add(v, eps))), v))
+    k.EndIf()
+    return k
+}
+
+# y[e] = (x[e] - mean[g]) inv[g] gain[ch] + bias[ch], then silu where act, ch = e mod c, g = ch / per (y may be x)
+fn applyKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(64)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    stats := k.Buffer(spirv.Ty.F32)
+    gb := k.Buffer(spirv.Ty.F32)
+    e, live := elemBegin(k)
+    c := k.Param(spirv.Ty.U32)
+    per := k.Param(spirv.Ty.U32)
+    groupsN := k.Param(spirv.Ty.U32)
+    act := k.Param(spirv.Ty.U32)
+    k.If(live)
+    ch := k.Mod(e, c)
+    g := k.Div(ch, per)
+    v := k.Add(k.Mul(k.Mul(k.Sub(k.Read(x, e), k.Read(stats, g)), k.Read(stats, k.Add(groupsN, g))), k.Read(gb, ch)), k.Read(gb, k.Add(c, ch)))
+    k.Write(y, e, k.Select(k.Ne(act, k.U(0)), k.Div(v, k.Add(k.F(1), k.Exp(k.Neg(v)))), v))
+    k.EndIf()
+    return k
+}
+
+# a convolution's weights ([OutC x C K K]) and bias on the device
+type dconv unique struct(w vdev.Buf<F32>, b vdev.Buf<F32>, c I64, outC I64, k I64) {
+    w
+    b
+    C I64 = c
+    OutC I64 = outC
+    K I64 = k
+}
+
+fn dconv.Make(dev mut vdev.Device&, cv vae.Conv&) dconv ? vdev.VkError {
+    r := dconv(try vdev.Buf<F32>.Make(dev, cv.W.Len()), try vdev.Buf<F32>.Make(dev, cv.OutC.Max(1)), cv.C, cv.OutC, cv.K)
+    if cv.OutC > 0 {
+        r.w.UploadAll(cv.W)
+        r.b.UploadAll(cv.B)
+    }
+    return r
+}
+
+# a norm's gains, then its biases
+fn dnorm(dev mut vdev.Device&, n vae.Norm&) vdev.Buf<F32> ? vdev.VkError {
+    b := try vdev.Buf<F32>.Make(dev, 2 * n.G.Len())
+    b.Upload(n.G, 0, 0, n.G.Len())
+    b.Upload(n.B, 0, n.G.Len(), n.B.Len())
+    return b
+}
+
+type dresnet unique struct(n1 vdev.Buf<F32>, c1 dconv, n2 vdev.Buf<F32>, c2 dconv, short dconv) {
+    n1
+    c1
+    n2
+    c2
+    short
+}
+
+fn dresnet.Make(dev mut vdev.Device&, r vae.Resnet&) dresnet ? vdev.VkError {
+    return dresnet(try dnorm(dev, r.Norm1), try dconv.Make(dev, r.Conv1), try dnorm(dev, r.Norm2), try dconv.Make(dev, r.Conv2), try dconv.Make(dev, r.Short))
+}
+
+# the most numbers one picture's activations hold at once in the decoder, for latents of h0 x w0
+fn widest(v vae.Vae&, h0 I64, w0 I64) I64 {
+    top := v.Widths[v.Widths.Len() - 1]
+    n := h0 * w0
+    most := n * 3 * top
+    for st in v.Stages {
+        for b in st.Blocks: most = most.Max(n * b.Conv1.C.Max(b.Conv1.OutC))
+        if st.Up.OutC == 0: continue
+        n *= 4
+        most = most.Max(n * st.Up.C)
+    }
+    return most
+}
+
+# the decoder on a device, for latents of h0 x w0: its weights, and three buffers of the widest activation that the
+# layers pass between them
+type VaeGpu unique struct(dev mut vdev.Device&, v vae.Vae&, h0 I64, w0 I64, ks kern.Set, patch kern.Kernel, twice kern.Kernel, stats kern.Kernel, reduce kern.Kernel, apply kern.Kernel, part vdev.Buf<F32>, moments vdev.Buf<F32>, b0 vdev.Buf<F32>, b1 vdev.Buf<F32>, b2 vdev.Buf<F32>, col vdev.Buf<F32>, scores vdev.Buf<F32>) {
+    dev
+    v
+    H0 I64 = h0
+    W0 I64 = w0
+    ks
+    patch
+    twice
+    stats
+    reduce
+    apply
+    part
+    moments             # a norm's means, then its 1 / sqrt(var + eps)
+    b0
+    b1
+    b2
+    col                 # a run of rows' patches
+    scores              # a run of queries' scores
+    convs mut Vec<dconv>& = Vec<dconv>()        # Post, In, Qkv, AttnOut, Out, then each stage's Up
+    norms mut Vec<vdev.Buf<F32>>& = Vec<vdev.Buf<F32>>()   # AttnNorm, OutNorm
+    blocks mut Vec<dresnet>& = Vec<dresnet>()   # Mid1, Mid2, then each stage's blocks in order
+    Bytes I64 = 0       # device memory held
+}
+
+# pixels a chunk of a norm's sums, and the most chunks
+NormChunk I64 = 1024
+NormChunks I64 = 4096
+
+# the most bytes of a run of patches or scores
+RunBytes I64 = 256 * 1048576
+
+fn VaeGpu.Make(dev mut vdev.Device&, v vae.Vae&, h0 I64, w0 I64) VaeGpu ? vdev.VkError {
+    most := widest(v, h0, w0)
+    if 4 * most > dev.MaxBufMiB * 1048576 {
+        error vdev.VkError.Vulkan(0, "the decoder needs buffers of " + $(4 * most / 1048576) + " MiB, more than one buffer of " + dev.Name + " holds (" + $dev.MaxBufMiB + " MiB): a smaller image may fit")
+    }
+    run := (dev.MaxBufMiB * 1048576).Min(RunBytes) / 4
+    cmax := v.Widths[v.Widths.Len() - 1]
+    n0 := 64 * h0 * w0
+    colN := run.Min(9 * cmax * n0)
+    scN := run.Min(h0 * w0 * h0 * w0)
+    g := VaeGpu(dev, v, h0, w0, try kern.Set.Make(dev), try made(dev, "vae_patch", patchKernel()), try made(dev, "vae_double", doubleKernel()), try made(dev, "vae_stats", statsKernel())
+        try made(dev, "vae_reduce", reduceKernel()), try made(dev, "vae_apply", applyKernel()), try vdev.Buf<F32>.Make(dev, v.Groups * NormChunks), try vdev.Buf<F32>.Make(dev, 2 * v.Groups)
+        try vdev.Buf<F32>.Make(dev, most), try vdev.Buf<F32>.Make(dev, most), try vdev.Buf<F32>.Make(dev, most), try vdev.Buf<F32>.Make(dev, colN), try vdev.Buf<F32>.Make(dev, scN))
+    g.Bytes = 4 * (3 * most + colN + scN)
+    g.convs.Push(try dconv.Make(dev, v.Post))
+    g.convs.Push(try dconv.Make(dev, v.In))
+    g.convs.Push(try dconv.Make(dev, v.Qkv))
+    g.convs.Push(try dconv.Make(dev, v.AttnOut))
+    g.convs.Push(try dconv.Make(dev, v.Out))
+    for st in v.Stages: g.convs.Push(try dconv.Make(dev, st.Up))
+    g.norms.Push(try dnorm(dev, v.AttnNorm))
+    g.norms.Push(try dnorm(dev, v.OutNorm))
+    g.blocks.Push(try dresnet.Make(dev, v.Mid1))
+    g.blocks.Push(try dresnet.Make(dev, v.Mid2))
+    for st in v.Stages {
+        for b in st.Blocks: g.blocks.Push(try dresnet.Make(dev, b))
+    }
+    try dev.Sync()
+    return g
+}
+
+# buffer i of the three
+fn (g VaeGpu&) buf(i I64) vdev.Buf<F32>& {
+    if i == 0: return g.b0
+    return g.b1 if i == 1 else g.b2
+}
+
+# k over count elements, a dispatch a reach of them: its buffers, then (at, m), then params
+fn (g mut VaeGpu&) each(k kern.Kernel&, count I64, bufs Array<U64>&, params Array<U32>&) {
+    d := g.dev
+    step := reach(d)
+    for at in range 0, count, step {
+        m := step.Min(count - at)
+        p := Vec<U32>()
+        p.Push(u(at))
+        p.Push(u(m))
+        for x in params: p.Push(x)
+        k.Run(d, groups(m, 64), 1, 1, bufs, p.ToArray())
+    }
+}
+
+# a group norm of buffer x's n pixels of c channels into buffer y (y may be x), then silu where act
+fn (g mut VaeGpu&) norm(y I64, x I64, n I64, c I64, gb vdev.Buf<F32>&, act Bool) {
+    d := g.dev
+    groupsN := g.v.Groups
+    per := c / groupsN
+    chunk := NormChunk.Max(groups(n, NormChunks))
+    chunks := groups(n, chunk)
+    count := F32(F64(n * per))
+    xh := g.buf(x).Handle()
+    for sq in range 2 {
+        g.stats.Run(d, groups(chunks, Tile), groups(groupsN, Tile), 1, Array<U64>[xh, g.part.Handle(), g.moments.Handle()], Array<U32>[u(n), u(c), u(per), u(groupsN), u(chunk), u(chunks), u(sq)])
+        g.reduce.Run(d, groups(groupsN, 64), 1, 1, Array<U64>[g.part.Handle(), g.moments.Handle()], Array<U32>[u(groupsN), u(chunks), f(count), u(sq), f(1e-6), u(sq * groupsN)])
+    }
+    g.each(g.apply, n * c, Array<U64>[xh, g.buf(y).Handle(), g.moments.Handle(), gb.Handle()], Array<U32>[u(c), u(per), u(groupsN), u(1 if act else 0)])
+}
+
+# buffer x's h x w pixels through cv (1 x 1 or 3 x 3, same size) into buffer y
+fn (g mut VaeGpu&) conv(y I64, x I64, h I64, w I64, cv dconv&) {
+    d := g.dev
+    n := h * w
+    yb := g.buf(y)
+    xb := g.buf(x)
+    wm := vdev.DMat<F32>(cv.w, 0, cv.OutC, cv.C * cv.K * cv.K, cv.C * cv.K * cv.K)
+    if cv.K == 1 {
+        g.ks.Gemm(d, vdev.DMat<F32>(yb, 0, n, cv.OutC, cv.OutC), vdev.DMat<F32>(xb, 0, n, cv.C, cv.C), false, wm, true)
+    } else {
+        depth := 9 * cv.C
+        rows := (g.col.N / (depth * w)).Max(1).Min(h)
+        for r0 in range 0, h, rows {
+            q := rows.Min(h - r0) * w
+            g.each(g.patch, q * depth, Array<U64>[xb.Handle(), g.col.Handle()], Array<U32>[u(r0 * w), u(h), u(w), u(cv.C)])
+            g.ks.Gemm(d, vdev.DMat<F32>(yb, r0 * w * cv.OutC, q, cv.OutC, cv.OutC), vdev.DMat<F32>(g.col, 0, q, depth, depth), false, wm, true)
+        }
+    }
+    g.ks.Add(d, yb, 0, yb, 0, cv.b, 0, n * cv.OutC, 1, cv.OutC)
+}
+
+# buffer x through a resnet block: the result in the buffer returned, x's buffer left for reuse
+fn (g mut VaeGpu&) resnet(x I64, h I64, w I64, b dresnet&) I64 {
+    d := g.dev
+    n := h * w
+    t1, t2 := (x + 1) % 3, (x + 2) % 3
+    g.norm(t1, x, n, b.c1.C, b.n1, true)
+    g.conv(t2, t1, h, w, b.c1)
+    g.norm(t2, t2, n, b.c1.OutC, b.n2, true)
+    g.conv(t1, t2, h, w, b.c2)
+    if b.short.OutC == 0 {
+        g.ks.Add(d, g.buf(t1), 0, g.buf(t1), 0, g.buf(x), 0, n * b.c2.OutC)
+        return t1
+    }
+    g.conv(t2, x, h, w, b.short)
+    g.ks.Add(d, g.buf(t1), 0, g.buf(t1), 0, g.buf(t2), 0, n * b.c2.OutC)
+    return t1
+}
+
+# the mid block's attention (one head over every pixel), a run of queries at a time
+fn (g mut VaeGpu&) attend(x I64, h I64, w I64) I64 {
+    d := g.dev
+    c := g.v.Widths[g.v.Widths.Len() - 1]
+    n := h * w
+    t1, t2 := (x + 1) % 3, (x + 2) % 3
+    g.norm(t1, x, n, c, g.norms[0], false)
+    g.conv(t2, t1, h, w, g.convs[2])
+    qkv := g.buf(t2)
+    out := g.buf(t1)
+    run := (g.scores.N / n).Max(1).Min(n)
+    for q0 in range 0, n, run {
+        q := run.Min(n - q0)
+        sc := vdev.DMat<F32>(g.scores, 0, q, n, n)
+        g.ks.Gemm(d, sc, vdev.DMat<F32>(qkv, q0 * 3 * c, q, c, 3 * c), false, vdev.DMat<F32>(qkv, c, n, c, 3 * c), true)
+        g.ks.Softmax(d, sc, sc, F32(1.0 / F64(c).Sqrt()))
+        g.ks.Gemm(d, vdev.DMat<F32>(out, q0 * c, q, c, c), sc, false, vdev.DMat<F32>(qkv, 2 * c, n, c, 3 * c), false)
+    }
+    g.conv(t2, t1, h, w, g.convs[3])
+    g.ks.Add(d, g.buf(t2), 0, g.buf(t2), 0, g.buf(x), 0, n * c)
+    return t2
+}
+
+# vae.Vae.Decode on the device: z ([H0 x W0 x Latent], NHWC) to [8 H0 x 8 W0 x 3]
+fn (g mut VaeGpu&) Decode(z Array<F32>&) Array<F32> ? vdev.VkError {
+    d := g.dev
+    v :~ g.v
+    h, w := g.H0, g.W0
+    g.b2.Upload(z, 0, 0, z.Len())
+    g.conv(1, 2, h, w, g.convs[0])
+    g.conv(0, 1, h, w, g.convs[1])
+    x := g.resnet(0, h, w, g.blocks[0])
+    x = g.attend(x, h, w)
+    x = g.resnet(x, h, w, g.blocks[1])
+    bi I64 = 2
+    for si in range v.Stages.Len() {
+        for _ in range v.Stages[si].Blocks.Len() {
+            x = g.resnet(x, h, w, g.blocks[bi])
+            bi += 1
+        }
+        if v.Stages[si].Up.OutC == 0: continue
+        c := v.Stages[si].Up.C
+        t1, t2 := (x + 1) % 3, (x + 2) % 3
+        g.each(g.twice, 4 * h * w * c, Array<U64>[g.buf(x).Handle(), g.buf(t1).Handle()], Array<U32>[u(w), u(c)])
+        h, w = 2 * h, 2 * w
+        g.conv(t2, t1, h, w, g.convs[5 + si])
+        x = t2
+    }
+    g.norm(x, x, h * w, v.Widths[0], g.norms[1], true)
+    t1 := (x + 1) % 3
+    g.conv(t1, x, h, w, g.convs[4])
+    out := Array<F32>(h * w * 3)
+    g.buf(t1).Download(out, 0, 0, out.Len())
+    try d.Sync()
+    return out
+}
+
+if TestBuild {
+
+import "std/rand"
+
+fn fill(r mut rand.Rand&, l mut flux2.Lin&) {
+    scale := 1.0 / F64(l.In).Sqrt()
+    for i in range l.W.Len(): l.W[i] = BF16(F32(r.Normal() * scale))
+}
+
+fn noise(r mut rand.Rand&, w mut Array<F32>&, b mut Array<F32>&) {
+    for i in range w.Len(): w[i] = F32(0.1 * r.Normal())
+    for i in range b.Len(): b[i] = F32(0.1 * r.Normal())
+}
+
+fn gainsOf(r mut rand.Rand&, a mut Array<F32>&) {
+    for i in range a.Len(): a[i] = F32(1.0 + 0.2 * r.Normal())
+}
+
+# a small model of random weights
+fn small() flux2.Model {
+    c := flux2.Config()
+    c.Heads, c.HeadDim, c.Dim = 3, 16, 48
+    c.Double, c.Single = 2, 3
+    c.In, c.Text, c.Ffn, c.TimeDim = 8, 24, 144, 16
+    m := flux2.Model(c, true)
+    r := rand.Rand(7)
+    for l in [m.ImgIn, m.TxtIn, m.Time1, m.Time2, m.ModImg, m.ModTxt, m.ModSingle, m.NormOut, m.Out]: fill(r, l)
+    for i in range c.Double {
+        for l in [m.Doubles[i].TxtQkv, m.Doubles[i].ImgQkv, m.Doubles[i].TxtO, m.Doubles[i].ImgO, m.Doubles[i].TxtUp, m.Doubles[i].ImgUp, m.Doubles[i].TxtDown, m.Doubles[i].ImgDown]: fill(r, l)
+        for a in [m.Doubles[i].TxtQ, m.Doubles[i].TxtK, m.Doubles[i].ImgQ, m.Doubles[i].ImgK]: gainsOf(r, a)
+    }
+    for i in range c.Single {
+        fill(r, m.Singles[i].Wide)
+        fill(r, m.Singles[i].Out)
+        gainsOf(r, m.Singles[i].Q)
+        gainsOf(r, m.Singles[i].K)
+    }
+    return m
+}
+
+# the device's pass against the CPU's over the same inputs: the largest difference, the largest value
+fn against(m flux2.Model&, dev mut vdev.Device&, budget I64) F64, F64, I64 ? vdev.VkError {
+    t, rows, cols := 5, 3, 4
+    r := rand.Rand(11)
+    embeds := Array<F32>[F32(r.Normal()) for _ in range t * m.C.Text]
+    lat := Array<F32>[F32(r.Normal()) for _ in range rows * cols * m.C.In]
+    e := flux2.Run(m, t, rows, cols)
+    m.SetText(e, embeds)
+    m.Forward(e, lat, 0.7)
+    g := try Gpu.Make(dev, m, t, rows, cols, budget)
+    try g.SetText(embeds)
+    try g.Forward(lat, 0.3)
+    try g.Forward(lat, 0.7)
+    worst, top := 0.0, 0.0
+    for i in range e.Out.Len() {
+        worst = worst.Max(F64(e.Out[i] - g.Out[i]).Abs())
+        top = top.Max(F64(e.Out[i]).Abs())
+    }
+    return worst, top, g.Resident
+}
+
+test Gpu "a small random model's pass on the device is the CPU's: every block resident, then every block streamed through split buffers" {
+    dev := try vdev.Device.Open() catch vdev.VkError.NoDevice {
+        vdev.Skip("the image transformer's pass")
+        return
+    }
+    m := small()
+    worst, top, kept := against(m, dev, 4096)!
+    Println("on " + dev.Name + ": resident " + $kept + " blocks, within " + $worst + " of the CPU's (values to " + $top + ")")
+    assert kept == 5 and worst < 1e-4 * top.Max(1.0)
+    BufLimit = 4096
+    worst, top, kept = against(m, dev, -1)!
+    BufLimit = 0
+    Println("streamed: resident " + $kept + " blocks, within " + $worst)
+    assert kept == 0 and worst < 1e-4 * top.Max(1.0)
+}
+
+test VaeGpu "a small random decoder on the device is the CPU's" {
+    dev := try vdev.Device.Open() catch vdev.VkError.NoDevice {
+        vdev.Skip("the image decoder")
+        return
+    }
+    v := vae.Vae(4, [32, 64], 1, 32, 1e-4)
+    r := rand.Rand(5)
+    for c in [v.Post, v.In, v.Qkv, v.AttnOut, v.Out, v.Mid1.Conv1, v.Mid1.Conv2, v.Mid2.Conv1, v.Mid2.Conv2]: noise(r, c.W, c.B)
+    for n in [v.Mid1.Norm1, v.Mid1.Norm2, v.Mid2.Norm1, v.Mid2.Norm2, v.AttnNorm, v.OutNorm]: gainsOf(r, n.G)
+    for i in range v.Stages.Len() {
+        for k in range v.Stages[i].Blocks.Len() {
+            noise(r, v.Stages[i].Blocks[k].Conv1.W, v.Stages[i].Blocks[k].Conv1.B)
+            noise(r, v.Stages[i].Blocks[k].Conv2.W, v.Stages[i].Blocks[k].Conv2.B)
+            noise(r, v.Stages[i].Blocks[k].Short.W, v.Stages[i].Blocks[k].Short.B)
+            gainsOf(r, v.Stages[i].Blocks[k].Norm1.G)
+            gainsOf(r, v.Stages[i].Blocks[k].Norm2.G)
+        }
+        noise(r, v.Stages[i].Up.W, v.Stages[i].Up.B)
+    }
+    h, w := 3, 5
+    z := Array<F32>[F32(r.Normal()) for _ in range h * w * 4]
+    want := v.Decode(z, h, w)
+    g := VaeGpu.Make(dev, v, h, w)!
+    got := g.Decode(z)!
+    worst, top := 0.0, 0.0
+    for i in range want.Len() {
+        worst = worst.Max(F64(want[i] - got[i]).Abs())
+        top = top.Max(F64(want[i]).Abs())
+    }
+    Println("decoder on " + dev.Name + ": within " + $worst + " of the CPU's (values to " + $top + ")")
+    assert got.Len() == 2 * h * 2 * w * 3 and worst < 1e-4 * top.Max(1.0)
+}
+
+}

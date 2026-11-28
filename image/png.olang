@@ -1,0 +1,57 @@
+# image/png - an image written as a PNG file: 8 bits a channel, RGB, each row filtered by the one above it (Up), one
+# zlib stream (std/flate). std/png reads them back.
+
+import "std/crc32"
+import "std/flate"
+
+fn be32(out mut Vec<U8>&, v U32) {
+    out.Push(U8(v >> 24))
+    out.Push(U8((v >> 16) & 0xFF))
+    out.Push(U8((v >> 8) & 0xFF))
+    out.Push(U8(v & 0xFF))
+}
+
+# a chunk: length, type, data, and the CRC-32 of type and data
+fn chunk(out mut Vec<U8>&, kind String&, data Array<U8>&) {
+    be32(out, U32(data.Len()))
+    start := out.Len()
+    out.PushAll(kind.Bytes())
+    out.PushAll(data)
+    be32(out, crc32.Checksum(out.View()[start:]))
+}
+
+# the PNG file of pixels (h x w x 3, row-major, red, green, blue)
+fn Encode(pixels Array<U8>&, w I64, h I64) Array<U8> {
+    stride := 1 + 3 * w
+    raw := Array<U8>(h * stride)
+    for y in range h {
+        raw[y * stride] = 2
+        for i in range 3 * w {
+            up := pixels[(y - 1) * 3 * w + i] if y > 0 else U8(0)
+            raw[y * stride + 1 + i] = pixels[y * 3 * w + i] - up
+        }
+    }
+    out := Vec<U8>()
+    out.PushAll(Array<U8>[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    head := Vec<U8>()
+    be32(head, U32(w))
+    be32(head, U32(h))
+    head.PushAll(Array<U8>[8, 2, 0, 0, 0])
+    chunk(out, "IHDR", head.View())
+    chunk(out, "IDAT", flate.Zlib(raw))
+    chunk(out, "IEND", Array<U8>(0))
+    return out.ToArray()
+}
+
+if TestBuild {
+
+import "std/png"
+
+test Encode "a picture written is the picture std/png reads" {
+    w, h := 5, 3
+    px := Array<U8>[U8((i * 37 + 11) % 256) for i in range w * h * 3]
+    img := png.Decode(Encode(px, w, h))!
+    assert img.Width == w and img.Height == h and img.Channels == 3 and img.Pixels == px
+}
+
+}

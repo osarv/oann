@@ -1,0 +1,137 @@
+# oann-image - a picture of a prompt, written as a PNG:
+#   oann-image MODEL "PROMPT" OUT.png [--size WxH] [--steps N] [--seed S] [--exact] [--device cpu|vulkan]
+# --device vulkan runs the transformer on a GPU through Vulkan (image/vk; a build with -define Vulkan=true), F32
+# activations as --exact.
+# MODEL is a directory holding FLUX.2 klein as its Hugging Face repository lays it out (image/klein). --size is
+# 1024x1024 by default, each side a multiple of 16; --steps 4, what the distilled models are made for; --exact runs F32
+# activations (the reference's arithmetic, slower).
+#
+#   oann-image MODEL --serve [--exact] [--device cpu|vulkan]
+# keeps the transformer and the decoder loaded and makes a picture for each line of stdin, a JSON object
+#   {"prompt": "...", "out": "PATH.png", "width": 1024, "height": 1024, "steps": 4, "seed": 0}
+# (width, height, steps and seed optional), answering each on stdout with JSON lines: {"step": N, "of": STEPS} as each
+# step starts, then {"ok": true, "path": "PATH.png", "width": W, "height": H, "seconds": S} or {"ok": false, "error":
+# "..."}. It ends when stdin closes. The text encoder is loaded for each picture and let go (its 6 GB beside the
+# transformer's 7.8 GB would be most of a 16 GB machine); the transformer's blocks on a device are sent up again for
+# each picture.
+import "std/io"
+import "std/json"
+import "std/os"
+import "std/time"
+import "flux2"
+import "klein"
+import "png"
+import "vae"
+
+fn fail(msg String&) noreturn {
+    try io.PutErrLn("oann-image: " + msg) catch { }
+    os.Exit(1)
+}
+
+fn usage() noreturn { fail("usage: oann-image MODEL \"PROMPT\" OUT.png [--size WxH] [--steps N] [--seed S] [--exact] [--device cpu|vulkan], or oann-image MODEL --serve [--exact] [--device cpu|vulkan]") }
+
+# a line of a server's input
+type request struct(prompt String&, out String&, width I64 = 1024, height I64 = 1024, steps I64 = 4, seed I64 = 0) {
+    prompt
+    out
+    width
+    height
+    steps
+    seed
+}
+
+fn say(line String&) {
+    try io.PutLn(line) catch { os.Exit(1) }
+}
+
+fn refuse(why String&) { say("{\"ok\":false,\"error\":" + json.Encode(why) + "}") }
+
+# one request of a server, the models loaded
+fn answer(dir String&, m flux2.Model&, v vae.Vae&, exact Bool, device String&, line String&) {
+    q := try json.Decode<request>(line) catch e {
+        refuse("the request is not {\"prompt\": ..., \"out\": ...}: " + $e)
+        return
+    }
+    rows, cols := q.height / 16, q.width / 16
+    if rows < 1 or cols < 1 or q.steps < 1 {
+        refuse("a picture smaller than 16 x 16, or no steps")
+        return
+    }
+    t0 := time.Now()
+    embeds := try klein.Embed(dir, q.prompt, exact, device = device) catch e {
+        refuse($e)
+        return
+    }
+    tokens := try klein.Steps(m, embeds, rows, cols, q.steps, U64(q.seed), fn(step I64) {
+        say("{\"step\":" + $(step + 1) + ",\"of\":" + $q.steps + "}")
+    }, device = device) catch e {
+        refuse($e)
+        return
+    }
+    px := klein.Pixels(v, tokens, rows, cols, device)
+    try os.WriteFile(q.out, png.Encode(px, 16 * cols, 16 * rows)) catch {
+        refuse("cannot write " + q.out)
+        return
+    }
+    secs := F64(time.Since(t0)) / 1e9
+    say("{\"ok\":true,\"path\":" + json.Encode(q.out) + ",\"width\":" + $(16 * cols) + ",\"height\":" + $(16 * rows) + ",\"seconds\":" + $secs + "}")
+}
+
+fn serve(dir String&, exact Bool, device String&) {
+    m := try klein.Transformer(dir, exact, device) catch e { fail($e) }
+    v := try klein.Decoder(dir) catch e { fail($e) }
+    try io.PutErrLn("oann-image: serving " + dir + " on " + device) catch { }
+    for {
+        line := try StdinLine() catch { return }
+        if line.Trim() != "": answer(dir, m, v, exact, device, line)
+    }
+}
+
+fn main() {
+    a := os.Args()
+    if a.Len() >= 3 and a[2] == "--serve" {
+        exact := false
+        device := "cpu"
+        for i in range 3, a.Len() {
+            if a[i] == "--exact": exact = true
+            else if a[i] == "--device" and i + 1 < a.Len(): device = a[i + 1]
+        }
+        serve(a[1], exact, device)
+        return
+    }
+    if a.Len() < 4: usage()
+    width, height, steps I64 = 1024, 1024, 4
+    seed U64 = 0
+    exact := false
+    device := "cpu"
+    i I64 = 4
+    for i < a.Len() {
+        if a[i] == "--exact" {
+            exact = true
+            i++
+            continue
+        }
+        if i + 1 >= a.Len(): usage()
+        if a[i] == "--size" {
+            parts := a[i + 1].Split("x")
+            if parts.Len() != 2: usage()
+            width = try parts[0].ParseInt() catch { usage() }
+            height = try parts[1].ParseInt() catch { usage() }
+        } else if a[i] == "--steps" {
+            steps = try a[i + 1].ParseInt() catch { usage() }
+        } else if a[i] == "--device" {
+            device = a[i + 1]
+        } else if a[i] == "--seed" {
+            seed = U64(try a[i + 1].ParseInt() catch { usage() })
+        } else {
+            usage()
+        }
+        i += 2
+    }
+    t0 := time.Now()
+    px, w, h := try klein.Generate(a[1], a[2], width, height, steps, seed, exact, fn(step I64) {
+        try io.PutErrLn("step " + $(step + 1) + " of " + $steps + " (" + $(time.Since(t0) / 1000000000) + " s)") catch { }
+    }, device) catch e { fail($e) }
+    try os.WriteFile(a[3], png.Encode(px, w, h)) catch { fail("cannot write " + a[3]) }
+    Println(a[3] + ": " + $w + " x " + $h + " in " + $(time.Since(t0) / 1000000000) + " s")
+}

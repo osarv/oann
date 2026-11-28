@@ -35,7 +35,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help vktest vkgemm vktune vklintune vkllm whispervk diloco oanngen visionbench oannlisten oannwho speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help oannimage vktest vkgemm vktune vklintune vkllm whispervk diloco oanngen visionbench oannlisten oannwho speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -56,7 +56,7 @@ gputest:
 # the Vulkan backend's tests (docs/vulkan.md), any GPU with a Vulkan driver - AMD, Intel, NVIDIA, a CPU's software Vulkan
 # (Mesa's lavapipe) - against the CPU kernels: -define Vulkan=true, which needs Vulkan's headers (libvulkan-dev) alone;
 # each test says it is skipped where there is no Vulkan device. OANN_VK_DEVICE=N picks one of several
-VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang llm/vk.olang speech/whispervk.olang
+VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang llm/vk.olang speech/whispervk.olang image/vk.olang
 vktest:
 	$(OLANG) test -define Vulkan=true $(VKTESTS)
 
@@ -234,6 +234,13 @@ oannwho:
 oanngen:
 	$(OLANG) build $(GPUDEFINE) $(VKDEFINE) -output build/oann-gen llm/gen.olang
 	$(if $(ARGS),./build/oann-gen $(ARGS),)
+
+# oann-image: a picture of a prompt by FLUX.2 klein (image/gen.olang, image/README.md), built to build/oann-image (with
+# Vulkan where its headers are: --device vulkan) -
+# ARGS: MODEL "PROMPT" OUT.png and its flags (none: only builds it)
+oannimage:
+	$(OLANG) build $(VKDEFINE) -output build/oann-image image/gen.olang
+	$(if $(ARGS),./build/oann-image $(ARGS),)
 
 # Whisper's real-time factor (bench/speech.olang) - ARGS: MODEL_DIR CLIP.wav [rounds] [threads ...]
 speechbench:

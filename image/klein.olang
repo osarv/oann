@@ -1,0 +1,241 @@
+# image/klein - text to image with FLUX.2 klein (Black Forest Labs; the 4B model is Apache 2.0), from a directory laid
+# out as the model's Hugging Face repository: tokenizer/, text_encoder/ (a Qwen3 language model), transformer/
+# (image/flux2), vae/ (image/vae).
+#
+# Embed: the prompt as one user turn of the encoder's chat template (thinking off), padded to 512 tokens; each token's
+# embedding is the language model's stream after layers 9, 18 and 27, side by side. Padding tokens are read after the
+# prompt and attend to the prompt alone, as the reference's attention mask has it.
+# Flow: latent tokens (one per 16 x 16 pixels) start as noise and are moved along the transformer's velocity from
+# noise level 1 to 0 in a few Euler steps (four for the distilled klein models), the levels shifted toward noise by the
+# image's size as the reference shifts them.
+# Decode: the tokens through the autoencoder's decoder to pixels.
+# Each part loads its model and lets it go, so the peak is the largest part's (the transformer's 7.8 GB), not their sum.
+# Transformer and Steps, Decoder and Pixels are the parts with the model loaded by the caller, to keep it for many
+# pictures (oann-image --serve).
+
+import "std/io"
+import "std/rand"
+import "std/time"
+import "../llm/bpe"
+import "../llm/chat"
+import "../llm/model"
+import "flux2"
+import "vae"
+
+type Error error {
+    Failed(what String)
+}
+
+TextTokens I64 = 512                        # the prompt's length, padded
+KeepLayers Array<I64>& = [9, 18, 27]        # the encoder's hidden states a token's embedding is made of
+
+# "oann-image: WHAT N.N s" on stderr, the seconds since t0: where a picture's time goes
+fn Note(what String&, t0 I64) {
+    try io.PutErrLn("oann-image: " + what + " " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s") catch { }
+}
+
+# the prompt's tokens as the reference's tokenizer gives them: the chat template's text, cut or padded to TextTokens;
+# the count before padding second
+fn Tokens(dir String&, prompt String&) Array<I32>, I64 ? Error {
+    t := try bpe.Bpe.Load(dir + "/tokenizer/tokenizer.json") catch { error Error.Failed(dir + "/tokenizer/tokenizer.json") }
+    c := chat.Chat.Load(dir + "/tokenizer", t)
+    ids := t.Encode(c.Prompt(prompt, think = false))
+    pad := t.Find("<|endoftext|>")
+    if pad < 0: error Error.Failed("the tokenizer has no <|endoftext|> to pad with")
+    real := ids.Len().Min(TextTokens)
+    return Array<I32>[ids[i] if i < real else pad for i in range TextTokens], real
+}
+
+# the prompt's embeddings for the transformer: TextTokens rows of 3 x the encoder's width
+fn Embed(dir String&, prompt String&, exact Bool = false, int8 Bool = false, device String& = "cpu") Array<F32> ? Error {
+    ids, real := try Tokens(dir, prompt)
+    last I64 = 0
+    for k in KeepLayers: last = last.Max(k)
+    onDevice := device == "vulkan"
+    t0 := time.Now()
+    m := try model.Model.Load(dir + "/text_encoder", exact or onDevice, int8 and not onDevice, layers = last) catch { error Error.Failed(dir + "/text_encoder") }
+    Note("text encoder loaded", t0)
+    t1 := time.Now()
+    pages := (TextTokens + model.PageSize - 1) / model.PageSize
+    s := model.State(m, TextTokens, 0, TextTokens)
+    s.Keep(m, KeepLayers)
+    for i in range TextTokens {
+        s.Add(ids[i], i, 0, false)
+        if i >= real: s.Last[i] = real - 1
+    }
+    # on the device where it has the room, else here
+    here := not onDevice
+    if onDevice {
+        try vkEmbed(m, s, pages) catch e {
+            try io.PutErrLn("oann-image: the text encoder runs on the CPU: " + $e) catch { }
+            here = true
+        }
+    }
+    if here {
+        k := model.Cache(m.C, pages, 1, pages, exact or onDevice)
+        for i in range pages: k.Table[i] = k.Take()
+        m.Step(s, k)
+    }
+    Note("prompt encoded", t1)
+    d := m.C.Dim
+    n := KeepLayers.Len()
+    out := Array<F32>(TextTokens * n * d)
+    for i in range TextTokens {
+        for l in range n {
+            for j in range d: out[(i * n + l) * d + j] = s.Kept[(l * TextTokens + i) * d + j]
+        }
+    }
+    return out
+}
+
+# the noise levels of `steps` Euler steps over an image of `tokens` latent tokens, from 1 down to 0 (steps + 1 of
+# them): evenly spaced from 1 to 1 / steps, each s shifted to e^mu / (e^mu + 1 / s - 1), mu growing with the image
+fn Sigmas(steps I64, tokens I64) Array<F64> {
+    a1, b1 := 8.73809524e-05, 1.89833333
+    a2, b2 := 0.00016927, 0.45666666
+    m200 := a2 * F64(tokens) + b2
+    m10 := a1 * F64(tokens) + b1
+    a := (m200 - m10) / 190.0
+    mu := m200 if tokens > 4300 else a * F64(steps) + m200 - 200.0 * a
+    out := Array<F64>(steps + 1)
+    for i in range steps {
+        s := 1.0 - F64(i) * (1.0 - 1.0 / F64(steps)) / F64((steps - 1).Max(1))
+        out[i] = mu.Exp() / (mu.Exp() + (1.0 / s - 1.0))
+    }
+    return out
+}
+
+# rows x cols latent tokens of an image of the prompt embedded as embeds: noise (given, or drawn from seed) carried
+# to an image's latents in `steps` steps. progress(i) is called as step i starts
+fn Flow(dir String&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed U64, exact Bool, progress fn&(step I64), noise Array<F32>& = Array<F32>(0), device String& = "cpu") Array<F32> ? Error {
+    m := try Transformer(dir, exact, device)
+    return try Steps(m, embeds, rows, cols, steps, seed, progress, noise, device)
+}
+
+# the transformer, for device ("cpu" or "vulkan": F32 activations on a device, as exact)
+fn Transformer(dir String&, exact Bool, device String&) flux2.Model ? Error {
+    if device != "cpu" and device != "vulkan": error Error.Failed("the device " + device + " (cpu and vulkan run)")
+    return try flux2.Model.Load(dir + "/transformer", exact or device == "vulkan") catch { error Error.Failed(dir + "/transformer") }
+}
+
+# Flow's steps with the transformer m loaded (Transformer)
+fn Steps(m flux2.Model&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed U64, progress fn&(step I64), noise Array<F32>& = Array<F32>(0), device String& = "cpu") Array<F32> ? Error {
+    onDevice := device == "vulkan"
+    r := rand.Rand(seed)
+    n := rows * cols * m.C.In
+    lat := Array<F32>[noise[i] if noise.Len() == n else F32(r.Normal()) for i in range n]
+    sig := Sigmas(steps, rows * cols)
+    if onDevice {
+        try vkFlow(m, embeds, rows, cols, lat, sig, progress)
+        return lat
+    }
+    e := flux2.Run(m, embeds.Len() / m.C.Text, rows, cols)
+    m.SetText(e, embeds)
+    for i in range steps {
+        progress(i)
+        m.Forward(e, lat, sig[i])
+        dt := F32(sig[i + 1] - sig[i])
+        for k in range n: lat[k] += dt * e.Out[k]
+    }
+    return lat
+}
+
+Vulkan Bool = false
+
+if Vulkan {
+    import "vk"
+    import vdev "../kernels/vk/device"
+    import lvk "../llm/vk"
+
+    # the steps of sig on the Vulkan device (image/vk), lat in place
+    fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
+        dev := try vdev.Device.Open() catch e { error Error.Failed("the Vulkan device: " + $e) }
+        t0 := time.Now()
+        g := try vk.Gpu.Make(dev, m, embeds.Len() / m.C.Text, rows, cols) catch e { error Error.Failed("the model on " + dev.Name + ": " + $e) }
+        try io.PutErrLn("oann-image: device " + dev.Str() + ", " + $g.Resident + " of " + $(m.C.Double + m.C.Single) + " blocks resident, " + $(g.Bytes / 1048576) + " MiB held") catch { }
+        Note("transformer on the device", t0)
+        try g.SetText(embeds) catch e { error Error.Failed($e) }
+        defer: Note("steps", t0)
+        for i in range sig.Len() - 1 {
+            progress(i)
+            try g.Forward(lat, sig[i]) catch e { error Error.Failed($e) }
+            dt := F32(sig[i + 1] - sig[i])
+            for k in range lat.Len(): lat[k] += dt * g.Out[k]
+        }
+    }
+
+    # Embed's step on the Vulkan device (llm/vk): Error.Failed where the device has not the room
+    fn vkEmbed(m model.Model&, s mut model.State&, pages I64) ? Error {
+        k := model.Cache(m.C, pages, 1, pages, device = true)
+        for i in range pages: k.Table[i] = k.Take()
+        dev := try vdev.Device.Open() catch e { error Error.Failed($e) }
+        t0 := time.Now()
+        dec := try lvk.Decoder.Make(dev, m, TextTokens, 1, k, TextTokens) catch e { error Error.Failed($e) }
+        Note("text encoder on the device", t0)
+        try dec.Step(m, s, k) catch e { error Error.Failed($e) }
+    }
+
+    # the decoder on the Vulkan device (image/vk)
+    fn vkDecode(v vae.Vae&, z Array<F32>&, h I64, w I64) Array<F32> ? Error {
+        dev := try vdev.Device.Open() catch e { error Error.Failed("the Vulkan device: " + $e) }
+        g := try vk.VaeGpu.Make(dev, v, h, w) catch e { error Error.Failed("the decoder on " + dev.Name + ": " + $e) }
+        return try g.Decode(z) catch e { error Error.Failed($e) }
+    }
+} else {
+    fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
+        error Error.Failed("the device vulkan: this program was built without Vulkan (-define Vulkan=true, where Vulkan's headers are: libvulkan-dev)")
+    }
+
+    fn vkEmbed(m model.Model&, s mut model.State&, pages I64) ? Error { error Error.Failed("built without Vulkan") }
+
+    fn vkDecode(v vae.Vae&, z Array<F32>&, h I64, w I64) Array<F32> ? Error {
+        error Error.Failed("the device vulkan: this program was built without Vulkan (-define Vulkan=true, where Vulkan's headers are: libvulkan-dev)")
+    }
+}
+
+# the latent tokens' picture: 16 rows x 16 cols x 3 bytes, row-major, red, green, blue
+fn Decode(dir String&, tokens Array<F32>&, rows I64, cols I64, device String& = "cpu") Array<U8> ? Error {
+    v := try Decoder(dir)
+    return Pixels(v, tokens, rows, cols, device)
+}
+
+# the autoencoder's decoder
+fn Decoder(dir String&) vae.Vae ? Error { return try vae.Vae.Load(dir + "/vae") catch { error Error.Failed(dir + "/vae") } }
+
+# the latents' picture on device where it has the room, else here
+fn decodeOn(v vae.Vae&, z mut Array<F32>&, h I64, w I64, device String&) Array<F32> {
+    if device != "vulkan": return v.Decode(z, h, w)
+    return try vkDecode(v, z, h, w) catch e {
+        try io.PutErrLn("oann-image: the decoder runs on the CPU: " + $e) catch { }
+        return v.Decode(z, h, w)
+    }
+}
+
+# Decode with the decoder v loaded (Decoder)
+fn Pixels(v vae.Vae&, tokens Array<F32>&, rows I64, cols I64, device String& = "cpu") Array<U8> {
+    z := v.Unpatch(tokens, rows, cols)
+    t0 := time.Now()
+    img := decodeOn(v, z, 2 * rows, 2 * cols, device)
+    Note("decoded", t0)
+    return Array<U8>[U8(((x / 2.0 + 0.5).Clamp(0.0, 1.0) * 255.0).RoundEven()) for x in img]
+}
+
+# a picture of the prompt, width x height (each rounded down to a multiple of 16): its bytes as Decode gives them, and
+# the width and height made
+fn Generate(dir String&, prompt String&, width I64, height I64, steps I64 = 4, seed U64 = 0, exact Bool = false, progress fn&(step I64) = fn(step I64) { }, device String& = "cpu") Array<U8>, I64, I64 ? Error {
+    rows, cols := height / 16, width / 16
+    if rows < 1 or cols < 1: error Error.Failed("an image smaller than 16 x 16")
+    embeds := try Embed(dir, prompt, exact, device = device)
+    tokens := try Flow(dir, embeds, rows, cols, steps, seed, exact, progress, device = device)
+    return try Decode(dir, tokens, rows, cols, device), 16 * cols, 16 * rows
+}
+
+if TestBuild {
+
+test Sigmas "the noise levels of four steps over a 256 x 256 image are the reference scheduler's" {
+    s := Sigmas(4, 256)
+    want := [1.0, 0.9553907, 0.8771343, 0.7041117, 0.0]
+    for i in range 5: assert (s[i] - want[i]).Abs() < 1e-6
+}
+
+}
