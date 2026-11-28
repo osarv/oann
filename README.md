@@ -32,6 +32,11 @@ import "github.com/osarv/oann/kernels/device"
 device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backend.Cpu)
 ```
 
+That GPU is NVIDIA's (CUDA, cuBLAS). Other cards - AMD, Intel, integrated GPUs, anything with a Vulkan driver - are
+reached through the Vulkan backend, `kernels/vk` (docs/vulkan.md, `-define Vulkan=true`): the products and the kernels a
+transformer's inference needs, called directly, not yet through `device.SetDefault`. It is there but lightly tested -
+checked on software Vulkan, hardly on real hardware - so expect bugs.
+
 Other modules the same way: `github.com/osarv/oann/nn/optim`, `.../ad/graph`, `.../models/gpt`, `.../dyn/system`.
 Run a file by naming it - olang builds it fully optimized into its cache and runs it. The examples work as they are:
 
@@ -146,6 +151,8 @@ It needs the olang compiler beside oann (`../olang/build/olang`, or `OLANG=path`
 ```
 make test                          # every module's tests, takes minutes
 make gputest                       # the GPU backend's tests (CUDA, cuBLAS; -define Gpu=true), skipped without a device
+make vktest                        # the Vulkan backend's tests (any GPU, or software Vulkan), skipped without a device
+make vkgemm ARGS="5"               # the product on the Vulkan device against the CPU
 make gpusettle ARGS="5 10 20 4"    # the settle and a lesson on the GPU against the CPU at batch 32, 128, 512
 make gpulearn ARGS="5 3"           # G-M2: mnist_learn's epochs CPU against GPU, batch 32-512, hidden 128 and 1024
 make mnist ARGS="10 adamw 1 1"     # an example or benchmark built and run with ARGS (data, cnn, int8, lmbench, board, ...)

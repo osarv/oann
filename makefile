@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help vktest vkgemm diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -50,6 +50,19 @@ test:
 # CUDA finds no device) - needs the CUDA toolkit's headers and libraries (cudart, cublas, cublasLt) and an NVIDIA GPU
 gputest:
 	$(GPUENV) $(OLANG) test -define Gpu=true $(GPUTESTS)
+
+# the Vulkan backend's tests (docs/vulkan.md), any GPU with a Vulkan driver - AMD, Intel, NVIDIA, a CPU's software Vulkan
+# (Mesa's lavapipe) - against the CPU kernels: -define Vulkan=true, which needs Vulkan's headers (libvulkan-dev) alone;
+# each test says it is skipped where there is no Vulkan device. OANN_VK_DEVICE=N picks one of several
+VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang
+vktest:
+	$(OLANG) test -define Vulkan=true $(VKTESTS)
+
+# GEMM GFLOPS of kernels/gemm (1 and 4 threads) against the Vulkan device's product, operands resident, medians
+# (bench/vkgemm.olang) - ARGS: rounds
+vkgemm:
+	$(OLANG) build -define Vulkan=true -output build/bench_vkgemm bench/vkgemm.olang
+	./build/bench_vkgemm $(ARGS)
 
 # G-M1: GEMM GFLOPS of kernels/gemm (1 and 4 threads) against cuBLAS on the MLP's and the settle's shapes, F32 and BF16,
 # interleaved, medians (bench/gpugemm.olang) - ARGS: rounds, and the CPU's thread counts after it
