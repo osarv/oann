@@ -132,13 +132,16 @@ fn Plan.Parse(t String&) Plan ? ParseError {
 
 # the plan of d's large products: $OANN_VK_GEMM ("ROWS,COLS,SIDE,CHUNK,FUSED") where it names one d runs, else the
 # one measured best for d's kind (docs/vulkan.md, "The product"): on a GPU 8 x 8 blocks from tiles staged 16 steps
-# at a time, on a CPU's software Vulkan 8 x 8 blocks read direct
+# at a time - on a discrete one 16 x 16 invocations a workgroup (128 x 128 tiles), else 8 x 8 - and on a CPU's
+# software Vulkan 8 x 8 blocks read direct. None is grouped: no device measured gains from it
 fn Plan.For(d device.Device&) Plan {
     env := try os.Env("OANN_VK_GEMM") catch default ""
     if env != "" {
         p := try Plan.Parse(env) catch default Plan(0, 0, 0, 0, false)
         if p.Fits(d): return p
     }
+    wide := Plan(8, 8, 16, 16, false)
+    if d.Kind == device.KindDiscrete and wide.Fits(d): return wide
     staged := Plan(8, 8, 8, 16, false)
     if d.Kind == device.KindCpu or not staged.Fits(d): return Plan(8, 8, 4, 0, false)
     return staged

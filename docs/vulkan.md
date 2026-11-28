@@ -91,9 +91,31 @@ transposed operand (a linear layer), and staged tiles take the Radeon from 19-47
 16 x 16 workgroups gain only on small results on the 4060. Fusing gives 5-20% and is left off: the product then
 keeps the CPU's arithmetic. cuBLAS on the same 4060 does 3283 and 3530 at 1024^3 and 2048^3 (`kernels/gpu`).
 
-`Plan.For(d)` is the large products' plan: 8x8 of 8x8 staged 16 on a GPU, 8x8 of 4x4 direct on software Vulkan
-(llvmpipe: 35 against 26 for 4 x 4 blocks at 512^3; a barrier there is a coroutine switch). `OANN_VK_GEMM=
-ROWS,COLS,SIDE,CHUNK,FUSED` names another. A `Set` picks by the result's shape, since a staged workgroup computes
+Large results (`make vktune ARGS="3 large"`: the staged plans of 64 x 64 to 128 x 128 tiles, each in the plain
+order and **grouped** - Plan's Group: the workgroups take the tiles in bands of 4, 8 or 16 tile rows, down each
+band's columns first, so the ones running together share rows of A and columns of B in the cache). Same PC, the
+4060 with nothing else on it, a build with olang's Windows link fix:
+
+| plan | 1024^3 | 2048^3 | 4096 x 1024 x 4096 | 4096^3 | 1500 x 768 x 3072 | 1500 x 3072 x 768 |
+|---|---|---|---|---|---|---|
+| 4060: 8x8 of 8x8, staged 16 | 3554 | 4092 | 4122 | 4072 | 3277 | 2795 |
+| 4060: 8x8 of 8x8, staged 16, grouped 8 | 3505 | 3827 | 4116 | 4195 | 3331 | 2971 |
+| 4060: 4x4 of 16x16, staged 16 | 3541 | 3751 | 3704 | 3759 | 3084 | 3030 |
+| 4060: **8x8 of 16x16, staged 16** | 4014 | 4472 | 4491 | 4646 | 3842 | 3960 |
+| Radeon: **8x8 of 8x8, staged 16** | 178 | 183 | 179 | 178 | 163 | 162 |
+| Radeon: 8x8 of 8x8, staged 16, grouped 8 | 157 | 165 | 160 | 166 | 154 | 162 |
+| Radeon: 8x8 of 16x16, staged 8 | 178 | 196 | 194 | 97 | 174 | 177 |
+
+There is no cliff past the 4060's 24 MB cache: the earlier 2048^3 drop (to under 800 in `vkgemm`) came with builds
+whose host code was the slow Windows build, not from the kernel. Grouping is within a few per cent either way on the
+4060 and costs the Radeon about 10%, so no plan is grouped by default (`OANN_VK_GEMM`'s sixth number sets it).
+128 x 128 tiles give the 4060 10-14% on square results and 17-42% on Whisper's layers. Both devices' runs ran out
+of device memory late (from the rows after the table's last on each), the times collapsing just before; the later
+rows are not trusted and the cause is open.
+
+`Plan.For(d)` is the large products' plan: 8x8 of 16x16 staged 16 on a discrete GPU, 8x8 of 8x8 staged 16 on
+another GPU, 8x8 of 4x4 direct on software Vulkan (llvmpipe: 35 against 26 for 4 x 4 blocks at 512^3; a barrier
+there is a coroutine switch). `OANN_VK_GEMM=ROWS,COLS,SIDE,CHUNK,FUSED[,GROUP]` names another. A `Set` picks by the result's shape, since a staged workgroup computes
 its whole tile: a result with a side under half a tile is read direct in 8 x 8 blocks, one under 8 rows or columns in
 blocks of 1 along that side (a decoder step's one row), and on a discrete GPU a result under 512^2 elements takes 4x4
 of 16x16 staged.
