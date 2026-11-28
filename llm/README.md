@@ -15,6 +15,7 @@ completions of a file of prompts as one long, resumable job. Nothing here trains
 | `chat.olang` | `Chat`: the model's own chat template run by `jinja.olang` (`Render`: messages, tool schemas, tool calls; `Prompt`: one user turn), with hard-coded ChatML, DeepSeek-R1, Llama 3, Granite and Gemma prompts where a directory has no template; stop tokens and sampling defaults; `Fetch` from Hugging Face |
 | `jinja.olang` | `Template`: the Jinja2 subset Hugging Face chat templates are written in, parsed once and rendered with a context of `Val`s, as transformers' environment renders them |
 | `gpu.olang` | `Decoder`: `Step`'s work on a CUDA device, for the engine's batches (below, "On the GPU"); built only with `-define Gpu=true` |
+| `vk.olang` | `Decoder`: `Step`'s work on any GPU with a Vulkan driver (below, "On a Vulkan device"); built only with `-define Vulkan=true` |
 | `gen.olang` | `oann-gen` |
 | `tools/reference.py`, `tools/tokref.py`, `tools/chatref.py`, `tools/ggufref.py`, `tools/visionref.py` | the references the tests are held to: transformers and tokenizers, F32, CPU (below, "Checks") |
 
@@ -66,6 +67,7 @@ a step never reads another row, so a completion does not depend on the batch it 
 | `--kv8` | values in the cache in 8 bits, a scale per position and head: 0.76 of the cache's memory, needs AMX |
 | `--exact` | F32 activations and cache: slow, for checking against a reference |
 | `--device gpu` | the model on the CUDA device, BF16 (below, "On the GPU"); `make oanngen` builds it in where the CUDA toolkit is installed |
+| `--device vulkan` | the model on any GPU with a Vulkan driver - AMD, Intel, NVIDIA, integrated - BF16 (below, "On a Vulkan device"); `make oanngen` builds it in where Vulkan's headers are (`libvulkan-dev`); `OANN_VK_DEVICE=N` picks one of several |
 
 ## How it works
 
@@ -168,7 +170,7 @@ table and the free pages); each step sends up its rows - tokens, positions, slot
 angles - and brings down the logits of the rows that want them, which the host samples as before. A layer is four
 cuBLASLt products (BF16 by BF16 summed in F32, planned once for each row count, a multiple of 8, and used by every
 layer) and seven kernels of `kernels/gpu/src/llm.cu`, one short launch each: the norm into BF16; the heads' QK-norm
-and rotation with the keys and values written into their pages; the attention, a block for each row's head over its
+and rotation with the keys and values written into their pages; the attention, a block for each row's key-value head over its
 sequence's pages (scores, softmax and the weighted values); the residual add; the gated perceptron's activation.
 
 It runs the dense decoders whose rows attend to every earlier position (Qwen3, Qwen2, Llama, Mistral, Granite,
@@ -181,6 +183,34 @@ When the pages run out the engine preempts as it does on the CPU.
 `make gputest` holds the device's logits to the CPU's on tiny models (QK-norm and a tied head; biases and a head of
 its own; a padded vocabulary) over 70 steps of two sequences crossing a page; `make gpullm ARGS=MODEL_DIR` does the
 same for a real model and then times batches.
+
+### On a Vulkan device
+
+`oann-gen --device vulkan` runs the engine's steps on any GPU with a Vulkan driver (`vk.olang` over `kernels/vk`,
+docs/vulkan.md): AMD, Intel, NVIDIA, a laptop's integrated GPU, a CPU's software Vulkan. The split is the CUDA
+decoder's: weights and the paged cache on the device, the step's rows up, the logits down, sampling on the host.
+
+The weights and the cached keys and values are BF16, as on the CPU, held two to a 32-bit word of a buffer; a kernel
+takes a word apart with a shift and rounds what it stores to nearest, even. So the device needs nothing beyond Vulkan
+1.0 - no 16-bit storage, no half floats - and the numbers are the CPU's own. Activations, queries and scores are F32. A
+weight matrix is one buffer, or runs of its rows where it is more than the device binds as one buffer (a large
+vocabulary's head on a device of a 128 MiB limit); a layer's keys are one buffer and its values another.
+
+A layer is four products and eight short kernels, written in olang with `spirv.Kernel` and recorded in order: the norm;
+the product (an invocation computes four outputs of one row, or of four rows where a step has four or more, reading a
+word of each output's weights a step); the heads' QK-norm and rotation with the keys and values written into their
+pages; the scores (an invocation a position of a row's head), their softmax (an invocation a row's head), the values'
+weighted mean (an invocation two elements of a head); the residual sums; the gated perceptron's activation. A step
+is one submission to the device and ends when its logits are down.
+
+It runs what the CUDA decoder runs and refuses the same by name. The cache takes the device's memory left after the
+weights, less 1 GB, and no more than one buffer a layer binds (`--kv-gb` says otherwise).
+
+`make vktest` holds the device's logits to the CPU's (the same BF16 cache on both) on tiny models - QK-norm and a tied
+head; biases and a head of its own; a padded vocabulary; every matrix split in runs of rows - over 70 steps of two
+sequences crossing a page, within 1e-3 of the largest logit; `make vkllm ARGS=MODEL_DIR` does the same for a real model
+and then times batches. Checked on software Vulkan (Mesa's llvmpipe), where Qwen3-0.6B and SmolLM2-135M write the
+CPU's text token for token; no real GPU has run it yet, and the product is not yet tuned for one.
 
 ## Checks
 

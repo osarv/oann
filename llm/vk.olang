@@ -1,0 +1,846 @@
+# llm/vk - a language model's decoding step on any GPU with a Vulkan driver (AMD, Intel, NVIDIA, integrated ones, a
+# CPU's software Vulkan): model.Model.Step's work on a kernels/vk device, for llm/engine's batches (oann-gen --device
+# vulkan). llm/gpu is the same on CUDA.
+#
+#     dev := try vdev.Device.Open()
+#     dec := try Decoder.Make(dev, m, e.State.Rows, e.Batch, e.Cache, maxCtx)
+#     for not e.Idle() {
+#         if e.Begin(): try dec.Step(m, e.State, e.Cache)
+#         for d in e.End() { ... }
+#     }
+#
+# What is where. The weights (BF16, row-major: a model loaded without AMX tiles, Model.Load's exact) go up once, a
+# buffer a matrix - or several, runs of its rows, where the matrix is more than the device binds as one buffer (a large
+# vocabulary's head on a device of a 128 MiB limit, as software Vulkan and some phones are); the keys and values of every page live on the device alone, a buffer a layer (a Cache made with
+# device = true holds the page table and the free pages); each step sends up its rows (tokens, positions, slots, the
+# page table, the rotations' angles) and brings down the logits of the rows that want them, which the host samples.
+#
+# Storage. The weights and the cached keys and values are BF16 as the CPU holds them, two to a 32-bit word of a buffer
+# (element i in word i / 2, its low half first): a kernel takes a word apart with a shift, so nothing is asked of the
+# device beyond Vulkan 1.0 - no 16-bit storage, no half floats - and the numbers are the CPU's own. Everything else (the
+# residual stream, what a product reads and gives, the queries, the scores) is F32. A kernel that writes the cache
+# writes whole words, two elements an iteration, so no two invocations share a word.
+#
+# The cache. Layer l's keys (and values) are one buffer: page p, key-value head g, position j of the page, HeadDim each,
+# at ((p * kv + g) * 64 + j) * dh. A sequence's pages are its slot's row of the table (maxPages a row): position n is
+# in page table[slot * maxPages + n / 64], at n % 64.
+#
+# A layer is 4 products and 8 short kernels (the two norms, the heads, the scores, their softmax, the values' mean, the
+# gated perceptron, the two sums into the residual stream), recorded in order and run at the step's one Sync.
+#
+# What runs: dense decoders whose rows attend to every earlier position - Qwen3, Qwen2, Llama, Mistral, Granite, SmolLM3,
+# Phi - in BF16. Refusal names what does not (INT8 and INT4 weights, a mixture of experts, sliding windows, Gemma's
+# post-norms and GELU, OLMoE's wide QK-norm, image rows).
+#
+# Built only with -define Vulkan=true; llm/gen imports it under `if Vulkan`.
+
+import vdev "../kernels/vk/device"
+import "../kernels/vk/kern"
+import "../kernels/vk/spirv"
+import "model"
+import "std/os"
+import "std/time"
+
+Vulkan Bool = false
+
+assert Vulkan, "llm/vk is a Vulkan device's and is built only with -define Vulkan=true: import it under if Vulkan { ... }"
+
+# the most bytes of one buffer of weights (0: what the device binds, at most 4 GiB): a test's, to split small matrices
+BufLimit mut I64 = 0
+
+# invocations a workgroup: Line along one axis, Tile along each of two (kernels/vk/kern's)
+Line I64 = 64
+Tile I64 = 8
+# the outputs of a product one invocation computes, and the rows where a step has many (Wide rows or more)
+Cols I64 = 4
+Wide I64 = 4
+
+fn groups(n I64, per I64) I64 { return (n + per - 1) / per }
+fn u(x I64) U32 { return U32(x) }
+fn f(x F32) U32 { return x.Bits() }
+
+# why m does not run here ("" where it does)
+fn Refusal(m model.Model&) String {
+    c model.Config& = m.C
+    if m.Tile: return "its weights are packed for AMX tiles (load it exact)"
+    if m.Int8 or m.Int4: return "INT8 and INT4 weights (BF16 alone)"
+    if c.Experts > 0: return "a mixture of experts"
+    if c.PostNorms or c.Gelu: return "Gemma's post-norms and GELU"
+    if c.QkWide: return "OLMoE's QK-norm over whole rows"
+    if c.Dim % 2 != 0 or c.HeadDim % 2 != 0 or c.Ffn % 2 != 0: return "an odd width (BF16 is held two to a word)"
+    for li in range c.Layers {
+        if c.WindowOf(li) > 0: return "sliding-window layers"
+    }
+    return ""
+}
+
+# m's weight matrices in their order on the device: each layer's Qkv, O, GateUp, Down, then the head, then the embedding
+# (where it is not the head)
+fn weightCount(m model.Model&) I64 { return 4 * m.C.Layers + (1 if m.C.Tied else 2) }
+
+fn weightOf(m model.Model&, i I64) model.Linear& {
+    if i == 4 * m.C.Layers: return m.Head
+    if i > 4 * m.C.Layers: return m.Embed
+    l :~ m.Layers[i / 4]
+    return match i % 4 {
+        case 0: l.Qkv
+        case 1: l.O
+        case 2: l.GateUp
+        case _: l.Down
+    }
+}
+
+# the device memory m's weights take, in bytes
+fn WeightBytes(m model.Model&) I64 {
+    n I64 = 0
+    for i in range weightCount(m): n += weightOf(m, i).W.Len() * 2
+    return n
+}
+
+# ---- the kernels, written (kernels/vk/spirv) ----
+
+# the two BF16 of a word, as F32: the low half and the high half
+fn bfLo(k mut spirv.Kernel&, word spirv.Val) spirv.Val { return k.FromBits(k.Shl(word, k.U(16))) }
+fn bfHi(k mut spirv.Kernel&, word spirv.Val) spirv.Val { return k.FromBits(k.BitAnd(word, k.U(0xffff0000))) }
+
+# element e of a buffer of BF16, as an F32
+fn bfAt(k mut spirv.Kernel&, b spirv.Buffer, e spirv.Val) spirv.Val {
+    word := k.Read(b, k.Shr(e, k.U(1)))
+    return bfLo(k, k.Shr(word, k.Shl(k.BitAnd(e, k.U(1)), k.U(4))))
+}
+
+# x rounded to BF16, to nearest, even (model's rne): its 16 bits
+fn rounded(k mut spirv.Kernel&, x spirv.Val) spirv.Val {
+    bits := k.Bits(x)
+    return k.Shr(k.Add(k.Add(bits, k.U(0x7fff)), k.BitAnd(k.Shr(bits, k.U(16)), k.U(1))), k.U(16))
+}
+
+# x[r, j] = table[tok[r], j] * scale for the rows whose token is one of the count from first, the table's rows bound
+# here: invocation (x, y) is column x of row y
+fn embedKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    ints := k.Buffer(spirv.Ty.U32)
+    table := k.Buffer(spirv.Ty.U32)
+    x := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    d := k.Param(spirv.Ty.U32)
+    tokOff := k.Param(spirv.Ty.U32)
+    first := k.Param(spirv.Ty.U32)
+    count := k.Param(spirv.Ty.U32)
+    scale := k.Param(spirv.Ty.F32)
+    j := k.GlobalId(0)
+    r := k.GlobalId(1)
+    k.If(k.And(k.Lt(r, n), k.Lt(j, d)))
+    tok := k.Read(ints, k.Add(tokOff, r))
+    k.If(k.And(k.Ge(tok, first), k.Lt(k.Sub(tok, first), count)))
+    k.Write(x, k.Add(k.Mul(r, d), j), k.Mul(bfAt(k, table, k.Add(k.Mul(k.Sub(tok, first), d), j)), scale))
+    k.EndIf()
+    k.EndIf()
+    return k
+}
+
+# y[j, :] = x[row, :] * gain / rms(x[row, :]), row = ints[rowsOff + j] where pick is not 0, else j: invocation j
+fn normKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    gain := k.Buffer(spirv.Ty.F32)
+    ints := k.Buffer(spirv.Ty.U32)
+    n := k.Param(spirv.Ty.U32)
+    d := k.Param(spirv.Ty.U32)
+    gOff := k.Param(spirv.Ty.U32)
+    rowsOff := k.Param(spirv.Ty.U32)
+    pick := k.Param(spirv.Ty.U32)
+    eps := k.Param(spirv.Ty.F32)
+    j := k.GlobalId(0)
+    k.If(k.Lt(j, n))
+    row := k.Select(k.Ne(pick, k.U(0)), k.Read(ints, k.Add(rowsOff, k.Select(k.Ne(pick, k.U(0)), j, k.U(0)))), j)
+    x0 := k.Mul(row, d)
+    y0 := k.Mul(j, d)
+    sq := k.Let(k.F(0))
+    i := k.Var(spirv.Ty.U32)
+    k.For(i, k.U(0), d)
+    v := k.Read(x, k.Add(x0, k.Get(i)))
+    k.Set(sq, k.Add(k.Get(sq), k.Mul(v, v)))
+    k.Next(i)
+    inv := k.Div(k.F(1), k.Sqrt(k.Add(k.Div(k.Get(sq), k.ToF(d)), eps)))
+    k.For(i, k.U(0), d)
+    iv := k.Get(i)
+    k.Write(y, k.Add(y0, iv), k.Mul(k.Mul(k.Read(x, k.Add(x0, iv)), inv), k.Read(gain, k.Add(gOff, iv))))
+    k.Next(i)
+    k.EndIf()
+    return k
+}
+
+# c[i, j] = sum over p of a[i, p] w[j, p] (+ bias[j] where hasBias): a's rows lda apart from aOff, w's rows the depth
+# apart from its start (BF16, the depth even), c's rows ldc apart. An invocation computes br rows of bc outputs, each
+# step of the loop reading a word of each output's weights (two of them) and two elements of each row; every sum is
+# taken in the depth's order. Rows and outputs past the edge read the last and are not written
+fn linearKernel(br I64, bc I64) spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    if br > 1: k = spirv.Kernel.Begin(Tile, Tile)
+    a := k.Buffer(spirv.Ty.F32)
+    w := k.Buffer(spirv.Ty.U32)
+    c := k.Buffer(spirv.Ty.F32)
+    bias := k.Buffer(spirv.Ty.F32)
+    m := k.Param(spirv.Ty.U32)
+    n := k.Param(spirv.Ty.U32)
+    depth := k.Param(spirv.Ty.U32)
+    aOff := k.Param(spirv.Ty.U32)
+    lda := k.Param(spirv.Ty.U32)
+    cOff := k.Param(spirv.Ty.U32)
+    ldc := k.Param(spirv.Ty.U32)
+    bOff := k.Param(spirv.Ty.U32)
+    hasBias := k.Param(spirv.Ty.U32)
+    j0 := k.Mul(k.GlobalId(0), k.U(bc))
+    i0 := k.Mul(k.GlobalId(1), k.U(br))
+    k.If(k.And(k.Lt(i0, m), k.Lt(j0, n)))
+    lastRow := k.Sub(m, k.U(1))
+    lastCol := k.Sub(n, k.U(1))
+    aBase := Vec<spirv.Val>()
+    wBase := Vec<spirv.Val>()
+    for q in range br: aBase.Push(k.Add(aOff, k.Mul(k.Least(k.Add(i0, k.U(q)), lastRow), lda)))
+    for q in range bc: wBase.Push(k.Shr(k.Mul(k.Least(k.Add(j0, k.U(q)), lastCol), depth), k.U(1)))
+    acc := Vec<spirv.Var>()
+    for _ in range br * bc: acc.Push(k.Let(k.F(0)))
+    p := k.Var(spirv.Ty.U32)
+    k.For(p, k.U(0), k.Shr(depth, k.U(1)))
+    pv := k.Get(p)
+    p2 := k.Shl(pv, k.U(1))
+    lo := Vec<spirv.Val>()
+    hi := Vec<spirv.Val>()
+    for q in range bc {
+        word := k.Read(w, k.Add(wBase[q], pv))
+        lo.Push(bfLo(k, word))
+        hi.Push(bfHi(k, word))
+    }
+    for r in range br {
+        a0 := k.Read(a, k.Add(aBase[r], p2))
+        a1 := k.Read(a, k.Add(aBase[r], k.Add(p2, k.U(1))))
+        for q in range bc {
+            s := acc[r * bc + q]
+            k.Set(s, k.Add(k.Add(k.Get(s), k.Mul(a0, lo[q])), k.Mul(a1, hi[q])))
+        }
+    }
+    k.Next(p)
+    biased := k.Ne(hasBias, k.U(0))
+    for q in range br * bc {
+        i := k.Add(i0, k.U(q / bc))
+        j := k.Add(j0, k.U(q % bc))
+        k.If(k.And(k.Lt(i, m), k.Lt(j, n)))
+        v := k.Get(acc[q])
+        bv := k.Read(bias, k.Add(bOff, k.Select(biased, j, k.U(0))))
+        k.Write(c, k.Add(cOff, k.Add(k.Mul(i, ldc), j)), k.Select(biased, k.Add(v, bv), v))
+        k.EndIf()
+    }
+    k.EndIf()
+    return k
+}
+
+# what the heads' kernel knows of an invocation's head: where it reads, whether it is normed and rotated
+type headOf struct(x0 spirv.Val, r spirv.Val, normed spirv.Val, turned spirv.Val, inv spirv.Val, gOff spirv.Val, half spirv.Val, cosOff spirv.Val, sinOff spirv.Val) {
+    x0
+    r
+    normed
+    turned
+    inv
+    gOff
+    half
+    cosOff
+    sinOff
+}
+
+# element i of the head after its norm (times gain / rms where normed)
+fn headNormed(k mut spirv.Kernel&, qkv spirv.Buffer, gain spirv.Buffer, h headOf&, i spirv.Val) spirv.Val {
+    v := k.Read(qkv, k.Add(h.x0, i))
+    g := k.Read(gain, k.Add(h.gOff, i))
+    return k.Select(h.normed, k.Mul(k.Mul(v, h.inv), g), v)
+}
+
+# element i of the head as it is kept: normed, then rotated by the row's angles (pairs i and i + half) where turned
+fn headKept(k mut spirv.Kernel&, qkv spirv.Buffer, gain spirv.Buffer, ang spirv.Buffer, h headOf&, i spirv.Val) spirv.Val {
+    plain := headNormed(k, qkv, gain, h, i)
+    low := k.Lt(i, h.half)
+    j := k.Least(k.Select(low, i, k.Sub(i, h.half)), k.Sub(h.half, k.U(1)))
+    lo := headNormed(k, qkv, gain, h, j)
+    hi := headNormed(k, qkv, gain, h, k.Add(h.half, j))
+    at := k.Add(k.Mul(h.r, h.half), j)
+    cs := k.Read(ang, k.Add(h.cosOff, at))
+    sn := k.Read(ang, k.Add(h.sinOff, at))
+    rot := k.Select(low, k.Sub(k.Mul(lo, cs), k.Mul(hi, sn)), k.Add(k.Mul(hi, cs), k.Mul(lo, sn)))
+    return k.Select(k.And(h.turned, k.Lt(i, k.Shl(h.half, k.U(1)))), rot, plain)
+}
+
+# head hh of row r (invocation item = r * (heads + 2 kv) + hh: the queries' heads, then the keys', then the values'): a
+# query or key normed over its head (QK-norm, where normed: times gain / rms, the gains at qnOff and knOff), then
+# rotated (where rot). The queries go into q (heads * dh a row), the keys and the values into the row's place in the
+# layer's cache, a word (two elements) an iteration
+fn headsKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    qkv := k.Buffer(spirv.Ty.F32)
+    q := k.Buffer(spirv.Ty.F32)
+    keys := k.Buffer(spirv.Ty.U32)
+    vals := k.Buffer(spirv.Ty.U32)
+    ang := k.Buffer(spirv.Ty.F32)
+    ints := k.Buffer(spirv.Ty.U32)
+    gain := k.Buffer(spirv.Ty.F32)
+    items := k.Param(spirv.Ty.U32)
+    heads := k.Param(spirv.Ty.U32)
+    kv := k.Param(spirv.Ty.U32)
+    dh := k.Param(spirv.Ty.U32)
+    half := k.Param(spirv.Ty.U32)
+    maxPages := k.Param(spirv.Ty.U32)
+    rot := k.Param(spirv.Ty.U32)
+    norm := k.Param(spirv.Ty.U32)
+    qnOff := k.Param(spirv.Ty.U32)
+    knOff := k.Param(spirv.Ty.U32)
+    posOff := k.Param(spirv.Ty.U32)
+    slotOff := k.Param(spirv.Ty.U32)
+    tableOff := k.Param(spirv.Ty.U32)
+    cosOff := k.Param(spirv.Ty.U32)
+    sinOff := k.Param(spirv.Ty.U32)
+    eps := k.Param(spirv.Ty.F32)
+    item := k.GlobalId(0)
+    k.If(k.Lt(item, items))
+    hc := k.Add(heads, k.Shl(kv, k.U(1)))
+    r := k.Div(item, hc)
+    hh := k.Mod(item, hc)
+    x0 := k.Mul(item, dh)
+    isQ := k.Lt(hh, heads)
+    qk := k.Lt(hh, k.Add(heads, kv))
+    normed := k.And(k.Ne(norm, k.U(0)), qk)
+    sq := k.Let(k.F(0))
+    i := k.Var(spirv.Ty.U32)
+    k.For(i, k.U(0), k.Select(normed, dh, k.U(0)))
+    v := k.Read(qkv, k.Add(x0, k.Get(i)))
+    k.Set(sq, k.Add(k.Get(sq), k.Mul(v, v)))
+    k.Next(i)
+    inv := k.Div(k.F(1), k.Sqrt(k.Add(k.Div(k.Get(sq), k.ToF(dh)), eps)))
+    h := headOf(x0, r, normed, k.And(k.Ne(rot, k.U(0)), qk), inv, k.Select(isQ, qnOff, knOff), half, cosOff, sinOff)
+    # where a key or a value goes: the row's page, its place in it
+    g0 := k.Select(isQ, k.U(0), k.Sub(hh, heads))
+    isV := k.Ge(g0, kv)
+    g := k.Select(isV, k.Sub(g0, kv), g0)
+    pos := k.Read(ints, k.Add(posOff, r))
+    page := k.Read(ints, k.Add(tableOff, k.Add(k.Mul(k.Read(ints, k.Add(slotOff, r)), maxPages), k.Shr(pos, k.U(6)))))
+    at := k.Shr(k.Mul(k.Add(k.Shl(k.Add(k.Mul(page, kv), g), k.U(6)), k.BitAnd(pos, k.U(63))), dh), k.U(1))
+    q0 := k.Mul(k.Add(k.Mul(r, heads), hh), dh)
+    k.For(i, k.U(0), k.Shr(dh, k.U(1)))
+    e := k.Shl(k.Get(i), k.U(1))
+    a := headKept(k, qkv, gain, ang, h, e)
+    b := headKept(k, qkv, gain, ang, h, k.Add(e, k.U(1)))
+    k.If(isQ)
+    k.Write(q, k.Add(q0, e), a)
+    k.Write(q, k.Add(q0, k.Add(e, k.U(1))), b)
+    k.Else()
+    word := k.BitOr(rounded(k, a), k.Shl(rounded(k, b), k.U(16)))
+    k.If(isV)
+    k.Write(vals, k.Add(at, k.Get(i)), word)
+    k.Else()
+    k.Write(keys, k.Add(at, k.Get(i)), word)
+    k.EndIf()
+    k.EndIf()
+    k.Next(i)
+    k.EndIf()
+    return k
+}
+
+# what attention's three kernels know of an item (row r's head h): its row, its key-value head, the positions it
+# attends to, and where its pages are in the table
+type itemOf struct(r spirv.Val, g spirv.Val, np spirv.Val, pages spirv.Val) {
+    r
+    g
+    np
+    pages
+}
+
+fn itemOf.At(k mut spirv.Kernel&, ints spirv.Buffer, item spirv.Val, heads spirv.Val, kv spirv.Val, maxPages spirv.Val, lastOff spirv.Val, slotOff spirv.Val, tableOff spirv.Val) itemOf {
+    r := k.Div(item, heads)
+    g := k.Div(k.Mod(item, heads), k.Div(heads, kv))
+    np := k.Add(k.Read(ints, k.Add(lastOff, r)), k.U(1))
+    pages := k.Add(tableOff, k.Mul(k.Read(ints, k.Add(slotOff, r)), maxPages))
+    return itemOf(r, g, np, pages)
+}
+
+# scores[item, p] = q[item] . key at position p of the item's sequence * scale, p up to the row's last: invocation
+# (x, y) is position x of item y = r * heads + h. Head h reads key-value head h / (heads / kv)
+fn scoresKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    q := k.Buffer(spirv.Ty.F32)
+    keys := k.Buffer(spirv.Ty.U32)
+    scores := k.Buffer(spirv.Ty.F32)
+    ints := k.Buffer(spirv.Ty.U32)
+    items := k.Param(spirv.Ty.U32)
+    heads := k.Param(spirv.Ty.U32)
+    kv := k.Param(spirv.Ty.U32)
+    dh := k.Param(spirv.Ty.U32)
+    maxPages := k.Param(spirv.Ty.U32)
+    cap := k.Param(spirv.Ty.U32)
+    lastOff := k.Param(spirv.Ty.U32)
+    slotOff := k.Param(spirv.Ty.U32)
+    tableOff := k.Param(spirv.Ty.U32)
+    scale := k.Param(spirv.Ty.F32)
+    p := k.GlobalId(0)
+    item := k.GlobalId(1)
+    k.If(k.Lt(item, items))
+    it := itemOf.At(k, ints, item, heads, kv, maxPages, lastOff, slotOff, tableOff)
+    k.If(k.Lt(p, it.np))
+    page := k.Read(ints, k.Add(it.pages, k.Shr(p, k.U(6))))
+    k0 := k.Shr(k.Mul(k.Add(k.Shl(k.Add(k.Mul(page, kv), it.g), k.U(6)), k.BitAnd(p, k.U(63))), dh), k.U(1))
+    q0 := k.Mul(item, dh)
+    s := k.Let(k.F(0))
+    i := k.Var(spirv.Ty.U32)
+    k.For(i, k.U(0), k.Shr(dh, k.U(1)))
+    iv := k.Get(i)
+    e := k.Add(q0, k.Shl(iv, k.U(1)))
+    word := k.Read(keys, k.Add(k0, iv))
+    k.Set(s, k.Add(k.Add(k.Get(s), k.Mul(k.Read(q, e), bfLo(k, word))), k.Mul(k.Read(q, k.Add(e, k.U(1))), bfHi(k, word))))
+    k.Next(i)
+    k.Write(scores, k.Add(k.Mul(item, cap), p), k.Mul(k.Get(s), scale))
+    k.EndIf()
+    k.EndIf()
+    return k
+}
+
+# scores[item, : np] becomes its softmax: invocation item
+fn softmaxKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    scores := k.Buffer(spirv.Ty.F32)
+    ints := k.Buffer(spirv.Ty.U32)
+    items := k.Param(spirv.Ty.U32)
+    heads := k.Param(spirv.Ty.U32)
+    cap := k.Param(spirv.Ty.U32)
+    lastOff := k.Param(spirv.Ty.U32)
+    item := k.GlobalId(0)
+    k.If(k.Lt(item, items))
+    np := k.Add(k.Read(ints, k.Add(lastOff, k.Div(item, heads))), k.U(1))
+    s0 := k.Mul(item, cap)
+    top := k.Let(k.Read(scores, s0))
+    p := k.Var(spirv.Ty.U32)
+    k.For(p, k.U(1), np)
+    k.Set(top, k.Most(k.Get(top), k.Read(scores, k.Add(s0, k.Get(p)))))
+    k.Next(p)
+    sum := k.Let(k.F(0))
+    k.For(p, k.U(0), np)
+    at := k.Add(s0, k.Get(p))
+    e := k.Exp(k.Sub(k.Read(scores, at), k.Get(top)))
+    k.Write(scores, at, e)
+    k.Set(sum, k.Add(k.Get(sum), e))
+    k.Next(p)
+    inv := k.Div(k.F(1), k.Get(sum))
+    k.For(p, k.U(0), np)
+    at2 := k.Add(s0, k.Get(p))
+    k.Write(scores, at2, k.Mul(k.Read(scores, at2), inv))
+    k.Next(p)
+    k.EndIf()
+    return k
+}
+
+# out[item, :] = the values at the item's positions, each times its weight in scores, summed in the positions' order:
+# invocation (x, y) is elements 2 x and 2 x + 1 of item y
+fn valuesKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    scores := k.Buffer(spirv.Ty.F32)
+    vals := k.Buffer(spirv.Ty.U32)
+    out := k.Buffer(spirv.Ty.F32)
+    ints := k.Buffer(spirv.Ty.U32)
+    items := k.Param(spirv.Ty.U32)
+    heads := k.Param(spirv.Ty.U32)
+    kv := k.Param(spirv.Ty.U32)
+    dh := k.Param(spirv.Ty.U32)
+    maxPages := k.Param(spirv.Ty.U32)
+    cap := k.Param(spirv.Ty.U32)
+    lastOff := k.Param(spirv.Ty.U32)
+    slotOff := k.Param(spirv.Ty.U32)
+    tableOff := k.Param(spirv.Ty.U32)
+    w := k.GlobalId(0)
+    item := k.GlobalId(1)
+    step := k.Shr(dh, k.U(1))
+    k.If(k.And(k.Lt(item, items), k.Lt(w, step)))
+    it := itemOf.At(k, ints, item, heads, kv, maxPages, lastOff, slotOff, tableOff)
+    s0 := k.Mul(item, cap)
+    a := k.Let(k.F(0))
+    b := k.Let(k.F(0))
+    pg := k.Var(spirv.Ty.U32)
+    j := k.Var(spirv.Ty.U32)
+    k.For(pg, k.U(0), k.Shr(k.Add(it.np, k.U(63)), k.U(6)))
+    first := k.Shl(k.Get(pg), k.U(6))
+    page := k.Read(ints, k.Add(it.pages, k.Get(pg)))
+    v0 := k.Add(k.Mul(k.Shl(k.Add(k.Mul(page, kv), it.g), k.U(6)), step), w)
+    k.For(j, k.U(0), k.Least(k.U(64), k.Sub(it.np, first)))
+    jv := k.Get(j)
+    wt := k.Read(scores, k.Add(s0, k.Add(first, jv)))
+    word := k.Read(vals, k.Add(v0, k.Mul(jv, step)))
+    k.Set(a, k.Add(k.Get(a), k.Mul(wt, bfLo(k, word))))
+    k.Set(b, k.Add(k.Get(b), k.Mul(wt, bfHi(k, word))))
+    k.Next(j)
+    k.Next(pg)
+    o := k.Add(k.Mul(item, dh), k.Shl(w, k.U(1)))
+    k.Write(out, o, k.Get(a))
+    k.Write(out, k.Add(o, k.U(1)), k.Get(b))
+    k.EndIf()
+    return k
+}
+
+# h[r, i] = silu(y[r, i]) * y[r, f + i], y's rows 2 f wide (the gate, then the up projection): invocation (x, y) is
+# element x of row y
+fn swigluKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    y := k.Buffer(spirv.Ty.F32)
+    h := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    width := k.Param(spirv.Ty.U32)
+    i := k.GlobalId(0)
+    r := k.GlobalId(1)
+    k.If(k.And(k.Lt(r, n), k.Lt(i, width)))
+    y0 := k.Add(k.Mul(r, k.Shl(width, k.U(1))), i)
+    gt := k.Read(y, y0)
+    act := k.Div(gt, k.Add(k.F(1), k.Exp(k.Neg(gt))))
+    k.Write(h, k.Add(k.Mul(r, width), i), k.Mul(act, k.Read(y, k.Add(y0, width))))
+    k.EndIf()
+    return k
+}
+
+# x[i] = x[i] * a + y[i] * b for i < n (a sum into the residual stream: a 1; a scaling: b 0, y any buffer)
+fn mixKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    a := k.Param(spirv.Ty.F32)
+    b := k.Param(spirv.Ty.F32)
+    wide := k.Param(spirv.Ty.U32)
+    i := k.GlobalId(0)
+    k.If(k.Lt(i, n))
+    xv := k.Read(x, i)
+    yv := k.Read(y, k.Select(k.Ne(wide, k.U(0)), i, k.U(0)))
+    k.If(k.Ne(wide, k.U(0)))
+    k.Write(x, i, k.Add(xv, k.Mul(yv, b)))
+    k.Else()
+    k.Write(x, i, k.Mul(xv, a))
+    k.EndIf()
+    k.EndIf()
+    return k
+}
+
+fn made(d mut vdev.Device&, name String, k spirv.Kernel) kern.Kernel ? vdev.VkError {
+    w := k
+    return try kern.Kernel.Make(d, name, w)
+}
+
+# the decoder's kernels on one device
+type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row kern.Kernel, rows kern.Kernel, heads kern.Kernel, scores kern.Kernel, softmax kern.Kernel, values kern.Kernel, swiglu kern.Kernel, mix kern.Kernel) {
+    embeds
+    norm
+    row             # the product of a step of few rows: a row an invocation
+    rows            # and of many: Wide rows an invocation
+    heads
+    scores
+    softmax
+    values
+    swiglu
+    mix
+}
+
+fn kit.Make(d mut vdev.Device&) kit ? vdev.VkError {
+    return kit(try made(d, "llm_embed", embedKernel()), try made(d, "llm_norm", normKernel()), try made(d, "llm_row", linearKernel(1, Cols))
+        try made(d, "llm_rows", linearKernel(Wide, Cols)), try made(d, "llm_heads", headsKernel()), try made(d, "llm_scores", scoresKernel())
+        try made(d, "llm_softmax", softmaxKernel()), try made(d, "llm_values", valuesKernel()), try made(d, "llm_swiglu", swigluKernel())
+        try made(d, "llm_mix", mixKernel()))
+}
+
+# ---- the decoder ----
+
+# a model on the device, for steps of at most rows rows, outs of them wanting logits, over a cache of these pages
+type Decoder unique struct(dev mut vdev.Device&, ks kit, rows I64, outs I64, slots I64, maxPages I64, pages I64, cap I64, half I64, g vdev.Buf<F32>, x vdev.Buf<F32>, h vdev.Buf<F32>, y vdev.Buf<F32>, q vdev.Buf<F32>, scores vdev.Buf<F32>, logits vdev.Buf<F32>, ints vdev.Buf<I32>, ang vdev.Buf<F32>) {
+    dev
+    ks
+    Rows I64 = rows
+    Outs I64 = outs
+    slots
+    maxPages
+    Pages I64 = pages
+    cap                 # positions a row may attend to
+    half
+    g                   # the gains and biases, at gAt
+    x                   # the residual stream, Dim a row
+    h                   # what a product reads
+    y                   # what it gives
+    q                   # the rows' queries
+    scores
+    logits
+    ints                # tokens, positions, slots, last positions (Rows each), the output rows (Outs), the page table
+    ang                 # cos, then sin: Rows x half each
+    w mut Vec<vdev.Buf<BF16>>& = Vec<vdev.Buf<BF16>>()      # the weight matrices, row-major, in weightOf's order: matrix
+    wFirst mut Vec<I64>& = Vec<I64>()                       # i's buffers are w[wFirst[i] .. wFirst[i + 1]], each wRows[i] of its
+    wRows mut Vec<I64>& = Vec<I64>()                        # rows (the last what is left)
+    k mut Vec<vdev.Buf<BF16>>& = Vec<vdev.Buf<BF16>>()      # each layer's keys
+    v mut Vec<vdev.Buf<BF16>>& = Vec<vdev.Buf<BF16>>()      # and values
+    gAt mut Vec<I64>& = Vec<I64>()          # a layer's 8: Norm1, Norm2, QNorm, KNorm (-1: none), then its four biases (-1: none); then Final
+    hostInts mut Array<I32>& = Array<I32>(4 * rows + outs + slots * maxPages)
+    Bytes I64 = 0       # device memory held
+}
+
+# m on dev, for an engine's State (rows a step, outs sequences) and its Cache (made with device = true): the buffers
+# made, the weights sent up, the kernels compiled. VkError.Vulkan naming the buffer where the device has not the room,
+# or where one buffer is more than the device binds
+fn Decoder.Make(dev mut vdev.Device&, m model.Model&, rows I64, outs I64, cache model.Cache&, maxCtx I64) Decoder ? vdev.VkError {
+    why := Refusal(m)
+    assert why == "", "llm/vk does not run this model: " + why
+    c model.Config& = m.C
+    d, dh, heads, kv, ffn := c.Dim, c.HeadDim, c.Heads, c.KvHeads, c.Ffn
+    w3 := (heads + 2 * kv) * dh
+    nw := weightCount(m)
+    span := cache.Pages * kv * model.PageSize * dh
+    widest := d.Max(heads * dh).Max(ffn)
+    wy := (2 * ffn).Max(d).Max(w3)
+    cap := maxCtx + model.PageSize
+    half := c.RotHalf()
+    nints := 4 * rows + outs + cache.Slots * cache.MaxPages
+    ng := c.Layers * (2 * d + 2 * dh + w3 + 2 * d + 2 * ffn) + d
+    # a buffer is bound whole: none may be more than the device binds, nor hold more elements than a U32 counts. A
+    # weight matrix past that is held in runs of its rows; the cache and the step's own buffers are not split
+    limit := BufLimit if BufLimit > 0 else (dev.MaxBufMiB * 1048576).Min(4294967296)
+    most := (span * 2).Max(4 * rows * heads * cap).Max(4 * outs * m.Head.Out)
+    if most > dev.MaxBufMiB * 1048576 or most / 2 >= 4294967296 {
+        error vdev.VkError.Vulkan(0, "a buffer of " + $(most / 1048576) + " MiB, more than one buffer of " + dev.Name + " holds (" + $dev.MaxBufMiB + " MiB): a smaller cache, batch or context may fit")
+    }
+    gains := Vec<F32>()
+    dec := Decoder(dev, try kit.Make(dev), rows, outs, cache.Slots, cache.MaxPages, cache.Pages, cap, half
+        try vdev.Buf<F32>.Make(dev, ng), try vdev.Buf<F32>.Make(dev, rows * d), try vdev.Buf<F32>.Make(dev, rows * widest)
+        try vdev.Buf<F32>.Make(dev, rows * wy), try vdev.Buf<F32>.Make(dev, rows * heads * dh), try vdev.Buf<F32>.Make(dev, rows * heads * cap)
+        try vdev.Buf<F32>.Make(dev, outs * m.Head.Out), try vdev.Buf<I32>.Make(dev, nints), try vdev.Buf<F32>.Make(dev, 2 * rows * half))
+    dec.Bytes = 4 * (ng + rows * (d + widest + wy + heads * dh + heads * cap) + outs * m.Head.Out + nints + 2 * rows * half) + WeightBytes(m) + 4 * c.Layers * span
+    for i in range nw {
+        w :~ weightOf(m, i)
+        per := (limit / (2 * w.In)).Max(1).Min(w.Out.Max(1))
+        dec.wFirst.Push(dec.w.Len())
+        dec.wRows.Push(per)
+        for o in range 0, w.Out, per {
+            count := per.Min(w.Out - o)
+            dec.w.Push(try vdev.Buf<BF16>.Make(dev, count * w.In))
+            dec.w.RefMut(dec.w.Len() - 1).Upload(w.W, o * w.In, 0, count * w.In)
+        }
+    }
+    dec.wFirst.Push(dec.w.Len())
+    # a page's stale keys and values are never read (a row attends to positions written since its page was taken), but
+    # the buffers start as zeros all the same
+    for li in range c.Layers {
+        dec.k.Push(try vdev.Buf<BF16>.Make(dev, span))
+        dec.k.RefMut(li).Zero(0, span)
+        dec.v.Push(try vdev.Buf<BF16>.Make(dev, span))
+        dec.v.RefMut(li).Zero(0, span)
+    }
+    # the gains and biases, one array
+    for li in range c.Layers {
+        l :~ m.Layers[li]
+        dec.gain(gains, l.Norm1)
+        dec.gain(gains, l.Norm2)
+        dec.gain(gains, l.QNorm)
+        dec.gain(gains, l.KNorm)
+        dec.gain(gains, l.Qkv.Bias)
+        dec.gain(gains, l.O.Bias)
+        dec.gain(gains, l.GateUp.Bias)
+        dec.gain(gains, l.Down.Bias)
+    }
+    dec.gain(gains, m.Final)
+    host := gains.ToArray()
+    dec.g.Upload(host, 0, 0, host.Len())
+    try dev.Sync()
+    return dec
+}
+
+# a's place noted (-1 where it is empty) and a appended to the gains
+fn (dec mut Decoder&) gain(gains mut Vec<F32>&, a Array<F32>&) {
+    dec.gAt.Push(gains.Len() if a.Len() > 0 else -1)
+    for x in a: gains.Push(x)
+}
+
+# y[: n, : w.Out] = src[: n, : w.In] W^T + b for weight matrix i, the bias noted at gains' bi (-1: none)
+fn (dec mut Decoder&) product(i I64, w model.Linear&, y vdev.Buf<F32>&, src vdev.Buf<F32>&, n I64, bi I64) {
+    d := dec.dev
+    bias := dec.gAt[bi] if bi >= 0 else -1
+    per := dec.wRows[i]
+    for o in range 0, w.Out, per {
+        outs := per.Min(w.Out - o)
+        p := Array<U32>[u(n), u(outs), u(w.In), u(0), u(w.In), u(o), u(w.Out), u(bias.Max(0) + o), u(1 if bias >= 0 else 0)]
+        bufs := Array<U64>[src.Handle(), dec.w[dec.wFirst[i] + o / per].Handle(), y.Handle(), dec.g.Handle()]
+        if n < Wide: dec.ks.row.Run(d, groups(outs, Line * Cols), n, 1, bufs, p)
+        else: dec.ks.rows.Run(d, groups(outs, Tile * Cols), groups(n, Tile * Wide), 1, bufs, p)
+    }
+}
+
+# h's first n rows = x's (those the output rows name where picked) normed by the gains at gAt[gi]
+fn (dec mut Decoder&) norm(n I64, gi I64, picked Bool, eps F64) {
+    d := dec.dev
+    dim := dec.x.N / dec.Rows
+    p := Array<U32>[u(n), u(dim), u(dec.gAt[gi]), u(4 * dec.Rows), u(1 if picked else 0), f(F32(eps))]
+    dec.ks.norm.Run(d, groups(n, Line), 1, 1, Array<U64>[dec.x.Handle(), dec.h.Handle(), dec.g.Handle(), dec.ints.Handle()], p)
+}
+
+# x[: n] += y[: n] * rs
+fn (dec mut Decoder&) add(n I64, rs F32) {
+    d := dec.dev
+    dec.ks.mix.Run(d, groups(n, Line), 1, 1, Array<U64>[dec.x.Handle(), dec.y.Handle()], Array<U32>[u(n), f(1), f(rs), u(1)])
+}
+
+# the logits of the rows of s that want them, into s.Logits, as Model.Step gives them: one pass through every layer on
+# the device. k is the cache's page table (made with device = true); the keys and values are here
+fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ? vdev.VkError {
+    t0 := time.Now()
+    c model.Config& = m.C
+    n := s.N
+    if n == 0: return
+    assert n <= dec.Rows and s.NOut <= dec.Outs, "a step larger than the decoder was made for"
+    dev := dec.dev
+    d, dh, heads, kv, ffn := c.Dim, c.HeadDim, c.Heads, c.KvHeads, c.Ffn
+    hc := heads + 2 * kv
+    rows := dec.Rows
+    # the step's rows and the page table
+    hi :~ dec.hostInts
+    longest I64 = 0
+    for r in range n {
+        assert s.Given[r] < 0, "llm/vk reads tokens alone: a row with a given embedding (an image's)"
+        hi[r] = s.Tok[r]
+        hi[rows + r] = I32(s.Pos[r])
+        hi[2 * rows + r] = I32(s.Slot[r])
+        hi[3 * rows + r] = I32(s.Last[r])
+        longest = longest.Max(s.Last[r] + 1)
+        if s.Out[r] >= 0: hi[4 * rows + s.Out[r]] = I32(r)
+    }
+    tableAt := 4 * rows + dec.Outs
+    for i in range dec.slots * dec.maxPages: hi[tableAt + i] = k.Table[i]
+    dec.ints.Upload(hi, 0, 0, hi.Len())
+    m.Angles(s)
+    half := dec.half
+    dec.ang.Upload(s.Cos(), 0, 0, n * half)
+    dec.ang.Upload(s.Sin(), 0, rows * half, n * half)
+    ints, g := dec.ints.Handle(), dec.g.Handle()
+    ti := 4 * c.Layers + (0 if c.Tied else 1)
+    per := dec.wRows[ti]
+    for b in range dec.wFirst[ti], dec.wFirst[ti + 1] {
+        first := (b - dec.wFirst[ti]) * per
+        dec.ks.embeds.Run(dev, groups(d, Tile), groups(n, Tile), 1, Array<U64>[ints, dec.w[b].Handle(), dec.x.Handle()], Array<U32>[u(n), u(d), u(0), u(first), u(per), f(F32(c.EmbedScale))])
+    }
+    rs := F32(c.ResScale)
+    items := n * heads
+    at := Array<U32>[u(3 * rows), u(2 * rows), u(tableAt)]      # the last positions, the slots, the page table
+    for li in range c.Layers {
+        l :~ m.Layers[li]
+        gi := 8 * li
+        keys, vals := dec.k[li].Handle(), dec.v[li].Handle()
+        dec.norm(n, gi, false, c.Eps)
+        dec.product(4 * li, l.Qkv, dec.y, dec.h, n, gi + 4)
+        qn, kn := dec.gAt[gi + 2], dec.gAt[gi + 3]
+        dec.ks.heads.Run(dev, groups(n * hc, Line), 1, 1, Array<U64>[dec.y.Handle(), dec.q.Handle(), keys, vals, dec.ang.Handle(), ints, g]
+            Array<U32>[u(n * hc), u(heads), u(kv), u(dh), u(half), u(dec.maxPages), u(1 if c.Rotates(li) else 0), u(1 if qn >= 0 else 0), u(qn.Max(0)), u(kn.Max(0))
+                u(rows), u(2 * rows), u(tableAt), u(0), u(rows * half), f(F32(c.Eps))])
+        dec.ks.scores.Run(dev, groups(longest, Line), items, 1, Array<U64>[dec.q.Handle(), keys, dec.scores.Handle(), ints]
+            Array<U32>[u(items), u(heads), u(kv), u(dh), u(dec.maxPages), u(dec.cap), at[0], at[1], at[2], f(F32(c.Scale()))])
+        dec.ks.softmax.Run(dev, groups(items, Line), 1, 1, Array<U64>[dec.scores.Handle(), ints], Array<U32>[u(items), u(heads), u(dec.cap), at[0]])
+        dec.ks.values.Run(dev, groups(dh / 2, Tile), groups(items, Tile), 1, Array<U64>[dec.scores.Handle(), vals, dec.h.Handle(), ints]
+            Array<U32>[u(items), u(heads), u(kv), u(dh), u(dec.maxPages), u(dec.cap), at[0], at[1], at[2]])
+        dec.product(4 * li + 1, l.O, dec.y, dec.h, n, gi + 5)
+        dec.add(n * d, rs)
+        dec.norm(n, gi + 1, false, c.Eps)
+        dec.product(4 * li + 2, l.GateUp, dec.y, dec.h, n, gi + 6)
+        dec.ks.swiglu.Run(dev, groups(ffn, Tile), groups(n, Tile), 1, Array<U64>[dec.y.Handle(), dec.h.Handle()], Array<U32>[u(n), u(ffn)])
+        dec.product(4 * li + 3, l.Down, dec.y, dec.h, n, gi + 7)
+        dec.add(n * d, rs)
+    }
+    # the final norm of the rows that want logits, gathered in order, and the head
+    no := s.NOut
+    if no > 0 {
+        hw := m.Head.Out
+        dec.norm(no, 8 * c.Layers, true, c.Eps)
+        dec.product(4 * c.Layers, m.Head, dec.logits, dec.h, no, -1)
+        if c.LogitScale != 1.0 {
+            dec.ks.mix.Run(dev, groups(no * hw, Line), 1, 1, Array<U64>[dec.logits.Handle(), dec.logits.Handle()], Array<U32>[u(no * hw), f(F32(1.0 / c.LogitScale)), f(0), u(0)])
+        }
+        if hw == c.Vocab {
+            dec.logits.Download(s.Logits, 0, 0, no * hw)
+        } else {
+            for j in range no: dec.logits.Download(s.Logits, j * hw, j * c.Vocab, c.Vocab)
+        }
+    }
+    try dev.Sync()
+    s.Times[3] += time.Since(t0)
+}
+
+# ---- tests ----
+
+# two sequences in one cache, their prompts read in one step and then a token each a step, on the CPU and on the
+# device: the largest difference of any logit, and the largest logit
+fn against(dir String&) F64, F64 ? vdev.VkError {
+    dev := try vdev.Device.Open()
+    m := model.Model.Load(dir, true)!
+    assert Refusal(m) == "", Refusal(m)
+    c model.Config& = m.C
+    kc := model.Cache(c, 8, 2, 4)
+    kg := model.Cache(c, 8, 2, 4, device = true)
+    for i in range 8 {
+        kc.Table[i] = kc.Take()
+        kg.Table[i] = kg.Take()
+    }
+    sc := model.State(m, 24, 24, 192)
+    sg := model.State(m, 24, 24, 192)
+    dec := try Decoder.Make(dev, m, 24, 24, kg, 192)
+    worst, top := 0.0, 0.0
+    lens := [11, 7]
+    for step in range 70 {
+        sc.Reset()
+        sg.Reset()
+        for q in range 2 {
+            first := 0 if step == 0 else lens[q] + step - 1
+            count := lens[q] if step == 0 else 1
+            for j in range count {
+                p := first + j
+                t := I32((p * 7 + q * 13 + 5) % c.Vocab)
+                sc.Add(t, p, q, true)
+                sg.Add(t, p, q, true)
+            }
+        }
+        m.Step(sc, kc)
+        try dec.Step(m, sg, kg)
+        for i in range sc.NOut * c.Vocab {
+            worst = worst.Max(F64((sc.Logits[i] - sg.Logits[i]).Abs()))
+            top = top.Max(F64(sc.Logits[i].Abs()))
+        }
+    }
+    return worst, top
+}
+
+fn checked(dir String&, what String&) {
+    worst, top := try against(dir) catch vdev.VkError.NoDevice {
+        vdev.Skip("llm/vk, " + what)
+        os.RemoveAll(dir)!
+        return
+    } catch e {
+        assert false, $e
+        return
+    }
+    Println("llm/vk, " + what + ": largest logit difference " + $worst + " of logits up to " + $top)
+    # the two differ where a key or a value a rounding apart on the two sides rounds to different BF16 (a part in 500 of
+    # that element): a tenth of what BF16 itself costs the logits, which is some 2e-3 of the largest here
+    assert worst <= 1e-3 * top, what + ": the device's logits differ from the CPU's by " + $worst
+    os.RemoveAll(dir)!
+}
+
+test Decoder "the device's logits are the CPU's over 70 steps of two sequences crossing a page: Qwen3 (QK-norm, tied head)" {
+    checked(model.Tiny(true, 31), "Qwen3")
+}
+
+test Decoder "and Qwen2 (biases, a head of its own)" {
+    checked(model.TinyTied(false, 32, false), "Qwen2")
+}
+
+test Decoder "and a tied head over a vocabulary not a multiple of 16" {
+    checked(model.TinyTied(false, 33, true, 90), "tied, vocabulary 90")
+}
+
+test Decoder "and every matrix held in runs of a few rows, as one larger than the device binds is" {
+    BufLimit = 7 * 64 * 2
+    checked(model.Tiny(true, 34), "Qwen3 in runs of 7 rows")
+    checked(model.TinyTied(false, 35, false), "Qwen2 in runs of 7 rows")
+    BufLimit = 0
+}

@@ -1,0 +1,188 @@
+# lm_test - a small language model's forward pass on a Vulkan device against the CPU (docs/vulkan.md): a pre-norm
+# transformer decoder (token and position embeddings, layers of causal multi-head attention and a GELU perceptron under
+# RMS norms, tied output weights) run with kernels/vk's kernels alone - Gather, Add, RmsNorm, Gemm, GemmBatch, Softmax,
+# Map, ArgMax - and by plain loops in F64 here. The logits agree to 1e-4 and the greedy choice of every position is the
+# same. Every kernel a decoder's inference needs is in it.
+
+import "device"
+import "kern"
+import "std/rand"
+
+# the model's shape
+Vocab I64 = 50
+Width I64 = 16
+Heads I64 = 2
+Steps I64 = 7
+Seqs I64 = 3
+Layers I64 = 2
+Hidden I64 = 64
+
+fn randoms(n I64, scale F64, r mut rand.Rand&) Array<F32> {
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(r.Uniform(-scale, scale))
+    return x
+}
+
+# a (ar x ac, row-major) times b (ac x bc), or times b's transpose (bc x ac) where tb
+fn times(a Array<F64>&, ar I64, ac I64, b Array<F32>&, bc I64, tb Bool = false) Array<F64> {
+    c := Array<F64>(ar * bc)
+    for i in range ar {
+        for j in range bc {
+            s F64 = 0
+            for p in range ac: s += a[i * ac + p] * (F64(b[j * ac + p]) if tb else F64(b[p * bc + j]))
+            c[i * bc + j] = s
+        }
+    }
+    return c
+}
+
+# each row of x (rows x Width) scaled to unit root mean square and by gain
+fn rms(x Array<F64>&, rows I64, gain Array<F32>&) Array<F64> {
+    y := Array<F64>(rows * Width)
+    for i in range rows {
+        sq F64 = 0
+        for j in range Width: sq += x[i * Width + j] * x[i * Width + j] / F64(Width)
+        for j in range Width: y[i * Width + j] = x[i * Width + j] * F64(gain[j]) / (sq + 1e-5).Sqrt()
+    }
+    return y
+}
+
+# causal attention of q, k, v (rows x Width, Seqs runs of Steps, Heads column blocks): each position's mix of the
+# values at its own and earlier positions
+fn attend(q Array<F64>&, k Array<F64>&, v Array<F64>&) Array<F64> {
+    dh := Width / Heads
+    o := Array<F64>(Seqs * Steps * Width)
+    w := Array<F64>(Steps)
+    for s in range Seqs * Heads {
+        r0, c0 := s / Heads * Steps, s % Heads * dh
+        for t in range Steps {
+            sum F64 = 0
+            for u in range t + 1 {
+                dot F64 = 0
+                for j in range dh: dot += q[(r0 + t) * Width + c0 + j] * k[(r0 + u) * Width + c0 + j]
+                w[u] = (dot / F64(dh).Sqrt()).Exp()
+                sum += w[u]
+            }
+            for j in range dh {
+                acc F64 = 0
+                for u in range t + 1: acc += w[u] / sum * v[(r0 + u) * Width + c0 + j]
+                o[(r0 + t) * Width + c0 + j] = acc
+            }
+        }
+    }
+    return o
+}
+
+fn geluTanh(x F64) F64 { return x / (1.0 + (-2.0 * 0.7978845608028654 * (x + 0.044715 * x * x * x)).Exp()) }
+
+fn up(d mut device.Device&, x Array<F32>&) device.Buf<F32> ? device.VkError {
+    b := try device.Buf<F32>.Make(d, x.Len())
+    b.UploadAll(x)
+    return b
+}
+
+fn view(b device.Buf<F32>&, rows I64, cols I64) device.DMat<F32> { return device.DMat<F32>(b, 0, rows, cols, cols) }
+
+test attend "a transformer decoder's forward pass on the device against the CPU: logits to 1e-4, the same greedy choices" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("the decoder's forward pass")
+        return
+    }
+    ks := try kern.Set.Make(d)
+    r := rand.Rand(21)
+    rows := Seqs * Steps
+    dh := Width / Heads
+    ids := Array<U32>(rows)
+    for i in range rows: ids[i] = U32(r.Below(Vocab))
+    emb := randoms(Vocab * Width, 0.5, r)
+    pos := randoms(Steps * Width, 0.5, r)
+    gf := randoms(Width, 1.0, r)
+    # per layer: the queries', keys', values' and output's weights, the two gains, the perceptron's two weights
+    per := 4 * Width * Width + 2 * Width + 2 * Width * Hidden
+    wts := randoms(Layers * per, 0.4, r)
+    oq, ok, ov, oo := 0, Width * Width, 2 * Width * Width, 3 * Width * Width
+    og1 := 4 * Width * Width
+    og2 := og1 + Width
+    o1 := og2 + Width
+    o2 := o1 + Width * Hidden
+
+    # the CPU, in F64
+    x := Array<F64>(rows * Width)
+    for i in range rows {
+        for j in range Width: x[i * Width + j] = F64(emb[I64(ids[i]) * Width + j]) + F64(pos[i % Steps * Width + j])
+    }
+    for l in range Layers {
+        w := wts[l * per:(l + 1) * per]
+        h := rms(x, rows, w[og1:og1 + Width])
+        q := times(h, rows, Width, w[oq:oq + Width * Width], Width)
+        k := times(h, rows, Width, w[ok:ok + Width * Width], Width)
+        v := times(h, rows, Width, w[ov:ov + Width * Width], Width)
+        a := times(attend(q, k, v), rows, Width, w[oo:oo + Width * Width], Width)
+        for i in range rows * Width: x[i] += a[i]
+        m := times(rms(x, rows, w[og2:og2 + Width]), rows, Width, w[o1:o1 + Width * Hidden], Hidden)
+        for i in range rows * Hidden: m[i] = geluTanh(m[i])
+        p := times(m, rows, Hidden, w[o2:o2 + Hidden * Width], Width)
+        for i in range rows * Width: x[i] += p[i]
+    }
+    want := times(rms(x, rows, gf), rows, Width, emb, Vocab, true)
+
+    # the device
+    bids := try device.Buf<U32>.Make(d, rows)
+    bids.UploadAll(ids)
+    bemb := try up(d, emb)
+    bpos := try up(d, pos)
+    bgf := try up(d, gf)
+    bw := try up(d, wts)
+    bx := try device.Buf<F32>.Make(d, rows * Width)
+    bh := try device.Buf<F32>.Make(d, rows * Width)
+    bq := try device.Buf<F32>.Make(d, rows * Width)
+    bk := try device.Buf<F32>.Make(d, rows * Width)
+    bv := try device.Buf<F32>.Make(d, rows * Width)
+    bo := try device.Buf<F32>.Make(d, rows * Width)
+    bs := try device.Buf<F32>.Make(d, Seqs * Heads * Steps * Steps)
+    bm := try device.Buf<F32>.Make(d, rows * Hidden)
+    bl := try device.Buf<F32>.Make(d, rows * Vocab)
+    bbest := try device.Buf<U32>.Make(d, rows)
+    dx, dhid := view(bx, rows, Width), view(bh, rows, Width)
+    dq, dk, dv, dout := view(bq, rows, Width), view(bk, rows, Width), view(bv, rows, Width), view(bo, rows, Width)
+    ds := view(bs, Seqs * Heads * Steps, Steps)
+    dm := view(bm, rows, Hidden)
+    ks.Gather(d, dx, view(bemb, Vocab, Width), bids, 0)
+    ks.Add(d, bx, 0, bx, 0, bpos, 0, rows * Width, 1, Steps * Width)
+    for l in range Layers {
+        base := l * per
+        ks.RmsNorm(d, dhid, dx, bw, base + og1, 1e-5)
+        ks.Gemm(d, dq, dhid, false, device.DMat<F32>(bw, base + oq, Width, Width, Width), false)
+        ks.Gemm(d, dk, dhid, false, device.DMat<F32>(bw, base + ok, Width, Width, Width), false)
+        ks.Gemm(d, dv, dhid, false, device.DMat<F32>(bw, base + ov, Width, Width, Width), false)
+        scores := device.DBatch<F32>.Stacked(ds, Steps, Heads)
+        ks.GemmBatch(d, scores, device.DBatch<F32>.Heads(dq, Steps, Heads), false, device.DBatch<F32>.Heads(dk, Steps, Heads), true)
+        ks.Softmax(d, ds, ds, F32(1.0 / F64(dh).Sqrt()), Steps)
+        ks.GemmBatch(d, device.DBatch<F32>.Heads(dout, Steps, Heads), scores, false, device.DBatch<F32>.Heads(dv, Steps, Heads), false)
+        ks.Gemm(d, dx, dout, false, device.DMat<F32>(bw, base + oo, Width, Width, Width), false, 1, 1)
+        ks.RmsNorm(d, dhid, dx, bw, base + og2, 1e-5)
+        ks.Gemm(d, dm, dhid, false, device.DMat<F32>(bw, base + o1, Width, Hidden, Hidden), false)
+        ks.Map(d, kern.Op.GeluTanh, bm, 0, bm, 0, rows * Hidden)
+        ks.Gemm(d, dx, dm, false, device.DMat<F32>(bw, base + o2, Hidden, Width, Width), false, 1, 1)
+    }
+    ks.RmsNorm(d, dhid, dx, bgf, 0, 1e-5)
+    dl := view(bl, rows, Vocab)
+    ks.Gemm(d, dl, dhid, false, view(bemb, Vocab, Width), true)
+    ks.ArgMax(d, bbest, 0, dl)
+    got := Array<F32>(rows * Vocab)
+    best := Array<U32>(rows)
+    bl.DownloadAll(got)
+    bbest.DownloadAll(best)
+    try d.Sync()
+    worst F64 = 0
+    for i in range rows {
+        big I64 = 0
+        for j in range Vocab {
+            worst = worst.Max((F64(got[i * Vocab + j]) - want[i * Vocab + j]).Abs())
+            if want[i * Vocab + j] > want[i * Vocab + big]: big = j
+        }
+        assert I64(best[i]) == big, "position " + $i + ": the device chose " + $best[i] + ", the CPU " + $big
+    }
+    Println("the decoder on " + d.Name + ": logits within " + $worst + " of the CPU's")
+    assert worst <= 1e-4, "logits off by " + $worst
+}

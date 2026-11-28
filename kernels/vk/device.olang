@@ -1,0 +1,339 @@
+# device - any GPU that speaks Vulkan, and where things live on it (docs/vulkan.md): AMD, Intel, NVIDIA, phones' and
+# integrated ones, and a CPU's software Vulkan. A Device (the Vulkan device and the one queue everything runs on),
+# Buf<S> (n elements of S in device memory), DMat<S> and DBatch<S> (kernels/mat's Mat and kernels/gemm's Batch over a
+# Buf, the same numbers as kernels/gpu/device's over CUDA memory) and VkError.
+#
+# Built only when asked: -define Vulkan=true, which needs Vulkan's headers and nothing else - the loader is opened when
+# a device is asked for (vk.c), so the program runs where there is no Vulkan and Open says NoDevice there. A CPU module
+# reaches this one only under a top-level `if Vulkan { import ... }`.
+#
+# Order. Everything asked of a device - an upload, a kernel (kern.olang), a download - is recorded in program order and
+# runs at Sync at the latest, each seeing what came before it: nothing races by construction. An upload's host array may
+# be written again as soon as Upload returns; a download's host array is read after Sync.
+#
+# Errors. Setup - Open, Buf.Make, a kernel's making - gives a VkError back at once. The recording calls do not branch:
+# the first failure is kept by the device and the next Sync gives it back.
+#
+# Who frees. Device and Buf are unique with destructors, and a Buf holds its Device by reference, so buffers go before
+# their device. Close releases a device early.
+
+import vk "vk.c"
+import "std/os"
+
+Vulkan Bool = false
+
+assert Vulkan, "kernels/vk needs Vulkan's headers and is built only with -define Vulkan=true: import it under if Vulkan { ... } (docs/vulkan.md)"
+
+# no Vulkan here at all - no loader, no driver, no device with a compute queue; or a Vulkan call that failed: its
+# status and the call, with Vulkan's name for the status
+type VkError error {
+    NoDevice
+    Vulkan(code I32, what String)
+}
+
+# the staging memory a device keeps for uploads and downloads; more than this between two Syncs runs what is recorded
+# early
+StageBytes I64 = 64 << 20
+
+# the kinds of device (Vulkan's VkPhysicalDeviceType)
+KindIntegrated I64 = 1
+KindDiscrete I64 = 2
+KindVirtual I64 = 3
+KindCpu I64 = 4
+
+# Vulkan's name for a status
+fn resultText(code I32) String {
+    if code == vk.VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY"
+    if code == vk.VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY"
+    if code == vk.VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED"
+    if code == vk.VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST"
+    if code == vk.VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS"
+    if code == vk.VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY"
+    if code == vk.VK_ERROR_INVALID_SHADER_NV: return "VK_ERROR_INVALID_SHADER_NV"
+    if code == vk.OANN_VK_NO_MEMORY_TYPE: return "no memory type of the device holds it"
+    if code == vk.OANN_VK_NO_QUEUE: return "the device has no compute queue"
+    return "VkResult " + $code
+}
+
+# Vulkan's status, where it is not success, as an error naming the call
+fn Check(code I32, what String&) ? VkError {
+    if code != 0: error VkError.Vulkan(code, what + ": " + resultText(code))
+}
+
+# the text up to a NUL C wrote into a buffer
+fn cstring(b Array<U8>&) String {
+    for i in range b.Len() {
+        if b[i] == 0: return String(b[:i])
+    }
+    return String(b)
+}
+
+# the names of the Vulkan devices here, in Vulkan's order (the index Open takes); none where there is no Vulkan
+fn Devices() Vec<String> {
+    names := Array<U8>(16 * 256)
+    n := I64(vk.oann_vk_devices(names, 256, 16))
+    out := Vec<String>()
+    for i in range n.Min(16): out.Push(cstring(names[256 * i:256 * (i + 1)]))
+    return out
+}
+
+# a Vulkan device, opened: Name, its Kind (KindDiscrete ...), Vulkan's version Major.Minor, the PCI Vendor (0x1002 AMD,
+# 0x8086 Intel, 0x10de NVIDIA ...), MiB of its own memory, MaxBufMiB the most one buffer may hold, MaxGroups the most
+# workgroups a dispatch takes along an axis. h is the shim's handle, 0 after Close
+type Device unique struct() {
+    Name String = ""
+    Kind I64 = 0
+    Major I64 = 0
+    Minor I64 = 0
+    Vendor I64 = 0
+    MiB I64 = 0
+    MaxBufMiB I64 = 0
+    MaxGroups I64 = 0
+    h U64 = 0
+} destruct {
+    if h != 0: vk.oann_vk_close(h)
+}
+
+# the device of this index among Devices(); with none named (-1), the one $OANN_VK_DEVICE names, else the first
+# discrete GPU, else an integrated one, else a virtual one, else a CPU's software Vulkan. VkError.NoDevice where there
+# is none (or no such index), else the failing call's error
+fn Device.Open(index I64 = -1) Device ? VkError {
+    want := index
+    if want < 0 {
+        env := try os.Env("OANN_VK_DEVICE") catch default ""
+        if env != "": want = try env.ParseInt() catch default -1
+    }
+    out := Array<U64>(1)
+    st := vk.oann_vk_open(out, I32(want), U64(StageBytes))
+    if st == vk.OANN_VK_NO_LOADER or st == vk.OANN_VK_NO_DEVICE: error VkError.NoDevice
+    try Check(st, "opening the Vulkan device")
+    d := Device()
+    d.h = out[0]
+    name := Array<U8>(256)
+    info := Array<I32>(8)
+    vk.oann_vk_info(d.h, name, 256, info)
+    d.Name = cstring(name)
+    d.Kind, d.Major, d.Minor, d.Vendor = I64(info[0]), I64(info[1]), I64(info[2]), I64(info[3])
+    d.MiB, d.MaxBufMiB, d.MaxGroups = I64(info[4]), I64(info[5]), I64(info[6])
+    return d
+}
+
+# "NAME (KIND, Vulkan MAJOR.MINOR, MIB MiB)"
+fn (d Device&) Str() String {
+    kind := "discrete GPU" if d.Kind == KindDiscrete else "integrated GPU" if d.Kind == KindIntegrated else "virtual GPU" if d.Kind == KindVirtual else "CPU" if d.Kind == KindCpu else "other"
+    return d.Name + " (" + kind + ", Vulkan " + $d.Major + "." + $d.Minor + ", " + $d.MiB + " MiB)"
+}
+
+# everything recorded has run when this returns; the first failure since the last Sync as an error, and forgotten
+fn (d mut Device&) Sync() ? VkError {
+    st := vk.oann_vk_sync(d.h)
+    if st != 0: try Check(st, String.FromC(vk.oann_vk_what(d.h)!, 256))
+}
+
+# releases the device now, not where its holder lets go; nothing may be asked of it after, and its buffers and kernels
+# must be gone
+fn (d mut Device&) Close() {
+    if d.h != 0: vk.oann_vk_close(d.h)
+    d.h = 0
+}
+
+# the shim's handle, for kernels/vk's other modules
+fn (d Device&) Handle() U64 { return d.h }
+
+# ---- device memory ----
+
+# n elements of S in the device's memory, uninitialized; freed where its holder lets go, after what is recorded has
+# run. It holds its device, so it cannot outlive it
+type Buf<S> unique struct(dev Device&, n I64, h U64) {
+    dev
+    N I64 = n
+    h
+    devh U64 = dev.h
+} destruct {
+    if h != 0: vk.oann_vk_buf_free(devh, h)
+}
+
+# n elements of S on the device: VkError.Vulkan naming the size where there is not the room
+fn Buf<S>.Make(dev mut Device&, n I64) Buf<S> ? VkError {
+    out := Array<U64>(1)
+    bytes := (U64(n.Max(1)) * U64(S.Size) + 3) / 4 * 4
+    st := vk.oann_vk_buf_new(dev.h, bytes, out)
+    try Check(st, "a buffer of " + $bytes + " bytes")
+    return Buf<S>(dev, n, out[0])
+}
+
+# the shim's handle: what a kernel's binding takes
+fn (b Buf<S>&) Handle() U64 { return b.h }
+
+# n elements of host from host[from] to the buffer from element to, in order. host may be written again as soon as
+# this returns. Unchecked: the ranges are the caller's
+fn (b mut Buf<S>&) Upload(host Array<S>&, from I64, to I64, n I64) {
+    sz := U64(S.Size)
+    vk.oann_vk_upload(b.devh, b.h, U64(to) * sz, host, U64(from) * sz, U64(n) * sz)
+}
+
+# n elements of the buffer from element from to host[to], in order; the host reads them after the device's Sync.
+# Unchecked: the ranges are the caller's
+fn (b Buf<S>&) Download(host mut Array<S>&, from I64, to I64, n I64) {
+    sz := U64(S.Size)
+    vk.oann_vk_download(b.devh, host, U64(to) * sz, b.h, U64(from) * sz, U64(n) * sz)
+}
+
+# the whole of host (as many elements as the buffer holds) up, and back
+fn (b mut Buf<S>&) UploadAll(host Array<S>&) { b.Upload(host, 0, 0, b.N) }
+fn (b Buf<S>&) DownloadAll(host mut Array<S>&) { b.Download(host, 0, 0, b.N) }
+
+# n elements from element at become zero, in order (S of 4 bytes, or at and n whole 4-byte words of it)
+fn (b mut Buf<S>&) Zero(at I64, n I64) {
+    if n > 0: vk.oann_vk_fill(b.devh, b.h, U64(at) * U64(S.Size), U64(n) * U64(S.Size), 0)
+}
+
+# n elements of from, from element fromAt, to this buffer from element at, in order
+fn (b mut Buf<S>&) CopyFrom(at I64, from Buf<S>&, fromAt I64, n I64) {
+    sz := U64(S.Size)
+    if n > 0: vk.oann_vk_copy(b.devh, b.h, U64(at) * sz, from.h, U64(fromAt) * sz, U64(n) * sz)
+}
+
+# Rows x Cols elements of a device buffer from element Off, rows Ld apart: kernels/mat's Mat over device memory, the
+# same numbers. A view; it checks nothing
+type DMat<S> struct(Data Buf<S>&, Off I64, Rows I64, Cols I64, Ld I64) {
+    Data
+    Off
+    Rows
+    Cols
+    Ld
+}
+
+# Groups x Members matrices of one shape over a device buffer: matrix (g, m) is Rows x Cols, rows Ld apart, its first
+# element at Off + g GroupStride + m MemberStride - kernels/gemm's Batch over device memory, the same numbers (every
+# sequence's every head of attention). A view; it checks nothing
+type DBatch<S> struct(Data Buf<S>&, Off I64, Rows I64, Cols I64, Ld I64, Groups I64, GroupStride I64, Members I64, MemberStride I64) {
+    Data
+    Off
+    Rows
+    Cols
+    Ld
+    Groups
+    GroupStride
+    Members
+    MemberStride
+}
+
+# one matrix as a batch of one
+fn DBatch<S>.One(m DMat<S>&) DBatch<S> { return DBatch<S>(m.Data, m.Off, m.Rows, m.Cols, m.Ld, 1, 0, 1, 0) }
+
+# m's rows in runs of rows (the groups: sequences) and its columns in heads equal blocks (the members), as gemm's
+# Batch.Heads: attention's queries, keys, values and outputs. Unchecked: rows divides m.Rows and heads m.Cols
+fn DBatch<S>.Heads(m DMat<S>&, rows I64, heads I64) DBatch<S> {
+    w I64 = m.Cols / heads
+    return DBatch<S>(m.Data, m.Off, rows, w, m.Ld, m.Rows / rows, rows * m.Ld, heads, w)
+}
+
+# m's rows in runs of rows, run r being matrix (r / members, r % members), as gemm's Batch.Stacked: attention's T x T
+# matrices of every sequence and head, stacked. Unchecked: rows members divides m.Rows
+fn DBatch<S>.Stacked(m DMat<S>&, rows I64, members I64 = 1) DBatch<S> {
+    return DBatch<S>(m.Data, m.Off, rows, m.Cols, m.Ld, m.Rows / (rows * members), rows * members * m.Ld, members, rows * m.Ld)
+}
+
+# ---- tests ----
+
+# the line a test without a device prints
+fn Skip(what String&) { Println("no Vulkan device: " + what + " skipped") }
+
+test Device.Open "names the device, and the devices here" {
+    d := try Device.Open() catch VkError.NoDevice {
+        Skip("Open")
+        return
+    }
+    Println("device: " + d.Str())
+    all := Devices()
+    assert all.Len() > 0 and d.Name.Len() > 0 and d.Major >= 1 and d.MaxGroups > 0
+    try d.Sync()
+    d.Close()
+    d.Close()
+}
+
+test Buf "upload then download is the identity, whole and in ranges at offsets, F32, I8 and F64; zero and copy in order" {
+    d := try Device.Open() catch VkError.NoDevice {
+        Skip("Buf")
+        return
+    }
+    n I64 = 1000
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(i) * 0.37 - 11.0
+    b := try Buf<F32>.Make(d, n)
+    b.UploadAll(x)
+    y := Array<F32>(n)
+    b.DownloadAll(y)
+    try d.Sync()
+    for i in range n: assert y[i] == x[i]
+    # a range: x[100 .. 400) to the buffer's [500 .. 800), then the buffer's [450 .. 850) to z[7 ..)
+    b.Upload(x, 100, 500, 300)
+    z := Array<F32>(n)
+    b.Download(z, 450, 7, 400)
+    try d.Sync()
+    for i in range 400 {
+        j := 450 + i
+        want := x[j - 400] if j >= 500 and j < 800 else x[j]
+        assert z[7 + i] == want, "element " + $j
+    }
+    assert z[6] == 0.0 and z[407] == 0.0
+    q := Array<I8>(n)
+    for i in range n: q[i] = I8(i % 256 - 128)
+    bq := try Buf<I8>.Make(d, n)
+    bq.UploadAll(q)
+    q2 := Array<I8>(n)
+    bq.Download(q2, 1, 0, n - 1)
+    w := Array<F64>(n)
+    for i in range n: w[i] = 1.0 / F64(i + 1)
+    bw := try Buf<F64>.Make(d, n)
+    bw.UploadAll(w)
+    w2 := Array<F64>(n)
+    bw.DownloadAll(w2)
+    c := try Buf<F32>.Make(d, n)
+    c.UploadAll(x)
+    c.Zero(10, 20)
+    c.CopyFrom(100, b, 0, 50)
+    v := Array<F32>(n)
+    c.DownloadAll(v)
+    try d.Sync()
+    for i in range n: assert w2[i] == w[i]
+    for i in range n - 1: assert q2[i] == q[i + 1]
+    for i in range n {
+        want := F32(0) if i >= 10 and i < 30 else x[i - 100] if i >= 100 and i < 150 else x[i]
+        assert v[i] == want, "element " + $i
+    }
+}
+
+test Buf "an upload is ordered before the next download, round after round, past the staging memory" {
+    d := try Device.Open() catch VkError.NoDevice {
+        Skip("Buf ordering")
+        return
+    }
+    n I64 = 5 << 20
+    x := Array<F32>(n)
+    y := Array<F32>(n)
+    b := try Buf<F32>.Make(d, n)
+    for round in range 6 {
+        for i in range 0, n, 4093: x[i] = F32(round * 7 + i)
+        b.UploadAll(x)
+        b.DownloadAll(y)
+        try d.Sync()
+        for i in range 0, n, 4093: assert y[i] == F32(round * 7 + i)
+    }
+}
+
+test VkError "an allocation past the device's memory is an error naming the size" {
+    d := try Device.Open() catch VkError.NoDevice {
+        Skip("VkError")
+        return
+    }
+    failed := false
+    try Buf<F32>.Make(d, 1 << 44) catch VkError.Vulkan e {
+        Println("as expected: " + e.what)
+        assert e.what.Contains("a buffer of 70368744177664 bytes"), e.what
+        failed = true
+    }
+    assert failed, "allocated 64 TiB"
+    try d.Sync()
+}
