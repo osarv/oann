@@ -46,8 +46,14 @@ fn say(line String&) {
 
 fn refuse(why String&) { say("{\"ok\":false,\"error\":" + json.Encode(why) + "}") }
 
-# one request of a server, the models loaded
-fn answer(dir String&, m flux2.Model&, v vae.Vae&, exact Bool, device String&, line String&) {
+# the latent tokens of embeds: by the held transformer where there is one (held[0]), else by one loaded now
+fn flow(dir String&, held Vec<flux2.Model>&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed U64, exact Bool, device String&, progress fn&(step I64)) Array<F32> ? klein.Error {
+    if held.Len() > 0: return try klein.Steps(held[0], embeds, rows, cols, steps, seed, progress, device = device)
+    return try klein.Flow(dir, embeds, rows, cols, steps, seed, exact, progress, device = device)
+}
+
+# one request of a server, the decoder (and the transformer, where held) loaded
+fn answer(dir String&, held Vec<flux2.Model>&, v vae.Vae&, exact Bool, device String&, line String&) {
     q := try json.Decode<request>(line) catch e {
         refuse("the request is not {\"prompt\": ..., \"out\": ...}: " + $e)
         return
@@ -62,9 +68,9 @@ fn answer(dir String&, m flux2.Model&, v vae.Vae&, exact Bool, device String&, l
         refuse($e)
         return
     }
-    tokens := try klein.Steps(m, embeds, rows, cols, q.steps, U64(q.seed), fn(step I64) {
+    tokens := try flow(dir, held, embeds, rows, cols, q.steps, U64(q.seed), exact, device, fn(step I64) {
         say("{\"step\":" + $(step + 1) + ",\"of\":" + $q.steps + "}")
-    }, device = device) catch e {
+    }) catch e {
         refuse($e)
         return
     }
@@ -77,13 +83,17 @@ fn answer(dir String&, m flux2.Model&, v vae.Vae&, exact Bool, device String&, l
     say("{\"ok\":true,\"path\":" + json.Encode(q.out) + ",\"width\":" + $(16 * cols) + ",\"height\":" + $(16 * rows) + ",\"seconds\":" + $secs + "}")
 }
 
+# a server: on the CPU the transformer stays loaded between requests; on a device it is loaded for each request after
+# the prompt is encoded, as one picture's run does, since holding its 7.4 GB while the text encoder loads pushed it out
+# to the page file on a 16 GB PC, and every step then read it back from disk (2-3x slower steps)
 fn serve(dir String&, exact Bool, device String&) {
-    m := try klein.Transformer(dir, exact, device) catch e { fail($e) }
+    held := Vec<flux2.Model>()
+    if device == "cpu": held.Push(try klein.Transformer(dir, exact, device) catch e { fail($e) })
     v := try klein.Decoder(dir) catch e { fail($e) }
     try io.PutErrLn("oann-image: serving " + dir + " on " + device) catch { }
     for {
         line := try StdinLine() catch { return }
-        if line.Trim() != "": answer(dir, m, v, exact, device, line)
+        if line.Trim() != "": answer(dir, held, v, exact, device, line)
     }
 }
 
