@@ -336,7 +336,8 @@ static void unref(vkdev *d) {
 
 /* the device's name into name (cap bytes, NUL-ended) and into info: its kind (VkPhysicalDeviceType), Vulkan version
  * (major, minor), PCI vendor, the MiB of its largest device-local heap, the most elements of F32 one buffer binding
- * holds in MiB, and the most invocations a dispatch takes along x */
+ * holds in MiB, the most workgroups a dispatch takes along x, the most invocations a workgroup holds and the bytes of
+ * its shared memory */
 void oann_vk_info(uint64_t h, uint8_t *name, int32_t cap, int32_t *info) {
     vkdev *d = D(h);
     strncpy((char *)name, d->props.deviceName, (size_t)cap - 1);
@@ -352,6 +353,8 @@ void oann_vk_info(uint64_t h, uint8_t *name, int32_t cap, int32_t *info) {
     info[4] = (int32_t)(heap >> 20);
     info[5] = (int32_t)(d->props.limits.maxStorageBufferRange >> 20);
     info[6] = (int32_t)(d->props.limits.maxComputeWorkGroupCount[0] > 0x7fffffffu ? 0x7fffffffu : d->props.limits.maxComputeWorkGroupCount[0]);
+    info[7] = (int32_t)(d->props.limits.maxComputeWorkGroupInvocations > 0x7fffffffu ? 0x7fffffffu : d->props.limits.maxComputeWorkGroupInvocations);
+    info[8] = (int32_t)(d->props.limits.maxComputeSharedMemorySize > 0x7fffffffu ? 0x7fffffffu : d->props.limits.maxComputeSharedMemorySize);
 }
 
 /* ---- recording and running ---- */
@@ -414,6 +417,9 @@ int32_t oann_vk_sync(uint64_t h) {
     d->code = 0;
     return code;
 }
+
+/* what is recorded runs now and has run when this returns; a failure stays for the next sync to tell */
+void oann_vk_flush(uint64_t h) { flush(D(h)); }
 
 /* the call the last sync's failure was */
 const char *oann_vk_what(uint64_t h) { return D(h)->what ? D(h)->what : ""; }

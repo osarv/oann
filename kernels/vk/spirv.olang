@@ -21,6 +21,9 @@
 # written as the CPU's code computes what the CPU's does wherever the operations themselves are exact (IEEE's + - * /
 # and sqrt; a driver's exp and tanh are its own).
 #
+# Shared arrays (Shared, ReadShared, WriteShared) live in workgroup memory, one a workgroup; Barrier is where its
+# invocations meet.
+#
 # Control flow is structured, as SPIR-V wants it: If / Else / EndIf, and Loop / While / EndLoop (For and Next the
 # counted form). Variables (Var, Get, Set) carry values across them. The words are not checked here: a kernel that
 # reads a value outside the block that made it is the driver's (or spirv-val's) to refuse.
@@ -42,6 +45,13 @@ type Var struct(Id U32, T Ty) {
 type Buffer struct(Id U32, T Ty) {
     Id
     T
+}
+
+# an array the invocations of one workgroup share: its id, the type it holds and its length
+type Shared struct(Id U32, T Ty, Len I64) {
+    Id
+    T
+    Len
 }
 
 # one instruction: its word count and opcode, then its operands
@@ -92,6 +102,8 @@ type Kernel struct(lx I64, ly I64, lz I64) {
     elemPtrs := Array<U32>(4)       # pointer to a buffer's element of each
     varPtrs := Array<U32>(4)        # pointer to a function variable of each
     pushPtrs := Array<U32>(4)       # pointer to a parameter of each
+    sharedPtrs := Array<U32>(4)     # pointer to a shared array's element of each
+    SharedBytes I64 = 0             # the workgroup memory the shared arrays take
     tVoid U32 = 0
     tV3 U32 = 0
     tFn U32 = 0
@@ -203,6 +215,44 @@ fn (k mut Kernel&) Write(b Buffer, i Val, x Val) {
     put(k.body, 65, k.elemPtrs[slot(b.T)], p, b.Id, k.U(0).Id, i.Id)
     put(k.body, 62, p, x.Id)
 }
+
+# an array of n elements of t (F32, U32 or I32) in workgroup memory: one a workgroup, every invocation of it reading
+# and writing the same elements. What one invocation writes another reads only after a Barrier
+fn (k mut Kernel&) Shared(t Ty, n I64) Shared {
+    s := slot(t)
+    if k.sharedPtrs[s] == 0 {
+        k.sharedPtrs[s] = k.id()
+        put(k.types, 32, k.sharedPtrs[s], 4, k.ty(t))
+    }
+    len := k.U(n)
+    arr := k.id()
+    put(k.types, 28, arr, k.ty(t), len.Id)
+    p := k.id()
+    put(k.types, 32, p, 4, arr)
+    v := k.id()
+    put(k.types, 59, p, v, 4)
+    k.SharedBytes += 4 * n
+    return Shared(v, t, n)
+}
+
+# element i (a U32) of a shared array, and element i becomes x
+fn (k mut Kernel&) ReadShared(a Shared, i Val) Val {
+    p := k.id()
+    put(k.body, 65, k.sharedPtrs[slot(a.T)], p, a.Id, i.Id)
+    v := k.id()
+    put(k.body, 61, k.ty(a.T), v, p)
+    return Val(v, a.T)
+}
+fn (k mut Kernel&) WriteShared(a Shared, i Val, x Val) {
+    p := k.id()
+    put(k.body, 65, k.sharedPtrs[slot(a.T)], p, a.Id, i.Id)
+    put(k.body, 62, p, x.Id)
+}
+
+# every invocation of the workgroup waits here for the others, and sees what they wrote to shared arrays before it.
+# Only where every invocation of the workgroup arrives the same number of times: not under an If or a loop whose
+# condition differs between them
+fn (k mut Kernel&) Barrier() { put(k.body, 224, k.U(2).Id, k.U(2).Id, k.U(0x108).Id) }
 
 # ---- constants ----
 
@@ -331,6 +381,14 @@ fn (k mut Kernel&) Tanh(a Val) Val { return k.ext1(21, a) }
 fn (k mut Kernel&) Exp(a Val) Val { return k.ext1(27, a) }
 fn (k mut Kernel&) Log(a Val) Val { return k.ext1(28, a) }
 fn (k mut Kernel&) Sqrt(a Val) Val { return k.ext1(31, a) }
+
+# a b + c of F32s as one operation where the device has one (a single rounding), else as the product and the sum: the
+# one arithmetic here whose result is the device's to choose
+fn (k mut Kernel&) Fma(a Val, b Val, c Val) Val {
+    r := k.id()
+    put(k.body, 12, k.ty(a.T), r, k.glsl, 50, a.Id, b.Id, c.Id)
+    return Val(r, a.T)
+}
 
 # the lesser and the greater of two values of one type
 fn (k mut Kernel&) Least(a Val, b Val) Val { return k.ext2(pick(a, 38, 39, 37), a, b) }

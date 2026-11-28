@@ -79,7 +79,10 @@ fn Devices() Vec<String> {
 
 # a Vulkan device, opened: Name, its Kind (KindDiscrete ...), Vulkan's version Major.Minor, the PCI Vendor (0x1002 AMD,
 # 0x8086 Intel, 0x10de NVIDIA ...), MiB of its own memory, MaxBufMiB the most one buffer may hold, MaxGroups the most
-# workgroups a dispatch takes along an axis. h is the shim's handle, 0 after Close
+# workgroups a dispatch takes along an axis, MaxInvocations the most invocations a workgroup holds, SharedBytes a
+# workgroup's shared memory. Budget: a GPU's driver gives up on a submission that runs for seconds (Windows resets the
+# device after two), so what is recorded runs once Spend has counted this much arithmetic - a fraction of a second's
+# on the slowest plan - not only at Sync. h is the shim's handle, 0 after Close
 type Device unique struct() {
     Name String = ""
     Kind I64 = 0
@@ -89,6 +92,10 @@ type Device unique struct() {
     MiB I64 = 0
     MaxBufMiB I64 = 0
     MaxGroups I64 = 0
+    MaxInvocations I64 = 0
+    SharedBytes I64 = 0
+    Budget F64 = 0      # the arithmetic (operations) recorded before it is run unasked; 0: no limit
+    work F64 = 0        # recorded since it last ran
     h U64 = 0
 } destruct {
     if h != 0: vk.oann_vk_close(h)
@@ -110,11 +117,13 @@ fn Device.Open(index I64 = -1) Device ? VkError {
     d := Device()
     d.h = out[0]
     name := Array<U8>(256)
-    info := Array<I32>(8)
+    info := Array<I32>(12)
     vk.oann_vk_info(d.h, name, 256, info)
     d.Name = cstring(name)
     d.Kind, d.Major, d.Minor, d.Vendor = I64(info[0]), I64(info[1]), I64(info[2]), I64(info[3])
     d.MiB, d.MaxBufMiB, d.MaxGroups = I64(info[4]), I64(info[5]), I64(info[6])
+    d.MaxInvocations, d.SharedBytes = I64(info[7]), I64(info[8])
+    d.Budget = 0.0 if d.Kind == KindCpu else 32e9 if d.Kind == KindDiscrete else 2e9
     return d
 }
 
@@ -126,8 +135,19 @@ fn (d Device&) Str() String {
 
 # everything recorded has run when this returns; the first failure since the last Sync as an error, and forgotten
 fn (d mut Device&) Sync() ? VkError {
+    d.work = 0
     st := vk.oann_vk_sync(d.h)
     if st != 0: try Check(st, String.FromC(vk.oann_vk_what(d.h)!, 256))
+}
+
+# a kernel recorded work operations of arithmetic: past the Budget, what is recorded runs now (a failure is the next
+# Sync's to tell)
+fn (d mut Device&) Spend(work F64) {
+    d.work += work
+    if d.Budget > 0 and d.work > d.Budget {
+        vk.oann_vk_flush(d.h)
+        d.work = 0
+    }
 }
 
 # releases the device now, not where its holder lets go; nothing may be asked of it after, and its buffers and kernels

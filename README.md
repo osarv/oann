@@ -155,6 +155,7 @@ make test                          # every module's tests, takes minutes
 make gputest                       # the GPU backend's tests (CUDA, cuBLAS; -define Gpu=true), skipped without a device
 make vktest                        # the Vulkan backend's tests (any GPU, or software Vulkan), skipped without a device
 make vkgemm ARGS="5"               # the product on the Vulkan device against the CPU
+make vktune ARGS="3"               # every plan of the Vulkan product timed on the device
 make vkllm ARGS="MODEL_DIR 64 1 8" # a language model's decoding on the Vulkan device against the CPU, then tokens a second
 make whispervk ARGS="small 3"      # Whisper's encoder and a decoder step on the Vulkan device against the CPU
 make gpusettle ARGS="5 10 20 4"    # the settle and a lesson on the GPU against the CPU at batch 32, 128, 512
