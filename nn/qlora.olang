@@ -22,6 +22,7 @@ import "std/rand"
 import "../ad/graph"
 import "../data/chat"
 import "../kernels/device"
+import "../kernels/gemm"
 import "../llm/bpe"
 import "../llm/model"
 import "../models/qwen"
@@ -46,7 +47,7 @@ type Options struct(Model String, Data String, Out String, Rank I64 = 16, Alpha 
         Rate F64 = 2e-4, Warmup I64 = 0, Steps I64 = 0, Epochs F64 = 1.0, Ctx I64 = 1024, Batch I64 = 1, Accum I64 = 1
         Nf4 Bool = true, Recompute Bool = true, Chunk I64 = 8192, Valid F64 = 0.05, EvalEvery I64 = 50, EvalBatches I64 = 8
         Every I64 = 10, CheckpointEvery I64 = 50, Seed I64 = 1, Merge String = "", Device String = "auto", Bf16 String = "auto"
-        Budget I64 = 8192, Clip F64 = 1.0, Stop I64 = 0) {
+        Budget I64 = 8192, Clip F64 = 1.0, Stop I64 = 0, Threads I64 = 0) {
     Model
     Data
     Out
@@ -75,6 +76,7 @@ type Options struct(Model String, Data String, Out String, Rank I64 = 16, Alpha 
     Budget
     Clip
     Stop
+    Threads                     # tasks the CPU graph splits over; 0: every core
 }
 
 type QloraError error {
@@ -125,7 +127,7 @@ fn (o Options&) runAs<T>(cfg model.Config&, data mut chat.ChatData&, steps I64, 
     where := "GPU" if gpu else "CPU"
     on("planned on the " + $where + ": " + $Mb(fp.Total) + " MB (arena " + $Mb(fp.Arena) + ", NF4 weights " + $Mb(fp.Quant) + ", moments " + $Mb(fp.Moments) + "), " + $fp.Params + " adapter parameters")
     if gpu and Mb(fp.Total) > o.Budget: error QloraError.TooBig($Mb(fp.Total) + " MB on a device of " + $o.Budget + " MB")
-    g mut graph.Graph<T>& = graph.Graph<T>(o.Batch)
+    g mut graph.Graph<T>& = graph.Graph<T>(o.Batch, o.Threads if o.Threads > 0 else gemm.Cores())
     q := try qwen.Qwen.New(g, cfg, o.Ctx, o.Nf4, o.Recompute)
     s := try q.AddLora(g, lc)
     lm := q.Lm(g, true, o.Chunk)
