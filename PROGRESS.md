@@ -2458,3 +2458,24 @@ short batch, at 1 and 2 threads, the arena under 3/4 and growing under a third a
 (Transformer.Loss against CrossEntropy(Apply), checkpointed equal), ad/gpu_test `bigVocabCase` (CPU against GPU in
 F32 and BF16, checkpointed against plain bit for bit on the device, Train as a CUDA graph) - compiled, skipped without a
 device; the kernels compile under nvcc for F32, F64 and BF16. **Not yet run on a GPU.**
+
+## Text to image: FLUX.2 klein on the CPU (image/, 2026-11-28)
+
+`image/` runs Black Forest Labs' FLUX.2 klein 4B (Apache 2.0 weights; 4 steps) from its Hugging Face repository: the
+prompt through the model's Qwen3-4B text encoder (llm/, its first 27 layers; `State.Keep` keeps the stream after
+layers 9, 18, 27; `Model.Load`'s `layers`), the flow transformer (image/flux2: 5 double-stream and 20 single-stream
+blocks, 3.9B parameters, BF16 weights as stored, F32 or BF16 activations), the autoencoder's decoder (image/vae, on
+kernels/conv) and a PNG (image/png). Chosen over Stable Diffusion's UNets because nothing but the decoder convolves -
+the rest is products and attention, which oann already runs on every backend - and the text encoder is an
+architecture llm/ had.
+
+**Checked** against diffusers' Flux2KleinPipeline (image/tools/ref.py: F32, CPU) on one prompt at 256 x 256, 4 steps,
+the reference's noise (4-core Xeon VM with AMX): tokens equal; embeddings within 2.6e-5 on average; each step's
+velocity within 4.1e-4 of values up to 8; the decoder within 1.9e-6; the picture from prompt to pixels within 0.014 of
+255 on average (worst 20) with F32 activations, 4.2 of 255 with BF16 activations (the same picture to the eye).
+**Times** there: BF16 9.5 s a step of 768 rows, loading the transformer 30 s, text 17 s, decoder 3.6 s; exact 14.5 s a
+step. **Not measured**: other prompts and sizes against the reference, 1024 x 1024 at all, any GPU, Windows.
+
+**Next**: the transformer's blocks on a GPU through kernels/vk (weights streamed a block at a time, since 7.8 GB does
+not fit beside a desktop on 8 GB), the decoder's convolutions there, loading BF16 tensors by bytes instead of an
+element at a time (30-40 s of every run), the text embedding cached or its encoder in 8 bits.

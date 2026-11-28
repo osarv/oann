@@ -67,6 +67,17 @@ A model named by its repository is fetched once from Hugging Face; its licence i
 MIT for the DeepSeek-R1 distillations). How it works, the flags, the checks against the reference implementation and
 the speed on a 4-core machine are in `llm/README.md`.
 
+## Making pictures
+
+`image/` runs FLUX.2 klein, an openly licensed text-to-image model (the 4B model's weights are Apache 2.0), from its
+Hugging Face repository: the prompt through its Qwen3 text encoder (llm/), four steps of its flow transformer, its
+decoder, a PNG. On the CPU for now; each stage is held to diffusers' output (image/README.md).
+
+```
+make oannimage
+build/oann-image klein4b "A cat holding a sign that says hello world" cat.png --size 512x512
+```
+
 ## Distributed training
 
 `nn/dist` trains one model on machines that share no network but a store of blobs - cloud VMs with outbound HTTPS

@@ -838,7 +838,7 @@ type Model struct(C Config, Tile Bool, Int8 Bool = false, Int4 Bool = false) {
 
 # the model in directory dir (config.json, model.safetensors or its shards): exact (F32 activations, gemm's products)
 # where AMX is missing or exact is set
-fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = false) Model ? ModelError, os.Error {
+fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = false, layers I64 = 0) Model ? ModelError, os.Error {
     if dir.EndsWith(".gguf") {
         g := try gguf.File.Open(dir) catch gguf.GgufError { error ModelError.Malformed(dir + " (GGUF)") }
         c := try Config.Parse(try g.ConfigJson() catch gguf.GgufError { error ModelError.Unsupported(dir + ": " + g.Arch) })
@@ -846,6 +846,7 @@ fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = fa
         return try Model.From(c, w, exact, int8, int4, ImportancePath(dir) if int4 and os.Exists(ImportancePath(dir)) else "")
     }
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
+    if layers > 0 and layers < c.Layers: c.Layers = layers      # the first layers alone: for their hidden states (State.Keep)
     w := try Weights.Open(dir)
     for p in ["language_model.model.", "model.language_model."] {
         if w.where.Has(p + "embed_tokens.weight"): w.prefix = p
@@ -1097,6 +1098,23 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     Taps mut Array<F32>& = Array<F32>(0)
     TapAt mut Array<I64>& = Array<I64>(0)           # product k of layer l's rows at TapAt[4 l + k], In apart
     TapN mut Array<I64>& = Array<I64>(0)            # and how many it holds
+    # hidden states (Keep): the stream after each layer named, of every row of a step
+    KeepAfter mut Array<I64>& = Array<I64>(0)       # k: after k layers (transformers' hidden_states[k]; 0 the embeddings)
+    Kept mut Array<F32>& = Array<F32>(0)            # the stream after KeepAfter[i] layers at i Rows Dim, rows Dim apart
+}
+
+# the stream after each of these many layers kept by the steps to come, in Kept: what a model that reads another's
+# hidden states takes (an image model's prompt embeddings)
+fn (s mut State&) Keep(m Model&, after Array<I64>&) {
+    s.KeepAfter ~ after.Copy()
+    s.Kept ~ Array<F32>(after.Len() * s.Rows * m.C.Dim)
+}
+
+fn (s mut State&) keep(layers I64, n I64, d I64) {
+    for i, k in s.KeepAfter {
+        if k != layers: continue
+        for j in range n * d: s.Kept[i * s.Rows * d + j] = s.x[j]
+    }
 }
 
 # up to rows rows of every dense product's inputs kept by the steps to come (Part order: Qkv, O, GateUp, Down)
@@ -1546,6 +1564,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
     }
     rs := F32(c.ResScale)
     m.Angles(s)
+    if s.KeepAfter.Len() > 0: s.keep(0, n, d)
     for li in range c.Layers {
         l :~ m.Layers[li]
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm1, c.Eps)
@@ -1581,6 +1600,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         tm += time.Since(t1)
         if c.PostNorms: rmsNorm(s.y, 0, s.y, 0, n, d, d, l.PostFfn, c.Eps)
         for i in range n * d: s.x[i] += s.y[i] * rs
+        if s.KeepAfter.Len() > 0: s.keep(li + 1, n, d)
     }
     # the final norm of the rows that want logits, gathered in order, and the head
     for r in range n {
@@ -2255,6 +2275,34 @@ test Model "decoding through the cache a token a step gives the logits of readin
         assert worst(want, got) < (1e-4 if exact else 0.01) * biggest(want), "exact " + $exact + ": " + $worst(want, got)
     }
     os.RemoveAll(dir)!
+}
+
+test State "Keep: the stream after k layers is the first k layers' alone, and a padding row that attends to the prompt alone leaves the prompt's rows as they are" {
+    dir := Tiny(true, 23)
+    full := Model.Load(dir, true)!
+    cut := Model.Load(dir, true, layers = 1)!
+    assert cut.C.Layers == 1 and full.C.Layers > 1
+    toks := tokens(40, 5)
+    kept := fn(m Model&, real I64) Array<F32> {
+        k := Cache.scattered(m, 1, true)
+        s := State(m, toks.Len(), 0, 256)
+        s.Keep(m, [0, 1])
+        for i, t in toks {
+            s.Add(t, I64(i), 0, false)
+            if i >= real: s.Last[i] = real - 1
+        }
+        m.Step(s, k)
+        return s.Kept.Copy()
+    }
+    a := kept(full, 40)
+    b := kept(cut, 40)
+    assert worst(a, b) == 0.0
+    d := full.C.Dim
+    for i in range d: assert a[i] == full.Head.Get(I64(toks[0]), i)       # after no layers: the embeddings (tied)
+    # 30 real tokens and 10 of padding: the real rows are the 30 alone, a padding row is not the unpadded row
+    c := kept(full, 30)
+    assert worst(a[40 * d:70 * d], c[40 * d:70 * d]) == 0.0
+    assert worst(a[75 * d:76 * d], c[75 * d:76 * d]) > 0.0
 }
 
 test Model "attention split into runs of pages over the tasks gives the logits of one run, to rounding, the same tokens" {
