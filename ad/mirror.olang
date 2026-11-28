@@ -103,8 +103,9 @@ type Step struct(Do Work) {
 # the experts' hidden width H, Heads the experts E, Ctx the experts a token takes K, Flag whether the gates are
 # renormalized, K the balance loss's weight; Geo its 3 E + 2 inputs' value offsets (x, the router, E Gate, E Up, E Down
 # matrices: separate parameters, anywhere in the arena) and then their gradients' (-1: not wanted); Saved its kept rows
-# by expert (xg, h1, h3, act, yg: R D, R H, R H, R H, R D elements, R = Rows K), Scratch its backward's (dyg, da, dh1,
-# dh3, dxg: the same sizes, then the logits' gradient, Rows E): graph.olang's customExtras
+# by expert (xg, h1, h3, act, yg: R D, R H, R H, R H, R D elements, R = MoeRows(Rows K, E): the widest blocks' rows),
+# Scratch its backward's (dyg, da, dh1, dh3, dxg: the same sizes, then the logits' gradient, Rows E): graph.olang's
+# customExtras
 
 # a view's geometry, GeoSize numbers in the mirror's table: the rank, the window's axis (-1: none), its low and high
 # bounds, the dims (6), the strides read at (6), dy's strides (6, an Expand's gradient), the kernel (0 gather, 1 unexpand).
@@ -258,12 +259,59 @@ type MatPlan<T> unique struct(dev gdev.Device&, node I64) {
     db blas.Product<T, T, T> = blas.Product<T, T, T>(dev)
 }
 
+# A Moe step's rows on the device (v2, grouped): every expert has a block of Cap rows of the kept arrays, Cap the mean
+# rows an expert (slots / E) and Slack eighths of it more, so each of the step's products is one cublasGemmBatchedEx of
+# E products of one fixed size, the addresses read from a device array - nothing waits for the rows per expert, and a
+# training step with a mixture is captured as a CUDA graph like any other. Rows no token takes are zero rows. An expert
+# given more than Cap rows overflows: launch by launch the host sees it at once (it reads the counts there) and widens
+# the blocks before the products; in a captured step the device marks it, AdamW steps nothing, and the host runs the
+# step again launch by launch (GpuAdamW.Train). Past MaxSlack (blocks half again the mean) the step runs v1's way: the
+# experts' rows packed, a cuBLAS product an expert sized by the counts the host read (never captured).
+MaxSlack := 4
+
+# the rows of an expert's block for `slots` rows over e experts at a slack (eighths of the mean more)
+fn MoeCap(slots I64, e I64, slack I64) I64 { return (slots * (8 + slack) + 8 * e - 1) / (8 * e) }
+
+# the rows a Moe step's kept arrays hold: the widest blocks'
+fn MoeRows(slots I64, e I64) I64 { return e * MoeCap(slots, e, MaxSlack) }
+
+# the smallest slack whose blocks hold `most` rows (MaxSlack + 1: none does)
+fn slackFor(slots I64, e I64, most I64) I64 {
+    for q in range 1, MaxSlack + 1 {
+        if MoeCap(slots, e, q) >= most: return q
+    }
+    return MaxSlack + 1
+}
+
+# the arrays of addresses a grouped Moe step's products read, E of each: the kept arrays' blocks, the backward's, the
+# experts' matrices and their gradients
+PXg := 0
+PH1 := 1
+PH3 := 2
+PAct := 3
+PYg := 4
+PDyg := 5
+PDa := 6
+PDh1 := 7
+PDh3 := 8
+PDxg := 9
+PGate := 10
+PUp := 11
+PDown := 12
+PGGate := 13
+PGUp := 14
+PGDown := 15
+PCount := 16
+
 # a Moe step's routing on the device, made at Plan for its planned tokens: the router's logits and probabilities, each
 # slot's expert, gate, gate's gradient and row, each row's token, the rows per expert and the counting block's runs
-# (F32 and I32, whatever the arena holds), the selection bias; on the host the rows per expert of the last Forward
-# (Counts, downloaded: the expert products' sizes), their starts, and the backward's adds by input (Adds, the graph's)
-type MoePlan unique struct(node I64, e I64, logits gdev.Buf<F32>, probs gdev.Buf<F32>, gate gdev.Buf<F32>, dgate gdev.Buf<F32>, bias gdev.Buf<F32>, sel gdev.Buf<I32>, pos gdev.Buf<I32>, tok gdev.Buf<I32>, count gdev.Buf<I32>, part gdev.Buf<I32>) {
+# (F32 and I32, whatever the arena holds), the selection bias, the products' addresses (ptr); on the host the rows per
+# expert of the last Forward (Counts, downloaded), their starts where packed, the backward's adds by input (Adds, the
+# graph's), the slack in use (Slack; MaxSlack + 1: packed), the blocks the last Forward ran with (Cap; 0: packed) and
+# what the addresses on the device were made for (ptrCap), the Forwards in a row a smaller slack would have held (Calm)
+type MoePlan unique struct(node I64, e I64, logits gdev.Buf<F32>, probs gdev.Buf<F32>, gate gdev.Buf<F32>, dgate gdev.Buf<F32>, bias gdev.Buf<F32>, sel gdev.Buf<I32>, pos gdev.Buf<I32>, tok gdev.Buf<I32>, count gdev.Buf<I32>, part gdev.Buf<I32>, ptr gdev.Buf<U64>) {
     node
+    e
     logits
     probs
     gate
@@ -274,18 +322,28 @@ type MoePlan unique struct(node I64, e I64, logits gdev.Buf<F32>, probs gdev.Buf
     tok
     count
     part
+    ptr
     hostCount mut Array<I32>& = Array<I32>(e)
+    hostPtr mut Array<U64>& = Array<U64>(PCount * e)
     Counts mut Array<I64>& = Array<I64>(e)
     starts mut Array<I64>& = Array<I64>(e)
     Adds mut Array<Bool>& = Array<Bool>(3 * e + 2)
+    Slack I64 = 2
+    Cap I64 = 0
+    Slots I64 = 0
+    ptrCap I64 = -1
+    Calm I64 = 0
 }
 
 fn MoePlan.Make(d mut gdev.Device&, s Step&) MoePlan ? gdev.GpuError {
     n, e, k := s.Rows, s.Heads, s.Ctx
-    p := MoePlan(s.Node, e, try gdev.Buf<F32>.Make(d, n * e), try gdev.Buf<F32>.Make(d, n * e), try gdev.Buf<F32>.Make(d, n * k), try gdev.Buf<F32>.Make(d, n * k), try gdev.Buf<F32>.Make(d, e), try gdev.Buf<I32>.Make(d, n * k), try gdev.Buf<I32>.Make(d, n * k), try gdev.Buf<I32>.Make(d, n * k), try gdev.Buf<I32>.Make(d, e), try gdev.Buf<I32>.Make(d, 257 * e))
+    p := MoePlan(s.Node, e, try gdev.Buf<F32>.Make(d, n * e), try gdev.Buf<F32>.Make(d, n * e), try gdev.Buf<F32>.Make(d, n * k), try gdev.Buf<F32>.Make(d, n * k), try gdev.Buf<F32>.Make(d, e), try gdev.Buf<I32>.Make(d, n * k), try gdev.Buf<I32>.Make(d, n * k), try gdev.Buf<I32>.Make(d, MoeRows(n * k, e)), try gdev.Buf<I32>.Make(d, e), try gdev.Buf<I32>.Make(d, 257 * e), try gdev.Buf<U64>.Make(d, PCount * e))
     kern.Zero(d, p.bias.Addr(0), e * 4)
     return p
 }
+
+# after CalmSteps Forwards in a row that a smaller slack would have held, the slack comes down one
+CalmSteps := 64
 
 # AdamW's state on the device: the moments and the per-parameter decay mask, the steps taken
 type AdamW<T> unique struct(m gdev.Buf<U8>, v gdev.Buf<U8>, mask gdev.Buf<U8>, hp gdev.Buf<F64>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
@@ -329,6 +387,7 @@ type Mirror<T> unique struct(dev mut gdev.Device&, size I64, ints I64, nodes I64
     Graphs mut gdev.Graphs& = gdev.Graphs(64)     # GP7: whole training steps captured once and replayed
     Key mut Array<U64>& = Array<U64>(8)
     Warm Bool = false
+    Capturing Bool = false      # a step is being captured: a Moe step neither uploads nor waits (its addresses are up: MoePrepare)
 }
 
 # ---- the plan ----
@@ -962,13 +1021,133 @@ fn (m Mirror<T>&) MoeAdds(i I64) mut Array<Bool>& { return m.moes[i].Adds }
 # input j's value (grad false) or gradient offset of the Moe step s
 fn (m Mirror<T>&) moeIn(s Step&, j I64, grad Bool) I64 { return m.geo[s.Geo + j + (3 * s.Heads + 2 if grad else 0)] }
 
-# the experts on `rows` tokens: the router's logits (F32) and its choices; the rows each expert takes, counted on the
-# device and brought down (the products' sizes: the one wait of the step, so a graph with a Moe step is not captured
-# whole); the tokens' rows gathered by expert, each expert's SwiGLU over its rows (cuBLAS), and the gated sum
+# the device's mark that a Moe step overflowed its blocks in the step in hand (an F64 of Stats: AdamW reads it)
+fn (m Mirror<T>&) moeOver() U64 { return m.Stats.Addr(2 * m.nodes + 3) }
+
+# the mark cleared, before a step (enqueued)
+fn (m mut Mirror<T>&) MoeBegin() {
+    d := m.dev
+    kern.Zero(d, m.moeOver(), 8)
+}
+
+# whether every Moe step runs grouped (its slack within MaxSlack): a training step may then be captured whole
+fn (m Mirror<T>&) MoeGrouped() Bool {
+    for i in range m.moes.Len() {
+        if m.moes[i].Slack > MaxSlack: return false
+    }
+    return true
+}
+
+# plan i's slack in use: the eighths of the mean rows its blocks are wider by (MaxSlack + 1: packed)
+fn (m Mirror<T>&) MoeSlack(i I64) I64 { return m.moes[i].Slack }
+
+# the slacks in use as one word (a captured step's key: its products' sizes)
+fn (m Mirror<T>&) MoeKey() U64 {
+    key U64 = 0
+    for i in range m.moes.Len(): key = key * 7 + U64(m.moes[i].Slack)
+    return key
+}
+
+# plan i's blocks for `rows` tokens at its slack (0: packed) and, where they changed, its products' addresses up
+fn (m mut Mirror<T>&) moeBlocks(s Step&, i I64, rows I64) I64 {
+    d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
+    slots := rows * k
+    cap := MoeCap(slots, e, m.moes[i].Slack) if m.moes[i].Slack <= MaxSlack else 0
+    m.moes[i].Cap = cap
+    m.moes[i].Slots = slots
+    if cap == 0 or cap == m.moes[i].ptrCap: return cap
+    big := MoeRows(s.Rows * k, e)
+    xg := s.Saved
+    dyg := s.Scratch
+    widths := Array<I64>[d, h, h, h, d]
+    host :~ m.moes[i].hostPtr
+    at I64 = 0
+    for a in range 5 {
+        for j in range e {
+            host[a * e + j] = m.at(xg + at + j * cap * widths[a])
+            host[(5 + a) * e + j] = m.at(dyg + at + j * cap * widths[a])
+        }
+        at += big * widths[a]
+    }
+    for w in range 3 {
+        for j in range e {
+            host[(PGate + w) * e + j] = m.at(m.moeIn(s, 2 + w * e + j, false))
+            g := m.moeIn(s, 2 + w * e + j, true)
+            host[(PGGate + w) * e + j] = m.at(g) if g >= 0 else 0
+        }
+    }
+    dev := m.dev
+    upload(dev, m.moes[i].ptr, host, 0, 0, PCount * e)
+    m.moes[i].ptrCap = cap
+    return cap
+}
+
+# before a step on n entries that may be captured or replayed: every Moe step's addresses up for its blocks
+fn (m mut Mirror<T>&) MoePrepare(n I64) {
+    for i in range m.moes.Len() {
+        s := m.steps[m.moes[i].node]
+        m.moeBlocks(s, i, s.RowsAt(n, m.batch))
+    }
+}
+
+# after a captured step: every Moe step's rows per expert brought down (one wait, at the step's end); whether one
+# overflowed its blocks - its slack is then widened, and the step is to be run again (AdamW stepped nothing)
+fn (m mut Mirror<T>&) MoeSettle() Bool {
+    for i in range m.moes.Len(): m.moes[i].count.Download(m.moes[i].hostCount, 0, 0, m.moes[i].e)
+    m.sync()
+    over := false
+    for i in range m.moes.Len() {
+        if m.moeCounted(i) > m.moes[i].Cap: over = true
+    }
+    return over
+}
+
+# plan i's downloaded counts into Counts and the packed starts; the most rows an expert took
+fn (m mut Mirror<T>&) moeCounted(i I64) I64 {
+    at, most := I64(0), I64(0)
+    for j in range m.moes[i].e {
+        c := I64(m.moes[i].hostCount[j])
+        m.moes[i].starts[j] = at
+        m.moes[i].Counts[j] = c
+        at += c
+        most = most.Max(c)
+    }
+    need := slackFor(m.moes[i].Slots, m.moes[i].e, most)
+    if need > m.moes[i].Slack: m.moes[i].Slack = need
+    return most
+}
+
+# after a Forward whose rows were counted (plan i's Counts are its own): the slack comes down one after CalmSteps
+# Forwards in a row that a smaller one would have held
+fn (m mut Mirror<T>&) MoeObserve(i I64) {
+    most I64 = 0
+    for j in range m.moes[i].e: most = most.Max(m.moes[i].Counts[j])
+    if slackFor(m.moes[i].Slots, m.moes[i].e, most) >= m.moes[i].Slack {
+        m.moes[i].Calm = 0
+        return
+    }
+    m.moes[i].Calm++
+    if m.moes[i].Calm < CalmSteps: return
+    m.moes[i].Slack--
+    m.moes[i].Calm = 0
+}
+
+# E products of one size, C[j] = op(A[j]) op(B[j]) (added to where add), their addresses plan i's arrays pc, pa and pb
+fn (m mut Mirror<T>&) gemmEach(i I64, pc I64, ldc I64, pa I64, ta Bool, lda I64, pb I64, tb Bool, ldb I64, rows I64, cols I64, k I64, add Bool) {
+    z T
+    t := storeType(z)
+    e := m.moes[i].e
+    cu.oann_gemm_batched(m.dev.Status(), m.dev.Blas(), tb, ta, I32(cols), I32(rows), I32(k), 1.0, m.moes[i].ptr.Addr(pb * e), t, I32(ldb), m.moes[i].ptr.Addr(pa * e), t, I32(lda), 1.0 if add else 0.0, m.moes[i].ptr.Addr(pc * e), t, I32(ldc), I32(e), cu.CUBLAS_COMPUTE_32F)
+}
+
+# the experts on `rows` tokens: the router's logits (F32) and its choices; each expert's rows found on the device, in
+# its block (grouped) - or, past MaxSlack, packed and counted by the host; the tokens' rows gathered by expert, each
+# expert's SwiGLU over its rows, and the gated sum. Launch by launch the host reads the counts (one wait: Counts, and
+# blocks too narrow are widened before any product); while a step is captured nothing waits
 fn (m mut Mirror<T>&) moeForward(s Step&, rows I64) {
     i := m.moeFor(s)
     d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
-    big := s.Rows * k
+    big := MoeRows(s.Rows * k, e)
     xg := s.Saved
     h1, h3, act, yg := xg + big * d, xg + big * (d + h), xg + big * (d + 2 * h), xg + big * (d + 3 * h)
     x, wr := m.moeIn(s, 0, false), m.moeIn(s, 1, false)
@@ -976,15 +1155,41 @@ fn (m mut Mirror<T>&) moeForward(s Step&, rows I64) {
     t := storeType(z)
     m.gemmAt(m.moes[i].logits.Addr(0), cu.CUDA_R_32F, e, m.at(x), false, d, m.at(wr), true, d, rows, e, d, t, false)
     m.elems(KMoeRoute, rows, m.moes[i].probs.Addr(0), m.moes[i].sel.Addr(0), m.moes[i].gate.Addr(0), m.moes[i].logits.Addr(0), m.moes[i].bias.Addr(0), n64(rows), n64(e), n64(k), flag(s.Flag))
-    m.once(KMoeRows, m.moes[i].pos.Addr(0), m.moes[i].tok.Addr(0), m.moes[i].count.Addr(0), m.moes[i].part.Addr(0), m.moes[i].sel.Addr(0), n64(rows * k), n64(e), n64(k))
-    m.moes[i].count.Download(m.moes[i].hostCount, 0, 0, e)
-    m.sync()
-    at I64 = 0
-    for j in range e {
-        m.moes[i].starts[j] = at
-        m.moes[i].Counts[j] = I64(m.moes[i].hostCount[j])
-        at += m.moes[i].Counts[j]
+    cap := m.moes[i].Cap if m.Capturing else m.moeBlocks(s, i, rows)
+    m.moeRows(i, rows * k, e, k, cap)
+    if not m.Capturing {
+        m.moes[i].count.Download(m.moes[i].hostCount, 0, 0, e)
+        m.sync()
+        if m.moeCounted(i) > cap and cap > 0 {
+            cap = m.moeBlocks(s, i, rows)
+            m.MoeBegin()
+            m.moeRows(i, rows * k, e, k, cap)
+        }
     }
+    if cap == 0 {
+        m.packedForward(s, i, rows)
+        return
+    }
+    m.elems(KMoeGather, e * cap * d, m.at(xg), m.at(x), m.moes[i].tok.Addr(0), n64(e * cap), n64(d))
+    m.gemmEach(i, PH1, h, PXg, false, d, PGate, true, d, cap, h, d, false)
+    m.gemmEach(i, PH3, h, PXg, false, d, PUp, true, d, cap, h, d, false)
+    m.elems(KMoeAct, e * cap * h, m.at(act), m.at(h1), m.at(h3), n64(e * cap * h))
+    m.gemmEach(i, PYg, d, PAct, false, h, PDown, true, h, cap, d, h, false)
+    m.elems(KMoeCombine, rows * d, m.at(s.Y), m.at(yg), m.moes[i].gate.Addr(0), m.moes[i].pos.Addr(0), n64(rows), n64(d), n64(k))
+}
+
+# each slot's row and each row's token: blocks of cap rows an expert, or packed (cap 0)
+fn (m mut Mirror<T>&) moeRows(i I64, slots I64, e I64, k I64, cap I64) {
+    m.once(KMoeRows, m.moes[i].pos.Addr(0), m.moes[i].tok.Addr(0), m.moes[i].count.Addr(0), m.moes[i].part.Addr(0), m.moes[i].sel.Addr(0), n64(slots), n64(e), n64(k), n64(cap), m.moeOver())
+}
+
+# the experts' products with their rows packed (v1): a cuBLAS product an expert over the rows the host counted
+fn (m mut Mirror<T>&) packedForward(s Step&, i I64, rows I64) {
+    d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
+    big := MoeRows(s.Rows * k, e)
+    xg := s.Saved
+    h1, h3, act, yg := xg + big * d, xg + big * (d + h), xg + big * (d + 2 * h), xg + big * (d + 3 * h)
+    x := m.moeIn(s, 0, false)
     m.elems(KMoeGather, rows * k * d, m.at(xg), m.at(x), m.moes[i].tok.Addr(0), n64(rows * k), n64(d))
     for j in range e {
         c, o := m.moes[i].Counts[j], m.moes[i].starts[j]
@@ -1000,24 +1205,34 @@ fn (m mut Mirror<T>&) moeForward(s Step&, rows I64) {
     m.elems(KMoeCombine, rows * d, m.at(s.Y), m.at(yg), m.moes[i].gate.Addr(0), m.moes[i].pos.Addr(0), n64(rows), n64(d), n64(k))
 }
 
-# the experts' backward on `rows` tokens, nn/moe's Backward step for step, from the rows the last Forward counted:
-# each slot's output and gate gradients; each expert's weights' gradients and its rows' input gradient; x's from its
-# slots' rows; the logits' (through the gates and the balance loss); the router's and its share of x's. Each input's
-# gradient written or added as its plan's Adds say; one an expert with no rows writes is zero
+# the experts' backward on `rows` tokens, nn/moe's Backward step for step, over the rows of the last Forward (its
+# blocks, or packed): each slot's output and gate gradients; each expert's weights' gradients and its rows' input
+# gradient; x's from its slots' rows; the logits' (through the gates and the balance loss); the router's and its share
+# of x's. Each input's gradient written or added as its plan's Adds say; one an expert with no rows writes is zero
 fn (m mut Mirror<T>&) moeBackward(s Step&, rows I64) {
     i := m.moeFor(s)
     d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
-    big := s.Rows * k
+    big := MoeRows(s.Rows * k, e)
     xg := s.Saved
     h1, h3, act, yg := xg + big * d, xg + big * (d + h), xg + big * (d + 2 * h), xg + big * (d + 3 * h)
     dyg := s.Scratch
     da, dh1, dh3, dxg, dl := dyg + big * d, dyg + big * (d + h), dyg + big * (d + 2 * h), dyg + big * (d + 3 * h), dyg + big * (2 * d + 3 * h)
     x, wr := m.moeIn(s, 0, false), m.moeIn(s, 1, false)
     gx, gwr := m.moeIn(s, 0, true), m.moeIn(s, 1, true)
+    cap := m.moes[i].Cap
+    live := e * cap if cap > 0 else rows * k        # the rows the products run over
+    if cap > 0 {
+        dev := m.dev
+        kern.Zero(dev, m.at(dyg), live * d * T.Size)        # the rows no token has: zero, as their kept rows are
+    }
     m.rowk(KMoeScatter, rows * k, d, m.at(dyg), m.moes[i].dgate.Addr(0), m.at(s.DY), m.at(yg), m.moes[i].gate.Addr(0), m.moes[i].pos.Addr(0), n64(d), n64(k))
-    for j in range e: m.expertBackward(s, i, j, act, dyg, da)
-    m.elems(KMoeActGrad, rows * k * h, m.at(dh1), m.at(dh3), m.at(da), m.at(h1), m.at(h3), n64(rows * k * h))
-    for j in range e: m.expertInputs(s, i, j, xg, dh1, dh3, dxg, gx >= 0)
+    if cap > 0 { m.groupedDown(s, i, cap) } else {
+        for j in range e: m.expertBackward(s, i, j, m.moes[i].Counts[j], m.moes[i].starts[j], act, dyg, da)
+    }
+    m.elems(KMoeActGrad, live * h, m.at(dh1), m.at(dh3), m.at(da), m.at(h1), m.at(h3), n64(live * h))
+    if cap > 0 { m.groupedInputs(s, i, cap, gx >= 0) } else {
+        for j in range e: m.expertInputs(s, i, j, m.moes[i].Counts[j], m.moes[i].starts[j], xg, dh1, dh3, dxg, gx >= 0)
+    }
     if gx >= 0: m.elems(KMoeDx, rows * d, m.at(gx), m.at(dxg), m.moes[i].pos.Addr(0), n64(rows), n64(d), n64(k), flag(m.moes[i].Adds[0]))
     if gx < 0 and gwr < 0: return
     scale := F32(s.K * F64(e) / (F64(rows) * F64(rows * k)))
@@ -1026,11 +1241,58 @@ fn (m mut Mirror<T>&) moeBackward(s Step&, rows I64) {
     if gx >= 0: m.gemmIn(gx, d, dl, false, e, wr, false, d, rows, d, e, true)
 }
 
-# expert j's Down gradient (dyg^T act) and its act's gradient (dyg Down) over its rows; an expert with no rows writes
-# zero into its three gradients (where they are written, not added to)
-fn (m mut Mirror<T>&) expertBackward(s Step&, i I64, j I64, act I64, dyg I64, da I64) {
+# whether the E matrices of kind w (0 Gate, 1 Up, 2 Down) all want their gradient and all add alike: one batched product
+fn (m Mirror<T>&) moeAlike(s Step&, i I64, w I64) Bool {
+    e := s.Heads
+    for j in range e {
+        if m.moeIn(s, 2 + w * e + j, true) < 0 or m.moes[i].Adds[2 + w * e + j] != m.moes[i].Adds[2 + w * e]: return false
+    }
+    return true
+}
+
+# grouped: every expert's act gradient (dyg Down) and Down gradient (dyg^T act) over its block
+fn (m mut Mirror<T>&) groupedDown(s Step&, i I64, cap I64) {
+    d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
+    big := MoeRows(s.Rows * k, e)
+    act := s.Saved + big * (d + 2 * h)
+    dyg := s.Scratch
+    m.gemmEach(i, PDa, h, PDyg, false, d, PDown, false, h, cap, h, d, false)
+    if m.moeAlike(s, i, 2) {
+        m.gemmEach(i, PGDown, h, PDyg, true, d, PAct, false, h, d, h, cap, m.moes[i].Adds[2 + 2 * e])
+        return
+    }
+    for j in range e {
+        g := m.moeIn(s, 2 + 2 * e + j, true)
+        if g >= 0: m.gemmIn(g, h, dyg + j * cap * d, true, d, act + j * cap * h, false, h, d, h, cap, m.moes[i].Adds[2 + 2 * e + j])
+    }
+}
+
+# grouped: every expert's Gate and Up gradients (dh^T xg) and, where x's is wanted, its rows' input gradient
+fn (m mut Mirror<T>&) groupedInputs(s Step&, i I64, cap I64, wantX Bool) {
+    d, h, e, k := s.Cols, s.Inner, s.Heads, s.Ctx
+    big := MoeRows(s.Rows * k, e)
+    xg := s.Saved
+    dh1 := s.Scratch + big * (d + h)
+    for w in range 2 {
+        pdh := PDh1 + w
+        if m.moeAlike(s, i, w) {
+            m.gemmEach(i, PGGate + w, d, pdh, true, h, PXg, false, d, h, d, cap, m.moes[i].Adds[2 + w * e])
+            continue
+        }
+        for j in range e {
+            g := m.moeIn(s, 2 + w * e + j, true)
+            if g >= 0: m.gemmIn(g, d, dh1 + w * big * h + j * cap * h, true, h, xg + j * cap * d, false, d, h, d, cap, m.moes[i].Adds[2 + w * e + j])
+        }
+    }
+    if not wantX: return
+    m.gemmEach(i, PDxg, d, PDh1, false, h, PGate, false, d, cap, d, h, false)
+    m.gemmEach(i, PDxg, d, PDh3, false, h, PUp, false, d, cap, d, h, true)
+}
+
+# packed: expert j's Down gradient (dyg^T act) and its act's gradient (dyg Down) over its c rows from o; an expert with
+# no rows writes zero into its three gradients (where they are written, not added to)
+fn (m mut Mirror<T>&) expertBackward(s Step&, i I64, j I64, c I64, o I64, act I64, dyg I64, da I64) {
     d, h, e := s.Cols, s.Inner, s.Heads
-    c, o := m.moes[i].Counts[j], m.moes[i].starts[j]
     if c == 0 {
         for w in range 3 {
             at := 2 + w * e + j
@@ -1045,10 +1307,9 @@ fn (m mut Mirror<T>&) expertBackward(s Step&, i I64, j I64, act I64, dyg I64, da
     if g >= 0: m.gemmIn(g, h, dyg + o * d, true, d, act + o * h, false, h, d, h, c, m.moes[i].Adds[down])
 }
 
-# expert j's Gate and Up gradients (dh^T xg) and, where x's is wanted, its rows' input gradient dh1 Gate + dh3 Up
-fn (m mut Mirror<T>&) expertInputs(s Step&, i I64, j I64, xg I64, dh1 I64, dh3 I64, dxg I64, wantX Bool) {
+# packed: expert j's Gate and Up gradients (dh^T xg) and, where x's is wanted, its rows' input gradient dh1 Gate + dh3 Up
+fn (m mut Mirror<T>&) expertInputs(s Step&, i I64, j I64, c I64, o I64, xg I64, dh1 I64, dh3 I64, dxg I64, wantX Bool) {
     d, h, e := s.Cols, s.Inner, s.Heads
-    c, o := m.moes[i].Counts[j], m.moes[i].starts[j]
     if c == 0: return
     for w in range 2 {
         at := 2 + w * e + j
@@ -1092,7 +1353,7 @@ fn (m mut Mirror<T>&) AdamLaunch(o mut AdamW<T>&) {
     n := m.params
     w := m.Masters.Addr(0) if m.HasMasters else m.at(0)
     m.elems(KAdamW, n, w, m.at(0), m.at(n), o.M.Addr(0), o.V.Addr(0), o.mask.Addr(0), n64(n), rl<T>(o.Beta1), rl<T>(o.Beta2), rl<T>(1.0 - o.Beta1), rl<T>(1.0 - o.Beta2)
-        o.Hp.Addr(0), rl<T>(o.Eps))
+        o.Hp.Addr(0), rl<T>(o.Eps), m.moeOver())
 }
 
 fn (m mut Mirror<T>&) AdamStep(o mut AdamW<T>&) {

@@ -1357,7 +1357,8 @@ fn (g Graph<T>&) customExtras(i I64, first I64, count I64, n I64) extras {
     if not g.onCpu and g.specOf(i, 0) == 1 {
         d, h, k := g.specOf(i, 1), g.specOf(i, 2), g.specOf(i, 4)
         tokens := g.nodes[g.customIn[first]].Dims.Count() / d
-        rows := tokens * k * (2 * d + 3 * h)
+        e := g.specOf(i, 3)
+        rows := e * ((tokens * k * 12 + 8 * e - 1) / (8 * e)) * (2 * d + 3 * h)     # mirror.MoeRows: the widest blocks' rows (half again the mean)
         return extras(rows, rows + tokens * g.specOf(i, 3), 0, 0)
     }
     scratch := g.customScratch(first, count)
@@ -3284,8 +3285,10 @@ if Gpu {
         g.gpu.M ~ try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss, g.qCodes.Len(), g.qScales.Len(), side) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
         for i in range g.nodes.Len() {
             match g.nodes[i].Kind {
-                case Op.Custom(f, _, _) {
+                case Op.Custom(f, first, count) {
                     if g.gpu.Steps[i].Do != mirror.Work.Moe: continue
+                    st := g.gpu.Steps[i]
+                    if mirror.MoeRows(st.Rows * st.Ctx, st.Heads) * (2 * st.Cols + 3 * st.Inner) != g.customExtras(i, first, count, 0).saved: unreachable "oann: a mixture's kept rows and mirror.MoeRows differ"
                     g.gpu.MoeBias.Push(f.GpuBias())
                     g.gpu.MoeLoad.Push(f.GpuLoad())
                 }
@@ -3391,7 +3394,10 @@ if Gpu {
     }
 
     # while a step is being captured the Forward and Backward upload nothing (the uploads are on another stream)
-    fn (g mut Graph<T>&) GpuCapturing(on Bool) { g.gpu.Capturing = on }
+    fn (g mut Graph<T>&) GpuCapturing(on Bool) {
+        g.gpu.Capturing = on
+        g.gpu.M!.Capturing = on
+    }
 
     # a Forward on the device: the parameters up if the host wrote them, every input up, each node's kernels
     fn (g mut Graph<T>&) gpuForward(n I64) {
@@ -3401,9 +3407,9 @@ if Gpu {
         for i in range g.nodes.Len() {
             if isLeaf(g.nodes[i].Kind): continue
             j := m.MoeOf(i) if steps[i].Do == mirror.Work.Moe else -1
-            if j >= 0: m.MoeBias(j, g.gpu.MoeBias[j])
+            if j >= 0 and not g.gpu.Capturing: m.MoeBias(j, g.gpu.MoeBias[j])
             m.Forward(steps[i], n, g.Pos)
-            if j >= 0: g.moeLoad(j)
+            if j >= 0 and not g.gpu.Capturing: g.moeLoad(j)
         }
         g.gpu.Gen++
         g.gpu.FreshParams = true
@@ -3447,11 +3453,34 @@ if Gpu {
         load :~ g.gpu.MoeLoad[j]
         counts :~ m.MoeCounts(j)
         for e in range load.Len().Min(counts.Len()): load[e] += counts[e]
+        m.MoeObserve(j)
     }
 
-    # whether a training step may be captured as one CUDA graph: no step of it waits on the host (a Moe step brings its
-    # rows per expert down to size its products)
-    fn (g Graph<T>&) GpuWhole() Bool { return g.gpu.MoeLoad.Len() == 0 }
+    # whether a training step may be captured as one CUDA graph: every Moe step of it runs grouped (its experts' rows in
+    # blocks of a fixed size, so nothing waits on the host for the rows per expert: mirror.olang's MoePlan)
+    fn (g Graph<T>&) GpuWhole() Bool { return g.gpu.M!.MoeGrouped() }
+
+    # before a training step on n entries that is captured or replayed: every Moe step's bias and its products'
+    # addresses up, the overflow mark cleared; the key word of the step's sizes
+    fn (g mut Graph<T>&) GpuMoePrepare(n I64) U64 {
+        if g.gpu.MoeLoad.Len() == 0: return 0
+        m :~ g.gpu.M!
+        for j in range g.gpu.MoeBias.Len(): m.MoeBias(j, g.gpu.MoeBias[j])
+        m.MoePrepare(n)
+        m.MoeBegin()
+        return m.MoeKey()
+    }
+
+    # after a captured or replayed training step: waits for it where the graph has a Moe step, and adds each one's rows
+    # per expert to its load. True where an expert overflowed its block: AdamW stepped nothing, the blocks are widened,
+    # and the step is to be run again launch by launch
+    fn (g mut Graph<T>&) GpuMoeSettle() Bool {
+        if g.gpu.MoeLoad.Len() == 0: return false
+        m :~ g.gpu.M!
+        if m.MoeSettle(): return true
+        for j in range g.gpu.MoeLoad.Len(): g.moeLoad(j)
+        return false
+    }
 
     # a Moe node's backward adds, one an input, marked as the CPU's Custom marks them (the gradients it gives its inputs)
     fn (g mut Graph<T>&) moeAdds(i I64) {
@@ -3473,7 +3502,7 @@ if Gpu {
         for x in range g.segs[2 * k], g.segs[2 * k + 1] {
             if not g.redo[x]: continue
             j := m.MoeOf(x) if steps[x].Do == mirror.Work.Moe else -1
-            if j >= 0: m.MoeBias(j, g.gpu.MoeBias[j])
+            if j >= 0 and not g.gpu.Capturing: m.MoeBias(j, g.gpu.MoeBias[j])
             m.Forward(steps[x], g.N, g.Pos)
         }
     }
