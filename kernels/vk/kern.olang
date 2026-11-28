@@ -80,47 +80,52 @@ fn f(x F32) U32 { return x.Bits() }
 
 # ---- the kernels, written ----
 
-# how the product is computed on a device: an invocation computes Block x Block elements of the result, a workgroup is
-# Side x Side invocations. Chunk 0: each step of the depth reads Block elements of each operand from the buffers.
-# Chunk > 0: the workgroup first copies its Side Block rows of op(A) and columns of op(B) over Chunk steps of the
-# depth into its shared memory, then every invocation computes from there - an operand's element is read from the
-# buffer once a workgroup, not once an invocation. Fused: a step's product and sum are one operation where the device
-# has one (spirv's Fma): faster on some devices, the result then the device's own rounding of each step. Without it
-# every plan gives the same bits: each element's sum is taken in the depth's order
-type Plan struct(block I64, side I64, chunk I64, fused Bool) {
-    Block I64 = block
+# how the product is computed on a device: an invocation computes Rows x Cols elements of the result, a workgroup is
+# Side x Side invocations. Chunk 0 (direct): each step of the depth reads Rows elements of op(A) and Cols of op(B)
+# from the buffers. Chunk > 0 (staged): the workgroup first copies its Side Rows rows of op(A) and Side Cols columns
+# of op(B) over Chunk steps of the depth into its shared memory, then every invocation computes from there - an
+# operand's element is read from the buffer once a workgroup, not once an invocation. Fused: a step's product and sum
+# are one operation where the device has one (spirv's Fma): faster on some devices, the result then the device's own
+# rounding of each step. Without it every plan gives the same bits: each element's sum is taken in the depth's order
+type Plan struct(rows I64, cols I64, side I64, chunk I64, fused Bool) {
+    Rows I64 = rows
+    Cols I64 = cols
     Side I64 = side
     Chunk I64 = chunk
     Fused Bool = fused
 }
 
-# the plan in words: "4x4 of 8x8, staged 16, fused"
+# the plan in words: "8x8 of 8x8, staged 16, fused"
 fn (p Plan) Str() String {
-    return $p.Block + "x" + $p.Block + " of " + $p.Side + "x" + $p.Side + (", staged " + $p.Chunk if p.Chunk > 0 else ", direct") + (", fused" if p.Fused else "")
+    return $p.Rows + "x" + $p.Cols + " of " + $p.Side + "x" + $p.Side + (", staged " + $p.Chunk if p.Chunk > 0 else ", direct") + (", fused" if p.Fused else "")
 }
 
 # whether d runs the plan: its workgroup's invocations and shared memory within the device's
 fn (p Plan) Fits(d device.Device&) Bool {
-    if p.Block < 1 or p.Side < 1 or p.Chunk < 0 or (p.Block * p.Chunk) % p.Side != 0: return false
-    return p.Side * p.Side <= d.MaxInvocations and 8 * p.Side * p.Block * p.Chunk <= d.SharedBytes
+    if p.Rows < 1 or p.Cols < 1 or p.Side < 1 or p.Chunk < 0: return false
+    if (p.Rows * p.Chunk) % p.Side != 0 or (p.Cols * p.Chunk) % p.Side != 0: return false
+    return p.Side * p.Side <= d.MaxInvocations and 4 * p.Side * (p.Rows + p.Cols) * p.Chunk <= d.SharedBytes
 }
 
-# "BLOCK,SIDE,CHUNK,FUSED" (numbers; FUSED 0 or 1) as a plan
+# "ROWS,COLS,SIDE,CHUNK,FUSED" (numbers; FUSED 0 or 1) as a plan
 fn Plan.Parse(t String&) Plan ? ParseError {
     parts := t.Split(",")
-    if parts.Len() != 4: error ParseError.Invalid
-    return Plan(try parts[0].ParseInt(), try parts[1].ParseInt(), try parts[2].ParseInt(), try parts[3].ParseInt() != 0)
+    if parts.Len() != 5: error ParseError.Invalid
+    return Plan(try parts[0].ParseInt(), try parts[1].ParseInt(), try parts[2].ParseInt(), try parts[3].ParseInt(), try parts[4].ParseInt() != 0)
 }
 
-# the plan for d: $OANN_VK_GEMM ("BLOCK,SIDE,CHUNK,FUSED") where it names one d runs, else the one measured best for
-# d's kind (docs/vulkan.md, "The product")
+# the plan of d's large products: $OANN_VK_GEMM ("ROWS,COLS,SIDE,CHUNK,FUSED") where it names one d runs, else the
+# one measured best for d's kind (docs/vulkan.md, "The product"): on a GPU 8 x 8 blocks from tiles staged 16 steps
+# at a time, on a CPU's software Vulkan 8 x 8 blocks read direct
 fn Plan.For(d device.Device&) Plan {
     env := try os.Env("OANN_VK_GEMM") catch default ""
     if env != "" {
-        p := try Plan.Parse(env) catch default Plan(0, 0, 0, false)
+        p := try Plan.Parse(env) catch default Plan(0, 0, 0, 0, false)
         if p.Fits(d): return p
     }
-    return Plan(4, 8, 0, false)
+    staged := Plan(8, 8, 8, 16, false)
+    if d.Kind == device.KindCpu or not staged.Fits(d): return Plan(8, 8, 4, 0, false)
+    return staged
 }
 
 # the 24 parameters of a product, in the dispatch's order
@@ -147,10 +152,10 @@ type gemmArgs struct(k mut spirv.Kernel&) {
     Beta spirv.Val = k.Param(spirv.Ty.F32)
 }
 
-# acc[q] takes av[q / block] bv[q % block] more, every q
+# acc[q] takes av[q / Cols] bv[q % Cols] more, every q
 fn accumulate(k mut spirv.Kernel&, p Plan, acc Vec<spirv.Var>&, av Vec<spirv.Val>&, bv Vec<spirv.Val>&) {
-    for q in range p.Block * p.Block {
-        x, y := av[q / p.Block], bv[q % p.Block]
+    for q in range p.Rows * p.Cols {
+        x, y := av[q / p.Cols], bv[q % p.Cols]
         k.Set(acc[q], k.Fma(x, y, k.Get(acc[q])) if p.Fused else k.Add(k.Get(acc[q]), k.Mul(x, y)))
     }
 }
@@ -158,9 +163,9 @@ fn accumulate(k mut spirv.Kernel&, p Plan, acc Vec<spirv.Var>&, av Vec<spirv.Val
 # the block's sums into C from row i0 and column j0, those inside the matrix: alpha acc + beta C
 fn gemmStore(k mut spirv.Kernel&, p Plan, g gemmArgs&, c spirv.Buffer, c0 spirv.Val, i0 spirv.Val, j0 spirv.Val, acc Vec<spirv.Var>&) {
     keep := k.Eq(g.Beta, k.F(0))
-    for q in range p.Block * p.Block {
-        i := k.Add(i0, k.U(q / p.Block))
-        j := k.Add(j0, k.U(q % p.Block))
+    for q in range p.Rows * p.Cols {
+        i := k.Add(i0, k.U(q / p.Cols))
+        j := k.Add(j0, k.U(q % p.Cols))
         k.If(k.And(k.Lt(i, g.M), k.Lt(j, g.N)))
         ci := k.Add(c0, k.Add(k.Mul(i, g.Ldc), j))
         k.If(keep)
@@ -172,8 +177,8 @@ fn gemmStore(k mut spirv.Kernel&, p Plan, g gemmArgs&, c spirv.Buffer, c0 spirv.
     }
 }
 
-# C = alpha op(A) op(B) + beta C over a batch by plan p: invocation (x, y, z) is the Block x Block elements of matrix
-# z from row Block y and column Block x, every element's sum taken in the depth's order
+# C = alpha op(A) op(B) + beta C over a batch by plan p: invocation (x, y, z) is the Rows x Cols elements of matrix
+# z from row Rows y and column Cols x, every element's sum taken in the depth's order
 fn gemmKernel(p Plan) spirv.Kernel {
     k := spirv.Kernel.Begin(p.Side, p.Side)
     a := k.Buffer(spirv.Ty.F32)
@@ -181,15 +186,15 @@ fn gemmKernel(p Plan) spirv.Kernel {
     c := k.Buffer(spirv.Ty.F32)
     g := gemmArgs(k)
     gx, gy, z := k.GlobalId(0), k.GlobalId(1), k.GlobalId(2)
-    j0 := k.Mul(gx, k.U(p.Block))
-    i0 := k.Mul(gy, k.U(p.Block))
+    j0 := k.Mul(gx, k.U(p.Cols))
+    i0 := k.Mul(gy, k.U(p.Rows))
     grp := k.Div(z, g.Members)
     mem := k.Mod(z, g.Members)
     a0 := k.Add(g.AOff, k.Add(k.Mul(grp, g.AGs), k.Mul(mem, g.AMs)))
     b0 := k.Add(g.BOff, k.Add(k.Mul(grp, g.BGs), k.Mul(mem, g.BMs)))
     c0 := k.Add(g.COff, k.Add(k.Mul(grp, g.CGs), k.Mul(mem, g.CMs)))
     acc := Vec<spirv.Var>()
-    for _ in range p.Block * p.Block: acc.Push(k.Let(k.F(0)))
+    for _ in range p.Rows * p.Cols: acc.Push(k.Let(k.F(0)))
     if p.Chunk > 0 {
         gemmStaged(k, p, g, a, b, a0, b0, gx, gy, acc)
     } else {
@@ -199,8 +204,8 @@ fn gemmKernel(p Plan) spirv.Kernel {
     return k
 }
 
-# the sums of the block from row i0 and column j0, each step of the depth reading Block elements of each operand for
-# Block^2 products. op(A)'s (i, s) is a0 + i lda + s, or transposed a0 + s lda + i; op(B)'s (s, j) is b0 + s ldb + j,
+# the sums of the block from row i0 and column j0, each step of the depth reading Rows elements of op(A) and Cols of
+# op(B) for Rows Cols products. op(A)'s (i, s) is a0 + i lda + s, or transposed a0 + s lda + i; op(B)'s (s, j) is b0 + s ldb + j,
 # or b0 + j ldb + s. Rows and columns past the matrix's edge read as its last (and are not stored)
 fn gemmDirect(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.Buffer, a0 spirv.Val, b0 spirv.Val, i0 spirv.Val, j0 spirv.Val, acc Vec<spirv.Var>&) {
     k.If(k.And(k.Lt(i0, g.M), k.Lt(j0, g.N)))
@@ -212,10 +217,12 @@ fn gemmDirect(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.
     lastCol := k.Sub(g.N, k.U(1))
     aBase := Vec<spirv.Val>()
     bBase := Vec<spirv.Val>()
-    for q in range p.Block {
+    for q in range p.Rows {
         i := k.Least(k.Add(i0, k.U(q)), lastRow)
-        j := k.Least(k.Add(j0, k.U(q)), lastCol)
         aBase.Push(k.Add(a0, k.Select(at, i, k.Mul(i, g.Lda))))
+    }
+    for q in range p.Cols {
+        j := k.Least(k.Add(j0, k.U(q)), lastCol)
         bBase.Push(k.Add(b0, k.Select(bt, k.Mul(j, g.Ldb), j)))
     }
     s := k.Var(spirv.Ty.U32)
@@ -224,56 +231,56 @@ fn gemmDirect(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.
     pb := k.Mul(k.Get(s), bStep)
     av := Vec<spirv.Val>()
     bv := Vec<spirv.Val>()
-    for q in range p.Block {
-        av.Push(k.Read(a, k.Add(aBase[q], pa)))
-        bv.Push(k.Read(b, k.Add(bBase[q], pb)))
-    }
+    for q in range p.Rows: av.Push(k.Read(a, k.Add(aBase[q], pa)))
+    for q in range p.Cols: bv.Push(k.Read(b, k.Add(bBase[q], pb)))
     accumulate(k, p, acc, av, bv)
     k.Next(s)
     k.EndIf()
 }
 
-# the same sums with the operands staged: the workgroup's tile is Side Block rows and columns; for each Chunk steps
-# of the depth its invocations copy the tile's rows of op(A) (row-major, Chunk a row) and columns of op(B) (a step's
-# columns together) into shared memory, meet, add the chunk's products from there, and meet again before the next
-# copy. Every invocation runs every chunk, those past the matrix's edge too (a Barrier is for all): they read the
-# last row and column and store nothing
+# the same sums with the operands staged: the workgroup's tile is Side Rows rows and Side Cols columns; for each
+# Chunk steps of the depth its invocations copy the tile's rows of op(A) (row-major, Chunk a row) and columns of op(B)
+# (a step's columns together) into shared memory, meet, add the chunk's products from there, and meet again before
+# the next copy. Every invocation runs every chunk, those past the matrix's edge too (a Barrier is for all): they read
+# the last row and column and store nothing
 fn gemmStaged(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.Buffer, a0 spirv.Val, b0 spirv.Val, gx spirv.Val, gy spirv.Val, acc Vec<spirv.Var>&) {
-    side, tile, chunk := p.Side, p.Side * p.Block, p.Chunk
-    sa := k.Shared(spirv.Ty.F32, tile * chunk)
-    sb := k.Shared(spirv.Ty.F32, tile * chunk)
+    side, tall, wide, chunk := p.Side, p.Side * p.Rows, p.Side * p.Cols, p.Chunk
+    sa := k.Shared(spirv.Ty.F32, tall * chunk)
+    sb := k.Shared(spirv.Ty.F32, wide * chunk)
     lx := k.Mod(gx, k.U(side))
     ly := k.Mod(gy, k.U(side))
     lid := k.Add(k.Mul(ly, k.U(side)), lx)
-    row0 := k.Mul(k.Sub(gy, ly), k.U(p.Block))
-    col0 := k.Mul(k.Sub(gx, lx), k.U(p.Block))
+    row0 := k.Mul(k.Sub(gy, ly), k.U(p.Rows))
+    col0 := k.Mul(k.Sub(gx, lx), k.U(p.Cols))
     at := k.Ne(g.Ta, k.U(0))
     bt := k.Ne(g.Tb, k.U(0))
     lastRow := k.Sub(g.M, k.U(1))
     lastCol := k.Sub(g.N, k.U(1))
     lastStep := k.Sub(g.Depth, k.U(1))
-    myRow := k.Mul(k.Mul(ly, k.U(p.Block)), k.U(chunk))
-    myCol := k.Mul(lx, k.U(p.Block))
+    myRow := k.Mul(k.Mul(ly, k.U(p.Rows)), k.U(chunk))
+    myCol := k.Mul(lx, k.U(p.Cols))
     s0 := k.Var(spirv.Ty.U32)
     k.Set(s0, k.U(0))
     k.Loop()
     k.While(k.Lt(k.Get(s0), g.Depth))
     from := k.Get(s0)
-    # each invocation copies tile chunk / side^2 elements of each operand, neighbours neighbouring elements
-    for e in range tile * chunk / (side * side) {
+    # each invocation copies its share of each operand's tile, neighbours what lies together in the buffer: a row's
+    # steps of A (a step's rows where transposed), a step's columns of B (a column's steps where transposed)
+    for e in range tall * chunk / (side * side) {
         at0 := k.Add(lid, k.U(e * side * side))
-        # neighbours copy what lies together in the buffer: a row's steps of A (a step's rows where transposed), a
-        # step's columns of B (a column's steps where transposed)
-        i := k.Select(at, k.Mod(at0, k.U(tile)), k.Div(at0, k.U(chunk)))
-        sA := k.Select(at, k.Div(at0, k.U(tile)), k.Mod(at0, k.U(chunk)))
+        i := k.Select(at, k.Mod(at0, k.U(tall)), k.Div(at0, k.U(chunk)))
+        sA := k.Select(at, k.Div(at0, k.U(tall)), k.Mod(at0, k.U(chunk)))
         ri := k.Least(k.Add(row0, i), lastRow)
         rs := k.Least(k.Add(from, sA), lastStep)
         k.WriteShared(sa, k.Add(k.Mul(i, k.U(chunk)), sA), k.Read(a, k.Add(a0, k.Select(at, k.Add(k.Mul(rs, g.Lda), ri), k.Add(k.Mul(ri, g.Lda), rs)))))
-        j := k.Select(bt, k.Div(at0, k.U(chunk)), k.Mod(at0, k.U(tile)))
-        sB := k.Select(bt, k.Mod(at0, k.U(chunk)), k.Div(at0, k.U(tile)))
+    }
+    for e in range wide * chunk / (side * side) {
+        at0 := k.Add(lid, k.U(e * side * side))
+        j := k.Select(bt, k.Div(at0, k.U(chunk)), k.Mod(at0, k.U(wide)))
+        sB := k.Select(bt, k.Mod(at0, k.U(chunk)), k.Div(at0, k.U(wide)))
         rj := k.Least(k.Add(col0, j), lastCol)
         rb := k.Least(k.Add(from, sB), lastStep)
-        k.WriteShared(sb, k.Add(k.Mul(sB, k.U(tile)), j), k.Read(b, k.Add(b0, k.Select(bt, k.Add(k.Mul(rj, g.Ldb), rb), k.Add(k.Mul(rb, g.Ldb), rj)))))
+        k.WriteShared(sb, k.Add(k.Mul(sB, k.U(wide)), j), k.Read(b, k.Add(b0, k.Select(bt, k.Add(k.Mul(rj, g.Ldb), rb), k.Add(k.Mul(rb, g.Ldb), rj)))))
     }
     k.Barrier()
     steps := k.Least(k.U(chunk), k.Sub(g.Depth, from))
@@ -281,10 +288,8 @@ fn gemmStaged(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.
     k.For(s, k.U(0), steps)
     av := Vec<spirv.Val>()
     bv := Vec<spirv.Val>()
-    for q in range p.Block {
-        av.Push(k.ReadShared(sa, k.Add(k.Add(myRow, k.U(q * chunk)), k.Get(s))))
-        bv.Push(k.ReadShared(sb, k.Add(k.Add(k.Mul(k.Get(s), k.U(tile)), myCol), k.U(q))))
-    }
+    for q in range p.Rows: av.Push(k.ReadShared(sa, k.Add(k.Add(myRow, k.U(q * chunk)), k.Get(s))))
+    for q in range p.Cols: bv.Push(k.ReadShared(sb, k.Add(k.Add(k.Mul(k.Get(s), k.U(wide)), myCol), k.U(q))))
     accumulate(k, p, acc, av, bv)
     k.Next(s)
     k.Barrier()
@@ -310,8 +315,7 @@ fn (p Product&) Run(d mut device.Device&, c device.DBatch<F32>&, a device.DBatch
     w := Array<U32>[u(c.Rows), u(c.Cols), u(depth), u(c.Members), u(a.Off), u(a.Ld), u(a.GroupStride), u(a.MemberStride)
         u(b.Off), u(b.Ld), u(b.GroupStride), u(b.MemberStride), u(c.Off), u(c.Ld), u(c.GroupStride), u(c.MemberStride)
         u(1 if ta else 0), u(1 if tb else 0), f(alpha), f(beta)]
-    tile := p.By.Side * p.By.Block
-    p.k.Run(d, groups(c.Cols, tile), groups(c.Rows, tile), c.Groups * c.Members, Array<U64>[a.Data.Handle(), b.Data.Handle(), c.Data.Handle()], w)
+    p.k.Run(d, groups(c.Cols, p.By.Side * p.By.Cols), groups(c.Rows, p.By.Side * p.By.Rows), c.Groups * c.Members, Array<U64>[a.Data.Handle(), b.Data.Handle(), c.Data.Handle()], w)
 }
 
 # the maps of one element: mat.Act's activations, and the affine a x + b
@@ -557,8 +561,13 @@ fn patchesKernel() spirv.Kernel {
 # ---- a device's kernels ----
 
 # every kernel of one device, made by Set.Make
-type Set unique struct(product Product, affine Kernel, relu Kernel, gelu Kernel, geluTanh Kernel, silu Kernel, sigmoid Kernel, tanh Kernel, softplus Kernel, exp Kernel, add Kernel, mul Kernel, softmax Kernel, rms Kernel, layer Kernel, gather Kernel, argmax Kernel, patches Kernel) {
-    product
+type Set unique struct(product Product, few Product, mid Product, flat Product, tall Product, one Product, affine Kernel, relu Kernel, gelu Kernel, geluTanh Kernel, silu Kernel, sigmoid Kernel, tanh Kernel, softplus Kernel, exp Kernel, add Kernel, mul Kernel, softmax Kernel, rms Kernel, layer Kernel, gather Kernel, argmax Kernel, patches Kernel) {
+    product             # the product by shape (productFor): large results
+    few                 # fewer elements than a large GPU's invocations fill
+    mid                 # a side under a staged tile's
+    flat                # under 8 rows
+    tall                # under 8 columns
+    one                 # both
     affine
     relu
     gelu
@@ -586,9 +595,19 @@ fn Kernel.of(d mut device.Device&, name String, k spirv.Kernel) Kernel ? device.
 # the kernels, each made a pipeline of d now: the first the driver refuses is the error, named
 fn Set.Make(d mut device.Device&) Set ? device.VkError { return try Set.MakeWith(d, Plan.For(d)) }
 
-# the same with the product by plan (one d runs: Plan.Fits)
+# the plan of d's results of few elements: on a discrete GPU 4 x 4 blocks of 16 x 16 invocations (more invocations
+# for the same result), else the large plan
+fn fewPlan(d device.Device&, large Plan) Plan {
+    p := Plan(4, 4, 16, 16, large.Fused)
+    if d.Kind == device.KindDiscrete and large.Chunk > 0 and p.Fits(d): return p
+    return large
+}
+
+# the same with the large products by plan (one d runs: Plan.Fits)
 fn Set.MakeWith(d mut device.Device&, plan Plan) Set ? device.VkError {
-    return Set(try Product.Make(d, plan)
+    fu := plan.Fused
+    return Set(try Product.Make(d, plan), try Product.Make(d, fewPlan(d, plan)), try Product.Make(d, Plan(plan.Rows.Min(8), plan.Cols.Min(8), 8, 0, fu))
+        try Product.Make(d, Plan(1, 8, 8, 0, fu)), try Product.Make(d, Plan(8, 1, 8, 0, fu)), try Product.Make(d, Plan(1, 1, 8, 0, fu))
         try Kernel.of(d, "affine", mapKernel(Op.Affine)), try Kernel.of(d, "relu", mapKernel(Op.Relu))
         try Kernel.of(d, "gelu", mapKernel(Op.Gelu)), try Kernel.of(d, "gelutanh", mapKernel(Op.GeluTanh))
         try Kernel.of(d, "silu", mapKernel(Op.Silu)), try Kernel.of(d, "sigmoid", mapKernel(Op.Sigmoid))
@@ -601,7 +620,20 @@ fn Set.MakeWith(d mut device.Device&, plan Plan) Set ? device.VkError {
 # c = alpha op(a) op(b) + beta c for every matrix of the batches (a, b and c of one Groups and Members; op the
 # transpose where ta, tb), kernels/gemm's GemmBatch. c is not read where beta is 0. Unchecked: the shapes agree
 fn (s Set&) GemmBatch(d mut device.Device&, c device.DBatch<F32>&, a device.DBatch<F32>&, ta Bool, b device.DBatch<F32>&, tb Bool, alpha F32 = 1, beta F32 = 0) {
-    s.product.Run(d, c, a, ta, b, tb, alpha, beta)
+    s.productFor(c.Rows, c.Cols, c.Groups * c.Members).Run(d, c, a, ta, b, tb, alpha, beta)
+}
+
+# the product for results of rows x cols, count of them. A staged plan's workgroup computes its whole tile, so a
+# result with a side under half a tile's is read direct (an invocation past the edge then does nothing), and one of
+# under 8 rows or columns in blocks of 1 along that side: no plan computes much that is not stored
+fn (s Set&) productFor(rows I64, cols I64, count I64) Product& {
+    if rows < 8 and cols < 8: return s.one
+    if rows < 8: return s.flat
+    if cols < 8: return s.tall
+    big Plan = s.product.By
+    if big.Chunk > 0 and (2 * rows < big.Side * big.Rows or 2 * cols < big.Side * big.Cols): return s.mid
+    if rows * cols * count < 512 * 512: return s.few
+    return s.product
 }
 
 # c = alpha op(a) op(b) + beta c, kernels/gemm's Gemm
@@ -813,10 +845,10 @@ test Product.Make "the product's plans - blocks, workgroups, staged operands, fu
     }
     r := rand.Rand(11)
     ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
-    plans := Array<Plan>[Plan(1, 8, 0, false), Plan(8, 4, 0, false), Plan(4, 8, 16, false), Plan(8, 8, 32, false), Plan(2, 16, 16, false), Plan(1, 8, 8, false), Plan(4, 8, 0, true), Plan(4, 8, 16, true)]
+    plans := Array<Plan>[Plan(4, 4, 8, 0, false), Plan(8, 8, 4, 0, false), Plan(4, 4, 8, 16, false), Plan(8, 8, 8, 32, false), Plan(2, 2, 16, 16, false), Plan(1, 1, 8, 8, false), Plan(2, 8, 8, 16, false), Plan(8, 1, 8, 8, false), Plan(4, 4, 8, 0, true), Plan(4, 4, 8, 16, true)]
     sizes := Array<I64>[1, 1, 1, 7, 5, 3, 33, 17, 65, 129, 65, 257, 100, 300, 70]
     a, b := randoms(131 * 77, r), randoms(77 * 67, r)
-    want := try planned(d, Plan(4, 8, 0, false), a, b, 131, 77, 67)
+    want := try planned(d, Plan(1, 1, 8, 0, false), a, b, 131, 77, 67)
     for plan in plans {
         if not plan.Fits(d): continue
         s := try Set.MakeWith(d, plan)

@@ -56,9 +56,51 @@ Vulkan and some phones) is held in runs of its rows, a dispatch each. `make vkte
 `make vkllm ARGS=MODEL_DIR` checks and times a real one.
 
 Tested on software Vulkan (Mesa's llvmpipe) and, as Windows programs, on an NVIDIA RTX 4060 and an AMD Radeon
-integrated GPU (2026-11-28: the decoder's logits within 4.8e-7 of the CPU's on both). The product there, `vkgemm`,
-GFLOPS F32 at 1024^3 and 2048^3: the RTX 4060 1024 and 1510 (another job on it), the Radeon integrated 47 and 47, the
-same machine's CPU at 4 threads 32 (a Windows build). Intel's and phones' GPUs have not seen it.
+integrated GPU (2026-11-28: the decoder's logits within 4.8e-7 of the CPU's on both). Intel's and phones' GPUs have
+not seen it.
+
+## The product
+
+`kern.Plan` says how a device computes `Gemm`: an invocation computes Rows x Cols elements of the result, a workgroup
+is Side x Side invocations, and the operands are read **direct** (each step of the depth reads Rows elements of A and
+Cols of B from the buffers) or **staged** (the workgroup first copies its tile of A's rows and B's columns, Chunk
+steps of the depth at a time, into workgroup memory - `spirv`'s `Shared` arrays - meets at a `Barrier`, and every
+invocation computes from there, so an element is read from the buffer once a workgroup). Every plan sums each element
+in the depth's order: the result's bits do not depend on the plan. A plan may also be **fused** (`Fma`: a step's
+product and sum in one operation), which a device rounds its own way; no default plan is.
+
+`bench/vktune` (`make vktune`) times 41 plans on a device. GFLOPS F32, operands resident, 2026-11-28, one PC (Ryzen
+5 7600: its two-unit Radeon integrated GPU, and an RTX 4060 with a training job on it meanwhile); the last two
+columns are a Whisper encoder's linear layers (B a transposed weight matrix):
+
+| plan | 256^3 | 1024^3 | 2048^3 | 1500 x 768 x 3072 | 1500 x 3072 x 768 |
+|---|---|---|---|---|---|
+| Radeon: 4x4 of 8x8, direct | 57 | 48 | 47 | 31 | 19 |
+| Radeon: 8x8 of 8x8, direct | 119 | 99 | 97 | 41 | 25 |
+| Radeon: 4x4 of 8x8, staged 16 | 139 | 148 | 148 | 128 | 128 |
+| Radeon: **8x8 of 8x8, staged 16** | 164 | 194 | 196 | 188 | 188 |
+| Radeon: 8x8 of 8x8, staged 16, fused | 216 | 261 | 229 | 224 | 222 |
+| 4060: 4x4 of 8x8, direct | 339 | 1604 | 1615 | 592 | 600 |
+| 4060: 4x4 of 16x16, staged 16 | 625 | 1960 | 2370 | 1756 | 2117 |
+| 4060: **8x8 of 8x8, staged 16** | 368 | 1893 | 2458 | 1908 | 2028 |
+| 4060: 8x8 of 8x8, staged 16, fused | 422 | 1991 | 2749 | 1911 | 2111 |
+
+What it says. Staging is what counts: direct reads collapse where each invocation streams its own rows of a
+transposed operand (a linear layer), and staged tiles take the Radeon from 19-47 to 188-196 and the 4060 from
+600-1615 to 1900-2460. 8 x 8 blocks beat 4 x 4 (fewer reads a product); chunks of 8 and 16 steps tie and 32 loses;
+16 x 16 workgroups gain only on small results on the 4060. Fusing gives 5-20% and is left off: the product then
+keeps the CPU's arithmetic. cuBLAS on the same 4060 does 3283 and 3530 at 1024^3 and 2048^3 (`kernels/gpu`).
+
+`Plan.For(d)` is the large products' plan: 8x8 of 8x8 staged 16 on a GPU, 8x8 of 4x4 direct on software Vulkan
+(llvmpipe: 35 against 26 for 4 x 4 blocks at 512^3; a barrier there is a coroutine switch). `OANN_VK_GEMM=
+ROWS,COLS,SIDE,CHUNK,FUSED` names another. A `Set` picks by the result's shape, since a staged workgroup computes
+its whole tile: a result with a side under half a tile is read direct in 8 x 8 blocks, one under 8 rows or columns in
+blocks of 1 along that side (a decoder step's one row), and on a discrete GPU a result under 512^2 elements takes 4x4
+of 16x16 staged.
+
+An integrated GPU against its CPU: the same Ryzen's CPU does about 100 GFLOPS a thread and 320-380 at 4 threads
+(AVX-512), so this two-unit Radeon at 190 does not beat it; integrated GPUs of 8-12 units (laptops' Radeon 680M and
+780M) have 4-6 times its arithmetic, and no such chip has been measured.
 
 ## Whisper on it
 
@@ -77,13 +119,13 @@ cost a dispatch decides the decoder.
 
 ## What comes next
 
-1. **A faster product.** An invocation computes a 4 x 4 block of the result, reading four elements of each operand a
-   step of the depth for sixteen products (5x the one-element form on llvmpipe; `make vkgemm`). Next, measured on real
-   GPUs first: tiles of the operands staged in workgroup memory, and the block's size by device.
+1. **The product on more devices**: the plans are measured on one Radeon and one NVIDIA card ("The product"); an
+   Intel integrated GPU and a larger Radeon want `make vktune`'s table before their plan is trusted. Fused steps and
+   `Plan.For` by vendor follow from those.
 2. **Whisper, tuned on real GPUs** (first: transcription on an office laptop's integrated GPU): it runs (above);
-   what it wants next is the product's tiles of item 1 and its weights packed as item 4 says.
-3. **LLM decoding, tuned on real GPUs**: the decoder runs (above); its product (`llm_row`, `llm_rows`) wants the
-   tiles item 1 finds, the norm and the softmax are one invocation a row and want a parallel sum, and sampling could
+   what it wants next is its weights packed as item 4 says, and times on a real GPU.
+3. **LLM decoding, tuned on real GPUs**: the decoder runs (above); its product (`llm_row`, `llm_rows`) wants
+   plans measured as the product's were, the norm and the softmax are one invocation a row and want a parallel sum, and sampling could
    stay on the device (the logits come down every step). `device.Backend.Vulkan` in `kernels/device` once plans run
    there.
 4. **Packed BF16 elsewhere**: llm/vk's two-to-a-word BF16 (no device feature needed) for Whisper's weights and the
