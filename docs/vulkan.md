@@ -126,7 +126,8 @@ integrated GPU (8x4 of 16x4 from 16 rows) and 4x4 of 8x8 direct on a discrete on
 A driver gives up on a submission that runs for seconds (Windows resets a device after two: `VK_ERROR_DEVICE_LOST`),
 and an integrated GPU takes that long over a Whisper encoder recorded whole. `Device.Spend` counts the arithmetic the
 products record and runs what is recorded once it passes `Device.Budget` (2e9 operations on an integrated GPU, 32e9
-on a discrete one, no limit on software Vulkan), so a program need not `Sync` by the clock. `OANN_VK_TRACE=1` runs
+on a discrete one, no limit on software Vulkan), and every dispatch counts a share of it (a run of 8 kernels on an
+integrated GPU, 512 on a discrete one), so a program need not `Sync` by the clock. `OANN_VK_TRACE=1` runs
 every kernel as it is recorded and names the first that fails.
 
 ## Whisper on it

@@ -82,7 +82,8 @@ fn Devices() Vec<String> {
 # workgroups a dispatch takes along an axis, MaxInvocations the most invocations a workgroup holds, SharedBytes a
 # workgroup's shared memory. Budget: a GPU's driver gives up on a submission that runs for seconds (Windows resets the
 # device after two), so what is recorded runs once Spend has counted this much arithmetic - a fraction of a second's
-# on the slowest plan - not only at Sync. h is the shim's handle, 0 after Close
+# on the slowest plan - not only at Sync; every dispatch counts Each, so a run of kernels that are no products (a
+# softmax over long rows, a norm) ends too: after 8 on an integrated GPU, 512 on a discrete one. h is the shim's handle, 0 after Close
 type Device unique struct() {
     Name String = ""
     Kind I64 = 0
@@ -95,6 +96,7 @@ type Device unique struct() {
     MaxInvocations I64 = 0
     SharedBytes I64 = 0
     Budget F64 = 0      # the arithmetic (operations) recorded before it is run unasked; 0: no limit
+    Each F64 = 0        # what any kernel's dispatch counts toward it, whatever it computes
     work F64 = 0        # recorded since it last ran
     h U64 = 0
 } destruct {
@@ -124,6 +126,7 @@ fn Device.Open(index I64 = -1) Device ? VkError {
     d.MiB, d.MaxBufMiB, d.MaxGroups = I64(info[4]), I64(info[5]), I64(info[6])
     d.MaxInvocations, d.SharedBytes = I64(info[7]), I64(info[8])
     d.Budget = 0.0 if d.Kind == KindCpu else 32e9 if d.Kind == KindDiscrete else 2e9
+    d.Each = d.Budget / (512.0 if d.Kind == KindDiscrete else 8.0)
     return d
 }
 
