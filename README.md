@@ -34,7 +34,8 @@ device.SetDefault(device.Backend.Gpu if device.GpuAvailable() else device.Backen
 
 That GPU is NVIDIA's (CUDA, cuBLAS). Other cards - AMD, Intel, integrated GPUs, anything with a Vulkan driver - are
 reached through the Vulkan backend, `kernels/vk` (docs/vulkan.md, `-define Vulkan=true`): the products and the kernels a
-transformer's inference needs, called directly, not yet through `device.SetDefault`. It is there but lightly tested -
+transformer's inference needs, called directly, not yet through `device.SetDefault`, and open-weight language models
+decoding on it (`oann-gen --device vulkan`, llm/README.md). It is there but lightly tested -
 checked on software Vulkan, hardly on real hardware - so expect bugs.
 
 Other modules the same way: `github.com/osarv/oann/nn/optim`, `.../ad/graph`, `.../models/gpt`, `.../dyn/system`.
@@ -153,6 +154,7 @@ make test                          # every module's tests, takes minutes
 make gputest                       # the GPU backend's tests (CUDA, cuBLAS; -define Gpu=true), skipped without a device
 make vktest                        # the Vulkan backend's tests (any GPU, or software Vulkan), skipped without a device
 make vkgemm ARGS="5"               # the product on the Vulkan device against the CPU
+make vkllm ARGS="MODEL_DIR 64 1 8" # a language model's decoding on the Vulkan device against the CPU, then tokens a second
 make gpusettle ARGS="5 10 20 4"    # the settle and a lesson on the GPU against the CPU at batch 32, 128, 512
 make gpulearn ARGS="5 3"           # G-M2: mnist_learn's epochs CPU against GPU, batch 32-512, hidden 128 and 1024
 make mnist ARGS="10 adamw 1 1"     # an example or benchmark built and run with ARGS (data, cnn, int8, lmbench, board, ...)

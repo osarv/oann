@@ -45,6 +45,16 @@ with the causal mask, `RmsNorm`, `LayerNorm`, `Gather` (an embedding's rows), `A
 kernel a transformer decoder's inference and Whisper's encoder and decoder need, F32. `make vktest` checks each against the CPU's kernels and runs a small decoder's forward
 pass on the device against the CPU (logits within 1e-6 on lavapipe).
 
+**LLM decoding** (`llm/vk.olang`, `oann-gen --device vulkan`): `llm/gpu`'s decoder on this backend - the weights and
+the paged key-value cache on the device, rotary positions, QK-norm, grouped heads, biases, a tied or separate head -
+for the dense decoders (Qwen3, Qwen2, Llama, Mistral, Granite, SmolLM3, Phi). Its ten kernels are its own, written with
+`spirv.Kernel` in llm/vk.olang (llm/README.md, "On a Vulkan device"). BF16 without half floats: the weights and the
+cache are BF16 held two to a 32-bit word, taken apart with a shift in the kernel (`Bits`, `FromBits`), so the memory is
+half of F32's on every device, with no `shaderFloat16` or 16-bit storage asked for, and the logits are the CPU's to
+BF16's own rounding. A matrix larger than the device binds as one buffer (`maxStorageBufferRange`: 128 MiB on software
+Vulkan and some phones) is held in runs of its rows, a dispatch each. `make vktest` checks it on tiny models;
+`make vkllm ARGS=MODEL_DIR` checks and times a real one.
+
 Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
 
 ## What comes next
@@ -56,9 +66,12 @@ Tested on software Vulkan (Mesa's llvmpipe). Real GPUs have seen little of it.
    with their arrays on the device - `Patches` and `Gemm` for the two convolutions, `Map` GELU, `LayerNorm`, `GemmBatch`
    and `Softmax` for the attention, the decoder's key and value cache as device buffers - behind a device choice in
    speech/transcribe, checked against the CPU's logits.
-3. **LLM decoding on it**: `llm/gpu`'s decoder (the paged cache, rotary positions, QK-norm) on `kernels/vk`, and
-   `device.Backend.Vulkan` in `kernels/device` once plans run there.
-4. **Half precision** where the device has `shaderFloat16` and 16-bit storage (BF16 has no Vulkan form: F16).
+3. **LLM decoding, tuned on real GPUs**: the decoder runs (above); its product (`llm_row`, `llm_rows`) wants the
+   tiles item 1 finds, the norm and the softmax are one invocation a row and want a parallel sum, and sampling could
+   stay on the device (the logits come down every step). `device.Backend.Vulkan` in `kernels/device` once plans run
+   there.
+4. **Packed BF16 elsewhere**: llm/vk's two-to-a-word BF16 (no device feature needed) for Whisper's weights and the
+   general product; F16 where a device has `shaderFloat16` and 16-bit storage only if it measures faster.
 5. **Training**: ad/mirror's backward kernels and AdamW, kernel by kernel.
 6. **Windows and Android builds** of the shim (the loader's name is already chosen per target), and a Metal backend
    for Apple.

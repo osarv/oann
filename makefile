@@ -22,6 +22,8 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers
 # nothing translates a CUDA header and everything builds for the CPU alone. GPU=0 leaves it out on a machine that has them
 GPUDEFINE = $(if $(filter 0,$(GPU)),,$(if $(wildcard /usr/include/cuda_runtime_api.h),-define Gpu=true,))
+# -define Vulkan=true where Vulkan's headers are (libvulkan-dev): what builds kernels/vk into a program (VK=0: never)
+VKDEFINE = $(if $(filter 0,$(VK)),,$(if $(wildcard /usr/include/vulkan/vulkan.h),-define Vulkan=true,))
 
 # the GPU backend's tests: the CPU's tests run green either way (they plan on the CPU); these need the define
 GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang ad/gpu_test.olang llm/gpu.olang
@@ -33,7 +35,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help vktest vkgemm diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help vktest vkgemm vkllm diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -54,9 +56,15 @@ gputest:
 # the Vulkan backend's tests (docs/vulkan.md), any GPU with a Vulkan driver - AMD, Intel, NVIDIA, a CPU's software Vulkan
 # (Mesa's lavapipe) - against the CPU kernels: -define Vulkan=true, which needs Vulkan's headers (libvulkan-dev) alone;
 # each test says it is skipped where there is no Vulkan device. OANN_VK_DEVICE=N picks one of several
-VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang
+VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang llm/vk.olang
 vktest:
 	$(OLANG) test -define Vulkan=true $(VKTESTS)
+
+# a language model's decoding on a Vulkan device (llm/vk) checked against the CPU's step, then tokens a second by batch
+# (bench/vkllm.olang) - ARGS: MODEL_DIR [steps] [batch ...]
+vkllm:
+	$(OLANG) build -define Vulkan=true -output build/bench_vkllm bench/vkllm.olang
+	./build/bench_vkllm $(ARGS)
 
 # GEMM GFLOPS of kernels/gemm (1 and 4 threads) against the Vulkan device's product, operands resident, medians
 # (bench/vkgemm.olang) - ARGS: rounds
@@ -200,7 +208,7 @@ oannlisten:
 # oann-gen: completions of a JSON-lines file of prompts by an open-weight model (llm/gen.olang, llm/README.md), built
 # to build/oann-gen - ARGS: MODEL prompts.jsonl out.jsonl and its flags (none: only builds it)
 oanngen:
-	$(OLANG) build $(GPUDEFINE) -output build/oann-gen llm/gen.olang
+	$(OLANG) build $(GPUDEFINE) $(VKDEFINE) -output build/oann-gen llm/gen.olang
 	$(if $(ARGS),./build/oann-gen $(ARGS),)
 
 # Whisper's real-time factor (bench/speech.olang) - ARGS: MODEL_DIR CLIP.wav [rounds] [threads ...]
