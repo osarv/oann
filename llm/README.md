@@ -253,6 +253,11 @@ Llama 3.2 1B and Granite 3.3 2B (8% for SmolLM2-135M), and greedy answers stay t
 (Gemma 3 1B's first answer token does, as PyTorch quantizing it the same way also gives). A GGUF file's own 4-bit
 weights are requantized into this layout, not kept as they are.
 
+Reading a prompt with 4- or 8-bit weights widens them to BF16 once a step: a step of 64 rows or more widens each block
+of 32 outputs whole and multiplies once. Llama 3.2 1B reads 2048 tokens at about 400 a second in INT4, as in BF16
+(it was 348); Phi-4-mini 1024 at 161 in INT4 against 177 in BF16. `bench/llm.olang` prints the reading speed;
+`OANN_CHUNK` sets its rows a step (256; 1024 saves widening but costs as much in attention).
+
 **Long contexts.** Tokens a second at 2048, 4096 and 8192 positions (BF16 weights; "-" where weights and cache do not
 fit in 15 GB):
 

@@ -1,7 +1,7 @@
 # decoding speed of an open-weight model (llm/model) on this machine: tokens a second at each batch size, every
 # sequence of the batch given a context of ctx positions first (random tokens, read 256 rows a step), then "steps"
 # steps of one token each timed - and where a step's time goes (the products, attention, the rest) and the process's
-# peak resident memory. Arguments: the model's directory, the context (512), the steps (16), "int8" or "int4" for 8- or 4-bit weights,
+# peak resident memory, and how fast the contexts were read. Arguments: the model's directory, the context (512), the steps (16), "int8" or "int4" for 8- or 4-bit weights,
 # then the batch sizes (1 16 64); OANN_KV8 set: 8-bit keys and values
 
 import "std/os"
@@ -41,29 +41,33 @@ fn main() {
     per := (ctx + steps) / model.PageSize + 1
     kv8 := (try os.Env("OANN_KV8") catch default "").Len() > 0
     k := model.Cache(m.C, top * per, top, per, Kv8 = kv8)
-    s := model.State(m, top + 256, top, ctx + steps + model.PageSize)
+    chunk I64 = (try os.Env("OANN_CHUNK") catch default "256").ParseInt()!     # context rows a step
+    s := model.State(m, top + chunk, top, ctx + steps + model.PageSize)
     for batch in batches.View() {
         for i in range top * per {
             if k.Table[i] >= 0: k.Give(k.Table[i])
             k.Table[i] = -1
         }
         for i in range batch * per: k.Table[i] = k.Take()
-        # the contexts, 256 rows a step
+        # the contexts, chunk rows a step
         rows := Vec<I64>()
         for b in range batch {
             for p in range ctx: rows.Push(b * ctx + p)
         }
         # (OANN_NOFILL: the cache's pages left as they are - the timing is the same, the logits meaningless)
         fill := (try os.Env("OANN_NOFILL") catch default "").Len() == 0
-        for r0 in range 0, rows.Len() if fill else 0, 256 {
+        for i in range 4: s.Times[i] = 0
+        t2 := time.Now()
+        for r0 in range 0, rows.Len() if fill else 0, chunk {
             s.Reset()
-            for j in range r0, (r0 + 256).Min(rows.Len()) {
+            for j in range r0, (r0 + chunk).Min(rows.Len()) {
                 b := rows[j] / ctx
                 p := rows[j] % ctx
                 s.Add(I32((p * 7919 + b * 131) % m.C.Vocab), p, b, false)
             }
             m.Step(s, k)
         }
+        if fill: Println("batch " + $batch + ": read " + $rows.Len() + " context tokens in " + (F64(time.Since(t2)) / 1e9).Fixed(2) + " s, " + (F64(rows.Len()) / F64(time.Since(t2)) * 1e9).Fixed(0) + " a second (products " + (F64(s.Times[0]) / 1e9).Fixed(2) + " s)")
         for i in range 4: s.Times[i] = 0
         t1 := time.Now()
         for t in range steps {

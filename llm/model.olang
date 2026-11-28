@@ -1063,49 +1063,57 @@ fn mmBlocks(dst mut Array<F32>&, x Array<BF16>&, w Linear&, rp I64, b0 I64, b1 I
         for r in range rp {
             for j in range w.Nb: dst[r * w.Out + c0 + j] = 0.0
         }
-        if w.Int8 {
-            # widened 512 deep at a time, into the L1 cache, and added from there (a batch of many rows: the whole
-            # block at once, its C tiles loaded once)
-            step := 512
-            row := 2 * w.Nb
-            ng := w.In / w.Group
-            for k0 in range 0, w.In, step {
-                depth := (w.In - k0).Min(step)
-                o := b * span + k0 * w.Nb
-                for p in range depth / 2 {
-                    k := k0 + 2 * p
-                    if k % w.Group == 0 {
-                        g := k / w.Group
-                        for n in range w.Nb {
-                            v := w.Scale[(c0 + n) * ng + g]
-                            sc[2 * n] = v
-                            sc[2 * n + 1] = v
-                        }
-                    }
-                    q := o + p * row
-                    d := p * row
-                    for j in range row {
-                        bits := (F32(w.Q[q + j]) * sc[j]).Bits()
-                        deq[d + j] = BF16.FromBits(U16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16))
-                    }
-                }
-                stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:depth * w.Nb])!
-            }
-        } else if w.Int4 {
-            # widened 512 deep at a time, as 8-bit weights are
-            for k0 in range 0, w.In, 512 {
-                depth := (w.In - k0).Min(512)
-                widen4(w, c0, k0, depth, deq, sc)
-                stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:depth * w.Nb])!
-            }
-        } else {
+        if not w.Int8 and not w.Int4 {
             stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x, w.In, w.In, w.W[b * span:(b + 1) * span])!
+            continue
         }
+        # widened 512 deep at a time into the L1 cache and added from there; a step of many rows widens the whole
+        # block first and multiplies once, its C tiles loaded once and the widening spread over more rows
+        if rp >= Whole and w.In * w.Nb <= deq.Len() {
+            for k0 in range 0, w.In, 512: widenBlock(w, b, k0, (w.In - k0).Min(512), deq[k0 * w.Nb:], sc)
+            stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x, w.In, w.In, deq[:w.In * w.Nb])!
+            continue
+        }
+        for k0 in range 0, w.In, 512 {
+            depth := (w.In - k0).Min(512)
+            widenBlock(w, b, k0, depth, deq, sc)
+            stdtile.AddDot(dst[c0:], w.Out, rp, w.Nb, x[k0:], w.In, depth, deq[:depth * w.Nb])!
+        }
+    }
+}
+
+# inputs k0 .. k0 + depth of block b's outputs widened to BF16 into deq in AddDot's pair layout
+fn widenBlock(w Linear&, b I64, k0 I64, depth I64, deq mut Array<BF16>&, sc mut Array<F32>&) {
+    if w.Int4 {
+        widen4(w, b * w.Nb, k0, depth, deq, sc)
+        return
+    }
+    # 8 bits: each times its group's scale and rounded to nearest, even (the scales of a pair row in sc)
+    c0 := b * w.Nb
+    row := 2 * w.Nb
+    ng := w.In / w.Group
+    o := b * w.In * w.Nb + k0 * w.Nb
+    for p in range depth / 2 {
+        k := k0 + 2 * p
+        if k % w.Group == 0 {
+            g := k / w.Group
+            for n in range w.Nb {
+                v := w.Scale[(c0 + n) * ng + g]
+                sc[2 * n] = v
+                sc[2 * n + 1] = v
+            }
+        }
+        q := o + p * row
+        d := p * row
+        for j in range row: deq[d + j] = rne(F32(w.Q[q + j]) * sc[j])
     }
 }
 
 # the rows a product of 4-bit weights takes by byte dots (decoding); more are widened to BF16 for AddDot
 Gemv4 I64 = 16
+
+# the rows from which a step widens a block's 4-bit weights whole before multiplying
+Whole I64 = 64
 
 # the rows a product of 8-bit weights takes by byte dots; more are widened (the reordering costs more than widening)
 Gemv8 I64 = 4
@@ -1241,46 +1249,49 @@ fn gemv4one(dst mut Array<F32>&, w Linear&, b0 I64, b1 I64, qx Array<U8>&, xs Ar
 }
 
 # inputs k0 .. k0 + depth of outputs c0 .. c0 + Nb of 4-bit W widened to BF16 into deq in AddDot's pair layout (input
-# 2 p + s of output n at p 2 Nb + 2 n + s); sc holds a group's 16 scales
+# 2 p + s of output n at p 2 Nb + 2 n + s); sc holds a group's scales and offsets, one a byte
 fn widen4(w Linear&, c0 I64, k0 I64, depth I64, deq mut Array<BF16>&, sc mut Array<F32>&) {
     ng := w.In / 32
     row := 2 * w.Nb
     sc4 :~ sc[:64]
-    f :~ sc[64:128]
-    mc4 :~ sc[128:192]
-    tb := tile4()
+    mc4 :~ sc[64:128]
+    tb := Array<BF16>(128)
     for sb in range w.Nb / 16 {
         cb := c0 / 16 + sb
         for g in range k0 / 32, (k0 + depth) / 32 {
             o := (cb * ng + g) * 256
             a4 := (cb * ng + g) * 16
             for j in range 64 {
-                sc4[j] = F32(w.D4[a4 + j / 4])
-                mc4[j] = F32(w.M4[a4 + j / 4])
+                d := F32(w.D4[a4 + j / 4])
+                sc4[j] = d
+                mc4[j] = F32(w.M4[a4 + j / 4]) - 8.0 * d
             }
-            for half in range 8 {
-                c := half / 2
+            # byte 64 c + 4 n + t: input 8 c + t of output n in its low half, 8 c + 4 + t in its high one; each four
+            # inputs of an output go to two pair rows
+            for c in range 4 {
                 q :~ w.Q4[o + 64 * c:o + 64 * c + 64]
-                if half % 2 == 0 {
-                    for j in range 64: f[j] = sc4[j] * F32(I32(q[j] & 15) - 8) + mc4[j]
-                } else {
-                    for j in range 64: f[j] = sc4[j] * F32(I32(q[j] >> 4) - 8) + mc4[j]
-                }
                 for j in range 64 {
-                    bits := f[j].Bits()
-                    tb.b[j] = BF16.FromBits(U16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16))
+                    tb[j] = rne(sc4[j] * F32(I32(q[j] & 15)) + mc4[j])
+                    tb[64 + j] = rne(sc4[j] * F32(I32(q[j] >> 4)) + mc4[j])
                 }
-                p0 := (32 * g + 4 * half - k0) / 2      # this quad's first pair: outputs' inputs 0, 1 there, 2, 3 next
-                at := p0 * row + 32 * sb
-                for n in range 16 {
-                    deq[at + 2 * n] = tb.b[4 * n]
-                    deq[at + 2 * n + 1] = tb.b[4 * n + 1]
-                    deq[at + row + 2 * n] = tb.b[4 * n + 2]
-                    deq[at + row + 2 * n + 1] = tb.b[4 * n + 3]
+                for h in range 2 {
+                    at := (32 * g + 8 * c + 4 * h - k0) / 2 * row + 32 * sb
+                    for n in range 16 {
+                        deq[at + 2 * n] = tb[64 * h + 4 * n]
+                        deq[at + 2 * n + 1] = tb[64 * h + 4 * n + 1]
+                        deq[at + row + 2 * n] = tb[64 * h + 4 * n + 2]
+                        deq[at + row + 2 * n + 1] = tb[64 * h + 4 * n + 3]
+                    }
                 }
             }
         }
     }
+}
+
+# x rounded to BF16, to nearest, even
+fn rne(x F32) BF16 {
+    bits := x.Bits()
+    return BF16.FromBits(U16((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16))
 }
 
 # gemv4's registers: a chunk's weights unpacked, the rows' I32 sums
@@ -2365,7 +2376,7 @@ test Linear "4- and 8-bit products by byte dots and by widening agree with the w
                 else: w.put8(o, g0, row, g0)
             }
         }
-        for rows in [1, 5, 20] {
+        for rows in [1, 3, 5, 20, 70] {
             rp := roundUp(rows, 16)
             x := Array<BF16>(rp * w.In)
             xf := Array<F32>(rows * w.In)
@@ -2394,3 +2405,4 @@ test Linear "4- and 8-bit products by byte dots and by widening agree with the w
         }
     }
 }
+
