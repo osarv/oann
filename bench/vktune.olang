@@ -3,7 +3,9 @@
 # for every plan that is not fused), and timed on each shape with the operands resident - products recorded back to
 # back for about 0.3 s, one Sync at the end, the best of the rounds. What it prints is what Plan.For is set from.
 # Arguments: rounds (3), then shapes as M K N triples (default: 256^3, 1024^3, 2048^3); a Whisper encoder's two
-# linear layers, B a transposed weight matrix, are always timed.
+# linear layers, B a transposed weight matrix, are always timed. "large" after the rounds times the large results'
+# plans instead: the staged ones, from 64 x 64 to 128 x 128 tiles, each in the plain and the grouped orders (Plan's
+# Group), on results larger than the device's cache (default shapes: 1024^3, 2048^3, 4096 x 1024 x 4096, 4096^3).
 #
 # From the repository's root: make vktune ARGS="3"; OANN_VK_DEVICE=N picks the device (the bench lists them)
 
@@ -85,15 +87,32 @@ fn plans() Vec<kern.Plan> {
     return ps
 }
 
+# the staged plans of large results, each tile in the plain order and grouped by 4, 8 and 16 tile rows
+fn largePlans() Vec<kern.Plan> {
+    ps := Vec<kern.Plan>()
+    tiles := Array<kern.Plan>[kern.Plan(8, 8, 8, 16, false), kern.Plan(8, 8, 8, 8, false), kern.Plan(4, 4, 16, 16, false), kern.Plan(8, 8, 16, 8, false), kern.Plan(8, 8, 16, 16, false), kern.Plan(8, 4, 16, 16, false)]
+    for t in tiles {
+        for group in Array<I64>[0, 4, 8, 16]: ps.Push(kern.Plan(t.Rows, t.Cols, t.Side, t.Chunk, false, group))
+    }
+    ps.Push(kern.Plan(8, 8, 8, 16, true, 8))
+    ps.Push(kern.Plan(8, 8, 16, 16, true, 8))
+    return ps
+}
+
 fn main() ? io.Error, ParseError, device.VkError {
     args :~ os.Args()
     rounds I64 = 3
     if args.Len() > 1: rounds = try args[1].ParseInt()
+    large := args.Len() > 2 and args[2] == "large"
     shapes := Vec<I64>()
-    for i in range 2, args.Len(): shapes.Push(try args[i].ParseInt())
+    for i in range (3 if large else 2), args.Len(): shapes.Push(try args[i].ParseInt())
     if shapes.Len() == 0 or shapes.Len() % 3 != 0 {
         shapes.Truncate(0)
-        shapes.PushAll(Array<I64>[256, 256, 256, 1024, 1024, 1024, 2048, 2048, 2048])
+        if large {
+            shapes.PushAll(Array<I64>[1024, 1024, 1024, 2048, 2048, 2048, 4096, 1024, 4096, 4096, 4096, 4096])
+        } else {
+            shapes.PushAll(Array<I64>[256, 256, 256, 1024, 1024, 1024, 2048, 2048, 2048])
+        }
     }
     names := device.Devices()
     for i in range names.Len(): try io.Put("Vulkan device " + $i + ": " + names[i] + "\n")
@@ -106,7 +125,7 @@ fn main() ? io.Error, ParseError, device.VkError {
     try io.Put(" | 1500 x 768 x 3072, B transposed | 1500 x 3072 x 768, B transposed\n")
     a, b := randoms(301 * 129, r), randoms(129 * 257, r)
     want := Array<F32>(0)
-    for plan in plans().View() {
+    for plan in (largePlans() if large else plans()).View() {
         if not plan.Fits(d) {
             try io.Put(plan.Str() + " | more than the device's workgroups hold\n")
             continue

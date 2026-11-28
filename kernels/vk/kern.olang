@@ -96,32 +96,38 @@ fn f(x F32) U32 { return x.Bits() }
 # of op(B) over Chunk steps of the depth into its shared memory, then every invocation computes from there - an
 # operand's element is read from the buffer once a workgroup, not once an invocation. Fused: a step's product and sum
 # are one operation where the device has one (spirv's Fma): faster on some devices, the result then the device's own
-# rounding of each step. Without it every plan gives the same bits: each element's sum is taken in the depth's order
-type Plan struct(rows I64, cols I64, side I64, chunk I64, fused Bool) {
+# rounding of each step. Without it every plan gives the same bits: each element's sum is taken in the depth's order.
+# Group > 0 (grouped): the workgroups take the result's tiles in bands of Group rows of tiles, down each band's
+# columns before across, so the workgroups running at once share Group tile rows of op(A) and few columns of op(B) and
+# find them in the device's cache; 0 takes the tiles row by row, every workgroup of a tile row reading all of op(B).
+# The order changes no sum
+type Plan struct(rows I64, cols I64, side I64, chunk I64, fused Bool, group I64 = 0) {
     Rows I64 = rows
     Cols I64 = cols
     Side I64 = side
     Chunk I64 = chunk
     Fused Bool = fused
+    Group I64 = group
 }
 
-# the plan in words: "8x8 of 8x8, staged 16, fused"
+# the plan in words: "8x8 of 8x8, staged 16, grouped 8, fused"
 fn (p Plan) Str() String {
-    return $p.Rows + "x" + $p.Cols + " of " + $p.Side + "x" + $p.Side + (", staged " + $p.Chunk if p.Chunk > 0 else ", direct") + (", fused" if p.Fused else "")
+    return $p.Rows + "x" + $p.Cols + " of " + $p.Side + "x" + $p.Side + (", staged " + $p.Chunk if p.Chunk > 0 else ", direct") + (", grouped " + $p.Group if p.Group > 0 else "") + (", fused" if p.Fused else "")
 }
 
 # whether d runs the plan: its workgroup's invocations and shared memory within the device's
 fn (p Plan) Fits(d device.Device&) Bool {
-    if p.Rows < 1 or p.Cols < 1 or p.Side < 1 or p.Chunk < 0: return false
+    if p.Rows < 1 or p.Cols < 1 or p.Side < 1 or p.Chunk < 0 or p.Group < 0: return false
     if (p.Rows * p.Chunk) % p.Side != 0 or (p.Cols * p.Chunk) % p.Side != 0: return false
     return p.Side * p.Side <= d.MaxInvocations and 4 * p.Side * (p.Rows + p.Cols) * p.Chunk <= d.SharedBytes
 }
 
-# "ROWS,COLS,SIDE,CHUNK,FUSED" (numbers; FUSED 0 or 1) as a plan
+# "ROWS,COLS,SIDE,CHUNK,FUSED[,GROUP]" (numbers; FUSED 0 or 1) as a plan
 fn Plan.Parse(t String&) Plan ? ParseError {
     parts := t.Split(",")
-    if parts.Len() != 5: error ParseError.Invalid
-    return Plan(try parts[0].ParseInt(), try parts[1].ParseInt(), try parts[2].ParseInt(), try parts[3].ParseInt(), try parts[4].ParseInt() != 0)
+    if parts.Len() != 5 and parts.Len() != 6: error ParseError.Invalid
+    group := try parts[5].ParseInt() if parts.Len() == 6 else 0
+    return Plan(try parts[0].ParseInt(), try parts[1].ParseInt(), try parts[2].ParseInt(), try parts[3].ParseInt(), try parts[4].ParseInt() != 0, group)
 }
 
 # the plan of d's large products: $OANN_VK_GEMM ("ROWS,COLS,SIDE,CHUNK,FUSED") where it names one d runs, else the
@@ -195,7 +201,8 @@ fn gemmKernel(p Plan) spirv.Kernel {
     b := k.Buffer(spirv.Ty.F32)
     c := k.Buffer(spirv.Ty.F32)
     g := gemmArgs(k)
-    gx, gy, z := k.GlobalId(0), k.GlobalId(1), k.GlobalId(2)
+    gx, gy := grouped(k, p, g, k.GlobalId(0), k.GlobalId(1))
+    z := k.GlobalId(2)
     j0 := k.Mul(gx, k.U(p.Cols))
     i0 := k.Mul(gy, k.U(p.Rows))
     grp := k.Div(z, g.Members)
@@ -212,6 +219,26 @@ fn gemmKernel(p Plan) spirv.Kernel {
     }
     gemmStore(k, p, g, c, c0, i0, j0, acc)
     return k
+}
+
+# the invocation's place (gx, gy) as the plan's order has it (unchanged where Group is 0): the workgroups counted row by row take the tiles down
+# bands of Group tile rows (the last band what is left), column by column within a band; its place in the workgroup
+# stays
+fn grouped(k mut spirv.Kernel&, p Plan, g gemmArgs&, gx spirv.Val, gy spirv.Val) spirv.Val, spirv.Val {
+    if p.Group == 0: return gx, gy
+    side := k.U(p.Side)
+    wide, tall := k.U(p.Side * p.Cols), k.U(p.Side * p.Rows)
+    across := k.Div(k.Add(g.N, k.Sub(wide, k.U(1))), wide)
+    down := k.Div(k.Add(g.M, k.Sub(tall, k.U(1))), tall)
+    lx, ly := k.Mod(gx, side), k.Mod(gy, side)
+    n := k.Add(k.Mul(k.Div(gy, side), across), k.Div(gx, side))
+    band := k.Mul(k.U(p.Group), across)
+    first := k.Mul(k.Div(n, band), k.U(p.Group))
+    rows := k.Least(k.Sub(down, first), k.U(p.Group))
+    at := k.Mod(n, band)
+    ty := k.Add(first, k.Mod(at, rows))
+    tx := k.Div(at, rows)
+    return k.Add(k.Mul(tx, side), lx), k.Add(k.Mul(ty, side), ly)
 }
 
 # the sums of the block from row i0 and column j0, each step of the depth reading Rows elements of op(A) and Cols of
@@ -856,7 +883,7 @@ test Product.Make "the product's plans - blocks, workgroups, staged operands, fu
     }
     r := rand.Rand(11)
     ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
-    plans := Array<Plan>[Plan(4, 4, 8, 0, false), Plan(8, 8, 4, 0, false), Plan(4, 4, 8, 16, false), Plan(8, 8, 8, 32, false), Plan(2, 2, 16, 16, false), Plan(1, 1, 8, 8, false), Plan(2, 8, 8, 16, false), Plan(8, 1, 8, 8, false), Plan(4, 4, 8, 0, true), Plan(4, 4, 8, 16, true)]
+    plans := Array<Plan>[Plan(4, 4, 8, 0, false), Plan(8, 8, 4, 0, false), Plan(4, 4, 8, 16, false), Plan(8, 8, 8, 32, false), Plan(2, 2, 16, 16, false), Plan(1, 1, 8, 8, false), Plan(2, 8, 8, 16, false), Plan(8, 1, 8, 8, false), Plan(4, 4, 8, 0, true), Plan(4, 4, 8, 16, true), Plan(4, 4, 8, 16, false, 3), Plan(2, 2, 8, 0, false, 2), Plan(2, 2, 8, 16, false, 4)]
     sizes := Array<I64>[1, 1, 1, 7, 5, 3, 33, 17, 65, 129, 65, 257, 100, 300, 70]
     a, b := randoms(131 * 77, r), randoms(77 * 67, r)
     want := try planned(d, Plan(1, 1, 8, 0, false), a, b, 131, 77, 67)
