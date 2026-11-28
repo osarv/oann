@@ -6,7 +6,7 @@
 # device (BF16 activations): the largest difference of any logit, the largest logit, and whether every greedy token
 # agrees. The speed: for each batch (default 1 8 32 64), `steps` steps (default 256) of one token a sequence from
 # position 0, every row's logits brought down - tokens a second over all of them, and over the last quarter (the
-# longest contexts). Built with -define Gpu=true (make gpullm).
+# longest contexts), and where a step at the last position spends its time. Built with -define Gpu=true (make gpullm).
 
 import gdev "../kernels/gpu/device"
 import "../llm/gpu"
@@ -94,6 +94,13 @@ fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&) ?
         tail := F64(time.Since(late)) / 1e9
         Println("batch " + $b + ": " + (F64(b * steps) / all).Fixed(1) + " tokens/s over " + $steps + " steps (" + (all * 1000.0 / F64(steps)).Fixed(1) + " ms a step); " +
             (F64(b * (steps - from)) / tail).Fixed(1) + " tokens/s at positions " + $from + " to " + $steps)
+        # where a step at the last position goes: the same step again, waiting after each part
+        dec.Profile = true
+        for i in range 4: s.Times[i] = 0
+        for _ in range 4: try dec.Step(m, s, k)
+        dec.Profile = false
+        Println("    a step at position " + $(steps - 1) + ": products " + (F64(s.Times[0]) / 4e6).Fixed(1) + " ms, attention and the heads " + (F64(s.Times[1]) / 4e6).Fixed(1) +
+            " ms, the rest (norms, adds, uploads, the logits down) " + (F64(s.Times[2]) / 4e6).Fixed(1) + " ms")
     }
 }
 

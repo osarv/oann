@@ -60,6 +60,7 @@ fn Refusal(m model.Model&) String {
     if c.Experts > 0: return "a mixture of experts"
     if c.PostNorms or c.Gelu: return "Gemma's post-norms and GELU"
     if c.QkWide: return "OLMoE's QK-norm over whole rows"
+    if c.Heads / c.KvHeads > 8: return "more than 8 query heads to a key-value head"
     for li in range c.Layers {
         if c.WindowOf(li) > 0: return "sliding-window layers"
     }
@@ -133,6 +134,8 @@ type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I6
     byRows mut Vec<plans>& = Vec<plans>()   # index: rows / Round
     byOuts mut Vec<headPlan>& = Vec<headPlan>()
     Bytes I64 = 0       # device memory held
+    Profile Bool = false    # waits after each part of a step, so s.Times says where the time goes (slower): products, attention, the rest, steps
+    mark I64 = 0
 }
 
 # m on dev, for an engine's State (rows a step, outs sequences) and its Cache (made with device = true): the buffers
@@ -160,7 +163,7 @@ fn Decoder.Make(dev mut gdev.Device&, m model.Model&, rows I64, outs I64, cache 
         try gdev.Buf<BF16>.Make(dev, rp * widest), try gdev.Buf<F32>.Make(dev, rp * (2 * f).Max(d).Max(w3)), try gdev.Buf<BF16>.Make(dev, rp * heads * dh)
         try gdev.Buf<F32>.Make(dev, rows * heads * cap), try gdev.Buf<F32>.Make(dev, op * m.Head.Out), try gdev.Buf<I32>.Make(dev, nints)
         try gdev.Buf<F32>.Make(dev, 2 * rows * half))
-    dec.Bytes = 2 * total + 4 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * cap + 4 * op * m.Head.Out
+    dec.Bytes = 2 * total + 2 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * cap + 4 * op * m.Head.Out
     # the weights, each at a multiple of Align
     at I64 = 0
     for i in range nw {
@@ -229,6 +232,16 @@ fn (dec mut Decoder&) product(p blas.Product<F32, BF16, BF16>&, i I64, w model.L
     if dec.gAt[bi] >= 0: dec.elems(KBias, n * w.Out, dec.y.Addr(0), dec.gainAddr(bi), kern.Arg(n), kern.Arg(w.Out))
 }
 
+# Profile: what was enqueued since the last lap has run; its time goes to s.Times[part]
+fn (dec mut Decoder&) lap(s mut model.State&, part I64) ? gdev.GpuError {
+    if not dec.Profile: return
+    d := dec.dev
+    try d.Sync()
+    now := time.Now()
+    s.Times[part] += now - dec.mark
+    dec.mark = now
+}
+
 # kernel k over n elements, a grid-stride launch
 fn (dec mut Decoder&) elems(k I64, n I64, args ...U64) {
     if n <= 0: return
@@ -282,22 +295,29 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
     rs := kern.Arg(F32(c.ResScale))
     eps := kern.Arg(c.Eps)
     ps :~ dec.byRows[rp / Round]
+    dec.mark = t0
     for li in range c.Layers {
         l :~ m.Layers[li]
         gi := 8 * li
         layerPages := kern.Arg(li * dec.Pages)
         dec.blocks(KNorm, n, kern.Block, hb, x, dec.gainAddr(gi), U64(0), kern.Arg(d), eps)
+        try dec.lap(s, 2)
         dec.product(ps.qkv, 4 * li, l.Qkv, rp, n, gi + 4)
+        try dec.lap(s, 0)
         dec.blocks(KHeads, n * hc, HeadBlock, q, dec.k.Addr(0), dec.v.Addr(0), y, cs, sn, pos, slot, table, dec.gainAddr(gi + 2), dec.gainAddr(gi + 3)
             kern.Arg(heads), kern.Arg(kv), kern.Arg(dh), kern.Arg(half), layerPages, kern.Arg(dec.maxPages), kern.Arg(I64(1 if c.Rotates(li) else 0)), eps)
-        dec.blocks(KAttend, n * heads, HeadBlock, hb, q, dec.k.Addr(0), dec.v.Addr(0), dec.scores.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
+        dec.blocks(KAttend, n * kv, HeadBlock, hb, q, dec.k.Addr(0), dec.v.Addr(0), dec.scores.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
             kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.cap), kern.Arg(F32(c.Scale())))
+        try dec.lap(s, 1)
         dec.product(ps.o, 4 * li + 1, l.O, rp, n, gi + 5)
+        try dec.lap(s, 0)
         dec.elems(KAdd, n * d, x, y, kern.Arg(n * d), rs)
         dec.blocks(KNorm, n, kern.Block, hb, x, dec.gainAddr(gi + 1), U64(0), kern.Arg(d), eps)
+        try dec.lap(s, 2)
         dec.product(ps.gateUp, 4 * li + 2, l.GateUp, rp, n, gi + 6)
         dec.elems(KSwiglu, n * f, hb, y, kern.Arg(n), kern.Arg(f))
         dec.product(ps.down, 4 * li + 3, l.Down, rp, n, gi + 7)
+        try dec.lap(s, 0)
         dec.elems(KAdd, n * d, x, y, kern.Arg(n * d), rs)
     }
     # the final norm of the rows that want logits, gathered in order, and the head
@@ -313,7 +333,9 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
             hp.made = true
         }
         dec.blocks(KNorm, no, kern.Block, hb, x, dec.gainAddr(8 * c.Layers), outs, kern.Arg(d), eps)
+        try dec.lap(s, 2)
         dec.byOuts[op / Round].p.Run(dev, lg, gdev.DMat<BF16>(dec.hb, 0, op, d, d), head)
+        try dec.lap(s, 0)
         if c.LogitScale != 1.0: dec.elems(KScale, no * hw, dec.logits.Addr(0), kern.Arg(no * hw), kern.Arg(F32(1.0 / c.LogitScale)))
         if hw == c.Vocab {
             dec.logits.Download(s.Logits, 0, 0, no * hw)
@@ -322,6 +344,7 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
         }
     }
     try dev.Sync()
+    if dec.Profile: s.Times[2] += time.Now() - dec.mark
     s.Times[3] += time.Since(t0)
 }
 
