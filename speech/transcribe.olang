@@ -25,6 +25,54 @@ import "../llm/bpe"
 import "mel"
 import "whisper"
 
+# ---- where the model runs ----
+
+# the CPU; a Vulkan device (any GPU with a Vulkan driver: speech/whispervk) for the encoder and the decoder; or the
+# device for the encoder alone, its positions brought back for the decoder on the CPU (the encoder is most of the
+# arithmetic; a decoder's step of one row is small products, which a device may not run faster than the CPU)
+type Backend enum { Cpu, Vulkan, VulkanEncoder }
+
+type BackendError error {
+    Unavailable(why String)     # this build has no Vulkan, the machine no device, the model's weights are not F32, or the device has not the room
+}
+
+# -define Vulkan=true builds the device in (it needs Vulkan's headers alone, and runs where there is no Vulkan)
+Vulkan Bool = false
+
+if Vulkan {
+    import "whispervk"
+    import vdev "../kernels/vk/device"
+
+    # a process's one model on a device
+    theDev mut vdev.Device?& = null
+    theRun mut whispervk.Runner?& = null
+
+    fn VulkanAvailable() Bool { return vdev.Devices().Len() > 0 }
+
+    # m on the device OANN_VK_DEVICE names, else the best one here; the device's description
+    fn devOpen(m whisper.Model&, slots I64, rows I64, outs I64) String ? BackendError {
+        why := whispervk.Refusal(m)
+        if why != "": error BackendError.Unavailable(why)
+        if theRun is not null: error BackendError.Unavailable("a model is on the device already (one a process)")
+        theDev ~ try vdev.Device.Open() catch e { error BackendError.Unavailable($e) }
+        theRun ~ try whispervk.Runner.Make(theDev!, m, slots, rows, outs) catch e { error BackendError.Unavailable($e + " (the model takes " + $(whispervk.Needs(m, slots, rows, outs) >> 20) + " MiB of device memory)") }
+        return theDev!.Str()
+    }
+    fn devEncode(spec Array<F32>&, n I64) { theRun!.Encode(spec, n) }
+    fn devEncoded(host mut Array<F32>&) { theRun!.Encoded(host)! }
+    fn devCross() { theRun!.Cross() }
+    fn devCopy(from I64, to I64, n I64) { theRun!.Copy(from, to, n) }
+    fn devStep(k mut whisper.Decoder&, out I64) { theRun!.Step(k, out)! }
+} else {
+    fn VulkanAvailable() Bool { return false }
+    fn devOpen(m whisper.Model&, slots I64, rows I64, outs I64) String ? BackendError { error BackendError.Unavailable("built without -define Vulkan=true") }
+    fn devEncode(spec Array<F32>&, n I64) { }
+    fn devEncoded(host mut Array<F32>&) { }
+    fn devCross() { }
+    fn devCopy(from I64, to I64, n I64) { }
+    fn devStep(k mut whisper.Decoder&, out I64) { }
+}
+
 # ---- the tokens ----
 
 type Tokens struct(Bpe bpe.Bpe) {
@@ -137,12 +185,14 @@ type Segment struct(Start F64, End F64, Text String) {
 
 # ---- a model ready to transcribe ----
 
-type Whisper struct(M whisper.Model, T Tokens, beams I64 = 5) {
+type Whisper struct(M whisper.Model, T Tokens, beams I64 = 5, where Backend = Backend.Cpu) {
     M
     T
+    Where Backend = where                       # set by LoadOn alone: the device holds the model
+    Device String = ""                        # the device's description, where there is one
     Mel mut mel.Mel& = mel.Mel(M.C.Mels, 1000, M.Threads)
-    Enc mut whisper.Encoder& = whisper.Encoder(M, M.C.Positions)
-    Dec mut whisper.Decoder& = whisper.Decoder(M, 2 * beams, beams.Max(M.C.Text / 2 + 4), beams)
+    Enc mut whisper.Encoder& = whisper.Encoder(M, M.C.Positions if where != Backend.Vulkan else 1)
+    Dec mut whisper.Decoder& = whisper.Decoder(M, 2 * beams, beams.Max(M.C.Text / 2 + 4), beams, where != Backend.Vulkan)
     Language I32 = -1                         # the last window's language token
     logp mut Array<F32>& = Array<F32>(M.C.Vocab)
 }
@@ -164,11 +214,49 @@ fn Whisper.Load(dir String&, bf Bool = false, beams I64 = 5, threads I64 = 0, q8
     return Whisper(m, t, beams.Max(1))
 }
 
+# the model and tokens in dir with its products at `where` (F32 weights): BackendError.Unavailable saying why where the
+# device cannot take it - the caller loads on the CPU then. One model a process may be on a device
+fn Whisper.LoadOn(dir String&, where Backend, beams I64 = 5, threads I64 = 0) Whisper ? whisper.ModelError, os.Error, BackendError {
+    if where == Backend.Cpu: return try Whisper.Load(dir, false, beams, threads)
+    m := try whisper.Model.Load(dir)
+    if threads > 0: m.Threads = threads
+    t := try Tokens.Load(dir)
+    nb := beams.Max(1)
+    name := try devOpen(m, 2 * nb if where == Backend.Vulkan else 0, nb.Max(m.C.Text / 2 + 4) if where == Backend.Vulkan else 0, nb if where == Backend.Vulkan else 0)
+    if where == Backend.Vulkan: m.Forget()
+    w := Whisper(m, t, nb, where)
+    w.Device = name
+    return w
+}
+
+# the step being made run where the model is, and a beam's cache copied there
+fn (w mut Whisper&) step(out I64) {
+    if w.Where == Backend.Vulkan {
+        devStep(w.Dec, out)
+        return
+    }
+    w.M.Step(w.Dec, out)
+}
+
+fn (w mut Whisper&) copy(from I64, to I64, n I64) {
+    if w.Where == Backend.Vulkan {
+        devCopy(from, to, n)
+        return
+    }
+    w.Dec.Copy(from, to, n, w.M.C)
+}
+
 # the window of a clip's log-mel (mel.Clip's, `frames` long) from frame seek, `take` frames of it and zeros after, n
 # positions (2n frames), encoded and crossed to
 fn (w mut Whisper&) Window(clip Array<F32>&, frames I64, seek I64 = 0, take I64 = 3000, n I64 = 1500) {
     spec := mel.Slice(clip, w.M.C.Mels, frames, seek, take, 2 * n)
-    w.M.Encode(w.Enc, spec, n)
+    if w.Where == Backend.Cpu: w.M.Encode(w.Enc, spec, n)
+    if w.Where != Backend.Cpu: devEncode(spec, n)
+    if w.Where == Backend.Vulkan {
+        devCross()
+        return
+    }
+    if w.Where == Backend.VulkanEncoder: devEncoded(w.Enc.Out)
     w.M.Cross(w.Dec, w.Enc.Out, n)
 }
 
@@ -185,7 +273,7 @@ fn (w mut Whisper&) Detect() I32 {
     if w.T.Langs.Len() == 0: return -1
     w.Dec.Reset()
     w.Dec.Add(w.T.Sot, 0, 0)
-    w.M.Step(w.Dec, 1)
+    w.step(1)
     best := w.T.Langs[0]
     for l in w.T.Langs {
         if w.Dec.Logits[I64(l)] > w.Dec.Logits[I64(best)]: best = l
@@ -272,7 +360,7 @@ fn (w mut Whisper&) Decode(prompt Array<I32>&, o Options&) Array<I32> {
     k :~ w.Dec
     k.Reset()
     for i, t in prompt: k.Add(t, I64(i), 0)
-    w.M.Step(k, 1)
+    w.step(1)
     gen := Vec<I32>()
     limit := o.MaxTokens.Min(w.M.C.Text - prompt.Len())
     for gen.Len() < limit {
@@ -292,7 +380,7 @@ fn (w mut Whisper&) Decode(prompt Array<I32>&, o Options&) Array<I32> {
         }
         k.Reset()
         k.Add(I32(best), I64(prompt.Len() + gen.Len() - 1), 0)
-        w.M.Step(k, 1)
+        w.step(1)
     }
     return gen.ToArray()
 }
@@ -326,8 +414,8 @@ fn (w mut Whisper&) beam(prompt Array<I32>&, o Options&) Array<I32> {
     k :~ w.Dec
     k.Reset()
     for i, t in prompt: k.Add(t, I64(i), 0)
-    w.M.Step(k, 1)
-    for b in range 1, nb: k.Copy(0, b, pl, w.M.C)
+    w.step(1)
+    for b in range 1, nb: w.copy(0, b, pl)
     # every beam's logits are the prompt's at first
     # the running beams' tokens: beam b's step tokens at b limit
     run := Array<I32>(nb * limit)
@@ -379,13 +467,13 @@ fn (w mut Whisper&) beam(prompt Array<I32>&, o Options&) Array<I32> {
         other := nb - half
         k.Reset()
         for b in range nb {
-            k.Copy(half + from[b], other + b, pl + step, w.M.C)
+            w.copy(half + from[b], other + b, pl + step)
             k.Add(next[b * limit + step], I64(pl + step), other + b)
             rows[b] = b
         }
         half = other
         run, next ~ next, run
-        w.M.Step(k, nb)
+        w.step(nb)
     }
     best I64 = 0
     for i in range doneScore.Len() {

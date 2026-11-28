@@ -477,25 +477,49 @@ fn (s Set&) mapOf(op Op) Kernel& {
     }
 }
 
+# the elements one dispatch of a kernel along a line takes on d (its workgroups an axis are bounded): a longer array
+# goes in runs of this many, a multiple of `period`
+fn most(d device.Device&, period I64 = 1) I64 {
+    top := d.MaxGroups * Line
+    return top if period >= top else top / period * period
+}
+
 # y[yOff + i] = op(x[xOff + i]) for i < n; x and y may be one buffer at one offset (in place)
 fn (s Set&) Map(d mut device.Device&, op Op, y device.Buf<F32>&, yOff I64, x device.Buf<F32>&, xOff I64, n I64) {
-    s.mapOf(op).Run(d, groups(n, Line), 1, 1, Array<U64>[x.Handle(), y.Handle()], Array<U32>[u(n), u(xOff), u(yOff), f(1), f(0)])
+    for at in range 0, n, most(d) {
+        m := most(d).Min(n - at)
+        s.mapOf(op).Run(d, groups(m, Line), 1, 1, Array<U64>[x.Handle(), y.Handle()], Array<U32>[u(m), u(xOff + at), u(yOff + at), f(1), f(0)])
+    }
 }
 
 # y[yOff + i] = a x[xOff + i] + b for i < n
 fn (s Set&) Affine(d mut device.Device&, y device.Buf<F32>&, yOff I64, x device.Buf<F32>&, xOff I64, n I64, a F32, b F32 = 0) {
-    s.affine.Run(d, groups(n, Line), 1, 1, Array<U64>[x.Handle(), y.Handle()], Array<U32>[u(n), u(xOff), u(yOff), f(a), f(b)])
+    for at in range 0, n, most(d) {
+        m := most(d).Min(n - at)
+        s.affine.Run(d, groups(m, Line), 1, 1, Array<U64>[x.Handle(), y.Handle()], Array<U32>[u(m), u(xOff + at), u(yOff + at), f(a), f(b)])
+    }
+}
+
+# the zip kernel k over n elements: z = x (+ or *) y, y repeating every period (0: no repeat), in runs a dispatch takes
+fn (s Set&) zip(d mut device.Device&, k Kernel&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, a F32, period I64) {
+    repeat := period > 0 and period < n
+    assert not repeat or period <= d.MaxGroups * Line, "a period longer than one dispatch takes: " + $period
+    step := most(d, period if repeat else 1)
+    for at in range 0, n, step {
+        m := step.Min(n - at)
+        k.Run(d, groups(m, Line), 1, 1, Array<U64>[x.Handle(), y.Handle(), z.Handle()], Array<U32>[u(m), u(xOff + at), u(yOff if repeat else yOff + at), u(zOff + at), u(period if repeat else m.Max(1)), f(a)])
+    }
 }
 
 # z[zOff + i] = x[xOff + i] + a y[yOff + i mod period] for i < n: a sum (a 1), a difference (a -1), and with period a
 # row's length, a bias added to every row. period 0 is n (no repeat). z may be x
 fn (s Set&) Add(d mut device.Device&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, a F32 = 1, period I64 = 0) {
-    s.add.Run(d, groups(n, Line), 1, 1, Array<U64>[x.Handle(), y.Handle(), z.Handle()], Array<U32>[u(n), u(xOff), u(yOff), u(zOff), u(period if period > 0 else n.Max(1)), f(a)])
+    s.zip(d, s.add, z, zOff, x, xOff, y, yOff, n, a, period)
 }
 
 # z[zOff + i] = x[xOff + i] y[yOff + i mod period] for i < n
 fn (s Set&) Mul(d mut device.Device&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, period I64 = 0) {
-    s.mul.Run(d, groups(n, Line), 1, 1, Array<U64>[x.Handle(), y.Handle(), z.Handle()], Array<U32>[u(n), u(xOff), u(yOff), u(zOff), u(period if period > 0 else n.Max(1)), f(0)])
+    s.zip(d, s.mul, z, zOff, x, xOff, y, yOff, n, 0, period)
 }
 
 # y's rows are the softmax of scale times x's rows. With causal T, the rows are positions in runs of T (attention's
@@ -844,5 +868,35 @@ test Set.Patches "a convolution's patches as speech/whisper makes them: width 3 
                 assert c2[i * 3 * dim + ch * 3 + k] == (xs[j * dim + ch] if j >= 0 and j < t else F32(0.0)), "the second's (" + $i + ", " + $ch + ", " + $k + ")"
             }
         }
+    }
+}
+
+test Set.Add "arrays longer than one dispatch's workgroups take: a map in place, a sum, and a bias repeated over rows, exact against the host" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("long arrays")
+        return
+    }
+    s := try Set.Make(d)
+    period I64 = 7
+    n := (d.MaxGroups * Line / period + 3) * period + 5
+    x := Array<F32>[F32((i * 7919) % 1001 - 500) for i in range n]
+    y := Array<F32>[F32((i * 104729) % 601 - 300) for i in range n]
+    bx device.Buf<F32> = try onDevice(d, x)
+    by device.Buf<F32> = try onDevice(d, y)
+    bz := try device.Buf<F32>.Make(d, n)
+    relu, sum, rows := Array<F32>(n), Array<F32>(n), Array<F32>(n)
+    s.Add(d, bz, 0, bx, 0, by, 0, n)
+    bz.DownloadAll(sum)
+    try d.Sync()
+    s.Add(d, bz, 0, bx, 0, by, 2, n, 1, period)
+    bz.DownloadAll(rows)
+    try d.Sync()
+    s.Map(d, Op.Relu, bx, 0, bx, 0, n)
+    bx.DownloadAll(relu)
+    try d.Sync()
+    for i in range n {
+        assert sum[i] == x[i] + y[i], "the sum at " + $i
+        assert rows[i] == x[i] + y[2 + i % period], "the bias at " + $i
+        assert relu[i] == x[i].Max(0.0), "the map at " + $i
     }
 }

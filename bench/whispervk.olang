@@ -1,0 +1,118 @@
+# Whisper on a Vulkan device against the CPU (docs/vulkan.md, speech/whispervk): the encoder over 30 s (1500
+# positions) and a greedy decoder step (one row, a few tens of positions into its sequence), each timed on the CPU
+# (speech/whisper, every core) and on the device (weights and cache resident, one Sync a step), the median of the
+# rounds; then what a 30 s window of 100 tokens takes each way: all on the CPU, the encoder on the device and the
+# decoder on the CPU, and all on the device. The model is a shape with random weights (no files; the time does not
+# depend on the weights), or a model's directory.
+#
+# From the repository's root: make whispervk ARGS="small 3" - a shape (tiny, base, small, medium, large) or a
+# directory, then the rounds (3). OANN_VK_DEVICE=N picks the device (the bench lists them).
+
+import "std/io"
+import "std/os"
+import "std/time"
+import "../kernels/vk/device"
+import "../speech/whisper"
+import "../speech/whispervk"
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn shape(name String&) whisper.Config ? os.Error {
+    dims := match name {
+        case "tiny": [384, 4, 6]
+        case "base": [512, 6, 8]
+        case "small": [768, 12, 12]
+        case "medium": [1024, 24, 16]
+        case "large": [1280, 32, 20]
+        case _: [0, 0, 0]
+    }
+    if dims[0] == 0: error os.Error.NotFound(name)
+    c := whisper.Config()
+    c.Dim, c.EncLayers, c.EncHeads, c.DecLayers, c.DecHeads = dims[0], dims[1], dims[2], dims[1], dims[2]
+    c.Ffn, c.Vocab, c.Mels, c.Positions, c.Text = 4 * dims[0], 51865, 80, 1500, 448
+    return c
+}
+
+fn secs(t I64) F64 { return F64(time.Since(t)) / 1e9 }
+
+# Steps greedy steps from position at: seconds a step, on the CPU (r null) or the device
+Steps I64 = 16
+
+fn stepsCpu(m whisper.Model&, k mut whisper.Decoder&, at I64) F64 {
+    t0 := time.Now()
+    for p in range at, at + Steps {
+        k.Reset()
+        k.Add(I32(100 + 37 * p), p, 0)
+        m.Step(k, 1)
+    }
+    return secs(t0) / F64(Steps)
+}
+
+fn stepsDev(r mut whispervk.Runner&, k mut whisper.Decoder&, at I64) F64 ? device.VkError {
+    t0 := time.Now()
+    for p in range at, at + Steps {
+        k.Reset()
+        k.Add(I32(100 + 37 * p), p, 0)
+        try r.Step(k, 1)
+    }
+    return secs(t0) / F64(Steps)
+}
+
+fn main() ? io.Error, ParseError, device.VkError, os.Error, whisper.ModelError {
+    args :~ os.Args()
+    if args.Len() < 2 {
+        try io.Put("usage: bench_whispervk SHAPE|DIR [ROUNDS]\n")
+        return
+    }
+    rounds I64 = 3
+    if args.Len() > 2: rounds = try args[2].ParseInt()
+    names := device.Devices()
+    for i in range names.Len(): try io.Put("Vulkan device " + $i + ": " + names[i] + "\n")
+    d := try device.Device.Open()
+    m := (try whisper.Model.Load(args[1])) if os.IsDir(args[1]) else whisper.Model.Random(try shape(args[1]))
+    c := m.C
+    n := c.Positions
+    try io.Put("on " + d.Str() + "; CPU on " + $m.Threads + " threads\n" + args[1] + ": " + $(m.Params() / 1000000) + " M parameters, " + $(whispervk.Needs(m, 1, 8, 1) >> 20) + " MiB on the device\n")
+    t0 := time.Now()
+    r := try whispervk.Runner.Make(d, m, 1, 8, 1)
+    try io.Put("weights sent and kernels compiled in " + secs(t0).Fixed(2) + " s\n")
+    e := whisper.Encoder(m, n)
+    k := whisper.Decoder(m, 1, 8, 1)
+    kd := whisper.Decoder(m, 1, 8, 1, false)
+    spec := Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.001 for i in range c.Mels * 2 * n]
+    got := Array<F32>(n * c.Dim)
+    encCpu, encDev, stepCpu, stepDev := Array<F64>(rounds), Array<F64>(rounds), Array<F64>(rounds), Array<F64>(rounds)
+    worst F64 = 0
+    for round in range rounds {
+        t0 = time.Now()
+        m.Encode(e, spec, n)
+        encCpu[round] = secs(t0)
+        t0 = time.Now()
+        r.Encode(spec, n)
+        try r.Encoded(got)
+        encDev[round] = secs(t0)
+        m.Cross(k, e.Out, n)
+        r.Cross()
+        # a prompt of 4, untimed, then steps from position 4 + 16 round
+        k.Reset()
+        kd.Reset()
+        for i in range 4 {
+            k.Add(I32(50257 + i), i, 0)
+            kd.Add(I32(50257 + i), i, 0)
+        }
+        m.Step(k, 1)
+        try r.Step(kd, 1)
+        stepCpu[round] = stepsCpu(m, k, 4)
+        stepDev[round] = try stepsDev(r, kd, 4)
+        for i in range c.Vocab: worst = worst.Max((F64(k.Logits[i]) - F64(kd.Logits[i])).Abs())
+    }
+    ec, ed, sc, sd := median(encCpu), median(encDev), median(stepCpu), median(stepDev)
+    try io.Put("\nlogits within " + $worst + " of the CPU's\n\n| | CPU | Vulkan | CPU / Vulkan |\n|---|---|---|---|\n")
+    try io.Put("| encoder, 30 s | " + ec.Fixed(3) + " s | " + ed.Fixed(3) + " s | " + (ec / ed).Fixed(2) + "x |\n")
+    try io.Put("| decoder, a greedy step | " + (sc * 1000.0).Fixed(2) + " ms | " + (sd * 1000.0).Fixed(2) + " ms | " + (sc / sd).Fixed(2) + "x |\n")
+    all, mixed, dev := ec + 100.0 * sc, ed + 100.0 * sc, ed + 100.0 * sd
+    try io.Put("\na 30 s window of 100 tokens: " + all.Fixed(2) + " s on the CPU, " + mixed.Fixed(2) + " s with the encoder on the device, " + dev.Fixed(2) + " s all on the device\n")
+}

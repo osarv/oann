@@ -155,6 +155,7 @@ make gputest                       # the GPU backend's tests (CUDA, cuBLAS; -def
 make vktest                        # the Vulkan backend's tests (any GPU, or software Vulkan), skipped without a device
 make vkgemm ARGS="5"               # the product on the Vulkan device against the CPU
 make vkllm ARGS="MODEL_DIR 64 1 8" # a language model's decoding on the Vulkan device against the CPU, then tokens a second
+make whispervk ARGS="small 3"      # Whisper's encoder and a decoder step on the Vulkan device against the CPU
 make gpusettle ARGS="5 10 20 4"    # the settle and a lesson on the GPU against the CPU at batch 32, 128, 512
 make gpulearn ARGS="5 3"           # G-M2: mnist_learn's epochs CPU against GPU, batch 32-512, hidden 128 and 1024
 make mnist ARGS="10 adamw 1 1"     # an example or benchmark built and run with ARGS (data, cnn, int8, lmbench, board, ...)

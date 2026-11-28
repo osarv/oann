@@ -106,6 +106,12 @@ fn assistant(w mut transcribe.Whisper&, o transcribe.Options&, wake String&, thr
     }
 }
 
+# the model in dir, on the CPU (BF16 or INT8 where asked) or with its products on a device
+fn load(dir String&, where transcribe.Backend, name String&, bf Bool, beams I64, threads I64, q8 Bool) transcribe.Whisper {
+    if where == transcribe.Backend.Cpu: return try transcribe.Whisper.Load(dir, bf, beams, threads, q8) catch { fail("cannot load the model in " + dir) }
+    return try transcribe.Whisper.LoadOn(dir, where, beams, threads) catch transcribe.BackendError e { fail("--device " + name + ": " + $e) } catch { fail("cannot load the model in " + dir) }
+}
+
 fn main() {
     p := flags.Flags("oann-listen", "the text of CLIP.wav (or of standard input's sound, \"-\") by the Whisper model MODEL")
     timed := p.Bool("timestamps", 't', "a line a segment, with its start and end")
@@ -115,6 +121,8 @@ fn main() {
     bf16 := p.Bool("bf16", 0, "BF16 weights (AMX products where the CPU has them): half the memory")
     int8 := p.Bool("int8", 0, "INT8 decoder weights (a quarter of the bytes a token reads: faster where memory is the limit, e.g. a Pi 4)")
     threads := p.Int("threads", 'j', 0, "threads (default: every core)")
+    device := p.Text("device", 0, "cpu", "where the products run: cpu, vulkan (any GPU with a Vulkan driver; a build with -define Vulkan=true) or vulkan-encoder (the encoder there, the decoder on the CPU)")
+    took := p.Bool("time", 0, "the seconds taken, to standard error")
     positions := p.Int("positions", 0, 1500, "the encoder's positions (fewer: a shorter window, faster, not the reference)")
     maxTokens := p.Int("max-tokens", 0, 224, "tokens a 30 s window may have")
     wake := p.Text("wake", 'w', "", "with \"-\": wait for this wake word (kws safetensors) before each utterance")
@@ -131,7 +139,15 @@ fn main() {
     args := p.Args()
     if args.Len() != 2: fail("usage: oann-listen MODEL CLIP.wav|- [flags] (--help)")
     dir := modelDir(args[0])
-    w := try transcribe.Whisper.Load(dir, bf16.Get(), beams.Get().Max(1), threads.Get(), int8.Get()) catch { fail("cannot load the model in " + dir) }
+    where := match device.Get() {
+        case "cpu": transcribe.Backend.Cpu
+        case "vulkan": transcribe.Backend.Vulkan
+        case "vulkan-encoder": transcribe.Backend.VulkanEncoder
+        case _: fail("--device is cpu, vulkan or vulkan-encoder")
+    }
+    w := load(dir, where, device.Get(), bf16.Get(), beams.Get().Max(1), threads.Get(), int8.Get())
+    if w.Device != "": say("on " + w.Device)
+    t0 := time.Now()
     o := transcribe.Options()
     o.Language = lang.Get()
     o.Translate = translate.Get()
@@ -145,9 +161,7 @@ fn main() {
         return
     }
     x := try mel.Wav(args[1]) catch { fail("cannot read " + args[1] + " (a 16-bit PCM WAVE file)") }
-    if timed.Get() or x.Len() > 30 * mel.Rate {
-        print(w.Transcribe(x, o), timed.Get())
-        return
-    }
-    Println(w.Text(x, o).Trim())
+    if timed.Get() or x.Len() > 30 * mel.Rate: print(w.Transcribe(x, o), timed.Get())
+    else: Println(w.Text(x, o).Trim())
+    if took.Get(): say((F64(time.Since(t0)) / 1e9).Fixed(2) + " s for " + (F64(x.Len()) / F64(mel.Rate)).Fixed(1) + " s of sound")
 }
