@@ -33,7 +33,7 @@ Gpu Bool = false
 assert Gpu, "llm/gpu is the GPU's and is built only with -define Gpu=true: import it under if Gpu { ... }"
 
 LlmText := String(embed "../kernels/gpu/src/llm.cu")
-Names Array<String>& = ["llm_embed", "llm_norm", "llm_heads", "llm_attend", "llm_add", "llm_swiglu", "llm_bias", "llm_scale"]
+Names Array<String>& = ["llm_embed", "llm_norm", "llm_heads", "llm_attend", "llm_add", "llm_swiglu", "llm_bias", "llm_scale", "llm_combine"]
 KEmbed I64 = 0
 KNorm I64 = 1
 KHeads I64 = 2
@@ -42,6 +42,7 @@ KAdd I64 = 4
 KSwiglu I64 = 5
 KBias I64 = 6
 KScale I64 = 7
+KCombine I64 = 8
 
 # the rows a product is planned for: a step's, rounded up
 Round I64 = 8
@@ -61,6 +62,7 @@ fn Refusal(m model.Model&) String {
     if c.PostNorms or c.Gelu: return "Gemma's post-norms and GELU"
     if c.QkWide: return "OLMoE's QK-norm over whole rows"
     if c.Heads / c.KvHeads > 8: return "more than 8 query heads to a key-value head"
+    if c.HeadDim > 256: return "heads wider than 256"
     for li in range c.Layers {
         if c.WindowOf(li) > 0: return "sliding-window layers"
     }
@@ -106,7 +108,7 @@ type headPlan unique struct(dev gdev.Device&) {
 }
 
 # a model on the device, for steps of at most rows rows, outs of them wanting logits, over a cache of these pages
-type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I64, slots I64, maxPages I64, pages I64, cap I64, half I64, nw I64, w gdev.Buf<BF16>, g gdev.Buf<F32>, k gdev.Buf<BF16>, v gdev.Buf<BF16>, x gdev.Buf<F32>, hb gdev.Buf<BF16>, y gdev.Buf<F32>, q gdev.Buf<BF16>, scores gdev.Buf<F32>, logits gdev.Buf<F32>, ints gdev.Buf<I32>, ang gdev.Buf<F32>) {
+type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I64, slots I64, maxPages I64, pages I64, cap I64, half I64, nw I64, w gdev.Buf<BF16>, g gdev.Buf<F32>, k gdev.Buf<BF16>, v gdev.Buf<BF16>, x gdev.Buf<F32>, hb gdev.Buf<BF16>, y gdev.Buf<F32>, q gdev.Buf<BF16>, part gdev.Buf<F32>, logits gdev.Buf<F32>, ints gdev.Buf<I32>, ang gdev.Buf<F32>) {
     dev
     kit
     Rows I64 = rows
@@ -124,7 +126,7 @@ type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I6
     hb                  # what a product reads
     y                   # what it gives
     q                   # the rows' queries
-    scores
+    part                # each (row, head, page)'s partial softmax: maximum, sum, weighted values
     logits
     ints                # tokens, positions, slots, last positions (Rows each), the output rows (Outs), the page table
     ang                 # cos, then sin: Rows x half each
@@ -161,9 +163,9 @@ fn Decoder.Make(dev mut gdev.Device&, m model.Model&, rows I64, outs I64, cache 
         try gdev.Buf<BF16>.Make(dev, total), try gdev.Buf<F32>.Make(dev, c.Layers * (2 * d + 2 * dh + w3 + 2 * d + 2 * f) + d)
         try gdev.Buf<BF16>.Make(dev, span), try gdev.Buf<BF16>.Make(dev, span), try gdev.Buf<F32>.Make(dev, rp * d)
         try gdev.Buf<BF16>.Make(dev, rp * widest), try gdev.Buf<F32>.Make(dev, rp * (2 * f).Max(d).Max(w3)), try gdev.Buf<BF16>.Make(dev, rp * heads * dh)
-        try gdev.Buf<F32>.Make(dev, rows * heads * cap), try gdev.Buf<F32>.Make(dev, op * m.Head.Out), try gdev.Buf<I32>.Make(dev, nints)
+        try gdev.Buf<F32>.Make(dev, rows * heads * cache.MaxPages * (dh + 2)), try gdev.Buf<F32>.Make(dev, op * m.Head.Out), try gdev.Buf<I32>.Make(dev, nints)
         try gdev.Buf<F32>.Make(dev, 2 * rows * half))
-    dec.Bytes = 2 * total + 2 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * cap + 4 * op * m.Head.Out
+    dec.Bytes = 2 * total + 2 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * cache.MaxPages * (dh + 2) + 4 * op * m.Head.Out
     # the weights, each at a multiple of Align
     at I64 = 0
     for i in range nw {
@@ -306,8 +308,9 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
         try dec.lap(s, 0)
         dec.blocks(KHeads, n * hc, HeadBlock, q, dec.k.Addr(0), dec.v.Addr(0), y, cs, sn, pos, slot, table, dec.gainAddr(gi + 2), dec.gainAddr(gi + 3)
             kern.Arg(heads), kern.Arg(kv), kern.Arg(dh), kern.Arg(half), layerPages, kern.Arg(dec.maxPages), kern.Arg(I64(1 if c.Rotates(li) else 0)), eps)
-        dec.blocks(KAttend, n * kv, HeadBlock, hb, q, dec.k.Addr(0), dec.v.Addr(0), dec.scores.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
-            kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.cap), kern.Arg(F32(c.Scale())))
+        dec.blocks(KAttend, n * kv * dec.maxPages, HeadBlock, dec.part.Addr(0), q, dec.k.Addr(0), dec.v.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
+            kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.maxPages), kern.Arg(F32(c.Scale())))
+        dec.blocks(KCombine, n * heads, dh.Min(256), hb, dec.part.Addr(0), last, kern.Arg(heads), kern.Arg(dh), kern.Arg(dec.maxPages))
         try dec.lap(s, 1)
         dec.product(ps.o, 4 * li + 1, l.O, rp, n, gi + 5)
         try dec.lap(s, 0)

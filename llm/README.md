@@ -170,8 +170,8 @@ table and the free pages); each step sends up its rows - tokens, positions, slot
 angles - and brings down the logits of the rows that want them, which the host samples as before. A layer is four
 cuBLASLt products (BF16 by BF16 summed in F32, planned once for each row count, a multiple of 8, and used by every
 layer) and seven kernels of `kernels/gpu/src/llm.cu`, one short launch each: the norm into BF16; the heads' QK-norm
-and rotation with the keys and values written into their pages; the attention, a block for each row's key-value head over its
-sequence's pages (scores, softmax and the weighted values); the residual add; the gated perceptron's activation.
+and rotation with the keys and values written into their pages; the attention split by pages (flash decoding: a block for each row's key-value head and page, its keys and values read
+once for the head's queries, then a block for each row's head joining the pages' partial softmaxes); the residual add; the gated perceptron's activation.
 
 It runs the dense decoders whose rows attend to every earlier position (Qwen3, Qwen2, Llama, Mistral, Granite,
 SmolLM3, Phi) in BF16, and refuses the rest by name: INT8 and INT4 weights, the mixtures of experts, sliding windows,
