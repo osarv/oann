@@ -18,7 +18,9 @@
 # (the two groups closest on average cosine merge first; with vectors of length 1 that average is the dot product of
 # the groups' sums over the product of their sizes, so a group is one sum and no table of pairs is kept, and the
 # merges are found by the nearest-neighbour chain), and the groups' mean vectors are clustered: the eigenvectors of
-# at most Whole x Whole numbers, whatever the recording's length.
+# at most Whole x Whole numbers, whatever the recording's length. Last, a group that is a small share of the windows
+# (Options.Stray) in runs of one or two (Options.Run) - scattered moments, not a speaker - is given to the speakers
+# left, each window to the closest (not where Options.Speakers gives the count).
 #
 # Turns. A window speaks for the part of its stretch nearer its middle than any other window's; neighbours of one
 # speaker join into a turn.
@@ -35,6 +37,8 @@ type Options struct() {
     Prune F64 = 0.02            # the share of the windows each keeps its cosine to
     Fewest I64 = 6              # and at least this many
     Whole I64 = 1000            # windows clustered as they are; more are merged down to this many groups first
+    Stray F64 = 0.05            # a group of a smaller share of the windows than this,
+    Run F64 = 2.0               # its runs of windows in a row no longer than this on average, is no speaker
     Speakers I64 = 0            # how many spoke, where known (0: found)
     MostSpeakers I64 = 20       # speakers found at most
     Threads I64 = 0             # tasks making vectors (0: every core)
@@ -348,6 +352,46 @@ fn spectral(v mut Array<F32>&, n I64, o Options&) Array<I64> {
     return kmeans(x, n, k, k)
 }
 
+# the windows of every stray group - one of at most o.Stray of the windows whose runs of windows in a row average
+# no more than o.Run: scattered moments (a pause, a cough, two at once), not a speaker - given the remaining speaker
+# whose mean vector is closest
+fn strays(v Array<F32>&, of mut Array<I64>&, o Options&) {
+    n := of.Len()
+    count I64 = 0
+    for g in of: count = count.Max(g + 1)
+    size := Array<I64>(count)
+    runs := Array<I64>(count)
+    for i in range n {
+        size[of[i]] += 1
+        if i == 0 or of[i - 1] != of[i]: runs[of[i]] += 1
+    }
+    stray := Array<Bool>(count)
+    kept I64 = 0
+    for g in range count {
+        if size[g] == 0: continue
+        stray[g] = F64(size[g]) < o.Stray * F64(n) and F64(size[g]) <= o.Run * F64(runs[g])
+        if not stray[g]: kept += 1
+    }
+    if kept == 0 or kept == count: return
+    centres := means(v, of, count)
+    dim := speaker.Dim
+    for i in range n {
+        if not stray[of[i]]: continue
+        best I64 = -1
+        near F64 = -2.0
+        for g in range count {
+            if stray[g] or size[g] == 0: continue
+            dot F64 = 0.0
+            for k in range dim: dot += F64(v[i * dim + k]) * F64(centres[g * dim + k])
+            if dot > near {
+                near = dot
+                best = g
+            }
+        }
+        of[i] = best
+    }
+}
+
 # the speaker of each of the n vectors of length 1 in v: 0, 1, .. in the order they first appear
 fn voices(v Array<F32>&, n I64, o Options&) Array<I64> {
     of := Array<I64>(n)
@@ -360,6 +404,7 @@ fn voices(v Array<F32>&, n I64, o Options&) Array<I64> {
         own := v.Copy()
         of = spectral(own, n, o)
     }
+    if o.Speakers <= 0: strays(v, of, o)
     seen := Map<I64, I64>()
     for i in range n {
         if not seen.Has(of[i]): seen.Put(of[i], seen.Len())
