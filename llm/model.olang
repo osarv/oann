@@ -762,6 +762,13 @@ fn valueAt(b Array<U8>&, i I64, d checkpoint.Dtype) F32 {
 # tensor "name", [rows, In], into outputs from..from + rows of l; or its rows at..at + rows, where it is [n, m, In] (a
 # mixture's experts in one tensor) or holds more rows
 fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64 = 0) ? ModelError {
+    if not l.Int8 and not l.Int4 and w.gg.Len() == 0 {
+        e, k := try w.entry(w.named(name))
+        if e.Type == checkpoint.Dtype.BF16 and e.Shape.Len() == 2 and e.Shape[1] == l.In and at + rows <= e.Shape[0] {
+            try w.bits(l, e, k, from, rows, at)
+            return
+        }
+    }
     per := (4 * 1048576 / l.In).Max(1)
     if w.row.Len() < per * l.In: w.row ~ Array<F32>(per * l.In)
     for r0 in range 0, rows, per {
@@ -777,6 +784,21 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
             continue
         }
         putRows(l, b, from + r0, 0, n)
+    }
+}
+
+# BF16 rows at.. of file k's tensor e straight into l's BF16 outputs from.., by bits (no F32 on the way)
+fn (w mut Weights&) bits(l mut Linear&, e checkpoint.Entry&, k I64, from I64, rows I64, at I64) ? ModelError {
+    per := (8 * 1048576 / (2 * l.In)).Max(1)
+    if w.buf.Len() < per * l.In * 2: w.buf ~ Array<U8>(per * l.In * 2)
+    for r0 in range 0, rows, per {
+        n := per.Min(rows - r0)
+        b :~ w.buf[:n * l.In * 2]
+        try w.read(k, e.Begin + (at + r0) * l.In * 2, b)
+        for r in range n {
+            o := from + r0 + r
+            for i in range l.In: l.W[l.at(o, i)] = BF16.FromBits(U16(b[2 * (r * l.In + i)]) | (U16(b[2 * (r * l.In + i) + 1]) << 8))
+        }
     }
 }
 
@@ -2675,4 +2697,18 @@ fn weighedError(w Linear&, o I64, g0 I64, row Array<F32>&) F64 {
         e += F64(w.Imp[g0 + t]) * d * d
     }
     return e
+}
+
+test Weights "BF16 rows copied by bits into a Linear, packed or as stored, equal the rows read through F32" {
+    dir := Tiny(true, 7)
+    w := Weights.Open(dir)!
+    want := Array<F32>(96 * 64)
+    w.rowsOf("model.layers.0.mlp.gate_proj.weight", 0, 96, 64, want)!
+    for pack in [false, true] {
+        l := Linear(64, 96, 32, pack)
+        w.fill(l, "model.layers.0.mlp.gate_proj.weight", 0, 96)!
+        for o in range 96 {
+            for i in range 64: assert l.Get(o, i) == want[o * 64 + i]
+        }
+    }
 }

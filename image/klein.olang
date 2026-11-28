@@ -15,6 +15,7 @@
 
 import "std/io"
 import "std/rand"
+import "std/time"
 import "../llm/bpe"
 import "../llm/chat"
 import "../llm/model"
@@ -27,6 +28,11 @@ type Error error {
 
 TextTokens I64 = 512                        # the prompt's length, padded
 KeepLayers Array<I64>& = [9, 18, 27]        # the encoder's hidden states a token's embedding is made of
+
+# "oann-image: WHAT N.N s" on stderr, the seconds since t0: where a picture's time goes
+fn Note(what String&, t0 I64) {
+    try io.PutErrLn("oann-image: " + what + " " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s") catch { }
+}
 
 # the prompt's tokens as the reference's tokenizer gives them: the chat template's text, cut or padded to TextTokens;
 # the count before padding second
@@ -46,7 +52,10 @@ fn Embed(dir String&, prompt String&, exact Bool = false, int8 Bool = false, dev
     last I64 = 0
     for k in KeepLayers: last = last.Max(k)
     onDevice := device == "vulkan"
+    t0 := time.Now()
     m := try model.Model.Load(dir + "/text_encoder", exact or onDevice, int8 and not onDevice, layers = last) catch { error Error.Failed(dir + "/text_encoder") }
+    Note("text encoder loaded", t0)
+    t1 := time.Now()
     pages := (TextTokens + model.PageSize - 1) / model.PageSize
     s := model.State(m, TextTokens, 0, TextTokens)
     s.Keep(m, KeepLayers)
@@ -67,6 +76,7 @@ fn Embed(dir String&, prompt String&, exact Bool = false, int8 Bool = false, dev
         for i in range pages: k.Table[i] = k.Take()
         m.Step(s, k)
     }
+    Note("prompt encoded", t1)
     d := m.C.Dim
     n := KeepLayers.Len()
     out := Array<F32>(TextTokens * n * d)
@@ -140,9 +150,12 @@ if Vulkan {
     # the steps of sig on the Vulkan device (image/vk), lat in place
     fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
         dev := try vdev.Device.Open() catch e { error Error.Failed("the Vulkan device: " + $e) }
+        t0 := time.Now()
         g := try vk.Gpu.Make(dev, m, embeds.Len() / m.C.Text, rows, cols) catch e { error Error.Failed("the model on " + dev.Name + ": " + $e) }
-        Println("device: " + dev.Str() + ", " + $g.Resident + " of " + $(m.C.Double + m.C.Single) + " blocks resident, " + $(g.Bytes / 1048576) + " MiB held")
+        try io.PutErrLn("oann-image: device " + dev.Str() + ", " + $g.Resident + " of " + $(m.C.Double + m.C.Single) + " blocks resident, " + $(g.Bytes / 1048576) + " MiB held") catch { }
+        Note("transformer on the device", t0)
         try g.SetText(embeds) catch e { error Error.Failed($e) }
+        defer: Note("steps", t0)
         for i in range sig.Len() - 1 {
             progress(i)
             try g.Forward(lat, sig[i]) catch e { error Error.Failed($e) }
@@ -199,7 +212,9 @@ fn decodeOn(v vae.Vae&, z mut Array<F32>&, h I64, w I64, device String&) Array<F
 # Decode with the decoder v loaded (Decoder)
 fn Pixels(v vae.Vae&, tokens Array<F32>&, rows I64, cols I64, device String& = "cpu") Array<U8> {
     z := v.Unpatch(tokens, rows, cols)
+    t0 := time.Now()
     img := decodeOn(v, z, 2 * rows, 2 * cols, device)
+    Note("decoded", t0)
     return Array<U8>[U8(((x / 2.0 + 0.5).Clamp(0.0, 1.0) * 255.0).RoundEven()) for x in img]
 }
 
