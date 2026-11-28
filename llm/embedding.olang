@@ -1,0 +1,89 @@
+# llm/embedding - a text as a vector, by an open-weight embedding model of an architecture llm/model runs
+# (Qwen/Qwen3-Embedding-0.6B, 4B, 8B): the text is read with the end-of-text token after it, and its vector is the
+# final-normed stream at that token, scaled to length 1 - so two texts are as alike as the dot product of their
+# vectors says (their cosine). A question is read after the instruction the model was trained with (Query), a
+# passage as it is (Embed).
+#
+#     e := try embedding.Embedder.Load(dir)
+#     q := e.Query("What is the capital of China?")
+#     d := e.Embed("The capital of China is Beijing.")
+#     alike := embedding.Dot(q, d)                                  # 0.76
+#
+# Texts longer than MaxLen tokens are cut there.
+
+import "std/json"
+import "std/os"
+import "bpe"
+import "engine"
+import "model"
+
+Instruction String& = "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+
+type Embedder struct(m model.Model, tok bpe.Bpe, MaxLen I64 = 512) {
+    m
+    tok
+    MaxLen
+    Dim I64 = m.C.Dim
+    end I32 = tok.Find("<|endoftext|>")
+    eng mut engine.Engine& = engine.Engine(m, 1, MaxLen + model.PageSize, (MaxLen + model.PageSize) / model.PageSize + 2, MaxLen + 1)
+}
+
+# the model of a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors)
+fn Embedder.Load(dir String&, maxLen I64 = 512) Embedder ? model.ModelError, bpe.BpeError, json.Error, os.Error {
+    return Embedder(try model.Model.Load(dir), try bpe.Bpe.Load(dir + "/tokenizer.json"), maxLen)
+}
+
+# a passage's vector
+fn (e mut Embedder&) Embed(text String&) Array<F32> {
+    ids := e.tok.Encode(text)
+    n := ids.Len().Min(e.MaxLen)
+    prompt := Array<I32>(n + 1)
+    for i in range n: prompt[i] = ids[i]
+    prompt[n] = e.end
+    e.eng.Submit(engine.Request(0, prompt, 1, 1))
+    out := Array<F32>(e.Dim)
+    got := false
+    for not e.eng.Idle() {
+        if e.eng.Begin() {
+            e.m.Step(e.eng.State, e.eng.Cache)
+            if e.eng.State.NOut > 0 and not got {
+                h :~ e.eng.State.Hidden(0, e.Dim)
+                for i in range e.Dim: out[i] = h[i]
+                got = true
+            }
+        }
+        e.eng.End()
+    }
+    norm F64 = 0.0
+    for v in out: norm += F64(v) * F64(v)
+    scale := F32(1.0 / norm.Sqrt()) if norm > 0.0 else 0.0
+    for i in range e.Dim: out[i] *= scale
+    return out
+}
+
+# a question's vector: the text after the instruction the model was trained to read questions with
+fn (e mut Embedder&) Query(text String&) Array<F32> { return e.Embed(Instruction + text) }
+
+fn Dot(a Array<F32>&, b Array<F32>&) F64 {
+    sum F64 = 0.0
+    for i in range a.Len(): sum += F64(a[i]) * F64(b[i])
+    return sum
+}
+
+# ---- tests ----
+
+# the model card's example and its scores (sentence-transformers, F32): 0.7646 0.1414 / 0.1355 0.6000
+test Embedder "scores the model card's questions and passages as the card does, where $OANN_MODELS holds Qwen3-Embedding-0.6B" {
+    root :~ try os.Env("OANN_MODELS") catch default ""
+    dir := root + "/Qwen--Qwen3-Embedding-0.6B"
+    if root.Len() == 0 or not os.IsDir(dir): return
+    e := Embedder.Load(dir)!
+    q0 := e.Query("What is the capital of China?")
+    q1 := e.Query("Explain gravity")
+    d0 := e.Embed("The capital of China is Beijing.")
+    d1 := e.Embed("Gravity is a force that attracts two bodies towards each other. It gives weight to physical objects and is responsible for the movement of planets around the sun.")
+    want := [0.7646, 0.1414, 0.1355, 0.6000]
+    for k, got in [Dot(q0, d0), Dot(q0, d1), Dot(q1, d0), Dot(q1, d1)] {
+        assert (got - want[k]).Abs() < 0.02, "score " + $k + ": " + $got + ", the card's " + $want[k]
+    }
+}
