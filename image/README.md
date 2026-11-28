@@ -1,16 +1,17 @@
 # image
 
 Text to image with FLUX.2 klein (Black Forest Labs' distilled rectified-flow models; the 4B model's weights are
-Apache 2.0), run from the model's Hugging Face repository as it is published. On the CPU for now. The weights are never
-committed.
+Apache 2.0), run from the model's Hugging Face repository as it is published. The transformer runs on the CPU or on any GPU with a
+Vulkan driver; the text encoder and the decoder on the CPU. The weights are never committed.
 
 | file | what |
 |---|---|
-| `klein.olang` | the pipeline: `Embed` (the prompt through the model's Qwen3 text encoder, llm/), `Flow` (noise to latents in a few Euler steps), `Decode` (latents to pixels), `Generate` (all three), `Sigmas` (the steps' noise levels) |
+| `klein.olang` | the pipeline: `Embed` (the prompt through the model's Qwen3 text encoder, llm/), `Flow` (noise to latents in a few Euler steps), `Decode` (latents to pixels), `Generate` (all three), `Sigmas` (the steps' noise levels); `Transformer` and `Steps`, `Decoder` and `Pixels`, the same with the model loaded once by the caller |
 | `flux2.olang` | `Model`, the flow transformer (diffusers' Flux2Transformer2DModel): `Load`, `Run` (the buffers of one image size), `SetText`, `Forward` (one pass: every latent token's velocity) |
+| `vk.olang` | `Gpu`, the transformer on a Vulkan device (kernels/vk): `Make` (the buffers, the blocks that fit kept on the device), `SetText`, `Forward`; built with `-define Vulkan=true` |
 | `vae.olang` | `Vae`, the autoencoder's decoder (AutoencoderKLFlux2): `Load`, `Unpatch` (tokens to latents), `Decode` |
 | `png.olang` | `Encode`: pixels as a PNG file |
-| `gen.olang` | `oann-image`, the command |
+| `gen.olang` | `oann-image`, the command, and its server mode |
 | `tools/ref.py`, `tools/check.olang` | the reference (diffusers, F32, CPU) and the program that holds each stage to it |
 
 ## Using it
@@ -26,7 +27,28 @@ build/oann-image klein4b "A cat holding a sign that says hello world" cat.png --
 (4, what the distilled models are made for), `--seed S` (the noise; a seed gives the same picture again), `--exact`
 (F32 activations). The noise is std/rand's, so a seed's picture is not the picture diffusers draws for that seed.
 
+`--device vulkan` runs the transformer on a GPU (a build with `-define Vulkan=true`, which `make oannimage` adds where
+Vulkan's headers are; `OANN_VK_DEVICE=N` picks one of several), with F32 activations as `--exact`.
+
 From a program: `klein.Generate(dir, prompt, width, height)` gives the picture's bytes (row-major, red, green, blue).
+
+**Server mode** keeps the transformer and the decoder loaded for many pictures, one JSON object a line on stdin:
+
+```
+build/oann-image klein4b --serve --device vulkan
+{"prompt": "A cat holding a sign that says hello world", "out": "cat.png", "width": 512, "height": 512}
+```
+
+It answers each on stdout, one JSON object a line: `{"step":1,"of":4}` as each step starts, then
+`{"ok":true,"path":"cat.png","width":512,"height":512,"seconds":41.2}`, or `{"ok":false,"error":"..."}` for a request
+it cannot do. `width`, `height` (1024), `steps` (4) and `seed` (0) are optional. It ends when stdin closes. The text
+encoder is loaded for each picture and let go, so the server holds the transformer's 7.8 GB and not the encoder's 6 GB
+beside it.
+
+**For Windows**: `olang build -define Vulkan=true -target x86_64-windows:x86-64-v3 -output build/oann-image.exe
+image/gen.olang`, with mingw-w64 and Vulkan's headers in its include directory (`cp -r /usr/include/vulkan
+/usr/include/vk_video /usr/x86_64-w64-mingw32/include/`). The program opens Windows' own Vulkan loader
+(vulkan-1.dll, installed with the graphics driver).
 
 ## How it works
 
@@ -47,6 +69,13 @@ positions, go through the decoder's convolutions (kernels/conv) to 8 x 8 pixels 
 
 Each part loads its model and lets it go before the next, so the peak memory is the transformer's and its buffers, not
 the sum.
+
+**On a GPU** (vk.olang) the stream and every product, norm, rotation and attention are on the device; the host works
+out the noise level's modulations (one row through a few small maps) and sends them up each step with the latents.
+The 7.4 GB of the blocks' weights is more than most cards hold beside a desktop, so the first blocks that fit a budget
+stay on the device and the rest are sent up again on each pass, in order with the work that reads them. The budget is
+`OANN_IMAGE_VK_MIB` (MiB of device memory for everything), else half the device's memory. Attention is the device's
+general product: a group of heads' scores in one buffer of at most 512 MiB, their softmax, the values' mean.
 
 ## Checks
 

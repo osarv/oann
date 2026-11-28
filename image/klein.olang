@@ -10,6 +10,8 @@
 # image's size as the reference shifts them.
 # Decode: the tokens through the autoencoder's decoder to pixels.
 # Each part loads its model and lets it go, so the peak is the largest part's (the transformer's 7.8 GB), not their sum.
+# Transformer and Steps, Decoder and Pixels are the parts with the model loaded by the caller, to keep it for many
+# pictures (oann-image --serve).
 
 import "std/rand"
 import "../llm/bpe"
@@ -83,14 +85,30 @@ fn Sigmas(steps I64, tokens I64) Array<F64> {
 
 # rows x cols latent tokens of an image of the prompt embedded as embeds: noise (given, or drawn from seed) carried
 # to an image's latents in `steps` steps. progress(i) is called as step i starts
-fn Flow(dir String&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed U64, exact Bool, progress fn&(step I64), noise Array<F32>& = Array<F32>(0)) Array<F32> ? Error {
-    m := try flux2.Model.Load(dir + "/transformer", exact) catch { error Error.Failed(dir + "/transformer") }
-    e := flux2.Run(m, embeds.Len() / m.C.Text, rows, cols)
-    m.SetText(e, embeds)
+fn Flow(dir String&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed U64, exact Bool, progress fn&(step I64), noise Array<F32>& = Array<F32>(0), device String& = "cpu") Array<F32> ? Error {
+    m := try Transformer(dir, exact, device)
+    return try Steps(m, embeds, rows, cols, steps, seed, progress, noise, device)
+}
+
+# the transformer, for device ("cpu" or "vulkan": F32 activations on a device, as exact)
+fn Transformer(dir String&, exact Bool, device String&) flux2.Model ? Error {
+    if device != "cpu" and device != "vulkan": error Error.Failed("the device " + device + " (cpu and vulkan run)")
+    return try flux2.Model.Load(dir + "/transformer", exact or device == "vulkan") catch { error Error.Failed(dir + "/transformer") }
+}
+
+# Flow's steps with the transformer m loaded (Transformer)
+fn Steps(m flux2.Model&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed U64, progress fn&(step I64), noise Array<F32>& = Array<F32>(0), device String& = "cpu") Array<F32> ? Error {
+    onDevice := device == "vulkan"
     r := rand.Rand(seed)
     n := rows * cols * m.C.In
     lat := Array<F32>[noise[i] if noise.Len() == n else F32(r.Normal()) for i in range n]
     sig := Sigmas(steps, rows * cols)
+    if onDevice {
+        try vkFlow(m, embeds, rows, cols, lat, sig, progress)
+        return lat
+    }
+    e := flux2.Run(m, embeds.Len() / m.C.Text, rows, cols)
+    m.SetText(e, embeds)
     for i in range steps {
         progress(i)
         m.Forward(e, lat, sig[i])
@@ -100,9 +118,42 @@ fn Flow(dir String&, embeds mut Array<F32>&, rows I64, cols I64, steps I64, seed
     return lat
 }
 
+Vulkan Bool = false
+
+if Vulkan {
+    import "vk"
+    import vdev "../kernels/vk/device"
+
+    # the steps of sig on the Vulkan device (image/vk), lat in place
+    fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
+        dev := try vdev.Device.Open() catch e { error Error.Failed("the Vulkan device: " + $e) }
+        g := try vk.Gpu.Make(dev, m, embeds.Len() / m.C.Text, rows, cols) catch e { error Error.Failed("the model on " + dev.Name + ": " + $e) }
+        Println("device: " + dev.Str() + ", " + $g.Resident + " of " + $(m.C.Double + m.C.Single) + " blocks resident, " + $(g.Bytes / 1048576) + " MiB held")
+        try g.SetText(embeds) catch e { error Error.Failed($e) }
+        for i in range sig.Len() - 1 {
+            progress(i)
+            try g.Forward(lat, sig[i]) catch e { error Error.Failed($e) }
+            dt := F32(sig[i + 1] - sig[i])
+            for k in range lat.Len(): lat[k] += dt * g.Out[k]
+        }
+    }
+} else {
+    fn vkFlow(m flux2.Model&, embeds Array<F32>&, rows I64, cols I64, lat mut Array<F32>&, sig Array<F64>&, progress fn&(step I64)) ? Error {
+        error Error.Failed("the device vulkan: this program was built without Vulkan (-define Vulkan=true, where Vulkan's headers are: libvulkan-dev)")
+    }
+}
+
 # the latent tokens' picture: 16 rows x 16 cols x 3 bytes, row-major, red, green, blue
 fn Decode(dir String&, tokens Array<F32>&, rows I64, cols I64) Array<U8> ? Error {
-    v := try vae.Vae.Load(dir + "/vae") catch { error Error.Failed(dir + "/vae") }
+    v := try Decoder(dir)
+    return Pixels(v, tokens, rows, cols)
+}
+
+# the autoencoder's decoder
+fn Decoder(dir String&) vae.Vae ? Error { return try vae.Vae.Load(dir + "/vae") catch { error Error.Failed(dir + "/vae") } }
+
+# Decode with the decoder v loaded (Decoder)
+fn Pixels(v vae.Vae&, tokens Array<F32>&, rows I64, cols I64) Array<U8> {
     z := v.Unpatch(tokens, rows, cols)
     img := v.Decode(z, 2 * rows, 2 * cols)
     return Array<U8>[U8(((x / 2.0 + 0.5).Clamp(0.0, 1.0) * 255.0).RoundEven()) for x in img]
@@ -110,11 +161,11 @@ fn Decode(dir String&, tokens Array<F32>&, rows I64, cols I64) Array<U8> ? Error
 
 # a picture of the prompt, width x height (each rounded down to a multiple of 16): its bytes as Decode gives them, and
 # the width and height made
-fn Generate(dir String&, prompt String&, width I64, height I64, steps I64 = 4, seed U64 = 0, exact Bool = false, progress fn&(step I64) = fn(step I64) { }) Array<U8>, I64, I64 ? Error {
+fn Generate(dir String&, prompt String&, width I64, height I64, steps I64 = 4, seed U64 = 0, exact Bool = false, progress fn&(step I64) = fn(step I64) { }, device String& = "cpu") Array<U8>, I64, I64 ? Error {
     rows, cols := height / 16, width / 16
     if rows < 1 or cols < 1: error Error.Failed("an image smaller than 16 x 16")
     embeds := try Embed(dir, prompt, exact)
-    tokens := try Flow(dir, embeds, rows, cols, steps, seed, exact, progress)
+    tokens := try Flow(dir, embeds, rows, cols, steps, seed, exact, progress, device = device)
     return try Decode(dir, tokens, rows, cols), 16 * cols, 16 * rows
 }
 

@@ -56,7 +56,7 @@ gputest:
 # the Vulkan backend's tests (docs/vulkan.md), any GPU with a Vulkan driver - AMD, Intel, NVIDIA, a CPU's software Vulkan
 # (Mesa's lavapipe) - against the CPU kernels: -define Vulkan=true, which needs Vulkan's headers (libvulkan-dev) alone;
 # each test says it is skipped where there is no Vulkan device. OANN_VK_DEVICE=N picks one of several
-VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang llm/vk.olang speech/whispervk.olang
+VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang llm/vk.olang speech/whispervk.olang image/vk.olang
 vktest:
 	$(OLANG) test -define Vulkan=true $(VKTESTS)
 
@@ -235,10 +235,11 @@ oanngen:
 	$(OLANG) build $(GPUDEFINE) $(VKDEFINE) -output build/oann-gen llm/gen.olang
 	$(if $(ARGS),./build/oann-gen $(ARGS),)
 
-# oann-image: a picture of a prompt by FLUX.2 klein (image/gen.olang, image/README.md), built to build/oann-image -
+# oann-image: a picture of a prompt by FLUX.2 klein (image/gen.olang, image/README.md), built to build/oann-image (with
+# Vulkan where its headers are: --device vulkan) -
 # ARGS: MODEL "PROMPT" OUT.png and its flags (none: only builds it)
 oannimage:
-	$(OLANG) build -output build/oann-image image/gen.olang
+	$(OLANG) build $(VKDEFINE) -output build/oann-image image/gen.olang
 	$(if $(ARGS),./build/oann-image $(ARGS),)
 
 # Whisper's real-time factor (bench/speech.olang) - ARGS: MODEL_DIR CLIP.wav [rounds] [threads ...]

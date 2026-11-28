@@ -1,7 +1,8 @@
 # image/tools/check - oann's FLUX.2 klein against the reference's dumps (image/tools/ref.py): each stage run on the
 # reference's inputs, the largest difference from its outputs printed.
 #   check MODEL REF vae|flow|text [exact]
-#   check MODEL REF all [exact] OUT.png
+#   check MODEL REF flow vulkan            (a build with -define Vulkan=true: the transformer on the device)
+#   check MODEL REF all [exact|vulkan] OUT.png
 #     (REF.prompt.raw.txt holds the prompt)
 import "std/os"
 import "std/time"
@@ -55,6 +56,43 @@ fn checkVae(model String&, ref String&) {
     Println("image: worst difference " + $d2 + " of values up to " + $top2)
 }
 
+Vulkan Bool = false
+
+if Vulkan {
+    import vdev "../../kernels/vk/device"
+    import "../vk"
+
+    # the flow's steps on the Vulkan device against the reference's
+    fn checkFlowVk(model String&, ref String&) {
+        m := flux2.Model.Load(model + "/transformer", true)!
+        text := checkpoint.File.Load(ref + ".text.safetensors")!
+        flow := checkpoint.File.Load(ref + ".flow.safetensors")!
+        embeds := flat(text, "embeds")
+        lat := flat(flow, "noise")
+        sig := flat(flow, "sigmas")
+        n := lat.Len() / m.C.In
+        side I64 = 1
+        for side * side < n: side++
+        dev := vdev.Device.Open()!
+        g := vk.Gpu.Make(dev, m, embeds.Len() / m.C.Text, side, side)!
+        Println("device: " + dev.Str() + ", " + $g.Resident + " blocks resident")
+        g.SetText(embeds)!
+        for i in range sig.Len() - 1 {
+            t1 := time.Now()
+            g.Forward(lat, F64(sig[i]))!
+            want := flat(flow, "pred" + $i)
+            d, top := gap(g.Out, want)
+            bad I64 = 0
+            for k in range want.Len(): bad += 1 if not ((F64(g.Out[k]) - F64(want[k])).Abs() < 0.01) else 0
+            for k in range lat.Len(): lat[k] += (sig[i + 1] - sig[i]) * g.Out[k]
+            d2, top2 := gap(lat, flat(flow, "lat" + $i))
+            Println("step " + $i + " (" + $(time.Since(t1) / 1000000) + " ms): velocity differs by at most " + $d + " of " + $top + " (" + $bad + " of " + $want.Len() + " off by 0.01 or more), latents by " + $d2 + " of " + $top2)
+        }
+    }
+} else {
+    fn checkFlowVk(model String&, ref String&) { Println("built without Vulkan: -define Vulkan=true") }
+}
+
 fn checkFlow(model String&, ref String&, exact Bool) {
     t0 := time.Now()
     m := flux2.Model.Load(model + "/transformer", exact)!
@@ -98,7 +136,7 @@ fn checkText(model String&, ref String&, exact Bool) {
 }
 
 # the whole pipeline from the prompt and the reference's noise: the picture written to out, its bytes against the reference's
-fn checkAll(model String&, ref String&, exact Bool, out String&) {
+fn checkAll(model String&, ref String&, exact Bool, out String&, device String&) {
     prompt := String(os.ReadFile(ref + ".prompt.raw.txt")!)
     flow := checkpoint.File.Load(ref + ".flow.safetensors")!
     f := checkpoint.File.Load(ref + ".vae.safetensors")!
@@ -109,7 +147,7 @@ fn checkAll(model String&, ref String&, exact Bool, out String&) {
     t0 := time.Now()
     embeds := klein.Embed(model, prompt, exact)!
     t1 := time.Now()
-    tokens := klein.Flow(model, embeds, rows, cols, steps, 0, exact, fn(step I64) { }, noise)!
+    tokens := klein.Flow(model, embeds, rows, cols, steps, 0, exact, fn(step I64) { Println("step " + $step + " at " + $(time.Since(t1) / 1000000) + " ms") }, noise, device)!
     t2 := time.Now()
     px := klein.Decode(model, tokens, rows, cols)!
     t3 := time.Now()
@@ -137,6 +175,8 @@ fn main() {
     }
     if a[3] == "vae": checkVae(a[1], a[2])
     if a[3] == "text": checkText(a[1], a[2], a.Len() > 4 and a[4] == "exact")
-    if a[3] == "all": checkAll(a[1], a[2], a.Len() > 4 and a[4] == "exact", a[a.Len() - 1])
-    if a[3] == "flow": checkFlow(a[1], a[2], a.Len() > 4 and a[4] == "exact")
+    if a[3] == "all": checkAll(a[1], a[2], a.Len() > 4 and a[4] == "exact", a[a.Len() - 1], "vulkan" if a.Len() > 4 and a[4] == "vulkan" else "cpu")
+    vulkan := a.Len() > 4 and a[4] == "vulkan"
+    if a[3] == "flow" and vulkan: checkFlowVk(a[1], a[2])
+    if a[3] == "flow" and not vulkan: checkFlow(a[1], a[2], a.Len() > 4 and a[4] == "exact")
 }
