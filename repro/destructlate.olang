@@ -1,0 +1,44 @@
+# A unique value made by a builder that takes a reference to an outer value (as kernels/vk's Buf<S>.Make(dev, n)),
+# then viewed by a local struct holding a reference to it (as device.DMat(buf, ...)), has its destructor run only when
+# the outer value's scope closes, not when the function holding it returns. kernels/vk: every temporary Buf viewed by a
+# DMat stays allocated until the Device goes - bench/vktune ran the RTX 4060 and the Radeon out of device memory.
+# Built with the type's constructor directly (Res(d, 1)), or not viewed, it is destructed at its function's end.
+# `-memory -check` says at the View: "Res may be held by two owning places at once" (a `&` field is no owning place).
+# Expected: "after 3 calls: 3". Actual (olang 22e1052): "after 3 calls: 0", the three run when Dev's scope closes.
+# Status: reproduces (olang 22e1052, 2026-11-28). Run: olang repro/destructlate.olang
+import "std/io"
+
+Freed mut I64 = 0
+
+type Dev unique struct() {
+    h U64 = 7
+}
+
+type Res unique struct(dev Dev&, n I64) {
+    dev
+    N I64 = n
+} destruct {
+    Freed++
+}
+
+fn Res.Make(dev mut Dev&, n I64) Res {
+    return Res(dev, n)
+}
+
+type View struct(Data Res&, Off I64) {
+    Data
+    Off
+}
+
+fn viewed(d mut Dev&) {
+    r := Res.Make(d, 1)
+    v := View(r, 0)
+    if v.Off == 1: return
+}
+
+fn main() ? io.Error {
+    d := Dev()
+    for _ in range 3: viewed(d)
+    try io.Put("after 3 calls: " + $Freed + "\n")
+    assert d.h == 7
+}

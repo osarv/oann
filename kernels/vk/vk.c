@@ -421,6 +421,9 @@ int32_t oann_vk_sync(uint64_t h) {
 /* what is recorded runs now and has run when this returns; a failure stays for the next sync to tell */
 void oann_vk_flush(uint64_t h) { flush(D(h)); }
 
+/* the buffers and kernels of the device still alive */
+int64_t oann_vk_live(uint64_t h) { return (int64_t)D(h)->refs; }
+
 /* the call the last sync's failure was */
 const char *oann_vk_what(uint64_t h) { return D(h)->what ? D(h)->what : ""; }
 

@@ -163,15 +163,19 @@ fn (d mut Device&) Close() {
 # the shim's handle, for kernels/vk's other modules
 fn (d Device&) Handle() U64 { return d.h }
 
+# the buffers and kernels made on d and not yet freed
+fn (d Device&) Live() I64 { return vk.oann_vk_live(d.h) }
+
 # ---- device memory ----
 
 # n elements of S in the device's memory, uninitialized; freed where its holder lets go, after what is recorded has
-# run. It holds its device, so it cannot outlive it
-type Buf<S> unique struct(dev Device&, n I64, h U64) {
-    dev
+# run. It holds its device's handle, not a reference to the Device: the shim keeps a device until its last buffer is
+# freed, and a reference made olang keep every buffer a function made and viewed (a DMat) until the Device's own scope
+# closed (repro/destructlate.olang) - bench/vktune ran out of device memory
+type Buf<S> unique struct(devh U64, n I64, h U64) {
+    devh
     N I64 = n
     h
-    devh U64 = dev.h
 } destruct {
     if h != 0: vk.oann_vk_buf_free(devh, h)
 }
@@ -182,7 +186,7 @@ fn Buf<S>.Make(dev mut Device&, n I64) Buf<S> ? VkError {
     bytes := (U64(n.Max(1)) * U64(S.Size) + 3) / 4 * 4
     st := vk.oann_vk_buf_new(dev.h, bytes, out)
     try Check(st, "a buffer of " + $bytes + " bytes")
-    return Buf<S>(dev, n, out[0])
+    return Buf<S>(dev.h, n, out[0])
 }
 
 # the shim's handle: what a kernel's binding takes
@@ -359,4 +363,22 @@ test VkError "an allocation past the device's memory is an error naming the size
     }
     assert failed, "allocated 64 TiB"
     try d.Sync()
+}
+
+# a buffer made and viewed as a matrix in a call, as a product's operands are
+fn viewedOnce(d mut Device&) ? VkError {
+    b := try Buf<F32>.Make(d, 64)
+    m := DMat<F32>(b, 0, 8, 8, 8)
+    try d.Sync()
+    assert m.Rows == 8
+}
+
+test Device.Live "a buffer a call made and viewed is freed when the call returns, not when the device goes" {
+    d := try Device.Open() catch VkError.NoDevice {
+        Skip("Live")
+        return
+    }
+    before := d.Live()
+    for _ in range 3: try viewedOnce(d)
+    assert d.Live() == before, "buffers left alive: " + $(d.Live() - before)
 }
