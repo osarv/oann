@@ -51,9 +51,50 @@ BufLimit mut I64 = 0
 # invocations a workgroup: Line along one axis, Tile along each of two (kernels/vk/kern's)
 Line I64 = 64
 Tile I64 = 8
-# the outputs of a product one invocation computes, and the rows where a step has many (Wide rows or more)
-Cols I64 = 4
+# rows a step from which the product computes several rows an invocation
 Wide I64 = 4
+
+# how a linear layer's product is computed on a device: an invocation computes Rows rows of Cols outputs, a workgroup
+# is Sx invocations along the outputs by Sy along the rows. Chunk 0 (direct): each step reads a word of each output's
+# weights from the buffer. Chunk > 0 (staged): the workgroup first copies Chunk words of each of its Sx Cols outputs'
+# weights into its shared memory, neighbours neighbouring words, and every invocation computes from there. Every plan
+# sums in the depth's order: the result's bits do not depend on the plan
+type LinPlan struct(rows I64, cols I64, sx I64, sy I64, chunk I64) {
+    Rows I64 = rows
+    Cols I64 = cols
+    Sx I64 = sx
+    Sy I64 = sy
+    Chunk I64 = chunk
+}
+
+# "1x4 of 64x1, staged 8"
+fn (p LinPlan) Str() String {
+    return $p.Rows + "x" + $p.Cols + " of " + $p.Sx + "x" + $p.Sy + (", staged " + $p.Chunk if p.Chunk > 0 else ", direct")
+}
+
+# whether dev runs the plan: its workgroup's invocations and shared memory within the device's
+fn (p LinPlan) Fits(dev vdev.Device&) Bool {
+    if p.Rows < 1 or p.Cols < 1 or p.Sx < 1 or p.Sy < 1 or p.Chunk < 0 or (p.Cols * p.Chunk) % p.Sy != 0: return false
+    return p.Sx * p.Sy <= dev.MaxInvocations and 4 * p.Sx * p.Cols * p.Chunk <= dev.SharedBytes
+}
+
+# "ROWS,COLS,SX,SY,CHUNK" as a plan
+fn LinPlan.Parse(t String&) LinPlan ? ParseError {
+    parts := t.Split(",")
+    if parts.Len() != 5: error ParseError.Invalid
+    return LinPlan(try parts[0].ParseInt(), try parts[1].ParseInt(), try parts[2].ParseInt(), try parts[3].ParseInt(), try parts[4].ParseInt())
+}
+
+# the plan of dev's products of few rows (wide false) or of Wide rows and more: $OANN_VK_LLM_ROW or $OANN_VK_LLM_ROWS
+# ("ROWS,COLS,SX,SY,CHUNK") where it names one dev runs, else the one measured best (docs/vulkan.md)
+fn LinPlan.For(dev vdev.Device&, wide Bool) LinPlan {
+    env := try os.Env("OANN_VK_LLM_ROWS" if wide else "OANN_VK_LLM_ROW") catch default ""
+    if env != "" {
+        p := try LinPlan.Parse(env) catch default LinPlan(0, 0, 0, 0, 0)
+        if p.Fits(dev) and (wide or p.Rows == 1): return p
+    }
+    return LinPlan(Wide, 4, Tile, Tile, 0) if wide else LinPlan(1, 4, Line, 1, 0)
+}
 
 fn groups(n I64, per I64) I64 { return (n + per - 1) / per }
 fn u(x I64) U32 { return U32(x) }
@@ -176,9 +217,9 @@ fn normKernel() spirv.Kernel {
 # apart from its start (BF16, the depth even), c's rows ldc apart. An invocation computes br rows of bc outputs, each
 # step of the loop reading a word of each output's weights (two of them) and two elements of each row; every sum is
 # taken in the depth's order. Rows and outputs past the edge read the last and are not written
-fn linearKernel(br I64, bc I64) spirv.Kernel {
-    k := spirv.Kernel.Begin(Line)
-    if br > 1: k = spirv.Kernel.Begin(Tile, Tile)
+fn linearKernel(plan LinPlan) spirv.Kernel {
+    br, bc := plan.Rows, plan.Cols
+    k := spirv.Kernel.Begin(plan.Sx, plan.Sy)
     a := k.Buffer(spirv.Ty.F32)
     w := k.Buffer(spirv.Ty.U32)
     c := k.Buffer(spirv.Ty.F32)
@@ -192,37 +233,31 @@ fn linearKernel(br I64, bc I64) spirv.Kernel {
     ldc := k.Param(spirv.Ty.U32)
     bOff := k.Param(spirv.Ty.U32)
     hasBias := k.Param(spirv.Ty.U32)
-    j0 := k.Mul(k.GlobalId(0), k.U(bc))
-    i0 := k.Mul(k.GlobalId(1), k.U(br))
-    k.If(k.And(k.Lt(i0, m), k.Lt(j0, n)))
+    gx, gy := k.GlobalId(0), k.GlobalId(1)
+    j0 := k.Mul(gx, k.U(bc))
+    i0 := k.Mul(gy, k.U(br))
     lastRow := k.Sub(m, k.U(1))
     lastCol := k.Sub(n, k.U(1))
+    half := k.Shr(depth, k.U(1))
     aBase := Vec<spirv.Val>()
-    wBase := Vec<spirv.Val>()
     for q in range br: aBase.Push(k.Add(aOff, k.Mul(k.Least(k.Add(i0, k.U(q)), lastRow), lda)))
-    for q in range bc: wBase.Push(k.Shr(k.Mul(k.Least(k.Add(j0, k.U(q)), lastCol), depth), k.U(1)))
     acc := Vec<spirv.Var>()
     for _ in range br * bc: acc.Push(k.Let(k.F(0)))
-    p := k.Var(spirv.Ty.U32)
-    k.For(p, k.U(0), k.Shr(depth, k.U(1)))
-    pv := k.Get(p)
-    p2 := k.Shl(pv, k.U(1))
-    lo := Vec<spirv.Val>()
-    hi := Vec<spirv.Val>()
-    for q in range bc {
-        word := k.Read(w, k.Add(wBase[q], pv))
-        lo.Push(bfLo(k, word))
-        hi.Push(bfHi(k, word))
+    if plan.Chunk > 0 {
+        linearStaged(k, plan, a, w, aBase, acc, gx, gy, lastCol, depth, half)
+    } else {
+        k.If(k.And(k.Lt(i0, m), k.Lt(j0, n)))
+        wBase := Vec<spirv.Val>()
+        for q in range bc: wBase.Push(k.Shr(k.Mul(k.Least(k.Add(j0, k.U(q)), lastCol), depth), k.U(1)))
+        p := k.Var(spirv.Ty.U32)
+        k.For(p, k.U(0), half)
+        pv := k.Get(p)
+        words := Vec<spirv.Val>()
+        for q in range bc: words.Push(k.Read(w, k.Add(wBase[q], pv)))
+        linearStep(k, plan, a, aBase, acc, words, k.Shl(pv, k.U(1)))
+        k.Next(p)
+        k.EndIf()
     }
-    for r in range br {
-        a0 := k.Read(a, k.Add(aBase[r], p2))
-        a1 := k.Read(a, k.Add(aBase[r], k.Add(p2, k.U(1))))
-        for q in range bc {
-            s := acc[r * bc + q]
-            k.Set(s, k.Add(k.Add(k.Get(s), k.Mul(a0, lo[q])), k.Mul(a1, hi[q])))
-        }
-    }
-    k.Next(p)
     biased := k.Ne(hasBias, k.U(0))
     for q in range br * bc {
         i := k.Add(i0, k.U(q / bc))
@@ -233,8 +268,78 @@ fn linearKernel(br I64, bc I64) spirv.Kernel {
         k.Write(c, k.Add(cOff, k.Add(k.Mul(i, ldc), j)), k.Select(biased, k.Add(v, bv), v))
         k.EndIf()
     }
-    k.EndIf()
     return k
+}
+
+# two steps of the depth from element p2: each row's two elements times each output's word (its two weights)
+fn linearStep(k mut spirv.Kernel&, plan LinPlan, a spirv.Buffer, aBase Vec<spirv.Val>&, acc Vec<spirv.Var>&, words Vec<spirv.Val>&, p2 spirv.Val) {
+    lo := Vec<spirv.Val>()
+    hi := Vec<spirv.Val>()
+    for word in words.View() {
+        lo.Push(bfLo(k, word))
+        hi.Push(bfHi(k, word))
+    }
+    for r in range plan.Rows {
+        a0 := k.Read(a, k.Add(aBase[r], p2))
+        a1 := k.Read(a, k.Add(aBase[r], k.Add(p2, k.U(1))))
+        for q in range plan.Cols {
+            s := acc[r * plan.Cols + q]
+            k.Set(s, k.Add(k.Add(k.Get(s), k.Mul(a0, lo[q])), k.Mul(a1, hi[q])))
+        }
+    }
+}
+
+# the sums with the weights staged: for each Chunk words of the depth the workgroup's invocations copy those words of
+# its Sx Cols outputs' rows into shared memory - neighbours neighbouring words of a row, so what is read together
+# lies together in the buffer - meet, add the chunk's products from there, and meet again before the next copy. Every
+# invocation runs every chunk (a Barrier is for all), those past the edge on the last output's weights
+fn linearStaged(k mut spirv.Kernel&, plan LinPlan, a spirv.Buffer, w spirv.Buffer, aBase Vec<spirv.Val>&, acc Vec<spirv.Var>&, gx spirv.Val, gy spirv.Val, lastCol spirv.Val, depth spirv.Val, half spirv.Val) {
+    chunk, tile, crowd := plan.Chunk, plan.Sx * plan.Cols, plan.Sx * plan.Sy
+    sw := k.Shared(spirv.Ty.U32, tile * chunk)
+    lx := k.Mod(gx, k.U(plan.Sx))
+    lid := k.Add(k.Mul(k.Mod(gy, k.U(plan.Sy)), k.U(plan.Sx)), lx)
+    col0 := k.Mul(k.Sub(gx, lx), k.U(plan.Cols))
+    lastWord := k.Sub(half, k.U(1))
+    mine := k.Mul(k.Mul(lx, k.U(plan.Cols)), k.U(chunk))
+    w0 := k.Var(spirv.Ty.U32)
+    k.Set(w0, k.U(0))
+    k.Loop()
+    k.While(k.Lt(k.Get(w0), half))
+    from := k.Get(w0)
+    for e in range tile * chunk / crowd {
+        at := k.Add(lid, k.U(e * crowd))
+        j := k.Least(k.Add(col0, k.Div(at, k.U(chunk))), lastCol)
+        word := k.Least(k.Add(from, k.Mod(at, k.U(chunk))), lastWord)
+        k.WriteShared(sw, at, k.Read(w, k.Add(k.Shr(k.Mul(j, depth), k.U(1)), word)))
+    }
+    k.Barrier()
+    p := k.Var(spirv.Ty.U32)
+    k.For(p, k.U(0), k.Least(k.U(chunk), k.Sub(half, from)))
+    words := Vec<spirv.Val>()
+    for q in range plan.Cols: words.Push(k.ReadShared(sw, k.Add(k.Add(mine, k.U(q * chunk)), k.Get(p))))
+    linearStep(k, plan, a, aBase, acc, words, k.Shl(k.Add(from, k.Get(p)), k.U(1)))
+    k.Next(p)
+    k.Barrier()
+    k.Set(w0, k.Add(from, k.U(chunk)))
+    k.EndLoop()
+}
+
+# a linear layer's product on a device, by a plan
+type Linear unique struct(k kern.Kernel, plan LinPlan) {
+    k
+    By LinPlan = plan
+}
+
+fn Linear.Make(dev mut vdev.Device&, name String, plan LinPlan) Linear ? vdev.VkError {
+    assert plan.Fits(dev), "the linear product's plan " + plan.Str() + " is more than the device's workgroups hold"
+    return Linear(try made(dev, name, linearKernel(plan)), plan)
+}
+
+# y[: n, : outs] (rows ldy apart from yOff) = src[: n, : depth] (rows the depth apart) W^T, W outs rows of depth BF16
+# (even) from w's start, + bias's outs from bOff where biased
+fn (l Linear&) Run(dev mut vdev.Device&, y vdev.Buf<F32>&, yOff I64, ldy I64, src vdev.Buf<F32>&, n I64, w vdev.Buf<BF16>&, outs I64, depth I64, bias vdev.Buf<F32>&, bOff I64, biased Bool) {
+    p := Array<U32>[u(n), u(outs), u(depth), u(0), u(depth), u(yOff), u(ldy), u(bOff), u(1 if biased else 0)]
+    l.k.Run(dev, groups(outs, l.By.Sx * l.By.Cols), groups(n, l.By.Sy * l.By.Rows), 1, Array<U64>[src.Handle(), w.Handle(), y.Handle(), bias.Handle()], p)
 }
 
 # what the heads' kernel knows of an invocation's head: where it reads, whether it is normed and rotated
@@ -529,7 +634,7 @@ fn made(d mut vdev.Device&, name String, k spirv.Kernel) kern.Kernel ? vdev.VkEr
 }
 
 # the decoder's kernels on one device
-type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row kern.Kernel, rows kern.Kernel, heads kern.Kernel, scores kern.Kernel, softmax kern.Kernel, values kern.Kernel, swiglu kern.Kernel, mix kern.Kernel) {
+type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row Linear, rows Linear, heads kern.Kernel, scores kern.Kernel, softmax kern.Kernel, values kern.Kernel, swiglu kern.Kernel, mix kern.Kernel) {
     embeds
     norm
     row             # the product of a step of few rows: a row an invocation
@@ -543,8 +648,8 @@ type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row kern.Kernel, ro
 }
 
 fn kit.Make(d mut vdev.Device&) kit ? vdev.VkError {
-    return kit(try made(d, "llm_embed", embedKernel()), try made(d, "llm_norm", normKernel()), try made(d, "llm_row", linearKernel(1, Cols))
-        try made(d, "llm_rows", linearKernel(Wide, Cols)), try made(d, "llm_heads", headsKernel()), try made(d, "llm_scores", scoresKernel())
+    return kit(try made(d, "llm_embed", embedKernel()), try made(d, "llm_norm", normKernel()), try Linear.Make(d, "llm_row", LinPlan.For(d, false))
+        try Linear.Make(d, "llm_rows", LinPlan.For(d, true)), try made(d, "llm_heads", headsKernel()), try made(d, "llm_scores", scoresKernel())
         try made(d, "llm_softmax", softmaxKernel()), try made(d, "llm_values", valuesKernel()), try made(d, "llm_swiglu", swigluKernel())
         try made(d, "llm_mix", mixKernel()))
 }
@@ -663,10 +768,8 @@ fn (dec mut Decoder&) product(i I64, w model.Linear&, y vdev.Buf<F32>&, src vdev
     per := dec.wRows[i]
     for o in range 0, w.Out, per {
         outs := per.Min(w.Out - o)
-        p := Array<U32>[u(n), u(outs), u(w.In), u(0), u(w.In), u(o), u(w.Out), u(bias.Max(0) + o), u(1 if bias >= 0 else 0)]
-        bufs := Array<U64>[src.Handle(), dec.w[dec.wFirst[i] + o / per].Handle(), y.Handle(), dec.g.Handle()]
-        if n < Wide: dec.ks.row.Run(d, groups(outs, Line * Cols), n, 1, bufs, p)
-        else: dec.ks.rows.Run(d, groups(outs, Tile * Cols), groups(n, Tile * Wide), 1, bufs, p)
+        l Linear& = dec.ks.row if n < Wide else dec.ks.rows
+        l.Run(d, y, o, w.Out, src, n, dec.w[dec.wFirst[i] + o / per], outs, w.In, dec.g, bias.Max(0) + o, bias >= 0)
     }
 }
 

@@ -35,7 +35,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help vktest vkgemm vktune vkllm whispervk diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help vktest vkgemm vktune vklintune vkllm whispervk diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -77,6 +77,12 @@ vkgemm:
 vktune:
 	$(OLANG) build -define Vulkan=true -output build/bench_vktune bench/vktune.olang
 	./build/bench_vktune $(ARGS)
+
+# every plan of a language model's linear product (llm/vk's LinPlan) checked and timed on the device
+# (bench/vklintune.olang) - ARGS: rounds
+vklintune:
+	$(OLANG) build -define Vulkan=true -output build/bench_vklintune bench/vklintune.olang
+	./build/bench_vklintune $(ARGS)
 
 # Whisper's encoder (30 s) and a greedy decoder step on the CPU against the Vulkan device (bench/whispervk.olang) -
 # ARGS: a shape (tiny, base, small, medium, large: random weights, no files) or a model's directory, then the rounds
