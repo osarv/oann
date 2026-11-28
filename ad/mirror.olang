@@ -260,24 +260,24 @@ type MatPlan<T> unique struct(dev gdev.Device&, node I64) {
 }
 
 # A Moe step's rows on the device (v2, grouped): every expert has a block of Cap rows of the kept arrays, Cap the mean
-# rows an expert (slots / E) and Slack eighths of it more, so each of the step's products is one cublasGemmBatchedEx of
+# rows an expert (slots / E) and Slack sixteenths of it more, so each of the step's products is one cublasGemmBatchedEx of
 # E products of one fixed size, the addresses read from a device array - nothing waits for the rows per expert, and a
 # training step with a mixture is captured as a CUDA graph like any other. Rows no token takes are zero rows. An expert
 # given more than Cap rows overflows: launch by launch the host sees it at once (it reads the counts there) and widens
 # the blocks before the products; in a captured step the device marks it, AdamW steps nothing, and the host runs the
 # step again launch by launch (GpuAdamW.Train). Past MaxSlack (blocks half again the mean) the step runs v1's way: the
 # experts' rows packed, a cuBLAS product an expert sized by the counts the host read (never captured).
-MaxSlack := 4
+MaxSlack := 8
 
-# the rows of an expert's block for `slots` rows over e experts at a slack (eighths of the mean more)
-fn MoeCap(slots I64, e I64, slack I64) I64 { return (slots * (8 + slack) + 8 * e - 1) / (8 * e) }
+# the rows of an expert's block for `slots` rows over e experts at a slack (sixteenths of the mean more)
+fn MoeCap(slots I64, e I64, slack I64) I64 { return (slots * (16 + slack) + 16 * e - 1) / (16 * e) }
 
 # the rows a Moe step's kept arrays hold: the widest blocks'
 fn MoeRows(slots I64, e I64) I64 { return e * MoeCap(slots, e, MaxSlack) }
 
 # the smallest slack whose blocks hold `most` rows (MaxSlack + 1: none does)
 fn slackFor(slots I64, e I64, most I64) I64 {
-    for q in range 1, MaxSlack + 1 {
+    for q in range MaxSlack + 1 {
         if MoeCap(slots, e, q) >= most: return q
     }
     return MaxSlack + 1
@@ -308,7 +308,7 @@ PCount := 16
 # (F32 and I32, whatever the arena holds), the selection bias, the products' addresses (ptr); on the host the rows per
 # expert of the last Forward (Counts, downloaded), their starts where packed, the backward's adds by input (Adds, the
 # graph's), the slack in use (Slack; MaxSlack + 1: packed), the blocks the last Forward ran with (Cap; 0: packed) and
-# what the addresses on the device were made for (ptrCap), the Forwards in a row a smaller slack would have held (Calm)
+# what the addresses on the device were made for (ptrCap)
 type MoePlan unique struct(node I64, e I64, logits gdev.Buf<F32>, probs gdev.Buf<F32>, gate gdev.Buf<F32>, dgate gdev.Buf<F32>, bias gdev.Buf<F32>, sel gdev.Buf<I32>, pos gdev.Buf<I32>, tok gdev.Buf<I32>, count gdev.Buf<I32>, part gdev.Buf<I32>, ptr gdev.Buf<U64>) {
     node
     e
@@ -332,7 +332,6 @@ type MoePlan unique struct(node I64, e I64, logits gdev.Buf<F32>, probs gdev.Buf
     Cap I64 = 0
     Slots I64 = 0
     ptrCap I64 = -1
-    Calm I64 = 0
 }
 
 fn MoePlan.Make(d mut gdev.Device&, s Step&) MoePlan ? gdev.GpuError {
@@ -341,9 +340,6 @@ fn MoePlan.Make(d mut gdev.Device&, s Step&) MoePlan ? gdev.GpuError {
     kern.Zero(d, p.bias.Addr(0), e * 4)
     return p
 }
-
-# after CalmSteps Forwards in a row that a smaller slack would have held, the slack comes down one
-CalmSteps := 64
 
 # AdamW's state on the device: the moments and the per-parameter decay mask, the steps taken
 type AdamW<T> unique struct(m gdev.Buf<U8>, v gdev.Buf<U8>, mask gdev.Buf<U8>, hp gdev.Buf<F64>, rate F64, beta1 F64, beta2 F64, eps F64, decay F64) {
@@ -1038,7 +1034,7 @@ fn (m Mirror<T>&) MoeGrouped() Bool {
     return true
 }
 
-# plan i's slack in use: the eighths of the mean rows its blocks are wider by (MaxSlack + 1: packed)
+# plan i's slack in use: the sixteenths of the mean rows its blocks are wider by (MaxSlack + 1: packed)
 fn (m Mirror<T>&) MoeSlack(i I64) I64 { return m.moes[i].Slack }
 
 # the slacks in use as one word (a captured step's key: its products' sizes)
@@ -1117,19 +1113,13 @@ fn (m mut Mirror<T>&) moeCounted(i I64) I64 {
     return most
 }
 
-# after a Forward whose rows were counted (plan i's Counts are its own): the slack comes down one after CalmSteps
-# Forwards in a row that a smaller one would have held
+# after a step whose rows were counted (plan i's Counts are its own): the next step's slack is the one that held this
+# step's rows and at most one more - blocks follow the load down at once, and up when an expert overflows
 fn (m mut Mirror<T>&) MoeObserve(i I64) {
     most I64 = 0
     for j in range m.moes[i].e: most = most.Max(m.moes[i].Counts[j])
-    if slackFor(m.moes[i].Slots, m.moes[i].e, most) >= m.moes[i].Slack {
-        m.moes[i].Calm = 0
-        return
-    }
-    m.moes[i].Calm++
-    if m.moes[i].Calm < CalmSteps: return
-    m.moes[i].Slack--
-    m.moes[i].Calm = 0
+    need := slackFor(m.moes[i].Slots, m.moes[i].e, most)
+    m.moes[i].Slack = need.Max(m.moes[i].Slack.Min(need + 1))
 }
 
 # E products of one size, C[j] = op(A[j]) op(B[j]) (added to where add), their addresses plan i's arrays pc, pa and pb

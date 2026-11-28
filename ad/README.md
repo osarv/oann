@@ -31,13 +31,13 @@ weights share - on the GPU by the `oann_ad_nf4` kernel, then cuBLAS. A Linear's 
 A Custom operation runs on the GPU where its Function says how (`GpuSpec`, a default of the trait: empty for none, and
 the graph is then refused there): kind 1 is nn/moe's mixture of experts, lowered to the mirror's `Moe` step - the
 router's product and choices, each expert's rows found in token order by one block and put in the expert's own block
-of a fixed size (the mean rows an expert and a slack of eighths more; rows no token takes are zero rows), so each of
+of a fixed size (the mean rows an expert and a slack of sixteenths more; rows no token takes are zero rows), so each of
 the step's products is one `cublasGemmBatchedEx` over the experts with its addresses read on the device, and nothing
 waits for the rows per expert: `GpuAdamW.Train` captures a graph with a mixture as a CUDA graph like any other, and
 waits once at the step's end for the counts (added to the op's load, `GpuLoad`; the selection bias goes up before each
 step, `GpuBias`). An expert given more rows than its block overflows: launch by launch the host sees the counts and
 widens the blocks before the products; in a captured step the device marks it, AdamW steps nothing and Train runs the
-step again. The slack comes down after 64 steps a smaller one would have held. Past blocks half again the mean the
+step again. The next step's slack is the one that held this step's rows, or one more. Past blocks half again the mean the
 rows are packed and each expert's products sized by the counts the host read (not captured, `GpuWhole` false).
 
 One parameter set in two graphs (a model and a copy of it on other inputs, a target network): record both the same
