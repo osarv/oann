@@ -1,0 +1,228 @@
+# What a grouped product costs on the GPU, to choose how a mixture of experts multiplies without the host knowing each
+# expert's rows (ad/mirror's Work.Moe, v2): R rows of width D through E experts of hidden H, the forward's product
+# (rows x H = x W^T) and a weight gradient's (H x D = dh^T x), each done several ways and timed plain (enqueued launch
+# by launch) and as one CUDA graph replayed:
+#   one       one cublasGemmEx over all R rows (the dense layer's product: the bar)
+#   experts   E cublasGemmEx of R / E rows (v1: sizes known to the host)
+#   batch E   one cublasGemmBatchedEx of E entries of R / E rows, addresses read on the device
+#   chunks B  (forward) one cublasGemmBatchedEx of R / B + E entries of B rows: every expert's rows padded to B
+#   rounds B  (gradient) R / (E B) + 1 calls of cublasGemmBatchedEx, E entries of B rows each, added into E gradients
+# Each figure is the median of `rounds` rounds of about 20 ms, after an untimed one; ms a pass over the R rows, and its
+# ratio to `one`. From the repository's root: make gpugroup ARGS="rounds rows experts D..." (7 16384 16 384 640 896)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/gpu/device"
+import cu "../kernels/gpu/cuda.c"
+
+fn number(args Array<String&>&, i I64, fallback I64) I64 ? ParseError {
+    if i >= args.Len(): return fallback
+    return try args[i].ParseInt()
+}
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn storeType<S>(z S) I32 {
+    return match S {
+        case BF16: cu.CUDA_R_16BF
+        case _: cu.CUDA_R_32F
+    }
+}
+
+# a way of multiplying: Kind 0 one product, 1 a product an expert, 2 batched calls - Calls of them, Entries each, of
+# Rows rows
+type Way struct(Name String, Kind I64, Calls I64, Entries I64, Rows I64) {
+    Name
+    Kind
+    Calls
+    Entries
+    Rows
+}
+
+# the operands on the device: x and h of Cap rows (R and the padding), E weights and E gradients of H x D, and a way's
+# addresses (three arrays of Entries a call: the left operand's, the right's, the result's)
+type Bench<S> unique struct(dev mut device.Device&, r I64, e I64, d I64, h I64, x device.Buf<S>, hid device.Buf<S>, w device.Buf<S>, dw device.Buf<S>, ptr device.Buf<U64>) {
+    dev
+    r
+    e
+    d
+    h
+    x
+    hid
+    w
+    dw
+    ptr
+    graphs mut device.Graphs& = device.Graphs(64)
+}
+
+# rows x cols at c = op(a) op(b), row-major (blas.olang's exchange), added to c where add
+fn (b mut Bench<S>&) gemm(c U64, ldc I64, a U64, ta Bool, lda I64, bb U64, tb Bool, ldb I64, rows I64, cols I64, k I64, add Bool) {
+    z S
+    t := storeType(z)
+    cu.oann_gemm(b.dev.Status(), b.dev.Blas(), tb, ta, I32(cols), I32(rows), I32(k), 1.0, bb, t, I32(ldb), a, t, I32(lda), 1.0 if add else 0.0, c, t, I32(ldc), cu.CUBLAS_COMPUTE_32F)
+}
+
+# the same for `count` products whose addresses are the device arrays at pa, pb and pc
+fn (b mut Bench<S>&) batched(pc U64, ldc I64, pa U64, ta Bool, lda I64, pb U64, tb Bool, ldb I64, rows I64, cols I64, k I64, add Bool, count I64) {
+    z S
+    t := storeType(z)
+    cu.oann_gemm_batched(b.dev.Status(), b.dev.Blas(), tb, ta, I32(cols), I32(rows), I32(k), 1.0, pb, t, I32(ldb), pa, t, I32(lda), 1.0 if add else 0.0, pc, t, I32(ldc), I32(count), cu.CUBLAS_COMPUTE_32F)
+}
+
+# a way's addresses up: the forward's entry i reads x's rows from i Rows with expert i mod E's weight into h's rows; the
+# gradient's call c, entry j reads h's and x's rows from (c E + j) Rows into gradient j
+fn (b mut Bench<S>&) address(w Way&, forward Bool) {
+    n := w.Calls * w.Entries
+    host := Array<U64>(3 * n)
+    for i in range n {
+        at := i * w.Rows
+        j := i % b.e
+        if forward {
+            host[i] = b.x.Addr(at * b.d)
+            host[n + i] = b.w.Addr(j * b.h * b.d)
+            host[2 * n + i] = b.hid.Addr(at * b.h)
+        } else {
+            host[i] = b.hid.Addr(at * b.h)
+            host[n + i] = b.x.Addr(at * b.d)
+            host[2 * n + i] = b.dw.Addr(j * b.h * b.d)
+        }
+    }
+    b.ptr.Upload(host, 0, 0, 3 * n)
+}
+
+# one pass over the R rows, enqueued
+fn (b mut Bench<S>&) pass(w Way&, forward Bool) {
+    d, h := b.d, b.h
+    n := w.Calls * w.Entries
+    if w.Kind == 2 {
+        for c in range w.Calls {
+            pa, pb, pc := b.ptr.Addr(c * w.Entries), b.ptr.Addr(n + c * w.Entries), b.ptr.Addr(2 * n + c * w.Entries)
+            if forward { b.batched(pc, h, pa, false, d, pb, true, d, w.Rows, h, d, false, w.Entries) } else { b.batched(pc, d, pa, true, h, pb, false, d, h, d, w.Rows, c > 0, w.Entries) }
+        }
+        return
+    }
+    for j in range w.Entries {
+        at := j * w.Rows
+        if forward { b.gemm(b.hid.Addr(at * h), h, b.x.Addr(at * d), false, d, b.w.Addr(j * h * d), true, d, w.Rows, h, d, false) } else { b.gemm(b.dw.Addr(j * h * d), d, b.hid.Addr(at * h), true, h, b.x.Addr(at * d), false, d, h, d, w.Rows, false) }
+    }
+}
+
+# ns a pass, over reps passes: enqueued one by one, or graph `exec` replayed (exec >= 0)
+fn (b mut Bench<S>&) run(w Way&, forward Bool, exec I64, reps I64) F64 ? device.GpuError {
+    t0 := time.Now()
+    for _ in range reps {
+        if exec >= 0 { b.graphs.Replay(b.dev, exec) } else { b.pass(w, forward) }
+    }
+    try b.dev.Sync()
+    return F64(time.Since(t0)) / F64(reps)
+}
+
+# the median ns a pass of one way (plain where exec < 0)
+fn (b mut Bench<S>&) timed(w Way&, forward Bool, exec I64, rounds I64) F64 ? device.GpuError {
+    try b.run(w, forward, exec, 2)
+    reps I64 = 1
+    for {
+        if try b.run(w, forward, exec, reps) * F64(reps) > 2e7 or reps >= 1 << 16: break
+        reps = reps * 2
+    }
+    times := Array<F64>(rounds)
+    for i in range rounds: times[i] = try b.run(w, forward, exec, reps)
+    return median(times)
+}
+
+# a way's pass captured as a CUDA graph: its index, or -1 where the capture cannot begin
+fn (b mut Bench<S>&) capture(w Way&, forward Bool, id I64) I64 ? device.GpuError {
+    try b.dev.Sync()
+    if b.graphs.Begin(b.dev) != 0: return -1
+    b.pass(w, forward)
+    key := Array<U64>(8)
+    key[0] = U64(id)
+    b.graphs.Seal(b.dev, key)
+    try b.dev.Sync()
+    return b.graphs.Count - 1
+}
+
+fn ways(r I64, e I64, forward Bool) Vec<Way> {
+    out := Vec<Way>()
+    out.Push(Way("one", 0, 1, 1, r))
+    out.Push(Way("experts", 1, 1, e, r / e))
+    out.Push(Way("batch " + $e, 2, 1, e, r / e))
+    for rows in Array<I64>[64, 128, 256] {
+        if rows * e > r: continue
+        if forward { out.Push(Way("chunks " + $rows, 2, 1, r / rows + e, rows)) } else { out.Push(Way("rounds " + $rows, 2, r / (e * rows) + 1, e, rows)) }
+    }
+    return out
+}
+
+fn table<S>(dev mut device.Device&, like S, name String&, rounds I64, r I64, e I64, d I64) ? io.Error, device.GpuError {
+    h := (8 * d / 3 + 63) / 64 * 64 / 2
+    cap := r + (e + 1) * 256
+    b := Bench<S>(dev, r, e, d, h, try device.Buf<S>.Make(dev, cap * d), try device.Buf<S>.Make(dev, cap * h), try device.Buf<S>.Make(dev, e * h * d), try device.Buf<S>.Make(dev, e * h * d), try device.Buf<U64>.Make(dev, 3 * (r / 64 + 2 * e)))
+    rnd := rand.Rand(1)
+    fill(b.x, cap * d, rnd)
+    fill(b.hid, cap * h, rnd)
+    fill(b.w, e * h * d, rnd)
+    try dev.Sync()
+    try io.Put("== " + name + ", " + $r + " rows, " + $e + " experts, D " + $d + ", H " + $h + "\n")
+    id I64 = 0
+    for forward in Array<Bool>[true, false] {
+        try io.Put(("forward (rows x H = x W^T)" if forward else "weight gradient (H x D = dh^T x)") + ": way | plain ms (x one) | as a CUDA graph ms (x one)\n")
+        base F64 = 0.0
+        for w in ways(r, e, forward) {
+            b.address(w, forward)
+            try dev.Sync()
+            plain := try b.timed(w, forward, -1, rounds) catch err {
+                try io.Put(w.Name + " | failed: " + $err + "\n")
+                continue
+            }
+            if w.Kind == 0: base = plain
+            line := w.Name + " | " + $(plain * 1e-6).Fixed(3) + " (" + $(plain / base).Fixed(2) + ")"
+            id++
+            exec := try b.capture(w, forward, id) catch err {
+                try io.Put(line + " | capture failed: " + $err + "\n")
+                continue
+            }
+            if exec < 0 {
+                try io.Put(line + " | not captured\n")
+                continue
+            }
+            graphed := try b.timed(w, forward, exec, rounds) catch err {
+                try io.Put(line + " | replay failed: " + $err + "\n")
+                continue
+            }
+            try io.Put(line + " | " + $(graphed * 1e-6).Fixed(3) + " (" + $(graphed / base).Fixed(2) + ")\n")
+        }
+    }
+}
+
+fn fill<S>(buf mut device.Buf<S>&, n I64, r mut rand.Rand&) {
+    host := Array<S>(n)
+    for i in range n: host[i] = S(r.Uniform(-1.0, 1.0))
+    buf.Upload(host, 0, 0, n)
+}
+
+fn main() ? io.Error, ParseError {
+    args :~ os.Args()
+    rounds := try number(args, 1, 7)
+    r := try number(args, 2, 16384)
+    e := try number(args, 3, 16)
+    widths := Vec<I64>()
+    for i in range 4, args.Len(): widths.Push(try args[i].ParseInt())
+    if widths.Len() == 0 {
+        for d in Array<I64>[384, 640, 896]: widths.Push(d)
+    }
+    dev := try device.Device.Open() catch err {
+        try io.Put("no GPU: " + $err + "\n")
+        return
+    }
+    try io.Put("on " + dev.Str() + "\n")
+    for d in widths {
+        try table(dev, BF16(0), "BF16", rounds, r, e, d) catch device.GpuError err: try io.Put("failed: " + $err + "\n")
+        try table(dev, F32(0), "F32", rounds, r, e, d) catch device.GpuError err: try io.Put("failed: " + $err + "\n")
+    }
+}
