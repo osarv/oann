@@ -27,17 +27,13 @@ fn fail(msg String&) noreturn {
     os.Exit(1)
 }
 
-fn check(dev mut gdev.Device&, m model.Model&) ? gdev.GpuError {
+# (on the speed's decoder and cache, slot 0's pages: one decoder, so the weights are on the device once)
+fn check(m model.Model&, dec mut gpu.Decoder&, kg model.Cache&) ? gdev.GpuError {
     c model.Config& = m.C
     kc := model.Cache(c, 2, 1, 2, true)
-    kg := model.Cache(c, 2, 1, 2, device = true)
-    for i in range 2 {
-        kc.Table[i] = kc.Take()
-        kg.Table[i] = kg.Take()
-    }
+    for i in range 2: kc.Table[i] = kc.Take()
     sc := model.State(m, 24, 24, 64)
     sg := model.State(m, 24, 24, 64)
-    dec := try gpu.Decoder.Make(dev, m, 24, 24, kg, 64)
     for i in range 24 {
         t := I32((i * 7919 + 1000) % c.Vocab)
         sc.Add(t, i, 0, true)
@@ -79,11 +75,13 @@ fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&, f
     need := most * per * model.PageBytes(c)
     Println("cache: " + $(most * per) + " pages, " + $(need / 1048576) + " MB of the " + $(room / 1048576) + " MB the weights leave of the " + $(free / 1048576) + " MB free at the start (" + $(model.PageBytes(c) / model.PageSize / 1024) + " KB a token); " + $(dev.FreeBytes() / 1048576) + " MB free now")
     k := model.Cache(c, most * per, most, per, device = true)
+    assert per >= 2, "at least 64 positions (the check's)"
     for i in range most * per: k.Table[i] = k.Take()
     s := model.State(m, most, most, steps)
     t0 := time.Now()
-    dec := try gpu.Decoder.Make(dev, m, most, most, k, steps)
+    dec := try gpu.Decoder.Make(dev, m, most.Max(24), most.Max(24), k, steps.Max(64))
     Println("on the device: " + $(dec.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s; " + $(dev.FreeBytes() / 1048576) + " MB still free")
+    try check(m, dec, k)
     sw, sk, sv := try dec.Speeds()
     Println("buffer speeds (a copy within each): weights " + sw.Fixed(0) + " GB/s, keys " + sk.Fixed(0) + ", values " + sv.Fixed(0) + (" - the cache is partly in shared system memory" if sk < sw / 4.0 or sv < sw / 4.0 else ""))
     for b in batches {
@@ -132,6 +130,5 @@ fn main() {
     dev := try gdev.Device.Open() catch e { fail($e) }
     free := dev.FreeBytes()
     Println(dev.Str() + "; " + args[1] + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(gpu.WeightBytes(m) / 1048576) + " MB on the device, loaded in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
-    try check(dev, m) catch e { fail("the check: " + $e) }
     try speed(dev, m, steps, bs.ToArray(), free) catch e { fail("the speed: " + $e) }
 }
