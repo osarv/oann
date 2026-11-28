@@ -738,3 +738,163 @@ extern "C" __global__ void oann_ad_rope(store *y, const store *x, long long n, l
         y[o + half] = add ? y[o + half] + v : v;
     }
 }
+
+// ---- a mixture of experts (nn/moe's Experts; ad/mirror's Work.Moe) ----
+//
+// The router's probabilities and choices are F32 (float) whatever the arena holds; the gathered rows, the experts'
+// activations and every gradient are the arena's store, as a BF16 graph's own products are. No atomics: the rows an
+// expert takes are found by one block in token order, so they are the CPU's rows and a run is the same every time.
+
+// token t's probabilities (the softmax of its logits), its k experts - the largest logit plus bias, the first of equal
+// ones, as the CPU chooses - and their gates, renormalized over the chosen where renorm. One thread a token
+extern "C" __global__ void oann_moe_route(float *probs, int *sel, float *gate, const float *logits, const float *bias, long long n, long long e, long long k, long long renorm) {
+    OANN_LOOP(t, n) {
+        const float *l = logits + t * e;
+        float *p = probs + t * e;
+        float hi = l[0];
+        for (long long j = 1; j < e; j++) hi = l[j] > hi ? l[j] : hi;
+        float s = 0.0f;
+        for (long long j = 0; j < e; j++) {
+            float v = oann_exp(l[j] - hi);
+            p[j] = v;
+            s += v;
+        }
+        for (long long j = 0; j < e; j++) p[j] = p[j] / s;
+        float gs = 0.0f;
+        for (long long j = 0; j < k; j++) {
+            long long best = -1;
+            for (long long x = 0; x < e; x++) {
+                bool taken = false;
+                for (long long i = 0; i < j; i++) taken = taken || (long long)sel[t * k + i] == x;
+                if (taken) continue;
+                if (best < 0 || l[x] + bias[x] > l[best] + bias[best]) best = x;
+            }
+            sel[t * k + j] = (int)best;
+            gate[t * k + j] = p[best];
+            gs += p[best];
+        }
+        if (renorm) for (long long j = 0; j < k; j++) gate[t * k + j] = gate[t * k + j] / gs;
+    }
+}
+
+// each expert's rows, in token order as the CPU's: the slots cut into 256 runs, each run's slots per expert counted
+// (part, a row of e a run), the runs' offsets summed per expert, the experts' starts after them (part's last row), then
+// each slot's row (pos) and each row's token (tok); count the rows per expert. One block of 256 threads; part 257 e
+extern "C" __global__ void oann_moe_rows(int *pos, int *tok, int *count, int *part, const int *sel, long long slots, long long e, long long k) {
+    long long run = (slots + 255) / 256;
+    long long lo = (long long)threadIdx.x * run;
+    long long hi = lo + run < slots ? lo + run : slots;
+    int *mine = part + threadIdx.x * e;
+    for (long long x = 0; x < e; x++) mine[x] = 0;
+    for (long long s = lo; s < hi; s++) mine[sel[s]]++;
+    __syncthreads();
+    for (long long x = threadIdx.x; x < e; x += blockDim.x) {
+        int at = 0;
+        for (int r = 0; r < 256; r++) {
+            int c = part[r * e + x];
+            part[r * e + x] = at;
+            at += c;
+        }
+        count[x] = at;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int at = 0;
+        for (long long x = 0; x < e; x++) {
+            part[256 * e + x] = at;
+            at += count[x];
+        }
+    }
+    __syncthreads();
+    for (long long s = lo; s < hi; s++) {
+        int x = sel[s];
+        int p = part[256 * e + x] + mine[x];
+        mine[x]++;
+        pos[s] = p;
+        tok[p] = (int)(s / k);
+    }
+}
+
+// the routed tokens' rows by expert: xg's row p is x's row tok[p]
+extern "C" __global__ void oann_moe_gather(store *xg, const store *x, const int *tok, long long rows, long long d) {
+    OANN_LOOP(i, rows * d) xg[i] = x[(long long)tok[i / d] * d + i % d];
+}
+
+// act = silu(h1) h3
+extern "C" __global__ void oann_moe_act(store *act, const store *h1, const store *h3, long long n) {
+    OANN_LOOP(i, n) {
+        float v = h1[i];
+        act[i] = v / (1.0f + oann_exp(-v)) * (float)h3[i];
+    }
+}
+
+// out[t] = the sum over t's experts, in order, of the gate times the expert's output
+extern "C" __global__ void oann_moe_combine(store *out, const store *yg, const float *gate, const int *pos, long long n, long long d, long long k) {
+    OANN_LOOP(i, n * d) {
+        long long t = i / d, c = i % d;
+        float s = 0.0f;
+        for (long long j = 0; j < k; j++) s += gate[t * k + j] * (float)yg[(long long)pos[t * k + j] * d + c];
+        out[i] = s;
+    }
+}
+
+// slot r's output gradient (its gate times its token's) into dyg at its row, and its gate's gradient dy . y. One block
+// a slot
+extern "C" __global__ void oann_moe_scatter(store *dyg, float *dgate, const store *dy, const store *yg, const float *gate, const int *pos, long long d, long long k) {
+    long long r = blockIdx.x;
+    long long t = (r / k) * d, p = (long long)pos[r] * d;
+    float g = gate[r];
+    float v = 0.0f;
+    for (long long c = threadIdx.x; c < d; c += blockDim.x) {
+        float y = dy[t + c];
+        v += y * (float)yg[p + c];
+        dyg[p + c] = g * y;
+    }
+    v = oann_bsum(v);
+    if (threadIdx.x == 0) dgate[r] = v;
+}
+
+// SwiGLU's gradient: from act's (da), h1's and h3's
+extern "C" __global__ void oann_moe_act_grad(store *dh1, store *dh3, const store *da, const store *h1, const store *h3, long long n) {
+    OANN_LOOP(i, n) {
+        float v = h1[i], d = da[i];
+        float sg = 1.0f / (1.0f + oann_exp(-v));
+        dh1[i] = d * (float)h3[i] * sg * (1.0f + v * (1.0f - sg));
+        dh3[i] = d * v * sg;
+    }
+}
+
+// dx[t] (+)= the sum over t's slots, in order, of their rows' input gradients
+extern "C" __global__ void oann_moe_dx(store *dx, const store *dxg, const int *pos, long long n, long long d, long long k, long long add) {
+    OANN_LOOP(i, n * d) {
+        long long t = i / d, c = i % d;
+        float s = 0.0f;
+        for (long long j = 0; j < k; j++) s += (float)dxg[(long long)pos[t * k + j] * d + c];
+        dx[i] = add ? (float)dx[i] + s : s;
+    }
+}
+
+// token t's logits' gradient (dl, a row of e): through the gates - the softmax over the chosen experts where renorm,
+// else p's values - and, where scale > 0, the balance loss's (scale = Aux E / (n n k), count the rows per expert).
+// One thread a token
+extern "C" __global__ void oann_moe_router_grad(store *dl, const float *probs, const float *gate, const float *dgate, const int *sel, const int *count, long long n, long long e, long long k, long long renorm, real scale) {
+    OANN_LOOP(t, n) {
+        const float *p = probs + t * e;
+        const float *g = gate + t * k;
+        const float *dg = dgate + t * k;
+        store *o = dl + t * e;
+        float dot = 0.0f;
+        for (long long j = 0; j < k; j++) dot += g[j] * dg[j];
+        float mean = 0.0f;
+        if (scale > (real)0) for (long long x = 0; x < e; x++) mean += p[x] * (float)count[x];
+        for (long long x = 0; x < e; x++) {
+            float v = renorm ? 0.0f : -p[x] * dot;
+            for (long long j = 0; j < k; j++) {
+                if ((long long)sel[t * k + j] != x) continue;
+                v = renorm ? g[j] * (dg[j] - dot) : p[x] * dg[j] - p[x] * dot;
+            }
+            if (scale > (real)0) v += (float)scale * p[x] * ((float)count[x] - mean);
+            o[x] = v;
+        }
+    }
+}

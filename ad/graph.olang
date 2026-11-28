@@ -86,6 +86,8 @@ if Gpu {
         HostParams Bool = true
         FrozenUploads I64 = 0       # frozen weights sent up (Frozen): each once, unless handed to the host again
         Capturing Bool = false      # a training step is being captured into a CUDA graph (GP7): nothing uploads meanwhile
+        MoeBias mut Vec<mut Array<F32>&>& = Vec<mut Array<F32>&>()     # each Moe step's Function's bias and load (GpuBias, GpuLoad)
+        MoeLoad mut Vec<mut Array<I64>&>& = Vec<mut Array<I64>&>()
     }
 } else {
     type onGpu<T> struct(n I64) { }
@@ -120,6 +122,17 @@ type Function trait {
     mut Forward(out mut tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&) noalloc
     mut Backward(dout tensor.Tensor<F32>&, inputs Array<tensor.Tensor<F32>>&, dinputs mut Array<tensor.Tensor<F32>>&) noalloc
 }
+
+# A Function's GPU form, as defaults (M19e: a Function without one is untouched, and refused on the GPU). GpuSpec says
+# what the device runs for it: nothing for none, else a kind and its sizes - kind 1 is a mixture of experts (ad/mirror's
+# Work.Moe: 1, D, H, E, K, renormalized gates 1 or 0, the balance loss's weight as an F64's bits). Read once, at Plan,
+# with GpuBias and GpuLoad: the selection bias the device routes by (sent up before each Forward) and the rows per expert
+# the device counts are added to after each (nn/moe's Experts.Bias and Load; empty for none)
+fn (f F&) GpuSpec<F Function>() Array<I64> { return Array<I64>(0) }
+
+fn (f mut F&) GpuBias<F Function>() mut Array<F32>& { return Array<F32>(0) }
+
+fn (f mut F&) GpuLoad<F Function>() mut Array<I64>& { return Array<I64>(0) }
 
 # what a node computes
 type Op enum {
@@ -409,6 +422,8 @@ type Graph<T> struct(batch I64, threads I64 = 1, mode Mode = Mode.Captured, deco
     packFwd mut Array<I64>& = Array<I64>(0)     # per node: its Linear's w^T in tilePacks, or 0
     packBwd mut Array<I64>& = Array<I64>(0)     # and its w, for dx
     customIn mut list.List<Var>& = list.List<Var>()
+    specNodes mut Vec<I64>& = Vec<I64>()            # the Custom nodes with a GPU form, and their Function.GpuSpec (SpecSize numbers each)
+    specs mut Vec<I64>& = Vec<I64>()
     rowSets Vec<RowSet> = Vec<RowSet>()        # the sparse tables'
     customVals mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]    # each custom input's value, set per call
     customGrads mut Array<tensor.Tensor<T>>& = Array<tensor.Tensor<T>>[]   # and the gradient its backward writes
@@ -1030,7 +1045,24 @@ fn (g mut Graph<T>&) Custom(f mut any Function&, inputs ...Var) Var {
     for x in inputs: g.customIn.Push(g.dense(x))
     if g.Eager: g.customRoom()
     out := f.Shape(shapes)
-    return g.add(Op.Custom(f, first, inputs.Len()), out, inputs.Len() > 0 and g.batched(inputs[0]))
+    spec := f.GpuSpec()
+    v := g.add(Op.Custom(f, first, inputs.Len()), out, inputs.Len() > 0 and g.batched(inputs[0]))
+    if spec.Len() > 0 {
+        g.specNodes.Push(I64(v))
+        for k in range SpecSize: g.specs.Push(spec[k] if k < spec.Len() else -1)
+    }
+    return v
+}
+
+# the numbers of a Function.GpuSpec kept (more are dropped, fewer filled with -1)
+SpecSize := 8
+
+# number k of node i's Function.GpuSpec, read when it was recorded (-1 for none)
+fn (g Graph<T>&) specOf(i I64, k I64) I64 {
+    for j in range g.specNodes.Len() {
+        if g.specNodes[j] == i: return g.specs[j * SpecSize + k]
+    }
+    return -1
 }
 
 # room for every custom input's value and gradient as the operations are handed them: an element per input, made once
@@ -1255,7 +1287,7 @@ fn (g Graph<T>&) extrasOf(i I64) extras {
         case Op.Scan(_, _, _): extras(0, 3 * n, 0, 2 * nd.Dims[0] * nd.Dims[2])
         case Op.SelectiveScan(_, _, a, _, _, _): g.selectiveExtras(nd, g.nodes[a].Dims[0])
         case Op.DeltaRule(q, _, _, beta, _): g.deltaExtras(nd, g.nodes[q].Dims[2], g.nodes[beta].Dims[2])
-        case Op.Custom(_, first, count): extras(0, g.customScratch(first, count), 0, (2 * g.customScratch(first, count) + n) if g.custom32() else 0)
+        case Op.Custom(_, first, count): g.customExtras(i, first, count, n)
         case _: extras(0, 0, 0, 0)
     }
 }
@@ -1317,6 +1349,19 @@ fn (g Graph<T>&) deltaExtras(nd Node&, qw I64, heads I64) extras {
     dv := nd.Dims[2] / heads
     each := 2 * seqs * nd.Dims[1] * qw + nd.Dims.Count() + 2 * seqs * nd.Dims[1] * heads
     return extras(0, each, 0, seqs * heads * chunks * dk * dv + 2 * seqs * heads * dk * dv)
+}
+
+# a Custom's extras: on the CPU its inputs' gradients' scratch (and, in a BF16 or F16 graph, F32 room for its operands);
+# on the GPU a mixture of experts' kept rows and backward scratch (ad/mirror's Work.Moe)
+fn (g Graph<T>&) customExtras(i I64, first I64, count I64, n I64) extras {
+    if not g.onCpu and g.specOf(i, 0) == 1 {
+        d, h, k := g.specOf(i, 1), g.specOf(i, 2), g.specOf(i, 4)
+        tokens := g.nodes[g.customIn[first]].Dims.Count() / d
+        rows := tokens * k * (2 * d + 3 * h)
+        return extras(rows, rows + tokens * g.specOf(i, 3), 0, 0)
+    }
+    scratch := g.customScratch(first, count)
+    return extras(0, scratch, 0, (2 * scratch + n) if g.custom32() else 0)
 }
 
 fn (g Graph<T>&) customScratch(first I64, count I64) I64 {
@@ -2955,7 +3000,10 @@ if Gpu {
                     if bn.Dims.Rank > 2 and an.Strides[an.Dims.Rank - 1] == 1 and bn.Strides[bn.Dims.Rank - 1] == 1: continue
                 }
                 case Op.Dropout(_, _), Op.Conv2d(_, _, _, _), Op.MaxPool2d(_, _), Op.Scan(_, _, _), Op.SelectiveScan(_, _, _, _, _, _) { return name + " (node " + $i + ")" }
-                case Op.DeltaRule(_, _, _, _, _), Op.Custom(_, _, _) { return name + " (node " + $i + ")" }
+                case Op.DeltaRule(_, _, _, _, _) { return name + " (node " + $i + ")" }
+                case Op.Custom(_, _, _) {
+                    if g.specOf(i, 0) != 1: return name + " (node " + $i + ")"
+                }
                 case _ { }
             }
             if isView(nd.Kind) or nd.Kind == Op.Contiguous: continue
@@ -3189,6 +3237,16 @@ if Gpu {
                 s.Do = mirror.Work.Reshape
                 s.Cols, s.A, s.DA = last, g.valAt(x), g.gradAt(x)
             }
+            case Op.Custom(_, first, count) {
+                # a mixture of experts (its spec checked by refusal): its sizes, and its inputs' offsets in geo
+                s.Do = mirror.Work.Moe
+                s.Cols, s.Inner, s.Heads, s.Ctx = g.specOf(i, 1), g.specOf(i, 2), g.specOf(i, 3), g.specOf(i, 4)
+                s.Flag, s.K = g.specOf(i, 5) != 0, F64.FromBits(U64(g.specOf(i, 6)))
+                s.Geo = geo.Len()
+                for j in range count: geo.Push(g.valAt(g.customIn[first + j]))
+                for j in range count: geo.Push(g.gradAt(g.customIn[first + j]))
+                s.Saved, s.Scratch = nd.SavedOffset, nd.ScratchOffset
+            }
             case Op.Sum(x, mean) {
                 s.Do = mirror.Work.Sum
                 xd := g.nodes[x].Dims
@@ -3224,6 +3282,16 @@ if Gpu {
         all := steps.ToArray()
         g.gpu.Steps ~ all
         g.gpu.M ~ try mirror.Mirror<T>.Make(device.Opened!, all, geo.ToArray(), g.mem.Len(), g.ParamCount, g.intMem.Len(), g.Batch, rowloss, g.qCodes.Len(), g.qScales.Len(), side) catch err { error tensor.ShapeError.Mismatch("the GPU plan: " + $err) }
+        for i in range g.nodes.Len() {
+            match g.nodes[i].Kind {
+                case Op.Custom(f, _, _) {
+                    if g.gpu.Steps[i].Do != mirror.Work.Moe: continue
+                    g.gpu.MoeBias.Push(f.GpuBias())
+                    g.gpu.MoeLoad.Push(f.GpuLoad())
+                }
+                case _ { }
+            }
+        }
         g.OnGpu = true
         g.gpu.HostParams = true
         for i in range g.nodes.Len(): g.gpu.Touched[i] = g.nodes[i].Frozen
@@ -3332,7 +3400,10 @@ if Gpu {
         steps :~ g.gpu.Steps
         for i in range g.nodes.Len() {
             if isLeaf(g.nodes[i].Kind): continue
+            j := m.MoeOf(i) if steps[i].Do == mirror.Work.Moe else -1
+            if j >= 0: m.MoeBias(j, g.gpu.MoeBias[j])
             m.Forward(steps[i], n, g.Pos)
+            if j >= 0: g.moeLoad(j)
         }
         g.gpu.Gen++
         g.gpu.FreshParams = true
@@ -3357,6 +3428,7 @@ if Gpu {
             nd := g.nodes[i]
             if g.redoAt[i] >= 0: g.gpuRecompute(g.redoAt[i])
             if nd.GradOffset < 0 or not g.written[i] or isLeaf(nd.Kind): continue
+            if steps[i].Do == mirror.Work.Moe: g.moeAdds(i)
             a0 := g.acc(firstInput(nd.Kind, 0))
             a1 := g.acc(firstInput(nd.Kind, 1))
             a2 := g.acc(firstInput(nd.Kind, 2))
@@ -3369,12 +3441,40 @@ if Gpu {
         g.gpu.FreshParams = true
     }
 
+    # a Moe step's rows per expert (its plan j's, of the Forward just run) added to its Function's load
+    fn (g mut Graph<T>&) moeLoad(j I64) {
+        m :~ g.gpu.M!
+        load :~ g.gpu.MoeLoad[j]
+        counts :~ m.MoeCounts(j)
+        for e in range load.Len().Min(counts.Len()): load[e] += counts[e]
+    }
+
+    # whether a training step may be captured as one CUDA graph: no step of it waits on the host (a Moe step brings its
+    # rows per expert down to size its products)
+    fn (g Graph<T>&) GpuWhole() Bool { return g.gpu.MoeLoad.Len() == 0 }
+
+    # a Moe node's backward adds, one an input, marked as the CPU's Custom marks them (the gradients it gives its inputs)
+    fn (g mut Graph<T>&) moeAdds(i I64) {
+        m :~ g.gpu.M!
+        j := m.MoeOf(i)
+        adds :~ m.MoeAdds(j)
+        match g.nodes[i].Kind {
+            case Op.Custom(_, first, count) {
+                for k in range count: adds[k] = g.acc(g.customIn[first + k])
+            }
+            case _ { }
+        }
+    }
+
     # segment k's dropped nodes computed again on the device (Recompute)
     fn (g mut Graph<T>&) gpuRecompute(k I64) {
         m :~ g.gpu.M!
         steps :~ g.gpu.Steps
         for x in range g.segs[2 * k], g.segs[2 * k + 1] {
-            if g.redo[x]: m.Forward(steps[x], g.N, g.Pos)
+            if not g.redo[x]: continue
+            j := m.MoeOf(x) if steps[x].Do == mirror.Work.Moe else -1
+            if j >= 0: m.MoeBias(j, g.gpu.MoeBias[j])
+            m.Forward(steps[x], g.N, g.Pos)
         }
     }
 

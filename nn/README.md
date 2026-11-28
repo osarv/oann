@@ -20,7 +20,10 @@ What models are built from and trained with, on the autodiff graph (`ad/`).
   logit plus a selection bias, gates from the router's softmax (renormalized over the chosen ones for K > 1), only the
   chosen experts' products run (kernels/gemm over the tokens gathered by expert). Balancing without a loss
   (DeepSeek-V3's): `op.Balance(rate)` after each step moves the bias toward an even load; `Aux` > 0 adds Switch's balance
-  loss as a gradient. `Imbalance()` is the busiest expert's load over the mean. CPU; F32 in and out of the graph.
+  loss as a gradient. `Imbalance()` is the busiest expert's load over the mean. F32 in and out of the graph on the CPU;
+  on the GPU (a graph planned on `device.Backend.Gpu`) the device runs it in the graph's own type (ad/mirror's Moe step:
+  routing and row counting on the device, each expert's products by cuBLAS), `Balance` and `Imbalance` unchanged; a
+  training step through it runs launch by launch, not as one CUDA graph. `make gpumoe` times it against the dense layer.
 - `ngram.olang` - input tables added to the embedding, lookups only: `Ngram` of order 1 (the previous token's code, a
   table indexed by x_{t-1}, its last row for the first position), 2 or 3 (a table of `Buckets` rows indexed by a hash of
   x_{t-1}, x_t or x_{t-2}, x_{t-1}, x_t). `New` registers the table and a `Tokens()` input of row indices, `Fill` computes

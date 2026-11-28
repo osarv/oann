@@ -24,7 +24,14 @@
 # most `tokens` tokens, so a step through it allocates nothing.
 #
 # The operation is a graph.Custom: it takes and gives F32 (a BF16 graph converts at its edge); Experts<BF16> keeps the
-# experts' product operands in BF16 (summed in F32), as a BF16 graph's own products are. On the CPU only for now.
+# experts' product operands in BF16 (summed in F32), as a BF16 graph's own products are.
+#
+# On the GPU (a graph planned on device.Backend.Gpu) the same layer runs on the device (ad/mirror's Work.Moe, read from
+# GpuSpec at Plan): the router's product and choices, the rows each expert takes counted in token order, each expert's
+# products by cuBLAS over its rows, in the graph's own type (BF16 under a BF16 graph). The rows per expert come down once
+# a Forward to size the products, so a training step through it runs launch by launch, not as one CUDA graph. Bias goes
+# up before each Forward and the counts are added to Load after it, so Balance and Imbalance work on either device;
+# Renorm and Aux are read when the layer is recorded (Apply) there.
 
 import "../ad/graph"
 import "../kernels/gemm"
@@ -304,6 +311,16 @@ fn (m mut Experts<S>&) auxGrad(row I64, n I64) {
     for e in range m.E: mean += m.probs[row + e] * F32(m.count[e])
     for e in range m.E: m.logits[row + e] += scale * m.probs[row + e] * (F32(m.count[e]) - mean)
 }
+
+# ---- on the GPU (ad/graph's Function defaults) ----
+
+# a mixture of experts of these sizes (ad/mirror's Work.Moe)
+fn (m Experts<S>&) GpuSpec() Array<I64> { return Array<I64>[1, m.D, m.H, m.E, m.K, 1 if m.Renorm else 0, I64(m.Aux.Bits())] }
+
+# what the device routes by, and where it adds the rows each expert took
+fn (m mut Experts<S>&) GpuBias() mut Array<F32>& { return m.Bias }
+
+fn (m mut Experts<S>&) GpuLoad() mut Array<I64>& { return m.Load }
 
 # ---- balancing ----
 

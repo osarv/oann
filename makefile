@@ -33,7 +33,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -105,6 +105,12 @@ arenaad:
 gpulm:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_gpulm bench/gpulm.olang
 	$(GPUENV) ./build/bench_gpulm $(ARGS)
+
+# a mixture-of-experts layer (nn/moe on the device) against the dense gated perceptron of its active size: median steps
+# and the mixture's cost over the dense layer's (bench/gpumoe.olang) - ARGS: tokens steps f32|bf16 experts k D...
+gpumoe:
+	$(OLANG) build $(GPUDEFINE) -output build/bench_gpumoe bench/gpumoe.olang
+	$(GPUENV) ./build/bench_gpumoe $(ARGS)
 
 # the activation arena of a BF16 model at Qwen3's sizes: full cross entropy, ChunkedCE, ChunkedCE with Recompute
 bigvocab:

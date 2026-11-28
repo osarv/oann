@@ -28,6 +28,12 @@ by `g.SetNF4(w, nf4.NF4.Quantize(values, rows, cols))`: the graph keeps 4.5 bits
 element type just before each product reading it (a Linear's forward and its input's gradient), into one buffer all NF4
 weights share - on the GPU by the `oann_ad_nf4` kernel, then cuBLAS. A Linear's weights alone; captured graphs only.
 
+A Custom operation runs on the GPU where its Function says how (`GpuSpec`, a default of the trait: empty for none, and
+the graph is then refused there): kind 1 is nn/moe's mixture of experts, lowered to the mirror's `Moe` step - the
+router's product and choices, each expert's rows counted in token order by one block, the counts brought down once a
+Forward to size each expert's cuBLAS products (so a graph with one is trained launch by launch, `GpuWhole` false), the
+selection bias sent up before each Forward (`GpuBias`) and the counts added to the op's load after it (`GpuLoad`).
+
 One parameter set in two graphs (a model and a copy of it on other inputs, a target network): record both the same
 way, `b.CopyParamsFrom(a)` before each of b's Forward (after a's optimizer step), run both Backwards, then
 `a.AddGradsFrom(b)` - a's `ParamGrads()` is then the gradient of the sum of the two losses, which a's optimizer steps.
