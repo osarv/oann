@@ -170,13 +170,15 @@ table and the free pages); each step sends up its rows - tokens, positions, slot
 angles - and brings down the logits of the rows that want them, which the host samples as before. A layer is four
 cuBLASLt products (BF16 by BF16 summed in F32, planned once for each row count, a multiple of 8, and used by every
 layer) and seven kernels of `kernels/gpu/src/llm.cu`, one short launch each: the norm into BF16; the heads' QK-norm
-and rotation with the keys and values written into their pages; the attention split by pages (flash decoding: a block for each row's key-value head and page, its keys and values read
-once for the head's queries, then a block for each row's head joining the pages' partial softmaxes); the residual add; the gated perceptron's activation.
+and rotation with the keys and values written into their pages; the attention, a block for each row's key-value head over its
+sequence's pages, its keys and values read once for the head's queries (`OANN_GPU_ATTN=split`: split by pages, flash
+decoding, the pages' partial softmaxes joined after); the residual add; the gated perceptron's activation.
 
 It runs the dense decoders whose rows attend to every earlier position (Qwen3, Qwen2, Llama, Mistral, Granite,
 SmolLM3, Phi) in BF16, and refuses the rest by name: INT8 and INT4 weights, the mixtures of experts, sliding windows,
-Gemma's post-norms and GELU, OLMoE's wide QK-norm, images. The cache takes the device's memory left after the weights,
-less 1.5 GB for the display and a step's buffers (`--kv-gb` says otherwise): a page is `PageBytes`, as on the CPU -
+Gemma's post-norms and GELU, OLMoE's wide QK-norm, images. The cache takes the device memory the driver reports free, less
+the weights and 768 MB for a step's buffers (`--kv-gb` says otherwise); a cache Windows put partly in shared system
+memory reads at the PCIe bus's speed, and oann-gen says so: a page is `PageBytes`, as on the CPU -
 Qwen3-1.7B's 115 KB a token after 3.4 GB of weights, so about 2.5 GB, 22 thousand cached tokens, on an 8 GB device.
 When the pages run out the engine preempts as it does on the CPU.
 

@@ -189,6 +189,75 @@ extern "C" __global__ void llm_combine(unsigned short *out, const float *part, c
     }
 }
 
+// (the unsplit form, OANN_GPU_ATTN=seq) attention of row r's key-value head g (a block each, item = r * kv + g) over positions 0 .. last[r] of its sequence,
+// for the heads / kv (at most 8) query heads that read it, h = g * (heads / kv) + t: the scores q . k * scale into
+// scores[r * heads + h, :], their softmax, and out[r, h, :] (BF16) = the values' mean by it. The keys and the values
+// are each read once for the group's heads
+extern "C" __global__ void llm_attend_seq(unsigned short *out, const unsigned short *q, const unsigned short *K, const unsigned short *V,
+                                      float *scores, const int *last, const int *slot, const int *table, long long heads, long long kv,
+                                      long long dh, long long layerPages, long long maxPages, long long cap, float scale) {
+    __shared__ float part[256];
+    int nq = (int)(heads / kv), D = (int)dh, tid = threadIdx.x, bd = blockDim.x;
+    long long r = blockIdx.x / kv, g = blockIdx.x % kv;
+    int np = last[r] + 1;
+    const int *pages = table + (long long)slot[r] * maxPages;
+    const unsigned short *qv = q + (r * heads + g * nq) * dh;
+    float *sc = scores + (r * heads + g * nq) * cap;
+    float top[LLM_GROUP], acc[LLM_GROUP];
+    for (int t = 0; t < nq; t++) top[t] = -OANN_INF32;
+    for (int p = tid; p < np; p += bd) {
+        const unsigned short *kp = K + ((layerPages + pages[p / LLM_PAGE]) * kv + g) * LLM_PAGE * dh + p % LLM_PAGE;
+        for (int t = 0; t < nq; t++) acc[t] = 0.0f;
+        for (int i = 0; i < D; i++) {
+            float kx = llm_bf(kp[i * LLM_PAGE]);
+            for (int t = 0; t < nq; t++) acc[t] += llm_bf(qv[t * D + i]) * kx;
+        }
+        for (int t = 0; t < nq; t++) {
+            float sv = acc[t] * scale;
+            sc[t * cap + p] = sv;
+            top[t] = sv > top[t] ? sv : top[t];
+        }
+    }
+    float inv[LLM_GROUP];
+    for (int t = 0; t < nq; t++) {
+        part[tid] = top[t];
+        __syncthreads();
+        for (int w = bd / 2; w > 0; w >>= 1) {
+            if (tid < w) part[tid] = part[tid] > part[tid + w] ? part[tid] : part[tid + w];
+            __syncthreads();
+        }
+        float mx = part[0];
+        __syncthreads();
+        float sum = 0.0f;
+        for (int p = tid; p < np; p += bd) {
+            float e = oann_exp(sc[t * cap + p] - mx);
+            sc[t * cap + p] = e;
+            sum += e;
+        }
+        part[tid] = sum;
+        __syncthreads();
+        for (int w = bd / 2; w > 0; w >>= 1) {
+            if (tid < w) part[tid] += part[tid + w];
+            __syncthreads();
+        }
+        inv[t] = 1.0f / part[0];
+        __syncthreads();
+    }
+    for (int i = tid; i < D; i += bd) {
+        for (int t = 0; t < nq; t++) acc[t] = 0.0f;
+        for (int pg = 0; pg * LLM_PAGE < np; pg++) {
+            const unsigned short *vp = V + ((layerPages + pages[pg]) * kv + g) * LLM_PAGE * dh + i;
+            int cnt = np - pg * LLM_PAGE < LLM_PAGE ? np - pg * LLM_PAGE : LLM_PAGE;
+            const float *w = sc + pg * LLM_PAGE;
+            for (int j = 0; j < cnt; j++) {
+                float vx = llm_bf(vp[j * D]);
+                for (int t = 0; t < nq; t++) acc[t] += w[t * cap + j] * vx;
+            }
+        }
+        for (int t = 0; t < nq; t++) out[(r * heads + g * nq + t) * dh + i] = llm_round(acc[t] * inv[t]);
+    }
+}
+
 // x += y * rs
 extern "C" __global__ void llm_add(float *x, const float *y, long long n, float rs) { LLM_LOOP(i, n) x[i] += y[i] * rs; }
 

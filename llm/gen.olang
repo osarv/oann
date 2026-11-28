@@ -21,8 +21,9 @@
 #
 # --device gpu runs the model on the CUDA device (llm/gpu: the weights in BF16 and the cache on the device, sampling
 # here), where oann-gen was built with -define Gpu=true (make oanngen does where the CUDA toolkit is installed). The
-# cache takes the device's memory left after the weights, less 1.5 GB for the display and the step's buffers; --kv-gb
-# says otherwise.
+# cache takes the device memory the driver reports free, less the weights and 768 MB for the step's buffers; --kv-gb
+# says otherwise. A cache that spilled into shared system memory (Windows, when the device runs short) is named, with a
+# smaller --kv-gb as the cure.
 #
 # --device vulkan runs it on any GPU with a Vulkan driver - AMD, Intel, NVIDIA, an integrated one (llm/vk: the same
 # split), where oann-gen was built with -define Vulkan=true (make oanngen does where Vulkan's headers are, libvulkan-dev).
@@ -55,7 +56,9 @@ if Gpu {
         if why != "": fail("--device gpu does not run this model: " + why)
         theDev ~ try gdev.Device.Open() catch e { fail("--device gpu: " + $e) }
         say("device: " + theDev!.Str() + ", weights " + $(gpu.WeightBytes(m) / 1048576) + " MB")
-        return theDev!.MiB * 1048576 - gpu.WeightBytes(m) - 1536 * 1048576
+        free := theDev!.FreeBytes()
+        if free == 0: free = theDev!.MiB * 1048576 - 1024 * 1048576
+        return free - gpu.WeightBytes(m) - 768 * 1048576
     }
 
     # m on the device, for e's steps
@@ -63,6 +66,10 @@ if Gpu {
         t0 := time.Now()
         theDec ~ try gpu.Decoder.Make(theDev!, m, e.State.Rows, e.Batch, e.Cache, maxCtx) catch err { fail("--device gpu: " + $err + " (a smaller --kv-gb, --batch or --ctx may fit)") }
         say("on the device: " + $(theDec!.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+        w, k, v := try theDec!.Speeds() catch err { fail("--device gpu: " + $err) }
+        if k < w / 4.0 or v < w / 4.0 {
+            say("warning: the cache reads at " + k.Min(v).Fixed(0) + " GB/s against the weights' " + w.Fixed(0) + " GB/s - part of it is in shared system memory (the device's memory ran short); a smaller --kv-gb will be faster")
+        }
     }
 
     fn gpuStep(m model.Model&, e mut engine.Engine&) {

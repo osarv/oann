@@ -70,16 +70,19 @@ fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&) ?
     most I64 = 0
     for b in batches: most = most.Max(b)
     per := steps / model.PageSize + 1
-    room := dev.MiB * 1048576 - gpu.WeightBytes(m) - 1536 * 1048576
+    free := dev.FreeBytes()
+    room := free - gpu.WeightBytes(m) - 768 * 1048576
     need := most * per * model.PageBytes(c)
-    Println("cache: " + $(most * per) + " pages, " + $(need / 1048576) + " MB of " + $(room / 1048576) + " MB left after the weights (" + $(model.PageBytes(c) / model.PageSize / 1024) + " KB a token)")
+    Println("cache: " + $(most * per) + " pages, " + $(need / 1048576) + " MB of " + $(room / 1048576) + " MB the weights leave of the " + $(free / 1048576) + " MB free (" + $(model.PageBytes(c) / model.PageSize / 1024) + " KB a token)")
     if need > room: fail("no room for batch " + $most + " over " + $steps + " positions: fewer steps or a smaller batch")
     k := model.Cache(c, most * per, most, per, device = true)
     for i in range most * per: k.Table[i] = k.Take()
     s := model.State(m, most, most, steps)
     t0 := time.Now()
     dec := try gpu.Decoder.Make(dev, m, most, most, k, steps)
-    Println("on the device: " + $(dec.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+    Println("on the device: " + $(dec.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s; " + $(dev.FreeBytes() / 1048576) + " MB still free")
+    sw, sk, sv := try dec.Speeds()
+    Println("buffer speeds (a copy within each): weights " + sw.Fixed(0) + " GB/s, keys " + sk.Fixed(0) + ", values " + sv.Fixed(0) + (" - the cache is partly in shared system memory" if sk < sw / 4.0 or sv < sw / 4.0 else ""))
     for b in batches {
         late I64 = 0
         from := steps - steps / 4
@@ -94,13 +97,18 @@ fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&) ?
         tail := F64(time.Since(late)) / 1e9
         Println("batch " + $b + ": " + (F64(b * steps) / all).Fixed(1) + " tokens/s over " + $steps + " steps (" + (all * 1000.0 / F64(steps)).Fixed(1) + " ms a step); " +
             (F64(b * (steps - from)) / tail).Fixed(1) + " tokens/s at positions " + $from + " to " + $steps)
-        # where a step at the last position goes: the same step again, waiting after each part
-        dec.Profile = true
-        for i in range 4: s.Times[i] = 0
-        for _ in range 4: try dec.Step(m, s, k)
-        dec.Profile = false
-        Println("    a step at position " + $(steps - 1) + ": products " + (F64(s.Times[0]) / 4e6).Fixed(1) + " ms, attention and the heads " + (F64(s.Times[1]) / 4e6).Fixed(1) +
-            " ms, the rest (norms, adds, uploads, the logits down) " + (F64(s.Times[2]) / 4e6).Fixed(1) + " ms")
+        # where a step at the last position goes: the same step again, waiting after each part, with each attention
+        split := dec.Split
+        for way in range 2 {
+            dec.Split = way == 1
+            dec.Profile = true
+            for i in range 4: s.Times[i] = 0
+            for _ in range 4: try dec.Step(m, s, k)
+            dec.Profile = false
+            Println("    a step at position " + $(steps - 1) + ", attention " + ("split" if dec.Split else "seq") + ": products " + (F64(s.Times[0]) / 4e6).Fixed(1) + " ms, attention and the heads " + (F64(s.Times[1]) / 4e6).Fixed(1) +
+                " ms, the rest (norms, adds, uploads, the logits down) " + (F64(s.Times[2]) / 4e6).Fixed(1) + " ms")
+        }
+        dec.Split = split
     }
 }
 

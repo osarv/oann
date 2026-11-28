@@ -79,6 +79,15 @@ int32_t oann_device_info(int32_t ordinal, char *name, int32_t len, int32_t *info
 
 int32_t oann_set_device(int32_t ordinal) { return cudaSetDevice(ordinal); }
 
+/* the current device's free memory in bytes into out[0], as the driver reports it (under Windows' WDDM, what this
+ * process may still take before allocations spill into shared system memory) */
+int32_t oann_mem_free(uint64_t *out) {
+    size_t free = 0, total = 0;
+    cudaError_t e = cudaMemGetInfo(&free, &total);
+    out[0] = (uint64_t)free;
+    return e;
+}
+
 /* a stream that does not synchronize with the legacy default stream */
 int32_t oann_stream_create(uint64_t *out) {
     cudaStream_t s = 0;
