@@ -25,10 +25,13 @@
 #include <vulkan/vulkan.h>
 
 #ifdef _WIN32
-#include <windows.h>
-static void *lib_open(void) { return (void *)LoadLibraryA("vulkan-1.dll"); }
-static void *lib_sym(void *lib, const char *name) { return (void *)GetProcAddress((HMODULE)lib, name); }
-static void lib_close(void *lib) { FreeLibrary((HMODULE)lib); }
+/* kernel32's three, declared here: <windows.h> is far more than a C import needs translated */
+__declspec(dllimport) void *__stdcall LoadLibraryA(const char *name);
+__declspec(dllimport) void *__stdcall GetProcAddress(void *module, const char *name);
+__declspec(dllimport) int __stdcall FreeLibrary(void *module);
+static void *lib_open(void) { return LoadLibraryA("vulkan-1.dll"); }
+static void *lib_sym(void *lib, const char *name) { return GetProcAddress(lib, name); }
+static void lib_close(void *lib) { FreeLibrary(lib); }
 #else
 #include <dlfcn.h>
 static void *lib_open(void) {
