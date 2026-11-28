@@ -117,5 +117,10 @@ Measured 2026-11-28 on a 4-core Xeon VM with AMX (15 GB), klein 4B, "A cat holdi
 | on software Vulkan: prompt embeddings | mean 0.026, worst 35 (llm/vk holds keys and values in BF16; the CPU's BF16 mode: mean 0.043, worst 60) |
 
 Times there, 256 x 256 (768 rows a pass): exact - text 34 s, flow 104 s (42 s of it loading; 14.5 s a step), decoder
-3.7 s; BF16 - text 17 s, flow 71 s (30 s loading; 9.5 s a step), decoder 3.6 s. Larger sizes and a GPU are not
-measured yet.
+3.7 s; BF16 - text 17 s, flow 71 s (30 s loading; 9.5 s a step), decoder 3.6 s.
+
+On an RTX 4060 (8 GB) under Windows, through Vulkan, 512 x 512 in server mode: about 40 s a picture (43 s for the
+first) - text encoder loaded about 7 s and run about 6 s, transformer loaded about 4 s and sent up about 5 s (6 of 25
+blocks resident), 6.6 s a step, decoder about 2 s; peak RAM 8.0 GB. 1024 x 1024 one-shot: about 115 s. A server on a
+device loads the transformer for each picture after the prompt is encoded: holding both models (13 GB) on a 16 GB PC
+sent the transformer to the page file and made every step 2-3x slower.
