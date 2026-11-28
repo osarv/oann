@@ -980,7 +980,7 @@ PageSize I64 = 64
 # Pages pages of 64 positions for every layer and key-value head, keys and values in BF16; Slots sequences of at most
 # MaxPages pages each, Table[slot MaxPages + i] its i-th page. A page's keys for a head: position n's dimension d at
 # ((d / 2) 32 + n) 2 + d % 2 (AddDot's pairs over the head's dimensions); its values: at ((n / 2) HeadDim + d) 2 + n % 2
-type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = false, Kv8 Bool = false) {
+type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = false, Kv8 Bool = false, device Bool = false) {
     Pages
     Slots
     MaxPages
@@ -988,8 +988,9 @@ type Cache struct(c Config&, Pages I64, Slots I64, MaxPages I64, exact Bool = fa
     Layers I64 = c.Layers
     KvHeads I64 = c.KvHeads
     HeadDim I64 = c.HeadDim
-    K mut Array<BF16>& = Array<BF16>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
-    V mut Array<BF16>& = Array<BF16>(0 if Kv8 else c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
+    # (device: the keys and values live on a device, llm/gpu - here the table and the free pages alone)
+    K mut Array<BF16>& = Array<BF16>(0 if device else c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
+    V mut Array<BF16>& = Array<BF16>(0 if Kv8 or device else c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize)
     V8 mut Array<I8>& = Array<I8>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize if Kv8 else 0)
     VS mut Array<F32>& = Array<F32>(c.Layers * Pages * c.KvHeads * PageSize if Kv8 else 0)   # position n's at at() / HeadDim + n
     KF mut Array<F32>& = Array<F32>(c.Layers * Pages * c.KvHeads * c.HeadDim * PageSize if exact else 0)  # exact: F32 too
@@ -1013,7 +1014,7 @@ fn (k mut Cache&) Take() I32 {
     if k.nfree == 0: return -1
     k.nfree--
     p := k.free[k.nfree]
-    if k.Kv8: return p
+    if k.Kv8 or k.V.Len() == 0: return p
     span := k.KvHeads * k.HeadDim * PageSize
     for l in range k.Layers {
         o := (l * k.Pages + I64(p)) * span
@@ -1181,6 +1182,10 @@ fn (s mut State&) Add(tok I32, pos I64, slot I64, logits Bool) I64 {
 }
 
 # the logits of output row j
+# each row's rotation as Angles left it: cos and sin of position x frequency, RotHalf() a row
+fn (s State&) Cos() Array<F32>& { return s.cos }
+fn (s State&) Sin() Array<F32>& { return s.sin }
+
 fn (s State&) LogitsOf(j I64, vocab I64) Array<F32>& { return s.Logits[j * vocab:(j + 1) * vocab] }
 
 # y[yo + r ld ..] = x[xo + r ld ..] / rms * g for rows r < n of width d
@@ -1483,7 +1488,7 @@ type tile4 struct() {
 }
 
 # the rotation of each row's position: cos and sin of position x freq[i]
-fn (m Model&) angles(s mut State&) {
+fn (m Model&) Angles(s mut State&) {
     half := m.C.RotHalf()
     for r in range s.N {
         p := F64(s.Pos[r]) / m.C.PosScale
@@ -1540,7 +1545,7 @@ fn (m Model&) Step(s mut State&, k mut Cache&) {
         }
     }
     rs := F32(c.ResScale)
-    m.angles(s)
+    m.Angles(s)
     for li in range c.Layers {
         l :~ m.Layers[li]
         rmsNorm(s.h, 0, s.x, 0, n, d, d, l.Norm1, c.Eps)

@@ -2458,3 +2458,38 @@ short batch, at 1 and 2 threads, the arena under 3/4 and growing under a third a
 (Transformer.Loss against CrossEntropy(Apply), checkpointed equal), ad/gpu_test `bigVocabCase` (CPU against GPU in
 F32 and BF16, checkpointed against plain bit for bit on the device, Train as a CUDA graph) - compiled, skipped without a
 device; the kernels compile under nvcc for F32, F64 and BF16. **Not yet run on a GPU.**
+
+## The mixture of experts grouped on the GPU (v2, 2026-11-28)
+
+v1 (bfab67e) brought each expert's row count down once a Forward and ran a cuBLAS product an expert, so a graph with a
+mixture was never captured. v2 (ad/mirror's MoePlan) gives each expert a block of a fixed size of the kept arrays
+(the mean rows an expert plus a slack in sixteenths); each of the step's nine products is one `cublasGemmBatchedEx` over
+the experts with its addresses read from a device array (`oann_gemm_batched`), rows no token takes are zero rows.
+Launch by launch the blocks are the narrowest that hold the step's rows (one wait, so it is a function of its inputs);
+`GpuAdamW.Train` captures the step (blocks a sixteenth wider than the last step needed) and waits at its end for the
+counts Balance reads. An expert that overflows its block in a captured step: the device marks it, AdamW steps nothing
+(`oann_ad_adamw`'s skip word), and Train runs the step again launch by launch. Past blocks half again the mean, v1's
+packed path. A captured step equals the launches within rounding, not bit for bit (cuBLAS rounds by product size).
+
+**How the layout was chosen** (`make gpugroup`, 16384 rows, 16 experts, RTX 4060, BF16, ms against one dense product
+of the same rows): one batched call over the experts 1.0-1.1x forward and 1.0-1.3x for a weight gradient; a product an
+expert (v1) 1.2-1.5x; fixed chunks of 64-256 rows 1.1-2.2x forward and rounds of batched calls 1.4-5x for gradients.
+A first v2 with blocks 25 % wider than needed was no faster than v1; blocks that follow the counts are.
+
+**Measured** (`make gpumoe`, RTX 4060, card otherwise idle, BF16, 16 experts top-2, active size of the dense layer,
+median of 5 rounds; the mixture's cost over the dense SwiGLU layer's; v1 = master 98ba1cc, v2 = 59495f1):
+
+| tokens, D | v1 launch by launch | v2 launch by launch | v1 against the dense graph | v2 graph against graph |
+|---|---|---|---|---|
+| 8192, 384 | +26.7 % | +17.5 % | +32.7 % | +19.6 % |
+| 8192, 640 | +26.3 % | +19.4 % | +26.5 % | +20.0 % |
+| 8192, 896 | +36.1 % | +31.4 % | +38.6 % | +29.3 % |
+| 16384, 384 | +13.3 % | +10.6 % | +12.8 % | +12.6 % |
+| 16384, 640 | +12.3 % | +8.7 % | +12.0 % | +11.5 % |
+| 16384, 896 | +14.8 % | +15.8 % | +17.8 % | +18.1 % |
+
+v2 is 5-13 points cheaper at 8192 tokens and ties at 16384, and the step is now captured. What is left of the cost is
+not the products: the mixture has E/K = 8 times the dense layer's parameters (AdamW, gradients), plus routing, gather and
+combine kernels. **Tests** (ad/gpu_test, all 23 pass on the 4060): moeCase, moeBalance, moeTrained (Train captured,
+equal within rounding), moeOverflow (a block overflowing in a captured step; a large kick ends packed), adamKernel.
+

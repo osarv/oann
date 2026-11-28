@@ -1,0 +1,524 @@
+# speech/whispervk - speech/whisper's Encode, Cross and Step on a Vulkan device (kernels/vk, docs/vulkan.md): any GPU
+# with a Vulkan driver, an office laptop's integrated one included. The weights live on the device (F32), every array
+# of the encoder and of a decoder's step is a device buffer, and the decoder's cache of keys and values and the
+# cross-attention's keys and values stay there between steps; a step sends its rows' tokens and positions up and brings
+# the logits of its last rows back. The arithmetic is whisper.olang's, kernel for kernel: Patches and Gemm for the two
+# convolutions, Map's GELU, LayerNorm, GemmBatch and Softmax for the attention. Sums run in another order than the
+# CPU's, so logits agree to about 1e-4, not bit for bit.
+#
+# Built only with -define Vulkan=true (kernels/vk/device); speech/transcribe reaches it under `if Vulkan`.
+#
+# A step's dispatches. A linear map is a product and a bias added (2); a decoder layer is about 25 dispatches whatever
+# the rows, so a step is a few hundred small ones and one Sync. Rows of one sequence from position 0 (a prompt) attend
+# as one causal batch; rows at one position in sequences next to each other (the beams of a step) as one batch of
+# groups; any other row by itself.
+
+import "../kernels/vk/device"
+import "../kernels/vk/kern"
+import "mel"
+import "whisper"
+
+# a block's arrays on the device, in this order: piece(b, i)
+Pieces I64 = 20
+Ln1G I64 = 0
+Ln1B I64 = 1
+QkvW I64 = 2
+QkvB I64 = 3
+OW I64 = 4
+OB I64 = 5
+Ln3G I64 = 6
+Ln3B I64 = 7
+Fc1W I64 = 8
+Fc1B I64 = 9
+Fc2W I64 = 10
+Fc2B I64 = 11
+Ln2G I64 = 12
+Ln2B I64 = 13
+CQW I64 = 14
+CQB I64 = 15
+CKvW I64 = 16
+CKvB I64 = 17
+COW I64 = 18
+COB I64 = 19
+
+fn piece(b whisper.Block&, i I64) Array<F32>& {
+    return match i {
+        case 0: b.Ln1.G
+        case 1: b.Ln1.B
+        case 2: b.Qkv.W
+        case 3: b.Qkv.Bias
+        case 4: b.O.W
+        case 5: b.O.Bias
+        case 6: b.Ln3.G
+        case 7: b.Ln3.B
+        case 8: b.Fc1.W
+        case 9: b.Fc1.Bias
+        case 10: b.Fc2.W
+        case 11: b.Fc2.Bias
+        case 12: b.Ln2.G
+        case 13: b.Ln2.B
+        case 14: b.CQ.W
+        case 15: b.CQ.Bias
+        case 16: b.CKv.W
+        case 17: b.CKv.Bias
+        case 18: b.CO.W
+        case _: b.CO.Bias
+    }
+}
+
+# the model's arrays outside its blocks and its embeddings, in this order: other(m, i)
+Others I64 = 10
+Conv1W I64 = 0
+Conv1B I64 = 1
+Conv2W I64 = 2
+Conv2B I64 = 3
+EncPos I64 = 4
+EncLnG I64 = 5
+EncLnB I64 = 6
+DecPos I64 = 7
+DecLnG I64 = 8
+DecLnB I64 = 9
+
+fn other(m whisper.Model&, i I64) Array<F32>& {
+    return match i {
+        case 0: m.Conv1.W
+        case 1: m.Conv1.Bias
+        case 2: m.Conv2.W
+        case 3: m.Conv2.Bias
+        case 4: m.EncPos
+        case 5: m.EncLn.G
+        case 6: m.EncLn.B
+        case 7: m.DecPos
+        case 8: m.DecLn.G
+        case _: m.DecLn.B
+    }
+}
+
+# why m does not run here, or "": the device's products are F32
+fn Refusal(m whisper.Model&) String {
+    if m.Bf: return "BF16 weights (the device runs F32: load without bf)"
+    if m.Head.W.Len() == 0 or (m.Dec.Len() > 0 and m.Dec[0].Qkv.W.Len() == 0): return "INT8 weights (the device runs F32: load without q8)"
+    if m.Enc.Len() > 0 and m.Enc[0].Qkv.W.Len() == 0: return "an INT8 encoder (the device runs F32)"
+    return ""
+}
+
+# elements of device memory the encoder's attention scores may take: a head's n x n at a time past this
+ScoreRoom I64 = 64 << 20
+
+# the bytes of device memory a Runner of m takes, for slots sequences and steps of rows rows
+fn Needs(m whisper.Model&, slots I64, rows I64, outs I64) I64 {
+    c := m.C
+    d, n := c.Dim, c.Positions
+    weights := m.Params() + c.EncLayers * 6 * d + c.DecLayers * 10 * d
+    enc := 2 * n * 3 * d.Max(c.Mels) + 2 * n * d + n * (6 * d + c.Ffn) + encHeads(c) * n * n
+    cache := c.DecLayers * (2 * slots * c.Text * d + n * 2 * d)
+    dec := rows * (6 * d + c.Ffn) + c.DecHeads * rows * n.Max(c.Text) + outs * c.Vocab
+    return 4 * (weights + enc + cache + dec)
+}
+
+# heads of the encoder's attention scored at once
+fn encHeads(c whisper.Config&) I64 { return (ScoreRoom / (c.Positions * c.Positions)).Clamp(1, c.EncHeads) }
+
+# m on a device: its weights, the encoder's buffers for every position, a decoder's for `slots` sequences and steps of
+# up to `rows` rows, the last `outs` of them giving logits
+type Runner unique struct(dev mut device.Device&, ks kern.Set, C whisper.Config, Slots I64, Rows I64, Outs I64, misc device.Buf<F32>, table device.Buf<F32>, col device.Buf<F32>, ex device.Buf<F32>, eh device.Buf<F32>, eqkv device.Buf<F32>, eatt device.Buf<F32>, ef device.Buf<F32>, es device.Buf<F32>, eout device.Buf<F32>, x device.Buf<F32>, h device.Buf<F32>, qkv device.Buf<F32>, att device.Buf<F32>, f device.Buf<F32>, s device.Buf<F32>, logits device.Buf<F32>, ids device.Buf<U32>) {
+    dev
+    ks
+    C
+    Slots
+    Rows
+    Outs
+    misc                    # the arrays of other(m, i), at miscAt
+    table                   # the tokens' embeddings, [Vocab x Dim]: the lookup and the head
+    col                     # a convolution's patches
+    ex                      # the encoder's states (the log-mel first, then the first convolution's 2n rows)
+    eh
+    eqkv
+    eatt
+    ef
+    es                      # the encoder's attention scores, encHeads heads at a time
+    eout                    # the encoded positions, [n x Dim]
+    x                       # the decoder's step: the residual stream
+    h
+    qkv
+    att
+    f
+    s
+    logits
+    ids                     # a step's tokens, then its positions (Rows each)
+    enc mut Vec<device.Buf<F32>>& = Vec<device.Buf<F32>>()      # an encoder block's arrays, at encAt[l Pieces + i]
+    dec mut Vec<device.Buf<F32>>& = Vec<device.Buf<F32>>()
+    kv mut Vec<device.Buf<F32>>& = Vec<device.Buf<F32>>()       # a decoder layer's cache: keys [Slots x Text x Dim], then values
+    ckv mut Vec<device.Buf<F32>>& = Vec<device.Buf<F32>>()      # a decoder layer's keys and values of the encoded positions, [n x 2 Dim]
+    miscAt mut Array<I64>& = Array<I64>(Others)
+    encAt mut Array<I64>& = Array<I64>(C.EncLayers * Pieces)
+    decAt mut Array<I64>& = Array<I64>(C.DecLayers * Pieces)
+    hostIds mut Array<U32>& = Array<U32>(2 * Rows)
+    N I64 = 0               # the positions encoded, and crossed to
+    Bytes I64 = 0           # device memory held
+}
+
+fn buf(dev mut device.Device&, n I64) device.Buf<F32> ? device.VkError { return try device.Buf<F32>.Make(dev, n) }
+
+# m's weights sent to dev, the buffers made, the kernels compiled by the driver: VkError.Vulkan naming the buffer where
+# the device has not the room (Needs says what it takes). Unchecked: Refusal(m) is ""
+fn Runner.Make(dev mut device.Device&, m whisper.Model&, slots I64, rows I64, outs I64) Runner ? device.VkError {
+    assert Refusal(m) == "", "speech/whispervk does not run this model: " + Refusal(m)
+    c := m.C
+    d, n, ffn := c.Dim, c.Positions, c.Ffn
+    total I64 = 0
+    for i in range Others: total += other(m, i).Len()
+    r := Runner(dev, try kern.Set.Make(dev), c, slots, rows, outs, try buf(dev, total), try buf(dev, c.Vocab * d)
+        try buf(dev, 2 * n * 3 * d.Max(c.Mels)), try buf(dev, 2 * n * d), try buf(dev, n * d), try buf(dev, n * 3 * d), try buf(dev, n * d)
+        try buf(dev, n * ffn), try buf(dev, encHeads(c) * n * n), try buf(dev, n * d)
+        try buf(dev, rows * d), try buf(dev, rows * d), try buf(dev, rows * 3 * d), try buf(dev, rows * d), try buf(dev, rows * ffn)
+        try buf(dev, c.DecHeads * rows * n.Max(c.Text)), try buf(dev, outs * c.Vocab), try device.Buf<U32>.Make(dev, 2 * rows))
+    at I64 = 0
+    for i in range Others {
+        w :~ other(m, i)
+        r.miscAt[i] = at
+        r.misc.Upload(w, 0, at, w.Len())
+        at += w.Len()
+    }
+    r.table.UploadAll(m.Embed)
+    for l in range c.EncLayers: r.enc.Push(try sendBlock(dev, m.Enc[l], r.encAt, l * Pieces))
+    for l in range c.DecLayers {
+        r.dec.Push(try sendBlock(dev, m.Dec[l], r.decAt, l * Pieces))
+        r.kv.Push(try buf(dev, 2 * slots * c.Text * d))
+        r.ckv.Push(try buf(dev, n * 2 * d))
+    }
+    r.Bytes = Needs(m, slots, rows, outs)
+    try dev.Sync()
+    return r
+}
+
+# b's arrays in one buffer of dev, each one's first element into at[from + i]
+fn sendBlock(dev mut device.Device&, b whisper.Block&, at mut Array<I64>&, from I64) device.Buf<F32> ? device.VkError {
+    total I64 = 0
+    for i in range Pieces: total += piece(b, i).Len()
+    out := try buf(dev, total)
+    to I64 = 0
+    for i in range Pieces {
+        w :~ piece(b, i)
+        at[from + i] = to
+        out.Upload(w, 0, to, w.Len())
+        to += w.Len()
+    }
+    return out
+}
+
+# ---- the arithmetic ----
+
+fn mat(b device.Buf<F32>&, off I64, rows I64, cols I64, ld I64) device.DMat<F32> { return device.DMat<F32>(b, off, rows, cols, ld) }
+
+# dst[dOff ..] (rows x out) = beta dst + src[sOff ..] (rows x inn) W^T + bias: W [out x inn] at wOff of w, the bias at bOff
+fn lin(dev mut device.Device&, ks kern.Set&, dst device.Buf<F32>&, dOff I64, src device.Buf<F32>&, sOff I64, rows I64, w device.Buf<F32>&, wOff I64, bOff I64, inn I64, out I64, beta F32 = 0) {
+    if rows == 0 or out == 0: return
+    ks.Gemm(dev, mat(dst, dOff, rows, out, out), mat(src, sOff, rows, inn, inn), false, mat(w, wOff, out, inn, inn), true, 1, beta)
+    ks.Add(dev, dst, dOff, dst, dOff, w, bOff, rows * out, 1, out)
+}
+
+# rows of d: y's = x's layer norm by the gain and bias at g and g + 1 of at
+fn norm(dev mut device.Device&, ks kern.Set&, y device.Buf<F32>&, yOff I64, x device.Buf<F32>&, xOff I64, rows I64, d I64, w device.Buf<F32>&, gOff I64, bOff I64) {
+    ks.LayerNorm(dev, mat(y, yOff, rows, d, d), mat(x, xOff, rows, d, d), w, gOff, w, bOff, 1e-5)
+}
+
+# a batch of `groups` sequences' `heads` matrices, rows x cols each, over b from off: a row ld on, a head hstep, a
+# sequence gstep
+fn batch(b device.Buf<F32>&, off I64, rows I64, cols I64, ld I64, groups I64, gstep I64, heads I64, hstep I64) device.DBatch<F32> {
+    return device.DBatch<F32>(b, off, rows, cols, ld, groups, gstep, heads, hstep)
+}
+
+# x (rows x d) += the perceptron of its layer norm: the block's Ln3, Fc1, GELU, Fc2; h and f are its room
+fn perceptron(dev mut device.Device&, ks kern.Set&, x device.Buf<F32>&, h device.Buf<F32>&, f device.Buf<F32>&, rows I64, d I64, ffn I64, w device.Buf<F32>&, at Array<I64>&) {
+    norm(dev, ks, h, 0, x, 0, rows, d, w, at[Ln3G], at[Ln3B])
+    lin(dev, ks, f, 0, h, 0, rows, w, at[Fc1W], at[Fc1B], d, ffn)
+    ks.Map(dev, kern.Op.Gelu, f, 0, f, 0, rows * ffn)
+    lin(dev, ks, x, 0, f, 0, rows, w, at[Fc2W], at[Fc2B], ffn, d, 1)
+}
+
+# ---- the encoder ----
+
+# the n positions of mel ([Mels x 2n], a mel's frames in a row) encoded on the device, as whisper's Encode: they stay
+# there (Cross reads them; Encoded brings them to the host)
+fn (r mut Runner&) Encode(spec Array<F32>&, n I64) {
+    c := r.C
+    d, t := c.Dim, 2 * n
+    r.N = n
+    r.ex.Upload(spec, 0, 0, c.Mels * t)
+    # the first convolution: frame i's patch (channel ch, tap k) is mel[ch, i + k - 1]
+    r.ks.Patches(r.dev, r.col, 0, t, r.ex, 0, t, 1, c.Mels, t, 3, 1, 1)
+    lin(r.dev, r.ks, r.ex, 0, r.col, 0, t, r.misc, r.miscAt[Conv1W], r.miscAt[Conv1B], 3 * c.Mels, d)
+    r.ks.Map(r.dev, kern.Op.Gelu, r.ex, 0, r.ex, 0, t * d)
+    # the second, stride 2: position i's patch is frames 2i - 1 .. 2i + 1
+    r.ks.Patches(r.dev, r.col, 0, n, r.ex, 0, t, d, d, 1, 3, 2, 1)
+    lin(r.dev, r.ks, r.eh, 0, r.col, 0, n, r.misc, r.miscAt[Conv2W], r.miscAt[Conv2B], 3 * d, d)
+    r.ks.Map(r.dev, kern.Op.Gelu, r.eh, 0, r.eh, 0, n * d)
+    r.ks.Add(r.dev, r.ex, 0, r.eh, 0, r.misc, r.miscAt[EncPos], n * d)
+    for l in range c.EncLayers: r.encBlock(l, n)
+    norm(r.dev, r.ks, r.eout, 0, r.ex, 0, n, d, r.misc, r.miscAt[EncLnG], r.miscAt[EncLnB])
+}
+
+fn (r mut Runner&) encBlock(l I64, n I64) {
+    c := r.C
+    d := c.Dim
+    hd := d / c.EncHeads
+    w :~ r.enc[l]
+    at :~ r.encAt[l * Pieces:(l + 1) * Pieces]
+    norm(r.dev, r.ks, r.eh, 0, r.ex, 0, n, d, w, at[Ln1G], at[Ln1B])
+    lin(r.dev, r.ks, r.eqkv, 0, r.eh, 0, n, w, at[QkvW], at[QkvB], d, 3 * d)
+    # the heads' attention over all n positions, as many heads at once as the scores' buffer holds
+    per := encHeads(c)
+    scale := F32(1.0 / F64(hd).Sqrt())
+    for h0 in range 0, c.EncHeads, per {
+        g := per.Min(c.EncHeads - h0)
+        scores := batch(r.es, 0, n, n, n, 1, 0, g, n * n)
+        r.ks.GemmBatch(r.dev, scores, batch(r.eqkv, h0 * hd, n, hd, 3 * d, 1, 0, g, hd), false, batch(r.eqkv, d + h0 * hd, n, hd, 3 * d, 1, 0, g, hd), true)
+        r.ks.Softmax(r.dev, mat(r.es, 0, g * n, n, n), mat(r.es, 0, g * n, n, n), scale)
+        r.ks.GemmBatch(r.dev, batch(r.eatt, h0 * hd, n, hd, d, 1, 0, g, hd), scores, false, batch(r.eqkv, 2 * d + h0 * hd, n, hd, 3 * d, 1, 0, g, hd), false)
+    }
+    lin(r.dev, r.ks, r.ex, 0, r.eatt, 0, n, w, at[OW], at[OB], d, d, 1)
+    perceptron(r.dev, r.ks, r.ex, r.eh, r.ef, n, d, c.Ffn, w, at)
+}
+
+# the encoded positions ([N x Dim]) into host: read after this returns (it waits for the device)
+fn (r mut Runner&) Encoded(host mut Array<F32>&) ? device.VkError {
+    r.eout.Download(host, 0, 0, r.N * r.C.Dim)
+    try r.dev.Sync()
+}
+
+# everything asked so far has run (for timing: nothing else needs it)
+fn (r mut Runner&) Sync() ? device.VkError { try r.dev.Sync() }
+
+# ---- the decoder ----
+
+# the cross-attention's keys and values of every layer over the positions last encoded, as whisper's Cross
+fn (r mut Runner&) Cross() {
+    d := r.C.Dim
+    for l in range r.C.DecLayers {
+        at :~ r.decAt[l * Pieces:(l + 1) * Pieces]
+        lin(r.dev, r.ks, r.ckv[l], 0, r.eout, 0, r.N, r.dec[l], at[CKvW], at[CKvB], d, 2 * d)
+    }
+}
+
+# sequence from's first n positions of the cache copied to slot to (a beam taking another's place), as Decoder.Copy
+fn (r mut Runner&) Copy(from I64, to I64, n I64) {
+    if from == to or n == 0: return
+    c := r.C
+    span := r.Slots * c.Text * c.Dim
+    for l in range c.DecLayers {
+        b :~ r.kv[l]
+        b.CopyFrom(to * c.Text * c.Dim, b, from * c.Text * c.Dim, n * c.Dim)
+        b.CopyFrom(span + to * c.Text * c.Dim, b, span + from * c.Text * c.Dim, n * c.Dim)
+    }
+}
+
+# the rows from r0 that attend as one batch: a negative count for a causal run (rows of one sequence at positions
+# 0, 1, ...), else the rows at one position in sequences one after another
+fn run(k whisper.Decoder&, r0 I64) I64 {
+    n := k.Count()
+    m I64 = 1
+    if k.Pos(r0) == 0 {
+        for r0 + m < n and k.Slot(r0 + m) == k.Slot(r0) and k.Pos(r0 + m) == m: m += 1
+        if m > 1: return -m
+    }
+    for r0 + m < n and k.Slot(r0 + m) == k.Slot(r0) + m and k.Pos(r0 + m) == k.Pos(r0): m += 1
+    return m
+}
+
+# k's step through the decoder on the device, as whisper's Step: each row's keys and values cached at its position,
+# the logits of the last `out` rows into k.Logits. It waits for the device where logits are asked
+fn (r mut Runner&) Step(k mut whisper.Decoder&, out I64) ? device.VkError {
+    c := r.C
+    d, ffn, heads := c.Dim, c.Ffn, c.DecHeads
+    hd := d / heads
+    n := k.Count()
+    if n == 0: return
+    scale := F32(1.0 / F64(hd).Sqrt())
+    span := r.Slots * c.Text * d
+    for i in range n {
+        r.hostIds[i] = U32(k.Tok(i))
+        r.hostIds[r.Rows + i] = U32(k.Pos(i))
+    }
+    r.ids.UploadAll(r.hostIds)
+    r.ks.Gather(r.dev, mat(r.x, 0, n, d, d), mat(r.table, 0, c.Vocab, d, d), r.ids, 0)
+    r.ks.Gather(r.dev, mat(r.h, 0, n, d, d), mat(r.misc, r.miscAt[DecPos], c.Text, d, d), r.ids, r.Rows)
+    r.ks.Add(r.dev, r.x, 0, r.x, 0, r.h, 0, n * d)
+    for l in range c.DecLayers {
+        w :~ r.dec[l]
+        at :~ r.decAt[l * Pieces:(l + 1) * Pieces]
+        cache :~ r.kv[l]
+        norm(r.dev, r.ks, r.h, 0, r.x, 0, n, d, w, at[Ln1G], at[Ln1B])
+        lin(r.dev, r.ks, r.qkv, 0, r.h, 0, n, w, at[QkvW], at[QkvB], d, 3 * d)
+        for i in range n {
+            to := (k.Slot(i) * c.Text + k.Pos(i)) * d
+            cache.CopyFrom(to, r.qkv, i * 3 * d + d, d)
+            cache.CopyFrom(span + to, r.qkv, i * 3 * d + 2 * d, d)
+        }
+        r0 I64 = 0
+        for r0 < n {
+            m := run(k, r0)
+            base := k.Slot(r0) * c.Text * d
+            if m < 0 {
+                # a causal run of -m rows: [heads] scores of m x m, row t over columns 0 .. t
+                m = -m
+                scores := batch(r.s, 0, m, m, m, 1, 0, heads, m * m)
+                r.ks.GemmBatch(r.dev, scores, batch(r.qkv, r0 * 3 * d, m, hd, 3 * d, 1, 0, heads, hd), false, batch(cache, base, m, hd, d, 1, 0, heads, hd), true)
+                r.ks.Softmax(r.dev, mat(r.s, 0, heads * m, m, m), mat(r.s, 0, heads * m, m, m), scale, m)
+                r.ks.GemmBatch(r.dev, batch(r.att, r0 * d, m, hd, d, 1, 0, heads, hd), scores, false, batch(cache, span + base, m, hd, d, 1, 0, heads, hd), false)
+            } else {
+                # m sequences' one row each over their p positions: [m x heads] scores of 1 x p
+                p := k.Pos(r0) + 1
+                scores := batch(r.s, 0, 1, p, p, m, heads * p, heads, p)
+                r.ks.GemmBatch(r.dev, scores, batch(r.qkv, r0 * 3 * d, 1, hd, 3 * d, m, 3 * d, heads, hd), false, batch(cache, base, p, hd, d, m, c.Text * d, heads, hd), true)
+                r.ks.Softmax(r.dev, mat(r.s, 0, m * heads, p, p), mat(r.s, 0, m * heads, p, p), scale)
+                r.ks.GemmBatch(r.dev, batch(r.att, r0 * d, 1, hd, d, m, d, heads, hd), scores, false, batch(cache, span + base, p, hd, d, m, c.Text * d, heads, hd), false)
+            }
+            r0 += m
+        }
+        lin(r.dev, r.ks, r.x, 0, r.att, 0, n, w, at[OW], at[OB], d, d, 1)
+        # every row over the encoded positions: [heads] scores of n x N
+        norm(r.dev, r.ks, r.h, 0, r.x, 0, n, d, w, at[Ln2G], at[Ln2B])
+        lin(r.dev, r.ks, r.qkv, 0, r.h, 0, n, w, at[CQW], at[CQB], d, d)
+        cross := batch(r.s, 0, n, r.N, r.N, 1, 0, heads, n * r.N)
+        r.ks.GemmBatch(r.dev, cross, batch(r.qkv, 0, n, hd, d, 1, 0, heads, hd), false, batch(r.ckv[l], 0, r.N, hd, 2 * d, 1, 0, heads, hd), true)
+        r.ks.Softmax(r.dev, mat(r.s, 0, heads * n, r.N, r.N), mat(r.s, 0, heads * n, r.N, r.N), scale)
+        r.ks.GemmBatch(r.dev, batch(r.att, 0, n, hd, d, 1, 0, heads, hd), cross, false, batch(r.ckv[l], d, r.N, hd, 2 * d, 1, 0, heads, hd), false)
+        lin(r.dev, r.ks, r.x, 0, r.att, 0, n, w, at[COW], at[COB], d, d, 1)
+        perceptron(r.dev, r.ks, r.x, r.h, r.f, n, d, ffn, w, at)
+    }
+    if out == 0: return
+    first := n - out
+    norm(r.dev, r.ks, r.h, 0, r.x, first * d, out, d, r.misc, r.miscAt[DecLnG], r.miscAt[DecLnB])
+    r.ks.Gemm(r.dev, mat(r.logits, 0, out, c.Vocab, c.Vocab), mat(r.h, 0, out, d, d), false, mat(r.table, 0, c.Vocab, d, d), true)
+    r.logits.Download(k.Logits, 0, 0, out * c.Vocab)
+    try r.dev.Sync()
+}
+
+# ---- tests: the CPU is the oracle ----
+
+fn small() whisper.Config {
+    c := whisper.Config()
+    c.Dim, c.EncLayers, c.EncHeads, c.DecLayers, c.DecHeads = 32, 2, 4, 2, 2
+    c.Ffn, c.Vocab, c.Mels, c.Positions, c.Text = 64, 90, 8, 24, 16
+    return c
+}
+
+fn gap(a Array<F32>&, b Array<F32>&, n I64) F64 {
+    worst F64 = 0
+    for i in range n: worst = worst.Max((F64(a[i]) - F64(b[i])).Abs())
+    return worst
+}
+
+# the same step on both: the greatest difference of its logits
+fn both(m whisper.Model&, r mut Runner&, k mut whisper.Decoder&, kd mut whisper.Decoder&, out I64) F64 ? device.VkError {
+    m.Step(k, out)
+    try r.Step(kd, out)
+    return gap(k.Logits, kd.Logits, out * m.C.Vocab)
+}
+
+test Runner "a random Whisper on the device against the CPU: the encoded positions (whole and a shorter window), a prompt's step, single steps, beams in slots after copies - logits to 1e-4" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Whisper on the device")
+        return
+    }
+    c := small()
+    m := whisper.Model.Random(c, 7)
+    slots, rows := 6, 8
+    r := try Runner.Make(d, m, slots, rows, 3)
+    e := whisper.Encoder(m, c.Positions)
+    k := whisper.Decoder(m, slots, rows, 3)
+    kd := whisper.Decoder(m, slots, rows, 3, false)
+    worst F64 = 0
+    for n in [c.Positions, 10] {
+        spec := Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.001 for i in range c.Mels * 2 * n]
+        m.Encode(e, spec, n)
+        r.Encode(spec, n)
+        got := Array<F32>(n * c.Dim)
+        try r.Encoded(got)
+        eg := gap(e.Out, got, n * c.Dim)
+        Println("encoder, " + $n + " positions: within " + $eg)
+        assert eg < 1e-4, "the encoder off by " + $eg
+        m.Cross(k, e.Out, n)
+        r.Cross()
+        # a prompt of 4 in slot 0, then two single steps
+        k.Reset()
+        kd.Reset()
+        for i in range 4 {
+            k.Add(I32(3 + 5 * i), i, 0)
+            kd.Add(I32(3 + 5 * i), i, 0)
+        }
+        worst = worst.Max(try both(m, r, k, kd, 1))
+        for p in range 4, 6 {
+            k.Reset()
+            kd.Reset()
+            k.Add(I32(11 * p), p, 0)
+            kd.Add(I32(11 * p), p, 0)
+            worst = worst.Max(try both(m, r, k, kd, 1))
+        }
+        # three beams of it into slots 3 .. 5 (one from slot 0 twice over), a row each; then back into 0 .. 2, crossed
+        for step in range 2 {
+            half := 3 - 3 * step
+            k.Reset()
+            kd.Reset()
+            for b in range 3 {
+                from := 0 if step == 0 else 3 + (b + 1) % 3
+                k.Copy(from, half + b, 6 + step, c)
+                r.Copy(from, half + b, 6 + step)
+                k.Add(I32(20 + 7 * b + step), 6 + step, half + b)
+                kd.Add(I32(20 + 7 * b + step), 6 + step, half + b)
+            }
+            worst = worst.Max(try both(m, r, k, kd, 3))
+        }
+        # rows that are no batch: a sequence's two positions past 0, and another's
+        k.Reset()
+        kd.Reset()
+        for row in [[40, 8, 0], [41, 9, 0], [42, 8, 2]] {
+            k.Add(I32(row[0]), row[1], row[2])
+            kd.Add(I32(row[0]), row[1], row[2])
+        }
+        worst = worst.Max(try both(m, r, k, kd, 3))
+    }
+    Println("decoder on " + d.Name + ": logits within " + $worst + " of the CPU's")
+    assert worst < 1e-4, "logits off by " + $worst
+}
+
+test Runner "whisper-tiny's weights on the device (where the model is fetched): the encoded 1500 positions and a prompt's and three steps' logits within 1e-3 of the CPU's" {
+    dir := mel.Cache() + "/models/openai--whisper-tiny"
+    m := try whisper.Model.Load(dir) catch {
+        Println("skipped: no " + dir)
+        return
+    }
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("whisper-tiny on the device")
+        return
+    }
+    c := m.C
+    n := c.Positions
+    r := try Runner.Make(d, m, 1, 8, 1)
+    e := whisper.Encoder(m, n)
+    k := whisper.Decoder(m, 1, 8, 1)
+    kd := whisper.Decoder(m, 1, 8, 1, false)
+    spec := Array<F32>[F32(((i * 7919) % 2001) - 1000) * 0.0005 for i in range c.Mels * 2 * n]
+    m.Encode(e, spec, n)
+    r.Encode(spec, n)
+    got := Array<F32>(n * c.Dim)
+    try r.Encoded(got)
+    eg := gap(e.Out, got, n * c.Dim)
+    m.Cross(k, e.Out, n)
+    r.Cross()
+    worst F64 = 0
+    for step in range 4 {
+        k.Reset()
+        kd.Reset()
+        for i in range (4 if step == 0 else 1) {
+            p := i if step == 0 else 3 + step
+            tok := I32(50258 + i) if step == 0 else I32(400 + 91 * step)
+            k.Add(tok, p, 0)
+            kd.Add(tok, p, 0)
+        }
+        worst = worst.Max(try both(m, r, k, kd, 1))
+    }
+    Println("whisper-tiny on " + d.Name + ": encoder within " + $eg + ", logits within " + $worst)
+    assert eg < 1e-3 and worst < 1e-3, "encoder " + $eg + ", logits " + $worst
+}

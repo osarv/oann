@@ -5,7 +5,7 @@
 OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
-TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/nf4.olang kernels/spike.olang \
+TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/eigen.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/nf4.olang kernels/spike.olang \
 	ad/graph.olang ad/descent.olang ad/score.olang tools/gradcheck.olang nn/layers.olang nn/moe.olang nn/ngram.olang nn/optim.olang nn/train.olang nn/tune.olang nn/qlora.olang nn/dist.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang nn/ternary.olang nn/potts.olang nn/seqsettle.olang nn/diffusion.olang nn/chain.olang nn/lines.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang models/qwen.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang data/chat.olang io/checkpoint.olang io/onnx.olang io/runlog.olang \
@@ -16,15 +16,17 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	archnet/encode.olang archnet/offline.olang archnet/toy.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
 	surgery/model.olang surgery/ops.olang \
 	llm/bpe.olang llm/jinja.olang llm/model.olang llm/engine.olang llm/chat.olang llm/gguf.olang llm/vision.olang \
-	speech/mel.olang speech/whisper.olang speech/transcribe.olang speech/kws.olang speech/speak.olang speech/vits.olang speech/g2p.olang
+	speech/mel.olang speech/whisper.olang speech/transcribe.olang speech/kws.olang speech/speak.olang speech/vits.olang speech/g2p.olang speech/speaker.olang speech/diarize.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers
 # nothing translates a CUDA header and everything builds for the CPU alone. GPU=0 leaves it out on a machine that has them
 GPUDEFINE = $(if $(filter 0,$(GPU)),,$(if $(wildcard /usr/include/cuda_runtime_api.h),-define Gpu=true,))
+# -define Vulkan=true where Vulkan's headers are (libvulkan-dev): what builds kernels/vk into a program (VK=0: never)
+VKDEFINE = $(if $(filter 0,$(VK)),,$(if $(wildcard /usr/include/vulkan/vulkan.h),-define Vulkan=true,))
 
 # the GPU backend's tests: the CPU's tests run green either way (they plan on the CPU); these need the define
-GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang ad/gpu_test.olang
+GPUTESTS = kernels/gpu/device.olang kernels/gpu/blas.olang kernels/gpu/kern.olang dyn/gpu_test.olang ad/gpu_test.olang llm/gpu.olang
 
 # where WSL keeps its libcuda.so.1, put first on the loader's path for the GPU targets: a native Linux driver package
 # installed beside the toolkit (libnvidia-compute) can shadow WSL's in the loader's cache, and CUDA then finds no
@@ -33,7 +35,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpumoe gpugroup bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help vktest vkgemm vktune vklintune vkllm whispervk diloco oanngen visionbench oannlisten oannwho speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe gpugroup bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -50,6 +52,43 @@ test:
 # CUDA finds no device) - needs the CUDA toolkit's headers and libraries (cudart, cublas, cublasLt) and an NVIDIA GPU
 gputest:
 	$(GPUENV) $(OLANG) test -define Gpu=true $(GPUTESTS)
+
+# the Vulkan backend's tests (docs/vulkan.md), any GPU with a Vulkan driver - AMD, Intel, NVIDIA, a CPU's software Vulkan
+# (Mesa's lavapipe) - against the CPU kernels: -define Vulkan=true, which needs Vulkan's headers (libvulkan-dev) alone;
+# each test says it is skipped where there is no Vulkan device. OANN_VK_DEVICE=N picks one of several
+VKTESTS = kernels/vk/spirv.olang kernels/vk/device.olang kernels/vk/kern.olang kernels/vk/lm_test.olang llm/vk.olang speech/whispervk.olang
+vktest:
+	$(OLANG) test -define Vulkan=true $(VKTESTS)
+
+# a language model's decoding on a Vulkan device (llm/vk) checked against the CPU's step, then tokens a second by batch
+# (bench/vkllm.olang) - ARGS: MODEL_DIR [steps] [batch ...]
+vkllm:
+	$(OLANG) build -define Vulkan=true -output build/bench_vkllm bench/vkllm.olang
+	./build/bench_vkllm $(ARGS)
+
+# GEMM GFLOPS of kernels/gemm (1 and 4 threads) against the Vulkan device's product, operands resident, medians
+# (bench/vkgemm.olang) - ARGS: rounds
+vkgemm:
+	$(OLANG) build -define Vulkan=true -output build/bench_vkgemm bench/vkgemm.olang
+	./build/bench_vkgemm $(ARGS)
+
+# every plan of the Vulkan product (block, workgroup, staged operands, fused steps) checked and timed on the device
+# (bench/vktune.olang) - ARGS: rounds [M K N ...]
+vktune:
+	$(OLANG) build -define Vulkan=true -output build/bench_vktune bench/vktune.olang
+	./build/bench_vktune $(ARGS)
+
+# every plan of a language model's linear product (llm/vk's LinPlan) checked and timed on the device
+# (bench/vklintune.olang) - ARGS: rounds
+vklintune:
+	$(OLANG) build -define Vulkan=true -output build/bench_vklintune bench/vklintune.olang
+	./build/bench_vklintune $(ARGS)
+
+# Whisper's encoder (30 s) and a greedy decoder step on the CPU against the Vulkan device (bench/whispervk.olang) -
+# ARGS: a shape (tiny, base, small, medium, large: random weights, no files) or a model's directory, then the rounds
+whispervk:
+	$(OLANG) build -define Vulkan=true -output build/bench_whispervk bench/whispervk.olang
+	./build/bench_whispervk $(ARGS)
 
 # G-M1: GEMM GFLOPS of kernels/gemm (1 and 4 threads) against cuBLAS on the MLP's and the settle's shapes, F32 and BF16,
 # interleaved, medians (bench/gpugemm.olang) - ARGS: rounds, and the CPU's thread counts after it
@@ -105,6 +144,12 @@ arenaad:
 gpulm:
 	$(OLANG) build $(GPUDEFINE) -output build/bench_gpulm bench/gpulm.olang
 	$(GPUENV) ./build/bench_gpulm $(ARGS)
+
+# a language model's decoding on the GPU (llm/gpu) checked against the CPU's step, then tokens a second by batch
+# (bench/gpullm.olang) - ARGS: MODEL_DIR [steps] [batch ...]
+gpullm:
+	$(OLANG) build -define Gpu=true -output build/bench_gpullm bench/gpullm.olang
+	$(GPUENV) ./build/bench_gpullm $(ARGS)
 
 # a mixture-of-experts layer (nn/moe on the device) against the dense gated perceptron of its active size: median steps
 # and the mixture's cost over the dense layer's (bench/gpumoe.olang) - ARGS: tokens steps f32|bf16 experts k D...
@@ -184,10 +229,16 @@ oannlisten:
 	$(OLANG) build -output build/oann-listen speech/listen.olang
 	$(if $(ARGS),./build/oann-listen $(ARGS),)
 
+# oann-who: who speaks when (speech/who.olang, speech/README.md), built to build/oann-who - ARGS: MODEL.onnx CLIP.wav
+# and its flags (none: only builds it)
+oannwho:
+	$(OLANG) build -output build/oann-who speech/who.olang
+	$(if $(ARGS),./build/oann-who $(ARGS),)
+
 # oann-gen: completions of a JSON-lines file of prompts by an open-weight model (llm/gen.olang, llm/README.md), built
 # to build/oann-gen - ARGS: MODEL prompts.jsonl out.jsonl and its flags (none: only builds it)
 oanngen:
-	$(OLANG) build -output build/oann-gen llm/gen.olang
+	$(OLANG) build $(GPUDEFINE) $(VKDEFINE) -output build/oann-gen llm/gen.olang
 	$(if $(ARGS),./build/oann-gen $(ARGS),)
 
 # Whisper's real-time factor (bench/speech.olang) - ARGS: MODEL_DIR CLIP.wav [rounds] [threads ...]

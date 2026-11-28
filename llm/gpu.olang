@@ -1,0 +1,455 @@
+# llm/gpu - a language model's decoding step on the GPU: model.Model.Step's work on a CUDA device, for llm/engine's
+# batches (oann-gen --device gpu).
+#
+#     dev := try gdev.Device.Open()
+#     dec := try Decoder.Make(dev, m, e.State.Rows, e.Batch, e.Cache)
+#     for not e.Idle() {
+#         if e.Begin(): try dec.Step(m, e.State, e.Cache)
+#         for d in e.End() { ... }
+#     }
+#
+# What is where. The weights (BF16, row-major: a model loaded without AMX tiles, Model.Load's exact) go up once; the
+# keys and values of every page live on the device alone (a Cache made with device = true holds the page table and the
+# free pages); each step sends up its rows (tokens, positions, slots, the page table, the rotations' angles) and brings
+# down the logits of the rows that want them, which the host samples. The products are cuBLASLt's, BF16 x BF16 summed
+# in F32 (kernels/gpu/blas), planned once for each row count (a multiple of 8) and used by every layer; everything
+# between them is src/llm.cu's kernels, one launch each - a layer is 4 products and 7 short launches.
+#
+# What runs: dense decoders whose rows attend to every earlier position - Qwen3, Qwen2, Llama, Mistral, Granite, SmolLM3,
+# Phi - in BF16. Refusal names what does not (INT8 and INT4 weights, a mixture of experts, sliding windows, Gemma's
+# post-norms and GELU, OLMoE's wide QK-norm, image rows).
+#
+# Built only with -define Gpu=true; llm/gen imports it under `if Gpu`.
+
+import gdev "../kernels/gpu/device"
+import "../kernels/gpu/kern"
+import "../kernels/gpu/blas"
+import "model"
+import "std/os"
+import "std/time"
+
+Gpu Bool = false
+
+assert Gpu, "llm/gpu is the GPU's and is built only with -define Gpu=true: import it under if Gpu { ... }"
+
+LlmText := String(embed "../kernels/gpu/src/llm.cu")
+Names Array<String>& = ["llm_embed", "llm_norm", "llm_heads", "llm_attend", "llm_add", "llm_swiglu", "llm_bias", "llm_scale", "llm_combine", "llm_attend_seq"]
+KEmbed I64 = 0
+KNorm I64 = 1
+KHeads I64 = 2
+KAttend I64 = 3
+KAdd I64 = 4
+KSwiglu I64 = 5
+KBias I64 = 6
+KScale I64 = 7
+KCombine I64 = 8
+KAttendSeq I64 = 9
+
+# the rows a product is planned for: a step's, rounded up
+Round I64 = 8
+# the threads of a block of the heads' and the attention's kernels (a power of two, at most 256)
+HeadBlock I64 = 128
+# the weights' offsets are multiples of this many elements, so one plan's alignment is every layer's
+Align I64 = 64
+
+fn roundUp(n I64, m I64) I64 { return (n + m - 1) / m * m }
+
+# why m does not run here ("" where it does)
+fn Refusal(m model.Model&) String {
+    c model.Config& = m.C
+    if m.Tile: return "its weights are packed for AMX tiles (load it exact)"
+    if m.Int8 or m.Int4: return "INT8 and INT4 weights (BF16 alone)"
+    if c.Experts > 0: return "a mixture of experts"
+    if c.PostNorms or c.Gelu: return "Gemma's post-norms and GELU"
+    if c.QkWide: return "OLMoE's QK-norm over whole rows"
+    if c.Heads / c.KvHeads > 8: return "more than 8 query heads to a key-value head"
+    if c.HeadDim > 256: return "heads wider than 256"
+    for li in range c.Layers {
+        if c.WindowOf(li) > 0: return "sliding-window layers"
+    }
+    return ""
+}
+
+# the device memory m's weights take, in bytes
+fn WeightBytes(m model.Model&) I64 {
+    n I64 = 0
+    for i in range weightCount(m): n += roundUp(weightAt(m, i).Len(), Align) * 2
+    return n
+}
+
+# m's weight matrices in their order on the device: each layer's Qkv, O, GateUp, Down, then the head, then the embedding
+# (where it is not the head)
+fn weightCount(m model.Model&) I64 { return 4 * m.C.Layers + (1 if m.C.Tied else 2) }
+
+fn weightAt(m model.Model&, i I64) Array<BF16>& {
+    if i == 4 * m.C.Layers: return m.Head.W
+    if i > 4 * m.C.Layers: return m.Embed.W
+    l :~ m.Layers[i / 4]
+    return match i % 4 {
+        case 0: l.Qkv.W
+        case 1: l.O.W
+        case 2: l.GateUp.W
+        case _: l.Down.W
+    }
+}
+
+# the products of one row count: a layer's four
+type plans unique struct(dev gdev.Device&) {
+    made Bool = false
+    qkv blas.Product<F32, BF16, BF16> = blas.Product<F32, BF16, BF16>(dev)
+    o blas.Product<F32, BF16, BF16> = blas.Product<F32, BF16, BF16>(dev)
+    gateUp blas.Product<F32, BF16, BF16> = blas.Product<F32, BF16, BF16>(dev)
+    down blas.Product<F32, BF16, BF16> = blas.Product<F32, BF16, BF16>(dev)
+}
+
+# the head's product of one count of output rows
+type headPlan unique struct(dev gdev.Device&) {
+    made Bool = false
+    p blas.Product<F32, BF16, BF16> = blas.Product<F32, BF16, BF16>(dev)
+}
+
+# a model on the device, for steps of at most rows rows, outs of them wanting logits, over a cache of these pages
+type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I64, slots I64, maxPages I64, pages I64, cap I64, half I64, nw I64, w gdev.Buf<BF16>, g gdev.Buf<F32>, k gdev.Buf<BF16>, v gdev.Buf<BF16>, x gdev.Buf<F32>, hb gdev.Buf<BF16>, y gdev.Buf<F32>, q gdev.Buf<BF16>, part gdev.Buf<F32>, scores gdev.Buf<F32>, logits gdev.Buf<F32>, ints gdev.Buf<I32>, ang gdev.Buf<F32>) {
+    dev
+    kit
+    Rows I64 = rows
+    Outs I64 = outs
+    slots
+    maxPages
+    Pages I64 = pages
+    cap                 # positions a row may attend to
+    half
+    w                   # every weight matrix, row-major, at wAt
+    g                   # the gains and biases, at gAt
+    k                   # the cache's keys and values (src/llm.cu, "The cache")
+    v
+    x                   # the residual stream, Dim a row
+    hb                  # what a product reads
+    y                   # what it gives
+    q                   # the rows' queries
+    part                # each (row, head, page)'s partial softmax: maximum, sum, weighted values (Split)
+    scores              # each (row, head)'s scores (not Split)
+    logits
+    ints                # tokens, positions, slots, last positions (Rows each), the output rows (Outs), the page table
+    ang                 # cos, then sin: Rows x half each
+    wAt mut Array<I64>& = Array<I64>(nw)
+    gAt mut Vec<I64>& = Vec<I64>()          # a layer's 8: Norm1, Norm2, QNorm, KNorm (-1: none), then its four biases (-1: none); then Final
+    hostInts mut Array<I32>& = Array<I32>(4 * rows + outs + slots * maxPages)
+    byRows mut Vec<plans>& = Vec<plans>()   # index: rows / Round
+    byOuts mut Vec<headPlan>& = Vec<headPlan>()
+    Bytes I64 = 0       # device memory held
+    # the attention split by pages (flash decoding, llm_attend and llm_combine), or a block for each row's key-value head
+    # over all its pages (llm_attend_seq); OANN_GPU_ATTN=split or seq, split by default (1.7-3x faster on an RTX 4060)
+    Split Bool = (try os.Env("OANN_GPU_ATTN") catch default "") != "seq"
+    Profile Bool = false    # waits after each part of a step, so s.Times says where the time goes (slower): products, attention, the rest, steps
+    mark I64 = 0
+}
+
+# m on dev, for an engine's State (rows a step, outs sequences) and its Cache (made with device = true): the buffers
+# made, the weights sent up, the kernels compiled. GpuError.Cuda naming cudaMalloc where the device has not the room
+fn Decoder.Make(dev mut gdev.Device&, m model.Model&, rows I64, outs I64, cache model.Cache&, maxCtx I64) Decoder ? gdev.GpuError {
+    why := Refusal(m)
+    assert why == "", "llm/gpu does not run this model: " + why
+    c model.Config& = m.C
+    d, dh, heads, kv, f := c.Dim, c.HeadDim, c.Heads, c.KvHeads, c.Ffn
+    w3 := (heads + 2 * kv) * dh
+    rp := roundUp(rows, Round)
+    op := roundUp(outs, Round)
+    nw := weightCount(m)
+    total I64 = 0
+    for i in range nw: total += roundUp(weightAt(m, i).Len(), Align)
+    span := c.Layers * cache.Pages * kv * model.PageSize * dh
+    widest := d.Max(heads * dh).Max(f)
+    cap := maxCtx + model.PageSize
+    half := c.RotHalf()
+    nints := 4 * rows + outs + cache.Slots * cache.MaxPages
+    gains := Vec<F32>()
+    dec := Decoder(dev, try kern.Kit.Compile(dev, kern.ElemSource() + LlmText, Names), rows, outs, cache.Slots, cache.MaxPages, cache.Pages, cap, half, nw
+        try gdev.Buf<BF16>.Make(dev, total), try gdev.Buf<F32>.Make(dev, c.Layers * (2 * d + 2 * dh + w3 + 2 * d + 2 * f) + d)
+        try gdev.Buf<BF16>.Make(dev, span), try gdev.Buf<BF16>.Make(dev, span), try gdev.Buf<F32>.Make(dev, rp * d)
+        try gdev.Buf<BF16>.Make(dev, rp * widest), try gdev.Buf<F32>.Make(dev, rp * (2 * f).Max(d).Max(w3)), try gdev.Buf<BF16>.Make(dev, rp * heads * dh)
+        try gdev.Buf<F32>.Make(dev, rows * heads * cache.MaxPages * (dh + 2)), try gdev.Buf<F32>.Make(dev, rows * heads * cap), try gdev.Buf<F32>.Make(dev, op * m.Head.Out), try gdev.Buf<I32>.Make(dev, nints)
+        try gdev.Buf<F32>.Make(dev, 2 * rows * half))
+    dec.Bytes = 2 * total + 2 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * (cache.MaxPages * (dh + 2) + cap) + 4 * op * m.Head.Out
+    # the weights, each at a multiple of Align
+    at I64 = 0
+    for i in range nw {
+        w :~ weightAt(m, i)
+        dec.wAt[i] = at
+        dec.w.Upload(w, 0, at, w.Len())
+        at += roundUp(w.Len(), Align)
+    }
+    # the gains and biases, one array
+    for li in range c.Layers {
+        l :~ m.Layers[li]
+        dec.gain(gains, l.Norm1)
+        dec.gain(gains, l.Norm2)
+        dec.gain(gains, l.QNorm)
+        dec.gain(gains, l.KNorm)
+        dec.gain(gains, l.Qkv.Bias)
+        dec.gain(gains, l.O.Bias)
+        dec.gain(gains, l.GateUp.Bias)
+        dec.gain(gains, l.Down.Bias)
+    }
+    dec.gain(gains, m.Final)
+    host := gains.ToArray()
+    dec.g.Upload(host, 0, 0, host.Len())
+    # a page's stale keys and values are never read (a row attends to positions written since its page was taken), but
+    # the buffers start as zeros all the same
+    kern.Zero(dev, dec.k.Addr(0), span * 2)
+    kern.Zero(dev, dec.v.Addr(0), span * 2)
+    kern.Zero(dev, dec.hb.Addr(0), rp * widest * 2)
+    kern.Zero(dev, dec.x.Addr(0), rp * d * 4)
+    for _ in range rp / Round + 1: dec.byRows.Push(plans(dev))
+    for _ in range op / Round + 1: dec.byOuts.Push(headPlan(dev))
+    try dev.Sync()
+    return dec
+}
+
+# a's place noted (-1 where it is empty) and a appended to the gains
+fn (dec mut Decoder&) gain(gains mut Vec<F32>&, a Array<F32>&) {
+    dec.gAt.Push(gains.Len() if a.Len() > 0 else -1)
+    for x in a: gains.Push(x)
+}
+
+# the address of the gains noted at i (0: none)
+fn (dec Decoder&) gainAddr(i I64) U64 { return dec.g.Addr(dec.gAt[i]) if dec.gAt[i] >= 0 else 0 }
+
+# weight matrix i as the product's right operand: out x in
+fn (dec Decoder&) weight(i I64, w model.Linear&) gdev.DMat<BF16> { return gdev.DMat<BF16>(dec.w, dec.wAt[i], w.Out, w.In, w.In) }
+
+# the plans for steps of rp rows, made the first time: layer 0's views stand for every layer's
+fn (dec mut Decoder&) plan(m model.Model&, rp I64) ? gdev.GpuError {
+    if dec.byRows[rp / Round].made: return
+    d := dec.dev
+    l :~ m.Layers[0]
+    ps :~ dec.byRows.RefMut(rp / Round)
+    ps.qkv = try blas.Product<F32, BF16, BF16>.Plan(d, gdev.DMat<F32>(dec.y, 0, rp, l.Qkv.Out, l.Qkv.Out), gdev.DMat<BF16>(dec.hb, 0, rp, l.Qkv.In, l.Qkv.In), false, dec.weight(0, l.Qkv), true)
+    ps.o = try blas.Product<F32, BF16, BF16>.Plan(d, gdev.DMat<F32>(dec.y, 0, rp, l.O.Out, l.O.Out), gdev.DMat<BF16>(dec.hb, 0, rp, l.O.In, l.O.In), false, dec.weight(1, l.O), true)
+    ps.gateUp = try blas.Product<F32, BF16, BF16>.Plan(d, gdev.DMat<F32>(dec.y, 0, rp, l.GateUp.Out, l.GateUp.Out), gdev.DMat<BF16>(dec.hb, 0, rp, l.GateUp.In, l.GateUp.In), false, dec.weight(2, l.GateUp), true)
+    ps.down = try blas.Product<F32, BF16, BF16>.Plan(d, gdev.DMat<F32>(dec.y, 0, rp, l.Down.Out, l.Down.Out), gdev.DMat<BF16>(dec.hb, 0, rp, l.Down.In, l.Down.In), false, dec.weight(3, l.Down), true)
+    ps.made = true
+}
+
+# y[: rp, : w.Out] = hb[: rp, : w.In] W^T + b for weight matrix i, the bias noted at gains' bi (rows n of them)
+fn (dec mut Decoder&) product(p blas.Product<F32, BF16, BF16>&, i I64, w model.Linear&, rp I64, n I64, bi I64) {
+    d := dec.dev
+    out := gdev.DMat<F32>(dec.y, 0, rp, w.Out, w.Out)
+    p.Run(d, out, gdev.DMat<BF16>(dec.hb, 0, rp, w.In, w.In), dec.weight(i, w))
+    if dec.gAt[bi] >= 0: dec.elems(KBias, n * w.Out, dec.y.Addr(0), dec.gainAddr(bi), kern.Arg(n), kern.Arg(w.Out))
+}
+
+# Profile: what was enqueued since the last lap has run; its time goes to s.Times[part]
+fn (dec mut Decoder&) lap(s mut model.State&, part I64) ? gdev.GpuError {
+    if not dec.Profile: return
+    d := dec.dev
+    try d.Sync()
+    now := time.Now()
+    s.Times[part] += now - dec.mark
+    dec.mark = now
+}
+
+# kernel k over n elements, a grid-stride launch
+fn (dec mut Decoder&) elems(k I64, n I64, args ...U64) {
+    if n <= 0: return
+    d := dec.dev
+    kern.LaunchKit(d, dec.kit, k, kern.Blocks(n), kern.Block, ...args)
+}
+
+# kernel k, a block of `block` threads for each of items
+fn (dec mut Decoder&) blocks(k I64, items I64, block I64, args ...U64) {
+    if items <= 0: return
+    d := dec.dev
+    kern.LaunchKit(d, dec.kit, k, items, block, ...args)
+}
+
+# the logits of the rows of s that want them, into s.Logits, as Model.Step gives them: one pass through every layer on
+# the device. k is the cache's page table (made with device = true); the keys and values are here
+fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ? gdev.GpuError {
+    t0 := time.Now()
+    c model.Config& = m.C
+    n := s.N
+    if n == 0: return
+    assert n <= dec.Rows and s.NOut <= dec.Outs, "a step larger than the decoder was made for"
+    dev := dec.dev
+    d, dh, heads, kv, f := c.Dim, c.HeadDim, c.Heads, c.KvHeads, c.Ffn
+    hc := heads + 2 * kv
+    rows := dec.Rows
+    rp := roundUp(n, Round)
+    try dec.plan(m, rp)
+    # the step's rows and the page table
+    hi :~ dec.hostInts
+    for r in range n {
+        assert s.Given[r] < 0, "llm/gpu reads tokens alone: a row with a given embedding (an image's)"
+        hi[r] = s.Tok[r]
+        hi[rows + r] = I32(s.Pos[r])
+        hi[2 * rows + r] = I32(s.Slot[r])
+        hi[3 * rows + r] = I32(s.Last[r])
+        if s.Out[r] >= 0: hi[4 * rows + s.Out[r]] = I32(r)
+    }
+    tableAt := 4 * rows + dec.Outs
+    for i in range dec.slots * dec.maxPages: hi[tableAt + i] = k.Table[i]
+    dec.ints.Upload(hi, 0, 0, hi.Len())
+    tok, pos, slot, last, outs, table := dec.ints.Addr(0), dec.ints.Addr(rows), dec.ints.Addr(2 * rows), dec.ints.Addr(3 * rows), dec.ints.Addr(4 * rows), dec.ints.Addr(tableAt)
+    m.Angles(s)
+    half := dec.half
+    dec.ang.Upload(s.Cos(), 0, 0, n * half)
+    dec.ang.Upload(s.Sin(), 0, rows * half, n * half)
+    cs, sn := dec.ang.Addr(0), dec.ang.Addr(rows * half)
+    x, hb, y, q := dec.x.Addr(0), dec.hb.Addr(0), dec.y.Addr(0), dec.q.Addr(0)
+    table0 := dec.wAt[4 * c.Layers + (0 if c.Tied else 1)]
+    dec.elems(KEmbed, n * d, x, tok, dec.w.Addr(table0), kern.Arg(n), kern.Arg(d), kern.Arg(F32(c.EmbedScale)))
+    rs := kern.Arg(F32(c.ResScale))
+    eps := kern.Arg(c.Eps)
+    ps :~ dec.byRows[rp / Round]
+    dec.mark = t0
+    for li in range c.Layers {
+        l :~ m.Layers[li]
+        gi := 8 * li
+        layerPages := kern.Arg(li * dec.Pages)
+        dec.blocks(KNorm, n, kern.Block, hb, x, dec.gainAddr(gi), U64(0), kern.Arg(d), eps)
+        try dec.lap(s, 2)
+        dec.product(ps.qkv, 4 * li, l.Qkv, rp, n, gi + 4)
+        try dec.lap(s, 0)
+        dec.blocks(KHeads, n * hc, HeadBlock, q, dec.k.Addr(0), dec.v.Addr(0), y, cs, sn, pos, slot, table, dec.gainAddr(gi + 2), dec.gainAddr(gi + 3)
+            kern.Arg(heads), kern.Arg(kv), kern.Arg(dh), kern.Arg(half), layerPages, kern.Arg(dec.maxPages), kern.Arg(I64(1 if c.Rotates(li) else 0)), eps)
+        if dec.Split {
+            dec.blocks(KAttend, n * kv * dec.maxPages, HeadBlock, dec.part.Addr(0), q, dec.k.Addr(0), dec.v.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
+                kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.maxPages), kern.Arg(F32(c.Scale())))
+            dec.blocks(KCombine, n * heads, dh.Min(256), hb, dec.part.Addr(0), last, kern.Arg(heads), kern.Arg(dh), kern.Arg(dec.maxPages))
+        } else {
+            dec.blocks(KAttendSeq, n * kv, HeadBlock, hb, q, dec.k.Addr(0), dec.v.Addr(0), dec.scores.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
+                kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.cap), kern.Arg(F32(c.Scale())))
+        }
+        try dec.lap(s, 1)
+        dec.product(ps.o, 4 * li + 1, l.O, rp, n, gi + 5)
+        try dec.lap(s, 0)
+        dec.elems(KAdd, n * d, x, y, kern.Arg(n * d), rs)
+        dec.blocks(KNorm, n, kern.Block, hb, x, dec.gainAddr(gi + 1), U64(0), kern.Arg(d), eps)
+        try dec.lap(s, 2)
+        dec.product(ps.gateUp, 4 * li + 2, l.GateUp, rp, n, gi + 6)
+        dec.elems(KSwiglu, n * f, hb, y, kern.Arg(n), kern.Arg(f))
+        dec.product(ps.down, 4 * li + 3, l.Down, rp, n, gi + 7)
+        try dec.lap(s, 0)
+        dec.elems(KAdd, n * d, x, y, kern.Arg(n * d), rs)
+    }
+    # the final norm of the rows that want logits, gathered in order, and the head
+    no := s.NOut
+    if no > 0 {
+        op := roundUp(no, Round)
+        hw := m.Head.Out
+        lg := gdev.DMat<F32>(dec.logits, 0, op, hw, hw)
+        head := dec.weight(4 * c.Layers, m.Head)
+        if not dec.byOuts[op / Round].made {
+            hp :~ dec.byOuts.RefMut(op / Round)
+            hp.p = try blas.Product<F32, BF16, BF16>.Plan(dev, lg, gdev.DMat<BF16>(dec.hb, 0, op, d, d), false, head, true)
+            hp.made = true
+        }
+        dec.blocks(KNorm, no, kern.Block, hb, x, dec.gainAddr(8 * c.Layers), outs, kern.Arg(d), eps)
+        try dec.lap(s, 2)
+        dec.byOuts[op / Round].p.Run(dev, lg, gdev.DMat<BF16>(dec.hb, 0, op, d, d), head)
+        try dec.lap(s, 0)
+        if c.LogitScale != 1.0: dec.elems(KScale, no * hw, dec.logits.Addr(0), kern.Arg(no * hw), kern.Arg(F32(1.0 / c.LogitScale)))
+        if hw == c.Vocab {
+            dec.logits.Download(s.Logits, 0, 0, no * hw)
+        } else {
+            for j in range no: dec.logits.Download(s.Logits, j * hw, j * c.Vocab, c.Vocab)
+        }
+    }
+    try dev.Sync()
+    if dec.Profile: s.Times[2] += time.Now() - dec.mark
+    s.Times[3] += time.Since(t0)
+}
+
+# the speed of reading and writing each of the weights' and the cache's buffers, GB a second (a copy of its first half
+# onto its second, in pieces of at most 256 MB, timed on the device): where Windows has put part of a buffer in shared
+# system memory (WDDM, when the device's memory runs short), that buffer's speed is the PCIe bus's, ten times lower
+fn (dec mut Decoder&) Speeds() F64, F64, F64 ? gdev.GpuError {
+    return try dec.speed(dec.w.Addr(0), dec.w.N * 2), try dec.speed(dec.k.Addr(0), dec.k.N * 2), try dec.speed(dec.v.Addr(0), dec.v.N * 2)
+}
+
+fn (dec mut Decoder&) speed(at U64, bytes I64) F64 ? gdev.GpuError {
+    d := dec.dev
+    half := bytes / 2 / 256 * 256
+    if half == 0: return 0.0
+    t := try kern.Timer.Make(d)
+    t.Start(d)
+    piece I64 = 256 << 20
+    for o in range 0, half, piece: kern.Copy(d, at + U64(half + o), at + U64(o), piece.Min(half - o))
+    t.Stop(d)
+    ms := try t.Ms()
+    return F64(2 * half) / (ms * 1e6)
+}
+
+# ---- tests ----
+
+# two sequences in one cache, their prompts read in one step and then a token each a step, on the CPU and on the
+# device: the largest difference of any logit, and the largest logit
+fn against(dir String&, split Bool) F64, F64 ? gdev.GpuError {
+    dev := try gdev.Device.Open()
+    m := model.Model.Load(dir, true)!
+    assert Refusal(m) == "", Refusal(m)
+    c model.Config& = m.C
+    kc := model.Cache(c, 8, 2, 4, true)
+    kg := model.Cache(c, 8, 2, 4, device = true)
+    for i in range 8 {
+        kc.Table[i] = kc.Take()
+        kg.Table[i] = kg.Take()
+    }
+    sc := model.State(m, 24, 24, 192)
+    sg := model.State(m, 24, 24, 192)
+    dec := try Decoder.Make(dev, m, 24, 24, kg, 192)
+    dec.Split = split
+    worst, top := 0.0, 0.0
+    lens := [11, 7]
+    for step in range 70 {
+        sc.Reset()
+        sg.Reset()
+        for q in range 2 {
+            first := 0 if step == 0 else lens[q] + step - 1
+            count := lens[q] if step == 0 else 1
+            for j in range count {
+                p := first + j
+                t := I32((p * 7 + q * 13 + 5) % c.Vocab)
+                sc.Add(t, p, q, true)
+                sg.Add(t, p, q, true)
+            }
+        }
+        m.Step(sc, kc)
+        try dec.Step(m, sg, kg)
+        for i in range sc.NOut * c.Vocab {
+            worst = worst.Max(F64((sc.Logits[i] - sg.Logits[i]).Abs()))
+            top = top.Max(F64(sc.Logits[i].Abs()))
+        }
+    }
+    return worst, top
+}
+
+fn checked(dir String&, what String&) {
+    for split in [false, true] {
+        how := what + (", attention split" if split else ", attention seq")
+        worst, top := try against(dir, split) catch gdev.GpuError.NoDevice {
+            gdev.Skip("llm/gpu, " + how)
+            os.RemoveAll(dir)!
+            return
+        } catch e {
+            assert false, $e
+            return
+        }
+        Println("llm/gpu, " + how + ": largest logit difference " + $worst + " of logits up to " + $top)
+        assert worst <= 0.03 * top, how + ": the device's logits differ from the CPU's by " + $worst
+    }
+    os.RemoveAll(dir)!
+}
+
+test Decoder "the device's logits are the CPU's over 70 steps of two sequences crossing a page: Qwen3 (QK-norm, tied head)" {
+    checked(model.Tiny(true, 31), "Qwen3")
+}
+
+test Decoder "and Qwen2 (biases, a head of its own)" {
+    checked(model.TinyTied(false, 32, false), "Qwen2")
+}
+
+test Decoder "and a tied head over a vocabulary not a multiple of 16" {
+    checked(model.TinyTied(false, 33, true, 90), "tied, vocabulary 90")
+}
