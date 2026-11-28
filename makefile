@@ -5,7 +5,7 @@
 OLANG ?= $(if $(wildcard ../olang/build/olang),../olang/build/olang,olang)
 
 # every module with test blocks
-TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/nf4.olang kernels/spike.olang \
+TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang kernels/eigen.olang kernels/elem.olang kernels/attention.olang kernels/scan.olang kernels/sparse.olang kernels/conv.olang kernels/fpmode.olang kernels/ternary.olang kernels/nf4.olang kernels/spike.olang \
 	ad/graph.olang ad/descent.olang ad/score.olang tools/gradcheck.olang nn/layers.olang nn/moe.olang nn/ngram.olang nn/optim.olang nn/train.olang nn/tune.olang nn/qlora.olang nn/dist.olang nn/generate.olang nn/quant.olang nn/quantgraph.olang nn/message.olang nn/history.olang nn/bestof.olang nn/ternary.olang nn/potts.olang nn/seqsettle.olang nn/diffusion.olang nn/chain.olang nn/lines.olang \
 	models/mlp.olang models/cnn.olang models/gpt.olang models/ssm.olang models/qwen.olang tokenizer.olang \
 	data/idx.olang data/loader.olang data/mnist.olang data/text.olang data/tokens.olang data/chat.olang io/checkpoint.olang io/onnx.olang io/runlog.olang \
@@ -16,7 +16,7 @@ TESTS = tensor.olang kernels/device.olang kernels/mat.olang kernels/gemm.olang k
 	archnet/encode.olang archnet/offline.olang archnet/toy.olang archnet/predict.olang archnet/propose.olang archnet/archnet.olang \
 	surgery/model.olang surgery/ops.olang \
 	llm/bpe.olang llm/jinja.olang llm/model.olang llm/engine.olang llm/chat.olang llm/gguf.olang llm/vision.olang \
-	speech/mel.olang speech/whisper.olang speech/transcribe.olang speech/kws.olang speech/speak.olang speech/vits.olang speech/g2p.olang
+	speech/mel.olang speech/whisper.olang speech/transcribe.olang speech/kws.olang speech/speak.olang speech/vits.olang speech/g2p.olang speech/speaker.olang speech/diarize.olang
 
 # -define Gpu=true wherever the CUDA toolkit's headers are (docs/redesign.md 1.10): every build and test of this makefile
 # then has the GPU, and a program uses it where it plans on it (device.SetDefault, or a plan's on). Without the headers
@@ -35,7 +35,7 @@ GPUENV = $(if $(wildcard /usr/lib/wsl/lib),LD_LIBRARY_PATH=/usr/lib/wsl/lib$(if 
 
 .DEFAULT_GOAL := help
 
-.PHONY: help vktest vkgemm vktune vklintune vkllm whispervk diloco oanngen visionbench oannlisten speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
+.PHONY: help vktest vkgemm vktune vklintune vkllm whispervk diloco oanngen visionbench oannlisten oannwho speechbench whisperlinbench vitsbench llmbench grow sparsetable evolm evomlp archsearch potts_latin energybench lmstep lmeq test gputest gpuad gpulm gpullm gpumoe bigvocab gpugemm gpurate gpult gpusettle gpulearn mlpad arenaad tinystories data bench epoch mnist cnn charlm lmbench lmref bpe bpelm qwenlora qlora board int8 int8lm int8bench storagebench bf16bench int8cnnbench int8decodebench graphcount historyencode bestof graphsettle samplebench sweepbench flashbench lmlayersbench ternarybench pottsbench focusbench pottsfitbench xor spiking prune hybridbench adjointbench sleepreplay mnistlearn sample clean
 
 # prints this list: every target with the comment above it (its ARGS included) - the default, runs nothing
 help:
@@ -222,6 +222,12 @@ qlora:
 oannlisten:
 	$(OLANG) build -output build/oann-listen speech/listen.olang
 	$(if $(ARGS),./build/oann-listen $(ARGS),)
+
+# oann-who: who speaks when (speech/who.olang, speech/README.md), built to build/oann-who - ARGS: MODEL.onnx CLIP.wav
+# and its flags (none: only builds it)
+oannwho:
+	$(OLANG) build -output build/oann-who speech/who.olang
+	$(if $(ARGS),./build/oann-who $(ARGS),)
 
 # oann-gen: completions of a JSON-lines file of prompts by an open-weight model (llm/gen.olang, llm/README.md), built
 # to build/oann-gen - ARGS: MODEL prompts.jsonl out.jsonl and its flags (none: only builds it)
