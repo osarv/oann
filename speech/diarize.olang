@@ -9,18 +9,22 @@
 # Options.Window seconds every Options.Step; a stretch shorter than a window is one window. Only the vectors are kept
 # (192 numbers a window), so a recording of any length is taken piece by piece.
 #
-# Grouping. The vectors are scaled to length 1 and merged bottom-up by average linkage - the two groups whose vectors
-# are closest on average (cosine) merge first - until no two groups are closer than Options.Threshold, or, where
-# Options.Speakers says how many spoke, until that many groups are left. With vectors of length 1 the average cosine
-# between two groups is the dot product of the groups' sums over the product of their sizes, so a group is one sum and
-# no table of pairs is kept; the merges are found by the nearest-neighbour chain (each group's nearest group is one
-# matrix-vector product), in time quadratic in the windows. A group of fewer than Options.Least windows is not a
-# speaker: its windows go to the nearest speaker. Last, every window is given the speaker whose mean vector is
-# closest, Options.Rounds times.
+# Grouping. Spectral clustering of the vectors (scaled to length 1), as WeSpeaker's recipe does it: every window keeps
+# its cosine to its nearest windows (the Options.Prune share of them, at least Options.Fewest) and none to the rest;
+# the table made symmetric is a graph whose Laplacian's smallest eigenvalues tell how many speakers there are - the
+# largest gap between two of the first values falls after as many values as there are speakers (or Options.Speakers
+# says how many) - and the eigenvectors of those values place every window as a point, which k-means groups. A
+# recording of more than Options.Whole windows is first merged bottom-up by average linkage down to that many groups
+# (the two groups closest on average cosine merge first; with vectors of length 1 that average is the dot product of
+# the groups' sums over the product of their sizes, so a group is one sum and no table of pairs is kept, and the
+# merges are found by the nearest-neighbour chain), and the groups' mean vectors are clustered: the eigenvectors of
+# at most Whole x Whole numbers, whatever the recording's length.
 #
 # Turns. A window speaks for the part of its stretch nearer its middle than any other window's; neighbours of one
 # speaker join into a turn.
 
+import "std/rand"
+import "../kernels/eigen"
 import "../kernels/gemm"
 import "../kernels/mat"
 import "speaker"
@@ -28,10 +32,11 @@ import "speaker"
 type Options struct() {
     Window F64 = 1.5            # seconds a window
     Step F64 = 0.75             # seconds between windows
-    Threshold F64 = 0.3         # two groups closer than this (average cosine) are one speaker
-    Speakers I64 = 0            # how many spoke, where known (0: found by Threshold)
-    Least I64 = 6               # windows a speaker has at least
-    Rounds I64 = 2              # times every window is given its nearest speaker
+    Prune F64 = 0.02            # the share of the windows each keeps its cosine to
+    Fewest I64 = 6              # and at least this many
+    Whole I64 = 1000            # windows clustered as they are; more are merged down to this many groups first
+    Speakers I64 = 0            # how many spoke, where known (0: found)
+    MostSpeakers I64 = 20       # speakers found at most
     Threads I64 = 0             # tasks making vectors (0: every core)
 }
 
@@ -191,75 +196,182 @@ fn groups(merges Array<merge>&, n I64, threshold F64, speakers I64) Array<I64>, 
     return out, count
 }
 
-# the mean vectors [count x Dim] of the groups in `of` (scaled to length 1; a group of fewer than least windows left
-# zero), and how many groups have at least `least`
-fn means(v Array<F32>&, of Array<I64>&, count I64, least I64) Array<F32>, I64 {
+# the mean vectors [count x Dim] of the groups in `of`, scaled to length 1
+fn means(v Array<F32>&, of Array<I64>&, count I64) Array<F32> {
     dim := speaker.Dim
     sums := Array<F64>(count * dim)
-    size := Array<I64>(count)
     for i in range of.Len() {
-        size[of[i]] += 1
         for k in range dim: sums[of[i] * dim + k] += F64(v[i * dim + k])
     }
     out := Array<F32>(count * dim)
-    kept I64 = 0
     for g in range count {
-        if size[g] < least: continue
-        kept += 1
         sq F64 = 0.0
         for k in range dim: sq += sums[g * dim + k] * sums[g * dim + k]
         for k in range dim: out[g * dim + k] = F32(sums[g * dim + k] / sq.Sqrt().Max(1e-20))
     }
-    return out, kept
+    return out
 }
 
-# every window given the group whose mean (centres' rows; a zero row is no group) is closest
-fn nearest(v Array<F32>&, of mut Array<I64>&, centres mut Array<F32>&, count I64) {
+# the Laplacian [n x n] of the graph of the n vectors of length 1 in v: each keeps its cosine to its `keep` nearest
+# (itself among them), the table made symmetric, its diagonal emptied; row sums less the table
+fn laplacian(v mut Array<F32>&, n I64, keep I64) Array<F64> {
     dim := speaker.Dim
-    dots := Array<F32>(count)
-    one := Array<F32>(dim)
-    all := mat.Mat<F32>(centres, 0, count, dim, dim)
-    live := Array<Bool>(count)
-    for g in range count {
-        for k in range dim: live[g] = live[g] or centres[g * dim + k] != 0.0
-    }
-    for i in range of.Len() {
-        for k in range dim: one[k] = v[i * dim + k]
-        gemm.Gemv(dots, all, false, one)
-        best I64 = -1
-        for g in range count {
-            if live[g] and (best < 0 or dots[g] > dots[best]): best = g
+    near := Array<F32>(n * n)
+    ws := gemm.Workspace<F32>(gemm.Cores(), n.Max(dim))
+    all := mat.Mat<F32>(v, 0, n, dim, dim)
+    table := mat.Mat<F32>(near, 0, n, n, n)
+    gemm.Gemm(ws, table, all, false, all, true)
+    kept := Array<F64>(n * n)
+    row := Array<F32>(n)
+    for i in range n {
+        for j in range n: row[j] = near[i * n + j]
+        row.Sort(fn(a, b): return a > b)
+        cut := row[keep - 1]
+        for j in range n {
+            if near[i * n + j] >= cut: kept[i * n + j] = F64(near[i * n + j])
         }
-        if best >= 0: of[i] = best
     }
+    out := Array<F64>(n * n)
+    for i in range n {
+        sum F64 = 0.0
+        for j in range n {
+            if j == i: continue
+            w := 0.5 * (kept[i * n + j] + kept[j * n + i])
+            out[i * n + j] = -w
+            sum += w
+        }
+        out[i * n + i] = sum
+    }
+    return out
+}
+
+# how many speakers the Laplacian's eigenvalues w (ascending) tell of: the largest gap between two of the first
+# most + 1 falls after that many
+fn told(w Array<F64>&, most I64) I64 {
+    best I64 = 1
+    gap F64 = -1.0
+    for i in range (most.Min(w.Len() - 1)) {
+        if w[i + 1] - w[i] > gap {
+            gap = w[i + 1] - w[i]
+            best = i + 1
+        }
+    }
+    return best
+}
+
+# the n points [n x dim] in k groups by k-means: the first centres drawn far apart (k-means++), the best of five
+# draws by the points' squared distance to their centres
+fn kmeans(x Array<F64>&, n I64, dim I64, k I64) Array<I64> {
+    r := rand.Rand(1)
+    best := Array<I64>(n)
+    least F64 = -1.0
+    for _ in range 5 {
+        of, cost := kmeansOnce(x, n, dim, k, r)
+        if least >= 0.0 and cost >= least: continue
+        least = cost
+        best = of
+    }
+    return best
+}
+
+fn far(x Array<F64>&, i I64, c Array<F64>&, g I64, dim I64) F64 {
+    s F64 = 0.0
+    for d in range dim: s += (x[i * dim + d] - c[g * dim + d]) * (x[i * dim + d] - c[g * dim + d])
+    return s
+}
+
+fn kmeansOnce(x Array<F64>&, n I64, dim I64, k I64, r mut rand.Rand&) Array<I64>, F64 {
+    c := Array<F64>(k * dim)
+    first := r.Below(n)
+    for d in range dim: c[d] = x[first * dim + d]
+    dist := Array<F64>[far(x, i, c, 0, dim) for i in range n]
+    for g in range 1, k {
+        total F64 = 0.0
+        for i in range n: total += dist[i]
+        at := r.Float() * total
+        pick := n - 1
+        for i in range n {
+            at -= dist[i]
+            if at > 0.0: continue
+            pick = i
+            break
+        }
+        for d in range dim: c[g * dim + d] = x[pick * dim + d]
+        for i in range n: dist[i] = dist[i].Min(far(x, i, c, g, dim))
+    }
+    of := Array<I64>[-1 for _ in range n]
+    cost F64 = 0.0
+    for _ in range 100 {
+        moved := false
+        cost = 0.0
+        for i in range n {
+            g0 I64 = 0
+            d0 := far(x, i, c, 0, dim)
+            for g in range 1, k {
+                dg := far(x, i, c, g, dim)
+                if dg < d0 {
+                    d0 = dg
+                    g0 = g
+                }
+            }
+            cost += d0
+            moved = moved or of[i] != g0
+            of[i] = g0
+        }
+        if not moved: break
+        size := Array<I64>(k)
+        sums := Array<F64>(k * dim)
+        for i in range n {
+            size[of[i]] += 1
+            for d in range dim: sums[of[i] * dim + d] += x[i * dim + d]
+        }
+        for g in range k {
+            if size[g] == 0: continue
+            for d in range dim: c[g * dim + d] = sums[g * dim + d] / F64(size[g])
+        }
+    }
+    return of, cost
+}
+
+# the speaker of each of the n vectors of length 1 in v, by spectral clustering (numbers from 0, in no order)
+fn spectral(v mut Array<F32>&, n I64, o Options&) Array<I64> {
+    if n < 2: return Array<I64>(n)
+    keep := n.Min(o.Fewest.Max(I64(o.Prune * F64(n))))
+    l := laplacian(v, n, keep)
+    w := eigen.Symmetric(l, n)
+    k := o.Speakers.Min(n) if o.Speakers > 0 else told(w, o.MostSpeakers)
+    if k < 2: return Array<I64>(n)
+    x := Array<F64>(n * k)
+    for i in range n {
+        for j in range k: x[i * k + j] = l[j * n + i]
+    }
+    return kmeans(x, n, k, k)
+}
+
+# the speaker of each of the n vectors of length 1 in v: 0, 1, .. in the order they first appear
+fn voices(v Array<F32>&, n I64, o Options&) Array<I64> {
+    of := Array<I64>(n)
+    if n > o.Whole {
+        pre, count := groups(linkage(v, n), n, 2.0, o.Whole)
+        centres := means(v, pre, count)
+        by := spectral(centres, count, o)
+        for i in range n: of[i] = by[pre[i]]
+    } else {
+        own := v.Copy()
+        of = spectral(own, n, o)
+    }
+    seen := Map<I64, I64>()
+    for i in range n {
+        if not seen.Has(of[i]): seen.Put(of[i], seen.Len())
+        of[i] = seen.Get(of[i])!
+    }
+    return of
 }
 
 # the speaker of each window so far: 0, 1, .. in the order they first speak
 fn (d Diarizer&) Labels() Array<I64> {
-    n := d.Windows()
-    if n == 0: return Array<I64>(0)
     v := d.vecs.ToArray()
-    of, count := groups(linkage(v, n), n, d.O.Threshold, d.O.Speakers)
-    least := d.O.Least
-    for _ in range d.O.Rounds + 1 {
-        centres, kept := means(v, of, count, least)
-        if kept == 0 {
-            if least <= 1: break
-            least = 1                                    # nobody spoke long: every group stays
-            centres, kept = means(v, of, count, least)
-        }
-        nearest(v, of, centres, count)
-    }
-    seen := Array<I64>[-1 for _ in range count]
-    next I64 = 0
-    for i in range n {
-        if seen[of[i]] < 0 {
-            seen[of[i]] = next
-            next += 1
-        }
-        of[i] = seen[of[i]]
-    }
-    return of
+    return voices(v, d.Windows(), d.O)
 }
 
 # who spoke when, so far: turns in order, none overlapping
@@ -305,8 +417,6 @@ fn Most(turns Array<Turn>&, from F64, to F64) I64 {
 
 # ---- checks ----
 
-import "std/rand"
-
 # n vectors of length 1 about `speakers` random directions (noise the spread), speaker i % speakers's the i-th
 fn cloud(n I64, speakers I64, noise F64, r mut rand.Rand&) Array<F32> {
     dim := speaker.Dim
@@ -336,6 +446,26 @@ test linkage "average linkage finds the speakers of a cloud, by threshold and by
     assert c1 == 1 and all[n - 1] == 0
     none, cn := groups(merges, n, 2.0, 0)
     assert cn == n and none[5] == 5 and two.Len() == n
+}
+
+test voices "the speakers of a cloud found and counted: as it is, merged down first, with the count given, and one speaker alone" {
+    r := rand.Rand(5)
+    n := 600
+    v := cloud(n, 5, 1.0, r)
+    o := Options()
+    of := voices(v, n, o)
+    for i in range n: assert of[i] == i % 5, $i + ": " + $of[i]
+    o.Whole = 150
+    merged := voices(v, n, o)
+    for i in range n: assert merged[i] == i % 5
+    o.Speakers = 3
+    three := voices(v, n, o)
+    most I64 = 0
+    for i in range n: most = most.Max(three[i])
+    assert most == 2
+    alone := voices(cloud(300, 1, 1.0, r), 300, Options())
+    for i in range 300: assert alone[i] == 0
+    assert voices(v, 1, Options()).Len() == 1 and voices(v, 0, Options()).Len() == 0
 }
 
 test linkage "the chain's merges are those of the plain search for the closest pair" {

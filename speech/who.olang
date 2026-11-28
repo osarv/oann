@@ -1,6 +1,6 @@
 # speech/who - oann-who, who spoke when in a recording (speech/diarize), and how well against a reference:
 #
-#     oann-who MODEL.onnx CLIP.wav... [--turns] [--threshold T] [--thresholds "0.2,0.3"] [--speakers N] [--threads T]
+#     oann-who MODEL.onnx CLIP.wav... [--turns] [--prune P] [--prunes "0.01,0.03"] [--speakers N] [--threads T]
 #
 # MODEL.onnx is WeSpeaker's voxceleb_ECAPA512.onnx (speech/speaker). A clip is a 16-bit PCM WAVE file, mono at 16 kHz,
 # read a minute at a time. Where CLIP.ref lies beside it - a line a turn, "start end speaker" in seconds - the speech
@@ -11,7 +11,7 @@
 # reference's speaker time not given to that speaker, the speakers found matched to the reference's one to one so
 # that the most time agrees (the diarization error rate with the reference's speech given, no collar, overlapped
 # speech counted: where two speak at once at most one can be right); "one talker" is the same over the time when
-# exactly one person speaks. --thresholds scores every threshold given from the same vectors.
+# exactly one person speaks. --prunes scores every Options.Prune given from the same vectors.
 
 import "std/flags"
 import "std/io"
@@ -259,13 +259,12 @@ fn Score.Of(ref Array<said>&, speakers I64, turns Array<diarize.Turn>&, seconds 
 fn main() {
     p := flags.Flags("oann-who", "who spoke when in CLIP.wav by the speaker model MODEL.onnx, scored where CLIP.ref is beside it")
     show := p.Bool("turns", 0, "print the turns found")
-    threshold := p.Float("threshold", 0, diarize.Options().Threshold, "two groups closer than this are one speaker")
-    several := p.Text("thresholds", 0, "", "score each of these thresholds (\"0.2,0.3\")")
+    threshold := p.Float("prune", 0, diarize.Options().Prune, "the share of the windows each keeps its cosine to")
+    several := p.Text("prunes", 0, "", "score each of these shares (\"0.01,0.03\")")
+    most := p.Int("most", 0, diarize.Options().Whole, "windows clustered as they are (more are merged down to this many first)")
     speakers := p.Int("speakers", 0, 0, "how many spoke (-1: as many as the reference has; 0: found)")
     window := p.Float("window", 0, diarize.Options().Window, "seconds a window")
     step := p.Float("step", 0, diarize.Options().Step, "seconds between windows")
-    least := p.Int("least", 0, diarize.Options().Least, "windows a speaker has at least")
-    rounds := p.Int("rounds", 0, diarize.Options().Rounds, "times every window is given its nearest speaker")
     threads := p.Int("threads", 'j', 0, "threads (default: every core)")
     dump := p.Text("dump", 0, "", "write each clip's windows to this folder: CLIP.vec (the vectors, F32) and CLIP.win (a line a window: start end)")
     try p.Parse(os.Args()) catch flags.Error.Help {
@@ -279,7 +278,7 @@ fn main() {
     m := try speaker.Model.Load(args[0]) catch { fail("cannot load the model " + args[0]) }
     tried := Vec<F64>()
     for w in several.Get().Split(",") {
-        if w.Trim().Len() > 0: tried.Push(try w.Trim().ParseFloat() catch { fail("not a threshold: " + w) })
+        if w.Trim().Len() > 0: tried.Push(try w.Trim().ParseFloat() catch { fail("not a share: " + w) })
     }
     if tried.Len() == 0: tried.Push(threshold.Get())
     totals := Vec<Score>()
@@ -293,8 +292,7 @@ fn main() {
         o := diarize.Options()
         o.Window = window.Get()
         o.Step = step.Get()
-        o.Least = least.Get()
-        o.Rounds = rounds.Get()
+        o.Whole = most.Get()
         o.Threads = threads.Get()
         o.Speakers = known if speakers.Get() < 0 else speakers.Get()
         d := diarize.Diarizer(m, o)
@@ -305,7 +303,7 @@ fn main() {
         line := StringBuilder()
         line.Push(path + ": " + (seconds / 60.0).Fixed(1) + " min, " + $d.Windows() + " windows")
         for i, th in tried {
-            d.O.Threshold = th
+            d.O.Prune = th
             turns := d.Turns()
             found I64 = 0
             for t in turns: found = found.Max(t.Speaker + 1)
@@ -318,7 +316,7 @@ fn main() {
             }
             s := Score.Of(ref, known, turns, seconds)
             totals.RefMut(i).Add(s)
-            line.Push(" | " + th.Fixed(2) + ": " + $found + "/" + $known + " speakers, error " + s.Error().Fixed(1) + " %, one talker " + s.SingleError().Fixed(1) + " %")
+            line.Push(" | " + th.Fixed(3) + ": " + $found + "/" + $known + " speakers, error " + s.Error().Fixed(1) + " %, one talker " + s.SingleError().Fixed(1) + " %")
         }
         t2 := time.Now()
         audio += seconds
@@ -328,7 +326,7 @@ fn main() {
     }
     for i, th in tried {
         s := totals[i]
-        if s.All > 0: Println("threshold " + th.Fixed(2) + ": error " + s.Error().Fixed(2) + " %, one talker " + s.SingleError().Fixed(2) + " % over " + (F64(s.All) / 360000.0).Fixed(2) + " h of speaker time")
+        if s.All > 0: Println("prune " + th.Fixed(3) + ": error " + s.Error().Fixed(2) + " %, one talker " + s.SingleError().Fixed(2) + " % over " + (F64(s.All) / 360000.0).Fixed(2) + " h of speaker time")
     }
     Println((audio / 3600.0).Fixed(2) + " h of sound: vectors " + making.Fixed(1) + " s, grouping " + grouping.Fixed(1) + " s (" + ((making + grouping) / audio.Max(1.0) * 3600.0).Fixed(0) + " s an hour of sound), peak memory " + $peak() + " MB")
 }
