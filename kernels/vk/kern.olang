@@ -262,12 +262,18 @@ fn gemmStaged(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.
     # each invocation copies tile chunk / side^2 elements of each operand, neighbours neighbouring elements
     for e in range tile * chunk / (side * side) {
         at0 := k.Add(lid, k.U(e * side * side))
-        i := k.Least(k.Add(row0, k.Div(at0, k.U(chunk))), lastRow)
-        sA := k.Least(k.Add(from, k.Mod(at0, k.U(chunk))), lastStep)
-        k.WriteShared(sa, at0, k.Read(a, k.Add(a0, k.Select(at, k.Add(k.Mul(sA, g.Lda), i), k.Add(k.Mul(i, g.Lda), sA)))))
-        j := k.Least(k.Add(col0, k.Mod(at0, k.U(tile))), lastCol)
-        sB := k.Least(k.Add(from, k.Div(at0, k.U(tile))), lastStep)
-        k.WriteShared(sb, at0, k.Read(b, k.Add(b0, k.Select(bt, k.Add(k.Mul(j, g.Ldb), sB), k.Add(k.Mul(sB, g.Ldb), j)))))
+        # neighbours copy what lies together in the buffer: a row's steps of A (a step's rows where transposed), a
+        # step's columns of B (a column's steps where transposed)
+        i := k.Select(at, k.Mod(at0, k.U(tile)), k.Div(at0, k.U(chunk)))
+        sA := k.Select(at, k.Div(at0, k.U(tile)), k.Mod(at0, k.U(chunk)))
+        ri := k.Least(k.Add(row0, i), lastRow)
+        rs := k.Least(k.Add(from, sA), lastStep)
+        k.WriteShared(sa, k.Add(k.Mul(i, k.U(chunk)), sA), k.Read(a, k.Add(a0, k.Select(at, k.Add(k.Mul(rs, g.Lda), ri), k.Add(k.Mul(ri, g.Lda), rs)))))
+        j := k.Select(bt, k.Div(at0, k.U(chunk)), k.Mod(at0, k.U(tile)))
+        sB := k.Select(bt, k.Mod(at0, k.U(chunk)), k.Div(at0, k.U(tile)))
+        rj := k.Least(k.Add(col0, j), lastCol)
+        rb := k.Least(k.Add(from, sB), lastStep)
+        k.WriteShared(sb, k.Add(k.Mul(sB, k.U(tile)), j), k.Read(b, k.Add(b0, k.Select(bt, k.Add(k.Mul(rj, g.Ldb), rb), k.Add(k.Mul(rb, g.Ldb), rj)))))
     }
     k.Barrier()
     steps := k.Least(k.U(chunk), k.Sub(g.Depth, from))

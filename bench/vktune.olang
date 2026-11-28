@@ -2,8 +2,8 @@
 # kernel is made, checked against the first plan's result on an odd shape (the largest difference of an element: 0
 # for every plan that is not fused), and timed on each shape with the operands resident - products recorded back to
 # back for about 0.3 s, one Sync at the end, the best of the rounds. What it prints is what Plan.For is set from.
-# Arguments: rounds (3), then shapes as M K N triples (default: 256^3, 1024^3, 2048^3 and a Whisper encoder's
-# 1500 x 768 x 3072).
+# Arguments: rounds (3), then shapes as M K N triples (default: 256^3, 1024^3, 2048^3); a Whisper encoder's two
+# linear layers, B a transposed weight matrix, are always timed.
 #
 # From the repository's root: make vktune ARGS="3"; OANN_VK_DEVICE=N picks the device (the bench lists them)
 
@@ -36,25 +36,25 @@ fn result(d mut device.Device&, p kern.Product&, a Array<F32>&, b Array<F32>&) A
 }
 
 # GFLOPS of the plan on m x k x n
-fn timed(d mut device.Device&, p kern.Product&, r mut rand.Rand&, m I64, k I64, n I64, rounds I64) F64 ? device.VkError {
+fn timed(d mut device.Device&, p kern.Product&, r mut rand.Rand&, m I64, k I64, n I64, tb Bool, rounds I64) F64 ? device.VkError {
     ba := try device.Buf<F32>.Make(d, m * k)
     bb := try device.Buf<F32>.Make(d, k * n)
     bc := try device.Buf<F32>.Make(d, m * n)
     ba.UploadAll(randoms(m * k, r))
     bb.UploadAll(randoms(k * n, r))
     da := device.DBatch<F32>.One(device.DMat<F32>(ba, 0, m, k, k))
-    db := device.DBatch<F32>.One(device.DMat<F32>(bb, 0, k, n, n))
+    db := device.DBatch<F32>.One(device.DMat<F32>(bb, 0, n, k, k) if tb else device.DMat<F32>(bb, 0, k, n, n))
     dc := device.DBatch<F32>.One(device.DMat<F32>(bc, 0, m, n, n))
-    p.Run(d, dc, da, false, db, false)
+    p.Run(d, dc, da, false, db, tb)
     try d.Sync()
     t0 := time.Now()
-    p.Run(d, dc, da, false, db, false)
+    p.Run(d, dc, da, false, db, tb)
     try d.Sync()
     reps := (300000000 / I64(time.Since(t0)).Max(1)).Clamp(1, 500)
     best F64 = 0
     for _ in range rounds {
         t0 = time.Now()
-        for _ in range reps: p.Run(d, dc, da, false, db, false)
+        for _ in range reps: p.Run(d, dc, da, false, db, tb)
         try d.Sync()
         best = best.Max(2.0 * F64(m) * F64(n) * F64(k) * F64(reps) / F64(time.Since(t0)))
     }
@@ -93,7 +93,7 @@ fn main() ? io.Error, ParseError, device.VkError {
     for i in range 2, args.Len(): shapes.Push(try args[i].ParseInt())
     if shapes.Len() == 0 or shapes.Len() % 3 != 0 {
         shapes.Truncate(0)
-        shapes.PushAll(Array<I64>[256, 256, 256, 1024, 1024, 1024, 2048, 2048, 2048, 1500, 768, 3072])
+        shapes.PushAll(Array<I64>[256, 256, 256, 1024, 1024, 1024, 2048, 2048, 2048])
     }
     names := device.Devices()
     for i in range names.Len(): try io.Put("Vulkan device " + $i + ": " + names[i] + "\n")
@@ -101,9 +101,9 @@ fn main() ? io.Error, ParseError, device.VkError {
     try io.Put("on " + d.Str() + ": workgroups of up to " + $d.MaxInvocations + " invocations, " + $d.SharedBytes + " bytes shared\n")
     r := rand.Rand(1)
     first := try kern.Product.Make(d, kern.Plan(4, 8, 0, false))
-    try io.Put("a product of 16 x 16 x 16, recorded back to back: " + (2.0 * 4096.0 / (try timed(d, first, r, 16, 16, 16, rounds)) / 1000.0).Fixed(2) + " us each\n\nGFLOPS, F32, operands resident\nplan | differs")
+    try io.Put("a product of 16 x 16 x 16, recorded back to back: " + (2.0 * 4096.0 / (try timed(d, first, r, 16, 16, 16, false, rounds)) / 1000.0).Fixed(2) + " us each\n\nGFLOPS, F32, operands resident\nplan | differs")
     for i in range 0, shapes.Len(), 3: try io.Put(" | " + $shapes[i] + " x " + $shapes[i + 1] + " x " + $shapes[i + 2])
-    try io.Put("\n")
+    try io.Put(" | 1500 x 768 x 3072, B transposed | 1500 x 3072 x 768, B transposed\n")
     a, b := randoms(301 * 129, r), randoms(129 * 257, r)
     want := Array<F32>(0)
     for plan in plans().View() {
@@ -120,7 +120,8 @@ fn main() ? io.Error, ParseError, device.VkError {
         worst F64 = 0
         for i in range got.Len(): worst = worst.Max((F64(got[i]) - F64(want[i])).Abs())
         try io.Put(plan.Str() + " | " + $worst)
-        for i in range 0, shapes.Len(), 3: try io.Put(" | " + (try timed(d, p, r, shapes[i], shapes[i + 1], shapes[i + 2], rounds)).Fixed(1))
+        for i in range 0, shapes.Len(), 3: try io.Put(" | " + (try timed(d, p, r, shapes[i], shapes[i + 1], shapes[i + 2], false, rounds)).Fixed(1))
+        try io.Put(" | " + (try timed(d, p, r, 1500, 768, 3072, true, rounds)).Fixed(1) + " | " + (try timed(d, p, r, 1500, 3072, 768, true, rounds)).Fixed(1))
         try io.Put("\n")
     }
 }
