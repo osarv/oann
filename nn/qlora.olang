@@ -8,7 +8,8 @@
 #
 # Before anything is allocated the run is laid out (models/qwen's Footprint) and what it takes printed - on the GPU a run
 # that would not fit the device's Budget MB is refused there and then. The device is the GPU where there is one (a
-# BF16 graph, F32 masters and moments), else the CPU (an F32 graph); Device and Bf16 override it.
+# BF16 graph, F32 masters and moments), else the CPU (a BF16 graph where the target has AMX, TargetHasTileDot - about 6x
+# faster than F32 there - else an F32 graph); Device and Bf16 override it.
 #
 # The output directory holds run.ckpt (the run so far: run again with the same options and it carries on where it
 # stopped), log.jsonl (io/runlog's record), adapter/ (adapter_model.safetensors and adapter_config.json, at the end) and,
@@ -114,7 +115,7 @@ fn (o Options&) Run(on fn&(line String&)) Result ? {
     rows := o.Batch * o.Accum
     steps I64 = o.Steps if o.Steps > 0 else I64((o.Epochs * F64(data.Train.Rows) / F64(rows)).Ceil()).Max(1)
     try os.MkDirAll(o.Out)
-    bf16 := o.Bf16 == "on" or (o.Bf16 == "auto" and gpu)
+    bf16 := o.Bf16 == "on" or (o.Bf16 == "auto" and (gpu or TargetHasTileDot))
     if bf16: return try o.runAs<BF16>(cfg, data, steps, gpu, on)
     return try o.runAs<F32>(cfg, data, steps, gpu, on)
 }
