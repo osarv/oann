@@ -139,11 +139,14 @@ are device buffers; a step sends its rows' tokens and positions up and brings it
 device, the decoder on the CPU), `oann-listen --device vulkan`. Against the CPU on software Vulkan: a random model's
 logits within 3e-6, whisper-tiny's within 2e-4, and the same transcript.
 
-Speed is not known on a real GPU. On software Vulkan (llvmpipe, 4 cores) it is slower than the CPU's kernels, as it
-must be: the small shape's encoder over 30 s takes 15.0 s against 1.6 s, a greedy step 122 ms against 44 ms
-(`make whispervk ARGS="small 3"`). Whether an integrated GPU beats the CPU is for that bench to say on one; the
-product (item 1 below) is the encoder's whole cost, and a step is about 25 small dispatches a layer, so a device's
-cost a dispatch decides the decoder.
+Speed on an integrated GPU (2026-11-28, a Ryzen 5 7600's two-unit Radeon, Windows; `whispervk`, random weights): the
+small shape's encoder over 30 s takes 6.5 s and a greedy step 483 ms; medium's 19.5 s and 2.5 s. The same PC's CPU
+takes about 1 s for small's encoder once built right (its matmul does 470 GFLOPS at 4 threads against the Radeon's
+190; the times printed beside these were a Windows build that had lost its vector code: 7.7 s and 36 ms), so on that
+machine the CPU is the faster place for both. The decoder's step is slow on the device because its one-row products
+go through `Set.Gemm`'s direct plans, which an AMD GPU reads at under 1 GFLOPS; `llm/vk`'s staged one-row plan is
+what they want (item 2 below). On software Vulkan (llvmpipe, 4 cores) the device is slower than the CPU's kernels,
+as it must be (`make whispervk ARGS="small 3"`).
 
 ## What comes next
 
@@ -151,7 +154,8 @@ cost a dispatch decides the decoder.
    Intel integrated GPU and a larger Radeon want `make vktune`'s table before their plan is trusted. Fused steps and
    `Plan.For` by vendor follow from those.
 2. **Whisper, tuned on real GPUs** (first: transcription on an office laptop's integrated GPU): it runs (above);
-   what it wants next is its weights packed as item 4 says, and times on a real GPU.
+   what it wants next is a staged plan for its decoder's one-row products (as `llm/vk`'s) and its weights packed as
+   item 4 says.
 3. **LLM decoding, tuned on real GPUs**: the decoder runs (above); its product (`llm_row`, `llm_rows`) wants
    plans measured as the product's were, the norm and the softmax are one invocation a row and want a parallel sum, and sampling could
    stay on the device (the logits come down every step). `device.Backend.Vulkan` in `kernels/device` once plans run
