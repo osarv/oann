@@ -65,16 +65,19 @@ fn check(dev mut gdev.Device&, m model.Model&) ? gdev.GpuError {
     Println("check: largest logit difference " + worst.Fixed(4) + " of logits up to " + top.Fixed(2) + "; the most likely token agrees at " + $agree + " of " + $total + " rows")
 }
 
-fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&) ? gdev.GpuError {
+fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&, free I64) ? gdev.GpuError {
     c model.Config& = m.C
-    most I64 = 0
-    for b in batches: most = most.Max(b)
     per := steps / model.PageSize + 1
-    free := dev.FreeBytes()
+    # free: the driver's free memory when the device was opened, before anything of ours was on it
     room := free - gpu.WeightBytes(m) - 768 * 1048576
+    most I64 = 0
+    for b in batches {
+        if b * per * model.PageBytes(c) <= room: most = most.Max(b)
+        else: Println("batch " + $b + " over " + $steps + " positions needs " + $(b * per * model.PageBytes(c) / 1048576) + " MB of cache: skipped")
+    }
+    if most == 0: fail("no room for any batch over " + $steps + " positions")
     need := most * per * model.PageBytes(c)
-    Println("cache: " + $(most * per) + " pages, " + $(need / 1048576) + " MB of " + $(room / 1048576) + " MB the weights leave of the " + $(free / 1048576) + " MB free (" + $(model.PageBytes(c) / model.PageSize / 1024) + " KB a token)")
-    if need > room: fail("no room for batch " + $most + " over " + $steps + " positions: fewer steps or a smaller batch")
+    Println("cache: " + $(most * per) + " pages, " + $(need / 1048576) + " MB of the " + $(room / 1048576) + " MB the weights leave of the " + $(free / 1048576) + " MB free at the start (" + $(model.PageBytes(c) / model.PageSize / 1024) + " KB a token); " + $(dev.FreeBytes() / 1048576) + " MB free now")
     k := model.Cache(c, most * per, most, per, device = true)
     for i in range most * per: k.Table[i] = k.Take()
     s := model.State(m, most, most, steps)
@@ -84,6 +87,7 @@ fn speed(dev mut gdev.Device&, m model.Model&, steps I64, batches Array<I64>&) ?
     sw, sk, sv := try dec.Speeds()
     Println("buffer speeds (a copy within each): weights " + sw.Fixed(0) + " GB/s, keys " + sk.Fixed(0) + ", values " + sv.Fixed(0) + (" - the cache is partly in shared system memory" if sk < sw / 4.0 or sv < sw / 4.0 else ""))
     for b in batches {
+        if b > most: continue
         late I64 = 0
         from := steps - steps / 4
         start := time.Now()
@@ -126,7 +130,8 @@ fn main() {
     why := gpu.Refusal(m)
     if why != "": fail("llm/gpu does not run this model: " + why)
     dev := try gdev.Device.Open() catch e { fail($e) }
+    free := dev.FreeBytes()
     Println(dev.Str() + "; " + args[1] + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(gpu.WeightBytes(m) / 1048576) + " MB on the device, loaded in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
     try check(dev, m) catch e { fail("the check: " + $e) }
-    try speed(dev, m, steps, bs.ToArray()) catch e { fail("the speed: " + $e) }
+    try speed(dev, m, steps, bs.ToArray(), free) catch e { fail("the speed: " + $e) }
 }
