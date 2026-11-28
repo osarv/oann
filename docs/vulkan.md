@@ -102,6 +102,33 @@ An integrated GPU against its CPU: the same Ryzen's CPU does about 100 GFLOPS a 
 (AVX-512), so this two-unit Radeon at 190 does not beat it; integrated GPUs of 8-12 units (laptops' Radeon 680M and
 780M) have 4-6 times its arithmetic, and no such chip has been measured.
 
+### A language model's product
+
+`llm/vk`'s linear product (`LinPlan`: rows and outputs an invocation, the workgroup, the weights' words staged) was
+measured the same way (`make vklintune`), the weights BF16 two to a word. GFLOPS, 2026-11-28, the same PC:
+
+| rows x depth x outs | Radeon, direct | Radeon, best | 4060, direct | 4060, best |
+|---|---|---|---|---|
+| 1 x 1024 x 3072 | 0.7 | 13.8 (1x1 of 64x1, staged 16) | 35 | 75 (the same) |
+| 1 x 1024 x 32768 | 0.7 | 15.3 (the same) | 50 | 109 (the same) |
+| 8 x 1024 x 3072 | 29 | 71 (8x4 of 64x1, staged 16) | 250 (4x4 of 8x8, direct) | 250 |
+| 32 x 1024 x 3072 | 64 | 169 (8x4 of 16x4, staged 16) | 807 (4x4 of 8x8, direct) | 807 |
+
+A step of one row is bound by the work a weight costs (a word read, taken apart, two products), not by the device's
+arithmetic: an invocation an output, the words staged so that a workgroup reads what lies together; each doubling
+of the chunk from 4 to 16 words doubled the Radeon's speed, and longer chunks are not measured. `LinPlan.For` and
+`ForMany`: one row and up to 3, 1x1 of 64x1 staged 16 on every GPU; 4 rows and more, 8x4 of 64x1 staged 16 on an
+integrated GPU (8x4 of 16x4 from 16 rows) and 4x4 of 8x8 direct on a discrete one; software Vulkan reads direct.
+`OANN_VK_LLM_ROW` and `OANN_VK_LLM_ROWS` ("ROWS,COLS,SX,SY,CHUNK") name others.
+
+### Long submissions
+
+A driver gives up on a submission that runs for seconds (Windows resets a device after two: `VK_ERROR_DEVICE_LOST`),
+and an integrated GPU takes that long over a Whisper encoder recorded whole. `Device.Spend` counts the arithmetic the
+products record and runs what is recorded once it passes `Device.Budget` (2e9 operations on an integrated GPU, 32e9
+on a discrete one, no limit on software Vulkan), so a program need not `Sync` by the clock. `OANN_VK_TRACE=1` runs
+every kernel as it is recorded and names the first that fails.
+
 ## Whisper on it
 
 `speech/whispervk` runs speech/whisper's `Encode`, `Cross` and `Step` on a device: the weights (F32), every array of

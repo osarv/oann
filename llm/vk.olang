@@ -51,8 +51,9 @@ BufLimit mut I64 = 0
 # invocations a workgroup: Line along one axis, Tile along each of two (kernels/vk/kern's)
 Line I64 = 64
 Tile I64 = 8
-# rows a step from which the product computes several rows an invocation
+# rows a step from which the product computes several rows an invocation, and from which a plan for many rows pays
 Wide I64 = 4
+Many I64 = 16
 
 # how a linear layer's product is computed on a device: an invocation computes Rows rows of Cols outputs, a workgroup
 # is Sx invocations along the outputs by Sy along the rows. Chunk 0 (direct): each step reads a word of each output's
@@ -93,7 +94,19 @@ fn LinPlan.For(dev vdev.Device&, wide Bool) LinPlan {
         p := try LinPlan.Parse(env) catch default LinPlan(0, 0, 0, 0, 0)
         if p.Fits(dev) and (wide or p.Rows == 1): return p
     }
-    return LinPlan(Wide, 4, Tile, Tile, 0) if wide else LinPlan(1, 4, Line, 1, 0)
+    if dev.Kind == vdev.KindCpu: return LinPlan(8, 4, Line, 1, 0) if wide else LinPlan(1, 4, Line, 1, 0)
+    if not wide: return LinPlan(1, 1, Line, 1, 16)
+    return LinPlan(Wide, 4, Tile, Tile, 0) if dev.Kind == vdev.KindDiscrete else LinPlan(8, 4, Line, 1, 16)
+}
+
+# the plan of dev's products of Many rows and more: on a GPU that is not discrete 8 rows of 4 outputs from 16 x 4
+# invocations' staged weights, else the wide plan
+fn LinPlan.ForMany(dev vdev.Device&) LinPlan {
+    wide := LinPlan.For(dev, true)
+    p := LinPlan(8, 4, 16, 4, 16)
+    env := try os.Env("OANN_VK_LLM_ROWS") catch default ""
+    if env != "" or dev.Kind == vdev.KindCpu or dev.Kind == vdev.KindDiscrete or not p.Fits(dev): return wide
+    return p
 }
 
 fn groups(n I64, per I64) I64 { return (n + per - 1) / per }
@@ -339,6 +352,7 @@ fn Linear.Make(dev mut vdev.Device&, name String, plan LinPlan) Linear ? vdev.Vk
 # (even) from w's start, + bias's outs from bOff where biased
 fn (l Linear&) Run(dev mut vdev.Device&, y vdev.Buf<F32>&, yOff I64, ldy I64, src vdev.Buf<F32>&, n I64, w vdev.Buf<BF16>&, outs I64, depth I64, bias vdev.Buf<F32>&, bOff I64, biased Bool) {
     p := Array<U32>[u(n), u(outs), u(depth), u(0), u(depth), u(yOff), u(ldy), u(bOff), u(1 if biased else 0)]
+    dev.Spend(2.0 * F64(n) * F64(outs) * F64(depth))
     l.k.Run(dev, groups(outs, l.By.Sx * l.By.Cols), groups(n, l.By.Sy * l.By.Rows), 1, Array<U64>[src.Handle(), w.Handle(), y.Handle(), bias.Handle()], p)
 }
 
@@ -634,11 +648,12 @@ fn made(d mut vdev.Device&, name String, k spirv.Kernel) kern.Kernel ? vdev.VkEr
 }
 
 # the decoder's kernels on one device
-type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row Linear, rows Linear, heads kern.Kernel, scores kern.Kernel, softmax kern.Kernel, values kern.Kernel, swiglu kern.Kernel, mix kern.Kernel) {
+type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row Linear, rows Linear, many Linear, heads kern.Kernel, scores kern.Kernel, softmax kern.Kernel, values kern.Kernel, swiglu kern.Kernel, mix kern.Kernel) {
     embeds
     norm
     row             # the product of a step of few rows: a row an invocation
-    rows            # and of many: Wide rows an invocation
+    rows            # of Wide rows and more
+    many            # and of Many and more
     heads
     scores
     softmax
@@ -649,7 +664,7 @@ type kit unique struct(embeds kern.Kernel, norm kern.Kernel, row Linear, rows Li
 
 fn kit.Make(d mut vdev.Device&) kit ? vdev.VkError {
     return kit(try made(d, "llm_embed", embedKernel()), try made(d, "llm_norm", normKernel()), try Linear.Make(d, "llm_row", LinPlan.For(d, false))
-        try Linear.Make(d, "llm_rows", LinPlan.For(d, true)), try made(d, "llm_heads", headsKernel()), try made(d, "llm_scores", scoresKernel())
+        try Linear.Make(d, "llm_rows", LinPlan.For(d, true)), try Linear.Make(d, "llm_many", LinPlan.ForMany(d)), try made(d, "llm_heads", headsKernel()), try made(d, "llm_scores", scoresKernel())
         try made(d, "llm_softmax", softmaxKernel()), try made(d, "llm_values", valuesKernel()), try made(d, "llm_swiglu", swigluKernel())
         try made(d, "llm_mix", mixKernel()))
 }
@@ -768,7 +783,7 @@ fn (dec mut Decoder&) product(i I64, w model.Linear&, y vdev.Buf<F32>&, src vdev
     per := dec.wRows[i]
     for o in range 0, w.Out, per {
         outs := per.Min(w.Out - o)
-        l Linear& = dec.ks.row if n < Wide else dec.ks.rows
+        l Linear& = dec.ks.row if n < Wide else dec.ks.rows if n < Many else dec.ks.many
         l.Run(d, y, o, w.Out, src, n, dec.w[dec.wFirst[i] + o / per], outs, w.In, dec.g, bias.Max(0) + o, bias >= 0)
     }
 }

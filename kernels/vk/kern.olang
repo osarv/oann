@@ -66,8 +66,17 @@ fn Kernel.Make(dev mut device.Device&, name String&, k mut spirv.Kernel&) Kernel
 fn (k Kernel&) Run(d mut device.Device&, x I64, y I64, z I64, bufs Array<U64>&, params Array<U32>&) {
     assert bufs.Len() == k.Buffers and params.Len() == k.Params, "the kernel " + k.Name + " takes " + $k.Buffers + " buffers and " + $k.Params + " parameters"
     assert x <= d.MaxGroups and y <= d.MaxGroups and z <= d.MaxGroups, "the kernel " + k.Name + " over more workgroups than the device takes"
-    if x > 0 and y > 0 and z > 0: vk.oann_vk_dispatch(d.Handle(), k.h, U32(x), U32(y), U32(z), bufs, params)
+    if x <= 0 or y <= 0 or z <= 0: return
+    vk.oann_vk_dispatch(d.Handle(), k.h, U32(x), U32(y), U32(z), bufs, params)
+    if not Trace: return
+    try d.Sync() catch e {
+        Println("OANN_VK_TRACE: the kernel " + k.Name + " over " + $x + " x " + $y + " x " + $z + " workgroups failed: " + $e)
+        os.Exit(1)
+    }
 }
+
+# $OANN_VK_TRACE set: every kernel runs as it is recorded, and the first that fails is named and ends the program
+Trace Bool = (try os.Env("OANN_VK_TRACE") catch default "") != ""
 
 # invocations a workgroup: Line along one axis, Tile along each of two
 Line I64 = 64
@@ -315,6 +324,7 @@ fn (p Product&) Run(d mut device.Device&, c device.DBatch<F32>&, a device.DBatch
     w := Array<U32>[u(c.Rows), u(c.Cols), u(depth), u(c.Members), u(a.Off), u(a.Ld), u(a.GroupStride), u(a.MemberStride)
         u(b.Off), u(b.Ld), u(b.GroupStride), u(b.MemberStride), u(c.Off), u(c.Ld), u(c.GroupStride), u(c.MemberStride)
         u(1 if ta else 0), u(1 if tb else 0), f(alpha), f(beta)]
+    d.Spend(2.0 * F64(c.Rows) * F64(c.Cols) * F64(depth) * F64(c.Groups * c.Members))
     p.k.Run(d, groups(c.Cols, p.By.Side * p.By.Cols), groups(c.Rows, p.By.Side * p.By.Rows), c.Groups * c.Members, Array<U64>[a.Data.Handle(), b.Data.Handle(), c.Data.Handle()], w)
 }
 

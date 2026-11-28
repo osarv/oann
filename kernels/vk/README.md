@@ -38,5 +38,5 @@ first discrete GPU, else an integrated one, else software Vulkan; `OANN_VK_DEVIC
 
 `make vktest` runs the tests, `make vkgemm` times the product against the CPU, `make vktune` times every plan of the
 product on the device (`OANN_VK_GEMM=ROWS,COLS,SIDE,CHUNK,FUSED` then names the plan a `Set` uses for large products), `make vkllm` checks and times a
-language model's decoding. `OANN_VK_DUMP=DIR` writes each kernel's
+language model's decoding. `OANN_VK_TRACE=1` runs every kernel as it is recorded and names the first that fails; `OANN_VK_DUMP=DIR` writes each kernel's
 SPIR-V to `DIR/NAME.spv` (for `spirv-val` and `spirv-dis`).
