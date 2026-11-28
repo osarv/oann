@@ -246,7 +246,11 @@ int32_t oann_vk_open(uint64_t *out, int32_t want, uint64_t stagebytes) {
 #undef X
     VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "oann";
-    app.apiVersion = VK_API_VERSION_1_0;
+    /* 1.1 where the loader has it, for the memory budget's query (oann_vk_free_mib) */
+    PFN_vkEnumerateInstanceVersion version = (PFN_vkEnumerateInstanceVersion)lib_sym(lib, "vkEnumerateInstanceVersion");
+    uint32_t loader = VK_API_VERSION_1_0;
+    if (version && version(&loader) != VK_SUCCESS) loader = VK_API_VERSION_1_0;
+    app.apiVersion = loader >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0;
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     VkResult r = d->CreateInstance(&ci, 0, &d->instance);
@@ -355,6 +359,41 @@ void oann_vk_info(uint64_t h, uint8_t *name, int32_t cap, int32_t *info) {
     info[6] = (int32_t)(d->props.limits.maxComputeWorkGroupCount[0] > 0x7fffffffu ? 0x7fffffffu : d->props.limits.maxComputeWorkGroupCount[0]);
     info[7] = (int32_t)(d->props.limits.maxComputeWorkGroupInvocations > 0x7fffffffu ? 0x7fffffffu : d->props.limits.maxComputeWorkGroupInvocations);
     info[8] = (int32_t)(d->props.limits.maxComputeSharedMemorySize > 0x7fffffffu ? 0x7fffffffu : d->props.limits.maxComputeSharedMemorySize);
+}
+
+/* the MiB of the largest device-local heap this process may still take before the driver starts moving memory out
+ * (VK_EXT_memory_budget: the heap's budget less what every process uses of it, this one included), into out; -1 where
+ * the device or the loader cannot say (no Vulkan 1.1 on both, or no VK_EXT_memory_budget) */
+void oann_vk_free_mib(uint64_t h, int64_t *out) {
+    vkdev *d = D(h);
+    out[0] = -1;
+    if (d->props.apiVersion < VK_API_VERSION_1_1) return;
+    PFN_vkGetPhysicalDeviceMemoryProperties2 props2 = (PFN_vkGetPhysicalDeviceMemoryProperties2)lib_sym(d->lib, "vkGetPhysicalDeviceMemoryProperties2");
+    PFN_vkEnumerateDeviceExtensionProperties exts = (PFN_vkEnumerateDeviceExtensionProperties)lib_sym(d->lib, "vkEnumerateDeviceExtensionProperties");
+    if (!props2 || !exts) return;
+    uint32_t n = 0;
+    if (exts(d->phys, 0, &n, 0) != VK_SUCCESS || n == 0) return;
+    VkExtensionProperties *list = (VkExtensionProperties *)calloc(n, sizeof(VkExtensionProperties));
+    if (!list) return;
+    int has = 0;
+    if (exts(d->phys, 0, &n, list) == VK_SUCCESS)
+        for (uint32_t i = 0; i < n; i++)
+            if (strcmp(list[i].extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME) == 0) has = 1;
+    free(list);
+    if (!has) return;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 mem = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+    mem.pNext = &budget;
+    props2(d->phys, &mem);
+    uint64_t size = 0;
+    int64_t left = -1;
+    for (uint32_t i = 0; i < mem.memoryProperties.memoryHeapCount; i++) {
+        VkMemoryHeap heap = mem.memoryProperties.memoryHeaps[i];
+        if (!(heap.flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) || heap.size <= size) continue;
+        size = heap.size;
+        left = budget.heapBudget[i] > budget.heapUsage[i] ? (int64_t)((budget.heapBudget[i] - budget.heapUsage[i]) >> 20) : 0;
+    }
+    out[0] = left;
 }
 
 /* ---- recording and running ---- */
