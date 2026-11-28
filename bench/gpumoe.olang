@@ -1,9 +1,9 @@
 # What a mixture-of-experts feed-forward layer costs on the GPU against the dense one it replaces: nn/moe's Experts
 # (E experts, K a token, hidden H each, ad/mirror's Work.Moe) against layers.Feed's gated (SwiGLU) perceptron of the same
 # active size (hidden K H), one layer of each on `tokens` rows of width D, trained by GpuAdamW (Forward, Backward, the
-# step) on random rows. Prints the median step of each: the dense one launch by launch and as one CUDA graph (Train), the
-# mixture launch by launch (a Moe step brings its rows per expert down once a Forward, so it is not captured), and the
-# mixture's cost over the dense layer's - reasoning-300m.md's P2 bar: well under 33 %. Each is the median of Rounds
+# step) on random rows. Prints the median step of each, launch by launch and as one CUDA graph (Train: the mixture's
+# experts' rows are in blocks of a fixed size, so its step is captured too), and the mixture's cost over the dense
+# layer's, each way - reasoning-300m.md's P2 bar: well under 33 %. Each is the median of Rounds
 # interleaved rounds (each round's own figure the median of its steps).
 # From the repository's root: make gpumoe ARGS="tokens steps f32|bf16 experts k D..." (the defaults: 8192 20 bf16 16 2
 # 384 640 896, the P4 ladder's widths); the dense hidden width is 8 D / 3 rounded up to 64, each expert's a K-th of it.
@@ -79,7 +79,7 @@ fn dense<T>(tokens I64, d I64, hidden I64, steps I64, whole Bool) F64 ? io.Error
     return try timed(g, loss, x, t, steps, whole, none)
 }
 
-fn mixture<T>(tokens I64, d I64, h I64, e I64, k I64, steps I64) F64 ? io.Error {
+fn mixture<T>(tokens I64, d I64, h I64, e I64, k I64, steps I64, whole Bool) F64 ? io.Error {
     op := moe.Experts<T>(tokens, d, h, e, k)
     g mut graph.Graph<T>& = graph.Graph<T>(tokens)
     x := g.Input(d)
@@ -90,23 +90,24 @@ fn mixture<T>(tokens I64, d I64, h I64, e I64, k I64, steps I64) F64 ? io.Error 
         try io.Put("not planned on the GPU: " + $err + "\n")
         return 0.0
     }
-    return try timed(g, loss, x, t, steps, false, op)
+    return try timed(g, loss, x, t, steps, whole, op)
 }
 
-# rounds of the three runs, interleaved, each reported as its median (a GPU that also drives a desktop is noisy)
+# rounds of the four runs, interleaved, each reported as its median (a GPU that also drives a desktop is noisy)
 Rounds := 5
 
 fn row<T>(tokens I64, d I64, e I64, k I64, steps I64) ? io.Error {
     hidden := (8 * d / 3 + 63) / 64 * 64
     h := hidden / k
-    ones, graphs, mixes := Array<F64>(Rounds), Array<F64>(Rounds), Array<F64>(Rounds)
+    ones, graphs, mixes, wholes := Array<F64>(Rounds), Array<F64>(Rounds), Array<F64>(Rounds), Array<F64>(Rounds)
     for i in range Rounds {
         ones[i] = try dense<T>(tokens, d, hidden, steps, false)
         graphs[i] = try dense<T>(tokens, d, hidden, steps, true)
-        mixes[i] = try mixture<T>(tokens, d, h, e, k, steps)
+        mixes[i] = try mixture<T>(tokens, d, h, e, k, steps, false)
+        wholes[i] = try mixture<T>(tokens, d, h, e, k, steps, true)
     }
-    one, graphed, mix := median(ones), median(graphs), median(mixes)
-    try io.Put("D " + $d + ": dense hidden " + $hidden + " " + $one + " ms (" + $graphed + " as a CUDA graph); " + $e + " experts x top-" + $k + " hidden " + $h + " " + $mix + " ms: +" + $(100.0 * (mix / one - 1.0)) + " % launch by launch, +" + $(100.0 * (mix / graphed - 1.0)) + " % against the graph\n")
+    one, graphed, mix, whole := median(ones), median(graphs), median(mixes), median(wholes)
+    try io.Put("D " + $d + ": dense hidden " + $hidden + " " + $one + " ms (" + $graphed + " as a CUDA graph); " + $e + " experts x top-" + $k + " hidden " + $h + " " + $mix + " ms (" + $whole + " as a CUDA graph): +" + $(100.0 * (mix / one - 1.0)) + " % launch by launch, +" + $(100.0 * (whole / graphed - 1.0)) + " % graph against graph\n")
 }
 
 fn main() ? io.Error, ParseError {

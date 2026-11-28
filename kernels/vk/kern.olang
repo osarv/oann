@@ -1,0 +1,1164 @@
+# kern - oann's kernels on any Vulkan GPU (docs/vulkan.md): each written with spirv.Kernel, made into a pipeline when a
+# Set is made, and recorded on the device's queue when called - the products, the element-wise maps, and what a model's
+# forward pass needs beside them (softmax with its causal mask, the two norms, an embedding's rows, the largest of a
+# row, a convolution's patches). F32 throughout.
+#
+# A Set is every kernel of one device, made once (Set.Make: the drivers compile them, tens of milliseconds each). Its
+# methods record: they return at once, the work runs by the device's next Sync at the latest, and a failure is that
+# Sync's error. Operands are views (device.DMat, device.DBatch) or a buffer with an offset; nothing is checked but what
+# the device itself limits (asserted).
+#
+# Against the CPU. Sums are taken one term after another in each kernel, where kernels/gemm sums in lanes, so a
+# product agrees with the CPU's to rounding (tests: within depth x eps), not bit for bit; +, -, * and / are IEEE's and
+# never fused; exp and tanh are the driver's, a few units in the last place from kernels/elem's.
+#
+# $OANN_VK_DUMP names a directory each kernel's SPIR-V is written to as NAME.spv when it is made (for spirv-val and
+# spirv-dis).
+#
+# Built only with -define Vulkan=true (device.olang asserts it).
+
+import vk "vk.c"
+import "device"
+import "spirv"
+import "../mat"
+import "../gemm"
+import "std/os"
+import "std/rand"
+
+# a kernel on a device: Buffers bindings and Params numbers a dispatch. It holds its device, so it cannot outlive it
+type Kernel unique struct(dev device.Device&, name String&) {
+    dev
+    Name String = $name
+    Buffers I64 = 0
+    Params I64 = 0
+    h U64 = 0
+    devh U64 = dev.Handle()
+} destruct {
+    if h != 0: vk.oann_vk_kernel_free(devh, h)
+}
+
+# words as the bytes of a .spv file
+fn bytesOf(w Array<U32>&) Array<U8> {
+    b := Array<U8>(4 * w.Len())
+    for i in range w.Len() {
+        for j in range 4: b[4 * i + j] = U8((w[i] >> U32(8 * j)) & 0xff)
+    }
+    return b
+}
+
+# the kernel k writes, made a pipeline of dev: VkError.Vulkan naming it where the driver refuses it
+fn Kernel.Make(dev mut device.Device&, name String&, k mut spirv.Kernel&) Kernel ? device.VkError {
+    words := k.Finish()
+    dir := try os.Env("OANN_VK_DUMP") catch default ""
+    if dir != "": try os.WriteFile($dir + "/" + name + ".spv", bytesOf(words)) catch os.Error { }
+    r := Kernel(dev, name)
+    out := Array<U64>(1)
+    st := vk.oann_vk_kernel_new(dev.Handle(), words, words.Len(), I32(k.Buffers), I32(4 * k.Params), out)
+    try device.Check(st, "the kernel " + name)
+    r.h = out[0]
+    r.Buffers = k.Buffers
+    r.Params = k.Params
+    return r
+}
+
+# the kernel over x by y by z workgroups, its bindings these buffers (Buf.Handle) and its parameters these words, in
+# order on the device
+fn (k Kernel&) Run(d mut device.Device&, x I64, y I64, z I64, bufs Array<U64>&, params Array<U32>&) {
+    assert bufs.Len() == k.Buffers and params.Len() == k.Params, "the kernel " + k.Name + " takes " + $k.Buffers + " buffers and " + $k.Params + " parameters"
+    assert x <= d.MaxGroups and y <= d.MaxGroups and z <= d.MaxGroups, "the kernel " + k.Name + " over more workgroups than the device takes"
+    if x <= 0 or y <= 0 or z <= 0: return
+    vk.oann_vk_dispatch(d.Handle(), k.h, U32(x), U32(y), U32(z), bufs, params)
+    d.Spend(d.Each)
+    if not Trace: return
+    try d.Sync() catch e {
+        Println("OANN_VK_TRACE: the kernel " + k.Name + " over " + $x + " x " + $y + " x " + $z + " workgroups failed: " + $e)
+        os.Exit(1)
+    }
+}
+
+# $OANN_VK_TRACE set: every kernel runs as it is recorded, and the first that fails is named and ends the program
+Trace Bool = (try os.Env("OANN_VK_TRACE") catch default "") != ""
+
+# invocations a workgroup: Line along one axis, Tile along each of two
+Line I64 = 64
+Tile I64 = 8
+
+fn groups(n I64, per I64) I64 { return (n + per - 1) / per }
+
+fn u(x I64) U32 { return U32(x) }
+fn f(x F32) U32 { return x.Bits() }
+
+# ---- the kernels, written ----
+
+# how the product is computed on a device: an invocation computes Rows x Cols elements of the result, a workgroup is
+# Side x Side invocations. Chunk 0 (direct): each step of the depth reads Rows elements of op(A) and Cols of op(B)
+# from the buffers. Chunk > 0 (staged): the workgroup first copies its Side Rows rows of op(A) and Side Cols columns
+# of op(B) over Chunk steps of the depth into its shared memory, then every invocation computes from there - an
+# operand's element is read from the buffer once a workgroup, not once an invocation. Fused: a step's product and sum
+# are one operation where the device has one (spirv's Fma): faster on some devices, the result then the device's own
+# rounding of each step. Without it every plan gives the same bits: each element's sum is taken in the depth's order.
+# Group > 0 (grouped): the workgroups take the result's tiles in bands of Group rows of tiles, down each band's
+# columns before across, so the workgroups running at once share Group tile rows of op(A) and few columns of op(B) and
+# find them in the device's cache; 0 takes the tiles row by row, every workgroup of a tile row reading all of op(B).
+# The order changes no sum
+type Plan struct(rows I64, cols I64, side I64, chunk I64, fused Bool, group I64 = 0) {
+    Rows I64 = rows
+    Cols I64 = cols
+    Side I64 = side
+    Chunk I64 = chunk
+    Fused Bool = fused
+    Group I64 = group
+}
+
+# the plan in words: "8x8 of 8x8, staged 16, grouped 8, fused"
+fn (p Plan) Str() String {
+    return $p.Rows + "x" + $p.Cols + " of " + $p.Side + "x" + $p.Side + (", staged " + $p.Chunk if p.Chunk > 0 else ", direct") + (", grouped " + $p.Group if p.Group > 0 else "") + (", fused" if p.Fused else "")
+}
+
+# whether d runs the plan: its workgroup's invocations and shared memory within the device's
+fn (p Plan) Fits(d device.Device&) Bool {
+    if p.Rows < 1 or p.Cols < 1 or p.Side < 1 or p.Chunk < 0 or p.Group < 0: return false
+    if (p.Rows * p.Chunk) % p.Side != 0 or (p.Cols * p.Chunk) % p.Side != 0: return false
+    return p.Side * p.Side <= d.MaxInvocations and 4 * p.Side * (p.Rows + p.Cols) * p.Chunk <= d.SharedBytes
+}
+
+# "ROWS,COLS,SIDE,CHUNK,FUSED[,GROUP]" (numbers; FUSED 0 or 1) as a plan
+fn Plan.Parse(t String&) Plan ? ParseError {
+    parts := t.Split(",")
+    if parts.Len() != 5 and parts.Len() != 6: error ParseError.Invalid
+    group := try parts[5].ParseInt() if parts.Len() == 6 else 0
+    return Plan(try parts[0].ParseInt(), try parts[1].ParseInt(), try parts[2].ParseInt(), try parts[3].ParseInt(), try parts[4].ParseInt() != 0, group)
+}
+
+# the plan of d's large products: $OANN_VK_GEMM ("ROWS,COLS,SIDE,CHUNK,FUSED") where it names one d runs, else the
+# one measured best for d's kind (docs/vulkan.md, "The product"): on a GPU 8 x 8 blocks from tiles staged 16 steps
+# at a time - on a discrete one 16 x 16 invocations a workgroup (128 x 128 tiles), else 8 x 8 - and on a CPU's
+# software Vulkan 8 x 8 blocks read direct. None is grouped: no device measured gains from it
+fn Plan.For(d device.Device&) Plan {
+    env := try os.Env("OANN_VK_GEMM") catch default ""
+    if env != "" {
+        p := try Plan.Parse(env) catch default Plan(0, 0, 0, 0, false)
+        if p.Fits(d): return p
+    }
+    wide := Plan(8, 8, 16, 16, false)
+    if d.Kind == device.KindDiscrete and wide.Fits(d): return wide
+    staged := Plan(8, 8, 8, 16, false)
+    if d.Kind == device.KindCpu or not staged.Fits(d): return Plan(8, 8, 4, 0, false)
+    return staged
+}
+
+# the 24 parameters of a product, in the dispatch's order
+type gemmArgs struct(k mut spirv.Kernel&) {
+    M spirv.Val = k.Param(spirv.Ty.U32)
+    N spirv.Val = k.Param(spirv.Ty.U32)
+    Depth spirv.Val = k.Param(spirv.Ty.U32)
+    Members spirv.Val = k.Param(spirv.Ty.U32)
+    AOff spirv.Val = k.Param(spirv.Ty.U32)
+    Lda spirv.Val = k.Param(spirv.Ty.U32)
+    AGs spirv.Val = k.Param(spirv.Ty.U32)
+    AMs spirv.Val = k.Param(spirv.Ty.U32)
+    BOff spirv.Val = k.Param(spirv.Ty.U32)
+    Ldb spirv.Val = k.Param(spirv.Ty.U32)
+    BGs spirv.Val = k.Param(spirv.Ty.U32)
+    BMs spirv.Val = k.Param(spirv.Ty.U32)
+    COff spirv.Val = k.Param(spirv.Ty.U32)
+    Ldc spirv.Val = k.Param(spirv.Ty.U32)
+    CGs spirv.Val = k.Param(spirv.Ty.U32)
+    CMs spirv.Val = k.Param(spirv.Ty.U32)
+    Ta spirv.Val = k.Param(spirv.Ty.U32)
+    Tb spirv.Val = k.Param(spirv.Ty.U32)
+    Alpha spirv.Val = k.Param(spirv.Ty.F32)
+    Beta spirv.Val = k.Param(spirv.Ty.F32)
+}
+
+# acc[q] takes av[q / Cols] bv[q % Cols] more, every q
+fn accumulate(k mut spirv.Kernel&, p Plan, acc Vec<spirv.Var>&, av Vec<spirv.Val>&, bv Vec<spirv.Val>&) {
+    for q in range p.Rows * p.Cols {
+        x, y := av[q / p.Cols], bv[q % p.Cols]
+        k.Set(acc[q], k.Fma(x, y, k.Get(acc[q])) if p.Fused else k.Add(k.Get(acc[q]), k.Mul(x, y)))
+    }
+}
+
+# the block's sums into C from row i0 and column j0, those inside the matrix: alpha acc + beta C
+fn gemmStore(k mut spirv.Kernel&, p Plan, g gemmArgs&, c spirv.Buffer, c0 spirv.Val, i0 spirv.Val, j0 spirv.Val, acc Vec<spirv.Var>&) {
+    keep := k.Eq(g.Beta, k.F(0))
+    for q in range p.Rows * p.Cols {
+        i := k.Add(i0, k.U(q / p.Cols))
+        j := k.Add(j0, k.U(q % p.Cols))
+        k.If(k.And(k.Lt(i, g.M), k.Lt(j, g.N)))
+        ci := k.Add(c0, k.Add(k.Mul(i, g.Ldc), j))
+        k.If(keep)
+        k.Write(c, ci, k.Mul(g.Alpha, k.Get(acc[q])))
+        k.Else()
+        k.Write(c, ci, k.Add(k.Mul(g.Alpha, k.Get(acc[q])), k.Mul(g.Beta, k.Read(c, ci))))
+        k.EndIf()
+        k.EndIf()
+    }
+}
+
+# C = alpha op(A) op(B) + beta C over a batch by plan p: invocation (x, y, z) is the Rows x Cols elements of matrix
+# z from row Rows y and column Cols x, every element's sum taken in the depth's order
+fn gemmKernel(p Plan) spirv.Kernel {
+    k := spirv.Kernel.Begin(p.Side, p.Side)
+    a := k.Buffer(spirv.Ty.F32)
+    b := k.Buffer(spirv.Ty.F32)
+    c := k.Buffer(spirv.Ty.F32)
+    g := gemmArgs(k)
+    gx, gy := grouped(k, p, g, k.GlobalId(0), k.GlobalId(1))
+    z := k.GlobalId(2)
+    j0 := k.Mul(gx, k.U(p.Cols))
+    i0 := k.Mul(gy, k.U(p.Rows))
+    grp := k.Div(z, g.Members)
+    mem := k.Mod(z, g.Members)
+    a0 := k.Add(g.AOff, k.Add(k.Mul(grp, g.AGs), k.Mul(mem, g.AMs)))
+    b0 := k.Add(g.BOff, k.Add(k.Mul(grp, g.BGs), k.Mul(mem, g.BMs)))
+    c0 := k.Add(g.COff, k.Add(k.Mul(grp, g.CGs), k.Mul(mem, g.CMs)))
+    acc := Vec<spirv.Var>()
+    for _ in range p.Rows * p.Cols: acc.Push(k.Let(k.F(0)))
+    if p.Chunk > 0 {
+        gemmStaged(k, p, g, a, b, a0, b0, gx, gy, acc)
+    } else {
+        gemmDirect(k, p, g, a, b, a0, b0, i0, j0, acc)
+    }
+    gemmStore(k, p, g, c, c0, i0, j0, acc)
+    return k
+}
+
+# the invocation's place (gx, gy) as the plan's order has it (unchanged where Group is 0): the workgroups counted row by row take the tiles down
+# bands of Group tile rows (the last band what is left), column by column within a band; its place in the workgroup
+# stays
+fn grouped(k mut spirv.Kernel&, p Plan, g gemmArgs&, gx spirv.Val, gy spirv.Val) spirv.Val, spirv.Val {
+    if p.Group == 0: return gx, gy
+    side := k.U(p.Side)
+    wide, tall := k.U(p.Side * p.Cols), k.U(p.Side * p.Rows)
+    across := k.Div(k.Add(g.N, k.Sub(wide, k.U(1))), wide)
+    down := k.Div(k.Add(g.M, k.Sub(tall, k.U(1))), tall)
+    lx, ly := k.Mod(gx, side), k.Mod(gy, side)
+    n := k.Add(k.Mul(k.Div(gy, side), across), k.Div(gx, side))
+    band := k.Mul(k.U(p.Group), across)
+    first := k.Mul(k.Div(n, band), k.U(p.Group))
+    rows := k.Least(k.Sub(down, first), k.U(p.Group))
+    at := k.Mod(n, band)
+    ty := k.Add(first, k.Mod(at, rows))
+    tx := k.Div(at, rows)
+    return k.Add(k.Mul(tx, side), lx), k.Add(k.Mul(ty, side), ly)
+}
+
+# the sums of the block from row i0 and column j0, each step of the depth reading Rows elements of op(A) and Cols of
+# op(B) for Rows Cols products. op(A)'s (i, s) is a0 + i lda + s, or transposed a0 + s lda + i; op(B)'s (s, j) is b0 + s ldb + j,
+# or b0 + j ldb + s. Rows and columns past the matrix's edge read as its last (and are not stored)
+fn gemmDirect(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.Buffer, a0 spirv.Val, b0 spirv.Val, i0 spirv.Val, j0 spirv.Val, acc Vec<spirv.Var>&) {
+    k.If(k.And(k.Lt(i0, g.M), k.Lt(j0, g.N)))
+    at := k.Ne(g.Ta, k.U(0))
+    bt := k.Ne(g.Tb, k.U(0))
+    aStep := k.Select(at, g.Lda, k.U(1))
+    bStep := k.Select(bt, k.U(1), g.Ldb)
+    lastRow := k.Sub(g.M, k.U(1))
+    lastCol := k.Sub(g.N, k.U(1))
+    aBase := Vec<spirv.Val>()
+    bBase := Vec<spirv.Val>()
+    for q in range p.Rows {
+        i := k.Least(k.Add(i0, k.U(q)), lastRow)
+        aBase.Push(k.Add(a0, k.Select(at, i, k.Mul(i, g.Lda))))
+    }
+    for q in range p.Cols {
+        j := k.Least(k.Add(j0, k.U(q)), lastCol)
+        bBase.Push(k.Add(b0, k.Select(bt, k.Mul(j, g.Ldb), j)))
+    }
+    s := k.Var(spirv.Ty.U32)
+    k.For(s, k.U(0), g.Depth)
+    pa := k.Mul(k.Get(s), aStep)
+    pb := k.Mul(k.Get(s), bStep)
+    av := Vec<spirv.Val>()
+    bv := Vec<spirv.Val>()
+    for q in range p.Rows: av.Push(k.Read(a, k.Add(aBase[q], pa)))
+    for q in range p.Cols: bv.Push(k.Read(b, k.Add(bBase[q], pb)))
+    accumulate(k, p, acc, av, bv)
+    k.Next(s)
+    k.EndIf()
+}
+
+# the same sums with the operands staged: the workgroup's tile is Side Rows rows and Side Cols columns; for each
+# Chunk steps of the depth its invocations copy the tile's rows of op(A) (row-major, Chunk a row) and columns of op(B)
+# (a step's columns together) into shared memory, meet, add the chunk's products from there, and meet again before
+# the next copy. Every invocation runs every chunk, those past the matrix's edge too (a Barrier is for all): they read
+# the last row and column and store nothing
+fn gemmStaged(k mut spirv.Kernel&, p Plan, g gemmArgs&, a spirv.Buffer, b spirv.Buffer, a0 spirv.Val, b0 spirv.Val, gx spirv.Val, gy spirv.Val, acc Vec<spirv.Var>&) {
+    side, tall, wide, chunk := p.Side, p.Side * p.Rows, p.Side * p.Cols, p.Chunk
+    sa := k.Shared(spirv.Ty.F32, tall * chunk)
+    sb := k.Shared(spirv.Ty.F32, wide * chunk)
+    lx := k.Mod(gx, k.U(side))
+    ly := k.Mod(gy, k.U(side))
+    lid := k.Add(k.Mul(ly, k.U(side)), lx)
+    row0 := k.Mul(k.Sub(gy, ly), k.U(p.Rows))
+    col0 := k.Mul(k.Sub(gx, lx), k.U(p.Cols))
+    at := k.Ne(g.Ta, k.U(0))
+    bt := k.Ne(g.Tb, k.U(0))
+    lastRow := k.Sub(g.M, k.U(1))
+    lastCol := k.Sub(g.N, k.U(1))
+    lastStep := k.Sub(g.Depth, k.U(1))
+    myRow := k.Mul(k.Mul(ly, k.U(p.Rows)), k.U(chunk))
+    myCol := k.Mul(lx, k.U(p.Cols))
+    s0 := k.Var(spirv.Ty.U32)
+    k.Set(s0, k.U(0))
+    k.Loop()
+    k.While(k.Lt(k.Get(s0), g.Depth))
+    from := k.Get(s0)
+    # each invocation copies its share of each operand's tile, neighbours what lies together in the buffer: a row's
+    # steps of A (a step's rows where transposed), a step's columns of B (a column's steps where transposed)
+    for e in range tall * chunk / (side * side) {
+        at0 := k.Add(lid, k.U(e * side * side))
+        i := k.Select(at, k.Mod(at0, k.U(tall)), k.Div(at0, k.U(chunk)))
+        sA := k.Select(at, k.Div(at0, k.U(tall)), k.Mod(at0, k.U(chunk)))
+        ri := k.Least(k.Add(row0, i), lastRow)
+        rs := k.Least(k.Add(from, sA), lastStep)
+        k.WriteShared(sa, k.Add(k.Mul(i, k.U(chunk)), sA), k.Read(a, k.Add(a0, k.Select(at, k.Add(k.Mul(rs, g.Lda), ri), k.Add(k.Mul(ri, g.Lda), rs)))))
+    }
+    for e in range wide * chunk / (side * side) {
+        at0 := k.Add(lid, k.U(e * side * side))
+        j := k.Select(bt, k.Div(at0, k.U(chunk)), k.Mod(at0, k.U(wide)))
+        sB := k.Select(bt, k.Mod(at0, k.U(chunk)), k.Div(at0, k.U(wide)))
+        rj := k.Least(k.Add(col0, j), lastCol)
+        rb := k.Least(k.Add(from, sB), lastStep)
+        k.WriteShared(sb, k.Add(k.Mul(sB, k.U(wide)), j), k.Read(b, k.Add(b0, k.Select(bt, k.Add(k.Mul(rj, g.Ldb), rb), k.Add(k.Mul(rb, g.Ldb), rj)))))
+    }
+    k.Barrier()
+    steps := k.Least(k.U(chunk), k.Sub(g.Depth, from))
+    s := k.Var(spirv.Ty.U32)
+    k.For(s, k.U(0), steps)
+    av := Vec<spirv.Val>()
+    bv := Vec<spirv.Val>()
+    for q in range p.Rows: av.Push(k.ReadShared(sa, k.Add(k.Add(myRow, k.U(q * chunk)), k.Get(s))))
+    for q in range p.Cols: bv.Push(k.ReadShared(sb, k.Add(k.Add(k.Mul(k.Get(s), k.U(wide)), myCol), k.U(q))))
+    accumulate(k, p, acc, av, bv)
+    k.Next(s)
+    k.Barrier()
+    k.Set(s0, k.Add(from, k.U(chunk)))
+    k.EndLoop()
+}
+
+# the product's kernel on a device, by a plan
+type Product unique struct(k Kernel, plan Plan) {
+    k
+    By Plan = plan
+}
+
+# plan's product made a pipeline of d (the plan one d runs: Plan.Fits)
+fn Product.Make(d mut device.Device&, plan Plan) Product ? device.VkError {
+    assert plan.Fits(d), "the product's plan " + plan.Str() + " is more than the device's workgroups hold"
+    return Product(try Kernel.of(d, "gemm", gemmKernel(plan)), plan)
+}
+
+# c = alpha op(a) op(b) + beta c for every matrix of the batches, Set.GemmBatch's
+fn (p Product&) Run(d mut device.Device&, c device.DBatch<F32>&, a device.DBatch<F32>&, ta Bool, b device.DBatch<F32>&, tb Bool, alpha F32 = 1, beta F32 = 0) {
+    depth := a.Rows if ta else a.Cols
+    w := Array<U32>[u(c.Rows), u(c.Cols), u(depth), u(c.Members), u(a.Off), u(a.Ld), u(a.GroupStride), u(a.MemberStride)
+        u(b.Off), u(b.Ld), u(b.GroupStride), u(b.MemberStride), u(c.Off), u(c.Ld), u(c.GroupStride), u(c.MemberStride)
+        u(1 if ta else 0), u(1 if tb else 0), f(alpha), f(beta)]
+    d.Spend(2.0 * F64(c.Rows) * F64(c.Cols) * F64(depth) * F64(c.Groups * c.Members))
+    p.k.Run(d, groups(c.Cols, p.By.Side * p.By.Cols), groups(c.Rows, p.By.Side * p.By.Rows), c.Groups * c.Members, Array<U64>[a.Data.Handle(), b.Data.Handle(), c.Data.Handle()], w)
+}
+
+# the maps of one element: mat.Act's activations, and the affine a x + b
+type Op enum { Affine, Relu, Gelu, GeluTanh, Silu, Sigmoid, Tanh, Softplus, Exp }
+
+# erf(x) to 1.5e-7 (Abramowitz and Stegun 7.1.26): GLSL has none
+fn erf(k mut spirv.Kernel&, x spirv.Val) spirv.Val {
+    ax := k.Abs(x)
+    t := k.Div(k.F(1), k.Add(k.F(1), k.Mul(k.F(0.3275911), ax)))
+    poly := k.F(1.061405429)
+    poly = k.Add(k.Mul(poly, t), k.F(-1.453152027))
+    poly = k.Add(k.Mul(poly, t), k.F(1.421413741))
+    poly = k.Add(k.Mul(poly, t), k.F(-0.284496736))
+    poly = k.Add(k.Mul(poly, t), k.F(0.254829592))
+    e := k.Sub(k.F(1), k.Mul(k.Mul(poly, t), k.Exp(k.Neg(k.Mul(ax, ax)))))
+    return k.Select(k.Lt(x, k.F(0)), k.Neg(e), e)
+}
+
+# what a map makes of x (a and b the affine's)
+fn mapped(k mut spirv.Kernel&, op Op, x spirv.Val, a spirv.Val, b spirv.Val) spirv.Val {
+    one := k.F(1)
+    if op == Op.Affine: return k.Add(k.Mul(a, x), b)
+    if op == Op.Relu: return k.Most(x, k.F(0))
+    if op == Op.Gelu: return k.Mul(k.Mul(k.F(0.5), x), k.Add(one, erf(k, k.Mul(x, k.F(0.70710678118654752)))))
+    if op == Op.GeluTanh {
+        # kernels/elem's form: x / (1 + e^(-2u)), u = sqrt(2 / pi) (x + 0.044715 x^3)
+        arg := k.Mul(k.F(0.7978845608028654), k.Add(x, k.Mul(k.Mul(k.Mul(k.F(0.044715), x), x), x)))
+        return k.Div(x, k.Add(one, k.Exp(k.Mul(k.F(-2), arg))))
+    }
+    if op == Op.Silu: return k.Div(x, k.Add(one, k.Exp(k.Neg(x))))
+    if op == Op.Sigmoid: return k.Div(one, k.Add(one, k.Exp(k.Neg(x))))
+    if op == Op.Tanh: return k.Tanh(x)
+    if op == Op.Softplus: return k.Add(k.Most(x, k.F(0)), k.Log(k.Add(one, k.Exp(k.Neg(k.Abs(x))))))
+    return k.Exp(x)
+}
+
+# y[yOff + i] = op(x[xOff + i]) for i < n
+fn mapKernel(op Op) spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    xOff := k.Param(spirv.Ty.U32)
+    yOff := k.Param(spirv.Ty.U32)
+    a := k.Param(spirv.Ty.F32)
+    b := k.Param(spirv.Ty.F32)
+    i := k.GlobalId(0)
+    k.If(k.Lt(i, n))
+    k.Write(y, k.Add(yOff, i), mapped(k, op, k.Read(x, k.Add(xOff, i)), a, b))
+    k.EndIf()
+    return k
+}
+
+# z[zOff + i] = x[xOff + i] + a y[yOff + i mod period], or where times the product x y (a unused), for i < n
+fn zipKernel(times Bool) spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    z := k.Buffer(spirv.Ty.F32)
+    n := k.Param(spirv.Ty.U32)
+    xOff := k.Param(spirv.Ty.U32)
+    yOff := k.Param(spirv.Ty.U32)
+    zOff := k.Param(spirv.Ty.U32)
+    period := k.Param(spirv.Ty.U32)
+    a := k.Param(spirv.Ty.F32)
+    i := k.GlobalId(0)
+    k.If(k.Lt(i, n))
+    xv := k.Read(x, k.Add(xOff, i))
+    yv := k.Read(y, k.Add(yOff, k.Mod(i, period)))
+    k.Write(z, k.Add(zOff, i), k.Mul(xv, yv) if times else k.Add(xv, k.Mul(a, yv)))
+    k.EndIf()
+    return k
+}
+
+# each row's softmax of scale x: invocation r is row r. Where causal is not 0 the rows are positions in runs of causal,
+# and row r reads only its columns up to position r mod causal: the others become 0
+fn softmaxKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    rows := k.Param(spirv.Ty.U32)
+    cols := k.Param(spirv.Ty.U32)
+    xOff := k.Param(spirv.Ty.U32)
+    ldx := k.Param(spirv.Ty.U32)
+    yOff := k.Param(spirv.Ty.U32)
+    ldy := k.Param(spirv.Ty.U32)
+    causal := k.Param(spirv.Ty.U32)
+    scale := k.Param(spirv.Ty.F32)
+    r := k.GlobalId(0)
+    k.If(k.Lt(r, rows))
+    seen := k.Least(cols, k.Add(k.Mod(r, k.Most(causal, k.U(1))), k.U(1)))
+    lim := k.Select(k.Ne(causal, k.U(0)), seen, cols)
+    x0 := k.Add(xOff, k.Mul(r, ldx))
+    y0 := k.Add(yOff, k.Mul(r, ldy))
+    big := k.Let(k.Mul(scale, k.Read(x, x0)))
+    j := k.Var(spirv.Ty.U32)
+    k.For(j, k.U(1), lim)
+    k.Set(big, k.Most(k.Get(big), k.Mul(scale, k.Read(x, k.Add(x0, k.Get(j))))))
+    k.Next(j)
+    sum := k.Let(k.F(0))
+    k.For(j, k.U(0), lim)
+    k.Set(sum, k.Add(k.Get(sum), k.Exp(k.Sub(k.Mul(scale, k.Read(x, k.Add(x0, k.Get(j)))), k.Get(big)))))
+    k.Next(j)
+    k.For(j, k.U(0), lim)
+    e := k.Exp(k.Sub(k.Mul(scale, k.Read(x, k.Add(x0, k.Get(j)))), k.Get(big)))
+    k.Write(y, k.Add(y0, k.Get(j)), k.Div(e, k.Get(sum)))
+    k.Next(j)
+    k.For(j, lim, cols)
+    k.Write(y, k.Add(y0, k.Get(j)), k.F(0))
+    k.Next(j)
+    k.EndIf()
+    return k
+}
+
+# each row normalized: invocation r is row r. RMS norm, y = x gain / sqrt(mean(x^2) + eps); or with centre, layer norm,
+# y = (x - mean) gain / sqrt(var + eps) + bias
+fn normKernel(centre Bool) spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    y := k.Buffer(spirv.Ty.F32)
+    gain := k.Buffer(spirv.Ty.F32)
+    bias := k.Buffer(spirv.Ty.F32)
+    rows := k.Param(spirv.Ty.U32)
+    cols := k.Param(spirv.Ty.U32)
+    xOff := k.Param(spirv.Ty.U32)
+    ldx := k.Param(spirv.Ty.U32)
+    yOff := k.Param(spirv.Ty.U32)
+    ldy := k.Param(spirv.Ty.U32)
+    gOff := k.Param(spirv.Ty.U32)
+    bOff := k.Param(spirv.Ty.U32)
+    eps := k.Param(spirv.Ty.F32)
+    r := k.GlobalId(0)
+    k.If(k.Lt(r, rows))
+    x0 := k.Add(xOff, k.Mul(r, ldx))
+    y0 := k.Add(yOff, k.Mul(r, ldy))
+    count := k.ToF(cols)
+    j := k.Var(spirv.Ty.U32)
+    mean := k.Let(k.F(0))
+    if centre {
+        k.For(j, k.U(0), cols)
+        k.Set(mean, k.Add(k.Get(mean), k.Read(x, k.Add(x0, k.Get(j)))))
+        k.Next(j)
+        k.Set(mean, k.Div(k.Get(mean), count))
+    }
+    sq := k.Let(k.F(0))
+    k.For(j, k.U(0), cols)
+    dv := k.Sub(k.Read(x, k.Add(x0, k.Get(j))), k.Get(mean))
+    k.Set(sq, k.Add(k.Get(sq), k.Mul(dv, dv)))
+    k.Next(j)
+    inv := k.Div(k.F(1), k.Sqrt(k.Add(k.Div(k.Get(sq), count), eps)))
+    k.For(j, k.U(0), cols)
+    jv := k.Get(j)
+    v := k.Mul(k.Mul(k.Sub(k.Read(x, k.Add(x0, jv)), k.Get(mean)), inv), k.Read(gain, k.Add(gOff, jv)))
+    k.Write(y, k.Add(y0, jv), k.Add(v, k.Read(bias, k.Add(bOff, jv))) if centre else v)
+    k.Next(j)
+    k.EndIf()
+    return k
+}
+
+# row r of out is the table's row ids[r]: invocation (x, y) is column x of row y
+fn gatherKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    ids := k.Buffer(spirv.Ty.U32)
+    table := k.Buffer(spirv.Ty.F32)
+    out := k.Buffer(spirv.Ty.F32)
+    rows := k.Param(spirv.Ty.U32)
+    cols := k.Param(spirv.Ty.U32)
+    idOff := k.Param(spirv.Ty.U32)
+    tOff := k.Param(spirv.Ty.U32)
+    ldt := k.Param(spirv.Ty.U32)
+    oOff := k.Param(spirv.Ty.U32)
+    ldo := k.Param(spirv.Ty.U32)
+    j := k.GlobalId(0)
+    i := k.GlobalId(1)
+    k.If(k.And(k.Lt(i, rows), k.Lt(j, cols)))
+    id := k.Read(ids, k.Add(idOff, i))
+    k.Write(out, k.Add(oOff, k.Add(k.Mul(i, ldo), j)), k.Read(table, k.Add(tOff, k.Add(k.Mul(id, ldt), j))))
+    k.EndIf()
+    return k
+}
+
+# out[oOff + r] is the column of row r's largest element (the first of equals): invocation r is row r
+fn argmaxKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Line)
+    x := k.Buffer(spirv.Ty.F32)
+    out := k.Buffer(spirv.Ty.U32)
+    rows := k.Param(spirv.Ty.U32)
+    cols := k.Param(spirv.Ty.U32)
+    xOff := k.Param(spirv.Ty.U32)
+    ldx := k.Param(spirv.Ty.U32)
+    oOff := k.Param(spirv.Ty.U32)
+    r := k.GlobalId(0)
+    k.If(k.Lt(r, rows))
+    x0 := k.Add(xOff, k.Mul(r, ldx))
+    big := k.Let(k.Read(x, x0))
+    at := k.Let(k.U(0))
+    j := k.Var(spirv.Ty.U32)
+    k.For(j, k.U(1), cols)
+    v := k.Read(x, k.Add(x0, k.Get(j)))
+    k.If(k.Gt(v, k.Get(big)))
+    k.Set(big, v)
+    k.Set(at, k.Get(j))
+    k.EndIf()
+    k.Next(j)
+    k.Write(out, k.Add(oOff, r), k.Get(at))
+    k.EndIf()
+    return k
+}
+
+# a convolution's patches along one axis, for a product to finish (the patch matrix times the filters): row i of col
+# is, for each channel ch and tap k, the source's frame i stride + k - pad of that channel, 0 where the frame is outside
+# the source. Invocation (x, y) is column x = ch width + k of row y
+fn patchesKernel() spirv.Kernel {
+    k := spirv.Kernel.Begin(Tile, Tile)
+    src := k.Buffer(spirv.Ty.F32)
+    col := k.Buffer(spirv.Ty.F32)
+    rows := k.Param(spirv.Ty.U32)
+    chans := k.Param(spirv.Ty.U32)
+    width := k.Param(spirv.Ty.U32)
+    frames := k.Param(spirv.Ty.U32)
+    stride := k.Param(spirv.Ty.U32)
+    pad := k.Param(spirv.Ty.U32)
+    sOff := k.Param(spirv.Ty.U32)
+    frameStep := k.Param(spirv.Ty.U32)
+    chanStep := k.Param(spirv.Ty.U32)
+    cOff := k.Param(spirv.Ty.U32)
+    x := k.GlobalId(0)
+    i := k.GlobalId(1)
+    k.If(k.And(k.Lt(i, rows), k.Lt(x, k.Mul(chans, width))))
+    ch := k.Div(x, width)
+    tap := k.Mod(x, width)
+    at := k.Add(k.Mul(i, stride), tap)       # the frame, pad too far right
+    out := k.Add(cOff, k.Add(k.Mul(i, k.Mul(chans, width)), x))
+    k.If(k.And(k.Ge(at, pad), k.Lt(k.Sub(at, pad), frames)))
+    k.Write(col, out, k.Read(src, k.Add(sOff, k.Add(k.Mul(k.Sub(at, pad), frameStep), k.Mul(ch, chanStep)))))
+    k.Else()
+    k.Write(col, out, k.F(0))
+    k.EndIf()
+    k.EndIf()
+    return k
+}
+
+# ---- a device's kernels ----
+
+# every kernel of one device, made by Set.Make
+type Set unique struct(product Product, few Product, mid Product, flat Product, tall Product, one Product, affine Kernel, relu Kernel, gelu Kernel, geluTanh Kernel, silu Kernel, sigmoid Kernel, tanh Kernel, softplus Kernel, exp Kernel, add Kernel, mul Kernel, softmax Kernel, rms Kernel, layer Kernel, gather Kernel, argmax Kernel, patches Kernel) {
+    product             # the product by shape (productFor): large results
+    few                 # fewer elements than a large GPU's invocations fill
+    mid                 # a side under a staged tile's
+    flat                # under 8 rows
+    tall                # under 8 columns
+    one                 # both
+    affine
+    relu
+    gelu
+    geluTanh
+    silu
+    sigmoid
+    tanh
+    softplus
+    exp
+    add
+    mul
+    softmax
+    rms
+    layer
+    gather
+    argmax
+    patches
+}
+
+fn Kernel.of(d mut device.Device&, name String, k spirv.Kernel) Kernel ? device.VkError {
+    w := k
+    return try Kernel.Make(d, name, w)
+}
+
+# the kernels, each made a pipeline of d now: the first the driver refuses is the error, named
+fn Set.Make(d mut device.Device&) Set ? device.VkError { return try Set.MakeWith(d, Plan.For(d)) }
+
+# the plan of d's results of few elements: on a discrete GPU 4 x 4 blocks of 16 x 16 invocations (more invocations
+# for the same result), else the large plan
+fn fewPlan(d device.Device&, large Plan) Plan {
+    p := Plan(4, 4, 16, 16, large.Fused)
+    if d.Kind == device.KindDiscrete and large.Chunk > 0 and p.Fits(d): return p
+    return large
+}
+
+# the same with the large products by plan (one d runs: Plan.Fits)
+fn Set.MakeWith(d mut device.Device&, plan Plan) Set ? device.VkError {
+    fu := plan.Fused
+    return Set(try Product.Make(d, plan), try Product.Make(d, fewPlan(d, plan)), try Product.Make(d, Plan(plan.Rows.Min(8), plan.Cols.Min(8), 8, 0, fu))
+        try Product.Make(d, Plan(1, 8, 8, 0, fu)), try Product.Make(d, Plan(8, 1, 8, 0, fu)), try Product.Make(d, Plan(1, 1, 8, 0, fu))
+        try Kernel.of(d, "affine", mapKernel(Op.Affine)), try Kernel.of(d, "relu", mapKernel(Op.Relu))
+        try Kernel.of(d, "gelu", mapKernel(Op.Gelu)), try Kernel.of(d, "gelutanh", mapKernel(Op.GeluTanh))
+        try Kernel.of(d, "silu", mapKernel(Op.Silu)), try Kernel.of(d, "sigmoid", mapKernel(Op.Sigmoid))
+        try Kernel.of(d, "tanh", mapKernel(Op.Tanh)), try Kernel.of(d, "softplus", mapKernel(Op.Softplus))
+        try Kernel.of(d, "exp", mapKernel(Op.Exp)), try Kernel.of(d, "add", zipKernel(false)), try Kernel.of(d, "mul", zipKernel(true))
+        try Kernel.of(d, "softmax", softmaxKernel()), try Kernel.of(d, "rmsnorm", normKernel(false))
+        try Kernel.of(d, "layernorm", normKernel(true)), try Kernel.of(d, "gather", gatherKernel()), try Kernel.of(d, "argmax", argmaxKernel()), try Kernel.of(d, "patches", patchesKernel()))
+}
+
+# c = alpha op(a) op(b) + beta c for every matrix of the batches (a, b and c of one Groups and Members; op the
+# transpose where ta, tb), kernels/gemm's GemmBatch. c is not read where beta is 0. Unchecked: the shapes agree
+fn (s Set&) GemmBatch(d mut device.Device&, c device.DBatch<F32>&, a device.DBatch<F32>&, ta Bool, b device.DBatch<F32>&, tb Bool, alpha F32 = 1, beta F32 = 0) {
+    s.productFor(c.Rows, c.Cols, c.Groups * c.Members).Run(d, c, a, ta, b, tb, alpha, beta)
+}
+
+# the product for results of rows x cols, count of them. A staged plan's workgroup computes its whole tile, so a
+# result with a side under half a tile's is read direct (an invocation past the edge then does nothing), and one of
+# under 8 rows or columns in blocks of 1 along that side: no plan computes much that is not stored
+fn (s Set&) productFor(rows I64, cols I64, count I64) Product& {
+    if rows < 8 and cols < 8: return s.one
+    if rows < 8: return s.flat
+    if cols < 8: return s.tall
+    big Plan = s.product.By
+    if big.Chunk > 0 and (2 * rows < big.Side * big.Rows or 2 * cols < big.Side * big.Cols): return s.mid
+    if rows * cols * count < 512 * 512: return s.few
+    return s.product
+}
+
+# c = alpha op(a) op(b) + beta c, kernels/gemm's Gemm
+fn (s Set&) Gemm(d mut device.Device&, c device.DMat<F32>&, a device.DMat<F32>&, ta Bool, b device.DMat<F32>&, tb Bool, alpha F32 = 1, beta F32 = 0) {
+    s.GemmBatch(d, device.DBatch<F32>.One(c), device.DBatch<F32>.One(a), ta, device.DBatch<F32>.One(b), tb, alpha, beta)
+}
+
+fn (s Set&) mapOf(op Op) Kernel& {
+    return match op {
+        case Op.Affine: s.affine
+        case Op.Relu: s.relu
+        case Op.Gelu: s.gelu
+        case Op.GeluTanh: s.geluTanh
+        case Op.Silu: s.silu
+        case Op.Sigmoid: s.sigmoid
+        case Op.Tanh: s.tanh
+        case Op.Softplus: s.softplus
+        case Op.Exp: s.exp
+    }
+}
+
+# the most elements one dispatch along a line is given, whatever the device takes: a kernel's indices are 32 bits wide
+# (a test lowers it, to split small arrays)
+LineMost mut I64 = 1 << 28
+
+# the elements one dispatch of a kernel along a line takes on d (its workgroups an axis are bounded): a longer array
+# goes in runs of this many, a multiple of `period`
+fn most(d device.Device&, period I64 = 1) I64 {
+    top := (d.MaxGroups * Line).Min(LineMost)
+    return top if period >= top else top / period * period
+}
+
+# y[yOff + i] = op(x[xOff + i]) for i < n; x and y may be one buffer at one offset (in place)
+fn (s Set&) Map(d mut device.Device&, op Op, y device.Buf<F32>&, yOff I64, x device.Buf<F32>&, xOff I64, n I64) {
+    for at in range 0, n, most(d) {
+        m := most(d).Min(n - at)
+        s.mapOf(op).Run(d, groups(m, Line), 1, 1, Array<U64>[x.Handle(), y.Handle()], Array<U32>[u(m), u(xOff + at), u(yOff + at), f(1), f(0)])
+    }
+}
+
+# y[yOff + i] = a x[xOff + i] + b for i < n
+fn (s Set&) Affine(d mut device.Device&, y device.Buf<F32>&, yOff I64, x device.Buf<F32>&, xOff I64, n I64, a F32, b F32 = 0) {
+    for at in range 0, n, most(d) {
+        m := most(d).Min(n - at)
+        s.affine.Run(d, groups(m, Line), 1, 1, Array<U64>[x.Handle(), y.Handle()], Array<U32>[u(m), u(xOff + at), u(yOff + at), f(a), f(b)])
+    }
+}
+
+# the zip kernel k over n elements: z = x (+ or *) y, y repeating every period (0: no repeat), in runs a dispatch takes
+fn (s Set&) zip(d mut device.Device&, k Kernel&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, a F32, period I64) {
+    repeat := period > 0 and period < n
+    assert not repeat or period <= most(d), "a period longer than one dispatch takes: " + $period
+    step := most(d, period if repeat else 1)
+    for at in range 0, n, step {
+        m := step.Min(n - at)
+        k.Run(d, groups(m, Line), 1, 1, Array<U64>[x.Handle(), y.Handle(), z.Handle()], Array<U32>[u(m), u(xOff + at), u(yOff if repeat else yOff + at), u(zOff + at), u(period if repeat else m.Max(1)), f(a)])
+    }
+}
+
+# z[zOff + i] = x[xOff + i] + a y[yOff + i mod period] for i < n: a sum (a 1), a difference (a -1), and with period a
+# row's length, a bias added to every row. period 0 is n (no repeat). z may be x
+fn (s Set&) Add(d mut device.Device&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, a F32 = 1, period I64 = 0) {
+    s.zip(d, s.add, z, zOff, x, xOff, y, yOff, n, a, period)
+}
+
+# z[zOff + i] = x[xOff + i] y[yOff + i mod period] for i < n
+fn (s Set&) Mul(d mut device.Device&, z device.Buf<F32>&, zOff I64, x device.Buf<F32>&, xOff I64, y device.Buf<F32>&, yOff I64, n I64, period I64 = 0) {
+    s.zip(d, s.mul, z, zOff, x, xOff, y, yOff, n, 0, period)
+}
+
+# y's rows are the softmax of scale times x's rows. With causal T, the rows are positions in runs of T (attention's
+# T x T scores, stacked) and position t attends to columns 0 .. t alone: the rest are 0. y may be x
+fn (s Set&) Softmax(d mut device.Device&, y device.DMat<F32>&, x device.DMat<F32>&, scale F32 = 1, causal I64 = 0) {
+    p := Array<U32>[u(x.Rows), u(x.Cols), u(x.Off), u(x.Ld), u(y.Off), u(y.Ld), u(causal), f(scale)]
+    s.softmax.Run(d, groups(x.Rows, Line), 1, 1, Array<U64>[x.Data.Handle(), y.Data.Handle()], p)
+}
+
+# y's rows are x's, each scaled to unit root mean square and by gain (a row's length from gOff): y = x gain /
+# sqrt(mean(x^2) + eps). y may be x
+fn (s Set&) RmsNorm(d mut device.Device&, y device.DMat<F32>&, x device.DMat<F32>&, gain device.Buf<F32>&, gOff I64, eps F32) {
+    p := Array<U32>[u(x.Rows), u(x.Cols), u(x.Off), u(x.Ld), u(y.Off), u(y.Ld), u(gOff), u(0), f(eps)]
+    s.rms.Run(d, groups(x.Rows, Line), 1, 1, Array<U64>[x.Data.Handle(), y.Data.Handle(), gain.Handle(), gain.Handle()], p)
+}
+
+# y's rows are x's, each centred and scaled to unit variance, then by gain and bias (a row's length each): y = (x -
+# mean) gain / sqrt(var + eps) + bias. y may be x
+fn (s Set&) LayerNorm(d mut device.Device&, y device.DMat<F32>&, x device.DMat<F32>&, gain device.Buf<F32>&, gOff I64, bias device.Buf<F32>&, bOff I64, eps F32) {
+    p := Array<U32>[u(x.Rows), u(x.Cols), u(x.Off), u(x.Ld), u(y.Off), u(y.Ld), u(gOff), u(bOff), f(eps)]
+    s.layer.Run(d, groups(x.Rows, Line), 1, 1, Array<U64>[x.Data.Handle(), y.Data.Handle(), gain.Handle(), bias.Handle()], p)
+}
+
+# out's row r is table's row ids[idOff + r]: an embedding's lookup. Unchecked: the ids are rows of the table
+fn (s Set&) Gather(d mut device.Device&, out device.DMat<F32>&, table device.DMat<F32>&, ids device.Buf<U32>&, idOff I64) {
+    p := Array<U32>[u(out.Rows), u(out.Cols), u(idOff), u(table.Off), u(table.Ld), u(out.Off), u(out.Ld)]
+    s.gather.Run(d, groups(out.Cols, Tile), groups(out.Rows, Tile), 1, Array<U64>[ids.Handle(), table.Data.Handle(), out.Data.Handle()], p)
+}
+
+# out[oOff + r] is the column of the largest element of x's row r, the first of equals: greedy decoding's choice
+fn (s Set&) ArgMax(d mut device.Device&, out device.Buf<U32>&, oOff I64, x device.DMat<F32>&) {
+    p := Array<U32>[u(x.Rows), u(x.Cols), u(x.Off), u(x.Ld), u(oOff)]
+    s.argmax.Run(d, groups(x.Rows, Line), 1, 1, Array<U64>[x.Data.Handle(), out.Handle()], p)
+}
+
+# col's rows are a convolution's patches of src along one axis: row i holds, for each of chans channels and width taps,
+# column ch width + k, the source's element at sOff + (i stride + k - pad) frameStep + ch chanStep, or 0 where that
+# frame is not one of the source's frames. col (rows x chans width, from cOff) times the filters is the convolution
+# (speech/whisper's two). Unchecked: the source holds what is named
+fn (s Set&) Patches(d mut device.Device&, col device.Buf<F32>&, cOff I64, rows I64, src device.Buf<F32>&, sOff I64, frames I64, frameStep I64, chans I64, chanStep I64, width I64, stride I64 = 1, pad I64 = 0) {
+    p := Array<U32>[u(rows), u(chans), u(width), u(frames), u(stride), u(pad), u(sOff), u(frameStep), u(chanStep), u(cOff)]
+    s.patches.Run(d, groups(chans * width, Tile), groups(rows, Tile), 1, Array<U64>[src.Handle(), col.Handle()], p)
+}
+
+# ---- tests: the CPU is the oracle ----
+
+# a host array of n F32, uniform in [-1, 1)
+fn randoms(n I64, r mut rand.Rand&) Array<F32> {
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(r.Uniform(-1.0, 1.0))
+    return x
+}
+
+# x on the device
+fn onDevice(d mut device.Device&, x Array<F32>&) device.Buf<F32> ? device.VkError {
+    b := try device.Buf<F32>.Make(d, x.Len())
+    b.UploadAll(x)
+    return b
+}
+
+Eps F64 = 1.1920928955078125e-07
+
+# one product of m x n from a depth of k on the device against kernels/gemm on the same arrays: views at offsets with
+# rows padded, every element of C's view within k eps |alpha| + 2 eps |beta| (operands in [-1, 1)) and a rounding,
+# every element outside the view untouched, and the product run again identical bit for bit
+fn compare(d mut device.Device&, s Set&, ws mut gemm.Workspace<F32>&, r mut rand.Rand&, m I64, n I64, k I64, ta Bool, tb Bool, alpha F32, beta F32) ? device.VkError {
+    ar, ac := m, k
+    if ta: ar, ac = k, m
+    br, bc := k, n
+    if tb: br, bc = n, k
+    oa, ob, oc := 3, 5, 7
+    lda, ldb, ldc := ac + 2, bc + 1, n + 3
+    ha := randoms(oa + ar * lda + 4, r)
+    hb := randoms(ob + br * ldb + 4, r)
+    hc := randoms(oc + m * ldc + 4, r)
+    want := hc.Copy()
+    cm := mat.Mat<F32>(want, oc, m, n, ldc)
+    gemm.Gemm(ws, cm, mat.Mat<F32>(ha, oa, ar, ac, lda), ta, mat.Mat<F32>(hb, ob, br, bc, ldb), tb, alpha, beta)
+    ba := try onDevice(d, ha)
+    bb := try onDevice(d, hb)
+    bc1 := try onDevice(d, hc)
+    bc2 := try onDevice(d, hc)
+    da := device.DMat<F32>(ba, oa, ar, ac, lda)
+    db := device.DMat<F32>(bb, ob, br, bc, ldb)
+    s.Gemm(d, device.DMat<F32>(bc1, oc, m, n, ldc), da, ta, db, tb, alpha, beta)
+    s.Gemm(d, device.DMat<F32>(bc2, oc, m, n, ldc), da, ta, db, tb, alpha, beta)
+    got := Array<F32>(hc.Len())
+    again := Array<F32>(hc.Len())
+    bc1.DownloadAll(got)
+    bc2.DownloadAll(again)
+    try d.Sync()
+    bound := Eps * (F64(k) * F64(alpha).Abs() + 2.0 * F64(beta).Abs())
+    shape := $m + "x" + $n + "x" + $k + " ta " + $ta + " tb " + $tb + " alpha " + $alpha + " beta " + $beta
+    for i in range hc.Len() {
+        assert got[i] == again[i], "run twice, element " + $i + " differs: " + shape
+        row, col := (i - oc) / ldc, (i - oc) % ldc
+        if i >= oc and row < m and col < n {
+            w := F64(want[i])
+            assert (F64(got[i]) - w).Abs() <= bound + Eps * w.Abs(), "C[" + $row + ", " + $col + "] " + $got[i] + " against the CPU's " + $want[i] + " (bound " + $bound + "): " + shape
+        } else {
+            assert got[i] == hc[i], "element " + $i + " outside C's view written: " + shape
+        }
+    }
+}
+
+test Set.Gemm "against kernels/gemm: every transpose, alpha and beta, offset views, odd sizes; run twice identical" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Gemm")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(7)
+    ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
+    sizes := Array<I64>[1, 1, 1, 7, 5, 3, 1, 33, 17, 33, 17, 65, 129, 65, 257, 128, 10, 128, 128, 128, 784, 100, 300, 1000]
+    for i in range 0, sizes.Len(), 3 {
+        for t in range 4 {
+            ta, tb := t % 2 == 1, t / 2 == 1
+            try compare(d, s, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, 1, 0)
+            try compare(d, s, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], ta, tb, -0.75, 0.5)
+        }
+    }
+}
+
+# the product of a (m x k) and b (k x n) by plan, brought back
+fn planned(d mut device.Device&, plan Plan, a Array<F32>&, b Array<F32>&, m I64, k I64, n I64) Array<F32> ? device.VkError {
+    p := try Product.Make(d, plan)
+    ba := try onDevice(d, a)
+    bb := try onDevice(d, b)
+    bc := try device.Buf<F32>.Make(d, m * n)
+    p.Run(d, device.DBatch<F32>.One(device.DMat<F32>(bc, 0, m, n, n)), device.DBatch<F32>.One(device.DMat<F32>(ba, 0, m, k, k)), false, device.DBatch<F32>.One(device.DMat<F32>(bb, 0, k, n, n)), false)
+    out := Array<F32>(m * n)
+    bc.DownloadAll(out)
+    try d.Sync()
+    return out
+}
+
+test Product.Make "the product's plans - blocks, workgroups, staged operands, fused steps - against kernels/gemm, and every plan not fused the same bits" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Product")
+        return
+    }
+    r := rand.Rand(11)
+    ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
+    plans := Array<Plan>[Plan(4, 4, 8, 0, false), Plan(8, 8, 4, 0, false), Plan(4, 4, 8, 16, false), Plan(8, 8, 8, 32, false), Plan(2, 2, 16, 16, false), Plan(1, 1, 8, 8, false), Plan(2, 8, 8, 16, false), Plan(8, 1, 8, 8, false), Plan(4, 4, 8, 0, true), Plan(4, 4, 8, 16, true), Plan(4, 4, 8, 16, false, 3), Plan(2, 2, 8, 0, false, 2), Plan(2, 2, 8, 16, false, 4)]
+    sizes := Array<I64>[1, 1, 1, 7, 5, 3, 33, 17, 65, 129, 65, 257, 100, 300, 70]
+    a, b := randoms(131 * 77, r), randoms(77 * 67, r)
+    want := try planned(d, Plan(1, 1, 8, 0, false), a, b, 131, 77, 67)
+    for plan in plans {
+        if not plan.Fits(d): continue
+        s := try Set.MakeWith(d, plan)
+        for i in range 0, sizes.Len(), 3 {
+            for t in range 4: try compare(d, s, ws, r, sizes[i], sizes[i + 1], sizes[i + 2], t % 2 == 1, t / 2 == 1, -0.75, 0.5)
+        }
+        if plan.Fused: continue
+        got := try planned(d, plan, a, b, 131, 77, 67)
+        for i in range got.Len(): assert got[i] == want[i], "element " + $i + " by " + plan.Str() + " is not the first plan's"
+    }
+}
+
+test Set.GemmBatch "attention's shapes against kernels/gemm's GemmBatch: heads as column blocks times their transposes into stacked T x T" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("GemmBatch")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(8)
+    seqs, t, heads, width := 3, 9, 4, 20
+    hq := randoms(seqs * t * width, r)
+    hk := randoms(seqs * t * width, r)
+    want := Array<F32>(seqs * heads * t * t)
+    ws := gemm.Workspace<F32>(2, 1024, 1024 * 1024)
+    qm := mat.Mat<F32>(hq, 0, seqs * t, width, width)
+    km := mat.Mat<F32>(hk, 0, seqs * t, width, width)
+    wm := mat.Mat<F32>(want, 0, seqs * heads * t, t, t)
+    wb := gemm.Batch<F32>.Stacked(wm, t, heads)
+    gemm.GemmBatch(ws, wb, gemm.Batch<F32>.Heads(qm, t, heads), false, gemm.Batch<F32>.Heads(km, t, heads), true, F32(0.5), F32(0))
+    bq := try onDevice(d, hq)
+    bk := try onDevice(d, hk)
+    bs := try device.Buf<F32>.Make(d, want.Len())
+    dq := device.DMat<F32>(bq, 0, seqs * t, width, width)
+    dk := device.DMat<F32>(bk, 0, seqs * t, width, width)
+    ds := device.DMat<F32>(bs, 0, seqs * heads * t, t, t)
+    s.GemmBatch(d, device.DBatch<F32>.Stacked(ds, t, heads), device.DBatch<F32>.Heads(dq, t, heads), false, device.DBatch<F32>.Heads(dk, t, heads), true, 0.5)
+    got := Array<F32>(want.Len())
+    bs.DownloadAll(got)
+    try d.Sync()
+    for i in range want.Len(): assert (F64(got[i]) - F64(want[i])).Abs() <= 8.0 * Eps, "score " + $i + ": " + $got[i] + " against " + $want[i]
+}
+
+# what the CPU makes of x by a map, in F64
+fn mapWant(op Op, x F64, a F64, b F64) F64 {
+    return match op {
+        case Op.Affine: a * x + b
+        case Op.Relu: x.Max(0.0)
+        case Op.Gelu: 0.5 * x * (1.0 + (x * 0.7071067811865476).Erf())
+        case Op.GeluTanh: x / (1.0 + (-2.0 * 0.7978845608028654 * (x + 0.044715 * x * x * x)).Exp())
+        case Op.Silu: x / (1.0 + (-x).Exp())
+        case Op.Sigmoid: 1.0 / (1.0 + (-x).Exp())
+        case Op.Tanh: x.Tanh()
+        case Op.Softplus: (1.0 + x.Exp()).Log()
+        case Op.Exp: x.Exp()
+    }
+}
+
+test Set.Map "every map against the CPU's function in F64, at offsets, in place; Add, Mul and a bias over rows" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Map")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(9)
+    n I64 = 1000
+    hx := randoms(n + 10, r)
+    for i in range n + 10: hx[i] = hx[i] * 6.0
+    bx := try onDevice(d, hx)
+    ops := Array<Op>[Op.Affine, Op.Relu, Op.Gelu, Op.GeluTanh, Op.Silu, Op.Sigmoid, Op.Tanh, Op.Softplus, Op.Exp]
+    for op in ops {
+        by := try device.Buf<F32>.Make(d, n + 10)
+        by.Zero(0, n + 10)
+        if op == Op.Affine {
+            s.Affine(d, by, 7, bx, 3, n, -1.5, 0.25)
+        } else {
+            s.Map(d, op, by, 7, bx, 3, n)
+        }
+        got := Array<F32>(n + 10)
+        by.DownloadAll(got)
+        try d.Sync()
+        for i in range n {
+            w := mapWant(op, F64(hx[3 + i]), -1.5, 0.25)
+            assert (F64(got[7 + i]) - w).Abs() <= 2e-6 * (1.0 + w.Abs()), "map " + $i + " of " + $hx[3 + i] + ": " + $got[7 + i] + " against " + $w
+        }
+        assert got[6] == 0.0 and got[7 + n] == 0.0
+    }
+    # in place, then a sum, a difference, a product, and a bias of 10 added to every row of 100
+    hy := randoms(n, r)
+    by := try onDevice(d, hy)
+    bias := try onDevice(d, hx)
+    bz := try device.Buf<F32>.Make(d, 4 * n)
+    s.Add(d, bz, 0, bx, 0, by, 0, n)
+    s.Add(d, bz, n, bx, 0, by, 0, n, -1)
+    s.Mul(d, bz, 2 * n, bx, 0, by, 0, n)
+    s.Add(d, bz, 3 * n, by, 0, bias, 5, n, 1, 10)
+    s.Map(d, Op.Relu, by, 0, by, 0, n)
+    got := Array<F32>(4 * n)
+    inplace := Array<F32>(n)
+    bz.DownloadAll(got)
+    by.DownloadAll(inplace)
+    try d.Sync()
+    for i in range n {
+        assert got[i] == hx[i] + hy[i] and got[n + i] == hx[i] - hy[i] and got[2 * n + i] == hx[i] * hy[i], "zip " + $i
+        assert got[3 * n + i] == hy[i] + hx[5 + i % 10], "bias " + $i
+        assert inplace[i] == hy[i].Max(0.0), "in place " + $i
+    }
+}
+
+test Set.Softmax "rows against the CPU, scaled, and causal: position t of each run sees columns 0 .. t, the rest 0" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Softmax")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(10)
+    rows, cols, t := 24, 6, 6
+    hx := randoms(rows * cols, r)
+    bx := try onDevice(d, hx)
+    by := try device.Buf<F32>.Make(d, rows * cols)
+    bc := try device.Buf<F32>.Make(d, rows * cols)
+    x := device.DMat<F32>(bx, 0, rows, cols, cols)
+    s.Softmax(d, device.DMat<F32>(by, 0, rows, cols, cols), x, 3.0)
+    s.Softmax(d, device.DMat<F32>(bc, 0, rows, cols, cols), x, 3.0, t)
+    full := Array<F32>(rows * cols)
+    causal := Array<F32>(rows * cols)
+    by.DownloadAll(full)
+    bc.DownloadAll(causal)
+    try d.Sync()
+    for i in range rows {
+        for pass in range 2 {
+            lim := cols if pass == 0 else i % t + 1
+            sum F64 = 0
+            for j in range lim: sum += (3.0 * F64(hx[i * cols + j])).Exp()
+            for j in range cols {
+                w := (3.0 * F64(hx[i * cols + j])).Exp() / sum if j < lim else 0.0
+                g := F64(full[i * cols + j]) if pass == 0 else F64(causal[i * cols + j])
+                assert (g - w).Abs() <= 2e-6, "row " + $i + " column " + $j + " pass " + $pass + ": " + $g + " against " + $w
+            }
+        }
+    }
+}
+
+test Set.RmsNorm "RMS norm and layer norm against the CPU in F64; an embedding's rows; the largest of each row" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("norms")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(11)
+    rows, cols := 13, 37
+    hx := randoms(rows * cols, r)
+    hg := randoms(cols, r)
+    hb := randoms(cols, r)
+    bx := try onDevice(d, hx)
+    bg := try onDevice(d, hg)
+    bb := try onDevice(d, hb)
+    b1 := try device.Buf<F32>.Make(d, rows * cols)
+    b2 := try device.Buf<F32>.Make(d, rows * cols)
+    x := device.DMat<F32>(bx, 0, rows, cols, cols)
+    s.RmsNorm(d, device.DMat<F32>(b1, 0, rows, cols, cols), x, bg, 0, 1e-5)
+    s.LayerNorm(d, device.DMat<F32>(b2, 0, rows, cols, cols), x, bg, 0, bb, 0, 1e-5)
+    # rows 5, 0, 12, 5 of x as a table
+    hi := Array<U32>[5, 0, 12, 5]
+    bi := try device.Buf<U32>.Make(d, 4)
+    bi.UploadAll(hi)
+    b3 := try device.Buf<F32>.Make(d, 4 * cols)
+    s.Gather(d, device.DMat<F32>(b3, 0, 4, cols, cols), x, bi, 0)
+    bm := try device.Buf<U32>.Make(d, rows)
+    s.ArgMax(d, bm, 0, x)
+    rms := Array<F32>(rows * cols)
+    layer := Array<F32>(rows * cols)
+    picked := Array<F32>(4 * cols)
+    best := Array<U32>(rows)
+    b1.DownloadAll(rms)
+    b2.DownloadAll(layer)
+    b3.DownloadAll(picked)
+    bm.DownloadAll(best)
+    try d.Sync()
+    for i in range rows {
+        mean, sq F64 = 0, 0
+        big I64 = 0
+        for j in range cols {
+            v := F64(hx[i * cols + j])
+            mean += v / F64(cols)
+            sq += v * v / F64(cols)
+            if hx[i * cols + j] > hx[i * cols + big]: big = j
+        }
+        assert I64(best[i]) == big, "the largest of row " + $i
+        for j in range cols {
+            v := F64(hx[i * cols + j])
+            w1 := v * F64(hg[j]) / (sq + 1e-5).Sqrt()
+            w2 := (v - mean) * F64(hg[j]) / (sq - mean * mean + 1e-5).Sqrt() + F64(hb[j])
+            assert (F64(rms[i * cols + j]) - w1).Abs() <= 1e-5, "RMS norm (" + $i + ", " + $j + "): " + $rms[i * cols + j] + " against " + $w1
+            assert (F64(layer[i * cols + j]) - w2).Abs() <= 1e-5, "layer norm (" + $i + ", " + $j + "): " + $layer[i * cols + j] + " against " + $w2
+        }
+    }
+    for i in range 4 {
+        for j in range cols: assert picked[i * cols + j] == hx[I64(hi[i]) * cols + j], "gathered (" + $i + ", " + $j + ")"
+    }
+}
+
+test Set.Patches "a convolution's patches as speech/whisper makes them: width 3 over channel-major frames, and stride 2 over frame-major rows" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("Patches")
+        return
+    }
+    s := try Set.Make(d)
+    r := rand.Rand(12)
+    mels, t, dim := 5, 22, 7
+    spec := randoms(mels * t, r)
+    xs := randoms(t * dim, r)
+    bspec := try onDevice(d, spec)
+    bx := try onDevice(d, xs)
+    b1 := try device.Buf<F32>.Make(d, t * 3 * mels)
+    b2 := try device.Buf<F32>.Make(d, t / 2 * 3 * dim)
+    s.Patches(d, b1, 0, t, bspec, 0, t, 1, mels, t, 3, 1, 1)
+    s.Patches(d, b2, 0, t / 2, bx, 0, t, dim, dim, 1, 3, 2, 1)
+    c1 := Array<F32>(t * 3 * mels)
+    c2 := Array<F32>(t / 2 * 3 * dim)
+    b1.DownloadAll(c1)
+    b2.DownloadAll(c2)
+    try d.Sync()
+    for i in range t {
+        for ch in range mels {
+            for k in range 3 {
+                j := i + k - 1
+                assert c1[i * 3 * mels + ch * 3 + k] == (spec[ch * t + j] if j >= 0 and j < t else F32(0.0)), "the first's (" + $i + ", " + $ch + ", " + $k + ")"
+            }
+        }
+    }
+    for i in range t / 2 {
+        for ch in range dim {
+            for k in range 3 {
+                j := 2 * i + k - 1
+                assert c2[i * 3 * dim + ch * 3 + k] == (xs[j * dim + ch] if j >= 0 and j < t else F32(0.0)), "the second's (" + $i + ", " + $ch + ", " + $k + ")"
+            }
+        }
+    }
+}
+
+test Set.Add "arrays longer than one dispatch's workgroups take: a map in place, a sum, and a bias repeated over rows, exact against the host" {
+    d := try device.Device.Open() catch device.VkError.NoDevice {
+        device.Skip("long arrays")
+        return
+    }
+    s := try Set.Make(d)
+    period I64 = 7
+    # runs of at most 2^16 elements, on every device (a GPU's own limit is billions)
+    LineMost = 1 << 16
+    defer: LineMost = 1 << 28
+    n := (most(d) / period * 3 + 3) * period + 5
+    x := Array<F32>[F32((i * 7919) % 1001 - 500) for i in range n]
+    y := Array<F32>[F32((i * 104729) % 601 - 300) for i in range n]
+    bx device.Buf<F32> = try onDevice(d, x)
+    by device.Buf<F32> = try onDevice(d, y)
+    bz := try device.Buf<F32>.Make(d, n)
+    relu, sum, rows := Array<F32>(n), Array<F32>(n), Array<F32>(n)
+    s.Add(d, bz, 0, bx, 0, by, 0, n)
+    bz.DownloadAll(sum)
+    try d.Sync()
+    s.Add(d, bz, 0, bx, 0, by, 2, n, 1, period)
+    bz.DownloadAll(rows)
+    try d.Sync()
+    s.Map(d, Op.Relu, bx, 0, bx, 0, n)
+    bx.DownloadAll(relu)
+    try d.Sync()
+    for i in range n {
+        assert sum[i] == x[i] + y[i], "the sum at " + $i
+        assert rows[i] == x[i] + y[2 + i % period], "the bias at " + $i
+        assert relu[i] == x[i].Max(0.0), "the map at " + $i
+    }
+}

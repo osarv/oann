@@ -1,0 +1,151 @@
+# The plans of a language model's linear product on one Vulkan device (llm/vk's LinPlan; docs/vulkan.md): y = x W^T,
+# W in BF16 two to a word, as a decoder's step computes it. Each plan's kernel is made, checked against the first
+# plan's result on an odd shape (the largest difference of an element: 0), and timed on each shape with everything
+# resident - products recorded back to back for about 0.3 s, one Sync at the end, the best of the rounds, as GFLOPS
+# (2 rows depth outs a product; at one row that is also the GB of weights read a second). Plans of one row an
+# invocation are timed on steps of 1 row, the others on steps of 8 and 32 rows. Arguments: rounds (3).
+#
+# From the repository's root: make vklintune ARGS="3"; OANN_VK_DEVICE=N picks the device (the bench lists them)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/vk/device"
+import "../llm/vk"
+
+fn randoms(n I64, r mut rand.Rand&) Array<F32> {
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(r.Uniform(-1.0, 1.0))
+    return x
+}
+
+fn weights(n I64, r mut rand.Rand&) Array<BF16> {
+    x := Array<BF16>(n)
+    for i in range n: x[i] = BF16(F32(r.Uniform(-1.0, 1.0)))
+    return x
+}
+
+# rows x depth times outs x depth on the device: the operands made and sent up
+type Case unique struct(x device.Buf<F32>, w device.Buf<BF16>, y device.Buf<F32>, bias device.Buf<F32>, rows I64, depth I64, outs I64) {
+    x
+    w
+    y
+    bias
+    Rows I64 = rows
+    Depth I64 = depth
+    Outs I64 = outs
+}
+
+fn Case.Make(d mut device.Device&, r mut rand.Rand&, rows I64, depth I64, outs I64) Case ? device.VkError {
+    c := Case(try device.Buf<F32>.Make(d, rows * depth), try device.Buf<BF16>.Make(d, outs * depth), try device.Buf<F32>.Make(d, rows * outs), try device.Buf<F32>.Make(d, outs), rows, depth, outs)
+    c.x.UploadAll(randoms(rows * depth, r))
+    c.w.Upload(weights(outs * depth, r), 0, 0, outs * depth)
+    try d.Sync()
+    return c
+}
+
+fn (c Case&) run(d mut device.Device&, l vk.Linear&) { l.Run(d, c.y, 0, c.Outs, c.x, c.Rows, c.w, c.Outs, c.Depth, c.bias, 0, false) }
+
+# GFLOPS of the plan on the case
+fn timed(d mut device.Device&, l vk.Linear&, c Case&, rounds I64) F64 ? device.VkError {
+    c.run(d, l)
+    try d.Sync()
+    t0 := time.Now()
+    c.run(d, l)
+    try d.Sync()
+    reps := (300000000 / I64(time.Since(t0)).Max(1)).Clamp(1, 2000)
+    best F64 = 0
+    for _ in range rounds {
+        t0 = time.Now()
+        for _ in range reps: c.run(d, l)
+        try d.Sync()
+        best = best.Max(2.0 * F64(c.Rows) * F64(c.Depth) * F64(c.Outs) * F64(reps) / F64(time.Since(t0)))
+    }
+    return best
+}
+
+fn rowPlans() Vec<vk.LinPlan> {
+    ps := Vec<vk.LinPlan>()
+    ps.Push(vk.LinPlan(1, 4, 64, 1, 0))
+    for cols in Array<I64>[1, 2, 8]: ps.Push(vk.LinPlan(1, cols, 64, 1, 0))
+    ps.Push(vk.LinPlan(1, 4, 256, 1, 0))
+    for chunk in Array<I64>[4, 8, 16] {
+        for cols in Array<I64>[1, 2, 4, 8]: ps.Push(vk.LinPlan(1, cols, 64, 1, chunk))
+    }
+    ps.Push(vk.LinPlan(1, 1, 256, 1, 16))
+    ps.Push(vk.LinPlan(1, 2, 256, 1, 8))
+    ps.Push(vk.LinPlan(1, 4, 256, 1, 8))
+    ps.Push(vk.LinPlan(1, 4, 16, 1, 8))
+    return ps
+}
+
+fn widePlans() Vec<vk.LinPlan> {
+    ps := Vec<vk.LinPlan>()
+    ps.Push(vk.LinPlan(4, 4, 8, 8, 0))
+    ps.Push(vk.LinPlan(8, 4, 8, 8, 0))
+    ps.Push(vk.LinPlan(8, 8, 8, 8, 0))
+    ps.Push(vk.LinPlan(8, 4, 64, 1, 0))
+    for chunk in Array<I64>[8, 16] {
+        ps.Push(vk.LinPlan(4, 4, 8, 8, chunk))
+        ps.Push(vk.LinPlan(8, 4, 8, 8, chunk))
+        ps.Push(vk.LinPlan(8, 8, 8, 8, chunk))
+        ps.Push(vk.LinPlan(4, 4, 64, 1, chunk))
+        ps.Push(vk.LinPlan(8, 4, 64, 1, chunk))
+        ps.Push(vk.LinPlan(8, 8, 64, 1, chunk))
+        ps.Push(vk.LinPlan(8, 4, 16, 4, chunk))
+    }
+    return ps
+}
+
+# the plans' table over the cases; the first plan's result on odd is what the others' are held against
+fn table(d mut device.Device&, plans Vec<vk.LinPlan>&, odd Case&, cases Vec<Case>&, rounds I64) ? io.Error, device.VkError {
+    try io.Put("\nplan | differs")
+    for c in cases.View(): try io.Put(" | " + $c.Rows + " x " + $c.Depth + " x " + $c.Outs)
+    try io.Put("\n")
+    want := Array<F32>(0)
+    for plan in plans.View() {
+        if not plan.Fits(d) {
+            try io.Put(plan.Str() + " | more than the device's workgroups hold\n")
+            continue
+        }
+        l := try vk.Linear.Make(d, "lin", plan) catch device.VkError {
+            try io.Put(plan.Str() + " | the driver refused it\n")
+            continue
+        }
+        odd.run(d, l)
+        got := Array<F32>(odd.Rows * odd.Outs)
+        odd.y.DownloadAll(got)
+        try d.Sync()
+        if want.Len() == 0: want = got.Copy()
+        worst F64 = 0
+        for i in range got.Len(): worst = worst.Max((F64(got[i]) - F64(want[i])).Abs())
+        try io.Put(plan.Str() + " | " + $worst)
+        for c in cases.View(): try io.Put(" | " + (try timed(d, l, c, rounds)).Fixed(1))
+        try io.Put("\n")
+    }
+}
+
+fn main() ? io.Error, ParseError, device.VkError {
+    args :~ os.Args()
+    rounds I64 = 3
+    if args.Len() > 1: rounds = try args[1].ParseInt()
+    names := device.Devices()
+    for i in range names.Len(): try io.Put("Vulkan device " + $i + ": " + names[i] + "\n")
+    d := try device.Device.Open()
+    try io.Put("on " + d.Str() + ": workgroups of up to " + $d.MaxInvocations + " invocations, " + $d.SharedBytes + " bytes shared\n\nGFLOPS, weights BF16, rows x depth x outs\n")
+    r := rand.Rand(1)
+    one := Vec<Case>()
+    one.Push(try Case.Make(d, r, 1, 1024, 3072))
+    one.Push(try Case.Make(d, r, 1, 3072, 1024))
+    one.Push(try Case.Make(d, r, 1, 1024, 32768))
+    odd1 := try Case.Make(d, r, 1, 130, 77)
+    try table(d, rowPlans(), odd1, one, rounds)
+    many := Vec<Case>()
+    many.Push(try Case.Make(d, r, 8, 1024, 3072))
+    many.Push(try Case.Make(d, r, 8, 3072, 1024))
+    many.Push(try Case.Make(d, r, 32, 1024, 3072))
+    many.Push(try Case.Make(d, r, 32, 1024, 32768))
+    odd9 := try Case.Make(d, r, 9, 130, 77)
+    try table(d, widePlans(), odd9, many, rounds)
+}

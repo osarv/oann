@@ -585,7 +585,9 @@ extern "C" __global__ void oann_ad_clip(store *x, const double *sumsq, long long
 // nn/optim's AdamW step over n parameters, adamRun operation for operation, the decay only where decays[k] is not 0
 // (decays 0: every parameter decays) - bit for bit with the CPU's. w the weights stepped in real: the parameters
 // themselves, or a BF16 graph's F32 masters, each then rounded into p (p == w: nothing to round)
-extern "C" __global__ void oann_ad_adamw(real *w, store *p, const store *g, real *m, real *v, const unsigned char *decays, long long n, real b1, real b2, real c1, real c2, const double *hp, real eps) {
+// skip[0] not 0: nothing is stepped (a step whose mixture of experts overflowed its blocks is run again: oann_moe_rows)
+extern "C" __global__ void oann_ad_adamw(real *w, store *p, const store *g, real *m, real *v, const unsigned char *decays, long long n, real b1, real b2, real c1, real c2, const double *hp, real eps, const double *skip) {
+    if (skip[0] != 0.0) return;
     real keep = (real)hp[0], step = (real)hp[1], root = (real)hp[2];   // the step's scalars, which change each step: read from the device so a CUDA graph replays them
     bool copy = (void *)p != (void *)w;
     OANN_LOOP(k, n) {
@@ -779,14 +781,20 @@ extern "C" __global__ void oann_moe_route(float *probs, int *sel, float *gate, c
 
 // each expert's rows, in token order as the CPU's: the slots cut into 256 runs, each run's slots per expert counted
 // (part, a row of e a run), the runs' offsets summed per expert, the experts' starts after them (part's last row), then
-// each slot's row (pos) and each row's token (tok); count the rows per expert. One block of 256 threads; part 257 e
-extern "C" __global__ void oann_moe_rows(int *pos, int *tok, int *count, int *part, const int *sel, long long slots, long long e, long long k) {
+// each slot's row (pos) and each row's token (tok); count the rows per expert. One block of 256 threads; part 257 e.
+// cap 0: the experts' rows packed one after another (their sizes are the host's to read). cap > 0: expert x's rows in
+// its own block of cap rows from x cap, the rows of a block no token takes marked -1 (gathered as zero rows, which
+// every product leaves zero), so every expert's products have one fixed size and nothing waits for the counts; an
+// expert given more than cap rows sets over[0] to 1 (its extra slots share its last row: the step is wrong, AdamW skips
+// it and the host runs it again with wider blocks)
+extern "C" __global__ void oann_moe_rows(int *pos, int *tok, int *count, int *part, const int *sel, long long slots, long long e, long long k, long long cap, double *over) {
     long long run = (slots + 255) / 256;
     long long lo = (long long)threadIdx.x * run;
     long long hi = lo + run < slots ? lo + run : slots;
     int *mine = part + threadIdx.x * e;
     for (long long x = 0; x < e; x++) mine[x] = 0;
     for (long long s = lo; s < hi; s++) mine[sel[s]]++;
+    for (long long p = threadIdx.x; p < e * cap; p += blockDim.x) tok[p] = -1;
     __syncthreads();
     for (long long x = threadIdx.x; x < e; x += blockDim.x) {
         int at = 0;
@@ -796,28 +804,38 @@ extern "C" __global__ void oann_moe_rows(int *pos, int *tok, int *count, int *pa
             at += c;
         }
         count[x] = at;
+        if (cap > 0 && at > cap) over[0] = 1.0;
     }
     __syncthreads();
     if (threadIdx.x == 0) {
         int at = 0;
         for (long long x = 0; x < e; x++) {
-            part[256 * e + x] = at;
+            part[256 * e + x] = cap > 0 ? (int)(x * cap) : at;
             at += count[x];
         }
     }
     __syncthreads();
     for (long long s = lo; s < hi; s++) {
         int x = sel[s];
-        int p = part[256 * e + x] + mine[x];
+        int r = mine[x];
         mine[x]++;
+        if (cap > 0 && r >= cap) {
+            pos[s] = part[256 * e + x] + (int)cap - 1;
+            continue;
+        }
+        int p = part[256 * e + x] + r;
         pos[s] = p;
         tok[p] = (int)(s / k);
     }
 }
 
-// the routed tokens' rows by expert: xg's row p is x's row tok[p]
+// the routed tokens' rows by expert: xg's row p is x's row tok[p], or zero where no token has row p (tok -1)
 extern "C" __global__ void oann_moe_gather(store *xg, const store *x, const int *tok, long long rows, long long d) {
-    OANN_LOOP(i, rows * d) xg[i] = x[(long long)tok[i / d] * d + i % d];
+    OANN_LOOP(i, rows * d) {
+        long long t = tok[i / d];
+        if (t < 0) xg[i] = 0.0f;
+        else xg[i] = x[t * d + i % d];
+    }
 }
 
 // act = silu(h1) h3

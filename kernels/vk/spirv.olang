@@ -1,0 +1,576 @@
+# spirv - compute kernels written in olang and assembled to SPIR-V, the form every Vulkan driver takes (docs/vulkan.md):
+# no shader compiler, no text. A Kernel is one compute shader being written: its buffers (arrays of F32, U32 or I32 the
+# device holds), its parameters (numbers given at each dispatch), and its body - values computed from them, variables,
+# loops and conditions - recorded as it is written. Finish gives the module's words.
+#
+#     k := spirv.Kernel.Begin(64)                   # workgroups of 64 invocations along x
+#     x := k.Buffer(spirv.Ty.F32)                   # binding 0
+#     y := k.Buffer(spirv.Ty.F32)                   # binding 1
+#     n := k.Param(spirv.Ty.U32)                    # the dispatch's first number
+#     a := k.Param(spirv.Ty.F32)
+#     i := k.GlobalId(0)                            # which invocation this is
+#     k.If(k.Lt(i, n))
+#     k.Write(y, i, k.Add(k.Mul(a, k.Read(x, i)), k.Read(y, i)))
+#     k.EndIf()
+#     words := k.Finish()
+#
+# What it makes. SPIR-V 1.0 for Vulkan 1.0, so it runs on every driver: the buffers are storage buffers of set 0, their
+# bindings in the order Buffer was called; the parameters are one push constant block, 4 bytes each in the order Param
+# was called; the entry point is "main". Values are 32 bits wide: F32, U32, I32 and Bool. Every floating-point add,
+# subtract and multiply is marked NoContraction, so a driver never fuses a * b + c: olang does not either, and a kernel
+# written as the CPU's code computes what the CPU's does wherever the operations themselves are exact (IEEE's + - * /
+# and sqrt; a driver's exp and tanh are its own).
+#
+# Shared arrays (Shared, ReadShared, WriteShared) live in workgroup memory, one a workgroup; Barrier is where its
+# invocations meet.
+#
+# Control flow is structured, as SPIR-V wants it: If / Else / EndIf, and Loop / While / EndLoop (For and Next the
+# counted form). Variables (Var, Get, Set) carry values across them. The words are not checked here: a kernel that
+# reads a value outside the block that made it is the driver's (or spirv-val's) to refuse.
+
+# the types of values: 32-bit numbers and Bool (a Bool is no buffer's element and no parameter)
+type Ty enum { U32, I32, F32, Bool }
+
+# a value: its id in the module and its type
+type Val struct(Id U32, T Ty) {
+    Id
+    T
+}
+
+# a variable of the kernel's function, and a buffer: the id of each and the type it holds
+type Var struct(Id U32, T Ty) {
+    Id
+    T
+}
+type Buffer struct(Id U32, T Ty) {
+    Id
+    T
+}
+
+# an array the invocations of one workgroup share: its id, the type it holds and its length
+type Shared struct(Id U32, T Ty, Len I64) {
+    Id
+    T
+    Len
+}
+
+# one instruction: its word count and opcode, then its operands
+fn putv(s mut Vec<U32>&, op U32, args Array<U32>&) {
+    s.Push((U32(args.Len() + 1) << 16) | op)
+    for a in args: s.Push(a)
+}
+fn put(s mut Vec<U32>&, op U32, args ...U32) { putv(s, op, args) }
+
+# text as SPIR-V's literal string: its bytes, a NUL, padded to whole words
+fn strWords(w mut Vec<U32>&, t String&) {
+    b := t.Bytes()
+    n := b.Len()
+    for i in range 0, n + 1, 4 {
+        x U32 = 0
+        for j in range 4 {
+            if i + j < n: x = x | (U32(b[i + j]) << U32(8 * j))
+        }
+        w.Push(x)
+    }
+}
+
+# a type's place in the per-type tables
+fn slot(t Ty) I64 {
+    if t == Ty.U32: return 0
+    if t == Ty.I32: return 1
+    if t == Ty.F32: return 2
+    return 3
+}
+
+# a compute shader being written, its workgroups Lx by Ly by Lz invocations
+type Kernel struct(lx I64, ly I64, lz I64) {
+    Lx I64 = lx
+    Ly I64 = ly
+    Lz I64 = lz
+    Buffers I64 = 0                 # buffers declared: the bindings 0 .. Buffers - 1
+    Params I64 = 0                  # parameters declared: 4 bytes of push constants each
+    next U32 = 1
+    decor := Vec<U32>()             # the annotations
+    types := Vec<U32>()             # types, constants and global variables
+    vars := Vec<U32>()              # the function's variables (its first block)
+    body := Vec<U32>()              # the function's instructions after them
+    consts := Vec<U32>()            # (type, bits, id) of each constant made
+    ctl := Vec<U32>()               # the labels of the open Ifs and Loops
+    paramTys := Vec<U32>()          # the type id of each parameter
+    tys := Array<U32>(4)            # U32, I32, F32, Bool
+    arrTys := Array<U32>(4)         # the runtime array of each, once a buffer holds it
+    elemPtrs := Array<U32>(4)       # pointer to a buffer's element of each
+    varPtrs := Array<U32>(4)        # pointer to a function variable of each
+    pushPtrs := Array<U32>(4)       # pointer to a parameter of each
+    sharedPtrs := Array<U32>(4)     # pointer to a shared array's element of each
+    SharedBytes I64 = 0             # the workgroup memory the shared arrays take
+    tVoid U32 = 0
+    tV3 U32 = 0
+    tFn U32 = 0
+    glsl U32 = 0
+    main U32 = 0
+    gid U32 = 0
+    push U32 = 0                    # the push constant block's variable
+}
+
+fn (k mut Kernel&) id() U32 {
+    k.next++
+    return k.next - 1
+}
+
+fn (k Kernel&) ty(t Ty) U32 { return k.tys[slot(t)] }
+
+# a kernel of lx by ly by lz invocations a workgroup, nothing written yet
+fn Kernel.Begin(lx I64, ly I64 = 1, lz I64 = 1) Kernel {
+    k := Kernel(lx, ly, lz)
+    k.glsl = k.id()
+    k.main = k.id()
+    k.tVoid = k.id()
+    put(k.types, 19, k.tVoid)
+    k.tys[3] = k.id()
+    put(k.types, 20, k.tys[3])
+    k.tys[0] = k.id()
+    put(k.types, 21, k.tys[0], 32, 0)
+    k.tys[1] = k.id()
+    put(k.types, 21, k.tys[1], 32, 1)
+    k.tys[2] = k.id()
+    put(k.types, 22, k.tys[2], 32)
+    k.tV3 = k.id()
+    put(k.types, 23, k.tV3, k.tys[0], 3)
+    k.tFn = k.id()
+    put(k.types, 33, k.tFn, k.tVoid)
+    p := k.id()
+    put(k.types, 32, p, 1, k.tV3)
+    k.gid = k.id()
+    put(k.types, 59, p, k.gid, 1)
+    put(k.decor, 71, k.gid, 11, 28)
+    k.push = k.id()
+    return k
+}
+
+# ---- what a kernel reads and writes ----
+
+# the next binding: a buffer of t (F32, U32 or I32), as long as the device's buffer bound to it
+fn (k mut Kernel&) Buffer(t Ty) Buffer {
+    s := slot(t)
+    if k.arrTys[s] == 0 {
+        k.arrTys[s] = k.id()
+        put(k.types, 29, k.arrTys[s], k.ty(t))
+        put(k.decor, 71, k.arrTys[s], 6, 4)
+        k.elemPtrs[s] = k.id()
+        put(k.types, 32, k.elemPtrs[s], 2, k.ty(t))
+    }
+    st := k.id()
+    put(k.types, 30, st, k.arrTys[s])
+    put(k.decor, 71, st, 3)
+    put(k.decor, 72, st, 0, 35, 0)
+    p := k.id()
+    put(k.types, 32, p, 2, st)
+    v := k.id()
+    put(k.types, 59, p, v, 2)
+    put(k.decor, 71, v, 34, 0)
+    put(k.decor, 71, v, 33, U32(k.Buffers))
+    k.Buffers++
+    return Buffer(v, t)
+}
+
+# the next parameter, a number of t given at each dispatch: its value
+fn (k mut Kernel&) Param(t Ty) Val {
+    s := slot(t)
+    if k.pushPtrs[s] == 0 {
+        k.pushPtrs[s] = k.id()
+        put(k.types, 32, k.pushPtrs[s], 9, k.ty(t))
+    }
+    at := k.U(k.Params)
+    k.paramTys.Push(k.ty(t))
+    k.Params++
+    p := k.id()
+    put(k.body, 65, k.pushPtrs[s], p, k.push, at.Id)
+    v := k.id()
+    put(k.body, 61, k.ty(t), v, p)
+    return Val(v, t)
+}
+
+# which invocation this is along an axis (0, 1, 2), counted over the whole dispatch
+fn (k mut Kernel&) GlobalId(axis I64) Val {
+    v := k.id()
+    put(k.body, 61, k.tV3, v, k.gid)
+    x := k.id()
+    put(k.body, 81, k.ty(Ty.U32), x, v, U32(axis))
+    return Val(x, Ty.U32)
+}
+
+# element i (a U32) of a buffer
+fn (k mut Kernel&) Read(b Buffer, i Val) Val {
+    p := k.id()
+    put(k.body, 65, k.elemPtrs[slot(b.T)], p, b.Id, k.U(0).Id, i.Id)
+    v := k.id()
+    put(k.body, 61, k.ty(b.T), v, p)
+    return Val(v, b.T)
+}
+
+# element i of a buffer becomes x
+fn (k mut Kernel&) Write(b Buffer, i Val, x Val) {
+    p := k.id()
+    put(k.body, 65, k.elemPtrs[slot(b.T)], p, b.Id, k.U(0).Id, i.Id)
+    put(k.body, 62, p, x.Id)
+}
+
+# an array of n elements of t (F32, U32 or I32) in workgroup memory: one a workgroup, every invocation of it reading
+# and writing the same elements. What one invocation writes another reads only after a Barrier
+fn (k mut Kernel&) Shared(t Ty, n I64) Shared {
+    s := slot(t)
+    if k.sharedPtrs[s] == 0 {
+        k.sharedPtrs[s] = k.id()
+        put(k.types, 32, k.sharedPtrs[s], 4, k.ty(t))
+    }
+    len := k.U(n)
+    arr := k.id()
+    put(k.types, 28, arr, k.ty(t), len.Id)
+    p := k.id()
+    put(k.types, 32, p, 4, arr)
+    v := k.id()
+    put(k.types, 59, p, v, 4)
+    k.SharedBytes += 4 * n
+    return Shared(v, t, n)
+}
+
+# element i (a U32) of a shared array, and element i becomes x
+fn (k mut Kernel&) ReadShared(a Shared, i Val) Val {
+    p := k.id()
+    put(k.body, 65, k.sharedPtrs[slot(a.T)], p, a.Id, i.Id)
+    v := k.id()
+    put(k.body, 61, k.ty(a.T), v, p)
+    return Val(v, a.T)
+}
+fn (k mut Kernel&) WriteShared(a Shared, i Val, x Val) {
+    p := k.id()
+    put(k.body, 65, k.sharedPtrs[slot(a.T)], p, a.Id, i.Id)
+    put(k.body, 62, p, x.Id)
+}
+
+# every invocation of the workgroup waits here for the others, and sees what they wrote to shared arrays before it.
+# Only where every invocation of the workgroup arrives the same number of times: not under an If or a loop whose
+# condition differs between them
+fn (k mut Kernel&) Barrier() { put(k.body, 224, k.U(2).Id, k.U(2).Id, k.U(0x108).Id) }
+
+# ---- constants ----
+
+fn (k mut Kernel&) constBits(t Ty, bits U32) Val {
+    ty := k.ty(t)
+    for i in range 0, k.consts.Len(), 3 {
+        if k.consts[i] == ty and k.consts[i + 1] == bits: return Val(k.consts[i + 2], t)
+    }
+    c := k.id()
+    put(k.types, 43, ty, c, bits)
+    k.consts.Push(ty)
+    k.consts.Push(bits)
+    k.consts.Push(c)
+    return Val(c, t)
+}
+
+# the constants x as a U32, an I32 and an F32
+fn (k mut Kernel&) U(x I64) Val { return k.constBits(Ty.U32, U32(x)) }
+fn (k mut Kernel&) I(x I64) Val { return k.constBits(Ty.I32, U32(I32(x))) }
+fn (k mut Kernel&) F(x F32) Val { return k.constBits(Ty.F32, x.Bits()) }
+
+# ---- arithmetic ----
+
+fn (k mut Kernel&) op2(op U32, t Ty, a Val, b Val) Val {
+    r := k.id()
+    put(k.body, op, k.ty(t), r, a.Id, b.Id)
+    return Val(r, t)
+}
+
+fn (k mut Kernel&) op1(op U32, t Ty, a Val) Val {
+    r := k.id()
+    put(k.body, op, k.ty(t), r, a.Id)
+    return Val(r, t)
+}
+
+# a floating-point result no driver may fuse with another operation
+fn (k mut Kernel&) exact(v Val) Val {
+    put(k.decor, 71, v.Id, 42)
+    return v
+}
+
+# the opcode for a's type among (unsigned, signed, float)
+fn pick(a Val, u U32, i U32, f U32) U32 {
+    if a.T == Ty.F32: return f
+    if a.T == Ty.I32: return i
+    return u
+}
+
+# a + b, a - b, a * b, a / b and (integers) a mod b, of two values of one type
+fn (k mut Kernel&) Add(a Val, b Val) Val {
+    if a.T == Ty.F32: return k.exact(k.op2(129, a.T, a, b))
+    return k.op2(128, a.T, a, b)
+}
+fn (k mut Kernel&) Sub(a Val, b Val) Val {
+    if a.T == Ty.F32: return k.exact(k.op2(131, a.T, a, b))
+    return k.op2(130, a.T, a, b)
+}
+fn (k mut Kernel&) Mul(a Val, b Val) Val {
+    if a.T == Ty.F32: return k.exact(k.op2(133, a.T, a, b))
+    return k.op2(132, a.T, a, b)
+}
+fn (k mut Kernel&) Div(a Val, b Val) Val { return k.op2(pick(a, 134, 135, 136), a.T, a, b) }
+fn (k mut Kernel&) Mod(a Val, b Val) Val { return k.op2(pick(a, 137, 139, 141), a.T, a, b) }
+fn (k mut Kernel&) Neg(a Val) Val { return k.op1(pick(a, 126, 126, 127), a.T, a) }
+
+# comparisons of two values of one type
+fn (k mut Kernel&) Lt(a Val, b Val) Val { return k.op2(pick(a, 176, 177, 184), Ty.Bool, a, b) }
+fn (k mut Kernel&) Le(a Val, b Val) Val { return k.op2(pick(a, 178, 179, 188), Ty.Bool, a, b) }
+fn (k mut Kernel&) Gt(a Val, b Val) Val { return k.op2(pick(a, 172, 173, 186), Ty.Bool, a, b) }
+fn (k mut Kernel&) Ge(a Val, b Val) Val { return k.op2(pick(a, 174, 175, 190), Ty.Bool, a, b) }
+fn (k mut Kernel&) Eq(a Val, b Val) Val { return k.op2(pick(a, 170, 170, 180), Ty.Bool, a, b) }
+fn (k mut Kernel&) Ne(a Val, b Val) Val { return k.op2(pick(a, 171, 171, 182), Ty.Bool, a, b) }
+
+# Bools: both, either, not
+fn (k mut Kernel&) And(a Val, b Val) Val { return k.op2(167, Ty.Bool, a, b) }
+fn (k mut Kernel&) Or(a Val, b Val) Val { return k.op2(166, Ty.Bool, a, b) }
+fn (k mut Kernel&) Not(a Val) Val { return k.op1(168, Ty.Bool, a) }
+
+# integers' bits: and, or, shifted left and right (zeros in)
+fn (k mut Kernel&) BitAnd(a Val, b Val) Val { return k.op2(199, a.T, a, b) }
+fn (k mut Kernel&) BitOr(a Val, b Val) Val { return k.op2(197, a.T, a, b) }
+fn (k mut Kernel&) Shl(a Val, b Val) Val { return k.op2(196, a.T, a, b) }
+fn (k mut Kernel&) Shr(a Val, b Val) Val { return k.op2(194, a.T, a, b) }
+
+# a where c, else b
+fn (k mut Kernel&) Select(c Val, a Val, b Val) Val {
+    r := k.id()
+    put(k.body, 169, k.ty(a.T), r, c.Id, a.Id, b.Id)
+    return Val(r, a.T)
+}
+
+# a as an F32 (its value), as a U32 and as an I32 (a float's value truncated, an integer's bits)
+fn (k mut Kernel&) ToF(a Val) Val {
+    if a.T == Ty.F32: return a
+    return k.op1(pick(a, 112, 111, 0), Ty.F32, a)
+}
+fn (k mut Kernel&) ToU(a Val) Val {
+    if a.T == Ty.U32: return a
+    return k.op1(pick(a, 0, 124, 109), Ty.U32, a)
+}
+fn (k mut Kernel&) ToI(a Val) Val {
+    if a.T == Ty.I32: return a
+    return k.op1(pick(a, 124, 0, 110), Ty.I32, a)
+}
+
+# an F32's bits as a U32, and the F32 of a U32's bits
+fn (k mut Kernel&) Bits(a Val) Val { return k.op1(124, Ty.U32, a) }
+fn (k mut Kernel&) FromBits(a Val) Val { return k.op1(124, Ty.F32, a) }
+
+# an operation of GLSL's library (GLSL.std.450's number) of one or two values, its result of a's type
+fn (k mut Kernel&) ext1(inst U32, a Val) Val {
+    r := k.id()
+    put(k.body, 12, k.ty(a.T), r, k.glsl, inst, a.Id)
+    return Val(r, a.T)
+}
+fn (k mut Kernel&) ext2(inst U32, a Val, b Val) Val {
+    r := k.id()
+    put(k.body, 12, k.ty(a.T), r, k.glsl, inst, a.Id, b.Id)
+    return Val(r, a.T)
+}
+
+# the driver's own functions of an F32, each as accurate as the driver makes it (Sqrt is IEEE's on most)
+fn (k mut Kernel&) Abs(a Val) Val { return k.ext1(4, a) }
+fn (k mut Kernel&) Floor(a Val) Val { return k.ext1(8, a) }
+fn (k mut Kernel&) Tanh(a Val) Val { return k.ext1(21, a) }
+fn (k mut Kernel&) Exp(a Val) Val { return k.ext1(27, a) }
+fn (k mut Kernel&) Log(a Val) Val { return k.ext1(28, a) }
+fn (k mut Kernel&) Sqrt(a Val) Val { return k.ext1(31, a) }
+
+# a b + c of F32s as one operation where the device has one (a single rounding), else as the product and the sum: the
+# one arithmetic here whose result is the device's to choose
+fn (k mut Kernel&) Fma(a Val, b Val, c Val) Val {
+    r := k.id()
+    put(k.body, 12, k.ty(a.T), r, k.glsl, 50, a.Id, b.Id, c.Id)
+    return Val(r, a.T)
+}
+
+# the lesser and the greater of two values of one type
+fn (k mut Kernel&) Least(a Val, b Val) Val { return k.ext2(pick(a, 38, 39, 37), a, b) }
+fn (k mut Kernel&) Most(a Val, b Val) Val { return k.ext2(pick(a, 41, 42, 40), a, b) }
+
+# ---- variables ----
+
+# a variable of t, for values that change across a loop or a condition
+fn (k mut Kernel&) Var(t Ty) Var {
+    s := slot(t)
+    if k.varPtrs[s] == 0 {
+        k.varPtrs[s] = k.id()
+        put(k.types, 32, k.varPtrs[s], 7, k.ty(t))
+    }
+    v := k.id()
+    put(k.vars, 59, k.varPtrs[s], v, 7)
+    return Var(v, t)
+}
+
+# a variable holding x
+fn (k mut Kernel&) Let(x Val) Var {
+    v := k.Var(x.T)
+    k.Set(v, x)
+    return v
+}
+
+fn (k mut Kernel&) Get(v Var) Val {
+    r := k.id()
+    put(k.body, 61, k.ty(v.T), r, v.Id)
+    return Val(r, v.T)
+}
+
+fn (k mut Kernel&) Set(v Var, x Val) { put(k.body, 62, v.Id, x.Id) }
+
+# ---- control flow ----
+
+# what follows runs where c holds, up to Else (what follows it where c does not) or EndIf
+fn (k mut Kernel&) If(c Val) {
+    merge := k.id()
+    els := k.id()
+    then := k.id()
+    put(k.body, 247, merge, 0)
+    put(k.body, 250, c.Id, then, els)
+    put(k.body, 248, then)
+    k.ctl.Push(merge)
+    k.ctl.Push(els)
+    k.ctl.Push(0)
+}
+
+fn (k mut Kernel&) Else() {
+    n := k.ctl.Len()
+    put(k.body, 249, k.ctl[n - 3])
+    put(k.body, 248, k.ctl[n - 2])
+    k.ctl.SetAt(n - 1, 1)
+}
+
+fn (k mut Kernel&) EndIf() {
+    n := k.ctl.Len()
+    merge := k.ctl[n - 3]
+    if k.ctl[n - 1] == 0 {
+        put(k.body, 249, merge)
+        put(k.body, 248, k.ctl[n - 2])
+    }
+    put(k.body, 249, merge)
+    put(k.body, 248, merge)
+    k.ctl.Truncate(n - 3)
+}
+
+# a loop: what follows up to While is computed before each round, While(c) ends the loop where c does not hold, and
+# what follows it up to EndLoop is the round
+fn (k mut Kernel&) Loop() {
+    header := k.id()
+    cond := k.id()
+    round := k.id()
+    cont := k.id()
+    merge := k.id()
+    put(k.body, 249, header)
+    put(k.body, 248, header)
+    put(k.body, 246, merge, cont, 0)
+    put(k.body, 249, cond)
+    put(k.body, 248, cond)
+    k.ctl.Push(header)
+    k.ctl.Push(round)
+    k.ctl.Push(cont)
+    k.ctl.Push(merge)
+}
+
+fn (k mut Kernel&) While(c Val) {
+    n := k.ctl.Len()
+    put(k.body, 250, c.Id, k.ctl[n - 3], k.ctl[n - 1])
+    put(k.body, 248, k.ctl[n - 3])
+}
+
+fn (k mut Kernel&) EndLoop() {
+    n := k.ctl.Len()
+    put(k.body, 249, k.ctl[n - 2])
+    put(k.body, 248, k.ctl[n - 2])
+    put(k.body, 249, k.ctl[n - 4])
+    put(k.body, 248, k.ctl[n - 1])
+    k.ctl.Truncate(n - 4)
+}
+
+# the counted loop: i from lo while it is less than hi, a round up to Next(i), which adds one
+fn (k mut Kernel&) For(i Var, lo Val, hi Val) {
+    k.Set(i, lo)
+    k.Loop()
+    k.While(k.Lt(k.Get(i), hi))
+}
+
+fn (k mut Kernel&) Next(i Var) {
+    one := k.U(1) if i.T == Ty.U32 else k.I(1)
+    k.Set(i, k.Add(k.Get(i), one))
+    k.EndLoop()
+}
+
+# ---- the module ----
+
+# the kernel's SPIR-V: the words a device makes a pipeline of
+fn (k mut Kernel&) Finish() Array<U32> {
+    assert k.ctl.Len() == 0, "an If or a Loop of the kernel is not ended"
+    w := Vec<U32>()
+    w.Push(0x07230203)
+    w.Push(0x00010000)
+    w.Push(0)
+    w.Push(0)       # the bound of the ids, set below
+    w.Push(0)
+    put(w, 17, 1)
+    s := Vec<U32>()
+    s.Push(k.glsl)
+    strWords(s, "GLSL.std.450")
+    putv(w, 11, s.View())
+    put(w, 14, 0, 1)
+    e := Vec<U32>()
+    e.Push(5)
+    e.Push(k.main)
+    strWords(e, "main")
+    e.Push(k.gid)
+    putv(w, 15, e.View())
+    put(w, 16, k.main, 17, U32(k.Lx), U32(k.Ly), U32(k.Lz))
+    w.PushAll(k.decor.View())
+    if k.Params > 0 {
+        st := k.id()
+        put(w, 71, st, 2)
+        for i in range k.Params: put(w, 72, st, U32(i), 35, U32(4 * i))
+        w.PushAll(k.types.View())
+        m := Vec<U32>()
+        m.Push(st)
+        for t in k.paramTys.View(): m.Push(t)
+        putv(w, 30, m.View())
+        p := k.id()
+        put(w, 32, p, 9, st)
+        put(w, 59, p, k.push, 9)
+    } else {
+        w.PushAll(k.types.View())
+    }
+    put(w, 54, k.tVoid, k.main, 0, k.tFn)
+    put(w, 248, k.id())
+    w.PushAll(k.vars.View())
+    w.PushAll(k.body.View())
+    put(w, 253)
+    put(w, 56)
+    w.SetAt(3, k.next)
+    return w.ToArray()
+}
+
+test Kernel "a kernel's words: SPIR-V's magic and version, whole instructions to the end" {
+    k := Kernel.Begin(64)
+    x := k.Buffer(Ty.F32)
+    y := k.Buffer(Ty.F32)
+    n := k.Param(Ty.U32)
+    a := k.Param(Ty.F32)
+    i := k.GlobalId(0)
+    k.If(k.Lt(i, n))
+    k.Write(y, i, k.Add(k.Mul(a, k.Read(x, i)), k.Read(y, i)))
+    k.EndIf()
+    w := k.Finish()
+    assert w[0] == 0x07230203 and w[1] == 0x00010000 and k.Buffers == 2 and k.Params == 2
+    at I64 = 5
+    for at < w.Len() {
+        len := I64(w[at] >> 16)
+        assert len > 0, "an instruction of no words at " + $at
+        at += len
+    }
+    assert at == w.Len()
+}

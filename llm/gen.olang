@@ -2,7 +2,7 @@
 #
 #     oann-gen MODEL prompts.jsonl out.jsonl [--n K] [--temp T] [--top-p P] [--top-k K] [--max-tokens M] [--batch B]
 #              [--ctx C] [--seed S] [--system TEXT] [--no-think] [--kv-gb G] [--int8] [--int4] [--kv8] [--exact]
-#              [--device gpu]
+#              [--device gpu|vulkan]
 #
 # MODEL is a directory holding a Hugging Face checkpoint (config.json, tokenizer.json, model.safetensors or its shards),
 # a GGUF file (llm/gguf: its weights widened to BF16, or requantized to INT8, as they load),
@@ -21,8 +21,13 @@
 #
 # --device gpu runs the model on the CUDA device (llm/gpu: the weights in BF16 and the cache on the device, sampling
 # here), where oann-gen was built with -define Gpu=true (make oanngen does where the CUDA toolkit is installed). The
-# cache takes the device's memory left after the weights, less 1.5 GB for the display and the step's buffers; --kv-gb
-# says otherwise.
+# cache takes the device memory the driver reports free, less the weights and 768 MB for the step's buffers; --kv-gb
+# says otherwise. A cache that spilled into shared system memory (Windows, when the device runs short) is named, with a
+# smaller --kv-gb as the cure.
+#
+# --device vulkan runs it on any GPU with a Vulkan driver - AMD, Intel, NVIDIA, an integrated one (llm/vk: the same
+# split), where oann-gen was built with -define Vulkan=true (make oanngen does where Vulkan's headers are, libvulkan-dev).
+# OANN_VK_DEVICE=N picks one of several devices. The cache takes the device's memory left after the weights, less 1 GB.
 
 import "std/flags"
 import "std/io"
@@ -51,7 +56,9 @@ if Gpu {
         if why != "": fail("--device gpu does not run this model: " + why)
         theDev ~ try gdev.Device.Open() catch e { fail("--device gpu: " + $e) }
         say("device: " + theDev!.Str() + ", weights " + $(gpu.WeightBytes(m) / 1048576) + " MB")
-        return theDev!.MiB * 1048576 - gpu.WeightBytes(m) - 1536 * 1048576
+        free := theDev!.FreeBytes()
+        if free == 0: free = theDev!.MiB * 1048576 - 1024 * 1048576
+        return free - gpu.WeightBytes(m) - 768 * 1048576
     }
 
     # m on the device, for e's steps
@@ -59,6 +66,10 @@ if Gpu {
         t0 := time.Now()
         theDec ~ try gpu.Decoder.Make(theDev!, m, e.State.Rows, e.Batch, e.Cache, maxCtx) catch err { fail("--device gpu: " + $err + " (a smaller --kv-gb, --batch or --ctx may fit)") }
         say("on the device: " + $(theDec!.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+        w, k, v := try theDec!.Speeds() catch err { fail("--device gpu: " + $err) }
+        if k < w / 4.0 or v < w / 4.0 {
+            say("warning: the cache reads at " + k.Min(v).Fixed(0) + " GB/s against the weights' " + w.Fixed(0) + " GB/s - part of it is in shared system memory (the device's memory ran short); a smaller --kv-gb will be faster")
+        }
     }
 
     fn gpuStep(m model.Model&, e mut engine.Engine&) {
@@ -68,6 +79,41 @@ if Gpu {
     fn gpuOpen(m model.Model&) I64 { fail("--device gpu: this oann-gen was built without the GPU (build it with -define Gpu=true: make oanngen where the CUDA toolkit is installed)") }
     fn gpuLoad(m model.Model&, e engine.Engine&, maxCtx I64) { }
     fn gpuStep(m model.Model&, e mut engine.Engine&) { }
+}
+
+Vulkan Bool = false
+
+if Vulkan {
+    import "vk"
+    import vdev "../kernels/vk/device"
+
+    vkDev mut vdev.Device?& = null
+    vkDec mut vk.Decoder?& = null
+
+    # the Vulkan device opened, for m: the bytes of its memory left for the cache
+    fn vkOpen(m model.Model&) I64 {
+        why := vk.Refusal(m)
+        if why != "": fail("--device vulkan does not run this model: " + why)
+        vkDev ~ try vdev.Device.Open() catch e { fail("--device vulkan: " + $e + " (no Vulkan driver here?)") }
+        say("device: " + vkDev!.Str() + ", weights " + $(vk.WeightBytes(m) / 1048576) + " MB")
+        # (a layer's keys are one buffer, its values another: no more pages than one buffer of the device binds)
+        return (vkDev!.MiB * 1048576 - vk.WeightBytes(m) - 1024 * 1048576).Min(vkDev!.MaxBufMiB * 1048576 * 2 * m.C.Layers)
+    }
+
+    # m on the device, for e's steps
+    fn vkLoad(m model.Model&, e engine.Engine&, maxCtx I64) {
+        t0 := time.Now()
+        vkDec ~ try vk.Decoder.Make(vkDev!, m, e.State.Rows, e.Batch, e.Cache, maxCtx) catch err { fail("--device vulkan: " + $err + " (a smaller --kv-gb, --batch or --ctx may fit)") }
+        say("on the device: " + $(vkDec!.Bytes / 1048576) + " MB, " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+    }
+
+    fn vkStep(m model.Model&, e mut engine.Engine&) {
+        try vkDec!.Step(m, e.State, e.Cache) catch err { fail("--device vulkan: " + $err) }
+    }
+} else {
+    fn vkOpen(m model.Model&) I64 { fail("--device vulkan: this oann-gen was built without Vulkan (build it with -define Vulkan=true: make oanngen where Vulkan's headers are, libvulkan-dev)") }
+    fn vkLoad(m model.Model&, e engine.Engine&, maxCtx I64) { }
+    fn vkStep(m model.Model&, e mut engine.Engine&) { }
 }
 
 type job struct(id String&, sample I64, prompt Array<I32>&, images Array<F32>&) {
@@ -180,7 +226,7 @@ fn main() {
     kv8 := p.Bool("kv8", 0, "keys and values in 8 bits, a scale per position and head: about half the cache (AMX)")
     int8 := p.Bool("int8", 0, "8-bit weights, a scale per 32 inputs (the head stays BF16): about 0.56 of the memory; needs AMX")
     int4 := p.Bool("int4", 0, "4-bit weights, a scale per 32 inputs (the head stays BF16): about a third of the memory, faster decoding; needs AMX")
-    deviceName := p.Text("device", 0, "cpu", "cpu, or gpu: the model on the CUDA device (BF16; a build with -define Gpu=true)")
+    deviceName := p.Text("device", 0, "cpu", "cpu; gpu: the model on the CUDA device (BF16; a build with -define Gpu=true); vulkan: on any GPU with a Vulkan driver (BF16; a build with -define Vulkan=true)")
     try p.Parse(os.Args()) catch flags.Error.Help {
         try io.Put(p.Help()) catch { }
         return
@@ -195,10 +241,12 @@ fn main() {
     tok := try tokenizer(dir) catch { fail("cannot read the tokenizer of " + dir) }
     ch := chat.Chat.Load(dir, tok)
     onGpu := deviceName.Get() == "gpu"
-    if not onGpu and deviceName.Get() != "cpu": fail("--device is cpu or gpu")
-    if onGpu and (int8.Get() or int4.Get() or kv8.Get() or exact.Get()): fail("--device gpu runs BF16 alone: not with --int8, --int4, --kv8 or --exact")
+    onVk := deviceName.Get() == "vulkan"
+    onDev := onGpu or onVk
+    if not onDev and deviceName.Get() != "cpu": fail("--device is cpu, gpu or vulkan")
+    if onDev and (int8.Get() or int4.Get() or kv8.Get() or exact.Get()): fail("--device " + deviceName.Get() + " runs BF16 alone: not with --int8, --int4, --kv8 or --exact")
     # (the device reads the weights row-major: loaded as --exact loads them, without AMX's packing)
-    m := try model.Model.Load(dir, exact.Get() or onGpu, int8.Get(), int4.Get()) catch { fail("cannot load the model in " + dir) }
+    m := try model.Model.Load(dir, exact.Get() or onDev, int8.Get(), int4.Get()) catch { fail("cannot load the model in " + dir) }
     say("loaded " + dir + ": " + $(m.C.Params() / 1000000) + "M parameters, " + $(m.Bytes() / 1048576) + " MB" + (" (INT8)" if m.Int8 else (" (INT4)" if m.Int4 else "")) + ", " +
         ("AMX tiles" if m.Tile else "F32 products") + ", " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
     # what is done already
@@ -273,11 +321,13 @@ fn main() {
     maxCtx = maxCtx.Min(m.C.MaxPos)
     budget := (available() - 1073741824) * 9 / 10
     if onGpu: budget = gpuOpen(m)
+    if onVk: budget = vkOpen(m)
     if kvGb.Get() > 0.0: budget = I64(kvGb.Get() * 1073741824.0)
     pages := engine.PagesFor(m.C, budget, kv8.Get() and m.Tile).Min(batch.Get() * (maxCtx / model.PageSize + 1))
     if pages < maxCtx / model.PageSize + 1: fail("no room for one sequence of " + $maxCtx + " positions in " + $(budget / 1048576) + " MB")
-    e := engine.Engine(m, batch.Get(), maxCtx, pages, Exact = exact.Get(), Kv8 = kv8.Get(), Device = onGpu)
+    e := engine.Engine(m, batch.Get(), maxCtx, pages, Exact = exact.Get(), Kv8 = kv8.Get(), Device = onDev)
     if onGpu: gpuLoad(m, e, maxCtx)
+    if onVk: vkLoad(m, e, maxCtx)
     tt := ch.Temp if temp.Get() < 0.0 else temp.Get()
     tp := ch.TopP if topP.Get() < 0.0 else topP.Get()
     tk := ch.TopK if topK.Get() < 0 else topK.Get()
@@ -298,6 +348,7 @@ fn main() {
     for not e.Idle() {
         if e.Begin() {
             if onGpu: gpuStep(m, e)
+            else if onVk: vkStep(m, e)
             else: m.Step(e.State, e.Cache)
         }
         for d in e.End() {

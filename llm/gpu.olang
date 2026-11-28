@@ -33,7 +33,7 @@ Gpu Bool = false
 assert Gpu, "llm/gpu is the GPU's and is built only with -define Gpu=true: import it under if Gpu { ... }"
 
 LlmText := String(embed "../kernels/gpu/src/llm.cu")
-Names Array<String>& = ["llm_embed", "llm_norm", "llm_heads", "llm_attend", "llm_add", "llm_swiglu", "llm_bias", "llm_scale"]
+Names Array<String>& = ["llm_embed", "llm_norm", "llm_heads", "llm_attend", "llm_add", "llm_swiglu", "llm_bias", "llm_scale", "llm_combine", "llm_attend_seq"]
 KEmbed I64 = 0
 KNorm I64 = 1
 KHeads I64 = 2
@@ -42,6 +42,8 @@ KAdd I64 = 4
 KSwiglu I64 = 5
 KBias I64 = 6
 KScale I64 = 7
+KCombine I64 = 8
+KAttendSeq I64 = 9
 
 # the rows a product is planned for: a step's, rounded up
 Round I64 = 8
@@ -60,6 +62,8 @@ fn Refusal(m model.Model&) String {
     if c.Experts > 0: return "a mixture of experts"
     if c.PostNorms or c.Gelu: return "Gemma's post-norms and GELU"
     if c.QkWide: return "OLMoE's QK-norm over whole rows"
+    if c.Heads / c.KvHeads > 8: return "more than 8 query heads to a key-value head"
+    if c.HeadDim > 256: return "heads wider than 256"
     for li in range c.Layers {
         if c.WindowOf(li) > 0: return "sliding-window layers"
     }
@@ -105,7 +109,7 @@ type headPlan unique struct(dev gdev.Device&) {
 }
 
 # a model on the device, for steps of at most rows rows, outs of them wanting logits, over a cache of these pages
-type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I64, slots I64, maxPages I64, pages I64, cap I64, half I64, nw I64, w gdev.Buf<BF16>, g gdev.Buf<F32>, k gdev.Buf<BF16>, v gdev.Buf<BF16>, x gdev.Buf<F32>, hb gdev.Buf<BF16>, y gdev.Buf<F32>, q gdev.Buf<BF16>, scores gdev.Buf<F32>, logits gdev.Buf<F32>, ints gdev.Buf<I32>, ang gdev.Buf<F32>) {
+type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I64, slots I64, maxPages I64, pages I64, cap I64, half I64, nw I64, w gdev.Buf<BF16>, g gdev.Buf<F32>, k gdev.Buf<BF16>, v gdev.Buf<BF16>, x gdev.Buf<F32>, hb gdev.Buf<BF16>, y gdev.Buf<F32>, q gdev.Buf<BF16>, part gdev.Buf<F32>, scores gdev.Buf<F32>, logits gdev.Buf<F32>, ints gdev.Buf<I32>, ang gdev.Buf<F32>) {
     dev
     kit
     Rows I64 = rows
@@ -123,7 +127,8 @@ type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I6
     hb                  # what a product reads
     y                   # what it gives
     q                   # the rows' queries
-    scores
+    part                # each (row, head, page)'s partial softmax: maximum, sum, weighted values (Split)
+    scores              # each (row, head)'s scores (not Split)
     logits
     ints                # tokens, positions, slots, last positions (Rows each), the output rows (Outs), the page table
     ang                 # cos, then sin: Rows x half each
@@ -133,6 +138,11 @@ type Decoder unique struct(dev mut gdev.Device&, kit kern.Kit, rows I64, outs I6
     byRows mut Vec<plans>& = Vec<plans>()   # index: rows / Round
     byOuts mut Vec<headPlan>& = Vec<headPlan>()
     Bytes I64 = 0       # device memory held
+    # the attention split by pages (flash decoding, llm_attend and llm_combine), or a block for each row's key-value head
+    # over all its pages (llm_attend_seq); OANN_GPU_ATTN=split or seq, split by default (1.7-3x faster on an RTX 4060)
+    Split Bool = (try os.Env("OANN_GPU_ATTN") catch default "") != "seq"
+    Profile Bool = false    # waits after each part of a step, so s.Times says where the time goes (slower): products, attention, the rest, steps
+    mark I64 = 0
 }
 
 # m on dev, for an engine's State (rows a step, outs sequences) and its Cache (made with device = true): the buffers
@@ -158,9 +168,9 @@ fn Decoder.Make(dev mut gdev.Device&, m model.Model&, rows I64, outs I64, cache 
         try gdev.Buf<BF16>.Make(dev, total), try gdev.Buf<F32>.Make(dev, c.Layers * (2 * d + 2 * dh + w3 + 2 * d + 2 * f) + d)
         try gdev.Buf<BF16>.Make(dev, span), try gdev.Buf<BF16>.Make(dev, span), try gdev.Buf<F32>.Make(dev, rp * d)
         try gdev.Buf<BF16>.Make(dev, rp * widest), try gdev.Buf<F32>.Make(dev, rp * (2 * f).Max(d).Max(w3)), try gdev.Buf<BF16>.Make(dev, rp * heads * dh)
-        try gdev.Buf<F32>.Make(dev, rows * heads * cap), try gdev.Buf<F32>.Make(dev, op * m.Head.Out), try gdev.Buf<I32>.Make(dev, nints)
+        try gdev.Buf<F32>.Make(dev, rows * heads * cache.MaxPages * (dh + 2)), try gdev.Buf<F32>.Make(dev, rows * heads * cap), try gdev.Buf<F32>.Make(dev, op * m.Head.Out), try gdev.Buf<I32>.Make(dev, nints)
         try gdev.Buf<F32>.Make(dev, 2 * rows * half))
-    dec.Bytes = 2 * total + 4 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * cap + 4 * op * m.Head.Out
+    dec.Bytes = 2 * total + 2 * 2 * span + 4 * rp * d + 2 * rp * widest + 4 * rp * (2 * f).Max(d).Max(w3) + 2 * rp * heads * dh + 4 * rows * heads * (cache.MaxPages * (dh + 2) + cap) + 4 * op * m.Head.Out
     # the weights, each at a multiple of Align
     at I64 = 0
     for i in range nw {
@@ -229,6 +239,16 @@ fn (dec mut Decoder&) product(p blas.Product<F32, BF16, BF16>&, i I64, w model.L
     if dec.gAt[bi] >= 0: dec.elems(KBias, n * w.Out, dec.y.Addr(0), dec.gainAddr(bi), kern.Arg(n), kern.Arg(w.Out))
 }
 
+# Profile: what was enqueued since the last lap has run; its time goes to s.Times[part]
+fn (dec mut Decoder&) lap(s mut model.State&, part I64) ? gdev.GpuError {
+    if not dec.Profile: return
+    d := dec.dev
+    try d.Sync()
+    now := time.Now()
+    s.Times[part] += now - dec.mark
+    dec.mark = now
+}
+
 # kernel k over n elements, a grid-stride launch
 fn (dec mut Decoder&) elems(k I64, n I64, args ...U64) {
     if n <= 0: return
@@ -282,22 +302,35 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
     rs := kern.Arg(F32(c.ResScale))
     eps := kern.Arg(c.Eps)
     ps :~ dec.byRows[rp / Round]
+    dec.mark = t0
     for li in range c.Layers {
         l :~ m.Layers[li]
         gi := 8 * li
         layerPages := kern.Arg(li * dec.Pages)
         dec.blocks(KNorm, n, kern.Block, hb, x, dec.gainAddr(gi), U64(0), kern.Arg(d), eps)
+        try dec.lap(s, 2)
         dec.product(ps.qkv, 4 * li, l.Qkv, rp, n, gi + 4)
+        try dec.lap(s, 0)
         dec.blocks(KHeads, n * hc, HeadBlock, q, dec.k.Addr(0), dec.v.Addr(0), y, cs, sn, pos, slot, table, dec.gainAddr(gi + 2), dec.gainAddr(gi + 3)
             kern.Arg(heads), kern.Arg(kv), kern.Arg(dh), kern.Arg(half), layerPages, kern.Arg(dec.maxPages), kern.Arg(I64(1 if c.Rotates(li) else 0)), eps)
-        dec.blocks(KAttend, n * heads, HeadBlock, hb, q, dec.k.Addr(0), dec.v.Addr(0), dec.scores.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
-            kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.cap), kern.Arg(F32(c.Scale())))
+        if dec.Split {
+            dec.blocks(KAttend, n * kv * dec.maxPages, HeadBlock, dec.part.Addr(0), q, dec.k.Addr(0), dec.v.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
+                kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.maxPages), kern.Arg(F32(c.Scale())))
+            dec.blocks(KCombine, n * heads, dh.Min(256), hb, dec.part.Addr(0), last, kern.Arg(heads), kern.Arg(dh), kern.Arg(dec.maxPages))
+        } else {
+            dec.blocks(KAttendSeq, n * kv, HeadBlock, hb, q, dec.k.Addr(0), dec.v.Addr(0), dec.scores.Addr(0), last, slot, table, kern.Arg(heads), kern.Arg(kv)
+                kern.Arg(dh), layerPages, kern.Arg(dec.maxPages), kern.Arg(dec.cap), kern.Arg(F32(c.Scale())))
+        }
+        try dec.lap(s, 1)
         dec.product(ps.o, 4 * li + 1, l.O, rp, n, gi + 5)
+        try dec.lap(s, 0)
         dec.elems(KAdd, n * d, x, y, kern.Arg(n * d), rs)
         dec.blocks(KNorm, n, kern.Block, hb, x, dec.gainAddr(gi + 1), U64(0), kern.Arg(d), eps)
+        try dec.lap(s, 2)
         dec.product(ps.gateUp, 4 * li + 2, l.GateUp, rp, n, gi + 6)
         dec.elems(KSwiglu, n * f, hb, y, kern.Arg(n), kern.Arg(f))
         dec.product(ps.down, 4 * li + 3, l.Down, rp, n, gi + 7)
+        try dec.lap(s, 0)
         dec.elems(KAdd, n * d, x, y, kern.Arg(n * d), rs)
     }
     # the final norm of the rows that want logits, gathered in order, and the head
@@ -313,7 +346,9 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
             hp.made = true
         }
         dec.blocks(KNorm, no, kern.Block, hb, x, dec.gainAddr(8 * c.Layers), outs, kern.Arg(d), eps)
+        try dec.lap(s, 2)
         dec.byOuts[op / Round].p.Run(dev, lg, gdev.DMat<BF16>(dec.hb, 0, op, d, d), head)
+        try dec.lap(s, 0)
         if c.LogitScale != 1.0: dec.elems(KScale, no * hw, dec.logits.Addr(0), kern.Arg(no * hw), kern.Arg(F32(1.0 / c.LogitScale)))
         if hw == c.Vocab {
             dec.logits.Download(s.Logits, 0, 0, no * hw)
@@ -322,14 +357,35 @@ fn (dec mut Decoder&) Step(m model.Model&, s mut model.State&, k model.Cache&) ?
         }
     }
     try dev.Sync()
+    if dec.Profile: s.Times[2] += time.Now() - dec.mark
     s.Times[3] += time.Since(t0)
+}
+
+# the speed of reading and writing each of the weights' and the cache's buffers, GB a second (a copy of its first half
+# onto its second, in pieces of at most 256 MB, timed on the device): where Windows has put part of a buffer in shared
+# system memory (WDDM, when the device's memory runs short), that buffer's speed is the PCIe bus's, ten times lower
+fn (dec mut Decoder&) Speeds() F64, F64, F64 ? gdev.GpuError {
+    return try dec.speed(dec.w.Addr(0), dec.w.N * 2), try dec.speed(dec.k.Addr(0), dec.k.N * 2), try dec.speed(dec.v.Addr(0), dec.v.N * 2)
+}
+
+fn (dec mut Decoder&) speed(at U64, bytes I64) F64 ? gdev.GpuError {
+    d := dec.dev
+    half := bytes / 2 / 256 * 256
+    if half == 0: return 0.0
+    t := try kern.Timer.Make(d)
+    t.Start(d)
+    piece I64 = 256 << 20
+    for o in range 0, half, piece: kern.Copy(d, at + U64(half + o), at + U64(o), piece.Min(half - o))
+    t.Stop(d)
+    ms := try t.Ms()
+    return F64(2 * half) / (ms * 1e6)
 }
 
 # ---- tests ----
 
 # two sequences in one cache, their prompts read in one step and then a token each a step, on the CPU and on the
 # device: the largest difference of any logit, and the largest logit
-fn against(dir String&) F64, F64 ? gdev.GpuError {
+fn against(dir String&, split Bool) F64, F64 ? gdev.GpuError {
     dev := try gdev.Device.Open()
     m := model.Model.Load(dir, true)!
     assert Refusal(m) == "", Refusal(m)
@@ -343,6 +399,7 @@ fn against(dir String&) F64, F64 ? gdev.GpuError {
     sc := model.State(m, 24, 24, 192)
     sg := model.State(m, 24, 24, 192)
     dec := try Decoder.Make(dev, m, 24, 24, kg, 192)
+    dec.Split = split
     worst, top := 0.0, 0.0
     lens := [11, 7]
     for step in range 70 {
@@ -369,16 +426,19 @@ fn against(dir String&) F64, F64 ? gdev.GpuError {
 }
 
 fn checked(dir String&, what String&) {
-    worst, top := try against(dir) catch gdev.GpuError.NoDevice {
-        gdev.Skip("llm/gpu, " + what)
-        os.RemoveAll(dir)!
-        return
-    } catch e {
-        assert false, $e
-        return
+    for split in [false, true] {
+        how := what + (", attention split" if split else ", attention seq")
+        worst, top := try against(dir, split) catch gdev.GpuError.NoDevice {
+            gdev.Skip("llm/gpu, " + how)
+            os.RemoveAll(dir)!
+            return
+        } catch e {
+            assert false, $e
+            return
+        }
+        Println("llm/gpu, " + how + ": largest logit difference " + $worst + " of logits up to " + $top)
+        assert worst <= 0.03 * top, how + ": the device's logits differ from the CPU's by " + $worst
     }
-    Println("llm/gpu, " + what + ": largest logit difference " + $worst + " of logits up to " + $top)
-    assert worst <= 0.03 * top, what + ": the device's logits differ from the CPU's by " + $worst
     os.RemoveAll(dir)!
 }
 

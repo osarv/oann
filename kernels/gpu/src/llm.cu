@@ -5,8 +5,9 @@
 // result, the perceptron's gated hidden row), the weights and the cached keys and values are BF16, rounded to nearest,
 // even, as the CPU's path rounds them.
 //
-// The cache. Keys and values of layer l, page p, key-value head g, position j of the page, HeadDim each, at
-// (((l * pages + p) * kv + g) * 64 + j) * dh. A sequence's pages are its slot's row of the table (maxPages a row):
+// The cache. Keys and values of layer l, page p, key-value head g: 64 * dh elements from ((l * pages + p) * kv + g) *
+// 64 * dh. Position j's value is the dh elements at j * dh; its key's dimension i is at i * 64 + j (dimension by
+// dimension, so the threads of the attention's scores, one a position, read neighbours). A sequence's pages are its slot's row of the table (maxPages a row):
 // position n is in page table[slot * maxPages + n / 64], at n % 64.
 
 #define LLM_LOOP(i, n) for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < (n); i += (long long)gridDim.x * blockDim.x)
@@ -75,8 +76,9 @@ extern "C" __global__ void llm_heads(unsigned short *q, unsigned short *K, unsig
     long long at = 0;
     if (!(hh < heads)) {
         long long page = table[(long long)slot[r] * maxPages + pos[r] / LLM_PAGE];
-        at = (((layerPages + page) * kv + g) * LLM_PAGE + pos[r] % LLM_PAGE) * dh;
+        at = ((layerPages + page) * kv + g) * LLM_PAGE * dh;
     }
+    long long n = pos[r] % LLM_PAGE;
     for (long long i = threadIdx.x; i < dh; i += blockDim.x) {
         float v = normed ? x[i] * inv * gain[i] : x[i];
         if (rot && qk && i < 2 * half) {
@@ -90,61 +92,169 @@ extern "C" __global__ void llm_heads(unsigned short *q, unsigned short *K, unsig
             v = i < half ? lo * c - hi * sv : hi * c + lo * sv;
         }
         if (hh < heads) q[(r * heads + hh) * dh + i] = llm_round(v);
-        else (isV ? V : K)[at + i] = llm_round(v);
+        else if (isV) V[at + n * dh + i] = llm_round(v);
+        else K[at + i * LLM_PAGE + n] = llm_round(v);
     }
 }
 
-// attention of row r's head h (a block each, block item = r * heads + h) over positions 0 .. last[r] of its sequence:
-// the scores q . k * scale into scores[item, :], their softmax, and out[r, h, :] (BF16) = the values' mean by it.
-// Head h reads key-value head h / (heads / kv)
-extern "C" __global__ void llm_attend(unsigned short *out, const unsigned short *q, const unsigned short *K, const unsigned short *V,
+// attention, split by pages (flash decoding). llm_attend: a block for each (row r, key-value head g, page c of r's
+// sequence), item = (r * kv + g) * chunks + c, for the heads / kv (at most 8) query heads that read g, h = g * (heads /
+// kv) + t: the page's scores q . k * scale, their maximum m, sum s of exp(score - m) and the values weighted by them,
+// a, into part[(r * heads + h) * chunks + c] as (m, s, a[0 .. dh)). The page's keys and values are read once for the
+// group's heads; nothing is written for a page past last[r]. llm_combine: a block for each (row, head) joins its
+// pages' parts into out[r, h, :] (BF16)
+#define LLM_GROUP 8
+extern "C" __global__ void llm_attend(float *part, const unsigned short *q, const unsigned short *K, const unsigned short *V,
+                                      const int *last, const int *slot, const int *table, long long heads, long long kv,
+                                      long long dh, long long layerPages, long long maxPages, long long chunks, float scale) {
+    __shared__ float qs[LLM_GROUP * 256];
+    __shared__ float w[LLM_GROUP * LLM_PAGE];
+    __shared__ float stat[2 * LLM_GROUP];
+    int nq = (int)(heads / kv), D = (int)dh, tid = threadIdx.x, bd = blockDim.x;
+    long long c = blockIdx.x % chunks, rg = blockIdx.x / chunks, r = rg / kv, g = rg % kv;
+    int np = last[r] + 1;
+    int first = (int)c * LLM_PAGE;
+    if (first >= np) return;
+    int cnt = np - first < LLM_PAGE ? np - first : LLM_PAGE;
+    long long base = ((layerPages + table[(long long)slot[r] * maxPages + c]) * kv + g) * LLM_PAGE * dh;
+    const unsigned short *qv = q + (r * heads + g * nq) * dh;
+    for (int i = tid; i < nq * D; i += bd) qs[i] = llm_bf(qv[i]);
+    __syncthreads();
+    // the scores: item (t, j), keys stored dimension by dimension so neighbouring j read neighbours
+    for (int it = tid; it < nq * LLM_PAGE; it += bd) {
+        int t = it / LLM_PAGE, j = it % LLM_PAGE;
+        float a = -OANN_INF32;
+        if (j < cnt) {
+            a = 0.0f;
+            const unsigned short *kp = K + base + j;
+            const float *qt = qs + t * D;
+            for (int i = 0; i < D; i++) a += qt[i] * llm_bf(kp[i * LLM_PAGE]);
+            a *= scale;
+        }
+        w[it] = a;
+    }
+    __syncthreads();
+    // each head's maximum and sum over the page (a warp a head, nq <= 8 warps of the block's)
+    int warp = tid / 32, lane = tid % 32;
+    for (int t = warp; t < nq; t += bd / 32) {
+        float m = -OANN_INF32;
+        for (int j = lane; j < cnt; j += 32) m = fmaxf(m, w[t * LLM_PAGE + j]);
+        for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+        float sum = 0.0f;
+        for (int j = lane; j < LLM_PAGE; j += 32) {
+            float e = j < cnt ? oann_exp(w[t * LLM_PAGE + j] - m) : 0.0f;
+            w[t * LLM_PAGE + j] = e;
+            sum += e;
+        }
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+        if (lane == 0) {
+            stat[2 * t] = m;
+            stat[2 * t + 1] = sum;
+        }
+    }
+    __syncthreads();
+    // the weighted values: a thread a dimension, values stored position by position
+    for (int i = tid; i < D; i += bd) {
+        float acc[LLM_GROUP];
+        for (int t = 0; t < nq; t++) acc[t] = 0.0f;
+        const unsigned short *vp = V + base + i;
+        for (int j = 0; j < cnt; j++) {
+            float vx = llm_bf(vp[(long long)j * D]);
+            for (int t = 0; t < nq; t++) acc[t] += w[t * LLM_PAGE + j] * vx;
+        }
+        for (int t = 0; t < nq; t++) part[((r * heads + g * nq + t) * chunks + c) * (dh + 2) + 2 + i] = acc[t];
+    }
+    if (tid < nq) {
+        float *pp = part + ((r * heads + g * nq + tid) * chunks + c) * (dh + 2);
+        pp[0] = stat[2 * tid];
+        pp[1] = stat[2 * tid + 1];
+    }
+}
+
+extern "C" __global__ void llm_combine(unsigned short *out, const float *part, const int *last, long long heads, long long dh, long long chunks) {
+    long long item = blockIdx.x, r = item / heads;
+    int nc = (last[r] + LLM_PAGE) / LLM_PAGE;
+    const float *pp = part + item * chunks * (dh + 2);
+    float m = -OANN_INF32;
+    for (int c = 0; c < nc; c++) m = fmaxf(m, pp[c * (dh + 2)]);
+    for (long long i = threadIdx.x; i < dh; i += blockDim.x) {
+        float s = 0.0f, a = 0.0f;
+        for (int c = 0; c < nc; c++) {
+            const float *q = pp + c * (dh + 2);
+            float k = oann_exp(q[0] - m);
+            s += q[1] * k;
+            a += q[2 + i] * k;
+        }
+        out[item * dh + i] = llm_round(a / s);
+    }
+}
+
+// (the unsplit form, OANN_GPU_ATTN=seq) attention of row r's key-value head g (a block each, item = r * kv + g) over positions 0 .. last[r] of its sequence,
+// for the heads / kv (at most 8) query heads that read it, h = g * (heads / kv) + t: the scores q . k * scale into
+// scores[r * heads + h, :], their softmax, and out[r, h, :] (BF16) = the values' mean by it. The keys and the values
+// are each read once for the group's heads
+extern "C" __global__ void llm_attend_seq(unsigned short *out, const unsigned short *q, const unsigned short *K, const unsigned short *V,
                                       float *scores, const int *last, const int *slot, const int *table, long long heads, long long kv,
                                       long long dh, long long layerPages, long long maxPages, long long cap, float scale) {
     __shared__ float part[256];
-    long long item = blockIdx.x, r = item / heads, h = item % heads, g = h / (heads / kv);
-    long long np = (long long)last[r] + 1;
+    int nq = (int)(heads / kv), D = (int)dh, tid = threadIdx.x, bd = blockDim.x;
+    long long r = blockIdx.x / kv, g = blockIdx.x % kv;
+    int np = last[r] + 1;
     const int *pages = table + (long long)slot[r] * maxPages;
-    const unsigned short *qv = q + (r * heads + h) * dh;
-    float *sc = scores + item * cap;
-    float top = -OANN_INF32;
-    for (long long p = threadIdx.x; p < np; p += blockDim.x) {
-        const unsigned short *kp = K + (((layerPages + pages[p / LLM_PAGE]) * kv + g) * LLM_PAGE + p % LLM_PAGE) * dh;
-        float s = 0.0f;
-        for (long long i = 0; i < dh; i++) s += llm_bf(qv[i]) * llm_bf(kp[i]);
-        s *= scale;
-        sc[p] = s;
-        top = s > top ? s : top;
-    }
-    part[threadIdx.x] = top;
-    __syncthreads();
-    for (unsigned w = blockDim.x / 2; w > 0; w >>= 1) {
-        if (threadIdx.x < w) part[threadIdx.x] = part[threadIdx.x] > part[threadIdx.x + w] ? part[threadIdx.x] : part[threadIdx.x + w];
-        __syncthreads();
-    }
-    top = part[0];
-    __syncthreads();
-    float sum = 0.0f;
-    for (long long p = threadIdx.x; p < np; p += blockDim.x) {
-        float e = oann_exp(sc[p] - top);
-        sc[p] = e;
-        sum += e;
-    }
-    part[threadIdx.x] = sum;
-    __syncthreads();
-    for (unsigned w = blockDim.x / 2; w > 0; w >>= 1) {
-        if (threadIdx.x < w) part[threadIdx.x] += part[threadIdx.x + w];
-        __syncthreads();
-    }
-    float inv = 1.0f / part[0];
-    for (long long i = threadIdx.x; i < dh; i += blockDim.x) {
-        float a = 0.0f;
-        for (long long pg = 0; pg * LLM_PAGE < np; pg++) {
-            const unsigned short *vp = V + ((layerPages + pages[pg]) * kv + g) * LLM_PAGE * dh + i;
-            long long cnt = np - pg * LLM_PAGE < LLM_PAGE ? np - pg * LLM_PAGE : LLM_PAGE;
-            const float *w = sc + pg * LLM_PAGE;
-            for (long long j = 0; j < cnt; j++) a += w[j] * llm_bf(vp[j * dh]);
+    const unsigned short *qv = q + (r * heads + g * nq) * dh;
+    float *sc = scores + (r * heads + g * nq) * cap;
+    float top[LLM_GROUP], acc[LLM_GROUP];
+    for (int t = 0; t < nq; t++) top[t] = -OANN_INF32;
+    for (int p = tid; p < np; p += bd) {
+        const unsigned short *kp = K + ((layerPages + pages[p / LLM_PAGE]) * kv + g) * LLM_PAGE * dh + p % LLM_PAGE;
+        for (int t = 0; t < nq; t++) acc[t] = 0.0f;
+        for (int i = 0; i < D; i++) {
+            float kx = llm_bf(kp[i * LLM_PAGE]);
+            for (int t = 0; t < nq; t++) acc[t] += llm_bf(qv[t * D + i]) * kx;
         }
-        out[(r * heads + h) * dh + i] = llm_round(a * inv);
+        for (int t = 0; t < nq; t++) {
+            float sv = acc[t] * scale;
+            sc[t * cap + p] = sv;
+            top[t] = sv > top[t] ? sv : top[t];
+        }
+    }
+    float inv[LLM_GROUP];
+    for (int t = 0; t < nq; t++) {
+        part[tid] = top[t];
+        __syncthreads();
+        for (int w = bd / 2; w > 0; w >>= 1) {
+            if (tid < w) part[tid] = part[tid] > part[tid + w] ? part[tid] : part[tid + w];
+            __syncthreads();
+        }
+        float mx = part[0];
+        __syncthreads();
+        float sum = 0.0f;
+        for (int p = tid; p < np; p += bd) {
+            float e = oann_exp(sc[t * cap + p] - mx);
+            sc[t * cap + p] = e;
+            sum += e;
+        }
+        part[tid] = sum;
+        __syncthreads();
+        for (int w = bd / 2; w > 0; w >>= 1) {
+            if (tid < w) part[tid] += part[tid + w];
+            __syncthreads();
+        }
+        inv[t] = 1.0f / part[0];
+        __syncthreads();
+    }
+    for (int i = tid; i < D; i += bd) {
+        for (int t = 0; t < nq; t++) acc[t] = 0.0f;
+        for (int pg = 0; pg * LLM_PAGE < np; pg++) {
+            const unsigned short *vp = V + ((layerPages + pages[pg]) * kv + g) * LLM_PAGE * dh + i;
+            int cnt = np - pg * LLM_PAGE < LLM_PAGE ? np - pg * LLM_PAGE : LLM_PAGE;
+            const float *w = sc + pg * LLM_PAGE;
+            for (int j = 0; j < cnt; j++) {
+                float vx = llm_bf(vp[j * D]);
+                for (int t = 0; t < nq; t++) acc[t] += w[t * cap + j] * vx;
+            }
+        }
+        for (int t = 0; t < nq; t++) out[(r * heads + g * nq + t) * dh + i] = llm_round(acc[t] * inv[t]);
     }
 }
 

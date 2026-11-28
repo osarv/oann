@@ -1,0 +1,561 @@
+# speech/diarize - who spoke when: the stretches of speech of a recording cut into windows, each window a voice vector
+# (speech/speaker), the vectors grouped, and each group a speaker, numbered from 0 in the order they first speak.
+#
+#     d := Diarizer(model)
+#     d.Add(samples, 0.0, speech)      # as often as the sound comes: the samples from a second, the speech in them
+#     turns := d.Turns()               # [Start, End) seconds and a speaker, in order
+#
+# Windows. A stretch of speech (from a transcript's segments, or any voice activity detector) is covered by windows of
+# Options.Window seconds every Options.Step; a stretch shorter than a window is one window. Only the vectors are kept
+# (192 numbers a window), so a recording of any length is taken piece by piece.
+#
+# Grouping. Spectral clustering of the vectors (scaled to length 1), as WeSpeaker's recipe does it: every window keeps
+# its cosine to its nearest windows (the Options.Prune share of them, at least Options.Fewest) and none to the rest;
+# the table made symmetric is a graph whose Laplacian's smallest eigenvalues tell how many speakers there are - the
+# largest gap between two of the first values falls after as many values as there are speakers (or Options.Speakers
+# says how many) - and the eigenvectors of those values place every window as a point, which k-means groups. A
+# recording of more than Options.Whole windows is first merged bottom-up by average linkage down to that many groups
+# (the two groups closest on average cosine merge first; with vectors of length 1 that average is the dot product of
+# the groups' sums over the product of their sizes, so a group is one sum and no table of pairs is kept, and the
+# merges are found by the nearest-neighbour chain), and the groups' mean vectors are clustered: the eigenvectors of
+# at most Whole x Whole numbers, whatever the recording's length. Last, a group that is a small share of the windows
+# (Options.Stray) in runs of one or two (Options.Run) - scattered moments, not a speaker - is given to the speakers
+# left, each window to the closest (not where Options.Speakers gives the count).
+#
+# Turns. A window speaks for the part of its stretch nearer its middle than any other window's; neighbours of one
+# speaker join into a turn.
+
+import "std/rand"
+import "../kernels/eigen"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "speaker"
+
+type Options struct() {
+    Window F64 = 1.5            # seconds a window
+    Step F64 = 0.75             # seconds between windows
+    Prune F64 = 0.02            # the share of the windows each keeps its cosine to
+    Fewest I64 = 6              # and at least this many
+    Whole I64 = 1000            # windows clustered as they are; more are merged down to this many groups first
+    Stray F64 = 0.05            # a group of a smaller share of the windows than this,
+    Run F64 = 2.0               # its runs of windows in a row no longer than this on average, is no speaker
+    Speakers I64 = 0            # how many spoke, where known (0: found)
+    MostSpeakers I64 = 20       # speakers found at most
+    Threads I64 = 0             # tasks making vectors (0: every core)
+}
+
+# seconds [Start, End) of a recording spoken by Speaker (0, 1, .. in the order they first speak)
+type Turn struct(Start F64, End F64, Speaker I64) {
+    Start
+    End
+    Speaker
+}
+
+type Diarizer struct(m speaker.Model&, o Options = Options()) {
+    m
+    O Options = o
+    vecs mut Vec<F32>& = Vec<F32>()         # a window's vector, length 1
+    from mut Vec<F64>& = Vec<F64>()         # a window's seconds
+    to mut Vec<F64>& = Vec<F64>()
+    lo mut Vec<F64>& = Vec<F64>()           # its stretch's seconds
+    hi mut Vec<F64>& = Vec<F64>()
+}
+
+# the windows so far
+fn (d Diarizer&) Windows() I64 { return d.from.Len() }
+
+# the windows' vectors so far, [Windows() x speaker.Dim], each of length 1
+fn (d Diarizer&) Vectors() Array<F32> { return d.vecs.ToArray() }
+
+# window i's seconds
+fn (d Diarizer&) Window(i I64) F64, F64 { return d.from[i], d.to[i] }
+
+# more sound: x the samples from second `at` of the recording, speech the stretches of speech in them (seconds of the
+# recording: each stretch's start and end, pair after pair, in order), each wholly inside x
+fn (d mut Diarizer&) Add(x Array<F32>&, at F64, speech Array<F64>&) {
+    spans := Vec<I64>()
+    first := d.from.Len()
+    for r in range speech.Len() / 2 {
+        a, b := speech[2 * r], speech[2 * r + 1]
+        if b - a < 0.05: continue
+        t := a
+        for {
+            e := (t + d.O.Window).Min(b)
+            if e - t < d.O.Window and t > a: t = (e - d.O.Window).Max(a)       # the last window ends with the stretch
+            d.from.Push(t)
+            d.to.Push(e)
+            d.lo.Push(a)
+            d.hi.Push(b)
+            spans.Push(I64((t - at) * F64(speaker.Rate)).Max(0).Min(x.Len()))
+            spans.Push(I64((e - at) * F64(speaker.Rate)).Max(0).Min(x.Len()))
+            if e >= b: break
+            t += d.O.Step
+        }
+    }
+    if spans.Len() == 0: return
+    frames := I64(d.O.Window * 100.0) + 2
+    v := try d.m.EmbedAll(x, spans.ToArray(), d.O.Threads, frames) catch default Array<F32>(spans.Len() / 2 * speaker.Dim)
+    for i in range spans.Len() / 2 {
+        sq F64 = 0.0
+        for k in range speaker.Dim: sq += F64(v[i * speaker.Dim + k]) * F64(v[i * speaker.Dim + k])
+        scale := F32(1.0 / sq.Sqrt().Max(1e-20))
+        for k in range speaker.Dim: d.vecs.Push(v[i * speaker.Dim + k] * scale)
+    }
+    assert d.from.Len() == first + spans.Len() / 2
+}
+
+# ---- grouping ----
+
+# a merge of the groups holding windows A and B, their average cosine Near
+type merge struct(A I64, B I64, Near F64) {
+    A
+    B
+    Near
+}
+
+# every merge of average linkage over the n vectors of length 1 in v, by the nearest-neighbour chain: n - 1 merges, in
+# the order the chain finds them (not by nearness)
+fn linkage(v Array<F32>&, n I64) Array<merge> {
+    dim := speaker.Dim
+    sums := Array<F32>(n * dim)
+    for i in range n * dim: sums[i] = v[i]
+    size := Array<I64>[1 for _ in range n]
+    alive := Array<Bool>[true for _ in range n]
+    dots := Array<F32>(n)
+    one := Array<F32>(dim)
+    chain := Vec<I64>()
+    out := Vec<merge>()
+    next I64 = 0
+    all := mat.Mat<F32>(sums, 0, n, dim, dim)
+    for out.Len() < n - 1 {
+        if chain.Len() == 0 {
+            for not alive[next]: next += 1
+            chain.Push(next)
+        }
+        a := chain[chain.Len() - 1]
+        before := chain[chain.Len() - 2] if chain.Len() > 1 else -1
+        for k in range dim: one[k] = sums[a * dim + k]
+        gemm.Gemv(dots, all, false, one)
+        best := before
+        near F64 = F64(dots[before]) / F64(size[before] * size[a]) if before >= 0 else -2.0
+        for j in range n {
+            if not alive[j] or j == a: continue
+            s := F64(dots[j]) / F64(size[j] * size[a])
+            if s > near {
+                near = s
+                best = j
+            }
+        }
+        if best != before {
+            chain.Push(best)
+            continue
+        }
+        chain.Pop()!
+        chain.Pop()!
+        out.Push(merge(a, before, near))
+        for k in range dim: sums[a * dim + k] += sums[before * dim + k]
+        for k in range dim: sums[before * dim + k] = 0.0
+        size[a] += size[before]
+        alive[before] = false
+    }
+    return out.ToArray()
+}
+
+fn root(parent mut Array<I64>&, i I64) I64 {
+    r := i
+    for parent[r] != r: r = parent[r]
+    at := i
+    for parent[at] != r {
+        up := parent[at]
+        parent[at] = r
+        at = up
+    }
+    return r
+}
+
+# the group of each of the n windows (numbers from 0, in no order) after the merges nearer than threshold - or, where
+# speakers > 0, the nearest merges that leave that many groups - and the groups' count
+fn groups(merges Array<merge>&, n I64, threshold F64, speakers I64) Array<I64>, I64 {
+    order := Array<I64>[i for i in range merges.Len()]
+    order.Sort(fn(a, b): return merges[a].Near > merges[b].Near)
+    parent := Array<I64>[i for i in range n]
+    left := n
+    for i in order {
+        if speakers > 0 and left <= speakers: break
+        if speakers <= 0 and merges[i].Near < threshold: break
+        parent[root(parent, merges[i].B)] = root(parent, merges[i].A)
+        left -= 1
+    }
+    label := Array<I64>[-1 for _ in range n]
+    out := Array<I64>(n)
+    count I64 = 0
+    for i in range n {
+        r := root(parent, i)
+        if label[r] < 0 {
+            label[r] = count
+            count += 1
+        }
+        out[i] = label[r]
+    }
+    return out, count
+}
+
+# the mean vectors [count x Dim] of the groups in `of`, scaled to length 1
+fn means(v Array<F32>&, of Array<I64>&, count I64) Array<F32> {
+    dim := speaker.Dim
+    sums := Array<F64>(count * dim)
+    for i in range of.Len() {
+        for k in range dim: sums[of[i] * dim + k] += F64(v[i * dim + k])
+    }
+    out := Array<F32>(count * dim)
+    for g in range count {
+        sq F64 = 0.0
+        for k in range dim: sq += sums[g * dim + k] * sums[g * dim + k]
+        for k in range dim: out[g * dim + k] = F32(sums[g * dim + k] / sq.Sqrt().Max(1e-20))
+    }
+    return out
+}
+
+# the Laplacian [n x n] of the graph of the n vectors of length 1 in v: each keeps its cosine to its `keep` nearest
+# (itself among them), the table made symmetric, its diagonal emptied; row sums less the table
+fn laplacian(v mut Array<F32>&, n I64, keep I64) Array<F64> {
+    dim := speaker.Dim
+    near := Array<F32>(n * n)
+    ws := gemm.Workspace<F32>(gemm.Cores(), n.Max(dim))
+    all := mat.Mat<F32>(v, 0, n, dim, dim)
+    table := mat.Mat<F32>(near, 0, n, n, n)
+    gemm.Gemm(ws, table, all, false, all, true)
+    kept := Array<F64>(n * n)
+    row := Array<F32>(n)
+    for i in range n {
+        for j in range n: row[j] = near[i * n + j]
+        row.Sort(fn(a, b): return a > b)
+        cut := row[keep - 1]
+        for j in range n {
+            if near[i * n + j] >= cut: kept[i * n + j] = F64(near[i * n + j])
+        }
+    }
+    out := Array<F64>(n * n)
+    for i in range n {
+        sum F64 = 0.0
+        for j in range n {
+            if j == i: continue
+            w := 0.5 * (kept[i * n + j] + kept[j * n + i])
+            out[i * n + j] = -w
+            sum += w
+        }
+        out[i * n + i] = sum
+    }
+    return out
+}
+
+# how many speakers the Laplacian's eigenvalues w (ascending) tell of: the largest gap between two of the first
+# most + 1 falls after that many
+fn told(w Array<F64>&, most I64) I64 {
+    best I64 = 1
+    gap F64 = -1.0
+    for i in range (most.Min(w.Len() - 1)) {
+        if w[i + 1] - w[i] > gap {
+            gap = w[i + 1] - w[i]
+            best = i + 1
+        }
+    }
+    return best
+}
+
+# the n points [n x dim] in k groups by k-means: the first centres drawn far apart (k-means++), the best of five
+# draws by the points' squared distance to their centres
+fn kmeans(x Array<F64>&, n I64, dim I64, k I64) Array<I64> {
+    r := rand.Rand(1)
+    best := Array<I64>(n)
+    least F64 = -1.0
+    for _ in range 5 {
+        of, cost := kmeansOnce(x, n, dim, k, r)
+        if least >= 0.0 and cost >= least: continue
+        least = cost
+        best = of
+    }
+    return best
+}
+
+fn far(x Array<F64>&, i I64, c Array<F64>&, g I64, dim I64) F64 {
+    s F64 = 0.0
+    for d in range dim: s += (x[i * dim + d] - c[g * dim + d]) * (x[i * dim + d] - c[g * dim + d])
+    return s
+}
+
+fn kmeansOnce(x Array<F64>&, n I64, dim I64, k I64, r mut rand.Rand&) Array<I64>, F64 {
+    c := Array<F64>(k * dim)
+    first := r.Below(n)
+    for d in range dim: c[d] = x[first * dim + d]
+    dist := Array<F64>[far(x, i, c, 0, dim) for i in range n]
+    for g in range 1, k {
+        total F64 = 0.0
+        for i in range n: total += dist[i]
+        at := r.Float() * total
+        pick := n - 1
+        for i in range n {
+            at -= dist[i]
+            if at > 0.0: continue
+            pick = i
+            break
+        }
+        for d in range dim: c[g * dim + d] = x[pick * dim + d]
+        for i in range n: dist[i] = dist[i].Min(far(x, i, c, g, dim))
+    }
+    of := Array<I64>[-1 for _ in range n]
+    cost F64 = 0.0
+    for _ in range 100 {
+        moved := false
+        cost = 0.0
+        for i in range n {
+            g0 I64 = 0
+            d0 := far(x, i, c, 0, dim)
+            for g in range 1, k {
+                dg := far(x, i, c, g, dim)
+                if dg < d0 {
+                    d0 = dg
+                    g0 = g
+                }
+            }
+            cost += d0
+            moved = moved or of[i] != g0
+            of[i] = g0
+        }
+        if not moved: break
+        size := Array<I64>(k)
+        sums := Array<F64>(k * dim)
+        for i in range n {
+            size[of[i]] += 1
+            for d in range dim: sums[of[i] * dim + d] += x[i * dim + d]
+        }
+        for g in range k {
+            if size[g] == 0: continue
+            for d in range dim: c[g * dim + d] = sums[g * dim + d] / F64(size[g])
+        }
+    }
+    return of, cost
+}
+
+# the speaker of each of the n vectors of length 1 in v, by spectral clustering (numbers from 0, in no order)
+fn spectral(v mut Array<F32>&, n I64, o Options&) Array<I64> {
+    if n < 2: return Array<I64>(n)
+    keep := n.Min(o.Fewest.Max(I64(o.Prune * F64(n))))
+    l := laplacian(v, n, keep)
+    w := eigen.Symmetric(l, n)
+    k := o.Speakers.Min(n) if o.Speakers > 0 else told(w, o.MostSpeakers)
+    if k < 2: return Array<I64>(n)
+    x := Array<F64>(n * k)
+    for i in range n {
+        for j in range k: x[i * k + j] = l[j * n + i]
+    }
+    return kmeans(x, n, k, k)
+}
+
+# the windows of every stray group - one of at most o.Stray of the windows whose runs of windows in a row average
+# no more than o.Run: scattered moments (a pause, a cough, two at once), not a speaker - given the remaining speaker
+# whose mean vector is closest
+fn strays(v Array<F32>&, of mut Array<I64>&, o Options&) {
+    n := of.Len()
+    count I64 = 0
+    for g in of: count = count.Max(g + 1)
+    size := Array<I64>(count)
+    runs := Array<I64>(count)
+    for i in range n {
+        size[of[i]] += 1
+        if i == 0 or of[i - 1] != of[i]: runs[of[i]] += 1
+    }
+    stray := Array<Bool>(count)
+    kept I64 = 0
+    for g in range count {
+        if size[g] == 0: continue
+        stray[g] = F64(size[g]) < o.Stray * F64(n) and F64(size[g]) <= o.Run * F64(runs[g])
+        if not stray[g]: kept += 1
+    }
+    if kept == 0 or kept == count: return
+    centres := means(v, of, count)
+    dim := speaker.Dim
+    for i in range n {
+        if not stray[of[i]]: continue
+        best I64 = -1
+        near F64 = -2.0
+        for g in range count {
+            if stray[g] or size[g] == 0: continue
+            dot F64 = 0.0
+            for k in range dim: dot += F64(v[i * dim + k]) * F64(centres[g * dim + k])
+            if dot > near {
+                near = dot
+                best = g
+            }
+        }
+        of[i] = best
+    }
+}
+
+# the speaker of each of the n vectors of length 1 in v: 0, 1, .. in the order they first appear
+fn voices(v Array<F32>&, n I64, o Options&) Array<I64> {
+    of := Array<I64>(n)
+    if n > o.Whole {
+        pre, count := groups(linkage(v, n), n, 2.0, o.Whole)
+        centres := means(v, pre, count)
+        by := spectral(centres, count, o)
+        for i in range n: of[i] = by[pre[i]]
+    } else {
+        own := v.Copy()
+        of = spectral(own, n, o)
+    }
+    if o.Speakers <= 0: strays(v, of, o)
+    seen := Map<I64, I64>()
+    for i in range n {
+        if not seen.Has(of[i]): seen.Put(of[i], seen.Len())
+        of[i] = seen.Get(of[i])!
+    }
+    return of
+}
+
+# the speaker of each window so far: 0, 1, .. in the order they first speak
+fn (d Diarizer&) Labels() Array<I64> {
+    v := d.vecs.ToArray()
+    return voices(v, d.Windows(), d.O)
+}
+
+# who spoke when, so far: turns in order, none overlapping
+fn (d Diarizer&) Turns() Array<Turn> {
+    of := d.Labels()
+    out := Vec<Turn>()
+    n := of.Len()
+    for i in range n {
+        mid := (d.from[i] + d.to[i]) / 2.0
+        a := d.lo[i]
+        b := d.hi[i]
+        if i > 0 and d.lo[i - 1] == d.lo[i] and d.hi[i - 1] == d.hi[i]: a = ((d.from[i - 1] + d.to[i - 1]) / 2.0 + mid) / 2.0
+        if i + 1 < n and d.lo[i + 1] == d.lo[i] and d.hi[i + 1] == d.hi[i]: b = ((d.from[i + 1] + d.to[i + 1]) / 2.0 + mid) / 2.0
+        if out.Len() > 0 {
+            last :~ out.RefMut(out.Len() - 1)
+            if last.Speaker == of[i] and last.End == a {
+                last.End = b
+                continue
+            }
+        }
+        out.Push(Turn(a, b, of[i]))
+    }
+    return out.ToArray()
+}
+
+# the speaker who spoke most of seconds [from, to) by turns (in order), or -1 where nobody did
+fn Most(turns Array<Turn>&, from F64, to F64) I64 {
+    best I64 = -1
+    most F64 = 0.0
+    time := Map<I64, F64>()
+    for t in turns {
+        if t.End <= from: continue
+        if t.Start >= to: break
+        got := (try time.Get(t.Speaker) catch default 0.0) + t.End.Min(to) - t.Start.Max(from)
+        time.Put(t.Speaker, got)
+        if got > most {
+            most = got
+            best = t.Speaker
+        }
+    }
+    return best
+}
+
+# ---- checks ----
+
+# n vectors of length 1 about `speakers` random directions (noise the spread), speaker i % speakers's the i-th
+fn cloud(n I64, speakers I64, noise F64, r mut rand.Rand&) Array<F32> {
+    dim := speaker.Dim
+    dirs := Array<F64>[r.Normal() for _ in range speakers * dim]
+    out := Array<F32>(n * dim)
+    for i in range n {
+        sq F64 = 0.0
+        row := Array<F64>[dirs[(i % speakers) * dim + k] + noise * r.Normal() for k in range dim]
+        for k in range dim: sq += row[k] * row[k]
+        for k in range dim: out[i * dim + k] = F32(row[k] / sq.Sqrt())
+    }
+    return out
+}
+
+test linkage "average linkage finds the speakers of a cloud, by threshold and by count, and the merges are every window's" {
+    r := rand.Rand(7)
+    n := 240
+    v := cloud(n, 4, 0.8, r)
+    merges := linkage(v, n)
+    assert merges.Len() == n - 1
+    of, count := groups(merges, n, 0.2, 0)
+    assert count == 4, $count
+    for i in range n: assert of[i] == of[i % 4]
+    two, c2 := groups(merges, n, 0.2, 2)
+    assert c2 == 2
+    all, c1 := groups(merges, n, -2.0, 0)
+    assert c1 == 1 and all[n - 1] == 0
+    none, cn := groups(merges, n, 2.0, 0)
+    assert cn == n and none[5] == 5 and two.Len() == n
+}
+
+test voices "the speakers of a cloud found and counted: as it is, merged down first, with the count given, and one speaker alone" {
+    r := rand.Rand(5)
+    n := 600
+    v := cloud(n, 5, 1.0, r)
+    o := Options()
+    of := voices(v, n, o)
+    for i in range n: assert of[i] == i % 5, $i + ": " + $of[i]
+    o.Whole = 150
+    merged := voices(v, n, o)
+    for i in range n: assert merged[i] == i % 5
+    o.Speakers = 3
+    three := voices(v, n, o)
+    most I64 = 0
+    for i in range n: most = most.Max(three[i])
+    assert most == 2
+    alone := voices(cloud(300, 1, 1.0, r), 300, Options())
+    for i in range 300: assert alone[i] == 0
+    assert voices(v, 1, Options()).Len() == 1 and voices(v, 0, Options()).Len() == 0
+}
+
+test linkage "the chain's merges are those of the plain search for the closest pair" {
+    r := rand.Rand(3)
+    n := 40
+    dim := speaker.Dim
+    v := cloud(n, 5, 1.5, r)
+    got := linkage(v, n)
+    nears := Vec<F64>()
+    for m in got: nears.Push(m.Near)
+    nears.Sort(fn(a, b): return a > b)
+    # the plain way: every pair of groups compared, the closest merged
+    member := Array<I64>[i for i in range n]
+    for step in range n - 1 {
+        best F64 = -2.0
+        ba I64 = -1
+        bb I64 = -1
+        for a in range n {
+            for b in range a + 1, n {
+                if member[a] != a or member[b] != b: continue
+                sum F64 = 0.0
+                pairs I64 = 0
+                for i in range n {
+                    for j in range n {
+                        if member[i] != a or member[j] != b: continue
+                        pairs += 1
+                        for k in range dim: sum += F64(v[i * dim + k]) * F64(v[j * dim + k])
+                    }
+                }
+                if sum / F64(pairs) > best {
+                    best = sum / F64(pairs)
+                    ba = a
+                    bb = b
+                }
+            }
+        }
+        assert (best - nears[step]).Abs() < 1e-4, $step + ": " + $best + " " + $nears[step]
+        for i in range n {
+            if member[i] == bb: member[i] = ba
+        }
+    }
+}
+
+test Most "the speaker of most of a stretch" {
+    turns := Array<Turn>[Turn(0.0, 4.0, 0), Turn(4.0, 5.0, 1), Turn(6.0, 9.0, 1), Turn(9.0, 9.5, 0)]
+    assert Most(turns, 0.0, 5.0) == 0 and Most(turns, 3.5, 9.0) == 1 and Most(turns, 5.0, 6.0) == -1
+    assert Most(turns, 9.2, 30.0) == 0 and Most(turns, 3.0, 4.5) == 0
+}

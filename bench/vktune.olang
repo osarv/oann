@@ -1,0 +1,146 @@
+# The product's plans on one Vulkan device (kernels/vk/kern's Plan; docs/vulkan.md, "The product"): each plan's
+# kernel is made, checked against the first plan's result on an odd shape (the largest difference of an element: 0
+# for every plan that is not fused), and timed on each shape with the operands resident - products recorded back to
+# back for about 0.3 s, one Sync at the end, the best of the rounds. What it prints is what Plan.For is set from.
+# Arguments: rounds (3), then shapes as M K N triples (default: 256^3, 1024^3, 2048^3); a Whisper encoder's two
+# linear layers, B a transposed weight matrix, are always timed. "large" after the rounds times the large results'
+# plans instead: the staged ones, from 64 x 64 to 128 x 128 tiles, each in the plain and the grouped orders (Plan's
+# Group), on results larger than the device's cache (default shapes: 1024^3, 2048^3, 4096 x 1024 x 4096, 4096^3).
+#
+# From the repository's root: make vktune ARGS="3"; OANN_VK_DEVICE=N picks the device (the bench lists them)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/vk/device"
+import "../kernels/vk/kern"
+
+fn randoms(n I64, r mut rand.Rand&) Array<F32> {
+    x := Array<F32>(n)
+    for i in range n: x[i] = F32(r.Uniform(-1.0, 1.0))
+    return x
+}
+
+# the plan's result on 301 x 129 x 257, brought back
+fn result(d mut device.Device&, p kern.Product&, a Array<F32>&, b Array<F32>&) Array<F32> ? device.VkError {
+    m, k, n := 301, 129, 257
+    ba := try device.Buf<F32>.Make(d, m * k)
+    bb := try device.Buf<F32>.Make(d, k * n)
+    bc := try device.Buf<F32>.Make(d, m * n)
+    ba.UploadAll(a)
+    bb.UploadAll(b)
+    p.Run(d, device.DBatch<F32>.One(device.DMat<F32>(bc, 0, m, n, n)), device.DBatch<F32>.One(device.DMat<F32>(ba, 0, m, k, k)), false, device.DBatch<F32>.One(device.DMat<F32>(bb, 0, k, n, n)), false)
+    out := Array<F32>(m * n)
+    bc.DownloadAll(out)
+    try d.Sync()
+    return out
+}
+
+# GFLOPS of the plan on m x k x n
+fn timed(d mut device.Device&, p kern.Product&, r mut rand.Rand&, m I64, k I64, n I64, tb Bool, rounds I64) F64 ? device.VkError {
+    ba := try device.Buf<F32>.Make(d, m * k)
+    bb := try device.Buf<F32>.Make(d, k * n)
+    bc := try device.Buf<F32>.Make(d, m * n)
+    ba.UploadAll(randoms(m * k, r))
+    bb.UploadAll(randoms(k * n, r))
+    da := device.DBatch<F32>.One(device.DMat<F32>(ba, 0, m, k, k))
+    db := device.DBatch<F32>.One(device.DMat<F32>(bb, 0, n, k, k) if tb else device.DMat<F32>(bb, 0, k, n, n))
+    dc := device.DBatch<F32>.One(device.DMat<F32>(bc, 0, m, n, n))
+    p.Run(d, dc, da, false, db, tb)
+    try d.Sync()
+    t0 := time.Now()
+    p.Run(d, dc, da, false, db, tb)
+    try d.Sync()
+    reps := (300000000 / I64(time.Since(t0)).Max(1)).Clamp(1, 500)
+    best F64 = 0
+    for _ in range rounds {
+        t0 = time.Now()
+        for _ in range reps: p.Run(d, dc, da, false, db, tb)
+        try d.Sync()
+        best = best.Max(2.0 * F64(m) * F64(n) * F64(k) * F64(reps) / F64(time.Since(t0)))
+    }
+    return best
+}
+
+fn plans() Vec<kern.Plan> {
+    ps := Vec<kern.Plan>()
+    ps.Push(kern.Plan(4, 4, 8, 0, false))
+    for fused in Array<Bool>[false, true] {
+        for b in Array<I64>[1, 2, 4, 8] {
+            if not (b == 4 and not fused): ps.Push(kern.Plan(b, b, 8, 0, fused))
+        }
+        ps.Push(kern.Plan(4, 4, 4, 0, fused))
+        ps.Push(kern.Plan(8, 8, 4, 0, fused))
+        ps.Push(kern.Plan(4, 4, 16, 0, fused))
+        for chunk in Array<I64>[8, 16, 32] {
+            ps.Push(kern.Plan(2, 2, 8, chunk, fused))
+            ps.Push(kern.Plan(4, 4, 8, chunk, fused))
+            ps.Push(kern.Plan(8, 8, 8, chunk, fused))
+        }
+        ps.Push(kern.Plan(1, 1, 16, 16, fused))
+        ps.Push(kern.Plan(2, 2, 16, 16, fused))
+        ps.Push(kern.Plan(2, 2, 16, 32, fused))
+        ps.Push(kern.Plan(4, 4, 16, 16, fused))
+        ps.Push(kern.Plan(4, 4, 16, 32, fused))
+    }
+    return ps
+}
+
+# the staged plans of large results, each tile in the plain order and grouped by 4, 8 and 16 tile rows
+fn largePlans() Vec<kern.Plan> {
+    ps := Vec<kern.Plan>()
+    tiles := Array<kern.Plan>[kern.Plan(8, 8, 8, 16, false), kern.Plan(8, 8, 8, 8, false), kern.Plan(4, 4, 16, 16, false), kern.Plan(8, 8, 16, 8, false), kern.Plan(8, 8, 16, 16, false), kern.Plan(8, 4, 16, 16, false)]
+    for t in tiles {
+        for group in Array<I64>[0, 4, 8, 16]: ps.Push(kern.Plan(t.Rows, t.Cols, t.Side, t.Chunk, false, group))
+    }
+    ps.Push(kern.Plan(8, 8, 8, 16, true, 8))
+    ps.Push(kern.Plan(8, 8, 16, 16, true, 8))
+    return ps
+}
+
+fn main() ? io.Error, ParseError, device.VkError {
+    args :~ os.Args()
+    rounds I64 = 3
+    if args.Len() > 1: rounds = try args[1].ParseInt()
+    large := args.Len() > 2 and args[2] == "large"
+    shapes := Vec<I64>()
+    for i in range (3 if large else 2), args.Len(): shapes.Push(try args[i].ParseInt())
+    if shapes.Len() == 0 or shapes.Len() % 3 != 0 {
+        shapes.Truncate(0)
+        if large {
+            shapes.PushAll(Array<I64>[1024, 1024, 1024, 2048, 2048, 2048, 4096, 1024, 4096, 4096, 4096, 4096])
+        } else {
+            shapes.PushAll(Array<I64>[256, 256, 256, 1024, 1024, 1024, 2048, 2048, 2048])
+        }
+    }
+    names := device.Devices()
+    for i in range names.Len(): try io.Put("Vulkan device " + $i + ": " + names[i] + "\n")
+    d := try device.Device.Open()
+    try io.Put("on " + d.Str() + ": workgroups of up to " + $d.MaxInvocations + " invocations, " + $d.SharedBytes + " bytes shared\n")
+    r := rand.Rand(1)
+    first := try kern.Product.Make(d, kern.Plan(4, 4, 8, 0, false))
+    try io.Put("a product of 16 x 16 x 16, recorded back to back: " + (2.0 * 4096.0 / (try timed(d, first, r, 16, 16, 16, false, rounds)) / 1000.0).Fixed(2) + " us each\n\nGFLOPS, F32, operands resident\nplan | differs")
+    for i in range 0, shapes.Len(), 3: try io.Put(" | " + $shapes[i] + " x " + $shapes[i + 1] + " x " + $shapes[i + 2])
+    try io.Put(" | 1500 x 768 x 3072, B transposed | 1500 x 3072 x 768, B transposed\n")
+    a, b := randoms(301 * 129, r), randoms(129 * 257, r)
+    want := Array<F32>(0)
+    for plan in (largePlans() if large else plans()).View() {
+        if not plan.Fits(d) {
+            try io.Put(plan.Str() + " | more than the device's workgroups hold\n")
+            continue
+        }
+        p := try kern.Product.Make(d, plan) catch device.VkError {
+            try io.Put(plan.Str() + " | the driver refused it\n")
+            continue
+        }
+        got := try result(d, p, a, b)
+        if want.Len() == 0: want = got.Copy()
+        worst F64 = 0
+        for i in range got.Len(): worst = worst.Max((F64(got[i]) - F64(want[i])).Abs())
+        try io.Put(plan.Str() + " | " + $worst)
+        for i in range 0, shapes.Len(), 3: try io.Put(" | " + (try timed(d, p, r, shapes[i], shapes[i + 1], shapes[i + 2], false, rounds)).Fixed(1))
+        try io.Put(" | " + (try timed(d, p, r, 1500, 768, 3072, true, rounds)).Fixed(1) + " | " + (try timed(d, p, r, 1500, 3072, 768, true, rounds)).Fixed(1))
+        try io.Put("\n")
+    }
+}

@@ -1,0 +1,86 @@
+# GEMM GFLOPS of kernels/gemm on the CPU against kernels/vk's product on a Vulkan device (docs/vulkan.md): square
+# products and the perceptron's and a transformer's shapes, F32. Each shape is timed three ways, interleaved round by
+# round, the median of the rounds: the CPU at 1 thread and at 4, and the device with every operand resident (products
+# recorded back to back, one Sync at the end). Each round repeats a product until it takes about 20 ms on the CPU; on
+# the device, it first runs products untimed for at least 100 ms, so a GPU that lowered its clocks while the CPU's
+# rounds ran is at its working clocks again, then times as many as take about 100 ms there (at least 3). Timing the
+# device as often as the CPU, after a single untimed product, measured a GPU still waking up: on an idle RTX 4060 the
+# large shapes came out 3 to 6 times too slow. Arguments: rounds (5).
+#
+# From the repository's root: make vkgemm ARGS="5"; OANN_VK_DEVICE=N picks the device (the bench lists them)
+
+import "std/io"
+import "std/os"
+import "std/rand"
+import "std/time"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../kernels/vk/device"
+import "../kernels/vk/kern"
+
+fn median(xs mut Array<F64>&) F64 {
+    xs.Sort(fn(a, b): return a < b)
+    return xs[xs.Len() / 2]
+}
+
+fn gflops(m I64, n I64, k I64, ns F64) String { return $(2.0 * F64(m) * F64(n) * F64(k) / ns).Fixed(1) }
+
+# one shape's line: C (m x n) = A (m x k) B (k x n)
+fn shape(d mut device.Device&, ks kern.Set&, r mut rand.Rand&, m I64, k I64, n I64, rounds I64) ? io.Error, device.VkError {
+    a := Array<F32>(m * k)
+    b := Array<F32>(k * n)
+    c := Array<F32>(m * n)
+    for i in range m * k: a[i] = F32(r.Uniform(-1.0, 1.0))
+    for i in range k * n: b[i] = F32(r.Uniform(-1.0, 1.0))
+    am, bm := mat.Mat<F32>(a, 0, m, k, k), mat.Mat<F32>(b, 0, k, n, n)
+    cm := mat.Mat<F32>(c, 0, m, n, n)
+    ws1 := gemm.Workspace<F32>(1, m.Max(k).Max(n), m * n)
+    ws4 := gemm.Workspace<F32>(4, m.Max(k).Max(n), m * n)
+    ba := try device.Buf<F32>.Make(d, m * k)
+    bb := try device.Buf<F32>.Make(d, k * n)
+    bc := try device.Buf<F32>.Make(d, m * n)
+    ba.UploadAll(a)
+    bb.UploadAll(b)
+    da, db := device.DMat<F32>(ba, 0, m, k, k), device.DMat<F32>(bb, 0, k, n, n)
+    dc := device.DMat<F32>(bc, 0, m, n, n)
+    t0 := time.Now()
+    gemm.Gemm(ws4, cm, am, false, bm, false)
+    reps := (20000000 / I64(time.Since(t0)).Max(1)).Clamp(1, 1000)
+    t1, t4, tv := Array<F64>(rounds), Array<F64>(rounds), Array<F64>(rounds)
+    for round in range rounds {
+        t0 = time.Now()
+        for _ in range reps: gemm.Gemm(ws1, cm, am, false, bm, false)
+        t1[round] = F64(time.Since(t0)) / F64(reps)
+        t0 = time.Now()
+        for _ in range reps: gemm.Gemm(ws4, cm, am, false, bm, false)
+        t4[round] = F64(time.Since(t0)) / F64(reps)
+        warm I64 = 0
+        t0 = time.Now()
+        for warm == 0 or I64(time.Since(t0)) < 100000000 {
+            ks.Gemm(d, dc, da, false, db, false)
+            try d.Sync()
+            warm++
+        }
+        each := F64(time.Since(t0)) / F64(warm)
+        greps := I64(1e8 / each).Clamp(3, 10000)
+        t0 = time.Now()
+        for _ in range greps: ks.Gemm(d, dc, da, false, db, false)
+        try d.Sync()
+        tv[round] = F64(time.Since(t0)) / F64(greps)
+    }
+    try io.Put($m + " x " + $k + " x " + $n + " | " + gflops(m, n, k, median(t1)) + " | " + gflops(m, n, k, median(t4)) + " | " + gflops(m, n, k, median(tv)) + "\n")
+}
+
+fn main() ? io.Error, ParseError, device.VkError {
+    args :~ os.Args()
+    rounds I64 = 5
+    if args.Len() > 1: rounds = try args[1].ParseInt()
+    names := device.Devices()
+    for i in range names.Len(): try io.Put("Vulkan device " + $i + ": " + names[i] + "\n")
+    d := try device.Device.Open()
+    try io.Put("on " + d.Str() + "\n\nGFLOPS, F32\nm x k x n | CPU 1 thread | CPU 4 threads | Vulkan, resident\n---|---|---|---\n")
+    ks := try kern.Set.Make(d)
+    r := rand.Rand(1)
+    sizes := Array<I64>[128, 784, 128, 128, 128, 10, 256, 256, 256, 512, 512, 512, 1024, 1024, 1024, 2048, 2048, 2048, 4096, 1024, 4096]
+    for i in range 0, sizes.Len(), 3: try shape(d, ks, r, sizes[i], sizes[i + 1], sizes[i + 2], rounds)
+}

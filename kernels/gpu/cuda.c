@@ -79,6 +79,15 @@ int32_t oann_device_info(int32_t ordinal, char *name, int32_t len, int32_t *info
 
 int32_t oann_set_device(int32_t ordinal) { return cudaSetDevice(ordinal); }
 
+/* the current device's free memory in bytes into out[0], as the driver reports it (under Windows' WDDM, what this
+ * process may still take before allocations spill into shared system memory) */
+int32_t oann_mem_free(uint64_t *out) {
+    size_t free = 0, total = 0;
+    cudaError_t e = cudaMemGetInfo(&free, &total);
+    out[0] = (uint64_t)free;
+    return e;
+}
+
 /* a stream that does not synchronize with the legacy default stream */
 int32_t oann_stream_create(uint64_t *out) {
     cudaStream_t s = 0;
@@ -177,6 +186,26 @@ void oann_gemm(uint64_t st, uint64_t h, bool ta, bool tb, int32_t m, int32_t n, 
                       (cudaDataType)btype, ldb, pb, (void *)(uintptr_t)c, (cudaDataType)ctype, ldc,
                       (cublasComputeType_t)compute, CUBLAS_GEMM_DEFAULT),
          "cublasGemmEx");
+}
+
+/* count products of one shape, each C[i] = alpha op(A[i]) op(B[i]) + beta C[i] in cuBLAS's column-major terms
+ * (cublasGemmBatchedEx): a, b and c are device addresses of arrays of count device addresses, read when the call runs
+ * - so what is multiplied is chosen on the device, and the call's shape is fixed (a CUDA graph can hold it). The C[i]
+ * must not overlap one another */
+void oann_gemm_batched(uint64_t st, uint64_t h, bool ta, bool tb, int32_t m, int32_t n, int32_t k, double alpha,
+                       uint64_t a, int32_t atype, int32_t lda, uint64_t b, int32_t btype, int32_t ldb, double beta,
+                       uint64_t c, int32_t ctype, int32_t ldc, int32_t count, int32_t compute) {
+    float alpha32 = (float)alpha, beta32 = (float)beta;
+    int wide = compute == CUBLAS_COMPUTE_64F || compute == CUBLAS_COMPUTE_64F_PEDANTIC;
+    const void *pa = wide ? (const void *)&alpha : (const void *)&alpha32;
+    const void *pb = wide ? (const void *)&beta : (const void *)&beta32;
+    note(st, OANN_CUBLAS,
+         cublasGemmBatchedEx((cublasHandle_t)(uintptr_t)h, ta ? CUBLAS_OP_T : CUBLAS_OP_N,
+                             tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, pa, (const void *const *)(uintptr_t)a,
+                             (cudaDataType)atype, lda, (const void *const *)(uintptr_t)b, (cudaDataType)btype, ldb, pb,
+                             (void *const *)(uintptr_t)c, (cudaDataType)ctype, ldc, count,
+                             (cublasComputeType_t)compute, CUBLAS_GEMM_DEFAULT),
+         "cublasGemmBatchedEx");
 }
 
 /* ---- device memory, filled and copied on the compute stream (kernels/gpu/kern.olang) ---- */
