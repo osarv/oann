@@ -2390,8 +2390,25 @@ GPT and the looped-depth and reasoning experiments use, which GP6 refused on the
 reports itself skipped; `ad/gpu_test.olang` adds `bandsCase` (a window of 3; documents causal; documents both ways),
 `elemsCase` (Rope at bases 10000 and 500, AddScalar, Sqrt, Log, stablemax with ignored classes) and `bf16Case` (a BF16
 GPT's forward and backward against the CPU's BF16 graph, then 15 steps of GpuAdamW on masters against the CPU's mixed
-AdamW, the arena the masters rounded, then `Train`); the kernels compile under nvcc for F32, F64 and BF16. **Not yet
-run on a GPU** - the first run is on the RTX 4060: `make gputest`, then `make gpulm` (G-M6) at 124M and 300M sizes.
+AdamW, the arena the masters rounded, then `Train`); the kernels compile under nvcc for F32, F64 and BF16.
+
+Run on the RTX 4060 (8188 MiB, WSL, 2026-11-27/28): two bugs found and fixed - the GPU plan's steps were copied into an
+empty array (`g.gpu.Steps = all`, now `~`: every planned graph indexed past it) and dyn's adamCase wrote its gradients
+into a copy (`gg :~`). bf16Case's masters are compared by the norm of their difference (0.063 measured; bound 0.1):
+AdamW steps a weight with a near-zero gradient by the sign of BF16's rounding noise, so a few weights drift up to 0.1
+apart in 15 steps at rate 0.01 while the losses agree at every step. `make gputest` all green.
+
+G-M6 (`make gpulm`, random tokens, oann bfab67e):
+
+| model | params | device MB | step | tokens/s | TFLOPS |
+|---|---|---|---|---|---|
+| 768 x 12, ctx 512, batch 8, BF16 | 109.6M | 4104 | 547 ms | 7493 | 4.93 |
+| 768 x 12, ctx 512, batch 8, F32 | 109.6M | 6537 | 822 ms | 4981 | 3.27 |
+| 1024 x 24 (16 heads), ctx 512, batch 4, BF16 | 335.3M | 7937 | 1043 ms | 1964 | 3.95 |
+| 1024 x 24 (16 heads), ctx 1024, batch 2, BF16 | 335.3M | 8705 | 1099 ms | 1863 | 3.75 |
+
+BF16 is 1.50x F32 at 110M. ~335M trains in BF16 with full AdamW state; the 8705 MB plan exceeds the card and runs only
+because WSL spills into shared memory (keep plans under ~7.9 GB, or use Recompute/ChunkedCE). No size failed to allocate.
 
 
 ## NF4 weights: QLoRA's 4-bit base (wt-nf4, 2026-11-27)
