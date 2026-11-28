@@ -1,0 +1,223 @@
+# kernels/eigen - the eigenvalues and eigenvectors of a real symmetric matrix: Householder's reduction to a
+# tridiagonal matrix, then the QL method with implicit shifts (EISPACK's tred2 and tql2, as JAMA wrote them), in F64.
+# About 4 n^3 multiply-adds for all n pairs; the matrix is held by columns throughout so that every inner loop runs
+# along memory.
+
+# a's eigenvalues, ascending, and a overwritten with its eigenvectors: a is [n x n] symmetric (only that is read); on
+# return eigenvector j (of the j-th eigenvalue, length 1) is a[j n : j n + n]
+fn Symmetric(a mut Array<F64>&, n I64) Array<F64> {
+    d := Array<F64>(n)
+    e := Array<F64>(n)
+    if n == 0: return d
+    tridiagonal(a, n, d, e)
+    ql(a, n, d, e)
+    order(a, n, d)
+    return d
+}
+
+# Householder's reduction: v (element (r, c) at c n + r) becomes the orthogonal matrix of the reduction, d the
+# diagonal and e the subdiagonal (e[0] = 0)
+fn tridiagonal(v mut Array<F64>&, n I64, d mut Array<F64>&, e mut Array<F64>&) {
+    for j in range n: d[j] = v[j * n + n - 1]
+    for back in range n - 1 {
+        i := n - 1 - back
+        scale F64 = 0.0
+        h F64 = 0.0
+        for k in range i: scale += d[k].Abs()
+        if scale == 0.0 {
+            e[i] = d[i - 1]
+            for j in range i {
+                d[j] = v[j * n + i - 1]
+                v[j * n + i] = 0.0
+                v[i * n + j] = 0.0
+            }
+            d[i] = h
+            continue
+        }
+        for k in range i {
+            d[k] /= scale
+            h += d[k] * d[k]
+        }
+        f F64 = d[i - 1]
+        g F64 = -h.Sqrt() if f > 0.0 else h.Sqrt()
+        e[i] = scale * g
+        h -= f * g
+        d[i - 1] = f - g
+        for j in range i: e[j] = 0.0
+        for j in range i {
+            f = d[j]
+            v[i * n + j] = f
+            g = e[j] + v[j * n + j] * f
+            for k in range j + 1, i {
+                g += v[j * n + k] * d[k]
+                e[k] += v[j * n + k] * f
+            }
+            e[j] = g
+        }
+        f = 0.0
+        for j in range i {
+            e[j] /= h
+            f += e[j] * d[j]
+        }
+        hh := f / (h + h)
+        for j in range i: e[j] -= hh * d[j]
+        for j in range i {
+            f = d[j]
+            g = e[j]
+            for k in range j, i: v[j * n + k] -= f * e[k] + g * d[k]
+            d[j] = v[j * n + i - 1]
+            v[j * n + i] = 0.0
+        }
+        d[i] = h
+    }
+    for i in range n - 1 {
+        v[i * n + n - 1] = v[i * n + i]
+        v[i * n + i] = 1.0
+        h := d[i + 1]
+        if h != 0.0 {
+            for k in range i + 1: d[k] = v[(i + 1) * n + k] / h
+            for j in range i + 1 {
+                g F64 = 0.0
+                for k in range i + 1: g += v[(i + 1) * n + k] * v[j * n + k]
+                for k in range i + 1: v[j * n + k] -= g * d[k]
+            }
+        }
+        for k in range i + 1: v[(i + 1) * n + k] = 0.0
+    }
+    for j in range n {
+        d[j] = v[j * n + n - 1]
+        v[j * n + n - 1] = 0.0
+    }
+    v[(n - 1) * n + n - 1] = 1.0
+    e[0] = 0.0
+}
+
+fn hypot(a F64, b F64) F64 { return (a * a + b * b).Sqrt() }
+
+# the QL method on the tridiagonal (d, e), its rotations applied to v's columns: d becomes the eigenvalues, v's
+# columns the eigenvectors
+fn ql(v mut Array<F64>&, n I64, d mut Array<F64>&, e mut Array<F64>&) {
+    for i in range 1, n: e[i - 1] = e[i]
+    e[n - 1] = 0.0
+    f F64 = 0.0
+    tst F64 = 0.0
+    eps F64 = 2.220446049250313e-16
+    for l in range n {
+        tst = tst.Max(d[l].Abs() + e[l].Abs())
+        m := l
+        for m < n and e[m].Abs() > eps * tst: m += 1
+        if m > l {
+            for {
+                g F64 = d[l]
+                p F64 = (d[l + 1] - g) / (2.0 * e[l])
+                r F64 = hypot(p, 1.0)
+                if p < 0.0: r = -r
+                d[l] = e[l] / (p + r)
+                d[l + 1] = e[l] * (p + r)
+                dl1 := d[l + 1]
+                h F64 = g - d[l]
+                for i in range l + 2, n: d[i] -= h
+                f += h
+                p = d[m]
+                c F64 = 1.0
+                c2 F64 = 1.0
+                c3 F64 = 1.0
+                el1 := e[l + 1]
+                s F64 = 0.0
+                s2 F64 = 0.0
+                for back in range m - l {
+                    i := m - 1 - back
+                    c3 = c2
+                    c2 = c
+                    s2 = s
+                    g = c * e[i]
+                    h = c * p
+                    r = hypot(p, e[i])
+                    e[i + 1] = s * r
+                    s = e[i] / r
+                    c = p / r
+                    p = c * d[i] - s * g
+                    d[i + 1] = h + s * (c * g + s * d[i])
+                    rotate(v, n, i, c, s)
+                }
+                p = -s * s2 * c3 * el1 * e[l] / dl1
+                e[l] = s * p
+                d[l] = c * p
+                if e[l].Abs() <= eps * tst: break
+            }
+        }
+        d[l] += f
+        e[l] = 0.0
+    }
+}
+
+# columns i and i + 1 of v turned by (c, s)
+fn rotate(v mut Array<F64>&, n I64, i I64, c F64, s F64) {
+    a := i * n
+    b := a + n
+    for k in range n {
+        h := v[b + k]
+        v[b + k] = s * v[a + k] + c * h
+        v[a + k] = c * v[a + k] - s * h
+    }
+}
+
+# the pairs put in ascending order of d
+fn order(v mut Array<F64>&, n I64, d mut Array<F64>&) {
+    for i in range n - 1 {
+        k := i
+        for j in range i + 1, n {
+            if d[j] < d[k]: k = j
+        }
+        if k == i: continue
+        d[i], d[k] = d[k], d[i]
+        for r in range n: v[i * n + r], v[k * n + r] = v[k * n + r], v[i * n + r]
+    }
+}
+
+# ---- checks ----
+
+import "std/rand"
+
+test Symmetric "a 2 x 2 matrix's pairs, and a diagonal one's in order" {
+    a := Array<F64>[2.0, 1.0, 1.0, 2.0]
+    d := Symmetric(a, 2)
+    assert (d[0] - 1.0).Abs() < 1e-12 and (d[1] - 3.0).Abs() < 1e-12
+    assert (a[0].Abs() - 0.5.Sqrt()).Abs() < 1e-12 and (a[0] + a[1]).Abs() < 1e-12 and (a[2] - a[3]).Abs() < 1e-12
+    b := Array<F64>[5.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 2.0]
+    w := Symmetric(b, 3)
+    assert w[0] == -1.0 and w[1] == 2.0 and w[2] == 5.0 and b[1].Abs() == 1.0 and b[5].Abs() == 1.0
+}
+
+test Symmetric "random matrices: A v = w v for every pair, the vectors orthonormal, repeated values too" {
+    r := rand.Rand(11)
+    for n in [1, 3, 17, 120] {
+        a := Array<F64>(n * n)
+        for i in range n {
+            for j in range i + 1 {
+                x := r.Normal() if (i + j) % 5 != 0 else 0.0
+                a[i * n + j] = x
+                a[j * n + i] = x
+            }
+        }
+        if n == 17 {
+            for i in range n * n: a[i] = 0.0
+            for i in range n: a[i * n + i] = F64(i / 4)                 # every value four times
+        }
+        v := a.Copy()
+        w := Symmetric(v, n)
+        for j in range n {
+            if j > 0: assert w[j] >= w[j - 1]
+            for i in range n {
+                s F64 = 0.0
+                for k in range n: s += a[i * n + k] * v[j * n + k]
+                assert (s - w[j] * v[j * n + i]).Abs() < 1e-9, $n + ": " + $(s - w[j] * v[j * n + i])
+            }
+            for j2 in range j + 1 {
+                dot F64 = 0.0
+                for k in range n: dot += v[j * n + k] * v[j2 * n + k]
+                assert (dot - (1.0 if j == j2 else 0.0)).Abs() < 1e-10
+            }
+        }
+    }
+}

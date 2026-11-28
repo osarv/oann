@@ -1,0 +1,332 @@
+# speech/who - oann-who, who spoke when in a recording (speech/diarize), and how well against a reference:
+#
+#     oann-who MODEL.onnx CLIP.wav... [--turns] [--prune P] [--prunes "0.01,0.03"] [--speakers N] [--threads T]
+#
+# MODEL.onnx is WeSpeaker's voxceleb_ECAPA512.onnx (speech/speaker). A clip is a 16-bit PCM WAVE file, mono at 16 kHz,
+# read a minute at a time. Where CLIP.ref lies beside it - a line a turn, "start end speaker" in seconds - the speech
+# is the reference's (its turns joined) and the turns found are scored against it; without one the whole clip is taken
+# as speech. --turns prints the turns found, "start end speaker".
+#
+# The score, counted in hundredths of a second over the reference's speech: the error rate is the share of the
+# reference's speaker time not given to that speaker, the speakers found matched to the reference's one to one so
+# that the most time agrees (the diarization error rate with the reference's speech given, no collar, overlapped
+# speech counted: where two speak at once at most one can be right); "one talker" is the same over the time when
+# exactly one person speaks. --prunes scores every Options.Prune given from the same vectors.
+
+import "std/flags"
+import "std/io"
+import "std/os"
+import "std/time"
+import "diarize"
+import "speaker"
+
+fn fail(msg String&) noreturn {
+    try io.PutErrLn("oann-who: " + msg) catch { }
+    os.Exit(1)
+}
+
+# the peak resident memory in MB (VmHWM)
+fn peak() I64 {
+    status :~ try os.ReadFile("/proc/self/status") catch default ""
+    for line in status.Lines() {
+        if not line.StartsWith("VmHWM:"): continue
+        return (try line[6:].Trim().Split(" ")[0].ParseInt() catch default 0) / 1024
+    }
+    return 0
+}
+
+# a reference turn
+type said struct(Start F64, End F64, Who I64) {
+    Start
+    End
+    Who
+}
+
+# CLIP.ref's turns and its speakers' count; none where there is no file
+fn reference(path String&) Array<said>, I64 {
+    text :~ try os.ReadFile(path) catch { return Array<said>(0), 0 }
+    names := Map<String, I64>()
+    out := Vec<said>()
+    for line in text.Lines() {
+        w := line.Trim().Split(" ")
+        if w.Len() < 3: continue
+        a := try w[0].ParseFloat() catch { fail(path + ": " + line) }
+        b := try w[1].ParseFloat() catch { fail(path + ": " + line) }
+        if not names.Has(w[2]): names.Put(String(w[2]), names.Len())
+        out.Push(said(a, b, names.Get(w[2])!))
+    }
+    return out.ToArray(), names.Len()
+}
+
+# the stretches of speech of turns (sorted by start): overlapping and touching turns joined, pairs of seconds
+fn stretches(turns Array<said>&) Array<F64> {
+    out := Vec<F64>()
+    for t in turns {
+        if out.Len() > 0 and t.Start <= out[out.Len() - 1] {
+            if t.End > out[out.Len() - 1]: out[out.Len() - 1] = t.End
+            continue
+        }
+        out.Push(t.Start)
+        out.Push(t.End)
+    }
+    return out.ToArray()
+}
+
+# where a 16-bit mono 16 kHz WAVE's samples start in its first bytes
+fn samplesAt(h Array<U8>&, path String&) I64 {
+    if h.Len() < 44 or h[0] != U8('R') or h[8] != U8('W'): fail(path + " is not a WAVE file")
+    at I64 = 12
+    for at + 8 <= h.Len() {
+        size := I64(h[at + 4]) | (I64(h[at + 5]) << 8) | (I64(h[at + 6]) << 16) | (I64(h[at + 7]) << 24)
+        if h[at] == U8('d') and h[at + 1] == U8('a'): return at + 8
+        if h[at] == U8('f') and h[at + 1] == U8('m') {
+            rate := I64(h[at + 12]) | (I64(h[at + 13]) << 8) | (I64(h[at + 14]) << 16)
+            if h[at + 8] != 1 or h[at + 10] != 1 or rate != speaker.Rate or h[at + 22] != 16: fail(path + " is not 16-bit PCM, mono, 16 kHz")
+        }
+        at += 8 + size + size % 2
+    }
+    fail(path + ": no samples in its first bytes")
+}
+
+# buf filled from f as far as it goes; the bytes read
+fn fill(f os.File&, buf mut Array<U8>&) I64 {
+    got I64 = 0
+    for got < buf.Len() {
+        n := (try f.Read(buf[got:]) catch { fail("a read failed") }).Len()
+        if n == 0: break
+        got += n
+    }
+    return got
+}
+
+# the clip's vectors made into d a minute at a time (speech: its stretches; empty: all of it); the clip's seconds
+fn listen(d mut diarize.Diarizer&, path String&, speech Array<F64>&) F64 {
+    f := try os.File.Open(path) catch { fail("cannot open " + path) }
+    head := Array<U8>(4096)
+    got := fill(f, head)
+    from := samplesAt(head[0:got], path)
+    chunk := 60 * speaker.Rate
+    buf := Array<U8>(2 * chunk)
+    for i in range from, got: buf[i - from] = head[i]
+    have := got - from
+    at F64 = 0.0
+    next I64 = 0                        # the first stretch not wholly before `at`
+    for {
+        have += fill(f, buf[have:])
+        n := have / 2
+        if n == 0: break
+        x := Array<F32>(n)
+        for i in range n {
+            v := I64(buf[2 * i]) | (I64(buf[2 * i + 1]) << 8)
+            x[i] = F32(F64(v - 65536 if v >= 32768 else v) / 32768.0)
+        }
+        end := at + F64(n) / F64(speaker.Rate)
+        part := Vec<F64>()
+        if speech.Len() == 0 {
+            part.Push(at)
+            part.Push(end)
+        }
+        for next < speech.Len() / 2 and speech[2 * next + 1] <= at: next += 1
+        for r in range next, speech.Len() / 2 {
+            if speech[2 * r] >= end: break
+            part.Push(speech[2 * r].Max(at))
+            part.Push(speech[2 * r + 1].Min(end))
+        }
+        d.Add(x, at, part.ToArray())
+        at = end
+        have = 0
+        if n < chunk: break
+    }
+    return at
+}
+
+# d's windows written as base.vec (the vectors' F32s) and base.win (a line a window, "start end")
+fn dumped(d diarize.Diarizer&, base String&) {
+    v := d.Vectors()
+    bytes := Array<U8>(4 * v.Len())
+    for i in range v.Len() {
+        b := v[i].Bits()
+        for k in range 4: bytes[4 * i + k] = U8((b >> U32(8 * k)) & 255)
+    }
+    try os.WriteFile(base + ".vec", bytes) catch { fail("cannot write " + base + ".vec") }
+    sb := StringBuilder()
+    for i in range d.Windows() {
+        a, b := d.Window(i)
+        sb.Push(a.Fixed(3) + " " + b.Fixed(3) + "\n")
+    }
+    try os.WriteFile(base + ".win", sb.ToString()) catch { fail("cannot write " + base + ".win") }
+}
+
+# ---- the score ----
+
+# the most that rows can be matched to columns one to one for: gain [n x n], the Hungarian method
+fn matched(gain Array<I64>&, n I64) I64 {
+    u := Array<I64>(n + 1)
+    v := Array<I64>(n + 1)
+    p := Array<I64>(n + 1)
+    way := Array<I64>(n + 1)
+    for i in range 1, n + 1 {
+        p[0] = i
+        j0 I64 = 0
+        least := Array<I64>[I64.Max for _ in range n + 1]
+        used := Array<Bool>(n + 1)
+        for {
+            used[j0] = true
+            i0 := p[j0]
+            delta := I64.Max
+            j1 I64 = 0
+            for j in range 1, n + 1 {
+                if used[j]: continue
+                cur := -gain[(i0 - 1) * n + j - 1] - u[i0] - v[j]
+                if cur < least[j] {
+                    least[j] = cur
+                    way[j] = j0
+                }
+                if least[j] < delta {
+                    delta = least[j]
+                    j1 = j
+                }
+            }
+            for j in range n + 1 {
+                if used[j] {
+                    u[p[j]] += delta
+                    v[j] -= delta
+                } else: least[j] -= delta
+            }
+            j0 = j1
+            if p[j0] == 0: break
+        }
+        for j0 != 0 {
+            j1 := way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+        }
+    }
+    total I64 = 0
+    for j in range 1, n + 1: total += gain[(p[j] - 1) * n + j - 1]
+    return total
+}
+
+# what a clip scored, in hundredths of a second: the reference's speaker time and how much of it was right, and the
+# same where one person speaks
+type Score struct() {
+    All I64 = 0
+    Right I64 = 0
+    Single I64 = 0
+    SingleRight I64 = 0
+}
+
+fn (s mut Score&) Add(o Score&) {
+    s.All += o.All
+    s.Right += o.Right
+    s.Single += o.Single
+    s.SingleRight += o.SingleRight
+}
+
+fn (s Score&) Error() F64 { return 100.0 * F64(s.All - s.Right) / F64(s.All.Max(1)) }
+fn (s Score&) SingleError() F64 { return 100.0 * F64(s.Single - s.SingleRight) / F64(s.Single.Max(1)) }
+
+fn Score.Of(ref Array<said>&, speakers I64, turns Array<diarize.Turn>&, seconds F64) Score {
+    frames := I64(seconds * 100.0) + 1
+    found := Array<I32>[I32(-1) for _ in range frames]
+    most I64 = 0
+    for t in turns {
+        most = most.Max(t.Speaker + 1)
+        for f in range I64(t.Start * 100.0 + 0.5), I64(t.End * 100.0 + 0.5).Min(frames): found[f] = I32(t.Speaker)
+    }
+    talking := Array<U8>(frames)
+    for t in ref {
+        for f in range I64(t.Start * 100.0 + 0.5), I64(t.End * 100.0 + 0.5).Min(frames): talking[f] = (talking[f] + 1).Min(200)
+    }
+    n := speakers.Max(most)
+    gain := Array<I64>(n * n)
+    single := Array<I64>(n * n)
+    out := Score()
+    for t in ref {
+        for f in range I64(t.Start * 100.0 + 0.5), I64(t.End * 100.0 + 0.5).Min(frames) {
+            out.All += 1
+            if talking[f] == 1: out.Single += 1
+            if found[f] < 0: continue
+            gain[t.Who * n + I64(found[f])] += 1
+            if talking[f] == 1: single[t.Who * n + I64(found[f])] += 1
+        }
+    }
+    out.Right = matched(gain, n)
+    out.SingleRight = matched(single, n)
+    return out
+}
+
+fn main() {
+    p := flags.Flags("oann-who", "who spoke when in CLIP.wav by the speaker model MODEL.onnx, scored where CLIP.ref is beside it")
+    show := p.Bool("turns", 0, "print the turns found")
+    threshold := p.Float("prune", 0, diarize.Options().Prune, "the share of the windows each keeps its cosine to")
+    several := p.Text("prunes", 0, "", "score each of these shares (\"0.01,0.03\")")
+    most := p.Int("most", 0, diarize.Options().Whole, "windows clustered as they are (more are merged down to this many first)")
+    speakers := p.Int("speakers", 0, 0, "how many spoke (-1: as many as the reference has; 0: found)")
+    window := p.Float("window", 0, diarize.Options().Window, "seconds a window")
+    step := p.Float("step", 0, diarize.Options().Step, "seconds between windows")
+    threads := p.Int("threads", 'j', 0, "threads (default: every core)")
+    dump := p.Text("dump", 0, "", "write each clip's windows to this folder: CLIP.vec (the vectors, F32) and CLIP.win (a line a window: start end)")
+    try p.Parse(os.Args()) catch flags.Error.Help {
+        try io.Put(p.Help()) catch { }
+        return
+    } catch flags.Error {
+        fail(p.Message())
+    }
+    args := p.Args()
+    if args.Len() < 2: fail("usage: oann-who MODEL.onnx CLIP.wav... [flags] (--help)")
+    m := try speaker.Model.Load(args[0]) catch { fail("cannot load the model " + args[0]) }
+    tried := Vec<F64>()
+    for w in several.Get().Split(",") {
+        if w.Trim().Len() > 0: tried.Push(try w.Trim().ParseFloat() catch { fail("not a share: " + w) })
+    }
+    if tried.Len() == 0: tried.Push(threshold.Get())
+    totals := Vec<Score>()
+    for _ in tried: totals.Push(Score())
+    audio F64 = 0.0
+    making F64 = 0.0
+    grouping F64 = 0.0
+    for a in range 1, args.Len() {
+        path := args[a]
+        ref, known := reference(String(path[0:path.Len() - 4]) + ".ref")
+        o := diarize.Options()
+        o.Window = window.Get()
+        o.Step = step.Get()
+        o.Whole = most.Get()
+        o.Threads = threads.Get()
+        o.Speakers = known if speakers.Get() < 0 else speakers.Get()
+        d := diarize.Diarizer(m, o)
+        t0 := time.Now()
+        seconds := listen(d, path, stretches(ref))
+        t1 := time.Now()
+        if dump.Get().Len() > 0: dumped(d, dump.Get() + "/" + String(path[0:path.Len() - 4]).Replace("/", "_"))
+        line := StringBuilder()
+        line.Push(path + ": " + (seconds / 60.0).Fixed(1) + " min, " + $d.Windows() + " windows")
+        for i, th in tried {
+            d.O.Prune = th
+            turns := d.Turns()
+            found I64 = 0
+            for t in turns: found = found.Max(t.Speaker + 1)
+            if show.Get() and i == 0 {
+                for t in turns: Println(t.Start.Fixed(2) + " " + t.End.Fixed(2) + " " + $t.Speaker)
+            }
+            if ref.Len() == 0 {
+                line.Push(", " + $found + " speakers")
+                continue
+            }
+            s := Score.Of(ref, known, turns, seconds)
+            totals.RefMut(i).Add(s)
+            line.Push(" | " + th.Fixed(3) + ": " + $found + "/" + $known + " speakers, error " + s.Error().Fixed(1) + " %, one talker " + s.SingleError().Fixed(1) + " %")
+        }
+        t2 := time.Now()
+        audio += seconds
+        making += F64(t1 - t0) / 1e9
+        grouping += F64(t2 - t1) / 1e9 / F64(tried.Len())
+        Println(line.ToString())
+    }
+    for i, th in tried {
+        s := totals[i]
+        if s.All > 0: Println("prune " + th.Fixed(3) + ": error " + s.Error().Fixed(2) + " %, one talker " + s.SingleError().Fixed(2) + " % over " + (F64(s.All) / 360000.0).Fixed(2) + " h of speaker time")
+    }
+    Println((audio / 3600.0).Fixed(2) + " h of sound: vectors " + making.Fixed(1) + " s, grouping " + grouping.Fixed(1) + " s (" + ((making + grouping) / audio.Max(1.0) * 3600.0).Fixed(0) + " s an hour of sound), peak memory " + $peak() + " MB")
+}

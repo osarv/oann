@@ -1,0 +1,522 @@
+# speech/speaker - a voice as a vector: an ECAPA-TDNN speaker model (WeSpeaker's ECAPA_TDNN_GLOB_c512, 6 million
+# weights, read from its .onnx) turns a stretch of sound into Dim (192) numbers that are close for the same speaker
+# and far for different ones (compare with Cosine). speech/diarize groups a recording's stretches by them.
+#
+# Features (Fbank) are Kaldi's: frames of 25 ms every 10 ms that lie wholly in the sound, the samples at 16-bit
+# scale, each frame less its mean, pre-emphasised (0.97), under a Povey window, transformed at 512 points, the power
+# through 80 triangular filters even on the mel scale from 20 Hz to 8 kHz, the natural log; each band then less its
+# mean over the stretch.
+#
+# The network over the frames [frames x channels]: a convolution of 5 taps to C (512) channels; three blocks, each a
+# 1-tap convolution, a Res2 step (the channels in Scale (8) groups, each but the last through a 3-tap dilated
+# convolution fed the group plus the previous group's output), a 1-tap convolution and a gate per channel made from the
+# block's mean over time, the block's input added; every convolution followed by ReLU and batch norm (an Affine
+# here). The three blocks' outputs side by side go through a 1-tap convolution to Wide (1536) channels; attention over
+# time per channel (a tanh layer reading each frame beside the stretch's mean and deviation, then a softmax over the
+# frames) gives each channel's weighted mean and deviation, and a linear map of those the vector, less the model's
+# mean vector. Every product is a kernels/gemm product on one thread; EmbedAll runs stretches side by side on tasks.
+
+import "std/os"
+import "../io/onnx"
+import "../kernels/elem"
+import "../kernels/gemm"
+import "../kernels/mat"
+
+type ModelError error {
+    Malformed(what String)
+}
+
+Rate I64 = 16000            # samples a second
+Frame I64 = 400             # samples a frame
+Hop I64 = 160               # samples between frames
+Bins I64 = 256              # frequencies the filters read (512 points)
+Mels I64 = 80
+C I64 = 512                 # the blocks' channels
+Scale I64 = 8               # groups of a Res2 step
+Wide I64 = 1536             # channels pooled
+Att I64 = 128               # the attention's layer
+Gate I64 = 128              # a block's gate's layer
+Dim I64 = 192               # the vector
+Shortest I64 = 4000         # samples a stretch is widened to (0.25 s)
+
+# ---- features ----
+
+type Fbank struct(frames I64) {
+    Frames I64 = frames                                   # frames a call takes at most
+    window mut Array<F32>& = Array<F32>[F32((0.5 - 0.5 * (2.0 * Pi * F64(i) / F64(Frame - 1)).Cos()).Pow(0.85)) for i in range Frame]
+    dft mut Array<F32>& = basis()                         # [2 Bins x Frame]: row 2k cos, 2k + 1 -sin of frequency k
+    filters mut Array<F32>& = Filters()
+    cut mut Array<F32>& = Array<F32>(Frames * Frame)
+    spec mut Array<F32>& = Array<F32>(Frames * 2 * Bins)
+    power mut Array<F32>& = Array<F32>(Frames * Bins)
+    ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(1, 2 * Bins)
+}
+
+fn basis() Array<F32> {
+    out := Array<F32>(2 * Bins * Frame)
+    for k in range Bins {
+        for n in range Frame {
+            a := 2.0 * Pi * F64((k * n) % (2 * Bins)) / F64(2 * Bins)
+            out[(2 * k) * Frame + n] = F32(a.Cos())
+            out[(2 * k + 1) * Frame + n] = F32(-a.Sin())
+        }
+    }
+    return out
+}
+
+fn melOf(hz F64) F64 { return 1127.0 * (1.0 + hz / 700.0).Log() }
+
+# Kaldi's filters, [Mels x Bins]: triangles even on the mel scale from 20 Hz to Rate / 2, a frequency's weight its
+# place on the triangle's side in mels
+fn Filters() Array<F32> {
+    out := Array<F32>(Mels * Bins)
+    low := melOf(20.0)
+    step := (melOf(F64(Rate) / 2.0) - low) / F64(Mels + 1)
+    for m in range Mels {
+        left := low + F64(m) * step
+        mid := left + step
+        right := mid + step
+        for k in range Bins {
+            at := melOf(F64(k) * F64(Rate) / F64(2 * Bins))
+            if at <= left or at >= right: continue
+            out[m * Bins + k] = F32((at - left) / (mid - left) if at <= mid else (right - at) / (right - mid))
+        }
+    }
+    return out
+}
+
+# the frames of x[from:to] a call makes: those wholly inside, at most s.Frames
+fn (s Fbank&) Count(from I64, to I64) I64 { return ((to - from - Frame) / Hop + 1).Max(0).Min(s.Frames) }
+
+# the log filter energies of x[from:to]'s frames into out, [frames x Mels]; the frames made
+fn (s mut Fbank&) Log(out mut Array<F32>&, x Array<F32>&, from I64, to I64) I64 {
+    n := s.Count(from, to)
+    for f in range n: s.frame(x, from + f * Hop, f * Frame)
+    sp := mat.Mat<F32>(s.spec, 0, n, 2 * Bins, 2 * Bins)
+    gemm.Gemm(s.ws, sp, mat.Mat<F32>(s.cut, 0, n, Frame, Frame), false, mat.Mat<F32>(s.dft, 0, 2 * Bins, Frame, Frame), true)
+    for i in range n * Bins: s.power[i] = s.spec[2 * i] * s.spec[2 * i] + s.spec[2 * i + 1] * s.spec[2 * i + 1]
+    ml := mat.Mat<F32>(out, 0, n, Mels, Mels)
+    gemm.Gemm(s.ws, ml, mat.Mat<F32>(s.power, 0, n, Bins, Bins), false, mat.Mat<F32>(s.filters, 0, Mels, Bins, Bins), true)
+    for i in range n * Mels: out[i] = out[i].Max(1.1920929e-7).Log()
+    return n
+}
+
+# the frame from x[at] into cut from o: at 16-bit scale, less its mean, pre-emphasised, windowed
+fn (s mut Fbank&) frame(x Array<F32>&, at I64, o I64) {
+    sum F64 = 0.0
+    for i in range Frame: sum += F64(x[at + i])
+    mean := F32(sum / F64(Frame)) * 32768.0
+    before := x[at] * 32768.0 - mean
+    for i in range Frame {
+        v := x[at + i] * 32768.0 - mean
+        s.cut[o + i] = (v - 0.97 * before) * s.window[i]
+        before = v
+    }
+}
+
+# each band of feats' n frames less its mean over them
+fn Centre(feats mut Array<F32>&, n I64) {
+    for m in range Mels {
+        sum F64 = 0.0
+        for f in range n: sum += F64(feats[f * Mels + m])
+        mean := F32(sum / F64(n.Max(1)))
+        for f in range n: feats[f * Mels + m] -= mean
+    }
+}
+
+# ---- the network ----
+
+# batch norm as it is once trained: y = S x + B per channel
+type Affine struct(n I64) {
+    S mut Array<F32>& = Array<F32>[F32(1.0) for _ in range n]
+    B mut Array<F32>& = Array<F32>(n)
+}
+
+# a convolution over time of In channels to Out, K taps Dil apart, zeros around: W [Out x K In] (tap k's channel c at
+# k In + c), a bias; then ReLU and Norm
+type Conv struct(In I64, Out I64, K I64 = 1, Dil I64 = 1) {
+    In
+    Out
+    K
+    Dil
+    Pad I64 = (K - 1) * Dil / 2
+    W mut Array<F32>& = Array<F32>(Out * In * K)
+    Bias mut Array<F32>& = Array<F32>(Out)
+    Norm Affine = Affine(Out)
+}
+
+type Block struct(dil I64) {
+    In Conv = Conv(C, C)
+    made := Vec<Conv>()
+    for _ in range Scale - 1: made.Push(Conv(C / Scale, C / Scale, 3, dil))
+    Groups mut Array<Conv>& = made.ToArray()
+    Out Conv = Conv(C, C)
+    G1 mut Array<F32>& = Array<F32>(Gate * C)            # the gate: [Gate x C], then [C x Gate]
+    G1b mut Array<F32>& = Array<F32>(Gate)
+    G2 mut Array<F32>& = Array<F32>(C * Gate)
+    G2b mut Array<F32>& = Array<F32>(C)
+}
+
+type Model struct() {
+    First Conv = Conv(Mels, C, 5)
+    made := Vec<Block>()
+    for d in [2, 3, 4]: made.Push(Block(d))
+    Blocks mut Array<Block>& = made.ToArray()
+    Last Conv = Conv(3 * C, Wide)
+    A1 mut Array<F32>& = Array<F32>(Att * 3 * Wide)     # attention: [Att x 3 Wide] (a frame, the mean, the deviation)
+    A1b mut Array<F32>& = Array<F32>(Att)
+    A2 mut Array<F32>& = Array<F32>(Wide * Att)
+    A2b mut Array<F32>& = Array<F32>(Wide)
+    Pooled Affine = Affine(2 * Wide)
+    Out mut Array<F32>& = Array<F32>(Dim * 2 * Wide)
+    OutB mut Array<F32>& = Array<F32>(Dim)               # the bias less the model's mean vector
+}
+
+# ---- loading ----
+
+type reader struct(f onnx.File&) {
+    f
+}
+
+fn (r reader&) floats(name String&, n I64) Array<F32> ? ModelError {
+    a := try r.f.Floats(name) catch { error ModelError.Malformed("no tensor " + name) }
+    if a.Len() != n: error ModelError.Malformed(name + " has " + $a.Len() + " elements, not " + $n)
+    return a
+}
+
+fn (r reader&) into(dst mut Array<F32>&, name String&) ? ModelError {
+    a := try r.floats(name, dst.Len())
+    for i in range a.Len(): dst[i] = a[i]
+}
+
+# batch norm name's four tensors as an Affine
+fn (r reader&) norm(a mut Affine&, name String&) ? ModelError {
+    n := a.S.Len()
+    g := try r.floats(name + ".weight", n)
+    b := try r.floats(name + ".bias", n)
+    mean := try r.floats(name + ".running_mean", n)
+    v := try r.floats(name + ".running_var", n)
+    for i in range n {
+        a.S[i] = F32(F64(g[i]) / (F64(v[i]) + 1e-5).Sqrt())
+        a.B[i] = b[i] - mean[i] * a.S[i]
+    }
+}
+
+# convolution name's weight ([Out x In x K] in the file) and bias, and batch norm bn where one follows
+fn (r reader&) conv(c mut Conv&, name String&, bn String& = "") ? ModelError {
+    w := try r.floats(name + ".weight", c.W.Len())
+    for o in range c.Out {
+        for ch in range c.In {
+            for k in range c.K: c.W[(o * c.K + k) * c.In + ch] = w[(o * c.In + ch) * c.K + k]
+        }
+    }
+    try r.into(c.Bias, name + ".bias")
+    if bn.Len() > 0: try r.norm(c.Norm, bn)
+}
+
+fn (r reader&) block(b mut Block&, p String&) ? ModelError {
+    try r.conv(b.In, p + "0.conv", p + "0.bn")
+    for i in range b.Groups.Len(): try r.conv(b.Groups[i], p + "1.convs." + $i, p + "1.bns." + $i)
+    try r.conv(b.Out, p + "2.conv", p + "2.bn")
+    try r.into(b.G1, p + "3.linear1.weight")
+    try r.into(b.G1b, p + "3.linear1.bias")
+    try r.into(b.G2, p + "3.linear2.weight")
+    try r.into(b.G2b, p + "3.linear2.bias")
+}
+
+# WeSpeaker's ECAPA_TDNN_GLOB_c512 from its .onnx (voxceleb_ECAPA512.onnx)
+fn Model.Load(path String&) Model ? ModelError, os.Error {
+    f := try onnx.File.Load(path) catch onnx.OnnxError { error ModelError.Malformed(path + " is not an ONNX model") }
+    r := reader(f)
+    m := Model()
+    try r.conv(m.First, "model.layer1.conv", "model.layer1.bn")
+    for i in range m.Blocks.Len(): try r.block(m.Blocks[i], "model.layer" + $(i + 2) + ".se_res2block.")
+    try r.conv(m.Last, "model.conv")
+    try r.into(m.A1, "model.pool.linear1.weight")
+    try r.into(m.A1b, "model.pool.linear1.bias")
+    try r.into(m.A2, "model.pool.linear2.weight")
+    try r.into(m.A2b, "model.pool.linear2.bias")
+    try r.norm(m.Pooled, "model.bn")
+    try r.into(m.Out, "model.linear.weight")
+    try r.into(m.OutB, "model.linear.bias")
+    mean := try r.floats("mean_vec", Dim)
+    for i in range Dim: m.OutB[i] -= mean[i]
+    return m
+}
+
+# ---- the arithmetic ----
+
+# what one task needs to embed stretches of up to `frames` frames
+type Embedder struct(m Model&, frames I64 = 300) {
+    m
+    Frames I64 = frames
+    fb mut Fbank& = Fbank(frames)
+    ws mut gemm.Workspace<F32>& = gemm.Workspace<F32>(1, 3 * Wide)
+    feats mut Array<F32>& = Array<F32>(frames * Mels)
+    h mut Array<F32>& = Array<F32>(frames * C)          # the first convolution's output, then the blocks' input
+    a mut Array<F32>& = Array<F32>(frames * C)
+    r mut Array<F32>& = Array<F32>(frames * C)
+    b mut Array<F32>& = Array<F32>(frames * C)
+    sp mut Array<F32>& = Array<F32>(frames * (C / Scale))
+    cat mut Array<F32>& = Array<F32>(frames * 3 * C)
+    wide mut Array<F32>& = Array<F32>(frames * Wide)
+    att mut Array<F32>& = Array<F32>(frames * Att)
+    e mut Array<F32>& = Array<F32>(frames * Wide)
+    col mut Array<F32>& = Array<F32>(frames * 5 * Mels)
+    v mut Array<F32>& = Array<F32>(2 * Wide)            # a vector's scratch: means and deviations
+    bias mut Array<F32>& = Array<F32>(C)
+    gate mut Array<F32>& = Array<F32>(C)
+    z1 mut Array<F64>& = Array<F64>(Wide)
+    z2 mut Array<F64>& = Array<F64>(Wide)
+    z3 mut Array<F64>& = Array<F64>(Wide)
+}
+
+fn block(a mut Array<F32>&, off I64, rows I64, cols I64, ld I64) mat.Mat<F32> { return mat.Mat<F32>(a, off, rows, cols, ld) }
+
+# dst = Norm(ReLU(c over src)), row for row (zeros outside src's rows)
+fn (s mut Embedder&) conv(c Conv&, dst mat.Mat<F32>, src mat.Mat<F32>) {
+    n := src.Rows
+    d := c.In * c.K
+    w := mat.Mat<F32>(c.W, 0, c.Out, d, d)
+    epi := gemm.Epilogue.BiasAct(c.Bias, mat.Act.Relu)
+    if c.K == 1: gemm.Gemm(s.ws, dst, src, false, w, true, epi = epi)
+    else {
+        for i in range n: gather(s.col, i * d, src, i, c)
+        gemm.Gemm(s.ws, dst, mat.Mat<F32>(s.col, 0, n, d, d), false, w, true, epi = epi)
+    }
+    for i in range n {
+        o := dst.Off + i * dst.Ld
+        for j in range c.Out: dst.Data[o + j] = dst.Data[o + j] * c.Norm.S[j] + c.Norm.B[j]
+    }
+}
+
+# the patch of output row q into col from at: tap k's channels at k In
+fn gather(col mut Array<F32>&, at I64, src mat.Mat<F32>, q I64, c Conv&) {
+    for k in range c.K {
+        j := q + k * c.Dil - c.Pad
+        to := at + k * c.In
+        if j < 0 or j >= src.Rows {
+            for ch in range c.In: col[to + ch] = 0.0
+            continue
+        }
+        o := src.Off + j * src.Ld
+        for ch in range c.In: col[to + ch] = src.Data[o + ch]
+    }
+}
+
+# a block over s.h's n frames into s.cat's columns from at
+fn (s mut Embedder&) run(bk Block&, n I64, at I64) {
+    g := C / Scale
+    s.conv(bk.In, block(s.a, 0, n, C, C), block(s.h, 0, n, C, C))
+    for i in range Scale - 1 {
+        if i == 0 {
+            s.conv(bk.Groups[i], block(s.r, 0, n, g, C), block(s.a, 0, n, g, C))
+            continue
+        }
+        for f in range n {
+            for j in range g: s.sp[f * g + j] = s.a[f * C + i * g + j] + s.r[f * C + (i - 1) * g + j]
+        }
+        s.conv(bk.Groups[i], block(s.r, i * g, n, g, C), block(s.sp, 0, n, g, g))
+    }
+    for f in range n {
+        for j in range C - g, C: s.r[f * C + j] = s.a[f * C + j]
+    }
+    s.conv(bk.Out, block(s.b, 0, n, C, C), block(s.r, 0, n, C, C))
+    s.gated(bk, n)
+    for f in range n {
+        for j in range C: s.cat[f * 3 * C + at + j] = s.h[f * C + j] + s.b[f * C + j] * s.gate[j]
+    }
+}
+
+# s.gate: a block's gate per channel from s.b's mean over the n frames
+fn (s mut Embedder&) gated(bk Block&, n I64) {
+    for j in range C: s.z1[j] = 0.0
+    for f in range n {
+        for j in range C: s.z1[j] += F64(s.b[f * C + j])
+    }
+    for j in range C: s.v[j] = F32(s.z1[j] / F64(n))
+    gemm.Gemv(s.bias, mat.Mat<F32>(bk.G1, 0, Gate, C, C), false, s.v)
+    for j in range Gate: s.bias[j] = (s.bias[j] + bk.G1b[j]).Max(0.0)
+    gemm.Gemv(s.gate, mat.Mat<F32>(bk.G2, 0, C, Gate, Gate), false, s.bias)
+    for j in range C: s.gate[j] = 1.0 / (1.0 + (-(s.gate[j] + bk.G2b[j])).Exp())
+}
+
+# the vector of s.feats' n frames (centred) into out[at:at + Dim]
+fn (s mut Embedder&) forward(n I64, out mut Array<F32>&, at I64) {
+    m :~ s.m
+    s.conv(m.First, block(s.h, 0, n, C, C), block(s.feats, 0, n, Mels, Mels))
+    for i in range 3 {
+        s.run(m.Blocks[i], n, i * C)
+        if i == 2: break
+        for f in range n {
+            for j in range C: s.h[f * C + j] = s.cat[f * 3 * C + i * C + j]
+        }
+    }
+    s.conv(m.Last, block(s.wide, 0, n, Wide, Wide), block(s.cat, 0, n, 3 * C, 3 * C))
+    s.attend(n)
+    s.pool(n)
+    for j in range 2 * Wide: s.v[j] = s.v[j] * m.Pooled.S[j] + m.Pooled.B[j]
+    gemm.Gemv(out[at:at + Dim], mat.Mat<F32>(s.m.Out, 0, Dim, 2 * Wide, 2 * Wide), false, s.v)
+    for j in range Dim: out[at + j] += m.OutB[j]
+}
+
+# s.e: the attention's scores [n x Wide] of s.wide's frames, each frame read beside every channel's mean and
+# deviation over the frames
+fn (s mut Embedder&) attend(n I64) {
+    m :~ s.m
+    for j in range Wide {
+        s.z1[j] = 0.0
+        s.z2[j] = 0.0
+    }
+    for f in range n {
+        for j in range Wide: s.z1[j] += F64(s.wide[f * Wide + j])
+    }
+    for j in range Wide: s.z1[j] /= F64(n)
+    for f in range n {
+        for j in range Wide {
+            d := F64(s.wide[f * Wide + j]) - s.z1[j]
+            s.z2[j] += d * d
+        }
+    }
+    for j in range Wide {
+        s.v[j] = F32(s.z1[j])
+        s.v[Wide + j] = F32((s.z2[j] / F64((n - 1).Max(1)) + 1e-7).Sqrt())
+    }
+    gemm.Gemv(s.bias, mat.Mat<F32>(s.m.A1, Wide, Att, 2 * Wide, 3 * Wide), false, s.v)
+    for j in range Att: s.bias[j] += m.A1b[j]
+    hid := block(s.att, 0, n, Att, Att)
+    gemm.Gemm(s.ws, hid, block(s.wide, 0, n, Wide, Wide), false, mat.Mat<F32>(s.m.A1, 0, Att, Wide, 3 * Wide), true, epi = gemm.Epilogue.Bias(s.bias[0:Att]))
+    elem.TanhInPlace32(s.att[0:n * Att])
+    sc := block(s.e, 0, n, Wide, Wide)
+    gemm.Gemm(s.ws, sc, hid, false, mat.Mat<F32>(s.m.A2, 0, Wide, Att, Att), true, epi = gemm.Epilogue.Bias(m.A2b))
+}
+
+# s.v: every channel's mean and deviation over the n frames, each frame weighed by the softmax of its score over time
+fn (s mut Embedder&) pool(n I64) {
+    for j in range Wide: s.v[j] = s.e[j]
+    for f in range 1, n {
+        for j in range Wide: s.v[j] = s.v[j].Max(s.e[f * Wide + j])
+    }
+    for j in range Wide {
+        s.z1[j] = 0.0
+        s.z2[j] = 0.0
+        s.z3[j] = 0.0
+    }
+    for f in range n {
+        for j in range Wide {
+            w := F64(elem.FastExp(s.e[f * Wide + j] - s.v[j]))
+            x := F64(s.wide[f * Wide + j])
+            s.z1[j] += w
+            s.z2[j] += w * x
+            s.z3[j] += w * x * x
+        }
+    }
+    for j in range Wide {
+        mean := s.z2[j] / s.z1[j]
+        s.v[j] = F32(mean)
+        s.v[Wide + j] = F32((s.z3[j] / s.z1[j] - mean * mean).Max(1e-7).Sqrt())
+    }
+}
+
+# the stretch [from, to) of x as the samples a vector is made from: widened about its middle to Shortest where
+# shorter, kept inside x, cut to what the embedder's frames hold (from its middle)
+fn (s Embedder&) span(x Array<F32>&, from I64, to I64) I64, I64 {
+    most := (s.Frames - 1) * Hop + Frame
+    mid := (from + to) / 2
+    len := (to - from).Max(Shortest).Min(most).Min(x.Len())
+    a := (mid - len / 2).Max(0).Min(x.Len() - len)
+    return a, a + len
+}
+
+type Short error { Sound }           # fewer than Shortest samples in all
+
+# the vector of x[from:to] into out[at:at + Dim] (a stretch shorter than Shortest widened to it, a longer one than
+# the embedder holds cut about its middle)
+fn (s mut Embedder&) Embed(x Array<F32>&, from I64, to I64, out mut Array<F32>&, at I64 = 0) ? Short {
+    if x.Len() < Shortest: error Short.Sound
+    a, b := s.span(x, from, to)
+    n := s.fb.Log(s.feats, x, a, b)
+    Centre(s.feats, n)
+    s.forward(n, out, at)
+}
+
+# the vectors [stretches x Dim] of x's stretches (spans: each stretch's first sample and the one past its last, pair
+# after pair), on `threads` tasks (0: every core), each stretch of at most `frames` frames
+fn (m Model&) EmbedAll(x Array<F32>&, spans Array<I64>&, threads I64 = 0, frames I64 = 300) Array<F32> ? Short {
+    if x.Len() < Shortest: error Short.Sound
+    n := spans.Len() / 2
+    out := Array<F32>(n * Dim)
+    t := (threads if threads > 0 else gemm.Cores()).Min(n).Max(1)
+    join {
+        for i in range t: spawn embedSome(m, x, spans, out, i, t, frames)
+    }
+    return out
+}
+
+fn embedSome(m Model&, x Array<F32>&, spans Array<I64>&, out mut Array<F32>&, first I64, step I64, frames I64) {
+    s := Embedder(m, frames)
+    for i in range first, spans.Len() / 2, step: try s.Embed(x, spans[2 * i], spans[2 * i + 1], out, i * Dim) catch { }
+}
+
+# the cosine of the angle between vectors a[i:i + Dim] and b[j:j + Dim]
+fn Cosine(a Array<F32>&, i I64, b Array<F32>&, j I64) F64 {
+    ab F64 = 0.0
+    aa F64 = 0.0
+    bb F64 = 0.0
+    for k in range Dim {
+        ab += F64(a[i + k]) * F64(b[j + k])
+        aa += F64(a[i + k]) * F64(a[i + k])
+        bb += F64(b[j + k]) * F64(b[j + k])
+    }
+    return ab / (aa * bb).Sqrt().Max(1e-30)
+}
+
+# ---- checks ----
+
+import "mel"
+
+test Fbank "the filters: each a triangle that peaks below 1, every frequency from 20 Hz weighed by two that sum to 1" {
+    f := Filters()
+    for m in range Mels {
+        top F32 = 0.0
+        for k in range Bins: top = top.Max(f[m * Bins + k])
+        assert top > 0.0 and top <= 1.0
+    }
+    for k in range 4, Bins - 8 {
+        sum F32 = 0.0
+        for m in range Mels: sum += f[m * Bins + k]
+        assert (sum - 1.0).Abs() < 1e-5, $k
+    }
+}
+
+test Model "the features within 2e-3 of Kaldi's and the vectors within 2e-3 of onnxruntime's (where the files are)" {
+    path := mel.Cache() + "/models/Wespeaker--wespeaker-voxceleb-ecapa-tdnn512/voxceleb_ECAPA512.onnx"
+    ref := mel.Cache() + "/ref/ecapa512"
+    if not os.Exists(path) or not os.Exists(ref + "/embs.f32") {
+        Println("skipped: no model or reference")
+        return
+    }
+    x := mel.F32s(ref + "/clip.f32")!
+    want := mel.F32s(ref + "/fbank.f32")!
+    fb := Fbank(want.Len() / Mels)
+    got := Array<F32>(want.Len())
+    assert fb.Log(got, x, 0, x.Len()) == want.Len() / Mels
+    worst F64 = 0.0
+    for i in range got.Len(): worst = worst.Max((F64(got[i]) - F64(want[i])).Abs())
+    assert worst < 2e-3, $worst
+    m := Model.Load(path)!
+    embs := mel.F32s(ref + "/embs.f32")!
+    s := Embedder(m, 600)
+    out := Array<F32>(Dim)
+    # the reference's stretches in frames: 0-150, 75-225, all 598, 300-340
+    for i, fr in [[0, 150], [75, 225], [0, 598], [300, 340]] {
+        s.Embed(x, fr[0] * Hop, (fr[1] - 1) * Hop + Frame, out)!
+        gap F64 = 0.0
+        for k in range Dim: gap = gap.Max((F64(out[k]) - F64(embs[i * Dim + k])).Abs())
+        assert gap < 2e-3, $i + ": " + $gap
+        assert Cosine(out, 0, embs, i * Dim) > 0.99999
+    }
+    all := m.EmbedAll(x, Array<I64>[0, 149 * Hop + Frame, 75 * Hop, 224 * Hop + Frame], 2)!
+    assert Cosine(all, 0, embs, 0) > 0.99999 and Cosine(all, Dim, embs, Dim) > 0.99999
+    assert Cosine(all, 0, all, Dim) < 0.9999
+}
