@@ -1,0 +1,151 @@
+# oann-imatrix: each input's importance for a model's 4-bit weights (`--int4`), written beside its weights
+# (model.ImportancePath: DIR/oann-imatrix.safetensors, or FILE.gguf.imatrix.safetensors).
+#
+#     olang llm/imatrix.olang DIR [TEXTFILE]
+#
+# The model is read in BF16 over a calibration text (TEXTFILE, else a built-in mix of prose, code, mathematics,
+# dialogue and a few languages) and the inputs of every dense layer's products kept (State.Tap). An input's importance
+# is the mean square of its activations; Model.Load reads it for `--int4` and fits each group's 4-bit scale and offset
+# to the inputs that matter (model.Linear.Put4Weighed), as llama.cpp's importance matrix does. The file holds
+# "model.layers.L.imp.{qkv,o,gate_up,down}" (F32, In long). Experts' products are not weighted. The report gives each
+# product's 4-bit error on the kept rows with the fitted rounding, as a share of min and max's.
+import "std/json"
+import "std/os"
+import "std/time"
+import "bpe"
+import "gguf"
+import "model"
+import "../io/checkpoint"
+import "../kernels/gemm"
+import "../kernels/mat"
+import "../tensor"
+
+Rows I64 = 512      # rows kept of each product's inputs
+
+Builtin String = "The history of the bridge begins in 1867, when the town council voted to replace the ferry. " +
+    "Engineers argued for two years about stone against iron; the iron design won because it could be built in winter. " +
+    "Question: if a train leaves at 9:40 and the trip takes 2 hours and 35 minutes, when does it arrive? " +
+    "Answer: 9:40 plus 2:35 is 12:15, so it arrives at a quarter past twelve.\n\n" +
+    "def merge(a, b):\n    out = []\n    i = j = 0\n    while i < len(a) and j < len(b):\n" +
+    "        if a[i] <= b[j]:\n            out.append(a[i]); i += 1\n        else:\n            out.append(b[j]); j += 1\n" +
+    "    return out + a[i:] + b[j:]\n\n" +
+    "Let f(x) = 3x^2 - 12x + 7. Its derivative is f'(x) = 6x - 12, which is zero at x = 2, so the minimum is f(2) = -5. " +
+    "The sum of the first n odd numbers is n^2: 1 + 3 = 4, 1 + 3 + 5 = 9, and by induction (n+1)^2 = n^2 + 2n + 1.\n\n" +
+    "User: Can you explain why the sky is blue?\nAssistant: Sunlight is scattered by the molecules of the air, and " +
+    "shorter wavelengths scatter much more strongly (Rayleigh scattering goes as the inverse fourth power of the " +
+    "wavelength), so blue light reaches your eyes from every part of the sky.\n\n" +
+    "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Gothenburg\", \"unit\": \"celsius\"}}\n" +
+    "SELECT name, COUNT(*) AS orders FROM customers JOIN orders ON orders.customer_id = customers.id " +
+    "GROUP BY name HAVING COUNT(*) > 3 ORDER BY orders DESC;\n\n" +
+    "Das Wetter in Stockholm ist heute kalt, aber sonnig. Le chat dort sur le canapé depuis ce matin. " +
+    "Hon läste boken på en kväll och skrev sedan ett långt brev till sin bror.\n\n" +
+    "In a well-designed experiment the treatment and control groups differ only in the variable being tested, and the " +
+    "sample size is chosen before the data are seen so that the result cannot be steered by when one stops counting. " +
+    "A p-value is not the probability that the hypothesis is true; it is the probability of data at least this extreme " +
+    "if the null hypothesis held. Proof that sqrt(2) is irrational: suppose sqrt(2) = p/q in lowest terms; then " +
+    "p^2 = 2q^2, so p is even, p = 2k, and 4k^2 = 2q^2 gives q^2 = 2k^2, so q is even too - a contradiction.\n"
+
+fn tokenizer(dir String&) bpe.Bpe ? bpe.BpeError, json.Error, os.Error, gguf.GgufError {
+    if not dir.EndsWith(".gguf"): return try bpe.Bpe.Load(dir + "/tokenizer.json")
+    return try bpe.Bpe.Parse(try (try gguf.File.Open(dir)).TokenizerJson())
+}
+
+# the squared error over the kept rows x (n of them) of the product with lin's weights rounded to 4 bits, by min and
+# max or (imp given) fitted to imp
+fn error4(ws mut gemm.Workspace<F32>&, x mut Array<F32>&, n I64, lin model.Linear&, want Array<F32>&, imp Array<F32>&) F64 {
+    q := model.Linear(lin.In, lin.Out, 16, true, Int4 = true)
+    for i in range imp.Len(): q.Imp[i] = imp[i]
+    row := Array<F32>(lin.In)
+    wq := Array<F32>(lin.Out * lin.In)
+    steps := Array<I64>(32)
+    best := Array<I64>(32)
+    for o in range lin.Out {
+        for i in range lin.In: row[i] = lin.Get(o, i)
+        for g0 in range 0, lin.In, 32 {
+            if imp.Len() > 0: q.Put4Weighed(o, g0, row, g0, steps, best)
+            else: q.Put4(o, g0, row, g0)
+        }
+        for i in range lin.In: wq[o * lin.In + i] = q.Get(o, i)
+    }
+    got := Array<F32>(n * lin.Out)
+    gemm.Gemm(ws, mat.Mat<F32>(got, 0, n, lin.Out, lin.Out), mat.Mat<F32>(x, 0, n, lin.In, lin.In), false, mat.Mat<F32>(wq, 0, lin.Out, lin.In, lin.In), true)
+    e F64 = 0.0
+    for i in range n * lin.Out: e += F64(got[i] - want[i]) * F64(got[i] - want[i])
+    return e
+}
+
+# product k of layer l, in model.AwqPart's order
+fn part(l model.Layer&, k I64) model.Linear& {
+    if k == 0: return l.Qkv
+    if k == 1: return l.O
+    if k == 2: return l.GateUp
+    return l.Down
+}
+
+fn fail(msg String&) noreturn {
+    Println(msg)
+    os.Exit(1)
+}
+
+fn main() {
+    args :~ os.Args()
+    if args.Len() < 2 {
+        Println("usage: olang llm/imatrix.olang DIR [TEXTFILE] (OANN_REPORT set: each product's 4-bit error, fitted against min and max)")
+        os.Exit(2)
+    }
+    dir := args[1]
+    text := (try os.ReadFile(args[2]) catch { fail("cannot read " + args[2]) }) if args.Len() > 2 else Builtin
+    t0 := time.Now()
+    m := try model.Model.Load(dir) catch { fail("cannot load " + dir) }
+    tok := try tokenizer(dir) catch { fail("cannot read the tokenizer of " + dir) }
+    ids := tok.Encode(text)
+    n := ids.Len()
+    k := model.Cache(m.C, n / model.PageSize + 2, 1, n / model.PageSize + 2)
+    for i in range n / model.PageSize + 2: k.Table[i] = k.Take()
+    s := model.State(m, n, 1, n + model.PageSize)
+    s.Tap(m, Rows)
+    for i, t in ids: s.Add(t, I64(i), 0, i == n - 1)
+    m.Step(s, k)
+    Println(dir + ": " + $n + " calibration tokens read in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+    ws := gemm.Workspace<F32>(m.Threads)
+    ws.Reserve(m.C.Ffn.Max(m.C.Heads * m.C.HeadDim + 2 * m.C.KvHeads * m.C.HeadDim).Max(2 * m.C.Ffn).Max(Rows))
+    out := checkpoint.Writer()
+    names := ["qkv", "o", "gate_up", "down"]
+    report := (try os.Env("OANN_REPORT") catch default "").Len() > 0
+    for li in range m.C.Layers {
+        if m.C.MoeAt(li): continue
+        l model.Layer& = m.Layers[li]
+        line := "layer " + $li + ":"
+        for kind in range 4 {
+            lin model.Linear& = part(l, kind)
+            rows := s.TapN[4 * li + kind]
+            if rows == 0: continue
+            x := Array<F32>(rows * lin.In)
+            at := s.TapAt[4 * li + kind]
+            for i in range rows * lin.In: x[i] = s.Taps[at + i]
+            ti := tensor.Tensor<F32>.Zeros(lin.In)
+            imp := Array<F32>(lin.In)
+            for i in range lin.In {
+                e F64 = 0.0
+                for r in range rows: e += F64(x[r * lin.In + i]) * F64(x[r * lin.In + i])
+                imp[i] = F32(e / F64(rows)).Max(1e-12)
+                ti.Set(imp[i], i)
+            }
+            try out.Add("model.layers." + $li + ".imp." + names[kind], ti) catch { unreachable }
+            if not report: continue
+            w := Array<F32>(lin.Out * lin.In)
+            for o in range lin.Out {
+                for i in range lin.In: w[o * lin.In + i] = lin.Get(o, i)
+            }
+            want := Array<F32>(rows * lin.Out)
+            gemm.Gemm(ws, mat.Mat<F32>(want, 0, rows, lin.Out, lin.Out), mat.Mat<F32>(x, 0, rows, lin.In, lin.In), false, mat.Mat<F32>(w, 0, lin.Out, lin.In, lin.In), true)
+            plain := error4(ws, x, rows, lin, want, Array<F32>(0))
+            least := error4(ws, x, rows, lin, want, imp)
+            line += " " + names[kind] + " " + (least / plain.Max(1e-30)).Fixed(2)
+        }
+        if report: Println(line)
+    }
+    path := model.ImportancePath(dir)
+    try out.Save(path) catch { fail("cannot write " + path) }
+    Println("wrote " + path + " in " + (F64(time.Since(t0)) / 1e9).Fixed(1) + " s")
+}

@@ -253,17 +253,24 @@ Llama 3.2 1B and Granite 3.3 2B (8% for SmolLM2-135M), and greedy answers stay t
 (Gemma 3 1B's first answer token does, as PyTorch quantizing it the same way also gives). A GGUF file's own 4-bit
 weights are requantized into this layout, not kept as they are.
 
-**Activation-aware scales** (AWQ-style): `olang llm/awq.olang DIR [TEXTFILE]` reads the model in BF16 over a
-calibration text (a built-in mix of prose, code, mathematics and dialogue by default), keeps 128 rows of every dense
-product's inputs, and for each product picks `s_i = a_i^alpha` (`a_i` input i's mean magnitude, alpha in 0, 0.1 ... 1)
-whose 4-bit product is nearest BF16's on those rows; the scales go to `DIR/oann-awq.safetensors`, which `--int4`
-then reads: the weights are multiplied by `s` before rounding and the activations divided by it, so the inputs that
-carry large activations get finer steps. The file also holds each input's importance (its mean square after the
-scales), and each group's 4-bit scale and offset are then fitted to it (steps a little finer and coarser than the
-range's tried, the scale and offset by weighted least squares, as llama.cpp's importance matrix does), on every core
-as the model loads (Llama 3.2 1B in 22 s instead of 8). Llama 3.2 1B (53 s to calibrate), the mean KL divergence from
-BF16 over 512 held-out tokens: 0.061 plain, 0.055 with the scales, 0.045 with the fitted rounding too; with the down
-projections in 4 bits as well 0.151 -> 0.107, still well behind 8-bit ones, which is why they stay 8-bit.
+**Importance-weighted rounding.** `olang llm/imatrix.olang DIR [TEXTFILE]` reads the model in BF16 over a
+calibration text (a built-in mix of prose, code, mathematics, dialogue and a few languages by default) and writes each
+dense product's inputs' importance - their activations' mean square - to `DIR/oann-imatrix.safetensors` (5-17 s for
+1-4B models). `--int4` then fits each group's scale and offset to it (steps a little finer and coarser than the range's
+tried, scale and offset by weighted least squares, the least weighted error kept - as llama.cpp's importance matrix
+does), on every core as the model loads (Llama 3.2 1B in 22 s instead of 8). The mean KL divergence from BF16 over 512
+held-out tokens (prose and Python):
+
+| model | `--int4` | with the importance |
+|---|---|---|
+| Llama-3.2-1B-Instruct | 0.061 | 0.041 |
+| Phi-4-mini-instruct | 0.052 | 0.033 |
+| granite-3.3-2b-instruct | 0.090 | 0.040 |
+
+(`--int8`: 0.0008 for Llama.) AWQ's per-input scales (weights times `a_i^alpha` before rounding, activations divided
+by it) were tried on top: a little better than nothing on Llama, worse on Phi-4-mini (0.085), and worse than the
+importance alone on both, so they are not kept. The down projections stay 8-bit: in 4 bits with the importance Llama's
+divergence is 0.107.
 
 Reading a prompt with 4- or 8-bit weights widens them to BF16 once a step: a step of 64 rows or more widens each block
 of 32 outputs whole and multiplies once. Llama 3.2 1B reads 2048 tokens at about 400 a second in INT4, as in BF16

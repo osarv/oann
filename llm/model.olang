@@ -367,25 +367,13 @@ type Linear struct(In I64, Out I64, Nb I64, Packed Bool, bias Bool = false, Int8
     M4 mut Array<F16>& = Array<F16>(Out * In / 32 if Int4 else 0)
     C4 mut Array<I16>& = Array<I16>(Out * In / 32 if Int4 else 0)
     Bias mut Array<F32>& = Array<F32>(Out if bias else 0)
-    # activation-aware scales (llm/awq.olang), where given: input i's weights times Awq[i] before they are quantized,
-    # and the activations times Unawq[i] = 1 / Awq[i] as they are multiplied - the product the same, the rounding
-    # of the weights that matter most smaller; held by 8- and 4-bit weights, all 0 where not given (a Layer is
-    # copied as it is loaded, so the scales are written into these arrays, not given new ones)
-    Awq mut Array<F32>& = Array<F32>(In if Int8 or Int4 else 0)
-    Unawq mut Array<F32>& = Array<F32>(In if Int8 or Int4 else 0)
-    Imp mut Array<F32>& = Array<F32>(In if Int4 else 0)       # each input's importance (mean square), 0 where not given
+    # each input's importance for the 4-bit rounding (Put4Weighed): its activations' mean square over a calibration text
+    # (llm/imatrix.olang), all 0 where not given - a Layer is copied as it is loaded, so it is written into this array
+    Imp mut Array<F32>& = Array<F32>(In if Int4 else 0)
 }
 
-# whether it has activation-aware scales
-fn (l Linear&) Scaled() Bool { return l.Unawq.Len() > 0 and l.Unawq[0] != 0.0 }
-
-# the scales s for its inputs (In of them; 8- or 4-bit weights)
-fn (l mut Linear&) SetAwq(s Array<F32>&) {
-    for i in range l.In {
-        l.Awq[i] = s[i]
-        l.Unawq[i] = 1.0 / s[i]
-    }
-}
+# whether its 4-bit rounding is fitted to its inputs' importance
+fn (l Linear&) Weighed() Bool { return l.Imp.Len() > 0 and l.Imp[0] > 0.0 }
 
 # inputs g0 .. g0 + Group of output o in 8 bits from row[at:], symmetric: the group's largest magnitude is 127
 fn (l mut Linear&) put8(o I64, g0 I64, row Array<F32>&, at I64) {
@@ -432,7 +420,7 @@ fn (w Linear&) byte4(o I64, i I64) I64 {
 }
 
 # a group of 32 weights of output o from input i0 quantized into 4 bits
-fn (w mut Linear&) put4(o I64, i0 I64, v Array<F32>&, at I64) {
+fn (w mut Linear&) Put4(o I64, i0 I64, v Array<F32>&, at I64) {
     lo := v[at]
     hi := v[at]
     for t in range 32 {
@@ -455,11 +443,11 @@ fn (w mut Linear&) put4(o I64, i0 I64, v Array<F32>&, at I64) {
     w.C4[w.at4(o, i0 / 32)] = I16(128 * sum)
 }
 
-# put4 with the group's scale and offset fitted to the inputs' importance (Imp): the steps tried a little finer and
+# Put4 with the group's scale and offset fitted to the inputs' importance (Imp): the steps tried a little finer and
 # coarser than the range's, the rounded values' scale and offset by weighted least squares each time, and the one
-# whose stored (F16) form leaves the least weighted error kept - min and max as put4 among them (q and best: scratch
+# whose stored (F16) form leaves the least weighted error kept - min and max as Put4 among them (q and best: scratch
 # for 32 steps)
-fn (w mut Linear&) put4w(o I64, i0 I64, v Array<F32>&, at I64, q mut Array<I64>&, best mut Array<I64>&) {
+fn (w mut Linear&) Put4Weighed(o I64, i0 I64, v Array<F32>&, at I64, q mut Array<I64>&, best mut Array<I64>&) {
     lo := v[at]
     hi := v[at]
     for t in range 32 {
@@ -467,7 +455,7 @@ fn (w mut Linear&) put4w(o I64, i0 I64, v Array<F32>&, at I64, q mut Array<I64>&
         hi = hi.Max(v[at + t])
     }
     if hi == lo {
-        w.put4(o, i0, v, at)
+        w.Put4(o, i0, v, at)
         return
     }
     imp :~ w.Imp[i0:i0 + 32]
@@ -543,15 +531,15 @@ fn blockOf(parts Array<I64>&) I64 {
     return 16
 }
 
-# the products of a layer that take activation-aware scales, by their names in the scales file
-type AwqPart enum { Qkv, O, GateUp, Down }
+# a dense layer's products, by their names in the importance file
+type Part enum { Qkv, O, GateUp, Down }
 
-fn (a AwqPart) Name() String& {
+fn (a Part) Name() String& {
     match a {
-        case AwqPart.Qkv: return "qkv"
-        case AwqPart.O: return "o"
-        case AwqPart.GateUp: return "gate_up"
-        case AwqPart.Down: return "down"
+        case Part.Qkv: return "qkv"
+        case Part.O: return "o"
+        case Part.GateUp: return "gate_up"
+        case Part.Down: return "down"
     }
 }
 
@@ -578,12 +566,12 @@ type Layer struct(c Config&, pack Bool, int8 Bool, moe Bool = false, int4 Bool =
 }
 
 # its product a
-fn (l mut Layer&) Part(a AwqPart) mut Linear& {
+fn (l Layer&) Of(a Part) Linear& {
     match a {
-        case AwqPart.Qkv: return l.Qkv
-        case AwqPart.O: return l.O
-        case AwqPart.GateUp: return l.GateUp
-        case AwqPart.Down: return l.Down
+        case Part.Qkv: return l.Qkv
+        case Part.O: return l.O
+        case Part.GateUp: return l.GateUp
+        case Part.Down: return l.Down
     }
 }
 
@@ -780,13 +768,8 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
         n := per.Min(rows - r0)
         try w.rowsOf(name, at + r0, n, l.In, w.row)
         b :~ w.row
-        if l.Scaled() {
-            for r in range n {
-                for i in range l.In: b[r * l.In + i] *= l.Awq[i]
-            }
-        }
         # rows rounded to 4 bits by importance on every core (each output's bytes and scales its own)
-        if l.Int4 and l.Imp.Len() > 0 and l.Imp[0] > 0.0 and n >= 16 {
+        if l.Int4 and l.Weighed() and n >= 16 {
             tasks := gemm.Cores().Min(n / 8)
             join {
                 for t in range tasks: spawn putRows(l, b, from + r0, t * n / tasks, (t + 1) * n / tasks)
@@ -801,16 +784,16 @@ fn (w mut Weights&) fill(l mut Linear&, name String&, from I64, rows I64, at I64
 fn putRows(l mut Linear&, b Array<F32>&, from I64, ra I64, rb I64) {
     q := Array<I64>(32)
     best := Array<I64>(32)
-    weighed := l.Int4 and l.Imp.Len() > 0 and l.Imp[0] > 0.0
+    weighed := l.Int4 and l.Weighed()
     for r in range ra, rb {
         o := from + r
         if l.Int8 {
             # symmetric, a scale per Group inputs of an output: the group's largest magnitude is 127
             for g0 in range 0, l.In, l.Group: l.put8(o, g0, b, r * l.In + g0)
         } else if weighed {
-            for g0 in range 0, l.In, 32: l.put4w(o, g0, b, r * l.In + g0, q, best)
+            for g0 in range 0, l.In, 32: l.Put4Weighed(o, g0, b, r * l.In + g0, q, best)
         } else if l.Int4 {
-            for g0 in range 0, l.In, 32: l.put4(o, g0, b, r * l.In + g0)
+            for g0 in range 0, l.In, 32: l.Put4(o, g0, b, r * l.In + g0)
         } else if l.Packed {
             base := (o / l.Nb) * l.In * l.Nb + (o % l.Nb) * 2
             for i in range l.In: l.W[base + (i / 2) * l.Nb * 2 + i % 2] = BF16(b[r * l.In + i])
@@ -860,22 +843,22 @@ fn Model.Load(dir String&, exact Bool = false, int8 Bool = false, int4 Bool = fa
         g := try gguf.File.Open(dir) catch gguf.GgufError { error ModelError.Malformed(dir + " (GGUF)") }
         c := try Config.Parse(try g.ConfigJson() catch gguf.GgufError { error ModelError.Unsupported(dir + ": " + g.Arch) })
         w := Weights.Gguf(g, c.HeadDim)
-        return try Model.From(c, w, exact, int8, int4, AwqPath(dir) if int4 and os.Exists(AwqPath(dir)) else "")
+        return try Model.From(c, w, exact, int8, int4, ImportancePath(dir) if int4 and os.Exists(ImportancePath(dir)) else "")
     }
     c := try Config.Parse(try os.ReadFile(dir + "/config.json"))
     w := try Weights.Open(dir)
     for p in ["language_model.model.", "model.language_model."] {
         if w.where.Has(p + "embed_tokens.weight"): w.prefix = p
     }
-    m := try Model.From(c, w, exact, int8, int4, AwqPath(dir) if int4 and os.Exists(AwqPath(dir)) else "")
+    m := try Model.From(c, w, exact, int8, int4, ImportancePath(dir) if int4 and os.Exists(ImportancePath(dir)) else "")
     return m
 }
 
-# where llm/awq.olang keeps a model's activation-aware scales: beside its weights
-fn AwqPath(dir String&) String { return dir + (".awq.safetensors" if dir.EndsWith(".gguf") else "/oann-awq.safetensors") }
+# where llm/imatrix.olang keeps a model's inputs' importance: beside its weights
+fn ImportancePath(dir String&) String { return dir + (".imatrix.safetensors" if dir.EndsWith(".gguf") else "/oann-imatrix.safetensors") }
 
-# the model of config c with weights w (4 bits: the activation-aware scales of the file awq, where named)
-fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false, awq String& = "") Model ? ModelError {
+# the model of config c with weights w (4 bits: rounded by the importance in the file imp, where named)
+fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false, imp String& = "") Model ? ModelError {
     if exact and (int8 or int4): error ModelError.Unsupported("exact products of 8- or 4-bit weights")
     if int8 and int4: error ModelError.Unsupported("both 8- and 4-bit weights")
     m := Model(c, TargetHasTileDot and not exact, int8 and TargetHasTileDot, int4 and TargetHasTileDot)
@@ -887,23 +870,17 @@ fn Model.From(c Config, w mut Weights&, exact Bool, int8 Bool, int4 Bool = false
     }
     q := c.Heads * c.HeadDim
     kv := c.KvHeads * c.HeadDim
-    scales := Vec<Weights>()
-    if awq.Len() > 0 and m.Int4: scales.Push(try Weights.File(awq) catch os.Error { error ModelError.Malformed(awq) })
+    imps := Vec<Weights>()
+    if imp.Len() > 0 and m.Int4: imps.Push(try Weights.File(imp) catch os.Error { error ModelError.Malformed(imp) })
     for i in range c.Layers {
         p := "model.layers." + $i + "."
         l := m.Layers[i]
-        if scales.Len() > 0 and not c.MoeAt(i) {
-            for part in [AwqPart.Qkv, AwqPart.O, AwqPart.GateUp, AwqPart.Down] {
-                name := p + "awq." + part.Name()
-                sw :~ scales.RefMut(0)
-                if not sw.Has(name): continue
-                lin :~ l.Part(part)
-                if lin.Awq.Len() == 0: continue
-                v := Array<F32>(lin.In)
-                try sw.Vector(v, name, lin.In)
-                lin.SetAwq(v)
-                imp := p + "awq_imp." + part.Name()
-                if lin.Imp.Len() > 0 and sw.Has(imp): try sw.Vector(lin.Imp, imp, lin.In)
+        if imps.Len() > 0 and not c.MoeAt(i) {
+            iw :~ imps.RefMut(0)
+            for part in [Part.Qkv, Part.O, Part.GateUp, Part.Down] {
+                lin Linear& = l.Of(part)
+                name := p + "imp." + part.Name()
+                if lin.Imp.Len() > 0 and iw.Has(name): try iw.Vector(lin.Imp, name, lin.In)
             }
         }
         # Phi's projections stored fused: qkv_proj (queries, keys, values) and gate_up_proj (gate, up), as oann holds them
@@ -1114,14 +1091,14 @@ type State struct(m Model&, Rows I64, Outs I64, MaxCtx I64) {
     work mut Array<Attend>& = tasks.ToArray()
     ws gemm.Workspace<F32> = gemm.Workspace<F32>(m.Threads)
     ws.Reserve(m.Head.Out.Max(2 * m.C.Ffn).Max(2 * m.C.MoeFfn).Max(Rows))
-    # taps (Tap): rows of each dense layer's product inputs kept, as calibration reads them (llm/awq.olang)
+    # taps (Tap): rows of each dense layer's product inputs kept, as calibration reads them (llm/imatrix.olang)
     TapRows I64 = 0
     Taps mut Array<F32>& = Array<F32>(0)
     TapAt mut Array<I64>& = Array<I64>(0)           # product k of layer l's rows at TapAt[4 l + k], In apart
     TapN mut Array<I64>& = Array<I64>(0)            # and how many it holds
 }
 
-# up to rows rows of every dense product's inputs kept by the steps to come (AwqPart order: Qkv, O, GateUp, Down)
+# up to rows rows of every dense product's inputs kept by the steps to come (Part order: Qkv, O, GateUp, Down)
 fn (s mut State&) Tap(m Model&, rows I64) {
     s.TapRows = rows
     s.TapAt ~ Array<I64>(4 * m.C.Layers + 1)
@@ -1222,13 +1199,7 @@ fn (m Model&) linear(xb mut Array<BF16>&, deq mut Array<BF16>&, scs mut Array<F3
     if rows == 0: return
     if m.Tile {
         rp := roundUp(rows, 16)
-        if w.Scaled() {
-            for r in range rows {
-                for i in range w.In: xb[r * w.In + i] = BF16(src[r * w.In + i] * w.Unawq[i])
-            }
-        } else {
-            for i in range rows * w.In: xb[i] = BF16(src[i])
-        }
+        for i in range rows * w.In: xb[i] = BF16(src[i])
         for i in range rows * w.In, rp * w.In: xb[i] = BF16(0.0)
         blocks := w.Out / w.Nb
         tasks := m.Threads.Min(blocks)
@@ -2583,7 +2554,7 @@ test Linear "4- and 8-bit products by byte dots and by widening agree with the w
         for o in range w.Out {
             for i in range w.In: row[i] = F32(r.Normal() * 0.05 + (0.02 if o % 3 == 0 else 0.0))
             for g0 in range 0, w.In, 32 {
-                if bits == 4: w.put4(o, g0, row, g0)
+                if bits == 4: w.Put4(o, g0, row, g0)
                 else: w.put8(o, g0, row, g0)
             }
         }
@@ -2617,44 +2588,38 @@ test Linear "4- and 8-bit products by byte dots and by widening agree with the w
     }
 }
 
-
-# scales that are powers of two, the same over each group of 32 inputs, change no rounding: the weights' 4-bit steps
-# and the activations' 8-bit ones scale exactly, so the logits are those of no scales, bit for bit
-test Model "activation-aware scales: powers of two per group give the logits of none, where $OANN_MODELS has SmolLM2" {
-    if not TargetHasTileDot: return
-    root :~ try os.Env("OANN_MODELS") catch default ""
-    dir := root + "/HuggingFaceTB--SmolLM2-135M-Instruct"
-    if root.Len() == 0 or not os.Exists(dir + "/config.json"): return
-    c := Config.Parse(os.ReadFile(dir + "/config.json")!)!
-    plain := Model.From(c, Weights.Open(dir)!, false, false, true, "")!
-    out := checkpoint.Writer()
-    for li in range c.Layers {
-        l Layer& = plain.Layers[li]
-        for k, name in ["qkv", "o", "gate_up", "down"] {
-            width := [l.Qkv.In, l.O.In, l.GateUp.In, l.Down.In][k]
-            t := tensor.Tensor<F32>.Zeros(width)
-            for i in range width: t.Set(F32([0.5, 1.0, 2.0, 4.0][(i / 32 + li + k) % 4]), i)
-            out.Add("model.layers." + $li + ".awq." + name, t)!
+# rounding fitted to importance never leaves more weighted error than min and max do, and less where one input
+# matters far more than the rest
+test Linear "4-bit rounding by importance: never worse than min and max in the weighted error, better where it can be" {
+    r := rand.Rand(11)
+    w := Linear(64, 16, 16, true, Int4 = true)
+    row := Array<F32>(64)
+    q := Array<I64>(32)
+    best := Array<I64>(32)
+    for i in range 64: w.Imp[i] = F32(r.Float() * 0.1 + (50.0 if i % 32 == 5 else 0.0))
+    plain F64 = 0.0
+    fitted F64 = 0.0
+    for o in range 16 {
+        for i in range 64: row[i] = F32(r.Normal() * 0.05)
+        for g0 in range 0, 64, 32 {
+            w.Put4(o, g0, row, g0)
+            a := weighedError(w, o, g0, row)
+            w.Put4Weighed(o, g0, row, g0, q, best)
+            b := weighedError(w, o, g0, row)
+            assert b <= a * (1.0 + 1e-9), "output " + $o + ", group " + $g0 + ": " + $b + " against " + $a
+            plain += a
+            fitted += b
         }
     }
-    path := (try os.Env("TMPDIR") catch default "/tmp") + "/oann-awq-test.safetensors"
-    out.Save(path)!
-    scaled := Model.From(c, Weights.Open(dir)!, false, false, true, path)!
-    os.Remove(path)!
-    assert scaled.Layers[0].Down.Scaled() and scaled.Layers[0].Qkv.Scaled()
-    for n in [3, 20] {
-        want := lastLogits(plain, n)
-        got := lastLogits(scaled, n)
-        for i in range c.Vocab: assert want[i].Bits() == got[i].Bits(), $n + " rows, logit " + $i + ": " + $got[i] + ", not " + $want[i]
-    }
+    assert fitted < 0.7 * plain, $fitted + " against " + $plain
 }
 
-# the logits of the last of n rows of made-up tokens
-fn lastLogits(m Model&, n I64) Array<F32> {
-    k := Cache(m.C, 4, 1, 4)
-    for i in range 4: k.Table[i] = k.Take()
-    s := State(m, n, n, 256)
-    for i in range n: s.Add(I32(100 + 37 * i), I64(i), 0, i == n - 1)
-    m.Step(s, k)
-    return s.LogitsOf(0, m.C.Vocab).Copy()
+# the importance-weighted squared error of output o's group g0 as stored, against row
+fn weighedError(w Linear&, o I64, g0 I64, row Array<F32>&) F64 {
+    e F64 = 0.0
+    for t in range 32 {
+        d := F64(w.Get(o, g0 + t) - row[g0 + t])
+        e += F64(w.Imp[g0 + t]) * d * d
+    }
+    return e
 }
